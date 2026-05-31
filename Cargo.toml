@@ -36,6 +36,11 @@ axum = "0.7"
 tower = "0.5"
 tower-http = { version = "0.6", features = ["trace"] }
 
+# Crypto — webhook signature verification (hq-mod-hooks.5+)
+hmac = "0.12"
+sha2 = "0.10"
+hex = "0.4"
+
 # Storage
 sqlx = { version = "0.8", default-features = false, features = ["postgres", "macros", "runtime-tokio-rustls", "uuid", "chrono"] }
 
