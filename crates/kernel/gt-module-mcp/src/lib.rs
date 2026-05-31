@@ -4,4 +4,4 @@
 #![warn(missing_docs)]
 
 #[doc(hidden)]
-pub const SCAFFOLD: &str = "gt-mod-mcp — hq-mod-mcp scaffold";
+pub const SCAFFOLD: &str = "gt-module-mcp — hq-mod-mcp scaffold";

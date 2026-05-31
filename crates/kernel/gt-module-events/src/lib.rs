@@ -4,4 +4,4 @@
 #![warn(missing_docs)]
 
 #[doc(hidden)]
-pub const SCAFFOLD: &str = "gt-mod-events — hq-mod-events scaffold";
+pub const SCAFFOLD: &str = "gt-module-events — hq-mod-events scaffold";

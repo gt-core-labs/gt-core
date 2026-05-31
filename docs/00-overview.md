@@ -22,7 +22,7 @@ Three forces pushed the foundation out of `gastown`:
                        │  gt-core (this repo)                  │
                        │  apps/api/crates/                     │
                        │   ├ kernel/                           │
-                       │   │   gt-module, gt-mod-{routes,mcp,  │
+                       │   │   gt-module, gt-module-{routes,mcp,  │
                        │   │   events,migrate,contracts},      │
                        │   │   gt-feature-flags, gt-hooks      │
                        │   └ domain/                           │

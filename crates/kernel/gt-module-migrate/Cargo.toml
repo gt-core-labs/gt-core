@@ -1,5 +1,5 @@
 [package]
-name = "gt-mod-migrate"
+name = "gt-module-migrate"
 version.workspace = true
 edition.workspace = true
 license.workspace = true

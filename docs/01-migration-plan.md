@@ -19,12 +19,12 @@ Real implementations of the skeleton crates. Built **in-place** in gt-core; no g
 
 Order:
 1. `hq-mod-core.1..8` → `gt-module` proper.
-2. `hq-mod-events.1..7` → `gt-mod-events` proper (event versioning + cross-module subscribe stubs).
-3. `hq-mod-routes.1..6` → `gt-mod-routes` proper.
-4. `hq-mod-mcp.1..5` → `gt-mod-mcp` proper.
-5. `hq-mod-migrate.1..5` → `gt-mod-migrate` proper.
+2. `hq-mod-events.1..7` → `gt-module-events` proper (event versioning + cross-module subscribe stubs).
+3. `hq-mod-routes.1..6` → `gt-module-routes` proper.
+4. `hq-mod-mcp.1..5` → `gt-module-mcp` proper.
+5. `hq-mod-migrate.1..5` → `gt-module-migrate` proper.
 6. `hq-mod-flags.1..6` → `gt-feature-flags` proper.
-7. `hq-mod-contracts.1..5` → `gt-mod-contracts` proper.
+7. `hq-mod-contracts.1..5` → `gt-module-contracts` proper.
 8. `hq-mod-hooks.1..7` → `gt-hooks` + `gt-webhooks` proper (lifecycle hooks + inbound webhook router + GitHub/Linear sources + sheriff hook refactor).
 9. `hq-mod-dogs.1..9` → `gt-dog` proper (worker abstraction + DogDispatcher + Gate evaluator + PluginExecutor + digest receipts + notify).
 
@@ -39,11 +39,11 @@ Add to `gastown/apps/api/Cargo.toml`:
 ```toml
 [workspace.dependencies]
 gt-module = { path = "../../../gt-core/crates/gt-module" }
-gt-mod-routes = { path = "../../../gt-core/crates/gt-mod-routes" }
-gt-mod-mcp = { path = "../../../gt-core/crates/gt-mod-mcp" }
-gt-mod-events = { path = "../../../gt-core/crates/gt-mod-events" }
-gt-mod-migrate = { path = "../../../gt-core/crates/gt-mod-migrate" }
-gt-mod-contracts = { path = "../../../gt-core/crates/gt-mod-contracts" }
+gt-module-routes = { path = "../../../gt-core/crates/gt-module-routes" }
+gt-module-mcp = { path = "../../../gt-core/crates/gt-module-mcp" }
+gt-module-events = { path = "../../../gt-core/crates/gt-module-events" }
+gt-module-migrate = { path = "../../../gt-core/crates/gt-module-migrate" }
+gt-module-contracts = { path = "../../../gt-core/crates/gt-module-contracts" }
 gt-feature-flags = { path = "../../../gt-core/crates/gt-feature-flags" }
 gt-workspace = { path = "../../../gt-core/crates/gt-workspace" }
 ```

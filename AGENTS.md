@@ -55,7 +55,7 @@ cd /home/nixos/gt-core-wt-<bead-id>
 Any change touching events / reducers MUST pass the replay gate. Run before pushing:
 
 ```bash
-cargo test -p gt-mod-events --test replay_gate
+cargo test -p gt-module-events --test replay_gate
 ```
 
 ## Consuming gt-core from gastown
@@ -65,11 +65,11 @@ In gastown's workspace `[workspace.dependencies]`, point at the gt-core paths:
 ```toml
 [workspace.dependencies]
 gt-module        = { path = "../../gt-core/apps/api/crates/kernel/gt-module" }
-gt-mod-routes    = { path = "../../gt-core/apps/api/crates/kernel/gt-mod-routes" }
-gt-mod-mcp       = { path = "../../gt-core/apps/api/crates/kernel/gt-mod-mcp" }
-gt-mod-events    = { path = "../../gt-core/apps/api/crates/kernel/gt-mod-events" }
-gt-mod-migrate   = { path = "../../gt-core/apps/api/crates/kernel/gt-mod-migrate" }
-gt-mod-contracts = { path = "../../gt-core/apps/api/crates/kernel/gt-mod-contracts" }
+gt-module-routes    = { path = "../../gt-core/apps/api/crates/kernel/gt-module-routes" }
+gt-module-mcp       = { path = "../../gt-core/apps/api/crates/kernel/gt-module-mcp" }
+gt-module-events    = { path = "../../gt-core/apps/api/crates/kernel/gt-module-events" }
+gt-module-migrate   = { path = "../../gt-core/apps/api/crates/kernel/gt-module-migrate" }
+gt-module-contracts = { path = "../../gt-core/apps/api/crates/kernel/gt-module-contracts" }
 gt-feature-flags = { path = "../../gt-core/apps/api/crates/kernel/gt-feature-flags" }
 gt-hooks         = { path = "../../gt-core/apps/api/crates/kernel/gt-hooks" }
 gt-workspace     = { path = "../../gt-core/apps/api/crates/domain/platform/gt-workspace" }

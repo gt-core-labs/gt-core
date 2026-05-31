@@ -87,7 +87,7 @@ Is it an executable? → bins/  (and you probably shouldn't add one)
 
 ### Naming
 
-- Kernel: `gt-mod-<X>` or `gt-<X>` where `<X>` is single-purpose (events, hooks, routes).
+- Kernel: `gt-module-<X>` or `gt-<X>` where `<X>` is single-purpose (events, hooks, routes).
 - Domain: `gt-<noun>` (gt-workspace, gt-dog, gt-polecat).
 - Modules: `mod-<noun>` (mod-kanban, mod-pages).
 - Bins: `gt-<tool>` if ever (gt-contracts).
@@ -115,7 +115,7 @@ let root = RootBuilder::new(workspace_id)
 
 - ❌ Direct `axum::Router::new().route("/api/...", ...)` for module routes. Use `GtModule::register_routes`.
 - ❌ Direct `#[tool]` macro on a struct that isn't a module's `register_mcp_tools` target.
-- ❌ Direct `sqlx::migrate!()` call. Use `gt-mod-migrate` multi-source loader.
+- ❌ Direct `sqlx::migrate!()` call. Use `gt-module-migrate` multi-source loader.
 - ❌ Spawning an actor outside `Module::register`. Lifecycle is owned by the builder.
 - ❌ Observer plugin registered ad-hoc. Plugins are declared in `Capability::hooks` or `Capability::subscribes`.
 

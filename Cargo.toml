@@ -2,11 +2,11 @@
 resolver = "2"
 members = [
     "crates/kernel/gt-module",
-    "crates/kernel/gt-mod-routes",
-    "crates/kernel/gt-mod-mcp",
-    "crates/kernel/gt-mod-events",
-    "crates/kernel/gt-mod-migrate",
-    "crates/kernel/gt-mod-contracts",
+    "crates/kernel/gt-module-routes",
+    "crates/kernel/gt-module-mcp",
+    "crates/kernel/gt-module-events",
+    "crates/kernel/gt-module-migrate",
+    "crates/kernel/gt-module-contracts",
     "crates/kernel/gt-feature-flags",
     "crates/kernel/gt-hooks",
     "crates/domain/platform/gt-workspace",
@@ -47,11 +47,11 @@ opentelemetry = "0.27"
 # Internal crates — referenced as `<name> = { workspace = true }` from member Cargo.toml.
 # Path-centralized here so members never juggle relative paths across tiers.
 gt-module        = { path = "crates/kernel/gt-module" }
-gt-mod-routes    = { path = "crates/kernel/gt-mod-routes" }
-gt-mod-mcp       = { path = "crates/kernel/gt-mod-mcp" }
-gt-mod-events    = { path = "crates/kernel/gt-mod-events" }
-gt-mod-migrate   = { path = "crates/kernel/gt-mod-migrate" }
-gt-mod-contracts = { path = "crates/kernel/gt-mod-contracts" }
+gt-module-routes    = { path = "crates/kernel/gt-module-routes" }
+gt-module-mcp       = { path = "crates/kernel/gt-module-mcp" }
+gt-module-events    = { path = "crates/kernel/gt-module-events" }
+gt-module-migrate   = { path = "crates/kernel/gt-module-migrate" }
+gt-module-contracts = { path = "crates/kernel/gt-module-contracts" }
 gt-feature-flags = { path = "crates/kernel/gt-feature-flags" }
 gt-hooks         = { path = "crates/kernel/gt-hooks" }
 gt-workspace     = { path = "crates/domain/platform/gt-workspace" }

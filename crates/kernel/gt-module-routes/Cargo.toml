@@ -1,5 +1,5 @@
 [package]
-name = "gt-mod-routes"
+name = "gt-module-routes"
 version.workspace = true
 edition.workspace = true
 license.workspace = true

@@ -4,4 +4,4 @@
 #![warn(missing_docs)]
 
 #[doc(hidden)]
-pub const SCAFFOLD: &str = "gt-mod-migrate — hq-mod-migrate scaffold";
+pub const SCAFFOLD: &str = "gt-module-migrate — hq-mod-migrate scaffold";

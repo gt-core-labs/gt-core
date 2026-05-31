@@ -1,5 +1,5 @@
 [package]
-name = "gt-mod-events"
+name = "gt-module-events"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
