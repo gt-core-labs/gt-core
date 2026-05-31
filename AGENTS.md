@@ -4,7 +4,7 @@ Quick onboarding for Claude / human contributors working on the module system + 
 
 ## STOP — read these first
 
-1. **[docs/04-non-negotiables.md](docs/04-non-negotiables.md)** — 15 hard invariants (ported from gastown). Stop-the-line if violated.
+1. **[docs/04-non-negotiables.md](docs/04-non-negotiables.md)** — 16 hard invariants (15 ported from gastown + NN-16 bead taxonomy). Stop-the-line if violated.
 2. **[docs/03-architecture-guardrails.md](docs/03-architecture-guardrails.md)** — folder structure + kernel migration policy + module-system on-ramp.
 3. **[docs/02-sse-pattern.md](docs/02-sse-pattern.md)** — streaming endpoint conventions.
 4. **[docs/01-migration-plan.md](docs/01-migration-plan.md)** — what ships when.
@@ -14,6 +14,7 @@ If the bead you claimed conflicts with these docs, file a doc gap via `meta.repo
 ## Where things are
 
 - **Tracking:** Dolt `hq.issues` in gastown (via gt-mcp). Epics: `hq-mod` (66 beads) + `hq-mt` (95 beads).
+- **Bead taxonomy (NN-16, mandatory):** `epic → sub-epic → bead`. Epic = `issue_type=epic`. Sub-epic = the `external_ref` (the canonical grouping key, e.g. `hq-mt-cli`). Bead = `issue_type=task`, id `<sub-epic>.<n>`. Every non-epic bead MUST set `external_ref` to its sub-epic and have id `<external_ref>.<n>`. Sub-epic → epic is by name prefix. Enforced at the MCP boundary — see docs/04 NN-16.
 - **Code:** here, `/home/nixos/gt-core`.
 - **Memory:** `~/.claude/projects/-home-nixos-gastown/memory/`.
 - **Consumer:** `/home/nixos/gastown` pulls these crates via `[patch.crates-io]`.

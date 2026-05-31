@@ -17,7 +17,7 @@ Foundational module system + multi-tenant primitives for Gas Town and downstream
 
 ## MUST-READ before writing code
 
-- **[docs/04-non-negotiables.md](docs/04-non-negotiables.md)** — 15 hard invariants ported from gastown. Stop-the-line if violated; battle scars behind every rule.
+- **[docs/04-non-negotiables.md](docs/04-non-negotiables.md)** — 16 hard invariants (15 ported from gastown + NN-16 bead taxonomy). Stop-the-line if violated; battle scars behind every rule.
 - **[docs/03-architecture-guardrails.md](docs/03-architecture-guardrails.md)** — folder structure, kernel migrates UP from gastown (no re-invention), module system is the only on-ramp, dep direction one-way, events versioned + replay-safe.
 - **[docs/02-sse-pattern.md](docs/02-sse-pattern.md)** — auth via cookie, per-workspace channel keying, Last-Event-ID, KeepAlive. Read before adding any streaming endpoint.
 

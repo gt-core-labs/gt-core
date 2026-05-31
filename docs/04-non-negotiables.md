@@ -227,6 +227,27 @@ This is a gt-core extension of the gastown principles to the multi-tenant target
 
 ---
 
+## 16. Bead taxonomy is epic → sub-epic → bead (enforced in code)
+
+**The tracking hierarchy is exactly three levels and is mandatory by design, not convention.**
+
+| Level | Representation | Example |
+|-------|----------------|---------|
+| **Epic** | a bead with `issue_type=epic` | `hq-mod`, `hq-mt` |
+| **Sub-epic** | the shared `external_ref` of its beads (the canonical grouping key) | `hq-mt-cli`, `hq-mod-flags` |
+| **Bead** | `issue_type=task`/`spike`, id `<sub-epic>.<n>` | `hq-mt-cli.7` |
+
+- Every non-epic bead MUST carry `external_ref` = its **sub-epic** (never the bare epic, never empty).
+- Bead id MUST match `<sub-epic>.<n>` where `<sub-epic>` equals its `external_ref`.
+- Sub-epic → epic linkage is by name prefix (`hq-mt-*` → `hq-mt`). There is no "parent" column.
+- Bead → bead ordering is `depends_on` (dependency graph), orthogonal to the hierarchy.
+
+**The code enforces this, not just the docs.** `issues.create` / `issues.update` validation in gt-mcp MUST reject, at the MCP boundary (the same way rule 15 rejects a spoofed `workspace_id`): a non-epic bead with empty `external_ref`, or an id that does not match `<external_ref>.<n>`. Epics are exempt. A validation gap → `meta.report_gap`; do not relax the rule. Enforcement tracked in `hq-mod-mcp.10`.
+
+**Provenance:** new — gt-core process invariant. Battle scar: this session found the CLI work scattered with `external_ref` set inconsistently and ids that didn't reflect their sub-epic, making `gt://issues?external_ref=<sub-epic>` an unreliable grouping query.
+
+---
+
 ## Stop-the-line protocol
 
 If a bead description, a code review comment, or your own draft conflicts with one of these:
@@ -258,3 +279,4 @@ Past violations have caused: split-brain Dolt corruption, cross-tenant leak (cau
 | 13 | 11-cutover-roadmap.md, memory:multi-bead-epic-discipline |
 | 14 | 01-architecture.md |
 | 15 | gt-core-extension over rules 1, 6 for hq-mt |
+| 16 | gt-core process invariant (bead taxonomy), enforced in gt-mcp validate; hq-mod-mcp.10 |
