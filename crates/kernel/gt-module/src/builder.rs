@@ -35,6 +35,7 @@ use axum::Router;
 
 use crate::capability::Capability;
 use crate::flags::{AllEnabled, FeatureFlags};
+use crate::hook::HookPoint;
 use crate::mcp::{McpRegistry, McpTool, McpToolNameError};
 use crate::meta::{ModuleId, ModuleMeta};
 use crate::module_trait::GtModule;
@@ -398,6 +399,25 @@ impl Root {
         self.entries.iter().flat_map(|e| e.mcp_tools.iter())
     }
 
+    /// Every active hook subscription as a `(module id, point)` pair, in module
+    /// init order then per-module declaration order (`hq-mod-hooks.3`).
+    ///
+    /// A module declares the points it observes through
+    /// [`Capability::subscribing`](crate::Capability::subscribing); this is the
+    /// aggregated, flag-filtered view the `gt-hooks` dispatcher binds handlers
+    /// against. Subscriptions from feature-flag-disabled modules never appear — a
+    /// disabled module is dropped before its [`ModuleEntry`] reaches the [`Root`],
+    /// so its subscriptions drop with it. Unlike scopes, the same [`HookPoint`]
+    /// may be returned for several modules: observation is shared, not exclusive.
+    pub fn hook_subscriptions(&self) -> impl Iterator<Item = (&ModuleId, HookPoint)> {
+        self.entries.iter().flat_map(|e| {
+            e.capability
+                .subscribed_hooks()
+                .iter()
+                .map(move |&point| (&e.meta.id, point))
+        })
+    }
+
     /// Mount every module's contributed routes into one application
     /// [`Router`] (`hq-mod-routes.1`, `.2`).
     ///
@@ -742,6 +762,95 @@ mod tests {
             .build_with_flags(&flags)
             .unwrap();
         assert_eq!(root.mcp_tools().count(), 0);
+    }
+
+    // --- Hook subscriptions (hq-mod-hooks.3) --------------------------------
+
+    use crate::hook::HookPoint;
+
+    /// Module subscribing to a fixed set of hook points, for aggregation tests.
+    struct Subscriber {
+        id: &'static str,
+        points: Vec<HookPoint>,
+        deps: Vec<&'static str>,
+    }
+    impl GtModule for Subscriber {
+        fn meta(&self) -> ModuleMeta {
+            ModuleMeta::new(
+                ModuleId::new(self.id).unwrap(),
+                self.id,
+                Version::new(1, 0, 0),
+                "Subscriber.",
+            )
+        }
+        fn capability(&self) -> Capability {
+            Capability::empty().subscribing_all(self.points.clone())
+        }
+        fn dependencies(&self) -> Vec<ModuleId> {
+            self.deps.iter().map(|d| ModuleId::new(*d).unwrap()).collect()
+        }
+    }
+
+    #[test]
+    fn module_with_no_subscriptions_contributes_none() {
+        let root = RootBuilder::new().module(Beads).build().unwrap();
+        assert_eq!(root.hook_subscriptions().count(), 0);
+    }
+
+    #[test]
+    fn subscriptions_follow_module_init_then_declaration_order() {
+        // `dependent` depends on `base`, so base inits first; within a module the
+        // declaration order is preserved.
+        let base = Subscriber {
+            id: "base",
+            points: vec![HookPoint::AfterCommand, HookPoint::OnClaim],
+            deps: vec![],
+        };
+        let dependent = Subscriber {
+            id: "dependent",
+            points: vec![HookPoint::BeforeCommand],
+            deps: vec!["base"],
+        };
+        // Register dependent first; build reorders so base (dependency) is first.
+        let root = RootBuilder::new().module(dependent).module(base).build().unwrap();
+        let subs: Vec<(&str, HookPoint)> = root
+            .hook_subscriptions()
+            .map(|(id, p)| (id.as_str(), p))
+            .collect();
+        assert_eq!(
+            subs,
+            [
+                ("base", HookPoint::AfterCommand),
+                ("base", HookPoint::OnClaim),
+                ("dependent", HookPoint::BeforeCommand),
+            ]
+        );
+    }
+
+    #[test]
+    fn the_same_point_may_be_observed_by_many_modules() {
+        let a = Subscriber { id: "a", points: vec![HookPoint::OnTransition], deps: vec![] };
+        let b = Subscriber { id: "b", points: vec![HookPoint::OnTransition], deps: vec![] };
+        let root = RootBuilder::new().module(a).module(b).build().unwrap();
+        let observers: Vec<&str> = root
+            .hook_subscriptions()
+            .filter(|(_, p)| *p == HookPoint::OnTransition)
+            .map(|(id, _)| id.as_str())
+            .collect();
+        assert_eq!(observers, ["a", "b"]);
+    }
+
+    #[test]
+    fn disabled_module_subscriptions_are_dropped() {
+        let off = Subscriber { id: "off", points: vec![HookPoint::AfterEvent], deps: vec![] };
+        let on = Subscriber { id: "on", points: vec![HookPoint::AfterCommand], deps: vec![] };
+        let flags = DisabledModules::new([ModuleId::new("off").unwrap()]);
+        let root = RootBuilder::new().module(off).module(on).build_with_flags(&flags).unwrap();
+        let subs: Vec<(&str, HookPoint)> = root
+            .hook_subscriptions()
+            .map(|(id, p)| (id.as_str(), p))
+            .collect();
+        assert_eq!(subs, [("on", HookPoint::AfterCommand)]);
     }
 
     // --- Router contribution (hq-mod-routes.1) ------------------------------

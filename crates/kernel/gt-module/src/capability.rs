@@ -13,6 +13,7 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::hook::HookPoint;
 use crate::scope::Scope;
 
 /// Declarative description of a module's contributions and requirements.
@@ -29,6 +30,17 @@ pub struct Capability {
     /// the single source of truth for. Two modules claiming the same scope is a
     /// wiring bug the builder rejects at `build()` time (`hq-mod-core.6`).
     scopes: Vec<Scope>,
+    /// Lifecycle [`HookPoint`]s this module observes (`hq-mod-hooks.3`).
+    ///
+    /// This is the declaration only — which points the module reacts to. The
+    /// handler itself (the async, `dyn`-dispatched behavior) lives in `gt-hooks`,
+    /// which cannot be named here without a dependency cycle. The builder
+    /// aggregates these declarations across the loaded modules and exposes them
+    /// via [`Root::hook_subscriptions`](crate::Root::hook_subscriptions); the
+    /// `gt-hooks` dispatcher binds handlers to them. Unlike [`scopes`](Self::scopes),
+    /// the same point may be observed by many modules — observation is not
+    /// exclusive ownership — so no conflict check applies.
+    subscribed_hooks: Vec<HookPoint>,
 }
 
 impl Capability {
@@ -59,5 +71,68 @@ impl Capability {
     /// The scopes this module claims, in declaration order.
     pub fn scopes(&self) -> &[Scope] {
         &self.scopes
+    }
+
+    /// Declare that this module observes lifecycle `point`. Chainable.
+    ///
+    /// Observation is not exclusive: many modules may subscribe to the same
+    /// point, and a module may list a point more than once (the dispatcher treats
+    /// the declaration set as the points to wire). A `BeforeCommand` subscriber
+    /// may later veto via the `gt-hooks` handler; every other point observes only
+    /// (see [`HookPoint::is_vetoable`]).
+    pub fn subscribing(mut self, point: HookPoint) -> Self {
+        self.subscribed_hooks.push(point);
+        self
+    }
+
+    /// Declare a batch of observed hook points at once. Chainable.
+    pub fn subscribing_all(mut self, points: impl IntoIterator<Item = HookPoint>) -> Self {
+        self.subscribed_hooks.extend(points);
+        self
+    }
+
+    /// The lifecycle hook points this module observes, in declaration order.
+    pub fn subscribed_hooks(&self) -> &[HookPoint] {
+        &self.subscribed_hooks
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn empty_capability_subscribes_to_nothing() {
+        assert!(Capability::empty().subscribed_hooks().is_empty());
+    }
+
+    #[test]
+    fn subscribing_records_points_in_declaration_order() {
+        let cap = Capability::empty()
+            .subscribing(HookPoint::BeforeCommand)
+            .subscribing(HookPoint::OnClaim);
+        assert_eq!(
+            cap.subscribed_hooks(),
+            [HookPoint::BeforeCommand, HookPoint::OnClaim]
+        );
+    }
+
+    #[test]
+    fn subscribing_all_appends_a_batch() {
+        let cap = Capability::empty()
+            .subscribing(HookPoint::AfterCommand)
+            .subscribing_all([HookPoint::BeforeEvent, HookPoint::AfterEvent]);
+        assert_eq!(
+            cap.subscribed_hooks(),
+            [HookPoint::AfterCommand, HookPoint::BeforeEvent, HookPoint::AfterEvent]
+        );
+    }
+
+    #[test]
+    fn hooks_and_scopes_are_independent() {
+        // A capability can declare hooks without scopes and vice versa.
+        let cap = Capability::empty().subscribing(HookPoint::OnTransition);
+        assert!(cap.scopes().is_empty());
+        assert_eq!(cap.subscribed_hooks(), [HookPoint::OnTransition]);
     }
 }

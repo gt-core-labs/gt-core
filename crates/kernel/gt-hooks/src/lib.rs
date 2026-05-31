@@ -1,16 +1,18 @@
 //! Lifecycle hooks framework — modules observe and react to kernel lifecycle
 //! points without knowing about the bus.
 //!
-//! A module declares the points it cares about (via `Capability::hooks`,
+//! A module declares the points it cares about (via
+//! [`Capability::subscribing`](gt_module::Capability::subscribing),
 //! `hq-mod-hooks.3`) and supplies a [`HookHandler`]; the [`HookRegistry`] holds
-//! those handlers keyed by [`HookPoint`], and the dispatcher (also `.3`) invokes
-//! them when the kernel reaches a point, honoring a [`HookOutcome::Reject`] veto
-//! at vetoable points.
+//! those handlers keyed by [`HookPoint`], and the dispatcher (`hq-mod-hooks.3+`)
+//! invokes them when the kernel reaches a point, honoring a
+//! [`HookOutcome::Reject`] veto at vetoable points.
 //!
 //! ## Landed so far
 //!
-//! - [`HookPoint`] — lifecycle moments; `BeforeCommand` / `AfterCommand` seed the
-//!   set, the full builtin list is `hq-mod-hooks.2` (`hq-mod-hooks.1`).
+//! - [`HookPoint`] — the lifecycle-point vocabulary, re-exported from `gt-module`
+//!   where it lives so [`Capability`](gt_module::Capability) can name it without a
+//!   dependency cycle (relocated by `hq-mod-hooks.3`; defined `.1`/`.2`).
 //! - [`HookHandler`] + [`HookContext`] + [`HookOutcome`] — the observer trait and
 //!   its in/out types (`hq-mod-hooks.1`).
 //! - [`HookRegistry`] — per-point, registration-ordered handler collection

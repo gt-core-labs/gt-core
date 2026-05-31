@@ -7,10 +7,8 @@ repository.workspace = true
 description = "Declarative HookPoint + HookHandler + HookRegistry. Lifecycle integration points for modules."
 
 [dependencies]
-serde = { workspace = true }
 async-trait = { workspace = true }
 gt-module = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true }
-serde_json = { workspace = true }

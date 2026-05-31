@@ -38,6 +38,15 @@
 //! - [`module_prefix`] / [`API_BASE`] — each module's routes are auto-mounted
 //!   under `/api/v1/<module-id>`, so modules declare plain relative paths and
 //!   never collide (`hq-mod-routes.2`).
+//!
+//! ## Hooks
+//!
+//! - [`HookPoint`] — the lifecycle-point vocabulary; a module declares the points
+//!   it observes through [`Capability::subscribing`] and the builder exposes the
+//!   active subscriptions via [`Root::hook_subscriptions`] (`hq-mod-hooks.3`). The
+//!   handlers + registry + dispatcher live in `gt-hooks`, which re-exports
+//!   `HookPoint`; `gt-module` holds only the pure-data vocabulary, never the async
+//!   `dyn` handler (non-negotiable #1/#2).
 
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
@@ -47,6 +56,7 @@ mod capability;
 mod deps;
 mod event_kind;
 mod flags;
+mod hook;
 mod mcp;
 mod meta;
 mod routes;
@@ -58,6 +68,7 @@ pub use builder::{BuildError, Root, RootBuilder};
 pub use capability::Capability;
 pub use event_kind::{EventKind, EventKindError};
 pub use flags::{AllEnabled, DisabledModules, FeatureFlags};
+pub use hook::HookPoint;
 pub use mcp::{McpRegistry, McpTool, McpToolNameError};
 pub use meta::{ModuleId, ModuleIdError, ModuleMeta};
 pub use module_trait::GtModule;
