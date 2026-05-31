@@ -25,8 +25,10 @@ Order:
 5. `hq-mod-migrate.1..5` → `gt-mod-migrate` proper.
 6. `hq-mod-flags.1..6` → `gt-feature-flags` proper.
 7. `hq-mod-contracts.1..5` → `gt-mod-contracts` proper.
+8. `hq-mod-hooks.1..7` → `gt-hooks` + `gt-webhooks` proper (lifecycle hooks + inbound webhook router + GitHub/Linear sources + sheriff hook refactor).
+9. `hq-mod-dogs.1..9` → `gt-dog` proper (worker abstraction + DogDispatcher + Gate evaluator + PluginExecutor + digest receipts + notify).
 
-**Gate:** `cargo test --workspace` green. `examples/mod-hello` registers + routes + emits one event + applies one migration end-to-end.
+**Gate:** `cargo test --workspace` green. `examples/mod-hello` registers + routes + emits one event + applies one migration end-to-end. Dog claims a sample plugin (cron gate, FakeAgent executor) and emits a digest receipt bead.
 
 ---
 

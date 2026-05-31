@@ -17,6 +17,9 @@ Foundational module system + multi-tenant primitives for Gas Town and any downst
 | `gt-mod-migrate` | Per-module SQL migration loader | `hq-mod-migrate` |
 | `gt-feature-flags` | Feature-flag repo + per-workspace overrides | `hq-mod-flags` |
 | `gt-mod-contracts` | TS DTO codegen + frozen contracts | `hq-mod-contracts` |
+| `gt-hooks` | HookPoint + HookHandler + HookRegistry (lifecycle hooks) | `hq-mod-hooks` |
+| `gt-webhooks` | Inbound webhook router + signature verify + GitHub/Linear sources | `hq-mod-hooks` |
+| `gt-dog` | Dog worker + DogDispatcher + Gate evaluator + PluginExecutor | `hq-mod-dogs` |
 | `gt-workspace` | WorkspaceId, catalog, repo (multi-tenant primitives) | `hq-mt-core` |
 | `examples/mod-hello` | Smallest viable module — learn-by-example | `hq-mod-docs.2` |
 

@@ -1,0 +1,13 @@
+[package]
+name = "gt-dog"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Dog worker abstraction + DogDispatcher + Gate evaluator + PluginExecutor. Picks up plugin.md tasks."
+
+[dependencies]
+serde = { workspace = true }
+async-trait = { workspace = true }
+gt-module = { path = "../gt-module" }
+gt-hooks = { path = "../gt-hooks" }

@@ -9,6 +9,9 @@ members = [
     "crates/gt-mod-events",
     "crates/gt-mod-migrate",
     "crates/gt-mod-contracts",
+    "crates/gt-hooks",
+    "crates/gt-webhooks",
+    "crates/gt-dog",
     "examples/mod-hello",
 ]
 

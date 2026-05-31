@@ -1,0 +1,12 @@
+[package]
+name = "gt-hooks"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Declarative HookPoint + HookHandler + HookRegistry. Lifecycle integration points for modules."
+
+[dependencies]
+serde = { workspace = true }
+async-trait = { workspace = true }
+gt-module = { path = "../gt-module" }

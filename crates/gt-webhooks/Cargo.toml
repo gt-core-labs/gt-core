@@ -1,0 +1,14 @@
+[package]
+name = "gt-webhooks"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Inbound webhook router: /api/v1/webhooks/<source>. Signature verify + dispatch to subscribed modules."
+
+[dependencies]
+axum = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+async-trait = { workspace = true }
+gt-hooks = { path = "../gt-hooks" }
