@@ -33,8 +33,11 @@
 //! ## Routes
 //!
 //! - [`GtModule::register_routes`] — a module contributes a self-contained
-//!   [`axum::Router`]; the builder merges them in init order and exposes the
+//!   [`axum::Router`]; the builder mounts them in init order and exposes the
 //!   application router through [`Root::into_router`] (`hq-mod-routes.1`).
+//! - [`module_prefix`] / [`API_BASE`] — each module's routes are auto-mounted
+//!   under `/api/v1/<module-id>`, so modules declare plain relative paths and
+//!   never collide (`hq-mod-routes.2`).
 
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
@@ -46,6 +49,7 @@ mod event_kind;
 mod flags;
 mod mcp;
 mod meta;
+mod routes;
 mod scope;
 #[path = "trait.rs"]
 mod module_trait;
@@ -57,4 +61,5 @@ pub use flags::{AllEnabled, DisabledModules, FeatureFlags};
 pub use mcp::{McpRegistry, McpTool, McpToolNameError};
 pub use meta::{ModuleId, ModuleIdError, ModuleMeta};
 pub use module_trait::GtModule;
+pub use routes::{module_prefix, API_BASE};
 pub use scope::{Scope, ScopeError};

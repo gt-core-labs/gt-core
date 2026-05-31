@@ -398,23 +398,34 @@ impl Root {
         self.entries.iter().flat_map(|e| e.mcp_tools.iter())
     }
 
-    /// Merge every module's contributed routes into one application
-    /// [`Router`] (`hq-mod-routes.1`).
+    /// Mount every module's contributed routes into one application
+    /// [`Router`] (`hq-mod-routes.1`, `.2`).
     ///
-    /// Routers are merged in init order (each module after its dependencies), so
-    /// the composition root obtains a fully wired router without naming a single
-    /// route. With no modules — or only modules that contribute no HTTP surface —
-    /// this is an empty router.
+    /// Each module's router is nested under its per-module prefix
+    /// [`module_prefix`](crate::module_prefix) — `/api/v1/<module-id>` — in init
+    /// order (each module after its dependencies). The composition root obtains a
+    /// fully wired router without naming a single route or prefix. With no
+    /// modules — or only modules that contribute no HTTP surface — this is an
+    /// empty router.
     ///
-    /// Path namespacing (`/api/v1/<module>`, `hq-mod-routes.2`) and per-route
-    /// scope guards (`hq-mod-routes.3`) hook into this merge as those beads land;
-    /// today it is a straight [`Router::merge`](axum::Router::merge), so two
-    /// modules declaring the same path collide exactly as axum specifies. Takes
-    /// `self` because an `axum::Router` is consumed by merge.
+    /// Because each module owns a distinct path segment, two modules declaring
+    /// the same relative path no longer collide (`hq-mod-routes.2`): a `/` route
+    /// in `beads` answers at `/api/v1/beads/`, independent of a `/` route in
+    /// `rigs`. Per-route scope guards derived from
+    /// [`capability`](crate::GtModule::capability) layer onto this mount in
+    /// `hq-mod-routes.3`. Takes `self` because an `axum::Router` is consumed by
+    /// nesting.
     pub fn into_router(self) -> Router {
-        self.routers
+        // Compute prefixes first so the borrow of `entries` ends before the
+        // `routers` field is moved out of `self`.
+        let prefixes: Vec<String> =
+            self.entries.iter().map(|e| crate::module_prefix(&e.meta.id)).collect();
+        prefixes
             .into_iter()
-            .fold(Router::new(), |app, module_router| app.merge(module_router))
+            .zip(self.routers)
+            .fold(Router::new(), |app, (prefix, module_router)| {
+                app.nest(&prefix, module_router)
+            })
     }
 }
 
@@ -741,17 +752,20 @@ mod tests {
     use axum::Router;
     use tower::ServiceExt; // `oneshot`
 
-    /// Test module that contributes one GET route at a configurable path,
-    /// answering with its own id so the merged router proves which module served.
+    /// Test module that contributes one GET route at a *relative* path,
+    /// answering with its own id so the mounted router proves which module
+    /// served. The builder namespaces it under `/api/v1/<id>` (`hq-mod-routes.2`).
     struct Routed {
         id: &'static str,
-        path: &'static str,
+        rel_path: &'static str,
         deps: Vec<&'static str>,
     }
 
     impl Routed {
-        fn new(id: &'static str, path: &'static str) -> Self {
-            Routed { id, path, deps: Vec::new() }
+        /// All test modules declare the same relative path `/list`, so the only
+        /// thing keeping them apart is the per-module prefix.
+        fn new(id: &'static str) -> Self {
+            Routed { id, rel_path: "/list", deps: Vec::new() }
         }
         fn with_dep(mut self, dep: &'static str) -> Self {
             self.deps.push(dep);
@@ -773,7 +787,7 @@ mod tests {
         }
         fn register_routes(&self) -> Router {
             let id = self.id;
-            Router::new().route(self.path, get(move || async move { id }))
+            Router::new().route(self.rel_path, get(move || async move { id }))
         }
     }
 
@@ -789,63 +803,75 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn module_route_is_reachable_through_root() {
-        let root = RootBuilder::new().module(Routed::new("beads", "/beads")).build().unwrap();
-        let (status, body) = hit(root.into_router(), "/beads").await;
+    async fn module_route_is_reachable_under_its_prefix() {
+        let root = RootBuilder::new().module(Routed::new("beads")).build().unwrap();
+        let (status, body) = hit(root.into_router(), "/api/v1/beads/list").await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(body, "beads");
     }
 
     #[tokio::test]
-    async fn routes_from_multiple_modules_all_merge() {
+    async fn relative_path_without_prefix_is_not_served() {
+        // The module declares `/list`, but only the namespaced path resolves —
+        // the prefix is mandatory (`hq-mod-routes.2`).
+        let root = RootBuilder::new().module(Routed::new("beads")).build().unwrap();
+        let app = root.into_router();
+        assert_eq!(hit(app.clone(), "/list").await.0, StatusCode::NOT_FOUND);
+        assert_eq!(hit(app, "/beads/list").await.0, StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn same_relative_path_in_two_modules_does_not_collide() {
+        // Both modules declare `/list`; the per-module prefix keeps them apart.
         let root = RootBuilder::new()
-            .module(Routed::new("beads", "/beads"))
-            .module(Routed::new("rigs", "/rigs"))
+            .module(Routed::new("beads"))
+            .module(Routed::new("rigs"))
             .build()
             .unwrap();
         let app = root.into_router();
-        assert_eq!(hit(app.clone(), "/beads").await, (StatusCode::OK, "beads".into()));
-        assert_eq!(hit(app, "/rigs").await, (StatusCode::OK, "rigs".into()));
+        assert_eq!(hit(app.clone(), "/api/v1/beads/list").await, (StatusCode::OK, "beads".into()));
+        assert_eq!(hit(app, "/api/v1/rigs/list").await, (StatusCode::OK, "rigs".into()));
     }
 
     #[tokio::test]
     async fn module_with_no_routes_contributes_nothing() {
         // `Beads` does not override `register_routes`; the default empty router
-        // means no path is served.
+        // means no path is served, even under its prefix.
         let root = RootBuilder::new().module(Beads).build().unwrap();
-        let (status, _) = hit(root.into_router(), "/anything").await;
-        assert_eq!(status, StatusCode::NOT_FOUND);
+        let app = root.into_router();
+        assert_eq!(hit(app.clone(), "/anything").await.0, StatusCode::NOT_FOUND);
+        assert_eq!(hit(app, "/api/v1/beads/list").await.0, StatusCode::NOT_FOUND);
     }
 
     #[tokio::test]
     async fn disabled_module_route_is_dropped() {
         let flags = DisabledModules::new([ModuleId::new("rigs").unwrap()]);
         let root = RootBuilder::new()
-            .module(Routed::new("beads", "/beads"))
-            .module(Routed::new("rigs", "/rigs"))
+            .module(Routed::new("beads"))
+            .module(Routed::new("rigs"))
             .build_with_flags(&flags)
             .unwrap();
         let app = root.into_router();
-        assert_eq!(hit(app.clone(), "/beads").await.0, StatusCode::OK);
-        // The disabled module's route is absent.
-        assert_eq!(hit(app, "/rigs").await.0, StatusCode::NOT_FOUND);
+        assert_eq!(hit(app.clone(), "/api/v1/beads/list").await.0, StatusCode::OK);
+        // The disabled module's prefix serves nothing.
+        assert_eq!(hit(app, "/api/v1/rigs/list").await.0, StatusCode::NOT_FOUND);
     }
 
     #[tokio::test]
     async fn routers_kept_aligned_with_modules_after_reorder() {
         // `merge` depends on `beads`, so build reorders it after `beads`. The
-        // router-ordering must follow the same permutation: both routes resolve.
+        // router ordering must follow the same permutation: both prefixes resolve.
         let root = RootBuilder::new()
-            .module(Routed::new("merge", "/merge").with_dep("beads"))
-            .module(Routed::new("beads", "/beads"))
+            .module(Routed::new("merge").with_dep("beads"))
+            .module(Routed::new("beads"))
             .build()
             .unwrap();
         // Sanity: build reordered beads before merge.
         let ids: Vec<&str> = root.modules().map(|m| m.id.as_str()).collect();
         assert_eq!(ids, ["beads", "merge"]);
         let app = root.into_router();
-        assert_eq!(hit(app.clone(), "/beads").await, (StatusCode::OK, "beads".into()));
-        assert_eq!(hit(app, "/merge").await, (StatusCode::OK, "merge".into()));
+        assert_eq!(hit(app.clone(), "/api/v1/beads/list").await, (StatusCode::OK, "beads".into()));
+        assert_eq!(hit(app, "/api/v1/merge/list").await, (StatusCode::OK, "merge".into()));
     }
 
     // --- Tool name namespacing (hq-mod-mcp.2) -------------------------------
