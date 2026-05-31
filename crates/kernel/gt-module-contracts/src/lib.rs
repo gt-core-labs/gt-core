@@ -9,13 +9,16 @@
 //!
 //! - [`ContractVersion`] — semantic `major.minor.patch` with a compatibility rule.
 //! - [`SurfaceHash`] — order-independent fingerprint of a module's surface items.
+//! - [`typescript_module`] — TypeScript DTO codegen from a module's JSON Schemas.
 //!
-//! Part of the gt-core module system (`hq-mod`). The version registry +
-//! compatibility check land in `hq-mod-contracts.2`; TS DTO generation in `.3`.
+//! Part of the gt-core module system (`hq-mod`). The frozen-baseline + CI diff
+//! check lands in `hq-mod-contracts.3`; semver enforcement in `.4`.
 
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
+mod codegen;
 mod version;
 
+pub use codegen::typescript_module;
 pub use version::{ContractVersion, SurfaceHash};
