@@ -35,7 +35,7 @@ use axum::Router;
 
 use crate::capability::Capability;
 use crate::flags::{AllEnabled, FeatureFlags};
-use crate::mcp::{McpRegistry, McpTool};
+use crate::mcp::{McpRegistry, McpTool, McpToolNameError};
 use crate::meta::{ModuleId, ModuleMeta};
 use crate::module_trait::GtModule;
 use crate::scope::Scope;
@@ -170,6 +170,7 @@ impl RootBuilder {
 
         // 3 + 4. Validate and order the surviving set.
         Self::check_scope_conflicts(&enabled)?;
+        Self::check_tool_namespacing(&enabled)?;
         let order = crate::deps::resolve_order(&enabled)?;
         // Reorder into init order. The module set is a handful of entries, so
         // cloning by index is cheaper than threading an in-place permutation.
@@ -209,6 +210,38 @@ impl RootBuilder {
         }
         Ok(())
     }
+
+    /// Reject a contributed MCP tool whose name breaks the namespacing rule
+    /// (`hq-mod-mcp.2`).
+    ///
+    /// Every tool name must be `<module-id>.<action>.<verb>` (three lowercase
+    /// kebab-case segments), and its leading segment must be the id of the
+    /// module that contributed it — a module may only register tools under its
+    /// own namespace, so two modules can never collide on a tool name and audit
+    /// attribution is unambiguous. Modules and their tools are visited in
+    /// registration/declaration order, so a malformed stack always reports the
+    /// same first offender.
+    fn check_tool_namespacing(entries: &[ModuleEntry]) -> Result<(), BuildError> {
+        for entry in entries {
+            for tool in &entry.mcp_tools {
+                let (prefix, _, _) = tool.parse_name().map_err(|reason| {
+                    BuildError::MalformedToolName {
+                        module: entry.meta.id.clone(),
+                        tool: tool.name.clone(),
+                        reason,
+                    }
+                })?;
+                if prefix != entry.meta.id.as_str() {
+                    return Err(BuildError::ToolNamespaceMismatch {
+                        module: entry.meta.id.clone(),
+                        tool: tool.name.clone(),
+                        prefix: prefix.to_string(),
+                    });
+                }
+            }
+        }
+        Ok(())
+    }
 }
 
 /// Why [`RootBuilder::build`] rejected a module set.
@@ -244,6 +277,27 @@ pub enum BuildError {
         /// The modules claiming it, sorted by id (always 2+).
         claimants: Vec<ModuleId>,
     },
+    /// A module contributed an MCP tool whose name is not
+    /// `<module-id>.<action>.<verb>` (`hq-mod-mcp.2`).
+    MalformedToolName {
+        /// The module that contributed the tool.
+        module: ModuleId,
+        /// The offending tool name, verbatim.
+        tool: String,
+        /// Why the name was rejected.
+        reason: McpToolNameError,
+    },
+    /// A module contributed a well-formed tool name whose namespace prefix is
+    /// not its own id (`hq-mod-mcp.2`) — a module may only register tools under
+    /// its own namespace.
+    ToolNamespaceMismatch {
+        /// The module that contributed the tool.
+        module: ModuleId,
+        /// The offending tool name, verbatim.
+        tool: String,
+        /// The leading segment it used instead of `module`.
+        prefix: String,
+    },
 }
 
 impl std::fmt::Display for BuildError {
@@ -271,6 +325,15 @@ impl std::fmt::Display for BuildError {
                     f,
                     "scope `{scope}` is claimed by multiple modules: {}",
                     ids.join(", ")
+                )
+            }
+            BuildError::MalformedToolName { module, tool, reason } => {
+                write!(f, "module {module} contributes malformed MCP tool `{tool}`: {reason}")
+            }
+            BuildError::ToolNamespaceMismatch { module, tool, prefix } => {
+                write!(
+                    f,
+                    "module {module} contributes MCP tool `{tool}` under foreign namespace `{prefix}`"
                 )
             }
         }
@@ -783,5 +846,88 @@ mod tests {
         let app = root.into_router();
         assert_eq!(hit(app.clone(), "/beads").await, (StatusCode::OK, "beads".into()));
         assert_eq!(hit(app, "/merge").await, (StatusCode::OK, "merge".into()));
+    }
+
+    // --- Tool name namespacing (hq-mod-mcp.2) -------------------------------
+
+    /// Module whose id and contributed tool name are both configurable, for
+    /// namespacing tests.
+    struct NamedTool {
+        id: &'static str,
+        tool: &'static str,
+    }
+    impl GtModule for NamedTool {
+        fn meta(&self) -> ModuleMeta {
+            ModuleMeta::new(
+                ModuleId::new(self.id).unwrap(),
+                self.id,
+                Version::new(1, 0, 0),
+                "namespacing test module",
+            )
+        }
+        fn register_mcp_tools(&self, reg: &mut McpRegistry) {
+            reg.tool(self.tool, "t");
+        }
+    }
+
+    #[test]
+    fn well_namespaced_tool_builds() {
+        let root = RootBuilder::new()
+            .module(NamedTool { id: "gt-rig", tool: "gt-rig.set-prefix.execute" })
+            .build()
+            .unwrap();
+        assert_eq!(root.mcp_tools().count(), 1);
+    }
+
+    #[test]
+    fn malformed_tool_name_is_rejected() {
+        let err = RootBuilder::new()
+            .module(NamedTool { id: "beads", tool: "beads.create" })
+            .build()
+            .unwrap_err();
+        let BuildError::MalformedToolName { module, tool, .. } = err else {
+            panic!("expected MalformedToolName, got {err:?}");
+        };
+        assert_eq!(module.as_str(), "beads");
+        assert_eq!(tool, "beads.create");
+    }
+
+    #[test]
+    fn foreign_namespace_prefix_is_rejected() {
+        // beads module trying to register a tool under the rigs namespace.
+        let err = RootBuilder::new()
+            .module(NamedTool { id: "beads", tool: "rigs.create.execute" })
+            .build()
+            .unwrap_err();
+        let BuildError::ToolNamespaceMismatch { module, tool, prefix } = err else {
+            panic!("expected ToolNamespaceMismatch, got {err:?}");
+        };
+        assert_eq!(module.as_str(), "beads");
+        assert_eq!(tool, "rigs.create.execute");
+        assert_eq!(prefix, "rigs");
+    }
+
+    #[test]
+    fn namespace_mismatch_message_names_tool_and_module() {
+        let err = RootBuilder::new()
+            .module(NamedTool { id: "beads", tool: "rigs.create.execute" })
+            .build()
+            .unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("beads"), "got: {msg}");
+        assert!(msg.contains("rigs.create.execute"), "got: {msg}");
+    }
+
+    #[test]
+    fn disabled_module_with_bad_tool_does_not_fail_build() {
+        // A disabled module's tools are never validated — it is dropped first.
+        let flags = DisabledModules::new([ModuleId::new("beads").unwrap()]);
+        let root = RootBuilder::new()
+            .module(NamedTool { id: "beads", tool: "garbage" })
+            .module(Rigs)
+            .build_with_flags(&flags)
+            .unwrap();
+        let ids: Vec<&str> = root.modules().map(|m| m.id.as_str()).collect();
+        assert_eq!(ids, ["rigs"]);
     }
 }

@@ -54,7 +54,7 @@ pub use builder::{BuildError, Root, RootBuilder};
 pub use capability::Capability;
 pub use event_kind::{EventKind, EventKindError};
 pub use flags::{AllEnabled, DisabledModules, FeatureFlags};
-pub use mcp::{McpRegistry, McpTool};
+pub use mcp::{McpRegistry, McpTool, McpToolNameError};
 pub use meta::{ModuleId, ModuleIdError, ModuleMeta};
 pub use module_trait::GtModule;
 pub use scope::{Scope, ScopeError};

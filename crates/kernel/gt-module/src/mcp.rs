@@ -50,6 +50,84 @@ impl McpTool {
             description: description.into(),
         }
     }
+
+    /// Validate the name against the `<module-id>.<action>.<verb>` rule and
+    /// return its three segments (`hq-mod-mcp.2`).
+    ///
+    /// A well-formed name is exactly three lowercase kebab-case segments joined
+    /// by single `.`s. The first segment is the owning module's id — the
+    /// namespace; the [`RootBuilder`](crate::RootBuilder) additionally checks it
+    /// matches the module that contributed the tool, so one module cannot squat
+    /// another's namespace. This method only judges the *shape*; the
+    /// prefix-binding check needs the module id and lives in the builder.
+    pub fn parse_name(&self) -> Result<(&str, &str, &str), McpToolNameError> {
+        let mut parts = self.name.split('.');
+        let (Some(module), Some(action), Some(verb), None) =
+            (parts.next(), parts.next(), parts.next(), parts.next())
+        else {
+            return Err(McpToolNameError::NotThreeSegments);
+        };
+        for seg in [module, action, verb] {
+            if !is_kebab_segment(seg) {
+                return Err(McpToolNameError::BadSegment(seg.to_string()));
+            }
+        }
+        Ok((module, action, verb))
+    }
+}
+
+/// Reason an [`McpTool`] name violated the `<module-id>.<action>.<verb>` rule.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum McpToolNameError {
+    /// The name was not exactly three `.`-separated segments.
+    NotThreeSegments,
+    /// A segment was empty or held a character outside lowercase kebab-case.
+    BadSegment(String),
+}
+
+impl std::fmt::Display for McpToolNameError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            McpToolNameError::NotThreeSegments => {
+                write!(f, "tool name must be exactly `<module-id>.<action>.<verb>`")
+            }
+            McpToolNameError::BadSegment(s) => {
+                write!(f, "segment {s:?} is not lowercase kebab-case")
+            }
+        }
+    }
+}
+
+impl std::error::Error for McpToolNameError {}
+
+/// A non-empty lowercase kebab-case slug: `[a-z0-9]+` groups joined by single
+/// `-`, no leading/trailing/doubled hyphen. Shared shape with [`ModuleId`] and
+/// [`Scope`] segments (each crate carries its own copy to stay self-contained).
+///
+/// [`ModuleId`]: crate::ModuleId
+/// [`Scope`]: crate::Scope
+fn is_kebab_segment(s: &str) -> bool {
+    if s.is_empty() {
+        return false;
+    }
+    let bytes = s.as_bytes();
+    if bytes[0] == b'-' || bytes[bytes.len() - 1] == b'-' {
+        return false;
+    }
+    let mut prev_dash = false;
+    for c in s.chars() {
+        match c {
+            'a'..='z' | '0'..='9' => prev_dash = false,
+            '-' => {
+                if prev_dash {
+                    return false;
+                }
+                prev_dash = true;
+            }
+            _ => return false,
+        }
+    }
+    true
 }
 
 /// Accumulates the MCP tools a single module contributes.
@@ -140,5 +218,41 @@ mod tests {
         let tools = reg.into_tools();
         let names: Vec<&str> = tools.iter().map(|t| t.name.as_str()).collect();
         assert_eq!(names, ["a.read.execute", "b.read.execute"]);
+    }
+
+    #[test]
+    fn parse_name_accepts_three_kebab_segments() {
+        for n in [
+            "beads.create.execute",
+            "gt-rig.set-prefix.execute",
+            "merge.submit.validate",
+        ] {
+            assert!(McpTool::new(n, "").parse_name().is_ok(), "expected {n:?} valid");
+        }
+    }
+
+    #[test]
+    fn parse_name_returns_segments() {
+        let tool = McpTool::new("gt-rig.set-prefix.execute", "");
+        let (m, a, v) = tool.parse_name().unwrap();
+        assert_eq!((m, a, v), ("gt-rig", "set-prefix", "execute"));
+    }
+
+    #[test]
+    fn parse_name_rejects_wrong_arity() {
+        use McpToolNameError::NotThreeSegments;
+        for n in ["beads", "beads.create", "beads.create.execute.extra", ""] {
+            assert_eq!(McpTool::new(n, "").parse_name(), Err(NotThreeSegments), "name {n:?}");
+        }
+    }
+
+    #[test]
+    fn parse_name_rejects_bad_segments() {
+        for n in ["Beads.create.execute", "beads.Create.execute", "beads..execute", "beads.create.-x"] {
+            assert!(
+                matches!(McpTool::new(n, "").parse_name(), Err(McpToolNameError::BadSegment(_))),
+                "expected {n:?} bad-segment"
+            );
+        }
     }
 }
