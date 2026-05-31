@@ -2,7 +2,9 @@
 
 Foundational module system + multi-tenant primitives for Gas Town and any downstream app.
 
-**Role:** kernel-tier crates only. Domain logic (rigs, beads, sessions, merge, quota, convoy, crew, feed) stays in [gastown](../gastown).
+**Role:** kernel-tier crates only. Domain logic (rigs, beads, sessions, merge, quota, convoy, crew, feed) stays in [gastown](../gastown) for now; portion migrates here per [docs/01-migration-plan.md](docs/01-migration-plan.md).
+
+**Status:** Primary working repo as of 2026-05-31. New `hq-mod-*` / `hq-mt-*` beads code-land here. Tracking remains in gastown's Dolt `hq.issues` (via gt-mcp) until a dedicated tracking surface ships.
 
 ## Crates
 
