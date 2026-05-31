@@ -6,14 +6,18 @@ Foundational module system + multi-tenant primitives for Gas Town and downstream
 
 ## Daily rules
 
-- Tracking: gastown `hq.issues` via `gt-mcp` (`gt-mcp-cli` or http://127.0.0.1:8765/mcp). All work via a claimed bead in `hq-mod-*` / `hq-mt-*`.
+- Tracking: gastown `hq.issues` via `gt-mcp` (`gt-mcp-cli` or http://127.0.0.1:8765/mcp). All work via a claimed bead in `hq-mod-*` / `hq-mt-*`. Review `gt://issues?external_ref=<sub-epic>` before starting.
+- Bead taxonomy is `epic → sub-epic → bead` (NN-16, mandatory). Sub-epic = the `external_ref`; bead id = `<external_ref>.<n>`.
 - 23 gastown strategic beads were CLOSED with `[FROZEN 2026-05-31]` title prefix. Do NOT reopen them. They are: hq-fe-svelte (+children: hq-fe-build, hq-fe-view, hq-fe-api-r, hq-fe-cut.3, hq-fe-auth.0, hq-fe-view.9), hq-03aw (+.9, .10), hq-63az, hq-mc72 (+.12.23, .12.24), hq-oap5 (+.1, .2), hq-61v, hq-d412, hq-hamg, hq-68kn, hq-4dte, hq-jaeh. See [memory:gastown frozen](../.claude/projects/-home-nixos-gt-core/memory/project_gastown_frozen_2026_05_31.md).
 - Code lives here. Branch off `main`. Worktrees under `/home/nixos/gt-core-wt-<bead-id>` (NEVER `/tmp` — tmpfs RAM, reboot wipes).
-- Comments in English.
+- Before claiming: `git log --all --grep <bead-id>` to avoid hijacking a branch another agent is mid-edit on (memory feedback_worktree_hijack_parallel applies).
+- Comments AND documentation in English.
 - Hexagonal: domain crate = Port + InMemory; PG adapter optional in `gt-store-pg-<X>`.
-- Replay byte-for-byte gate required on every change touching events/reducers.
-- One bead per branch, conventional commits (`feat(gt-module): ...`).
-- Don't touch gastown unless porting a crate.
+- `cargo build` green + replay byte-for-byte gate green before PR (gate required on every change touching events/reducers).
+- One bead per branch, conventional commits (`feat(gt-module): ...`). ff-merge to `main` from TOWN ROOT, never from a worktree.
+- Migration from gastown to gt-core is crate-by-crate (see [docs/01-migration-plan.md](docs/01-migration-plan.md)). Do NOT move gt-events/gt-bus/gt-audit/gt-plugin/gt-telemetry until `hq-mod-refactor.10..12` closes with replay green.
+- gastown stays the consumer while gt-core stabilizes. Don't touch gastown except for wiring (path patch) or a planned crate port.
+- Gap in tooling/spec → `meta.report_gap`, never improvise. Stop-the-line on any conflict with docs/04.
 
 ## MUST-READ before writing code
 
