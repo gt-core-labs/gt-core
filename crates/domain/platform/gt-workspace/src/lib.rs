@@ -9,19 +9,22 @@
 //!   (Create/Rename/Suspend/Archive) over the catalog (`hq-mt-core.3`).
 //! - [`WorkspaceRepository`] + [`InMemoryWorkspaces`] — the persistence port and
 //!   its in-memory adapter (`hq-mt-core.4`).
+//! - [`WorkspaceActor`] — the write-side owner that decides/applies/persists/logs
+//!   commands and guards the byte-for-byte replay gate (`hq-mt-core.7`).
 //!
-//! Still to come on this epic: the PG adapter (`.5`/`.6`) and the workspace actor
-//! (`.7`).
+//! Still to come on this epic: the PG adapter (`.5`/`.6`).
 
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
+mod actor;
 mod commands;
 mod events;
 mod repo;
 mod state;
 mod workspace_id;
 
+pub use actor::{ActorError, WorkspaceActor};
 pub use commands::{WorkspaceCommand, WorkspaceError};
 pub use events::WorkspaceEvent;
 pub use repo::{InMemoryWorkspaces, RepoError, WorkspaceRepository};

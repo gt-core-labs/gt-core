@@ -8,9 +8,9 @@ description = "Workspace identity + catalog + repo port. Tenant-boundary primiti
 
 [dependencies]
 serde = { workspace = true }
+serde_json = { workspace = true }
 schemars = { workspace = true }
 async-trait = { workspace = true }
 
 [dev-dependencies]
-serde_json = { workspace = true }
 tokio = { workspace = true }
