@@ -1,10 +1,16 @@
-//! Workspace identity + catalog scaffolding.
+//! Workspace identity + catalog — the tenant-boundary primitive.
 //!
-//! Tenant boundary primitive. Real types land in `hq-mt-core.1` through `.7`.
+//! ## Landed so far
+//!
+//! - [`WorkspaceId`] — the validated tenant-boundary slug (`hq-mt-core.1`).
+//!
+//! Still to come on this epic: the catalog + reducer (`hq-mt-core.2`), commands
+//! and events (`.3`), the repository port + in-memory adapter (`.4`), the PG
+//! adapter (`.5`/`.6`), and the workspace actor (`.7`).
 
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
-/// Placeholder until [`hq-mt-core.1`](../../../README.md) lands `WorkspaceId`.
-#[doc(hidden)]
-pub const SCAFFOLD: &str = "gt-workspace — hq-mt-core scaffold";
+mod workspace_id;
+
+pub use workspace_id::{WorkspaceId, WorkspaceIdError, MAX_WORKSPACE_ID_LEN};

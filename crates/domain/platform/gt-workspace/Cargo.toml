@@ -9,3 +9,6 @@ description = "Workspace identity + catalog + repo port. Tenant-boundary primiti
 [dependencies]
 serde = { workspace = true }
 schemars = { workspace = true }
+
+[dev-dependencies]
+serde_json = { workspace = true }
