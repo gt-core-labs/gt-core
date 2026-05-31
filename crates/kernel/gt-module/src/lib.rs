@@ -9,21 +9,25 @@
 //!
 //! - [`ModuleId`] / [`ModuleMeta`] — module identity (`hq-mod-core.2`).
 //! - [`GtModule`] — the trait (`hq-mod-core.2`).
-//! - [`Capability`] — contribution/requirement declaration; minimal seam now,
-//!   real shape in `hq-mod-core.3`.
+//! - [`Capability`] + [`Scope`] + [`EventKind`] — contribution/requirement
+//!   declaration and its vocabulary (`hq-mod-core.3`).
 //!
-//! Still to come on this epic: capability shape (`.3`), `RootBuilder` (`.4`),
-//! dependency-cycle detection (`.5`), capability-conflict detection (`.6`),
-//! feature-flag filtering (`.7`), the test matrix (`.8`).
+//! Still to come on this epic: `RootBuilder` (`.4`), dependency-cycle detection
+//! (`.5`), capability-conflict detection (`.6`), feature-flag filtering (`.7`),
+//! the test matrix (`.8`).
 
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
 mod capability;
+mod event_kind;
 mod meta;
+mod scope;
 #[path = "trait.rs"]
 mod module_trait;
 
 pub use capability::Capability;
+pub use event_kind::{EventKind, EventKindError};
 pub use meta::{ModuleId, ModuleIdError, ModuleMeta};
 pub use module_trait::GtModule;
+pub use scope::{Scope, ScopeError};
