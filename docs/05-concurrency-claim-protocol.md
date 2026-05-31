@@ -94,7 +94,13 @@ while), reclaim only after confirming via git that no live process holds it.
 
 `main` is shared; several actors ff-merge concurrently.
 
-- ff-merge from **town root** (`/home/nixos/gt-core`), never from a worktree.
+- **Merge with `git mainmerge <branch>`, never a raw `git merge`.** It
+  (`~/.claude/bin/gt-main-merge.sh`) holds a cross-session `flock` so two merges
+  can't interleave, and forces `--ff-only` with an ancestry check: if `main`
+  advanced since you rebased, it fails clean (`'<branch>' is behind main`) →
+  rebase and re-run, instead of clobbering. This is the enforced form of every
+  rule below. Mandated in [CLAUDE.md](../CLAUDE.md) (Daily rules, anti-overlap).
+- It merges into **town root** main in place; never ff-merge from a worktree.
 - `git fetch` + **rebase your branch onto `main` immediately before** the merge;
   re-run build + replay gate **after**, not just before.
 - Frontier-style conflicts (e.g. workspace member lists, doc indexes) are
