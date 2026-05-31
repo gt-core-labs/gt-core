@@ -102,6 +102,7 @@ mod tests {
             depends_on: deps.iter().map(|d| ModuleId::new(*d).unwrap()).collect(),
             mcp_tools: Vec::new(),
             migrations: Vec::new(),
+            openapi: None,
         }
     }
 

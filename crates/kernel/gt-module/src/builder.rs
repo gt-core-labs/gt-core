@@ -82,6 +82,9 @@ pub(crate) struct ModuleEntry {
     /// SQL migrations this module owns, as returned (`hq-mod-migrate.1`); the
     /// builder validates and the [`Root`] exposes them version-sorted.
     pub(crate) migrations: Vec<Migration>,
+    /// The module's OpenAPI spec with *relative* paths, if it documents its
+    /// routes (`hq-mod-routes.4`); the [`Root`] prefixes and merges these.
+    pub(crate) openapi: Option<utoipa::openapi::OpenApi>,
 }
 
 impl RootBuilder {
@@ -109,6 +112,7 @@ impl RootBuilder {
             depends_on: module.dependencies(),
             mcp_tools: mcp.into_tools(),
             migrations: module.migrations(),
+            openapi: module.openapi(),
         });
         // Extract the module's HTTP contribution alongside its data, then drop
         // the value. The router is self-contained (`Router<()>`); merging is
@@ -473,6 +477,38 @@ impl Root {
             plan.extend(ms.into_iter().map(|m| (&entry.meta.id, m)));
         }
         plan
+    }
+
+    /// The combined OpenAPI document for every loaded module that documents its
+    /// routes (`hq-mod-routes.4`).
+    ///
+    /// Each contributing module's spec is mounted under its prefix
+    /// [`module_prefix`](crate::module_prefix) — so a module's relative `/list`
+    /// path appears as `/api/v1/<module>/list`, matching where
+    /// [`into_router`](Root::into_router) actually serves it — and the specs are
+    /// merged (paths plus component schemas) into one document in module init
+    /// order. Modules that return no spec, and feature-flag-disabled modules
+    /// (dropped before they reach the [`Root`]), contribute nothing. With no
+    /// documenting module this is an empty-but-valid document carrying only the
+    /// gt-core info block.
+    pub fn openapi(&self) -> utoipa::openapi::OpenApi {
+        use utoipa::openapi::{InfoBuilder, OpenApiBuilder};
+        let mut combined = OpenApiBuilder::new()
+            .info(
+                InfoBuilder::new()
+                    .title("gt-core")
+                    .version(env!("CARGO_PKG_VERSION"))
+                    .build(),
+            )
+            .build();
+        for entry in &self.entries {
+            if let Some(spec) = &entry.openapi {
+                // `nest` rewrites the spec's paths under the prefix and merges its
+                // components, so module annotations stay prefix-free.
+                combined = combined.nest(crate::module_prefix(&entry.meta.id), spec.clone());
+            }
+        }
+        combined
     }
 
     /// Mount every module's contributed routes into one application
@@ -1100,6 +1136,87 @@ mod tests {
             send(app, Method::GET, "/api/v1/rigs/list", None).await,
             StatusCode::OK
         );
+    }
+
+    // --- OpenAPI aggregation (hq-mod-routes.4) ------------------------------
+
+    /// Handlers + derived specs for documenting test modules. Each declares a
+    /// *relative* `/list` path; the builder rewrites it under the module prefix.
+    /// The handler fns are referenced only by the `utoipa::path` macro that feeds
+    /// the derived spec, never called directly.
+    #[allow(dead_code)]
+    mod openapi_fixture {
+        #[utoipa::path(get, path = "/list", responses((status = 200, description = "beads")))]
+        pub async fn list_beads() -> &'static str {
+            "[]"
+        }
+        #[derive(utoipa::OpenApi)]
+        #[openapi(paths(list_beads))]
+        pub struct BeadsApi;
+
+        #[utoipa::path(get, path = "/list", responses((status = 200, description = "rigs")))]
+        pub async fn list_rigs() -> &'static str {
+            "[]"
+        }
+        #[derive(utoipa::OpenApi)]
+        #[openapi(paths(list_rigs))]
+        pub struct RigsApi;
+    }
+
+    /// Test module that documents its routes with the given derived spec.
+    struct Documented {
+        id: &'static str,
+        spec: utoipa::openapi::OpenApi,
+    }
+    impl GtModule for Documented {
+        fn meta(&self) -> ModuleMeta {
+            ModuleMeta::new(
+                ModuleId::new(self.id).unwrap(),
+                self.id,
+                Version::new(1, 0, 0),
+                "documented test module",
+            )
+        }
+        fn openapi(&self) -> Option<utoipa::openapi::OpenApi> {
+            Some(self.spec.clone())
+        }
+    }
+
+    fn beads_doc() -> Documented {
+        Documented { id: "beads", spec: <openapi_fixture::BeadsApi as utoipa::OpenApi>::openapi() }
+    }
+    fn rigs_doc() -> Documented {
+        Documented { id: "rigs", spec: <openapi_fixture::RigsApi as utoipa::OpenApi>::openapi() }
+    }
+
+    #[test]
+    fn module_openapi_paths_are_prefixed() {
+        let root = RootBuilder::new().module(beads_doc()).build().unwrap();
+        let doc = root.openapi();
+        assert!(doc.paths.paths.contains_key("/api/v1/beads/list"), "got: {:?}", doc.paths.paths.keys().collect::<Vec<_>>());
+        // The bare relative path is rewritten away.
+        assert!(!doc.paths.paths.contains_key("/list"));
+    }
+
+    #[test]
+    fn multiple_module_specs_merge_under_their_prefixes() {
+        let root = RootBuilder::new().module(beads_doc()).module(rigs_doc()).build().unwrap();
+        let doc = root.openapi();
+        assert!(doc.paths.paths.contains_key("/api/v1/beads/list"));
+        assert!(doc.paths.paths.contains_key("/api/v1/rigs/list"));
+    }
+
+    #[test]
+    fn module_without_openapi_contributes_no_paths() {
+        let root = RootBuilder::new().module(Beads).build().unwrap();
+        assert!(root.openapi().paths.paths.is_empty());
+    }
+
+    #[test]
+    fn disabled_module_openapi_is_dropped() {
+        let flags = DisabledModules::new([ModuleId::new("beads").unwrap()]);
+        let root = RootBuilder::new().module(beads_doc()).build_with_flags(&flags).unwrap();
+        assert!(root.openapi().paths.paths.is_empty());
     }
 
     // --- Tool name namespacing (hq-mod-mcp.2) -------------------------------

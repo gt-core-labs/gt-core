@@ -154,6 +154,25 @@ pub trait GtModule {
     fn register_routes(&self) -> Router {
         Router::new()
     }
+
+    /// The OpenAPI description of this module's routes, if it documents them
+    /// (`hq-mod-routes.4`).
+    ///
+    /// A module declares its spec with `#[derive(utoipa::OpenApi)]` and returns
+    /// `Some(MyApi::openapi())`. The builder mounts every module's spec under its
+    /// prefix and merges them into one document
+    /// ([`Root::openapi`](crate::Root::openapi)), so the paths in the returned
+    /// spec are *relative* — exactly the relative paths
+    /// [`register_routes`](GtModule::register_routes) declares. The builder
+    /// rewrites them to `/api/v1/<module>/...` to match where the routes actually
+    /// mount (`hq-mod-routes.2`), so a module never repeats its prefix in
+    /// annotations.
+    ///
+    /// Defaults to `None`: a module that ships no OpenAPI contributes no paths to
+    /// the combined document, exactly as it contributes no routes by default.
+    fn openapi(&self) -> Option<utoipa::openapi::OpenApi> {
+        None
+    }
 }
 
 #[cfg(test)]

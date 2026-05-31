@@ -42,6 +42,9 @@
 //!   in its [`Capability`] gets every route guarded by a method-derived
 //!   `<module>.<read|write>` scope check; modules claiming none stay public
 //!   (`hq-mod-routes.3`).
+//! - [`GtModule::openapi`] — a module documents its routes with a `utoipa` spec;
+//!   [`Root::openapi`] mounts each under `/api/v1/<module>` and merges them into
+//!   one OpenAPI document (`hq-mod-routes.4`).
 //!
 //! ## Hooks
 //!
