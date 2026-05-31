@@ -2,6 +2,14 @@
 
 Quick onboarding for Claude / human contributors working on the module system + tenancy primitives.
 
+## STOP — read these first
+
+1. **[docs/03-architecture-guardrails.md](docs/03-architecture-guardrails.md)** — invariants. Folder structure, kernel migration policy, module-system on-ramp, dep direction, event versioning, workspace boundary, replay gate.
+2. **[docs/02-sse-pattern.md](docs/02-sse-pattern.md)** — streaming endpoint conventions.
+3. **[docs/01-migration-plan.md](docs/01-migration-plan.md)** — what ships when.
+
+If the bead you claimed conflicts with these docs, file a doc gap via `meta.report_gap` MCP — do NOT improvise.
+
 ## Where things are
 
 - **Tracking:** Dolt `hq.issues` in gastown (via gt-mcp). Epics: `hq-mod` (66 beads) + `hq-mt` (95 beads).

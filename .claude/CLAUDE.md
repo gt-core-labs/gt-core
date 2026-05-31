@@ -1,3 +1,4 @@
+- LEER ANTES de tocar codigo: docs/03-architecture-guardrails.md + docs/02-sse-pattern.md. Reglas de carpetas + capas + auth + workspace son INVARIANTES, no preferencias. Gap encontrado = `meta.report_gap`, NO improvisar.
 - planning + bead tracking via gt-mcp (http://127.0.0.1:8765/mcp). hq.issues lives in gastown's Dolt; tracking stays there until we add a dedicated gt-core surface.
 - comentarios en ingles
 - todo desarrollo pasa por un bead reclamado en hq-mod-* o hq-mt-*. revisar `gt://issues?external_ref=hq-mod-core` antes de empezar

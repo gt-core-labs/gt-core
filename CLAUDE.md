@@ -15,14 +15,24 @@ Foundational module system + multi-tenant primitives for Gas Town and downstream
 - One bead per branch, conventional commits (`feat(gt-module): ...`).
 - Don't touch gastown unless porting a crate.
 
+## MUST-READ before writing code
+
+- **[docs/03-architecture-guardrails.md](docs/03-architecture-guardrails.md)** — folder structure is fixed, kernel migrates UP from gastown (no re-invention), module system is the only on-ramp, dep direction is one-way, events are versioned + replay-safe. Read this FIRST.
+- **[docs/02-sse-pattern.md](docs/02-sse-pattern.md)** — auth via cookie, per-workspace channel keying, Last-Event-ID, KeepAlive. Read before adding any streaming endpoint.
+
 ## Layout
 
 See [README.md](README.md) for crate table. [docs/00-overview.md](docs/00-overview.md) for layering. [docs/01-migration-plan.md](docs/01-migration-plan.md) for what comes from gastown and when. [AGENTS.md](AGENTS.md) for claim/branch/commit drill.
 
-## Anti-patterns
+## Anti-patterns (see docs/03 for full list + rationale)
 
 - Adding `tokio::spawn` in kernel crates. Allowed only in `gt-plugin` relay and explicit actor crates.
 - Adding `dyn Trait` in kernel crates except observer plugins.
 - Mutating domain state from observer subscriptions. Cross-module communication is event-driven only.
 - Hand-wiring routes / MCP tools / migrations in app composition root. Use `RootBuilder::new(ws).module(...).build()`.
 - Re-using a `/tmp/wt-*` worktree someone else created.
+- **Re-inventing kernel primitives** that already exist in gastown (gt-events, gt-bus, gt-audit, gt-plugin, gt-telemetry). They migrate up in P4 — don't fork them.
+- **Adding top-level folders** outside `crates/`, `examples/`, `docs/`. The taxonomy is fixed.
+- **Cross-tier downward deps** (kernel depending on domain, domain depending on modules). One-way only.
+- **Unversioned event kinds** (`bead.created` instead of `bead.created.v1`).
+- **Workspace_id in MCP payload / URL / body.** Server-injected from auth ctx; spoofing rejected.
