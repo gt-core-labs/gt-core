@@ -38,6 +38,10 @@
 //! - [`module_prefix`] / [`API_BASE`] — each module's routes are auto-mounted
 //!   under `/api/v1/<module-id>`, so modules declare plain relative paths and
 //!   never collide (`hq-mod-routes.2`).
+//! - [`guard_module_scopes`] / [`CallerScopes`] — a module that declares scopes
+//!   in its [`Capability`] gets every route guarded by a method-derived
+//!   `<module>.<read|write>` scope check; modules claiming none stay public
+//!   (`hq-mod-routes.3`).
 //!
 //! ## Hooks
 //!
@@ -74,5 +78,5 @@ pub use mcp::{McpRegistry, McpTool, McpToolNameError};
 pub use meta::{ModuleId, ModuleIdError, ModuleMeta};
 pub use migrate::Migration;
 pub use module_trait::GtModule;
-pub use routes::{module_prefix, API_BASE};
+pub use routes::{guard_module_scopes, module_prefix, CallerScopes, API_BASE};
 pub use scope::{Scope, ScopeError};

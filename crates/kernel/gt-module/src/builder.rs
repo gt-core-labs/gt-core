@@ -488,20 +488,27 @@ impl Root {
     /// Because each module owns a distinct path segment, two modules declaring
     /// the same relative path no longer collide (`hq-mod-routes.2`): a `/` route
     /// in `beads` answers at `/api/v1/beads/`, independent of a `/` route in
-    /// `rigs`. Per-route scope guards derived from
-    /// [`capability`](crate::GtModule::capability) layer onto this mount in
-    /// `hq-mod-routes.3`. Takes `self` because an `axum::Router` is consumed by
-    /// nesting.
+    /// `rigs`.
+    ///
+    /// A module that declares scopes in its
+    /// [`capability`](crate::GtModule::capability) has every one of its routes
+    /// guarded by [`guard_module_scopes`](crate::guard_module_scopes): the caller
+    /// must hold the `<module>.<read|write>` scope the request method implies
+    /// (`hq-mod-routes.3`). A module claiming no scope keeps public routes. Takes
+    /// `self` because an `axum::Router` is consumed by nesting.
     pub fn into_router(self) -> Router {
-        // Compute prefixes first so the borrow of `entries` ends before the
-        // `routers` field is moved out of `self`.
-        let prefixes: Vec<String> =
-            self.entries.iter().map(|e| crate::module_prefix(&e.meta.id)).collect();
-        prefixes
-            .into_iter()
+        // Pair each module's id + claimed scopes with its router. Borrowing
+        // `entries` while moving `routers` is fine — they are disjoint fields.
+        self.entries
+            .iter()
             .zip(self.routers)
-            .fold(Router::new(), |app, (prefix, module_router)| {
-                app.nest(&prefix, module_router)
+            .fold(Router::new(), |app, (entry, module_router)| {
+                let guarded = if entry.capability.scopes().is_empty() {
+                    module_router
+                } else {
+                    crate::guard_module_scopes(module_router, &entry.meta.id)
+                };
+                app.nest(&crate::module_prefix(&entry.meta.id), guarded)
             })
     }
 }
@@ -925,16 +932,22 @@ mod tests {
         id: &'static str,
         rel_path: &'static str,
         deps: Vec<&'static str>,
+        scopes: Vec<&'static str>,
     }
 
     impl Routed {
         /// All test modules declare the same relative path `/list`, so the only
         /// thing keeping them apart is the per-module prefix.
         fn new(id: &'static str) -> Self {
-            Routed { id, rel_path: "/list", deps: Vec::new() }
+            Routed { id, rel_path: "/list", deps: Vec::new(), scopes: Vec::new() }
         }
         fn with_dep(mut self, dep: &'static str) -> Self {
             self.deps.push(dep);
+            self
+        }
+        /// Claim a scope, opting this module's routes into RBAC (`hq-mod-routes.3`).
+        fn claiming(mut self, scope: &'static str) -> Self {
+            self.scopes.push(scope);
             self
         }
     }
@@ -951,9 +964,15 @@ mod tests {
         fn dependencies(&self) -> Vec<ModuleId> {
             self.deps.iter().map(|d| ModuleId::new(*d).unwrap()).collect()
         }
+        fn capability(&self) -> Capability {
+            Capability::empty().claiming_all(self.scopes.iter().map(|s| Scope::new(*s).unwrap()))
+        }
         fn register_routes(&self) -> Router {
             let id = self.id;
-            Router::new().route(self.rel_path, get(move || async move { id }))
+            // A read (GET) and a write (POST) route, so scope guards can be
+            // method-distinguished.
+            Router::new()
+                .route(self.rel_path, get(move || async move { id }).post(move || async move { id }))
         }
     }
 
@@ -1038,6 +1057,49 @@ mod tests {
         let app = root.into_router();
         assert_eq!(hit(app.clone(), "/api/v1/beads/list").await, (StatusCode::OK, "beads".into()));
         assert_eq!(hit(app, "/api/v1/merge/list").await, (StatusCode::OK, "merge".into()));
+    }
+
+    #[tokio::test]
+    async fn claimed_scopes_guard_routes_through_the_builder() {
+        use axum::http::Method;
+        use crate::CallerScopes;
+
+        // `beads` claims read+write → guarded; `rigs` claims nothing → public.
+        let root = RootBuilder::new()
+            .module(Routed::new("beads").claiming("beads.read").claiming("beads.write"))
+            .module(Routed::new("rigs"))
+            .build()
+            .unwrap();
+        let app = root.into_router();
+
+        let send = |app: Router, method: Method, path: &'static str, cs: Option<CallerScopes>| async move {
+            let mut req = Request::builder().method(method).uri(path).body(Body::empty()).unwrap();
+            if let Some(cs) = cs {
+                req.extensions_mut().insert(cs);
+            }
+            app.oneshot(req).await.unwrap().status()
+        };
+
+        // Guarded module: no caller scopes → 401.
+        assert_eq!(
+            send(app.clone(), Method::GET, "/api/v1/beads/list", None).await,
+            StatusCode::UNAUTHORIZED
+        );
+        // With beads.read → GET ok, POST forbidden.
+        let read = CallerScopes::new([Scope::new("beads.read").unwrap()]);
+        assert_eq!(
+            send(app.clone(), Method::GET, "/api/v1/beads/list", Some(read.clone())).await,
+            StatusCode::OK
+        );
+        assert_eq!(
+            send(app.clone(), Method::POST, "/api/v1/beads/list", Some(read)).await,
+            StatusCode::FORBIDDEN
+        );
+        // Unguarded module stays public — no caller scopes needed.
+        assert_eq!(
+            send(app, Method::GET, "/api/v1/rigs/list", None).await,
+            StatusCode::OK
+        );
     }
 
     // --- Tool name namespacing (hq-mod-mcp.2) -------------------------------
