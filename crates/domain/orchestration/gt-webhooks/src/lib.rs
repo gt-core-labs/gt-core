@@ -16,22 +16,25 @@
 //!   [`WebhookError`] to `404`/`401`/`400` (`hq-mod-hooks.4`).
 //! - [`GitHubSource`] — HMAC-SHA256 verification of `X-Hub-Signature-256` +
 //!   [`pull_request_action`] classification (`hq-mod-hooks.5`).
+//! - [`LinearSource`] — HMAC-SHA256 verification of `Linear-Signature` +
+//!   [`issue_action`] classification of issue transitions (`hq-mod-hooks.6`).
 //!
-//! The Linear source (`hq-mod-hooks.6`) lands next; dispatch of a verified
-//! delivery to subscribed modules wires up when the merge/beads modules exist
-//! (Phase 4).
+//! Dispatch of a verified delivery to subscribed modules wires up when the
+//! merge/beads modules exist (Phase 4).
 
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
 mod error;
 mod github;
+mod linear;
 mod registry;
 mod router;
 mod source;
 
 pub use error::WebhookError;
 pub use github::{pull_request_action, GitHubSource, PullRequestAction};
+pub use linear::{issue_action, IssueAction, LinearSource};
 pub use registry::WebhookRegistry;
 pub use router::{webhook_router, WEBHOOK_BASE};
 pub use source::{WebhookDelivery, WebhookSource};
