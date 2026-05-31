@@ -22,8 +22,13 @@
 //! - Feature-flag filtering — [`RootBuilder::build_with_flags`] drops modules a
 //!   [`FeatureFlags`] predicate disables, rejecting an enabled module that
 //!   depends on a disabled one (`hq-mod-core.7`).
+//! - Black-box integration matrix in `tests/integration.rs` — empty,
+//!   single-module, dependency cycle, capability conflict, plus ordering and
+//!   flag behavior against the public API (`hq-mod-core.8`).
 //!
-//! Still to come on this epic: the test matrix (`.8`).
+//! The `hq-mod-core` sub-epic is complete: this crate is the module-system
+//! foundation the rest of `hq-mod` (routes, MCP, events, migrate, flags,
+//! frontend, contracts, refactor) builds on.
 
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
