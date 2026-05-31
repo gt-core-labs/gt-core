@@ -1,12 +1,27 @@
 //! Dog worker abstraction.
 //!
-//! Closes the loop that `gt-plugin/src/descriptor.rs:7` deferred: a Dog claims a Plugin,
-//! evaluates its Gate, executes per ExecutionType, emits a digest receipt.
+//! Closes the loop that `gt-plugin/src/descriptor.rs:7` deferred: a Dog claims a
+//! Plugin, evaluates its Gate, executes per ExecutionType, emits a digest
+//! receipt.
 //!
-//! Real impl lands in `hq-mod-dogs.1` through `.9`.
+//! ## Landed so far
+//!
+//! - [`Dog`] + [`DogReport`] — the async worker trait and its outcome
+//!   (`hq-mod-dogs.1`).
+//! - [`DogId`] — the validated worker identity (`hq-mod-dogs.1`).
+//! - [`DogState`] + [`DogStatus`] — the per-worker lifecycle projection and its
+//!   reducer primitives (`hq-mod-dogs.1`).
+//!
+//! Still to come on this epic: the `DogDispatcher` matching gates to Dogs and
+//! capacity (`.2`), the `Gate` evaluator (`.3`), the `PluginExecutor` (`.4`),
+//! digest/tracking (`.5`), failure notify (`.6`), MCP claim tools (`.7`), the
+//! per-workspace pool (`.8`), and the end-to-end test (`.9`).
 
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
-#[doc(hidden)]
-pub const SCAFFOLD: &str = "gt-dog — hq-mod-dogs scaffold";
+mod dog;
+mod state;
+
+pub use dog::{Dog, DogReport};
+pub use state::{DogError, DogId, DogIdError, DogState, DogStatus};

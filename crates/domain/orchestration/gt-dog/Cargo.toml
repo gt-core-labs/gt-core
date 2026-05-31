@@ -11,3 +11,7 @@ serde = { workspace = true }
 async-trait = { workspace = true }
 gt-module = { workspace = true }
 gt-hooks = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true }
+serde_json = { workspace = true }
