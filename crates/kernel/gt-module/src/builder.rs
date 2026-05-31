@@ -34,6 +34,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use axum::Router;
 
 use crate::capability::Capability;
+use crate::event_kind::EventKind;
 use crate::flags::{AllEnabled, FeatureFlags};
 use crate::hook::HookPoint;
 use crate::mcp::{McpRegistry, McpTool, McpToolNameError};
@@ -180,6 +181,7 @@ impl RootBuilder {
 
         // 3 + 4. Validate and order the surviving set.
         Self::check_scope_conflicts(&enabled)?;
+        Self::check_event_kind_conflicts(&enabled)?;
         Self::check_tool_namespacing(&enabled)?;
         Self::check_migration_versions(&enabled)?;
         let order = crate::deps::resolve_order(&enabled)?;
@@ -216,6 +218,34 @@ impl RootBuilder {
                 return Err(BuildError::ScopeConflict {
                     scope: scope.clone(),
                     claimants: owners.into_iter().cloned().collect(),
+                });
+            }
+        }
+        Ok(())
+    }
+
+    /// Reject a stack where two distinct modules emit the same event kind+version
+    /// (`hq-mod-events.5`).
+    ///
+    /// An event kind names a single source of truth; two modules emitting the
+    /// same `<module>.<noun>.v<N>` is a wiring bug (ambiguous provenance, racing
+    /// reducers). v1 and v2 of a noun are distinct kinds and never conflict — only
+    /// the *same* kind+version emitted by two *different* modules does. Detection
+    /// mirrors [`check_scope_conflicts`](Self::check_scope_conflicts): kinds are
+    /// visited in sorted order, so a malformed stack always reports the same
+    /// conflict, and a module listing the same kind twice is harmless.
+    fn check_event_kind_conflicts(entries: &[ModuleEntry]) -> Result<(), BuildError> {
+        let mut emitters: BTreeMap<&EventKind, BTreeSet<&ModuleId>> = BTreeMap::new();
+        for entry in entries {
+            for kind in entry.capability.emits() {
+                emitters.entry(kind).or_default().insert(&entry.meta.id);
+            }
+        }
+        for (kind, owners) in emitters {
+            if owners.len() > 1 {
+                return Err(BuildError::EventKindConflict {
+                    kind: kind.clone(),
+                    emitters: owners.into_iter().cloned().collect(),
                 });
             }
         }
@@ -311,6 +341,14 @@ pub enum BuildError {
         /// The modules claiming it, sorted by id (always 2+).
         claimants: Vec<ModuleId>,
     },
+    /// Two or more distinct modules emit the same event kind+version
+    /// (`hq-mod-events.5`). Each `<module>.<noun>.v<N>` must have one emitter.
+    EventKindConflict {
+        /// The contested event kind, version included.
+        kind: EventKind,
+        /// The modules emitting it, sorted by id (always 2+).
+        emitters: Vec<ModuleId>,
+    },
     /// A module contributed an MCP tool whose name is not
     /// `<module-id>.<action>.<verb>` (`hq-mod-mcp.2`).
     MalformedToolName {
@@ -366,6 +404,14 @@ impl std::fmt::Display for BuildError {
                 write!(
                     f,
                     "scope `{scope}` is claimed by multiple modules: {}",
+                    ids.join(", ")
+                )
+            }
+            BuildError::EventKindConflict { kind, emitters } => {
+                let ids: Vec<&str> = emitters.iter().map(ModuleId::as_str).collect();
+                write!(
+                    f,
+                    "event kind `{kind}` is emitted by multiple modules: {}",
                     ids.join(", ")
                 )
             }
@@ -728,6 +774,101 @@ mod tests {
         let msg = err.to_string();
         assert!(msg.contains("beads.write"), "got: {msg}");
         assert!(msg.contains("audit") && msg.contains("beads"), "got: {msg}");
+    }
+
+    // --- Event-kind emission ownership (hq-mod-events.5) --------------------
+
+    use crate::event_kind::EventKind;
+
+    /// Module with a configurable id + emitted event kinds, for conflict tests.
+    struct Emitter {
+        id: &'static str,
+        kinds: Vec<&'static str>,
+    }
+    impl GtModule for Emitter {
+        fn meta(&self) -> ModuleMeta {
+            ModuleMeta::new(
+                ModuleId::new(self.id).unwrap(),
+                self.id,
+                Version::new(1, 0, 0),
+                "event-emitting test module",
+            )
+        }
+        fn capability(&self) -> Capability {
+            Capability::empty().emitting_all(self.kinds.iter().map(|k| EventKind::new(*k).unwrap()))
+        }
+    }
+    fn emitter(id: &'static str, kinds: &[&'static str]) -> Emitter {
+        Emitter { id, kinds: kinds.to_vec() }
+    }
+
+    #[test]
+    fn disjoint_event_kinds_build_cleanly() {
+        let root = RootBuilder::new()
+            .module(emitter("beads", &["beads.created.v1", "beads.closed.v1"]))
+            .module(emitter("rigs", &["rigs.added.v1"]))
+            .build()
+            .unwrap();
+        assert_eq!(root.len(), 2);
+    }
+
+    #[test]
+    fn two_modules_emitting_same_kind_conflict() {
+        let err = RootBuilder::new()
+            .module(emitter("beads", &["beads.created.v1"]))
+            .module(emitter("legacy", &["beads.created.v1"]))
+            .build()
+            .unwrap_err();
+        let BuildError::EventKindConflict { kind, emitters } = err else {
+            panic!("expected EventKindConflict, got {err:?}");
+        };
+        assert_eq!(kind, EventKind::new("beads.created.v1").unwrap());
+        let ids: Vec<String> = emitters.iter().map(|m| m.to_string()).collect();
+        assert_eq!(ids, ["beads", "legacy"]);
+    }
+
+    #[test]
+    fn distinct_versions_of_a_noun_do_not_conflict() {
+        // v1 and v2 of the same noun are separate kinds; one module emits v1, the
+        // other v2 — no ownership clash.
+        let root = RootBuilder::new()
+            .module(emitter("beads", &["beads.created.v1"]))
+            .module(emitter("beads-next", &["beads.created.v2"]))
+            .build()
+            .unwrap();
+        assert_eq!(root.len(), 2);
+    }
+
+    #[test]
+    fn same_module_repeating_a_kind_is_not_a_conflict() {
+        let root = RootBuilder::new()
+            .module(emitter("beads", &["beads.created.v1", "beads.created.v1"]))
+            .build()
+            .unwrap();
+        assert_eq!(root.len(), 1);
+    }
+
+    #[test]
+    fn event_kind_conflict_message_names_kind_and_modules() {
+        let err = RootBuilder::new()
+            .module(emitter("beads", &["beads.created.v1"]))
+            .module(emitter("audit", &["beads.created.v1"]))
+            .build()
+            .unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("beads.created.v1"), "got: {msg}");
+        assert!(msg.contains("audit") && msg.contains("beads"), "got: {msg}");
+    }
+
+    #[test]
+    fn disabling_an_emitter_clears_the_event_kind_conflict() {
+        let flags = crate::flags::DisabledModules::new([ModuleId::new("legacy").unwrap()]);
+        let root = RootBuilder::new()
+            .module(emitter("beads", &["beads.created.v1"]))
+            .module(emitter("legacy", &["beads.created.v1"]))
+            .build_with_flags(&flags)
+            .unwrap();
+        assert_eq!(root.len(), 1);
     }
 
     use crate::flags::DisabledModules;
