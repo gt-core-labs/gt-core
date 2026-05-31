@@ -33,6 +33,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use crate::capability::Capability;
 use crate::flags::{AllEnabled, FeatureFlags};
+use crate::mcp::{McpRegistry, McpTool};
 use crate::meta::{ModuleId, ModuleMeta};
 use crate::module_trait::GtModule;
 use crate::scope::Scope;
@@ -59,6 +60,8 @@ pub(crate) struct ModuleEntry {
     pub(crate) meta: ModuleMeta,
     pub(crate) capability: Capability,
     pub(crate) depends_on: Vec<ModuleId>,
+    /// MCP tools this module contributes, in declaration order (`hq-mod-mcp.1`).
+    pub(crate) mcp_tools: Vec<McpTool>,
 }
 
 impl RootBuilder {
@@ -71,14 +74,20 @@ impl RootBuilder {
     ///
     /// Takes the module by value (implementors are zero-sized marker structs),
     /// reads its pure-data [`meta`](GtModule::meta) and
-    /// [`capability`](GtModule::capability) once, stores the snapshot, and drops
-    /// the value. Returns `self` so registrations chain. Dispatch is static —
-    /// no trait object is retained (non-negotiable #1).
+    /// [`capability`](GtModule::capability), harvests the MCP tools it pushes
+    /// into a fresh [`McpRegistry`](crate::McpRegistry) via
+    /// [`register_mcp_tools`](GtModule::register_mcp_tools) (`hq-mod-mcp.1`),
+    /// stores the snapshot, and drops the value. Returns `self` so registrations
+    /// chain. Dispatch is static — no trait object is retained (non-negotiable
+    /// #1).
     pub fn module<M: GtModule>(mut self, module: M) -> Self {
+        let mut mcp = McpRegistry::new();
+        module.register_mcp_tools(&mut mcp);
         self.entries.push(ModuleEntry {
             meta: module.meta(),
             capability: module.capability(),
             depends_on: module.dependencies(),
+            mcp_tools: mcp.into_tools(),
         });
         self
     }
@@ -277,6 +286,16 @@ impl Root {
             .iter()
             .map(|e| &e.meta)
             .find(|m| &m.id == id)
+    }
+
+    /// Every MCP tool contributed by the loaded modules, in module init order
+    /// then per-module declaration order (`hq-mod-mcp.1`).
+    ///
+    /// Tools from feature-flag-disabled modules never appear: a disabled module
+    /// is dropped before its [`ModuleEntry`] reaches the [`Root`], so its tools
+    /// drop with it.
+    pub fn mcp_tools(&self) -> impl Iterator<Item = &McpTool> {
+        self.entries.iter().flat_map(|e| e.mcp_tools.iter())
     }
 }
 
@@ -510,5 +529,88 @@ mod tests {
     fn build_defaults_to_all_enabled() {
         let root = RootBuilder::new().module(Beads).module(Rigs).build().unwrap();
         assert_eq!(root.len(), 2);
+    }
+
+    use crate::mcp::McpRegistry;
+
+    /// Module that contributes two MCP tools, for collection tests.
+    struct Toolful;
+    impl GtModule for Toolful {
+        fn meta(&self) -> ModuleMeta {
+            ModuleMeta::new(
+                ModuleId::new("toolful").unwrap(),
+                "Toolful",
+                Version::new(1, 0, 0),
+                "Contributes MCP tools.",
+            )
+        }
+        fn register_mcp_tools(&self, reg: &mut McpRegistry) {
+            reg.tool("toolful.create.execute", "Create")
+                .tool("toolful.close.execute", "Close");
+        }
+    }
+
+    #[test]
+    fn module_with_no_tools_contributes_nothing() {
+        let root = RootBuilder::new().module(Beads).build().unwrap();
+        assert_eq!(root.mcp_tools().count(), 0);
+    }
+
+    #[test]
+    fn builder_collects_contributed_tools() {
+        let root = RootBuilder::new().module(Toolful).build().unwrap();
+        let names: Vec<&str> = root.mcp_tools().map(|t| t.name.as_str()).collect();
+        assert_eq!(names, ["toolful.create.execute", "toolful.close.execute"]);
+    }
+
+    #[test]
+    fn tools_follow_module_init_order() {
+        // Merge depends on beads, so beads inits first; tools must follow.
+        struct ToolfulBeads;
+        impl GtModule for ToolfulBeads {
+            fn meta(&self) -> ModuleMeta {
+                ModuleMeta::new(
+                    ModuleId::new("beads").unwrap(),
+                    "Beads",
+                    Version::new(1, 0, 0),
+                    "Beads.",
+                )
+            }
+            fn register_mcp_tools(&self, reg: &mut McpRegistry) {
+                reg.tool("beads.read.execute", "Read");
+            }
+        }
+        struct ToolfulMerge;
+        impl GtModule for ToolfulMerge {
+            fn meta(&self) -> ModuleMeta {
+                ModuleMeta::new(
+                    ModuleId::new("merge").unwrap(),
+                    "Merge",
+                    Version::new(1, 0, 0),
+                    "Merge.",
+                )
+            }
+            fn dependencies(&self) -> Vec<ModuleId> {
+                vec![ModuleId::new("beads").unwrap()]
+            }
+            fn register_mcp_tools(&self, reg: &mut McpRegistry) {
+                reg.tool("merge.submit.execute", "Submit");
+            }
+        }
+        // Register merge first; build reorders so beads (dependency) inits first.
+        let root = RootBuilder::new().module(ToolfulMerge).module(ToolfulBeads).build().unwrap();
+        let names: Vec<&str> = root.mcp_tools().map(|t| t.name.as_str()).collect();
+        assert_eq!(names, ["beads.read.execute", "merge.submit.execute"]);
+    }
+
+    #[test]
+    fn disabled_module_tools_are_dropped() {
+        let flags = DisabledModules::new([ModuleId::new("toolful").unwrap()]);
+        let root = RootBuilder::new()
+            .module(Beads)
+            .module(Toolful)
+            .build_with_flags(&flags)
+            .unwrap();
+        assert_eq!(root.mcp_tools().count(), 0);
     }
 }

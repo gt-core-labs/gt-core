@@ -100,6 +100,7 @@ mod tests {
             ),
             capability: Capability::empty(),
             depends_on: deps.iter().map(|d| ModuleId::new(*d).unwrap()).collect(),
+            mcp_tools: Vec::new(),
         }
     }
 

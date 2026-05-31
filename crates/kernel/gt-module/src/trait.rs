@@ -19,6 +19,7 @@
 //! (non-negotiable #14); it does not make trait methods `async`.
 
 use crate::capability::Capability;
+use crate::mcp::McpRegistry;
 use crate::meta::{ModuleId, ModuleMeta};
 
 /// A pluggable feature: one crate, registered with the builder in one line.
@@ -74,6 +75,15 @@ pub trait GtModule {
     fn dependencies(&self) -> Vec<ModuleId> {
         Vec::new()
     }
+
+    /// Declare the MCP tools this module serves (`hq-mod-mcp.1`).
+    ///
+    /// The builder hands each module a fresh [`McpRegistry`] and harvests the
+    /// tools pushed into it, so the composition root never lists MCP tools by
+    /// hand (see `docs/03-architecture-guardrails.md` rule 3). Defaults to a
+    /// no-op so a module that serves no MCP tools — and a not-yet-ported one —
+    /// implements nothing.
+    fn register_mcp_tools(&self, _registry: &mut McpRegistry) {}
 }
 
 #[cfg(test)]
