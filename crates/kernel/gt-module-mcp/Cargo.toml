@@ -8,5 +8,9 @@ description = "MCP tool registry namespaced per GtModule."
 
 [dependencies]
 serde = { workspace = true }
+serde_json = { workspace = true }
 schemars = { workspace = true }
 gt-module = { workspace = true }
+
+[dev-dependencies]
+semver = { workspace = true }

@@ -70,7 +70,7 @@ impl std::fmt::Debug for RootBuilder {
 /// The originating `M: GtModule` value is dropped after extraction; everything
 /// the builder and the validation beads need is captured here. `pub(crate)` so
 /// the sibling validation passes ([`crate::deps`]) can read it.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub(crate) struct ModuleEntry {
     pub(crate) meta: ModuleMeta,
     pub(crate) capability: Capability,

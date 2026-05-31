@@ -11,43 +11,61 @@
 //!
 //! ## What this bead does and does not do
 //!
-//! `.1` defines the contribution type and wires collection into the builder. It
-//! deliberately does **not** yet:
+//! `.1` defines the contribution type and wires collection into the builder;
+//! `.2` enforced the `<module-id>.<action>.<verb>` name convention. `.3` adds
+//! the JSON **input schema** each tool carries and the [`McpTool`] serialization
+//! an MCP `tools/list` (`meta.help`) response is built from — the assembly of
+//! that response over a built [`Root`](crate::Root) lives in the `gt-module-mcp`
+//! crate, which owns the schemas-and-JSON dependencies.
 //!
-//! - enforce the `<module-id>.<action>.<verb>` name convention — `hq-mod-mcp.2`;
-//! - carry a JSON input schema or feed `meta.help` — `hq-mod-mcp.3`.
-//!
-//! The type is `#[non_exhaustive]` and the registry's API is additive so those
-//! beads grow it (a schema field, a namespacing check) without breaking a module
-//! written against `.1`.
+//! The type is `#[non_exhaustive]` and the registry's API is additive, so each
+//! bead grows it without breaking a module written against an earlier one.
+
+use serde::Serialize;
 
 /// A single MCP tool a module contributes.
 ///
-/// Pure data: a name and a one-line description. The name is the fully
-/// namespaced tool id a client invokes; its `<module-id>.<action>.<verb>` shape
-/// is validated in `hq-mod-mcp.2` and an input schema is attached in `.3`. Cheap
-/// to clone and free of handlers, so it is safe to surface in diagnostics and
-/// (later) `meta.help`.
-#[derive(Clone, Debug, PartialEq, Eq)]
+/// Pure data: a fully namespaced name, a one-line description, and the JSON
+/// Schema describing its input arguments. Serializes to the object shape an MCP
+/// `tools/list` entry expects (`name`, `description`, `inputSchema`), so the
+/// `meta.help` response is just the enabled tools serialized in order. Cheap to
+/// clone and free of handlers.
+#[derive(Clone, Debug, PartialEq, Serialize)]
 #[non_exhaustive]
 pub struct McpTool {
     /// Fully namespaced tool name a client invokes (e.g. `beads.create.execute`).
     pub name: String,
     /// One-line human-readable summary of what the tool does.
     pub description: String,
+    /// JSON Schema for the tool's input arguments. Defaults to the empty-object
+    /// schema (`{}`) for a tool that takes no arguments. Serialized under the
+    /// MCP-canonical `inputSchema` key.
+    #[serde(rename = "inputSchema")]
+    pub input_schema: serde_json::Value,
 }
 
 impl McpTool {
-    /// Construct a tool descriptor from already-known parts.
+    /// Construct a tool descriptor with the empty-object input schema (`{}`).
     ///
     /// Module authors normally call [`McpRegistry::tool`] instead of building
     /// this directly; the constructor exists so diagnostics and tests can mint a
     /// descriptor, and because the `#[non_exhaustive]` attribute forbids struct
-    /// literals outside this crate.
+    /// literals outside this crate. Use [`with_schema`](McpTool::with_schema) to
+    /// attach a non-trivial input schema.
     pub fn new(name: impl Into<String>, description: impl Into<String>) -> Self {
+        McpTool::with_schema(name, description, serde_json::json!({}))
+    }
+
+    /// Construct a tool descriptor carrying an explicit JSON input schema.
+    pub fn with_schema(
+        name: impl Into<String>,
+        description: impl Into<String>,
+        input_schema: serde_json::Value,
+    ) -> Self {
         McpTool {
             name: name.into(),
             description: description.into(),
+            input_schema,
         }
     }
 
@@ -137,7 +155,7 @@ fn is_kebab_segment(s: &str) -> bool {
 /// its tools through the chainable [`tool`](McpRegistry::tool) method and the
 /// builder harvests the result. Holds plain data only — no runtime handles — so
 /// it is cheap and carries nothing across an `await`.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct McpRegistry {
     tools: Vec<McpTool>,
 }
@@ -150,11 +168,29 @@ impl McpRegistry {
 
     /// Declare one MCP tool by name and description. Chainable.
     ///
-    /// Pushes the tool in declaration order. The name is taken verbatim here;
-    /// the `<module-id>.<action>.<verb>` convention is enforced later
-    /// (`hq-mod-mcp.2`), so this method never rejects.
+    /// Pushes the tool in declaration order, with the empty-object input schema.
+    /// The name is taken verbatim here; the `<module-id>.<action>.<verb>`
+    /// convention is enforced later (`hq-mod-mcp.2`), so this method never
+    /// rejects. Use [`tool_with_schema`](McpRegistry::tool_with_schema) for a
+    /// tool that takes arguments.
     pub fn tool(&mut self, name: impl Into<String>, description: impl Into<String>) -> &mut Self {
         self.tools.push(McpTool::new(name, description));
+        self
+    }
+
+    /// Declare one MCP tool with an explicit JSON input schema. Chainable
+    /// (`hq-mod-mcp.3`).
+    ///
+    /// The schema is stored verbatim and surfaces under the `inputSchema` key of
+    /// the tool's `meta.help` entry. Generate it however the module prefers —
+    /// the `gt-module-mcp` crate offers a `schemars`-backed helper.
+    pub fn tool_with_schema(
+        &mut self,
+        name: impl Into<String>,
+        description: impl Into<String>,
+        input_schema: serde_json::Value,
+    ) -> &mut Self {
+        self.tools.push(McpTool::with_schema(name, description, input_schema));
         self
     }
 
@@ -254,5 +290,38 @@ mod tests {
                 "expected {n:?} bad-segment"
             );
         }
+    }
+
+    #[test]
+    fn new_defaults_to_empty_object_schema() {
+        let t = McpTool::new("beads.create.execute", "Create");
+        assert_eq!(t.input_schema, serde_json::json!({}));
+    }
+
+    #[test]
+    fn tool_with_schema_records_schema() {
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": { "title": { "type": "string" } },
+            "required": ["title"],
+        });
+        let mut reg = McpRegistry::new();
+        reg.tool_with_schema("beads.create.execute", "Create", schema.clone());
+        assert_eq!(reg.tools()[0].input_schema, schema);
+    }
+
+    #[test]
+    fn serializes_to_mcp_tool_shape() {
+        let schema = serde_json::json!({ "type": "object" });
+        let tool = McpTool::with_schema("beads.create.execute", "Create a bead", schema.clone());
+        let value = serde_json::to_value(&tool).unwrap();
+        assert_eq!(
+            value,
+            serde_json::json!({
+                "name": "beads.create.execute",
+                "description": "Create a bead",
+                "inputSchema": schema,
+            })
+        );
     }
 }
