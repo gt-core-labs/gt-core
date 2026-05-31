@@ -39,11 +39,18 @@ git log --all --grep hq-mod-core.1
 
 Always work in a worktree on persistent storage (NEVER `/tmp` — it's tmpfs RAM and reboot wipes it):
 
+Use a **per-actor path** (`-<actor>` suffix) so two sessions on the same bead, or
+a stale dir from a crashed session, never collide on one path. The branch stays
+canonical (`<bead-id>`); only the path is namespaced. See protocol §2.
+
 ```bash
 cd /home/nixos/gt-core
-git worktree add /home/nixos/gt-core-wt-<bead-id> -b <bead-id> main
-cd /home/nixos/gt-core-wt-<bead-id>
+git worktree add /home/nixos/gt-core-wt-<bead-id>-<actor> -b <bead-id> main
+cd /home/nixos/gt-core-wt-<bead-id>-<actor>
 ```
+
+`<actor>` = a stable per-session tag (session PID, or `iv` for an interactive
+operator session). Never `Write` into a `gt-core-wt-*` you did not create.
 
 ## Commit + PR
 
