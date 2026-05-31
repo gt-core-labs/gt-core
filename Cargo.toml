@@ -1,0 +1,53 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/gt-module",
+    "crates/gt-workspace",
+    "crates/gt-feature-flags",
+    "crates/gt-mod-routes",
+    "crates/gt-mod-mcp",
+    "crates/gt-mod-events",
+    "crates/gt-mod-migrate",
+    "crates/gt-mod-contracts",
+    "examples/mod-hello",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/codecsrayo/gt-core"
+authors = ["codecsrayo"]
+
+[workspace.dependencies]
+# Async + serde core
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+schemars = { version = "0.8", features = ["preserve_order"] }
+semver = { version = "1", features = ["serde"] }
+async-trait = "0.1"
+
+# Web + axum
+axum = "0.7"
+tower = "0.5"
+tower-http = { version = "0.6", features = ["trace"] }
+
+# Storage
+sqlx = { version = "0.8", default-features = false, features = ["postgres", "macros", "runtime-tokio-rustls", "uuid", "chrono"] }
+
+# Telemetry
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+opentelemetry = "0.27"
+
+# Reused from gastown via path patch (see [patch.crates-io] in app workspaces)
+# gt-events    — domain event primitives (lives in gastown for now)
+# gt-bus       — sync bus (lives in gastown for now)
+# gt-audit     — event log (lives in gastown for now)
+# gt-plugin    — observer plugin trait (lives in gastown for now)
+# These move into gt-core after hq-mod-refactor.10 ships and replay gate is green.
+
+[profile.release]
+lto = "thin"
+codegen-units = 1

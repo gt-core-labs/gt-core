@@ -1,0 +1,11 @@
+[package]
+name = "gt-feature-flags"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Feature-flag repo port + per-workspace overrides. Consumed by gt-module RootBuilder."
+
+[dependencies]
+serde = { workspace = true }
+async-trait = { workspace = true }

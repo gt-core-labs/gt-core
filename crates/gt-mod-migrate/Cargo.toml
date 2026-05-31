@@ -1,0 +1,11 @@
+[package]
+name = "gt-mod-migrate"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Per-module SQL migration loader. sqlx multi-source aggregation."
+
+[dependencies]
+sqlx = { workspace = true }
+gt-module = { path = "../gt-module" }

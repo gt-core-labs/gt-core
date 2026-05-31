@@ -1,0 +1,9 @@
+[package]
+name = "mod-hello"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Smallest viable GtModule — learn-by-example reference. Lands in hq-mod-docs.2."
+
+[dependencies]
+gt-module = { path = "../../crates/gt-module" }

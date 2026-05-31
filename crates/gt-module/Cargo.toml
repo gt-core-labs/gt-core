@@ -1,0 +1,15 @@
+[package]
+name = "gt-module"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "GtModule trait + RootBuilder. Foundation for pluggable features in Gas Town and downstream apps."
+
+[dependencies]
+serde = { workspace = true }
+schemars = { workspace = true }
+semver = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true }

@@ -1,0 +1,11 @@
+[package]
+name = "gt-workspace"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Workspace identity + catalog + repo port. Tenant-boundary primitive for multi-tenant apps."
+
+[dependencies]
+serde = { workspace = true }
+schemars = { workspace = true }
