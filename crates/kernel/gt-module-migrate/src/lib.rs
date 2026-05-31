@@ -27,11 +27,25 @@
 //! migration is recorded as applied only if its SQL committed, so a mid-plan
 //! failure leaves the database at a clean prefix of the plan.
 //!
+//! ## Disable-safe
+//!
+//! Disabling a module drops it from the [`RootBuilder`](gt_module::RootBuilder),
+//! so its migrations vanish from the plan — but the loader never deletes tracking
+//! rows and never drops schema. The applied rows for an absent module are
+//! *retained*, queryable through [`retained`], and the module's tables keep their
+//! data. Re-enabling the module brings its migrations back into the plan; because
+//! their `(module_id, version)` rows are still recorded, [`apply`] skips them
+//! rather than re-running DDL against existing objects. Disable → re-enable is
+//! therefore lossless and non-destructive by construction. Reclaiming a disabled
+//! module's schema is a separate, opt-in purge (`hq-mod-migrate.5`), never an
+//! automatic side effect of dropping it from the plan.
+//!
 //! ## Scope
 //!
-//! `.2` is the loader itself. Disable-safe retention (`.3`), backfilling existing
-//! migrations under module folders (`.4`), and the apply/disable/reactivate/purge
-//! integration test (`.5`) build on this.
+//! `.2` is the loader itself; `.3` adds the disable-safe retention guarantee and
+//! [`retained`] introspection. Backfilling existing migrations under module
+//! folders (`.4`) and the apply/disable/reactivate/purge integration test (`.5`)
+//! build on this.
 
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
@@ -147,6 +161,30 @@ pub fn pending<'a>(
         .collect()
 }
 
+/// The applied `(module_id, version)` migrations no longer present in `plan` —
+/// the retained history of disabled or removed modules.
+///
+/// Disabling a module drops its migrations from the plan but leaves their
+/// tracking rows in place (see the crate-level *Disable-safe* section). This
+/// reports exactly those rows: migrations the database still records as applied
+/// that the current plan no longer mentions. Pure and database-free. Order
+/// follows `applied`'s iteration and is therefore unspecified, so callers that
+/// need a stable order should sort. Useful for an opt-in purge
+/// (`hq-mod-migrate.5`) or for surfacing orphaned schema in diagnostics. Never
+/// consulted by [`apply`], which only ever adds.
+pub fn retained(
+    applied: &HashSet<(String, u32)>,
+    plan: &[(&ModuleId, &Migration)],
+) -> Vec<(String, u32)> {
+    let in_plan: HashSet<(&str, u32)> =
+        plan.iter().map(|(module, m)| (module.as_str(), m.version)).collect();
+    applied
+        .iter()
+        .filter(|(module, version)| !in_plan.contains(&(module.as_str(), *version)))
+        .cloned()
+        .collect()
+}
+
 /// Create the tracking table if it does not yet exist.
 async fn ensure_table(pool: &PgPool) -> Result<(), sqlx::Error> {
     let ddl = format!(
@@ -258,6 +296,49 @@ mod tests {
         let out = pending(&applied, &plan);
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].0.as_str(), "rigs");
+    }
+
+    #[test]
+    fn disable_retains_applied_rows_and_skips_them() {
+        // beads was applied, then disabled: it drops out of the plan, but its
+        // tracking rows survive and must be reported as retained — not pending.
+        let rigs = id("rigs");
+        let m_rigs = Migration::new(1, "r", "SELECT 1");
+        let plan = vec![(&rigs, &m_rigs)];
+        let mut applied = HashSet::new();
+        applied.insert(("beads".to_owned(), 1u32));
+        applied.insert(("rigs".to_owned(), 1u32));
+
+        let kept = retained(&applied, &plan);
+        assert_eq!(kept, vec![("beads".to_owned(), 1u32)]);
+        // The disabled module contributes nothing to apply; only rigs/1 (already
+        // applied) would be considered, and it is skipped.
+        assert!(pending(&applied, &plan).is_empty());
+    }
+
+    #[test]
+    fn reactivate_does_not_reapply() {
+        // beads comes back into the plan; its already-applied migration must not
+        // re-run, and nothing is retained because the plan covers it again.
+        let beads = id("beads");
+        let (m1, m2) = (Migration::new(1, "a", "SELECT 1"), Migration::new(2, "b", "SELECT 1"));
+        let plan = vec![(&beads, &m1), (&beads, &m2)];
+        let mut applied = HashSet::new();
+        applied.insert(("beads".to_owned(), 1u32));
+
+        assert!(retained(&applied, &plan).is_empty());
+        let versions: Vec<u32> = pending(&applied, &plan).iter().map(|(_, m)| m.version).collect();
+        assert_eq!(versions, vec![2], "only the never-applied migration is pending");
+    }
+
+    #[test]
+    fn retained_empty_when_plan_covers_all_applied() {
+        let beads = id("beads");
+        let m1 = Migration::new(1, "a", "SELECT 1");
+        let plan = vec![(&beads, &m1)];
+        let mut applied = HashSet::new();
+        applied.insert(("beads".to_owned(), 1u32));
+        assert!(retained(&applied, &plan).is_empty());
     }
 
     #[test]
