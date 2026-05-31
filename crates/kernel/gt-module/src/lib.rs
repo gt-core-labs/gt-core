@@ -19,10 +19,11 @@
 //! - Capability-scope conflict detection — [`Capability`] now carries the scopes
 //!   a module claims, and `build()` rejects two modules claiming the same one
 //!   (`hq-mod-core.6`).
+//! - Feature-flag filtering — [`RootBuilder::build_with_flags`] drops modules a
+//!   [`FeatureFlags`] predicate disables, rejecting an enabled module that
+//!   depends on a disabled one (`hq-mod-core.7`).
 //!
-//! Still to come on this epic: feature-flag filtering (`.7`), the test matrix
-//! (`.8`). Each grows a [`BuildError`] variant
-//! — the `build()` signature is already fallible.
+//! Still to come on this epic: the test matrix (`.8`).
 
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
@@ -31,6 +32,7 @@ mod builder;
 mod capability;
 mod deps;
 mod event_kind;
+mod flags;
 mod meta;
 mod scope;
 #[path = "trait.rs"]
@@ -39,6 +41,7 @@ mod module_trait;
 pub use builder::{BuildError, Root, RootBuilder};
 pub use capability::Capability;
 pub use event_kind::{EventKind, EventKindError};
+pub use flags::{AllEnabled, DisabledModules, FeatureFlags};
 pub use meta::{ModuleId, ModuleIdError, ModuleMeta};
 pub use module_trait::GtModule;
 pub use scope::{Scope, ScopeError};

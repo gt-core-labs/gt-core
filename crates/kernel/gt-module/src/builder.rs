@@ -32,6 +32,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::capability::Capability;
+use crate::flags::{AllEnabled, FeatureFlags};
 use crate::meta::{ModuleId, ModuleMeta};
 use crate::module_trait::GtModule;
 use crate::scope::Scope;
@@ -82,23 +83,66 @@ impl RootBuilder {
         self
     }
 
-    /// Finalize the registry.
+    /// Finalize the registry with every module enabled.
     ///
-    /// Runs the validation passes and either hands back the assembled [`Root`]
-    /// or the first [`BuildError`]:
-    ///
-    /// - no two modules claim the same authorization scope (`hq-mod-core.6`);
-    /// - the dependency graph is acyclic and fully resolved, yielding the init
-    ///   order each module appears after its dependencies ([`crate::deps`],
-    ///   `hq-mod-core.5`).
-    ///
-    /// Flag filtering (`.7`) slots in here without changing this signature.
+    /// Shorthand for [`build_with_flags`](RootBuilder::build_with_flags) with
+    /// [`AllEnabled`]. See that method for the validation passes.
     pub fn build(self) -> Result<Root, BuildError> {
-        Self::check_scope_conflicts(&self.entries)?;
-        let order = crate::deps::resolve_order(&self.entries)?;
+        self.build_with_flags(&AllEnabled)
+    }
+
+    /// Finalize the registry, dropping modules `flags` reports as disabled.
+    ///
+    /// Runs, in order, and returns the first [`BuildError`]:
+    ///
+    /// 1. drop every module for which `flags.is_enabled` is false
+    ///    (`hq-mod-core.7`);
+    /// 2. reject an enabled module that depends on a disabled one
+    ///    ([`BuildError::DisabledDependency`]) — a disabled dependency is a
+    ///    configuration mistake, not a silent cascade;
+    /// 3. reject two enabled modules claiming the same scope (`hq-mod-core.6`);
+    /// 4. resolve the dependency graph into init order ([`crate::deps`],
+    ///    `hq-mod-core.5`).
+    ///
+    /// Dispatch over `flags` is static (non-negotiable #1): no trait object is
+    /// stored or boxed.
+    pub fn build_with_flags<F: FeatureFlags>(self, flags: &F) -> Result<Root, BuildError> {
+        // 1. Partition by flag. Keep enabled entries; remember disabled ids so a
+        //    dangling enabled->disabled edge reports precisely. Owned ids so the
+        //    set outlives the `into_iter` move below.
+        let disabled: BTreeSet<ModuleId> = self
+            .entries
+            .iter()
+            .map(|e| &e.meta.id)
+            .filter(|id| !flags.is_enabled(id))
+            .cloned()
+            .collect();
+        // 2. An enabled module may not depend on a disabled one.
+        for entry in &self.entries {
+            if disabled.contains(&entry.meta.id) {
+                continue;
+            }
+            for dep in &entry.depends_on {
+                if disabled.contains(dep) {
+                    return Err(BuildError::DisabledDependency {
+                        module: entry.meta.id.clone(),
+                        dependency: dep.clone(),
+                    });
+                }
+            }
+        }
+        let enabled: Vec<ModuleEntry> = self
+            .entries
+            .into_iter()
+            .filter(|e| !disabled.contains(&e.meta.id))
+            .collect();
+
+        // 3 + 4. Validate and order the surviving set.
+        Self::check_scope_conflicts(&enabled)?;
+        let order = crate::deps::resolve_order(&enabled)?;
         // Reorder into init order. The module set is a handful of entries, so
         // cloning by index is cheaper than threading an in-place permutation.
-        let entries = order.iter().map(|&i| self.entries[i].clone()).collect();
+        let entries = order.iter().map(|&i| enabled[i].clone()).collect();
         Ok(Root { entries })
     }
 
@@ -132,8 +176,8 @@ impl RootBuilder {
 
 /// Why [`RootBuilder::build`] rejected a module set.
 ///
-/// Marked `#[non_exhaustive]` so the remaining validation bead (`.7` flags) can
-/// add variants — and so downstream `match` arms keep a wildcard from day one.
+/// Marked `#[non_exhaustive]` so later epics can add variants — and so
+/// downstream `match` arms keep a wildcard from day one.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum BuildError {
@@ -143,6 +187,14 @@ pub enum BuildError {
         module: ModuleId,
         /// The unregistered id it named.
         missing: ModuleId,
+    },
+    /// An enabled module depends on a module the feature flags disabled
+    /// (`hq-mod-core.7`). Enable the dependency or disable the dependent.
+    DisabledDependency {
+        /// The enabled module with the unsatisfiable dependency.
+        module: ModuleId,
+        /// The disabled module it depends on.
+        dependency: ModuleId,
     },
     /// The module dependency graph contains a cycle, so no init order exists.
     /// Holds the ids on or downstream of the cycle.
@@ -162,6 +214,9 @@ impl std::fmt::Display for BuildError {
         match self {
             BuildError::UnknownDependency { module, missing } => {
                 write!(f, "module {module} depends on unregistered module {missing}")
+            }
+            BuildError::DisabledDependency { module, dependency } => {
+                write!(f, "enabled module {module} depends on disabled module {dependency}")
             }
             BuildError::DependencyCycle(ids) => {
                 write!(f, "module dependency cycle among: ")?;
@@ -404,5 +459,56 @@ mod tests {
         let msg = err.to_string();
         assert!(msg.contains("beads.write"), "got: {msg}");
         assert!(msg.contains("audit") && msg.contains("beads"), "got: {msg}");
+    }
+
+    use crate::flags::DisabledModules;
+
+    #[test]
+    fn disabled_module_is_dropped_from_root() {
+        let flags = DisabledModules::new([ModuleId::new("rigs").unwrap()]);
+        let root = RootBuilder::new()
+            .module(Beads)
+            .module(Rigs)
+            .build_with_flags(&flags)
+            .unwrap();
+        let ids: Vec<&str> = root.modules().map(|m| m.id.as_str()).collect();
+        assert_eq!(ids, ["beads"]);
+    }
+
+    #[test]
+    fn disabling_a_dependency_used_by_enabled_module_is_rejected() {
+        // merge depends on beads; disabling beads leaves merge unsatisfiable.
+        let flags = DisabledModules::new([ModuleId::new("beads").unwrap()]);
+        let err = RootBuilder::new()
+            .module(Beads)
+            .module(Merge)
+            .build_with_flags(&flags)
+            .unwrap_err();
+        let BuildError::DisabledDependency { module, dependency } = err else {
+            panic!("expected DisabledDependency, got {err:?}");
+        };
+        assert_eq!(module.as_str(), "merge");
+        assert_eq!(dependency.as_str(), "beads");
+    }
+
+    #[test]
+    fn disabling_a_module_and_its_dependent_together_builds() {
+        // Disable both merge and its dependency beads — no dangling edge.
+        let flags =
+            DisabledModules::new([ModuleId::new("beads").unwrap(), ModuleId::new("merge").unwrap()]);
+        let root = RootBuilder::new()
+            .module(Beads)
+            .module(Merge)
+            .module(Rigs)
+            .build_with_flags(&flags)
+            .unwrap();
+        let ids: Vec<&str> = root.modules().map(|m| m.id.as_str()).collect();
+        assert_eq!(ids, ["rigs"]);
+    }
+
+    #[test]
+    fn build_defaults_to_all_enabled() {
+        let root = RootBuilder::new().module(Beads).module(Rigs).build().unwrap();
+        assert_eq!(root.len(), 2);
     }
 }
