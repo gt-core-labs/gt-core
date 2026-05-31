@@ -9,7 +9,9 @@ description = "GtModule trait + RootBuilder. Foundation for pluggable features i
 [dependencies]
 serde = { workspace = true }
 semver = { workspace = true }
+axum = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true }
 serde_json = { workspace = true }
+tower = { workspace = true, features = ["util"] }

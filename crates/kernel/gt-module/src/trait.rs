@@ -18,6 +18,8 @@
 //! registers an actor whose runtime handle is supplied by the binary
 //! (non-negotiable #14); it does not make trait methods `async`.
 
+use axum::Router;
+
 use crate::capability::Capability;
 use crate::mcp::McpRegistry;
 use crate::meta::{ModuleId, ModuleMeta};
@@ -84,6 +86,60 @@ pub trait GtModule {
     /// no-op so a module that serves no MCP tools — and a not-yet-ported one —
     /// implements nothing.
     fn register_mcp_tools(&self, _registry: &mut McpRegistry) {}
+
+    /// The HTTP routes this module contributes, as a self-contained
+    /// [`axum::Router`] (`hq-mod-routes.1`).
+    ///
+    /// The builder calls this once, in init order, when `.module()` registers the
+    /// module, and merges the returned routers into one application router
+    /// ([`RootBuilder`](crate::RootBuilder) → [`Root::into_router`](crate::Root::into_router)).
+    /// The composition root hand-wires nothing — it never calls
+    /// `Router::route` for a module (see `docs/03-architecture-guardrails.md`
+    /// rule 3 and the `register_routes` callout).
+    ///
+    /// ## Why the return type is state-erased (`Router<()>`)
+    ///
+    /// A module owns its dependencies (its repository ports, per the hexagonal
+    /// rule) and bakes them into its handlers with
+    /// [`Router::with_state`](axum::Router::with_state) *before* returning, so the
+    /// router the builder merges carries no outstanding state type. This keeps
+    /// modules decoupled: the kernel never learns a shared application-state type,
+    /// and two modules cannot collide on one. A module that needs runtime handles
+    /// at construction takes them in its own constructor (the trait takes `&self`,
+    /// so an implementor need not be zero-sized); the actor handles a module may
+    /// require are supplied by the binary (non-negotiable #14).
+    ///
+    /// Defaults to an empty router so a module that contributes no HTTP surface —
+    /// or one not yet ported — implements nothing. Path namespacing
+    /// (`/api/v1/<module>`) is applied by the builder in `hq-mod-routes.2`, and
+    /// per-route scope guards derived from [`capability`](GtModule::capability) in
+    /// `hq-mod-routes.3`; an implementor declares plain relative routes here.
+    ///
+    /// ```
+    /// use axum::{routing::get, Router};
+    /// use gt_module::{GtModule, ModuleId, ModuleMeta};
+    /// use semver::Version;
+    ///
+    /// struct BeadsModule;
+    ///
+    /// impl GtModule for BeadsModule {
+    ///     fn meta(&self) -> ModuleMeta {
+    ///         ModuleMeta::new(
+    ///             ModuleId::new("beads").unwrap(),
+    ///             "Beads",
+    ///             Version::new(1, 0, 0),
+    ///             "Issue tracking aggregate backed by Dolt.",
+    ///         )
+    ///     }
+    ///
+    ///     fn register_routes(&self) -> Router {
+    ///         Router::new().route("/beads", get(|| async { "[]" }))
+    ///     }
+    /// }
+    /// ```
+    fn register_routes(&self) -> Router {
+        Router::new()
+    }
 }
 
 #[cfg(test)]

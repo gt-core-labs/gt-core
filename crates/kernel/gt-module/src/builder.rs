@@ -31,6 +31,8 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
+use axum::Router;
+
 use crate::capability::Capability;
 use crate::flags::{AllEnabled, FeatureFlags};
 use crate::mcp::{McpRegistry, McpTool};
@@ -42,12 +44,25 @@ use crate::scope::Scope;
 ///
 /// Constructed with [`RootBuilder::new`], extended one module at a time through
 /// the generic [`module`](RootBuilder::module) method, and finalized with
-/// [`build`](RootBuilder::build). Holds extracted data only, so it is cheap and
-/// carries no runtime handles.
-#[derive(Debug, Default)]
+/// [`build`](RootBuilder::build). Holds the extracted per-module data plus each
+/// module's contributed [`Router`] (`hq-mod-routes.1`); it carries no runtime
+/// handles of its own — any a module needs are baked into its router.
+#[derive(Default)]
 pub struct RootBuilder {
     /// One entry per registered module, in registration order.
     entries: Vec<ModuleEntry>,
+    /// Each registered module's contributed router, parallel to `entries` by
+    /// index. A module that contributes no HTTP surface stores an empty router.
+    routers: Vec<Router>,
+}
+
+// `axum::Router` is not `Debug`; report the builder by the module ids it holds.
+impl std::fmt::Debug for RootBuilder {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RootBuilder")
+            .field("modules", &self.entries.iter().map(|e| &e.meta.id).collect::<Vec<_>>())
+            .finish()
+    }
 }
 
 /// Pure-data snapshot the builder keeps for one registered module.
@@ -89,6 +104,10 @@ impl RootBuilder {
             depends_on: module.dependencies(),
             mcp_tools: mcp.into_tools(),
         });
+        // Extract the module's HTTP contribution alongside its data, then drop
+        // the value. The router is self-contained (`Router<()>`); merging is
+        // deferred to `build()` so it happens in init order (`hq-mod-routes.1`).
+        self.routers.push(module.register_routes());
         self
     }
 
@@ -140,19 +159,28 @@ impl RootBuilder {
                 }
             }
         }
-        let enabled: Vec<ModuleEntry> = self
+        // Filter entries and their parallel routers in lockstep so a router
+        // stays aligned with its surviving module.
+        let (enabled, mut enabled_routers): (Vec<ModuleEntry>, Vec<Router>) = self
             .entries
             .into_iter()
-            .filter(|e| !disabled.contains(&e.meta.id))
-            .collect();
+            .zip(self.routers)
+            .filter(|(e, _)| !disabled.contains(&e.meta.id))
+            .unzip();
 
         // 3 + 4. Validate and order the surviving set.
         Self::check_scope_conflicts(&enabled)?;
         let order = crate::deps::resolve_order(&enabled)?;
         // Reorder into init order. The module set is a handful of entries, so
         // cloning by index is cheaper than threading an in-place permutation.
+        // Routers move out by index (each is taken exactly once) to avoid an
+        // `axum::Router` clone per module.
         let entries = order.iter().map(|&i| enabled[i].clone()).collect();
-        Ok(Root { entries })
+        let routers = order
+            .iter()
+            .map(|&i| std::mem::replace(&mut enabled_routers[i], Router::new()))
+            .collect();
+        Ok(Root { entries, routers })
     }
 
     /// Reject a stack where two distinct modules claim the same authorization
@@ -257,9 +285,18 @@ impl std::error::Error for BuildError {}
 /// with the wired routers, MCP tool tables, and lifecycle handles; for now it
 /// exposes the module list so the composition root and diagnostics can enumerate
 /// what was loaded.
-#[derive(Debug)]
 pub struct Root {
     entries: Vec<ModuleEntry>,
+    /// Each module's contributed router, parallel to `entries`, in init order
+    /// (`hq-mod-routes.1`). Consumed by [`into_router`](Root::into_router).
+    routers: Vec<Router>,
+}
+
+// `axum::Router` is not `Debug`; report the root by its module metadata.
+impl std::fmt::Debug for Root {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Root").field("modules", &self.entries).finish()
+    }
 }
 
 impl Root {
@@ -296,6 +333,25 @@ impl Root {
     /// drop with it.
     pub fn mcp_tools(&self) -> impl Iterator<Item = &McpTool> {
         self.entries.iter().flat_map(|e| e.mcp_tools.iter())
+    }
+
+    /// Merge every module's contributed routes into one application
+    /// [`Router`] (`hq-mod-routes.1`).
+    ///
+    /// Routers are merged in init order (each module after its dependencies), so
+    /// the composition root obtains a fully wired router without naming a single
+    /// route. With no modules — or only modules that contribute no HTTP surface —
+    /// this is an empty router.
+    ///
+    /// Path namespacing (`/api/v1/<module>`, `hq-mod-routes.2`) and per-route
+    /// scope guards (`hq-mod-routes.3`) hook into this merge as those beads land;
+    /// today it is a straight [`Router::merge`](axum::Router::merge), so two
+    /// modules declaring the same path collide exactly as axum specifies. Takes
+    /// `self` because an `axum::Router` is consumed by merge.
+    pub fn into_router(self) -> Router {
+        self.routers
+            .into_iter()
+            .fold(Router::new(), |app, module_router| app.merge(module_router))
     }
 }
 
@@ -612,5 +668,120 @@ mod tests {
             .build_with_flags(&flags)
             .unwrap();
         assert_eq!(root.mcp_tools().count(), 0);
+    }
+
+    // --- Router contribution (hq-mod-routes.1) ------------------------------
+
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode};
+    use axum::routing::get;
+    use axum::Router;
+    use tower::ServiceExt; // `oneshot`
+
+    /// Test module that contributes one GET route at a configurable path,
+    /// answering with its own id so the merged router proves which module served.
+    struct Routed {
+        id: &'static str,
+        path: &'static str,
+        deps: Vec<&'static str>,
+    }
+
+    impl Routed {
+        fn new(id: &'static str, path: &'static str) -> Self {
+            Routed { id, path, deps: Vec::new() }
+        }
+        fn with_dep(mut self, dep: &'static str) -> Self {
+            self.deps.push(dep);
+            self
+        }
+    }
+
+    impl GtModule for Routed {
+        fn meta(&self) -> ModuleMeta {
+            ModuleMeta::new(
+                ModuleId::new(self.id).unwrap(),
+                self.id,
+                Version::new(1, 0, 0),
+                "route-contributing test module",
+            )
+        }
+        fn dependencies(&self) -> Vec<ModuleId> {
+            self.deps.iter().map(|d| ModuleId::new(*d).unwrap()).collect()
+        }
+        fn register_routes(&self) -> Router {
+            let id = self.id;
+            Router::new().route(self.path, get(move || async move { id }))
+        }
+    }
+
+    /// GET `path` against `app`; returns the status (and body for 2xx).
+    async fn hit(app: Router, path: &str) -> (StatusCode, String) {
+        let res = app
+            .oneshot(Request::builder().uri(path).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        let status = res.status();
+        let bytes = axum::body::to_bytes(res.into_body(), usize::MAX).await.unwrap();
+        (status, String::from_utf8(bytes.to_vec()).unwrap())
+    }
+
+    #[tokio::test]
+    async fn module_route_is_reachable_through_root() {
+        let root = RootBuilder::new().module(Routed::new("beads", "/beads")).build().unwrap();
+        let (status, body) = hit(root.into_router(), "/beads").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body, "beads");
+    }
+
+    #[tokio::test]
+    async fn routes_from_multiple_modules_all_merge() {
+        let root = RootBuilder::new()
+            .module(Routed::new("beads", "/beads"))
+            .module(Routed::new("rigs", "/rigs"))
+            .build()
+            .unwrap();
+        let app = root.into_router();
+        assert_eq!(hit(app.clone(), "/beads").await, (StatusCode::OK, "beads".into()));
+        assert_eq!(hit(app, "/rigs").await, (StatusCode::OK, "rigs".into()));
+    }
+
+    #[tokio::test]
+    async fn module_with_no_routes_contributes_nothing() {
+        // `Beads` does not override `register_routes`; the default empty router
+        // means no path is served.
+        let root = RootBuilder::new().module(Beads).build().unwrap();
+        let (status, _) = hit(root.into_router(), "/anything").await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn disabled_module_route_is_dropped() {
+        let flags = DisabledModules::new([ModuleId::new("rigs").unwrap()]);
+        let root = RootBuilder::new()
+            .module(Routed::new("beads", "/beads"))
+            .module(Routed::new("rigs", "/rigs"))
+            .build_with_flags(&flags)
+            .unwrap();
+        let app = root.into_router();
+        assert_eq!(hit(app.clone(), "/beads").await.0, StatusCode::OK);
+        // The disabled module's route is absent.
+        assert_eq!(hit(app, "/rigs").await.0, StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn routers_kept_aligned_with_modules_after_reorder() {
+        // `merge` depends on `beads`, so build reorders it after `beads`. The
+        // router-ordering must follow the same permutation: both routes resolve.
+        let root = RootBuilder::new()
+            .module(Routed::new("merge", "/merge").with_dep("beads"))
+            .module(Routed::new("beads", "/beads"))
+            .build()
+            .unwrap();
+        // Sanity: build reordered beads before merge.
+        let ids: Vec<&str> = root.modules().map(|m| m.id.as_str()).collect();
+        assert_eq!(ids, ["beads", "merge"]);
+        let app = root.into_router();
+        assert_eq!(hit(app.clone(), "/beads").await, (StatusCode::OK, "beads".into()));
+        assert_eq!(hit(app, "/merge").await, (StatusCode::OK, "merge".into()));
     }
 }

@@ -29,6 +29,12 @@
 //! The `hq-mod-core` sub-epic is complete: this crate is the module-system
 //! foundation the rest of `hq-mod` (routes, MCP, events, migrate, flags,
 //! frontend, contracts, refactor) builds on.
+//!
+//! ## Routes
+//!
+//! - [`GtModule::register_routes`] — a module contributes a self-contained
+//!   [`axum::Router`]; the builder merges them in init order and exposes the
+//!   application router through [`Root::into_router`] (`hq-mod-routes.1`).
 
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
