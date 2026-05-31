@@ -9,15 +9,20 @@
 //! - [`FlagKey`] — dotted-kebab flag identity (`module.beads`, `feature.dark-mode`).
 //! - [`FeatureFlag`] — a flag definition with its default state.
 //! - [`evaluate`] — resolve a flag's effective state from default + optional override.
+//! - [`FeatureFlags`] — repository port for per-workspace overrides, with
+//!   [`InMemoryFeatureFlags`] and the [`FeatureFlagsExt::is_enabled`] resolver.
 //!
-//! Part of the gt-core module system (`hq-mod`).
+//! Part of the gt-core module system (`hq-mod`). The Postgres adapter lives in
+//! `gt-store-pg` (`hq-mod-flags.3`).
 
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
 mod key;
+mod repo;
 
 pub use key::{FlagKey, FlagKeyError};
+pub use repo::{FeatureFlags, FeatureFlagsExt, FlagError, InMemoryFeatureFlags};
 
 /// A feature flag definition: its identity plus the state it takes when no
 /// override exists.
