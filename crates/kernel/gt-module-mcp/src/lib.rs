@@ -25,6 +25,8 @@
 
 use gt_module::Root;
 
+pub mod taxonomy;
+
 /// Generate a JSON Schema [`Value`](serde_json::Value) for a type's MCP input.
 ///
 /// Thin wrapper over `schemars` so a module declares a tool's argument shape
