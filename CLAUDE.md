@@ -15,6 +15,7 @@ Foundational module system + multi-tenant primitives for Gas Town and downstream
 - Hexagonal: domain crate = Port + InMemory; PG adapter optional in `gt-store-pg-<X>`.
 - `cargo build` green + replay byte-for-byte gate green before PR (gate required on every change touching events/reducers).
 - One bead per branch, conventional commits (`feat(gt-module): ...`). ff-merge to `main` from TOWN ROOT, never from a worktree.
+- **Anti-overlap:** never `git merge` straight to `main`. Use `git mainmerge <branch>` (`~/.claude/bin/gt-main-merge.sh`): flock serializes concurrent sessions + `--ff-only` ancestry check fails clean if main advanced (orchestrator race) → rebase and re-run. Don't bypass with a raw merge.
 - Migration from gastown to gt-core is crate-by-crate (see [docs/01-migration-plan.md](docs/01-migration-plan.md)). Do NOT move gt-events/gt-bus/gt-audit/gt-plugin/gt-telemetry until `hq-mod-refactor.10..12` closes with replay green.
 - gastown stays the consumer while gt-core stabilizes. Don't touch gastown except for wiring (path patch) or a planned crate port.
 - Gap in tooling/spec → `meta.report_gap`, never improvise. Stop-the-line on any conflict with docs/04.
