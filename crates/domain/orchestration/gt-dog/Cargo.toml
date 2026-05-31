@@ -8,10 +8,10 @@ description = "Dog worker abstraction + DogDispatcher + Gate evaluator + PluginE
 
 [dependencies]
 serde = { workspace = true }
+serde_json = { workspace = true }
 async-trait = { workspace = true }
 gt-module = { workspace = true }
 gt-hooks = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true }
-serde_json = { workspace = true }

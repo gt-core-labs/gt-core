@@ -22,8 +22,11 @@
 //! - [`Notification`] + [`Notifier`] + [`notify_failure`] — surfacing a failed
 //!   run to an operator via the `gt-notify` port (`hq-mod-dogs.6`).
 //!
-//! Still to come on this epic: the `Gate` evaluator (`.3`), MCP claim tools
-//! (`.7`), the per-workspace pool (`.8`), and the end-to-end test (`.9`).
+//! - [`mcp`] — the `dog.claim.{validate,execute}`, `dog.release.execute`,
+//!   `dog.status.read` MCP tools and their payload parsing (`hq-mod-dogs.7`).
+//!
+//! Still to come on this epic: the `Gate` evaluator (`.3`), the per-workspace
+//! pool (`.8`), and the end-to-end test (`.9`).
 
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
@@ -31,6 +34,7 @@
 mod dispatcher;
 mod dog;
 mod executor;
+pub mod mcp;
 mod notify;
 mod state;
 mod tracking;
