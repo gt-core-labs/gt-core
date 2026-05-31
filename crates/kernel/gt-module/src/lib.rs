@@ -59,6 +59,7 @@ mod flags;
 mod hook;
 mod mcp;
 mod meta;
+mod migrate;
 mod routes;
 mod scope;
 #[path = "trait.rs"]
@@ -71,6 +72,7 @@ pub use flags::{AllEnabled, DisabledModules, FeatureFlags};
 pub use hook::HookPoint;
 pub use mcp::{McpRegistry, McpTool, McpToolNameError};
 pub use meta::{ModuleId, ModuleIdError, ModuleMeta};
+pub use migrate::Migration;
 pub use module_trait::GtModule;
 pub use routes::{module_prefix, API_BASE};
 pub use scope::{Scope, ScopeError};

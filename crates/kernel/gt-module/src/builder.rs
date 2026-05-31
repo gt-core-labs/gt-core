@@ -38,6 +38,7 @@ use crate::flags::{AllEnabled, FeatureFlags};
 use crate::hook::HookPoint;
 use crate::mcp::{McpRegistry, McpTool, McpToolNameError};
 use crate::meta::{ModuleId, ModuleMeta};
+use crate::migrate::Migration;
 use crate::module_trait::GtModule;
 use crate::scope::Scope;
 
@@ -78,6 +79,9 @@ pub(crate) struct ModuleEntry {
     pub(crate) depends_on: Vec<ModuleId>,
     /// MCP tools this module contributes, in declaration order (`hq-mod-mcp.1`).
     pub(crate) mcp_tools: Vec<McpTool>,
+    /// SQL migrations this module owns, as returned (`hq-mod-migrate.1`); the
+    /// builder validates and the [`Root`] exposes them version-sorted.
+    pub(crate) migrations: Vec<Migration>,
 }
 
 impl RootBuilder {
@@ -104,6 +108,7 @@ impl RootBuilder {
             capability: module.capability(),
             depends_on: module.dependencies(),
             mcp_tools: mcp.into_tools(),
+            migrations: module.migrations(),
         });
         // Extract the module's HTTP contribution alongside its data, then drop
         // the value. The router is self-contained (`Router<()>`); merging is
@@ -172,6 +177,7 @@ impl RootBuilder {
         // 3 + 4. Validate and order the surviving set.
         Self::check_scope_conflicts(&enabled)?;
         Self::check_tool_namespacing(&enabled)?;
+        Self::check_migration_versions(&enabled)?;
         let order = crate::deps::resolve_order(&enabled)?;
         // Reorder into init order. The module set is a handful of entries, so
         // cloning by index is cheaper than threading an in-place permutation.
@@ -243,6 +249,29 @@ impl RootBuilder {
         }
         Ok(())
     }
+
+    /// Reject a module whose migrations reuse a version number (`hq-mod-migrate.1`).
+    ///
+    /// Versions are the apply order within a module, so a duplicate is
+    /// ambiguous — two distinct migrations claiming the same slot. Versions need
+    /// not be contiguous and need not be declared in order (the [`Root`] sorts
+    /// them); they only need to be unique per module. Modules are visited in
+    /// registration order and versions in declaration order, so a malformed
+    /// stack always reports the same first offender.
+    fn check_migration_versions(entries: &[ModuleEntry]) -> Result<(), BuildError> {
+        for entry in entries {
+            let mut seen = BTreeSet::new();
+            for migration in &entry.migrations {
+                if !seen.insert(migration.version) {
+                    return Err(BuildError::DuplicateMigrationVersion {
+                        module: entry.meta.id.clone(),
+                        version: migration.version,
+                    });
+                }
+            }
+        }
+        Ok(())
+    }
 }
 
 /// Why [`RootBuilder::build`] rejected a module set.
@@ -299,6 +328,14 @@ pub enum BuildError {
         /// The leading segment it used instead of `module`.
         prefix: String,
     },
+    /// A module declared two migrations with the same version (`hq-mod-migrate.1`).
+    /// Versions must be unique within a module.
+    DuplicateMigrationVersion {
+        /// The module with the colliding migrations.
+        module: ModuleId,
+        /// The version claimed more than once.
+        version: u32,
+    },
 }
 
 impl std::fmt::Display for BuildError {
@@ -336,6 +373,9 @@ impl std::fmt::Display for BuildError {
                     f,
                     "module {module} contributes MCP tool `{tool}` under foreign namespace `{prefix}`"
                 )
+            }
+            BuildError::DuplicateMigrationVersion { module, version } => {
+                write!(f, "module {module} declares migration version {version} more than once")
             }
         }
     }
@@ -416,6 +456,23 @@ impl Root {
                 .iter()
                 .map(move |&point| (&e.meta.id, point))
         })
+    }
+
+    /// The ordered migration apply plan (`hq-mod-migrate.1`).
+    ///
+    /// Each entry pairs the owning [`ModuleId`] (the migration's directory
+    /// namespace) with the [`Migration`]. Ordered for application: modules in
+    /// dependency-first init order — the same order [`modules`](Root::modules)
+    /// reports — and, within a module, ascending [`Migration::version`].
+    /// Disabled modules' migrations never appear (they dropped with their entry).
+    pub fn migrations(&self) -> Vec<(&ModuleId, &Migration)> {
+        let mut plan = Vec::new();
+        for entry in &self.entries {
+            let mut ms: Vec<&Migration> = entry.migrations.iter().collect();
+            ms.sort_by_key(|m| m.version);
+            plan.extend(ms.into_iter().map(|m| (&entry.meta.id, m)));
+        }
+        plan
     }
 
     /// Mount every module's contributed routes into one application
@@ -1064,5 +1121,101 @@ mod tests {
             .unwrap();
         let ids: Vec<&str> = root.modules().map(|m| m.id.as_str()).collect();
         assert_eq!(ids, ["rigs"]);
+    }
+
+    // --- Migrations (hq-mod-migrate.1) --------------------------------------
+
+    use crate::migrate::Migration;
+
+    /// Module contributing migrations declared out of version order, plus an
+    /// optional dependency, for plan-ordering tests.
+    struct Migrated {
+        id: &'static str,
+        versions: Vec<u32>,
+        deps: Vec<&'static str>,
+    }
+    impl Migrated {
+        fn new(id: &'static str, versions: &[u32]) -> Self {
+            Migrated { id, versions: versions.to_vec(), deps: Vec::new() }
+        }
+        fn with_dep(mut self, dep: &'static str) -> Self {
+            self.deps.push(dep);
+            self
+        }
+    }
+    impl GtModule for Migrated {
+        fn meta(&self) -> ModuleMeta {
+            ModuleMeta::new(
+                ModuleId::new(self.id).unwrap(),
+                self.id,
+                Version::new(1, 0, 0),
+                "migration test module",
+            )
+        }
+        fn dependencies(&self) -> Vec<ModuleId> {
+            self.deps.iter().map(|d| ModuleId::new(*d).unwrap()).collect()
+        }
+        fn migrations(&self) -> Vec<Migration> {
+            self.versions.iter().map(|v| Migration::new(*v, format!("m{v}"), "")).collect()
+        }
+    }
+
+    #[test]
+    fn module_with_no_migrations_has_empty_plan() {
+        let root = RootBuilder::new().module(Beads).build().unwrap();
+        assert!(root.migrations().is_empty());
+    }
+
+    #[test]
+    fn plan_sorts_by_version_within_module() {
+        // Declared 3, 1, 2 — plan must apply 1, 2, 3.
+        let root = RootBuilder::new().module(Migrated::new("beads", &[3, 1, 2])).build().unwrap();
+        let versions: Vec<u32> = root.migrations().iter().map(|(_, m)| m.version).collect();
+        assert_eq!(versions, [1, 2, 3]);
+    }
+
+    #[test]
+    fn plan_orders_modules_dependency_first() {
+        // merge depends on beads; even registered first, beads' migrations apply first.
+        let root = RootBuilder::new()
+            .module(Migrated::new("merge", &[1]).with_dep("beads"))
+            .module(Migrated::new("beads", &[1]))
+            .build()
+            .unwrap();
+        let owners: Vec<&str> = root.migrations().iter().map(|(id, _)| id.as_str()).collect();
+        assert_eq!(owners, ["beads", "merge"]);
+    }
+
+    #[test]
+    fn duplicate_version_within_module_is_rejected() {
+        let err = RootBuilder::new().module(Migrated::new("beads", &[1, 2, 1])).build().unwrap_err();
+        let BuildError::DuplicateMigrationVersion { module, version } = err else {
+            panic!("expected DuplicateMigrationVersion, got {err:?}");
+        };
+        assert_eq!(module.as_str(), "beads");
+        assert_eq!(version, 1);
+    }
+
+    #[test]
+    fn same_version_across_modules_is_allowed() {
+        // Versions are namespaced per module; beads v1 and rigs v1 do not collide.
+        let root = RootBuilder::new()
+            .module(Migrated::new("beads", &[1]))
+            .module(Migrated::new("rigs", &[1]))
+            .build()
+            .unwrap();
+        assert_eq!(root.migrations().len(), 2);
+    }
+
+    #[test]
+    fn disabled_module_migrations_are_dropped() {
+        let flags = DisabledModules::new([ModuleId::new("beads").unwrap()]);
+        let root = RootBuilder::new()
+            .module(Migrated::new("beads", &[1, 2]))
+            .module(Migrated::new("rigs", &[1]))
+            .build_with_flags(&flags)
+            .unwrap();
+        let owners: Vec<&str> = root.migrations().iter().map(|(id, _)| id.as_str()).collect();
+        assert_eq!(owners, ["rigs"]);
     }
 }

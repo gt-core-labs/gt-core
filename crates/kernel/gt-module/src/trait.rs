@@ -23,6 +23,7 @@ use axum::Router;
 use crate::capability::Capability;
 use crate::mcp::McpRegistry;
 use crate::meta::{ModuleId, ModuleMeta};
+use crate::migrate::Migration;
 
 /// A pluggable feature: one crate, registered with the builder in one line.
 ///
@@ -86,6 +87,19 @@ pub trait GtModule {
     /// no-op so a module that serves no MCP tools — and a not-yet-ported one —
     /// implements nothing.
     fn register_mcp_tools(&self, _registry: &mut McpRegistry) {}
+
+    /// The SQL migrations this module owns (`hq-mod-migrate.1`).
+    ///
+    /// Returned in any order; the builder sorts by [`Migration::version`] within
+    /// the module and applies modules in dependency-first init order. Versions
+    /// must be unique within a module — the builder rejects a duplicate
+    /// ([`BuildError::DuplicateMigrationVersion`](crate::BuildError::DuplicateMigrationVersion)).
+    /// Defaults to none, so a module with no schema of its own — or one not yet
+    /// ported — implements nothing. A module typically supplies each migration's
+    /// SQL with `include_str!` from its `migrations/<module-id>/` directory.
+    fn migrations(&self) -> Vec<Migration> {
+        Vec::new()
+    }
 
     /// The HTTP routes this module contributes, as a self-contained
     /// [`axum::Router`] (`hq-mod-routes.1`).
