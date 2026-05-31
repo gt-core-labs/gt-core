@@ -16,9 +16,12 @@
 //! - Dependency-cycle detection + topological init ordering — `build()` orders
 //!   modules so each follows its dependencies, rejecting cycles and dangling
 //!   references via [`BuildError`] (`hq-mod-core.5`).
+//! - Capability-scope conflict detection — [`Capability`] now carries the scopes
+//!   a module claims, and `build()` rejects two modules claiming the same one
+//!   (`hq-mod-core.6`).
 //!
-//! Still to come on this epic: capability-conflict detection (`.6`), feature-flag
-//! filtering (`.7`), the test matrix (`.8`). Each grows a [`BuildError`] variant
+//! Still to come on this epic: feature-flag filtering (`.7`), the test matrix
+//! (`.8`). Each grows a [`BuildError`] variant
 //! — the `build()` signature is already fallible.
 
 #![forbid(unsafe_code)]

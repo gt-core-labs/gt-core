@@ -21,16 +21,20 @@
 //! slot in without churning the signature:
 //!
 //! - dependency-cycle detection + topological ordering — `hq-mod-core.5` (done)
-//! - capability-conflict detection — `hq-mod-core.6`
+//! - capability-conflict detection — `hq-mod-core.6` (done)
 //! - feature-flag filtering of disabled modules — `hq-mod-core.7`
 //!
 //! Each grows a [`BuildError`] variant. As of `.5`, `build()` orders the
 //! registered modules so each appears after every module it depends on (see
-//! [`crate::deps`]).
+//! [`crate::deps`]); as of `.6` it also rejects two modules claiming the same
+//! authorization scope.
+
+use std::collections::{BTreeMap, BTreeSet};
 
 use crate::capability::Capability;
 use crate::meta::{ModuleId, ModuleMeta};
 use crate::module_trait::GtModule;
+use crate::scope::Scope;
 
 /// Accumulates modules and assembles them into a [`Root`].
 ///
@@ -80,25 +84,56 @@ impl RootBuilder {
 
     /// Finalize the registry.
     ///
-    /// Resolves module init order so each module appears after every module it
-    /// depends on, rejecting dependency cycles and references to unregistered
-    /// modules ([`crate::deps`], `hq-mod-core.5`). Later beads add further
-    /// [`BuildError`] variants (`.6` capability conflicts, `.7` flags) without
-    /// changing this signature.
+    /// Runs the validation passes and either hands back the assembled [`Root`]
+    /// or the first [`BuildError`]:
+    ///
+    /// - no two modules claim the same authorization scope (`hq-mod-core.6`);
+    /// - the dependency graph is acyclic and fully resolved, yielding the init
+    ///   order each module appears after its dependencies ([`crate::deps`],
+    ///   `hq-mod-core.5`).
+    ///
+    /// Flag filtering (`.7`) slots in here without changing this signature.
     pub fn build(self) -> Result<Root, BuildError> {
+        Self::check_scope_conflicts(&self.entries)?;
         let order = crate::deps::resolve_order(&self.entries)?;
         // Reorder into init order. The module set is a handful of entries, so
         // cloning by index is cheaper than threading an in-place permutation.
         let entries = order.iter().map(|&i| self.entries[i].clone()).collect();
         Ok(Root { entries })
     }
+
+    /// Reject a stack where two distinct modules claim the same authorization
+    /// scope (`hq-mod-core.6`).
+    ///
+    /// A scope names a single source of truth for a `<resource>.<verb>`
+    /// authority; two modules owning it is a wiring bug (overlapping route
+    /// guards, ambiguous audit attribution). Detection is deterministic: scopes
+    /// are visited in sorted order, so a given malformed stack always reports the
+    /// same conflict. A module listing the same scope twice is not a conflict —
+    /// only distinct claimants count.
+    fn check_scope_conflicts(entries: &[ModuleEntry]) -> Result<(), BuildError> {
+        let mut claimants: BTreeMap<&Scope, BTreeSet<&ModuleId>> = BTreeMap::new();
+        for entry in entries {
+            for scope in entry.capability.scopes() {
+                claimants.entry(scope).or_default().insert(&entry.meta.id);
+            }
+        }
+        for (scope, owners) in claimants {
+            if owners.len() > 1 {
+                return Err(BuildError::ScopeConflict {
+                    scope: scope.clone(),
+                    claimants: owners.into_iter().cloned().collect(),
+                });
+            }
+        }
+        Ok(())
+    }
 }
 
 /// Why [`RootBuilder::build`] rejected a module set.
 ///
-/// Marked `#[non_exhaustive]` so later validation beads (`.6` capability
-/// conflicts, `.7` flags) can add variants — and so downstream `match` arms keep
-/// a wildcard from day one.
+/// Marked `#[non_exhaustive]` so the remaining validation bead (`.7` flags) can
+/// add variants — and so downstream `match` arms keep a wildcard from day one.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum BuildError {
@@ -112,6 +147,14 @@ pub enum BuildError {
     /// The module dependency graph contains a cycle, so no init order exists.
     /// Holds the ids on or downstream of the cycle.
     DependencyCycle(Vec<ModuleId>),
+    /// Two or more distinct modules claim the same authorization scope
+    /// (`hq-mod-core.6`). A scope must have exactly one owning module.
+    ScopeConflict {
+        /// The contested `<resource>.<verb>` scope.
+        scope: Scope,
+        /// The modules claiming it, sorted by id (always 2+).
+        claimants: Vec<ModuleId>,
+    },
 }
 
 impl std::fmt::Display for BuildError {
@@ -129,6 +172,14 @@ impl std::fmt::Display for BuildError {
                     write!(f, "{id}")?;
                 }
                 Ok(())
+            }
+            BuildError::ScopeConflict { scope, claimants } => {
+                let ids: Vec<&str> = claimants.iter().map(ModuleId::as_str).collect();
+                write!(
+                    f,
+                    "scope `{scope}` is claimed by multiple modules: {}",
+                    ids.join(", ")
+                )
             }
         }
     }
@@ -256,5 +307,102 @@ mod tests {
         // Merge depends on beads, which is never registered.
         let err = RootBuilder::new().module(Merge).build().unwrap_err();
         assert!(matches!(err, BuildError::UnknownDependency { .. }));
+    }
+
+    use crate::scope::Scope;
+
+    /// Module with a configurable id + claimed scopes, for conflict tests.
+    struct Claimer {
+        id: &'static str,
+        scopes: Vec<&'static str>,
+    }
+
+    impl GtModule for Claimer {
+        fn meta(&self) -> ModuleMeta {
+            ModuleMeta::new(
+                ModuleId::new(self.id).unwrap(),
+                self.id,
+                Version::new(1, 0, 0),
+                "scope-claiming test module",
+            )
+        }
+
+        fn capability(&self) -> Capability {
+            Capability::empty().claiming_all(self.scopes.iter().map(|s| Scope::new(*s).unwrap()))
+        }
+    }
+
+    fn claimer(id: &'static str, scopes: &[&'static str]) -> Claimer {
+        Claimer { id, scopes: scopes.to_vec() }
+    }
+
+    #[test]
+    fn disjoint_scopes_build_cleanly() {
+        let root = RootBuilder::new()
+            .module(claimer("beads", &["beads.read", "beads.write"]))
+            .module(claimer("rigs", &["rigs.read"]))
+            .build()
+            .unwrap();
+        assert_eq!(root.len(), 2);
+    }
+
+    #[test]
+    fn two_modules_same_scope_conflict() {
+        let err = RootBuilder::new()
+            .module(claimer("beads", &["beads.write"]))
+            .module(claimer("beads-legacy", &["beads.write"]))
+            .build()
+            .unwrap_err();
+        let BuildError::ScopeConflict { scope, claimants } = err else {
+            panic!("expected ScopeConflict, got {err:?}");
+        };
+        assert_eq!(scope, Scope::new("beads.write").unwrap());
+        // Sorted by id, both claimants present.
+        let ids: Vec<String> = claimants.iter().map(|m| m.to_string()).collect();
+        assert_eq!(ids, ["beads", "beads-legacy"]);
+    }
+
+    #[test]
+    fn same_module_repeating_a_scope_is_not_a_conflict() {
+        // One module listing the same scope twice is harmless.
+        let root = RootBuilder::new()
+            .module(claimer("beads", &["beads.write", "beads.write"]))
+            .build()
+            .unwrap();
+        assert_eq!(root.len(), 1);
+    }
+
+    #[test]
+    fn conflict_detection_is_deterministic() {
+        // Two independent conflicts; the lexicographically-first scope wins.
+        let make = || {
+            RootBuilder::new()
+                .module(claimer("a", &["alpha.read"]))
+                .module(claimer("b", &["alpha.read", "zeta.read"]))
+                .module(claimer("c", &["zeta.read"]))
+                .build()
+                .unwrap_err()
+        };
+        let BuildError::ScopeConflict { scope, .. } = make() else {
+            panic!("expected ScopeConflict");
+        };
+        assert_eq!(scope, Scope::new("alpha.read").unwrap());
+        // Repeated runs report the same scope.
+        let BuildError::ScopeConflict { scope: again, .. } = make() else {
+            panic!("expected ScopeConflict");
+        };
+        assert_eq!(again, Scope::new("alpha.read").unwrap());
+    }
+
+    #[test]
+    fn conflict_message_names_scope_and_modules() {
+        let err = RootBuilder::new()
+            .module(claimer("beads", &["beads.write"]))
+            .module(claimer("audit", &["beads.write"]))
+            .build()
+            .unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("beads.write"), "got: {msg}");
+        assert!(msg.contains("audit") && msg.contains("beads"), "got: {msg}");
     }
 }
