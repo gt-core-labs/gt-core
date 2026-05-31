@@ -54,6 +54,42 @@ pub struct Capability {
     /// cross-module subscribe live in `gt-events`/`gt-plugin` (later beads); this
     /// is the declaration the module system reasons about.
     emits: Vec<EventKind>,
+    /// Emitted event kinds the module has marked **deprecated** (`hq-mod-events.6`).
+    ///
+    /// A deprecated kind is one the module *still* emits — so it stays in
+    /// [`emits`](Self::emits) and keeps replaying — but plans to retire in favour
+    /// of a newer version. The declaration carries a free-text note (what to use
+    /// instead / why) that the emission boundary surfaces as a telemetry warning
+    /// when the kind is actually emitted, giving downstream subscribers a window
+    /// to migrate before the kind is dropped. Unlike [`emits`](Self::emits) this is
+    /// not exclusive ownership and there is no cross-module conflict check: a module
+    /// deprecates only kinds it already owns.
+    deprecations: Vec<Deprecation>,
+}
+
+/// A [`Capability`] declaration that an emitted [`EventKind`] is deprecated, plus
+/// the guidance shown when it is still emitted (`hq-mod-events.6`).
+///
+/// The `note` is the human-facing warning text — typically the replacement kind
+/// and/or the removal timeline (e.g. `"use bead.created.v2; v1 removed after the
+/// P5 cutover"`). It is required: a deprecation with no migration guidance is a
+/// warning nobody can act on.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Deprecation {
+    kind: EventKind,
+    note: String,
+}
+
+impl Deprecation {
+    /// The deprecated event kind.
+    pub fn kind(&self) -> &EventKind {
+        &self.kind
+    }
+
+    /// The migration guidance surfaced when the deprecated kind is emitted.
+    pub fn note(&self) -> &str {
+        &self.note
+    }
 }
 
 impl Capability {
@@ -130,6 +166,49 @@ impl Capability {
     pub fn emits(&self) -> &[EventKind] {
         &self.emits
     }
+
+    /// Mark an emitted event `kind` as deprecated, with `note` guidance. Chainable.
+    ///
+    /// Deprecation is orthogonal to [`emitting`](Self::emitting): the module keeps
+    /// emitting the kind (so call `emitting(k)` too, or `emitting_deprecated` to do
+    /// both at once), but the emission boundary surfaces `note` as a telemetry
+    /// warning each time the deprecated kind is emitted. Marking the same kind
+    /// twice keeps the last `note` wins behaviour of a lookup but records both in
+    /// declaration order; module authors should deprecate a kind once.
+    pub fn deprecating(mut self, kind: EventKind, note: impl Into<String>) -> Self {
+        self.deprecations.push(Deprecation { kind, note: note.into() });
+        self
+    }
+
+    /// Declare an emitted kind *and* mark it deprecated in one call. Chainable.
+    ///
+    /// Sugar for [`emitting`](Self::emitting) followed by
+    /// [`deprecating`](Self::deprecating): the kind appears in both
+    /// [`emits`](Self::emits) (it is still emitted and replayed) and
+    /// [`deprecations`](Self::deprecations) (it warns on emission).
+    pub fn emitting_deprecated(self, kind: EventKind, note: impl Into<String>) -> Self {
+        self.emitting(kind.clone()).deprecating(kind, note)
+    }
+
+    /// The deprecated event kinds and their guidance, in declaration order.
+    pub fn deprecations(&self) -> &[Deprecation] {
+        &self.deprecations
+    }
+
+    /// Whether `kind` has been marked deprecated.
+    pub fn is_deprecated(&self, kind: &EventKind) -> bool {
+        self.deprecations.iter().any(|d| &d.kind == kind)
+    }
+
+    /// The deprecation guidance for `kind`, or `None` if it is not deprecated.
+    ///
+    /// If a kind was deprecated more than once the first declaration wins.
+    pub fn deprecation_note(&self, kind: &EventKind) -> Option<&str> {
+        self.deprecations
+            .iter()
+            .find(|d| &d.kind == kind)
+            .map(Deprecation::note)
+    }
 }
 
 #[cfg(test)]
@@ -204,5 +283,64 @@ mod tests {
         assert!(cap.scopes().is_empty());
         assert!(cap.subscribed_hooks().is_empty());
         assert_eq!(cap.emits().len(), 1);
+    }
+
+    #[test]
+    fn empty_capability_deprecates_nothing() {
+        assert!(Capability::empty().deprecations().is_empty());
+    }
+
+    #[test]
+    fn deprecating_records_kind_and_note() {
+        let v1 = EventKind::new("bead.created.v1").unwrap();
+        let cap = Capability::empty()
+            .emitting(v1.clone())
+            .deprecating(v1.clone(), "use bead.created.v2");
+        assert!(cap.is_deprecated(&v1));
+        assert_eq!(cap.deprecation_note(&v1), Some("use bead.created.v2"));
+        assert_eq!(cap.deprecations().len(), 1);
+        assert_eq!(cap.deprecations()[0].kind(), &v1);
+        assert_eq!(cap.deprecations()[0].note(), "use bead.created.v2");
+    }
+
+    #[test]
+    fn emitting_deprecated_adds_to_both_emits_and_deprecations() {
+        let v1 = EventKind::new("bead.created.v1").unwrap();
+        let cap = Capability::empty().emitting_deprecated(v1.clone(), "removed after P5");
+        // Still emitted (replays), and flagged deprecated (warns).
+        assert_eq!(cap.emits(), [v1.clone()]);
+        assert!(cap.is_deprecated(&v1));
+        assert_eq!(cap.deprecation_note(&v1), Some("removed after P5"));
+    }
+
+    #[test]
+    fn non_deprecated_emitted_kind_has_no_note() {
+        let v2 = EventKind::new("bead.created.v2").unwrap();
+        let cap = Capability::empty()
+            .emitting_deprecated(EventKind::new("bead.created.v1").unwrap(), "use v2")
+            .emitting(v2.clone());
+        // v2 is emitted but not deprecated.
+        assert!(!cap.is_deprecated(&v2));
+        assert_eq!(cap.deprecation_note(&v2), None);
+    }
+
+    #[test]
+    fn deprecation_note_returns_first_on_duplicate() {
+        let v1 = EventKind::new("bead.created.v1").unwrap();
+        let cap = Capability::empty()
+            .deprecating(v1.clone(), "first")
+            .deprecating(v1.clone(), "second");
+        assert_eq!(cap.deprecation_note(&v1), Some("first"));
+        assert_eq!(cap.deprecations().len(), 2);
+    }
+
+    #[test]
+    fn deprecation_serde_roundtrips() {
+        let v1 = EventKind::new("bead.created.v1").unwrap();
+        let cap = Capability::empty().emitting_deprecated(v1.clone(), "use v2");
+        let json = serde_json::to_string(&cap).unwrap();
+        let back: Capability = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, cap);
+        assert_eq!(back.deprecation_note(&v1), Some("use v2"));
     }
 }

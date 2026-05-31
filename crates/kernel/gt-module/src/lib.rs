@@ -73,7 +73,7 @@ mod scope;
 mod module_trait;
 
 pub use builder::{BuildError, Root, RootBuilder};
-pub use capability::Capability;
+pub use capability::{Capability, Deprecation};
 pub use event_kind::{EventKind, EventKindError};
 pub use flags::{AllEnabled, DisabledModules, FeatureFlags};
 pub use hook::HookPoint;
