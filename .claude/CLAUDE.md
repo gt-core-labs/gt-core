@@ -1,6 +1,6 @@
 - LEER ANTES de tocar codigo: docs/04-non-negotiables.md (15 invariantes portados de gastown) + docs/03-architecture-guardrails.md + docs/02-sse-pattern.md. Reglas son INVARIANTES, no preferencias. Gap = `meta.report_gap`, NO improvisar. Stop-the-line si conflicto con doc/04.
 - planning + bead tracking via gt-mcp (http://127.0.0.1:8765/mcp). hq.issues lives in gastown's Dolt; tracking stays there until we add a dedicated gt-core surface.
-- comentarios en ingles
+- comentarios  y documentacion en ingles
 - todo desarrollo pasa por un bead reclamado en hq-mod-* o hq-mt-*. revisar `gt://issues?external_ref=hq-mod-core` antes de empezar
 - branch off main, worktree en /home/nixos/gt-core-wt-<bead-id>. NUNCA /tmp (tmpfs RAM)
 - antes de claim: `git log --all --grep <bead-id>` para evitar hijack (memoria feedback_worktree_hijack_parallel aplica aquí también)
