@@ -9,4 +9,4 @@ description = "axum router composition per GtModule. Scope guards + OpenAPI per 
 [dependencies]
 axum = { workspace = true }
 tower = { workspace = true }
-gt-module = { path = "../gt-module" }
+gt-module = { workspace = true }

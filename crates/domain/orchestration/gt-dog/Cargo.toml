@@ -9,5 +9,5 @@ description = "Dog worker abstraction + DogDispatcher + Gate evaluator + PluginE
 [dependencies]
 serde = { workspace = true }
 async-trait = { workspace = true }
-gt-module = { path = "../../../kernel/gt-module" }
-gt-hooks = { path = "../../../kernel/gt-hooks" }
+gt-module = { workspace = true }
+gt-hooks = { workspace = true }

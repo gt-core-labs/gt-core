@@ -8,4 +8,4 @@ description = "Per-module SQL migration loader. sqlx multi-source aggregation."
 
 [dependencies]
 sqlx = { workspace = true }
-gt-module = { path = "../gt-module" }
+gt-module = { workspace = true }

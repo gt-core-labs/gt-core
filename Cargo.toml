@@ -1,18 +1,18 @@
 [workspace]
 resolver = "2"
 members = [
-    "apps/api/crates/kernel/gt-module",
-    "apps/api/crates/kernel/gt-mod-routes",
-    "apps/api/crates/kernel/gt-mod-mcp",
-    "apps/api/crates/kernel/gt-mod-events",
-    "apps/api/crates/kernel/gt-mod-migrate",
-    "apps/api/crates/kernel/gt-mod-contracts",
-    "apps/api/crates/kernel/gt-feature-flags",
-    "apps/api/crates/kernel/gt-hooks",
-    "apps/api/crates/domain/platform/gt-workspace",
-    "apps/api/crates/domain/orchestration/gt-webhooks",
-    "apps/api/crates/domain/orchestration/gt-dog",
-    "apps/api/examples/mod-hello",
+    "crates/kernel/gt-module",
+    "crates/kernel/gt-mod-routes",
+    "crates/kernel/gt-mod-mcp",
+    "crates/kernel/gt-mod-events",
+    "crates/kernel/gt-mod-migrate",
+    "crates/kernel/gt-mod-contracts",
+    "crates/kernel/gt-feature-flags",
+    "crates/kernel/gt-hooks",
+    "crates/domain/platform/gt-workspace",
+    "crates/domain/orchestration/gt-webhooks",
+    "crates/domain/orchestration/gt-dog",
+    "examples/mod-hello",
 ]
 
 [workspace.package]
@@ -44,14 +44,22 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 opentelemetry = "0.27"
 
-# Reused from gastown via path patch (see [patch.crates-io] in app workspaces)
-# gt-events    — domain event primitives (lives in gastown for now)
-# gt-bus       — sync bus (lives in gastown for now)
-# gt-audit     — event log (lives in gastown for now)
-# gt-plugin    — observer plugin trait (lives in gastown for now)
-# gt-telemetry — OTel adapter (lives in gastown for now)
-# These move into apps/api/crates/kernel/ after hq-mod-refactor train ships
-# and replay byte-for-byte gate is green.
+# Internal crates — referenced as `<name> = { workspace = true }` from member Cargo.toml.
+# Path-centralized here so members never juggle relative paths across tiers.
+gt-module        = { path = "crates/kernel/gt-module" }
+gt-mod-routes    = { path = "crates/kernel/gt-mod-routes" }
+gt-mod-mcp       = { path = "crates/kernel/gt-mod-mcp" }
+gt-mod-events    = { path = "crates/kernel/gt-mod-events" }
+gt-mod-migrate   = { path = "crates/kernel/gt-mod-migrate" }
+gt-mod-contracts = { path = "crates/kernel/gt-mod-contracts" }
+gt-feature-flags = { path = "crates/kernel/gt-feature-flags" }
+gt-hooks         = { path = "crates/kernel/gt-hooks" }
+gt-workspace     = { path = "crates/domain/platform/gt-workspace" }
+gt-webhooks      = { path = "crates/domain/orchestration/gt-webhooks" }
+gt-dog           = { path = "crates/domain/orchestration/gt-dog" }
+
+# Reused from gastown until P4 (foundation kernel crates):
+# gt-events, gt-bus, gt-audit, gt-plugin, gt-telemetry remain in gastown.
 
 [profile.release]
 lto = "thin"

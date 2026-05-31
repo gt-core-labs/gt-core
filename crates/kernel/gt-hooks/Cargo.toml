@@ -9,4 +9,4 @@ description = "Declarative HookPoint + HookHandler + HookRegistry. Lifecycle int
 [dependencies]
 serde = { workspace = true }
 async-trait = { workspace = true }
-gt-module = { path = "../gt-module" }
+gt-module = { workspace = true }
