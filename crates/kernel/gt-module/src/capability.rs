@@ -13,6 +13,7 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::event_kind::EventKind;
 use crate::hook::HookPoint;
 use crate::scope::Scope;
 
@@ -41,6 +42,18 @@ pub struct Capability {
     /// the same point may be observed by many modules — observation is not
     /// exclusive ownership — so no conflict check applies.
     subscribed_hooks: Vec<HookPoint>,
+    /// Versioned event kinds this module emits — i.e. owns as the source of truth
+    /// (`hq-mod-events.1`).
+    ///
+    /// Each [`EventKind`] is a `<module>.<noun>.v<N>` identifier the module is the
+    /// sole emitter of. v1 and v2 of the same noun are distinct kinds and may be
+    /// emitted side by side during a migration (guardrail rule 5: versioned,
+    /// replay-safe). Like [`scopes`](Self::scopes) this is exclusive ownership: two
+    /// modules declaring the same emitted kind+version is a wiring bug the builder
+    /// rejects (`hq-mod-events.5`). The append-only emission, replay reducers, and
+    /// cross-module subscribe live in `gt-events`/`gt-plugin` (later beads); this
+    /// is the declaration the module system reasons about.
+    emits: Vec<EventKind>,
 }
 
 impl Capability {
@@ -95,6 +108,28 @@ impl Capability {
     pub fn subscribed_hooks(&self) -> &[HookPoint] {
         &self.subscribed_hooks
     }
+
+    /// Declare that this module emits (owns) event `kind`. Chainable.
+    ///
+    /// A module is the single source of truth for the kinds it emits. Listing the
+    /// same kind twice within one module is harmless and collapses in the
+    /// ownership check; that check (`hq-mod-events.5`) only flags the *same*
+    /// kind+version emitted by two *different* modules.
+    pub fn emitting(mut self, kind: EventKind) -> Self {
+        self.emits.push(kind);
+        self
+    }
+
+    /// Declare a batch of emitted event kinds at once. Chainable.
+    pub fn emitting_all(mut self, kinds: impl IntoIterator<Item = EventKind>) -> Self {
+        self.emits.extend(kinds);
+        self
+    }
+
+    /// The event kinds this module emits, in declaration order.
+    pub fn emits(&self) -> &[EventKind] {
+        &self.emits
+    }
 }
 
 #[cfg(test)]
@@ -134,5 +169,40 @@ mod tests {
         let cap = Capability::empty().subscribing(HookPoint::OnTransition);
         assert!(cap.scopes().is_empty());
         assert_eq!(cap.subscribed_hooks(), [HookPoint::OnTransition]);
+    }
+
+    #[test]
+    fn empty_capability_emits_nothing() {
+        assert!(Capability::empty().emits().is_empty());
+    }
+
+    #[test]
+    fn emitting_records_kinds_in_declaration_order() {
+        let cap = Capability::empty()
+            .emitting(EventKind::new("beads.created.v1").unwrap())
+            .emitting(EventKind::new("beads.closed.v1").unwrap());
+        let kinds: Vec<&str> = cap.emits().iter().map(|k| k.as_str()).collect();
+        assert_eq!(kinds, ["beads.created.v1", "beads.closed.v1"]);
+    }
+
+    #[test]
+    fn emitting_all_appends_a_batch() {
+        let cap = Capability::empty()
+            .emitting(EventKind::new("beads.created.v1").unwrap())
+            .emitting_all([
+                EventKind::new("beads.created.v2").unwrap(),
+                EventKind::new("beads.moved.v1").unwrap(),
+            ]);
+        let kinds: Vec<&str> = cap.emits().iter().map(|k| k.as_str()).collect();
+        // v1 and v2 of the same noun coexist as distinct kinds.
+        assert_eq!(kinds, ["beads.created.v1", "beads.created.v2", "beads.moved.v1"]);
+    }
+
+    #[test]
+    fn emits_is_independent_of_scopes_and_hooks() {
+        let cap = Capability::empty().emitting(EventKind::new("rigs.added.v1").unwrap());
+        assert!(cap.scopes().is_empty());
+        assert!(cap.subscribed_hooks().is_empty());
+        assert_eq!(cap.emits().len(), 1);
     }
 }
