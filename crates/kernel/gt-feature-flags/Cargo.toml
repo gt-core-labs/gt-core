@@ -9,3 +9,6 @@ description = "Feature-flag repo port + per-workspace overrides. Consumed by gt-
 [dependencies]
 serde = { workspace = true }
 async-trait = { workspace = true }
+
+[dev-dependencies]
+serde_json = { workspace = true }
