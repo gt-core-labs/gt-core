@@ -13,17 +13,20 @@
 //!   declaration and its vocabulary (`hq-mod-core.3`).
 //! - [`RootBuilder`] / [`Root`] — the composition seam that collects modules and
 //!   builds the registry (`hq-mod-core.4`).
+//! - Dependency-cycle detection + topological init ordering — `build()` orders
+//!   modules so each follows its dependencies, rejecting cycles and dangling
+//!   references via [`BuildError`] (`hq-mod-core.5`).
 //!
-//! Still to come on this epic: dependency-cycle detection (`.5`),
-//! capability-conflict detection (`.6`), feature-flag filtering (`.7`), the test
-//! matrix (`.8`). Each grows a [`BuildError`] variant — the `build()` signature
-//! is already fallible.
+//! Still to come on this epic: capability-conflict detection (`.6`), feature-flag
+//! filtering (`.7`), the test matrix (`.8`). Each grows a [`BuildError`] variant
+//! — the `build()` signature is already fallible.
 
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
 mod builder;
 mod capability;
+mod deps;
 mod event_kind;
 mod meta;
 mod scope;

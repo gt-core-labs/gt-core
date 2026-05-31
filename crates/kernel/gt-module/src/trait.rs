@@ -19,7 +19,7 @@
 //! (non-negotiable #14); it does not make trait methods `async`.
 
 use crate::capability::Capability;
-use crate::meta::ModuleMeta;
+use crate::meta::{ModuleId, ModuleMeta};
 
 /// A pluggable feature: one crate, registered with the builder in one line.
 ///
@@ -62,6 +62,17 @@ pub trait GtModule {
     /// detection).
     fn capability(&self) -> Capability {
         Capability::empty()
+    }
+
+    /// Ids of the other modules this module requires to be present and
+    /// initialized before it.
+    ///
+    /// The builder uses these to order module wiring (dependencies first) and to
+    /// reject dependency cycles and dangling references (`hq-mod-core.5`).
+    /// Defaults to none, so a module with no inter-module dependencies — the
+    /// common case — implements nothing.
+    fn dependencies(&self) -> Vec<ModuleId> {
+        Vec::new()
     }
 }
 

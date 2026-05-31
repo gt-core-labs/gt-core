@@ -17,14 +17,16 @@
 //! attach in later epics by growing [`Capability`] and the per-contribution
 //! registration hooks; each is additive.
 //!
-//! [`build`](RootBuilder::build) already returns a [`Result`] so the validation
-//! beads slot in without churning the signature:
+//! [`build`](RootBuilder::build) returns a [`Result`] so the validation beads
+//! slot in without churning the signature:
 //!
-//! - dependency-cycle detection — `hq-mod-core.5`
+//! - dependency-cycle detection + topological ordering — `hq-mod-core.5` (done)
 //! - capability-conflict detection — `hq-mod-core.6`
 //! - feature-flag filtering of disabled modules — `hq-mod-core.7`
 //!
-//! Each grows a [`BuildError`] variant; the skeleton itself never fails.
+//! Each grows a [`BuildError`] variant. As of `.5`, `build()` orders the
+//! registered modules so each appears after every module it depends on (see
+//! [`crate::deps`]).
 
 use crate::capability::Capability;
 use crate::meta::{ModuleId, ModuleMeta};
@@ -45,11 +47,13 @@ pub struct RootBuilder {
 /// Pure-data snapshot the builder keeps for one registered module.
 ///
 /// The originating `M: GtModule` value is dropped after extraction; everything
-/// the builder and the validation beads need is captured here.
+/// the builder and the validation beads need is captured here. `pub(crate)` so
+/// the sibling validation passes ([`crate::deps`]) can read it.
 #[derive(Clone, Debug, PartialEq, Eq)]
-struct ModuleEntry {
-    meta: ModuleMeta,
-    capability: Capability,
+pub(crate) struct ModuleEntry {
+    pub(crate) meta: ModuleMeta,
+    pub(crate) capability: Capability,
+    pub(crate) depends_on: Vec<ModuleId>,
 }
 
 impl RootBuilder {
@@ -69,37 +73,64 @@ impl RootBuilder {
         self.entries.push(ModuleEntry {
             meta: module.meta(),
             capability: module.capability(),
+            depends_on: module.dependencies(),
         });
         self
     }
 
     /// Finalize the registry.
     ///
-    /// The skeleton always succeeds; the [`Result`] reserves the seam for the
-    /// validation beads (`.5` cycles, `.6` capability conflicts, `.7` flags),
-    /// each of which adds a [`BuildError`] variant rather than changing this
-    /// signature.
+    /// Resolves module init order so each module appears after every module it
+    /// depends on, rejecting dependency cycles and references to unregistered
+    /// modules ([`crate::deps`], `hq-mod-core.5`). Later beads add further
+    /// [`BuildError`] variants (`.6` capability conflicts, `.7` flags) without
+    /// changing this signature.
     pub fn build(self) -> Result<Root, BuildError> {
-        Ok(Root {
-            entries: self.entries,
-        })
+        let order = crate::deps::resolve_order(&self.entries)?;
+        // Reorder into init order. The module set is a handful of entries, so
+        // cloning by index is cheaper than threading an in-place permutation.
+        let entries = order.iter().map(|&i| self.entries[i].clone()).collect();
+        Ok(Root { entries })
     }
 }
 
 /// Why [`RootBuilder::build`] rejected a module set.
 ///
-/// Intentionally empty in `hq-mod-core.4`: the skeleton never fails. Marked
-/// `#[non_exhaustive]` so the validation beads (`.5`/`.6`/`.7`) can add variants
-/// — and so downstream `match` arms are forced to keep a wildcard from day one.
+/// Marked `#[non_exhaustive]` so later validation beads (`.6` capability
+/// conflicts, `.7` flags) can add variants — and so downstream `match` arms keep
+/// a wildcard from day one.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
-pub enum BuildError {}
+pub enum BuildError {
+    /// A module declared a dependency on a module id that was never registered.
+    UnknownDependency {
+        /// The module carrying the dangling dependency.
+        module: ModuleId,
+        /// The unregistered id it named.
+        missing: ModuleId,
+    },
+    /// The module dependency graph contains a cycle, so no init order exists.
+    /// Holds the ids on or downstream of the cycle.
+    DependencyCycle(Vec<ModuleId>),
+}
 
 impl std::fmt::Display for BuildError {
-    fn fmt(&self, _f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        // No variants yet; match exhaustively so adding one is a compile error
-        // here, forcing a real message.
-        match *self {}
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            BuildError::UnknownDependency { module, missing } => {
+                write!(f, "module {module} depends on unregistered module {missing}")
+            }
+            BuildError::DependencyCycle(ids) => {
+                write!(f, "module dependency cycle among: ")?;
+                for (i, id) in ids.iter().enumerate() {
+                    if i > 0 {
+                        f.write_str(", ")?;
+                    }
+                    write!(f, "{id}")?;
+                }
+                Ok(())
+            }
+        }
     }
 }
 
@@ -127,7 +158,9 @@ impl Root {
         self.entries.is_empty()
     }
 
-    /// Metadata of every registered module, in registration order.
+    /// Metadata of every registered module, in init order — each module after
+    /// every module it depends on (`hq-mod-core.5`). With no dependencies this
+    /// is the registration order.
     pub fn modules(&self) -> impl Iterator<Item = &ModuleMeta> {
         self.entries.iter().map(|e| &e.meta)
     }
@@ -170,6 +203,22 @@ mod tests {
         }
     }
 
+    /// Depends on `beads`; used to assert build orders dependencies first.
+    struct Merge;
+    impl GtModule for Merge {
+        fn meta(&self) -> ModuleMeta {
+            ModuleMeta::new(
+                ModuleId::new("merge").unwrap(),
+                "Merge",
+                Version::new(1, 0, 0),
+                "Merge queue over beads.",
+            )
+        }
+        fn dependencies(&self) -> Vec<ModuleId> {
+            vec![ModuleId::new("beads").unwrap()]
+        }
+    }
+
     #[test]
     fn empty_builder_builds_empty_root() {
         let root = RootBuilder::new().build().unwrap();
@@ -192,5 +241,20 @@ mod tests {
         let id = ModuleId::new("rigs").unwrap();
         assert_eq!(root.module(&id).unwrap().version, Version::new(0, 2, 0));
         assert!(root.module(&ModuleId::new("absent").unwrap()).is_none());
+    }
+
+    #[test]
+    fn build_orders_dependencies_before_dependents() {
+        // Merge registered before its dependency beads — build must reorder.
+        let root = RootBuilder::new().module(Merge).module(Beads).build().unwrap();
+        let ids: Vec<&str> = root.modules().map(|m| m.id.as_str()).collect();
+        assert_eq!(ids, ["beads", "merge"]);
+    }
+
+    #[test]
+    fn build_rejects_unknown_dependency() {
+        // Merge depends on beads, which is never registered.
+        let err = RootBuilder::new().module(Merge).build().unwrap_err();
+        assert!(matches!(err, BuildError::UnknownDependency { .. }));
     }
 }
