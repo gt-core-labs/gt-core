@@ -51,13 +51,21 @@ cargo test -p gt-mod-events --test replay_gate
 
 ## Consuming gt-core from gastown
 
-In `/home/nixos/gastown/apps/api/Cargo.toml`, add (or confirm) workspace `[patch.crates-io]`:
+In gastown's workspace `[workspace.dependencies]`, point at the gt-core paths:
 
 ```toml
-[patch.crates-io]
-gt-module = { path = "../../gt-core/crates/gt-module" }
-gt-workspace = { path = "../../gt-core/crates/gt-workspace" }
-# ... etc
+[workspace.dependencies]
+gt-module        = { path = "../../gt-core/apps/api/crates/kernel/gt-module" }
+gt-mod-routes    = { path = "../../gt-core/apps/api/crates/kernel/gt-mod-routes" }
+gt-mod-mcp       = { path = "../../gt-core/apps/api/crates/kernel/gt-mod-mcp" }
+gt-mod-events    = { path = "../../gt-core/apps/api/crates/kernel/gt-mod-events" }
+gt-mod-migrate   = { path = "../../gt-core/apps/api/crates/kernel/gt-mod-migrate" }
+gt-mod-contracts = { path = "../../gt-core/apps/api/crates/kernel/gt-mod-contracts" }
+gt-feature-flags = { path = "../../gt-core/apps/api/crates/kernel/gt-feature-flags" }
+gt-hooks         = { path = "../../gt-core/apps/api/crates/kernel/gt-hooks" }
+gt-workspace     = { path = "../../gt-core/apps/api/crates/domain/platform/gt-workspace" }
+gt-webhooks      = { path = "../../gt-core/apps/api/crates/domain/orchestration/gt-webhooks" }
+gt-dog           = { path = "../../gt-core/apps/api/crates/domain/orchestration/gt-dog" }
 ```
 
 `cargo build` in gastown picks up gt-core's path version transparently.

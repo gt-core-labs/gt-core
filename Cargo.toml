@@ -1,18 +1,18 @@
 [workspace]
 resolver = "2"
 members = [
-    "crates/gt-module",
-    "crates/gt-workspace",
-    "crates/gt-feature-flags",
-    "crates/gt-mod-routes",
-    "crates/gt-mod-mcp",
-    "crates/gt-mod-events",
-    "crates/gt-mod-migrate",
-    "crates/gt-mod-contracts",
-    "crates/gt-hooks",
-    "crates/gt-webhooks",
-    "crates/gt-dog",
-    "examples/mod-hello",
+    "apps/api/crates/kernel/gt-module",
+    "apps/api/crates/kernel/gt-mod-routes",
+    "apps/api/crates/kernel/gt-mod-mcp",
+    "apps/api/crates/kernel/gt-mod-events",
+    "apps/api/crates/kernel/gt-mod-migrate",
+    "apps/api/crates/kernel/gt-mod-contracts",
+    "apps/api/crates/kernel/gt-feature-flags",
+    "apps/api/crates/kernel/gt-hooks",
+    "apps/api/crates/domain/platform/gt-workspace",
+    "apps/api/crates/domain/orchestration/gt-webhooks",
+    "apps/api/crates/domain/orchestration/gt-dog",
+    "apps/api/examples/mod-hello",
 ]
 
 [workspace.package]
@@ -49,7 +49,9 @@ opentelemetry = "0.27"
 # gt-bus       — sync bus (lives in gastown for now)
 # gt-audit     — event log (lives in gastown for now)
 # gt-plugin    — observer plugin trait (lives in gastown for now)
-# These move into gt-core after hq-mod-refactor.10 ships and replay gate is green.
+# gt-telemetry — OTel adapter (lives in gastown for now)
+# These move into apps/api/crates/kernel/ after hq-mod-refactor train ships
+# and replay byte-for-byte gate is green.
 
 [profile.release]
 lto = "thin"

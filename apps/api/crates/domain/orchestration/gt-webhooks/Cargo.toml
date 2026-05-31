@@ -11,4 +11,4 @@ axum = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 async-trait = { workspace = true }
-gt-hooks = { path = "../gt-hooks" }
+gt-hooks = { path = "../../../kernel/gt-hooks" }

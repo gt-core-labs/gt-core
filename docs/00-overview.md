@@ -20,11 +20,15 @@ Three forces pushed the foundation out of `gastown`:
                                          │ depends on
                        ┌─────────────────▼─────────────────────┐
                        │  gt-core (this repo)                  │
-                       │  - gt-module (trait + RootBuilder)    │
-                       │  - gt-workspace (tenancy primitives)  │
-                       │  - gt-mod-{routes,mcp,events,migrate, │
-                       │             contracts}                │
-                       │  - gt-feature-flags                   │
+                       │  apps/api/crates/                     │
+                       │   ├ kernel/                           │
+                       │   │   gt-module, gt-mod-{routes,mcp,  │
+                       │   │   events,migrate,contracts},      │
+                       │   │   gt-feature-flags, gt-hooks      │
+                       │   └ domain/                           │
+                       │       platform/gt-workspace           │
+                       │       orchestration/{gt-webhooks,     │
+                       │                       gt-dog}         │
                        └─────────────────┬─────────────────────┘
                                          │ wraps / re-exports
                        ┌─────────────────▼─────────────────────┐
