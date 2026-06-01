@@ -1,0 +1,17 @@
+[package]
+name = "gt-meta"
+edition.workspace = true
+version.workspace = true
+
+# gt-meta — the cross-cutting `meta.*` MCP tools as a GtModule (hq-core-host.7):
+# meta.help (the tools/list payload) + meta.report-gap (mint a hq-gap bead so a
+# missing operation enters the catalog). Descriptor-only seam: this crate declares
+# the tools + their arg schema; the server bin dispatches them (meta.help over the
+# built Root's tool list, meta.report-gap over the Dolt issues store).
+[dependencies]
+gt-module = { workspace = true }
+gt-module-mcp = { workspace = true }
+semver = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+schemars = { workspace = true }

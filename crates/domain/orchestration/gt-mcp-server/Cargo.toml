@@ -16,6 +16,7 @@ path = "src/main.rs"
 gt-module = { workspace = true }
 gt-module-mcp = { workspace = true }
 gt-issues = { workspace = true }
+gt-meta = { workspace = true }
 gt-store-dolt = { workspace = true }
 gt-rbac = { workspace = true }
 gt-audit = { workspace = true }

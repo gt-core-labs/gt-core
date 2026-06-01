@@ -12,8 +12,11 @@ use gt_issues::handlers::{
     ClaimResult,
 };
 use gt_issues::{ClaimIssue, CloseIssue, CreateIssue, TransitionIssue, UpdateIssue};
-use gt_store_dolt::{AppError, ClaimOutcome, DoltIssues, IssueFilter};
+use gt_meta::ReportGap;
+use gt_module::McpTool;
+use gt_store_dolt::{AppError, ClaimOutcome, DoltIssues, IssueFilter, NewIssue};
 use serde_json::{json, Value};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Map a serde deserialization error onto the domain error so a malformed tool
 /// payload surfaces as a validation failure (not a 500).
@@ -103,6 +106,66 @@ pub async fn dispatch(
         }
         other => Err(AppError::Validation(format!("unknown tool `{other}`"))),
     }
+}
+
+/// Dispatch a `meta.*` tool (hq-core-host.7). `tools` is the server's full
+/// descriptor set (for meta.help); `store` + `actor` back meta.report-gap, which
+/// mints a `hq-gap-<slug>-<ts>` bead directly via the issues store.
+pub async fn dispatch_meta(
+    store: &DoltIssues,
+    tool: &str,
+    args: Value,
+    actor: &str,
+    tools: &[McpTool],
+) -> Result<Value, AppError> {
+    match tool {
+        "meta.help.execute" => Ok(json!({ "tools": tools })),
+        "meta.report-gap.execute" => {
+            let g: ReportGap = parse_args(args)?;
+            g.validate().map_err(AppError::Validation)?;
+            let ts = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            let id = format!("hq-gap-{}-{ts}", slugify(&g.operation));
+            let priority = g.priority.unwrap_or(2);
+            let new = NewIssue {
+                id: id.clone(),
+                title: format!("gap: {}", g.operation),
+                issue_type: "task".into(),
+                created_by: actor.into(),
+                notes: g.notes.unwrap_or_default(),
+                priority,
+                ..Default::default()
+            };
+            store.insert(&new).await?;
+            Ok(json!({ "bead": id, "operation": g.operation, "priority": priority }))
+        }
+        other => Err(AppError::Validation(format!("unknown tool `{other}`"))),
+    }
+}
+
+/// Lowercase the operation into a kebab slug for the gap bead id: runs of
+/// non-alphanumerics collapse to a single `-`, with no leading/trailing dash.
+fn slugify(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut prev_dash = true; // suppress leading dash
+    for c in s.chars() {
+        if c.is_ascii_alphanumeric() {
+            out.push(c.to_ascii_lowercase());
+            prev_dash = false;
+        } else if !prev_dash {
+            out.push('-');
+            prev_dash = true;
+        }
+    }
+    while out.ends_with('-') {
+        out.pop();
+    }
+    if out.is_empty() {
+        out.push_str("op");
+    }
+    out
 }
 
 /// Parse the optional `gt://issues?...` querystring into an [`IssueFilter`].

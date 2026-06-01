@@ -21,7 +21,7 @@ use rmcp::model::{
 use rmcp::service::{RequestContext, RoleServer};
 use rmcp::{ErrorData as McpError, ServerHandler};
 
-use crate::dispatch::{dispatch, parse_issue_filter};
+use crate::dispatch::{dispatch, dispatch_meta, parse_issue_filter};
 
 /// The shared MCP service. Cheap to clone (every field is `Arc`-backed) so the
 /// streamable-HTTP session manager hands each connection its own handle over the
@@ -112,7 +112,11 @@ impl ServerHandler for IssuesServer {
             return Err(McpError::invalid_request(e.to_string(), None));
         }
 
-        let result = dispatch(&self.store, &tool, args.clone(), &self.scope.actor).await;
+        let result = if tool.starts_with("meta.") {
+            dispatch_meta(&self.store, &tool, args.clone(), &self.scope.actor, &self.tools).await
+        } else {
+            dispatch(&self.store, &tool, args.clone(), &self.scope.actor).await
+        };
         let _ = self
             .audit
             .record(AuditRecord::invoked(&self.scope.actor, &tool, args));

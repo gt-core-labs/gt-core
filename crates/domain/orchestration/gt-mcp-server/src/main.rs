@@ -26,6 +26,7 @@ use rmcp::transport::{StreamableHttpServerConfig, StreamableHttpService};
 
 use gt_audit::{AuditSink, InMemoryAudit};
 use gt_issues::IssuesModule;
+use gt_meta::MetaModule;
 use gt_module::RootBuilder;
 use gt_rbac::{RbacConfig, Scope};
 use gt_store_dolt::DoltIssues;
@@ -51,10 +52,11 @@ async fn main() -> anyhow::Result<()> {
     // the composition root never hand-lists tools (docs/03 rule 3).
     let root = RootBuilder::new()
         .module(IssuesModule)
+        .module(MetaModule)
         .build()
         .map_err(|e| anyhow::anyhow!("module build failed: {e:?}"))?;
     let tools: Vec<_> = root.mcp_tools().cloned().collect();
-    eprintln!("[gt-mcp-server] {} issues tools registered", tools.len());
+    eprintln!("[gt-mcp-server] {} tools registered", tools.len());
 
     // Scope: resolve the actor against the RBAC config, or deny-by-default.
     let scope = match std::env::var("GT_MCP_SCOPE_CONFIG") {
