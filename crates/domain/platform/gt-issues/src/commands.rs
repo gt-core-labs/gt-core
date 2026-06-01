@@ -27,6 +27,8 @@ use gt_store_dolt::{AppError, IssuePatch, IssueStatus, NewIssue};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
+use crate::taxonomy::Domain;
+
 /// Map a [`gt_module_mcp::taxonomy::TaxonomyError`] onto the store's
 /// [`AppError::Validation`] so the NN-16 rejection surfaces with the same
 /// `validation failed: …` shape as every other shape-rule failure.
@@ -74,6 +76,12 @@ fn to_json_array(items: &[String]) -> String {
     serde_json::to_string(items).unwrap_or_else(|_| "[]".to_string())
 }
 
+/// JSON-array string for the closed-set [`Domain`] values (e.g.
+/// `["orch.merge","store.dolt"]`). Same NOT-NULL `"[]"` fallback.
+fn domain_to_json(items: &[Domain]) -> String {
+    serde_json::to_string(items).unwrap_or_else(|_| "[]".to_string())
+}
+
 fn default_priority() -> u8 {
     2
 }
@@ -116,10 +124,10 @@ pub struct CreateIssue {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub owner: Option<String>,
     /// Semantic domains the bead affects (doc 14 §3). At least one is required.
-    /// Free-form strings here — the closed-set `Domain` enum narrowing is a
-    /// separate port (see module note).
+    /// Closed set ([`Domain`]): an out-of-set value is rejected at deserialization
+    /// (hq-core-mcp.3).
     #[serde(default)]
-    pub domain: Vec<String>,
+    pub domain: Vec<Domain>,
     /// Physical impact surface — crate names or repo paths the bead touches.
     /// Empty for pure spec/process work.
     #[serde(default)]
@@ -196,7 +204,7 @@ impl CreateIssue {
             external_ref: self.external_ref.clone(),
             assignee: self.assignee.clone(),
             owner: self.owner.clone(),
-            domain_json: to_json_array(&self.domain),
+            domain_json: domain_to_json(&self.domain),
             surface_json: to_json_array(&self.surface),
             depends_on_json: to_json_array(&self.depends_on),
             role_scope: self.role_scope.clone(),
@@ -243,10 +251,11 @@ pub struct UpdateIssue {
     /// re-checked against the (possibly also-updated) `issue_type`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub external_ref: Option<String>,
-    /// New semantic domains. `None` leaves the column untouched; an empty
-    /// overwrite is rejected (a bead must keep at least one domain).
+    /// New semantic domains (closed set [`Domain`]). `None` leaves the column
+    /// untouched; an empty overwrite is rejected (a bead must keep at least one
+    /// domain); an out-of-set value is rejected at deserialization.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub domain: Option<Vec<String>>,
+    pub domain: Option<Vec<Domain>>,
     /// New impact surface. `None` leaves the column untouched; `Some(_)`
     /// overwrites (empty allowed). This is the field that repoints stale
     /// `surface_json` paths after a crate moves.
@@ -331,7 +340,7 @@ impl UpdateIssue {
             assignee: self.assignee.clone(),
             owner: self.owner.clone(),
             external_ref: self.external_ref.clone(),
-            domain_json: self.domain.as_deref().map(to_json_array),
+            domain_json: self.domain.as_deref().map(domain_to_json),
             surface_json: self.surface.as_deref().map(to_json_array),
             depends_on_json: self.depends_on.as_deref().map(to_json_array),
             expected_version: self.expected_version,
@@ -461,7 +470,7 @@ mod tests {
             external_ref: Some("hq-core-host".into()),
             assignee: None,
             owner: None,
-            domain: vec!["store.dolt".into()],
+            domain: vec![Domain::StoreDolt],
             surface: vec![],
             depends_on: vec![],
             role_scope: None,
