@@ -3,7 +3,7 @@
 //! This is the learn-by-example reference (`hq-mod-docs.2`): one module that
 //! touches every contribution point the kernel offers, so a module author can
 //! read one file and copy the shape. It pairs with the authoring guide in
-//! `docs/16-module-authoring.md` (`hq-mod-docs.1`).
+//! `docs/08-module-authoring.md` (`hq-mod-docs.1`).
 //!
 //! What it demonstrates, and where each piece is proved by the end-to-end gate
 //! in `tests/e2e.rs`:
