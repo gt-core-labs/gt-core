@@ -40,6 +40,21 @@ pub fn workspace_migrations() -> Vec<Migration> {
     vec![Migration::new(1, "0001_workspaces", WORKSPACE_0001_SQL)]
 }
 
+/// Initial migration: per-workspace `flag_overrides` table.
+const FEATURE_FLAGS_0001_SQL: &str =
+    include_str!("../migrations/gt-feature-flags/0001_flag_overrides.sql");
+
+/// Migrations for the `gt-feature-flags` override store, in ascending apply order.
+///
+/// `gt-feature-flags` is a kernel crate exposing only the `FeatureFlags` port
+/// (override-only, keyed by workspace + `FlagKey`); like `gt-workspace` it carries
+/// no schema of its own, so its Postgres table lives here. The owning module
+/// surfaces these through `GtModule::migrations` so the kernel orders them after
+/// `workspaces` (the FK target) alongside every other module's schema.
+pub fn feature_flags_migrations() -> Vec<Migration> {
+    vec![Migration::new(1, "0001_flag_overrides", FEATURE_FLAGS_0001_SQL)]
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -74,5 +89,37 @@ mod tests {
         for status in ["active", "suspended", "archived"] {
             assert!(sql.contains(status), "status variant `{status}` must be allowed");
         }
+    }
+
+    #[test]
+    fn flags_exposes_one_versioned_migration() {
+        let migrations = feature_flags_migrations();
+        assert_eq!(migrations.len(), 1);
+        assert_eq!(migrations[0].version, 1);
+        assert_eq!(migrations[0].name, "0001_flag_overrides");
+    }
+
+    #[test]
+    fn flags_migration_creates_override_table_with_columns() {
+        let sql = &feature_flags_migrations()[0].sql;
+        assert!(sql.contains("CREATE TABLE"), "must create the table");
+        assert!(sql.contains("flag_overrides"), "table name present");
+        for col in ["workspace_id", "flag_key", "enabled", "since", "set_by"] {
+            assert!(sql.contains(col), "column `{col}` must be present");
+        }
+        // Override-only store: one row per (workspace, key).
+        assert!(
+            sql.to_uppercase().contains("PRIMARY KEY (WORKSPACE_ID, FLAG_KEY)"),
+            "composite PK keys overrides by (workspace, flag_key)",
+        );
+    }
+
+    #[test]
+    fn flags_migration_fks_workspaces_with_cascade() {
+        // docs/04 rule 14: projection tables FK workspaces.id; removing a
+        // workspace must take its overrides with it.
+        let sql = feature_flags_migrations()[0].sql.to_uppercase();
+        assert!(sql.contains("REFERENCES WORKSPACES (ID)"), "FK to workspaces.id");
+        assert!(sql.contains("ON DELETE CASCADE"), "cascade on workspace removal");
     }
 }
