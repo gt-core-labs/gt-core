@@ -1,0 +1,10 @@
+[package]
+name = "gt-store-pg"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+gt-module = { workspace = true }
+
+[dev-dependencies]
