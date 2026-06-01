@@ -13,6 +13,8 @@ members = [
     "crates/domain/orchestration/gt-runtime",
     "crates/kernel/gt-store-pg",
     "crates/kernel/gt-store-dolt",
+    "crates/kernel/gt-rbac",
+    "crates/kernel/gt-audit",
     "examples/mod-hello",
 ]
 
@@ -49,6 +51,8 @@ sqlx = { version = "0.8", default-features = false, features = ["postgres", "mac
 # TLS (local Dolt), minimal deps.
 mysql_async = { version = "0.34", default-features = false, features = ["minimal"] }
 thiserror = "2"
+# RBAC config parser — gt-rbac reads TOML or JSON (hq-core-host.4).
+toml = "0.8"
 # Lock-free concurrent map (per-workspace RootRegistry, hq-mt-routing.1).
 dashmap = "6"
 
@@ -72,9 +76,14 @@ gt-runtime       = { path = "crates/domain/orchestration/gt-runtime" }
 
 gt-store-pg      = { path = "crates/kernel/gt-store-pg" }
 gt-store-dolt    = { path = "crates/kernel/gt-store-dolt" }
+gt-rbac          = { path = "crates/kernel/gt-rbac" }
+gt-audit         = { path = "crates/kernel/gt-audit" }
 
 # Reused from gastown until P4 (foundation kernel crates):
-# gt-events, gt-bus, gt-audit, gt-plugin, gt-telemetry remain in gastown.
+# gt-events, gt-bus, gt-plugin, gt-telemetry remain in gastown. NOTE: gt-core's
+# gt-audit here is the MCP dispatch audit SINK (hq-core-host.4), a different
+# concept from gastown's event-replay gt-audit (EventStore) that migrates up in
+# P4 — a name collision to resolve then (cf. gt-workspace → gt-townroot).
 
 [profile.release]
 lto = "thin"

@@ -1,0 +1,17 @@
+[package]
+name = "gt-audit"
+edition.workspace = true
+version.workspace = true
+
+# Audit sink for the MCP tool dispatch path (hq-core-host.4). Records who called
+# which tool with what args and whether it was Invoked or rejected Unauthorized.
+# MVP: `AuditSink` trait + `InMemoryAudit`; a Postgres sink follows once the
+# server bin (hq-core-host.3) lands. Sync, no tokio — the trait is `&self` so the
+# server can share one sink across dispatches behind an Arc.
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
