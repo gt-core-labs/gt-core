@@ -12,6 +12,7 @@ members = [
     "crates/domain/orchestration/gt-webhooks",
     "crates/domain/orchestration/gt-dog",
     "crates/domain/orchestration/gt-runtime",
+    "crates/domain/orchestration/gt-mcp-server",
     "crates/kernel/gt-store-pg",
     "crates/kernel/gt-store-dolt",
     "crates/kernel/gt-rbac",
@@ -61,6 +62,10 @@ dashmap = "6"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 opentelemetry = "0.27"
+
+# MCP server transport (hq-core-host.3) — official rmcp SDK, streamable-HTTP.
+rmcp = { version = "1.7", features = ["server", "transport-streamable-http-server"] }
+anyhow = "1"
 
 # Internal crates — referenced as `<name> = { workspace = true }` from member Cargo.toml.
 # Path-centralized here so members never juggle relative paths across tiers.
