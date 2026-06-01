@@ -28,9 +28,11 @@
 #![forbid(unsafe_code)]
 
 mod handle;
+mod idle;
 mod lifecycle;
 mod registry;
 
 pub use handle::RootHandle;
+pub use idle::{idle_from_env, DEFAULT_IDLE_SECS};
 pub use lifecycle::{Phase, Supervisor};
 pub use registry::RootRegistry;
