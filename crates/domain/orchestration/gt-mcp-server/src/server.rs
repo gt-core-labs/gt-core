@@ -6,17 +6,19 @@
 //! the kernel deliberately keeps out of itself — the rmcp `call_tool` dispatch,
 //! the `gt-rbac` scope check, and the `gt-audit` record per call.
 
+use std::borrow::Cow;
 use std::sync::Arc;
 
 use gt_audit::{AuditRecord, AuditSink};
 use gt_module::McpTool;
-use gt_rbac::Scope;
+use gt_rbac::{RbacConfig, Scope};
 use gt_store_dolt::{AppError, DoltIssues};
 
 use rmcp::model::{
-    AnnotateAble, CallToolRequestParams, CallToolResult, Content, Implementation, ListResourcesResult,
-    ListToolsResult, PaginatedRequestParams, RawResource, ReadResourceRequestParams,
-    ReadResourceResult, ResourceContents, ServerCapabilities, ServerInfo, Tool,
+    AnnotateAble, CallToolRequestParams, CallToolResult, Content, Extensions, Implementation,
+    ListResourcesResult, ListToolsResult, PaginatedRequestParams, RawResource,
+    ReadResourceRequestParams, ReadResourceResult, ResourceContents, ServerCapabilities,
+    ServerInfo, Tool,
 };
 use rmcp::service::{RequestContext, RoleServer};
 use rmcp::{ErrorData as McpError, ServerHandler};
@@ -29,7 +31,14 @@ use crate::dispatch::{dispatch, dispatch_meta, parse_issue_filter};
 #[derive(Clone)]
 pub struct IssuesServer {
     store: Arc<DoltIssues>,
-    scope: Arc<Scope>,
+    /// Scope used when a request carries no `X-Actor` header (the boot
+    /// `GT_MCP_ACTOR`, or a closed deny-all when no RBAC config is wired).
+    default_scope: Arc<Scope>,
+    /// RBAC config for per-connection resolution (hq-core-mcp.6). `Some` when
+    /// `GT_MCP_SCOPE_CONFIG` is set: a request's `X-Actor` header then resolves
+    /// its own scope, so multiple actors share one server with distinct
+    /// allow-lists. `None` keeps every request on `default_scope`.
+    rbac: Option<Arc<RbacConfig>>,
     audit: Arc<dyn AuditSink + Send + Sync>,
     tools: Arc<Vec<McpTool>>,
 }
@@ -37,18 +46,31 @@ pub struct IssuesServer {
 impl IssuesServer {
     /// Build the service from the composed pieces. `tools` are the descriptors
     /// the built `Root` exposes (`root.mcp_tools()`), already namespaced + NN-16
-    /// shaped by the kernel builder.
+    /// shaped by the kernel builder. `rbac` enables per-connection `X-Actor`
+    /// scope resolution; `None` pins every call to `default_scope`.
     pub fn new(
         store: Arc<DoltIssues>,
-        scope: Scope,
+        default_scope: Scope,
+        rbac: Option<Arc<RbacConfig>>,
         audit: Arc<dyn AuditSink + Send + Sync>,
         tools: Vec<McpTool>,
     ) -> Self {
         Self {
             store,
-            scope: Arc::new(scope),
+            default_scope: Arc::new(default_scope),
+            rbac,
             audit,
             tools: Arc::new(tools),
+        }
+    }
+
+    /// Resolve the scope for one request from its extensions. When an RBAC config
+    /// is wired and the request carries an `X-Actor` header, the actor gets its
+    /// own allow-list; otherwise the boot `default_scope` applies.
+    fn resolve_scope(&self, ext: &Extensions) -> Cow<'_, Scope> {
+        match (&self.rbac, actor_from_ext(ext)) {
+            (Some(rbac), Some(actor)) => Cow::Owned(Scope::from_rbac(rbac, actor)),
+            _ => Cow::Borrowed(&self.default_scope),
         }
     }
 
@@ -98,28 +120,32 @@ impl ServerHandler for IssuesServer {
     async fn call_tool(
         &self,
         request: CallToolRequestParams,
-        _context: RequestContext<RoleServer>,
+        context: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
         let tool = request.name.to_string();
         let args = serde_json::Value::Object(request.arguments.clone().unwrap_or_default());
 
+        // Per-connection scope (hq-core-mcp.6): the X-Actor header picks the
+        // allow-list + the attribution actor, falling back to the boot default.
+        let scope = self.resolve_scope(&context.extensions);
+
         // Scope check FIRST — deny-by-default. A rejection is audited as
         // Unauthorized and surfaces as an invalid_request the caller cannot retry.
-        if let Err(e) = self.scope.check(&tool) {
+        if let Err(e) = scope.check(&tool) {
             let _ = self
                 .audit
-                .record(AuditRecord::unauthorized(&self.scope.actor, &tool, args));
+                .record(AuditRecord::unauthorized(&scope.actor, &tool, args));
             return Err(McpError::invalid_request(e.to_string(), None));
         }
 
         let result = if tool.starts_with("meta.") {
-            dispatch_meta(&self.store, &tool, args.clone(), &self.scope.actor, &self.tools).await
+            dispatch_meta(&self.store, &tool, args.clone(), &scope.actor, &self.tools).await
         } else {
-            dispatch(&self.store, &tool, args.clone(), &self.scope.actor).await
+            dispatch(&self.store, &tool, args.clone(), &scope.actor).await
         };
         let _ = self
             .audit
-            .record(AuditRecord::invoked(&self.scope.actor, &tool, args));
+            .record(AuditRecord::invoked(&scope.actor, &tool, args));
 
         match result {
             Ok(payload) => Ok(CallToolResult::success(vec![Content::text(
@@ -209,5 +235,53 @@ impl IssuesServer {
         }
 
         Err(AppError::NotFound(format!("resource {uri}")))
+    }
+}
+
+/// Extract the `X-Actor` header from a request's extensions. rmcp injects the
+/// HTTP `Parts` into each call's extensions, so the trimmed, non-empty header
+/// value identifies the connection's actor (hq-core-mcp.6). `None` when no Parts,
+/// no header, or an empty/garbled value — the caller then uses the default scope.
+fn actor_from_ext(ext: &Extensions) -> Option<&str> {
+    ext.get::<axum::http::request::Parts>()
+        .and_then(|p| p.headers.get("x-actor"))
+        .and_then(|v| v.to_str().ok())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::actor_from_ext;
+    use rmcp::model::Extensions;
+
+    fn ext_with_header(name: &str, value: &str) -> Extensions {
+        let parts = axum::http::Request::builder()
+            .header(name, value)
+            .body(())
+            .unwrap()
+            .into_parts()
+            .0;
+        let mut ext = Extensions::new();
+        ext.insert(parts);
+        ext
+    }
+
+    #[test]
+    fn reads_x_actor_header() {
+        let ext = ext_with_header("x-actor", "alice");
+        assert_eq!(actor_from_ext(&ext), Some("alice"));
+    }
+
+    #[test]
+    fn trims_and_rejects_blank() {
+        assert_eq!(actor_from_ext(&ext_with_header("x-actor", "  bob ")), Some("bob"));
+        assert_eq!(actor_from_ext(&ext_with_header("x-actor", "   ")), None);
+    }
+
+    #[test]
+    fn none_without_parts_or_header() {
+        assert_eq!(actor_from_ext(&Extensions::new()), None);
+        assert_eq!(actor_from_ext(&ext_with_header("x-other", "alice")), None);
     }
 }

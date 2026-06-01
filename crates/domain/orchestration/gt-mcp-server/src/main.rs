@@ -58,14 +58,22 @@ async fn main() -> anyhow::Result<()> {
     let tools: Vec<_> = root.mcp_tools().cloned().collect();
     eprintln!("[gt-mcp-server] {} tools registered", tools.len());
 
-    // Scope: resolve the actor against the RBAC config, or deny-by-default.
-    let scope = match std::env::var("GT_MCP_SCOPE_CONFIG") {
-        Ok(path) => Scope::from_rbac(&RbacConfig::load(&path)?, &actor),
+    // Scope: the boot actor's scope is the default; when an RBAC config is wired
+    // the server also resolves per-connection scopes from the X-Actor header
+    // (hq-core-mcp.6), so several actors share one server with distinct allow-lists.
+    let (default_scope, rbac) = match std::env::var("GT_MCP_SCOPE_CONFIG") {
+        Ok(path) => {
+            let cfg = Arc::new(RbacConfig::load(&path)?);
+            eprintln!(
+                "[gt-mcp-server] RBAC config loaded; per-connection X-Actor scope resolution on (default actor '{actor}')"
+            );
+            (Scope::from_rbac(&cfg, &actor), Some(cfg))
+        }
         Err(_) => {
             eprintln!(
-                "[gt-mcp-server] GT_MCP_SCOPE_CONFIG unset; actor '{actor}' gets a closed scope (deny all)"
+                "[gt-mcp-server] GT_MCP_SCOPE_CONFIG unset; actor '{actor}' gets a closed scope (deny all), no per-connection resolution"
             );
-            Scope::denied(&actor)
+            (Scope::denied(&actor), None)
         }
     };
 
@@ -88,7 +96,7 @@ async fn main() -> anyhow::Result<()> {
             Arc::new(InMemoryAudit::new())
         }
     };
-    let service = IssuesServer::new(store, scope, audit, tools);
+    let service = IssuesServer::new(store, default_scope, rbac, audit, tools);
 
     let http = StreamableHttpService::new(
         move || Ok(service.clone()),
