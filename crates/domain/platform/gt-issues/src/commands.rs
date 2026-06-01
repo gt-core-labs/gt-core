@@ -27,6 +27,9 @@ use gt_store_dolt::{AppError, IssuePatch, IssueStatus, NewIssue};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
+use crate::surface::{
+    check_surface_existence, check_surface_shape, surface_to_json, SurfaceEntry, SurfaceTree,
+};
 use crate::taxonomy::Domain;
 
 /// Map a [`gt_module_mcp::taxonomy::TaxonomyError`] onto the store's
@@ -34,22 +37,6 @@ use crate::taxonomy::Domain;
 /// `validation failed: …` shape as every other shape-rule failure.
 fn taxonomy_err(e: gt_module_mcp::taxonomy::TaxonomyError) -> AppError {
     AppError::Validation(e.to_string())
-}
-
-/// Reject an empty entry or a duplicate in a free-form string list (used for
-/// `surface` on update). Returns the offending value verbatim so the agent sees
-/// exactly what the frontier rejected.
-fn check_no_empty_or_dup(label: &str, items: &[String]) -> Result<(), AppError> {
-    let mut seen = HashSet::new();
-    for s in items {
-        if s.trim().is_empty() {
-            return Err(AppError::Validation(format!("{label} contains an empty entry")));
-        }
-        if !seen.insert(s.as_str()) {
-            return Err(AppError::Validation(format!("{label} lists `{s}` more than once")));
-        }
-    }
-    Ok(())
 }
 
 /// Reject a self-edge or a duplicate dependency in a `depends_on` list.
@@ -128,10 +115,11 @@ pub struct CreateIssue {
     /// (hq-core-mcp.3).
     #[serde(default)]
     pub domain: Vec<Domain>,
-    /// Physical impact surface — crate names or repo paths the bead touches.
-    /// Empty for pure spec/process work.
+    /// Physical impact surface — crate names or repo paths the bead touches,
+    /// each carrying a `planned` intent (docs/10 §S3). A bare string is read as
+    /// `planned:false` for back-compat. Empty for pure spec/process work.
     #[serde(default)]
-    pub surface: Vec<String>,
+    pub surface: Vec<SurfaceEntry>,
     /// Forward dependency edges (this bead is blocked until each listed bead
     /// closes). Self-edges and duplicates are rejected at [`Self::validate`].
     #[serde(default)]
@@ -184,12 +172,21 @@ impl CreateIssue {
             ));
         }
         check_depends_on(&self.id, &self.depends_on)?;
-        check_no_empty_or_dup("surface", &self.surface)?;
+        check_surface_shape(&self.surface)?;
         Ok(())
     }
 
-    /// Translate onto the store's insert payload. The `Vec<String>` taxonomy
-    /// columns serialize to the same JSON-array form the store persists.
+    /// S3 surface existence check (docs/10 §S3): every `planned:false` surface
+    /// path must exist on `main`. Separate from the shape-only [`Self::validate`]
+    /// because it needs the git tree the server supplies; the handler runs it on
+    /// both the `validate` and `execute` paths.
+    pub fn validate_surface(&self, tree: &(dyn SurfaceTree + Sync)) -> Result<(), AppError> {
+        check_surface_existence(&self.surface, tree)
+    }
+
+    /// Translate onto the store's insert payload. The taxonomy columns serialize
+    /// to the JSON-array form the store persists; `surface` lands as the object
+    /// form `[{"path":…,"planned":…}]`.
     pub fn to_new(&self) -> NewIssue {
         NewIssue {
             id: self.id.clone(),
@@ -205,7 +202,7 @@ impl CreateIssue {
             assignee: self.assignee.clone(),
             owner: self.owner.clone(),
             domain_json: domain_to_json(&self.domain),
-            surface_json: to_json_array(&self.surface),
+            surface_json: surface_to_json(&self.surface),
             depends_on_json: to_json_array(&self.depends_on),
             role_scope: self.role_scope.clone(),
         }
@@ -256,11 +253,12 @@ pub struct UpdateIssue {
     /// domain); an out-of-set value is rejected at deserialization.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub domain: Option<Vec<Domain>>,
-    /// New impact surface. `None` leaves the column untouched; `Some(_)`
-    /// overwrites (empty allowed). This is the field that repoints stale
-    /// `surface_json` paths after a crate moves.
+    /// New impact surface (object form `[{path,planned}]`, bare string read as
+    /// `planned:false`). `None` leaves the column untouched; `Some(_)` overwrites
+    /// (empty allowed). This is the field that repoints stale `surface_json` paths
+    /// after a crate moves, or flips a `planned:true` entry to `false` on delivery.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub surface: Option<Vec<String>>,
+    pub surface: Option<Vec<SurfaceEntry>>,
     /// New forward dependency edges. `None` leaves the column untouched. Self-
     /// cycle and duplicate ids are rejected at `validate`; cross-bead cycle
     /// detection runs at execute in the store.
@@ -318,7 +316,7 @@ impl UpdateIssue {
             check_depends_on(&self.id, depends_on)?;
         }
         if let Some(surface) = &self.surface {
-            check_no_empty_or_dup("surface", surface)?;
+            check_surface_shape(surface)?;
         }
         if self.to_patch().is_empty() {
             return Err(AppError::Validation("no fields set; nothing to update".into()));
@@ -326,8 +324,19 @@ impl UpdateIssue {
         Ok(())
     }
 
-    /// Translate onto the store's patch. Typed `Some(Vec<String>)` columns
-    /// serialize to the JSON-array form the store overwrites verbatim.
+    /// S3 surface existence check (docs/10 §S3): when the patch repoints
+    /// `surface`, every `planned:false` path in the new set must exist on `main`.
+    /// A `None` surface patch leaves the column alone and is a no-op here.
+    pub fn validate_surface(&self, tree: &(dyn SurfaceTree + Sync)) -> Result<(), AppError> {
+        match &self.surface {
+            Some(surface) => check_surface_existence(surface, tree),
+            None => Ok(()),
+        }
+    }
+
+    /// Translate onto the store's patch. Typed `Some(Vec<…>)` columns serialize
+    /// to the JSON-array form the store overwrites verbatim; `surface` lands as
+    /// the object form `[{"path":…,"planned":…}]`.
     pub fn to_patch(&self) -> IssuePatch {
         IssuePatch {
             title: self.title.clone(),
@@ -341,7 +350,7 @@ impl UpdateIssue {
             owner: self.owner.clone(),
             external_ref: self.external_ref.clone(),
             domain_json: self.domain.as_deref().map(domain_to_json),
-            surface_json: self.surface.as_deref().map(to_json_array),
+            surface_json: self.surface.as_deref().map(surface_to_json),
             depends_on_json: self.depends_on.as_deref().map(to_json_array),
             expected_version: self.expected_version,
         }
@@ -538,6 +547,47 @@ mod tests {
         assert_eq!(n.domain_json, "[\"store.dolt\"]");
         assert_eq!(n.surface_json, "[]");
         assert_eq!(n.depends_on_json, "[]");
+    }
+
+    #[test]
+    fn create_surface_serializes_object_form_and_accepts_bare_wire() {
+        // A bare-string surface entry on the wire reads as planned:false …
+        let mut c = base_create();
+        c.surface = serde_json::from_value(serde_json::json!([
+            "crates/a",
+            { "path": "migrations/gt-rig", "planned": true }
+        ]))
+        .unwrap();
+        assert!(c.validate().is_ok());
+        // … and the store form is the normalized object array.
+        assert_eq!(
+            c.to_new().surface_json,
+            r#"[{"path":"crates/a","planned":false},{"path":"migrations/gt-rig","planned":true}]"#
+        );
+        // Shape rules still bite: duplicate path is rejected.
+        c.surface = vec![
+            SurfaceEntry { path: "x".into(), planned: false },
+            SurfaceEntry { path: "x".into(), planned: true },
+        ];
+        assert!(c.validate().is_err());
+    }
+
+    #[test]
+    fn validate_surface_rejects_missing_non_planned_only() {
+        use crate::surface::SurfaceTree;
+        struct Empty;
+        impl SurfaceTree for Empty {
+            fn contains(&self, _: &str) -> bool {
+                false
+            }
+        }
+        let mut c = base_create();
+        // planned:false against an empty tree → rejected.
+        c.surface = vec![SurfaceEntry { path: "crates/missing".into(), planned: false }];
+        assert!(c.validate_surface(&Empty).is_err());
+        // planned:true → accepted even against an empty tree.
+        c.surface = vec![SurfaceEntry { path: "crates/missing".into(), planned: true }];
+        assert!(c.validate_surface(&Empty).is_ok());
     }
 
     #[test]

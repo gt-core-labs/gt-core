@@ -16,7 +16,10 @@ use gt_meta::ReportGap;
 use gt_module::McpTool;
 use gt_store_dolt::{AppError, ClaimOutcome, DoltIssues, IssueFilter, NewIssue};
 use serde_json::{json, Value};
+use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
+
+use crate::git_tree::surface_tree;
 
 /// Map a serde deserialization error onto the domain error so a malformed tool
 /// payload surfaces as a validation failure (not a 500).
@@ -33,28 +36,29 @@ pub async fn dispatch(
     tool: &str,
     args: Value,
     actor: &str,
+    repo_dir: Option<&Path>,
 ) -> Result<Value, AppError> {
     match tool {
         "issues.create.validate" => {
             let a: CreateIssue = parse_args(args)?;
-            run_create_issue(store, &a, true).await?;
+            run_create_issue(store, &a, surface_tree(repo_dir).as_ref(), true).await?;
             Ok(json!({ "ok": true }))
         }
         "issues.create.execute" => {
             let a: CreateIssue = parse_args(args)?;
-            run_create_issue(store, &a, false).await?;
+            run_create_issue(store, &a, surface_tree(repo_dir).as_ref(), false).await?;
             Ok(json!({ "ok": true }))
         }
         "issues.update.validate" => {
             let a: UpdateIssue = parse_args(args.clone())?;
-            run_update_issue(store, &a, true).await?;
+            run_update_issue(store, &a, surface_tree(repo_dir).as_ref(), true).await?;
             // Echo the parsed params back so a caller can confirm what the server
             // received (the DX echo shipped in hq-gap-issues-update-validate).
             Ok(json!({ "ok": true, "parsed": args }))
         }
         "issues.update.execute" => {
             let a: UpdateIssue = parse_args(args)?;
-            let version = run_update_issue(store, &a, false).await?;
+            let version = run_update_issue(store, &a, surface_tree(repo_dir).as_ref(), false).await?;
             let mut body = json!({ "ok": true });
             if let Some(v) = version {
                 body["version"] = json!(v);

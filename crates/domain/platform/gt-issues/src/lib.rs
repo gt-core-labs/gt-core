@@ -35,9 +35,11 @@
 pub mod commands;
 pub mod handlers;
 pub mod resources;
+pub mod surface;
 pub mod taxonomy;
 mod module;
 
 pub use commands::{ClaimIssue, CloseIssue, CreateIssue, TransitionIssue, UpdateIssue};
 pub use module::IssuesModule;
+pub use surface::{AllowAllTree, SurfaceEntry, SurfaceTree};
 pub use taxonomy::Domain;

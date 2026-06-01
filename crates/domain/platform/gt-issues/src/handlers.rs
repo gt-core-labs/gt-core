@@ -14,6 +14,7 @@
 use gt_store_dolt::{AppError, ClaimOutcome, DoltIssues};
 
 use crate::commands::{ClaimIssue, CloseIssue, CreateIssue, TransitionIssue, UpdateIssue};
+use crate::surface::SurfaceTree;
 
 /// Outcome of [`run_claim_issue`]. Carries the CAS result plus, on a won execute,
 /// the post-bump row `version` so a follow-up `issues.update` can chain its
@@ -27,14 +28,19 @@ pub struct ClaimResult {
     pub version: Option<i64>,
 }
 
-/// `issues.create`: validate, then (execute only) insert + atomic Dolt commit.
-/// Uniqueness on `id` is enforced by the store's duplicate-key path.
+/// `issues.create`: validate (shape + S3 surface existence against `tree`), then
+/// (execute only) insert + atomic Dolt commit. Uniqueness on `id` is enforced by
+/// the store's duplicate-key path. `tree` is the server's `main` git tree; a
+/// non-existent `planned:false` surface path is rejected before any write
+/// (docs/10 §S3).
 pub async fn run_create_issue(
     issues: &DoltIssues,
     args: &CreateIssue,
+    tree: &(dyn SurfaceTree + Sync),
     validate_only: bool,
 ) -> Result<(), AppError> {
     args.validate()?;
+    args.validate_surface(tree)?;
     if validate_only {
         return Ok(());
     }
@@ -48,9 +54,11 @@ pub async fn run_create_issue(
 pub async fn run_update_issue(
     issues: &DoltIssues,
     args: &UpdateIssue,
+    tree: &(dyn SurfaceTree + Sync),
     validate_only: bool,
 ) -> Result<Option<i64>, AppError> {
     args.validate()?;
+    args.validate_surface(tree)?;
     if validate_only {
         return Ok(None);
     }

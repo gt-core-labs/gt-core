@@ -7,6 +7,7 @@
 //! the `gt-rbac` scope check, and the `gt-audit` record per call.
 
 use std::borrow::Cow;
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use gt_audit::{AuditRecord, AuditSink};
@@ -41,19 +42,26 @@ pub struct IssuesServer {
     rbac: Option<Arc<RbacConfig>>,
     audit: Arc<dyn AuditSink + Send + Sync>,
     tools: Arc<Vec<McpTool>>,
+    /// Git repo whose `main` tree backs surface referential integrity (S3,
+    /// hq-core-mcp.9). `Some` when `GT_REPO_DIR` is set: `issues.create`/`.update`
+    /// reject a `planned:false` surface path absent from `main`. `None` (no
+    /// checkout, e.g. the live container) degrades to accept-all, no validation.
+    repo_dir: Option<Arc<PathBuf>>,
 }
 
 impl IssuesServer {
     /// Build the service from the composed pieces. `tools` are the descriptors
     /// the built `Root` exposes (`root.mcp_tools()`), already namespaced + NN-16
     /// shaped by the kernel builder. `rbac` enables per-connection `X-Actor`
-    /// scope resolution; `None` pins every call to `default_scope`.
+    /// scope resolution; `None` pins every call to `default_scope`. `repo_dir` is
+    /// the gt-core checkout backing surface validation; `None` disables it.
     pub fn new(
         store: Arc<DoltIssues>,
         default_scope: Scope,
         rbac: Option<Arc<RbacConfig>>,
         audit: Arc<dyn AuditSink + Send + Sync>,
         tools: Vec<McpTool>,
+        repo_dir: Option<PathBuf>,
     ) -> Self {
         Self {
             store,
@@ -61,6 +69,7 @@ impl IssuesServer {
             rbac,
             audit,
             tools: Arc::new(tools),
+            repo_dir: repo_dir.map(Arc::new),
         }
     }
 
@@ -141,7 +150,8 @@ impl ServerHandler for IssuesServer {
         let result = if tool.starts_with("meta.") {
             dispatch_meta(&self.store, &tool, args.clone(), &scope.actor, &self.tools).await
         } else {
-            dispatch(&self.store, &tool, args.clone(), &scope.actor).await
+            let repo_dir = self.repo_dir.as_deref().map(|p| p.as_path());
+            dispatch(&self.store, &tool, args.clone(), &scope.actor, repo_dir).await
         };
         let _ = self
             .audit

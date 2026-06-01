@@ -11,8 +11,11 @@
 //! - `GT_MCP_HTTP_BIND` — listen address, default `127.0.0.1:8765`.
 //! - `GT_MCP_ACTOR` — scope actor, default `mcp-local`.
 //! - `GT_MCP_SCOPE_CONFIG` — RBAC TOML/JSON path; unset ⇒ deny-by-default.
+//! - `GT_REPO_DIR` — gt-core checkout whose `main` tree backs surface validation
+//!   (S3, hq-core-mcp.9); unset ⇒ surface existence checks are skipped.
 
 mod dispatch;
+mod git_tree;
 mod pg_audit;
 mod server;
 
@@ -42,6 +45,10 @@ async fn main() -> anyhow::Result<()> {
         .context("GT_DOLT_URL is required (e.g. mysql://gastown@127.0.0.1:3307/hq)")?;
     let bind = std::env::var("GT_MCP_HTTP_BIND").unwrap_or_else(|_| "127.0.0.1:8765".into());
     let actor = std::env::var("GT_MCP_ACTOR").unwrap_or_else(|_| "mcp-local".into());
+    // S3 surface validation (hq-core-mcp.9): the gt-core checkout whose `main`
+    // tree create/update validate `planned:false` surface paths against. Unset ⇒
+    // no checkout (e.g. the live container), so surface validation is skipped.
+    let repo_dir = std::env::var("GT_REPO_DIR").ok().map(std::path::PathBuf::from);
 
     // Store: the lifted Dolt issues adapter (hq-core-host.1), on the shared Dolt.
     let store = Arc::new(DoltIssues::connect(&dolt_url)?);
@@ -96,7 +103,16 @@ async fn main() -> anyhow::Result<()> {
             Arc::new(InMemoryAudit::new())
         }
     };
-    let service = IssuesServer::new(store, default_scope, rbac, audit, tools);
+    match &repo_dir {
+        Some(dir) => eprintln!(
+            "[gt-mcp-server] surface validation on; main git tree from {}",
+            dir.display()
+        ),
+        None => eprintln!(
+            "[gt-mcp-server] GT_REPO_DIR unset; surface existence checks skipped (accept-all)"
+        ),
+    }
+    let service = IssuesServer::new(store, default_scope, rbac, audit, tools, repo_dir);
 
     let http = StreamableHttpService::new(
         move || Ok(service.clone()),
