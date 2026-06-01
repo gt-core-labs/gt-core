@@ -11,6 +11,18 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 schemars = { workspace = true }
 async-trait = { workspace = true }
+# Heavy adapters live here behind off-by-default features so the core build
+# stays dependency-light (see lib.rs "Adapters").
+sqlx = { workspace = true, optional = true }
+axum = { workspace = true, optional = true }
+
+[features]
+# Postgres `WorkspaceRepository` adapter (`PgWorkspaces`).
+pg = ["dep:sqlx"]
+# Axum `WorkspaceContext` request extractor.
+axum = ["dep:axum"]
 
 [dev-dependencies]
 tokio = { workspace = true }
+# Source of the workspaces migration SQL for the `pg` contract test.
+gt-store-pg = { workspace = true }

@@ -12,7 +12,18 @@
 //! - [`WorkspaceActor`] — the write-side owner that decides/applies/persists/logs
 //!   commands and guards the byte-for-byte replay gate (`hq-mt-core.7`).
 //!
-//! Still to come on this epic: the PG adapter (`.5`/`.6`).
+//! ## Adapters
+//!
+//! Adapters of the [`WorkspaceRepository`] port live in this crate beside the
+//! port, so the dependency points inward (adapter → port) and never crosses a
+//! tier boundary. [`InMemoryWorkspaces`] is always present; heavier adapters are
+//! gated so the default build pulls no database or web framework:
+//!
+//! - `pg` → [`PgWorkspaces`], the Postgres adapter (`hq-mt-core.6`).
+//! - `axum` → [`WorkspaceContext`], the request extractor (`hq-mt-core.8`).
+//!
+//! The generic migration SQL lives in the kernel `gt-store-pg` crate (no domain
+//! dependency); the `pg` adapter reads that table.
 
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
@@ -20,8 +31,12 @@
 mod actor;
 mod commands;
 mod events;
+#[cfg(feature = "pg")]
+mod pg;
 mod repo;
 mod state;
+#[cfg(feature = "axum")]
+mod web;
 mod workspace_id;
 
 pub use actor::{ActorError, WorkspaceActor};
@@ -30,3 +45,8 @@ pub use events::WorkspaceEvent;
 pub use repo::{InMemoryWorkspaces, RepoError, WorkspaceRepository};
 pub use state::{CatalogError, WorkspaceCatalog, WorkspaceEntry, WorkspaceStatus};
 pub use workspace_id::{WorkspaceId, WorkspaceIdError, MAX_WORKSPACE_ID_LEN};
+
+#[cfg(feature = "pg")]
+pub use pg::PgWorkspaces;
+#[cfg(feature = "axum")]
+pub use web::{WorkspaceContext, WorkspaceContextRejection, WORKSPACE_HEADER};

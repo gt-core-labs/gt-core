@@ -13,7 +13,6 @@ members = [
     "crates/domain/orchestration/gt-webhooks",
     "crates/domain/orchestration/gt-dog",
     "crates/kernel/gt-store-pg",
-    "crates/domain/platform/gt-store-pg-workspace",
     "examples/mod-hello",
 ]
 
@@ -67,8 +66,6 @@ gt-webhooks      = { path = "crates/domain/orchestration/gt-webhooks" }
 gt-dog           = { path = "crates/domain/orchestration/gt-dog" }
 
 gt-store-pg      = { path = "crates/kernel/gt-store-pg" }
-
-gt-store-pg-workspace = { path = "crates/domain/platform/gt-store-pg-workspace" }
 
 # Reused from gastown until P4 (foundation kernel crates):
 # gt-events, gt-bus, gt-audit, gt-plugin, gt-telemetry remain in gastown.

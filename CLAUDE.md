@@ -12,7 +12,7 @@ Foundational module system + multi-tenant primitives for Gas Town and downstream
 - Code lives here. Branch off `main`. Worktrees under `/home/nixos/gt-core-wt-<bead-id>` (NEVER `/tmp` — tmpfs RAM, reboot wipes).
 - Before claiming: `git log --all --grep <bead-id>` to avoid hijacking a branch another agent is mid-edit on (memory feedback_worktree_hijack_parallel applies).
 - Comments AND documentation in English.
-- Hexagonal: domain crate = Port + InMemory; PG adapter optional in `gt-store-pg-<X>`.
+- Hexagonal: domain crate = Port + InMemory. Heavy adapters (PG repo, axum extractor) live in the SAME domain crate behind off-by-default features (`pg`, `axum`) so the core build stays dependency-light — NOT separate adapter crates. A separate adapter crate would force a forbidden `domain/platform → domain/platform` dep (docs/03 Rule 4). Generic, domain-free plumbing (e.g. migration-SQL host `gt-store-pg`) may still be its own kernel crate.
 - `cargo build` green + replay byte-for-byte gate green before PR (gate required on every change touching events/reducers).
 - One bead per branch, conventional commits (`feat(gt-module): ...`). ff-merge to `main` from TOWN ROOT, never from a worktree.
 - **Anti-overlap:** never `git merge` straight to `main`. Use `git mainmerge <branch>` (`~/.claude/bin/gt-main-merge.sh`): flock serializes concurrent sessions + `--ff-only` ancestry check fails clean if main advanced (orchestrator race) → rebase and re-run. Don't bypass with a raw merge.

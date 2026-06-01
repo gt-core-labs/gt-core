@@ -1,27 +1,24 @@
-//! Postgres adapter for the `gt-workspace` [`WorkspaceRepository`] port
-//! (`hq-mt-core.6`).
+//! Postgres adapter for the [`WorkspaceRepository`](crate::WorkspaceRepository)
+//! port (`hq-mt-core.6`). Compiled only under the `pg` feature.
 //!
-//! The hexagonal outer adapter: it depends on the `gt-workspace` domain crate
-//! (port + types) and on `sqlx`, and backs the port with the `workspaces` table
-//! created by the `gt-store-pg` migration (`hq-mt-core.5`). Because it references
-//! domain types it lives in `domain/platform`, not `kernel` — a kernel crate may
-//! not depend on a domain crate (docs/03 Rule 4). The bead's `surface_json`
-//! pointed at `crates/kernel/gt-store-pg`; that placement is unreachable under
-//! the dependency rule (see gap `arch.hq-mt-core.6.store-pg-tier-placement`).
+//! Backs the port with the `workspaces` table created by the `gt-store-pg`
+//! migration (`hq-mt-core.5`). It sits beside [`InMemoryWorkspaces`] as another
+//! adapter of the same port; the heavy `sqlx` dependency is feature-gated so the
+//! default `gt-workspace` build stays pure.
 //!
 //! `WorkspaceEntry` carries no slug of its own, but the table's `slug` column is
 //! `NOT NULL UNIQUE`; since [`WorkspaceId`] is itself a validated DNS-label slug,
 //! the adapter writes `slug = id`.
-
-#![forbid(unsafe_code)]
+//!
+//! [`InMemoryWorkspaces`]: crate::InMemoryWorkspaces
 
 use async_trait::async_trait;
 use sqlx::postgres::PgRow;
 use sqlx::{PgPool, Row};
 
-use gt_workspace::{RepoError, WorkspaceEntry, WorkspaceId, WorkspaceRepository, WorkspaceStatus};
+use crate::{RepoError, WorkspaceEntry, WorkspaceId, WorkspaceRepository, WorkspaceStatus};
 
-/// Postgres-backed [`WorkspaceRepository`].
+/// Postgres-backed [`WorkspaceRepository`](crate::WorkspaceRepository).
 ///
 /// Holds a [`PgPool`]; every method runs one statement against the `workspaces`
 /// table. Cloning is cheap — `PgPool` is an `Arc` over the connection pool.
@@ -148,7 +145,6 @@ mod tests {
         let repo = PgWorkspaces::new(pool.clone());
 
         let wid = id("acme-pg-test");
-        // Clean any leftover from a prior run.
         sqlx::query("DELETE FROM workspaces WHERE id = $1")
             .bind(wid.as_str())
             .execute(&pool)
@@ -163,7 +159,6 @@ mod tests {
         repo.save(&entry).await.unwrap();
         assert_eq!(repo.load(&wid).await.unwrap(), Some(entry.clone()));
 
-        // Upsert: same id, new name + status.
         let updated = WorkspaceEntry {
             name: "Acme Corp".to_string(),
             status: WorkspaceStatus::Suspended,
@@ -174,13 +169,11 @@ mod tests {
         assert_eq!(loaded.name, "Acme Corp");
         assert_eq!(loaded.status, WorkspaceStatus::Suspended);
 
-        // The bootstrap default row from the migration is visible via list.
         let ids: Vec<String> =
             repo.list().await.unwrap().into_iter().map(|e| e.id.as_str().to_string()).collect();
         assert!(ids.contains(&"default".to_string()), "bootstrap default present");
         assert!(ids.contains(&"acme-pg-test".to_string()));
 
-        // Cleanup.
         sqlx::query("DELETE FROM workspaces WHERE id = $1")
             .bind(wid.as_str())
             .execute(&pool)

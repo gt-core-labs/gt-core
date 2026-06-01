@@ -152,9 +152,24 @@ modules    → domain    → kernel    → (gastown kernel until P4)
 
 ### Forbidden
 
-- ❌ Kernel crate depending on a domain crate. The trait is in kernel; impls live in domain/modules.
+- ❌ Kernel crate depending on a domain crate. A port defined in kernel has its impls in domain/modules; a port defined in a domain crate (e.g. `WorkspaceRepository` in `gt-workspace`) keeps its adapters in that same crate (see below).
 - ❌ Module A calling Module B directly. Cross-module = event subscription + CommandBus dispatch only.
 - ❌ Crate importing from a sibling via `../../<other>/src/lib.rs` path hack. Use `[workspace.dependencies]`.
+- ❌ A separate `domain/platform/*` crate that depends on another `domain/platform/*` crate. The table above does not permit `platform → platform`; an adapter that would need it belongs *inside* the port's crate (see below).
+
+### Adapters of a domain port
+
+A driven adapter (Postgres repo) or driving adapter (axum extractor) of a port
+defined in a `domain/platform` crate lives in **that same crate**, behind an
+off-by-default Cargo feature — never in a separate crate. This keeps the
+dependency inward (adapter → port, intra-crate) and avoids a `platform → platform`
+edge the allowed-deps table forbids, while the default build stays free of the
+adapter's heavy dependencies (`sqlx`, `axum`).
+
+Example — `gt-workspace` always ships `InMemoryWorkspaces`, plus `PgWorkspaces`
+under feature `pg` and `WorkspaceContext` under feature `axum`. Generic,
+domain-free plumbing (e.g. the migration-SQL host `gt-store-pg`, which depends
+only on kernel) may still be its own kernel crate.
 
 ### Centralized paths
 

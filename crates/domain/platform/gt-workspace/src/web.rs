@@ -1,29 +1,21 @@
 //! [`WorkspaceContext`] — the axum extractor that resolves a request's tenant
-//! boundary (`hq-mt-core.8`).
+//! boundary (`hq-mt-core.8`). Compiled only under the `axum` feature.
 //!
 //! Every multi-tenant handler needs the [`WorkspaceId`] it operates under, and
 //! docs/04 rule 15 is non-negotiable: that id is taken from the request's auth
 //! context, **never** from a URL path or body (those are spoofable). This
 //! extractor is the single injection point — a handler that takes
-//! `WorkspaceContext` cannot accidentally read the workspace from anywhere else.
-//!
-//! ## Placement
-//!
-//! The bead's `surface_json` named `crates/bins/gt-web`, but an axum
-//! [`FromRequestParts`] extractor is reusable library code, not bin code, and it
-//! depends on the `gt-workspace` domain crate (so it cannot be kernel — docs/03
-//! Rule 4). It therefore lives here in `domain/platform`. See gap
-//! `arch.hq-mt-core.8.web-context-tier-and-jwt`.
+//! [`WorkspaceContext`] cannot accidentally read the workspace from anywhere
+//! else.
 //!
 //! ## Resolution sources
 //!
 //! Two sources are specified: the `X-GT-Workspace` header and a JWT claim. Only
 //! the header path is implemented — the JWT/auth layer is not yet ported to
-//! gt-core (it lives in gastown). When that lands, [`from_request_parts`] gains
-//! a fallback: header first, then the verified JWT claim. Until then a request
-//! without the header is [`Missing`](WorkspaceContextRejection::Missing).
-
-#![forbid(unsafe_code)]
+//! gt-core (it lives in gastown). When that lands,
+//! [`from_request_parts`](WorkspaceContext::from_request_parts) gains a fallback:
+//! header first, then the verified JWT claim. Until then a request without the
+//! header is [`Missing`](WorkspaceContextRejection::Missing).
 
 use axum::async_trait;
 use axum::extract::FromRequestParts;
@@ -31,7 +23,7 @@ use axum::http::request::Parts;
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 
-use gt_workspace::{WorkspaceId, WorkspaceIdError};
+use crate::{WorkspaceId, WorkspaceIdError};
 
 /// Request header carrying the target workspace slug.
 pub const WORKSPACE_HEADER: &str = "X-GT-Workspace";
@@ -61,7 +53,7 @@ impl WorkspaceContext {
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum WorkspaceContextRejection {
-    /// No `X-GT-Workspace` header (and no JWT fallback yet — see crate docs).
+    /// No `X-GT-Workspace` header (and no JWT fallback yet — see module docs).
     Missing,
     /// The header value was not valid ASCII / printable header text.
     InvalidHeaderEncoding,
