@@ -11,18 +11,31 @@
 //! - [`evaluate`] — resolve a flag's effective state from default + optional override.
 //! - [`FeatureFlags`] — repository port for per-workspace overrides, with
 //!   [`InMemoryFeatureFlags`] and the [`FeatureFlagsExt::is_enabled`] resolver.
+//! - [`PgFeatureFlags`] — Postgres adapter of the port (under the `pg` feature).
+//! - [`FlagsModule`] — the `GtModule` contributing the `feature.*` MCP tools +
+//!   the override-table migration (`hq-mod-flags.4`).
 //!
-//! Part of the gt-core module system (`hq-mod`). The Postgres adapter lives in
-//! `gt-store-pg` (`hq-mod-flags.3`).
+//! Part of the gt-core module system (`hq-mod`). The `flag_overrides` migration
+//! SQL is hosted by `gt-store-pg` (`hq-mod-flags.7`).
 
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
+mod commands;
+mod handlers;
 mod key;
+mod module;
 mod repo;
+#[cfg(feature = "pg")]
+mod pg;
 
+pub use commands::{DisableFeature, EnableFeature, FeatureCmdError, ListFeatures};
+pub use handlers::{run_disable_feature, run_enable_feature, run_list_features, FeatureOverride};
 pub use key::{FlagKey, FlagKeyError};
+pub use module::FlagsModule;
 pub use repo::{FeatureFlags, FeatureFlagsExt, FlagError, InMemoryFeatureFlags};
+#[cfg(feature = "pg")]
+pub use pg::PgFeatureFlags;
 
 /// A feature flag definition: its identity plus the state it takes when no
 /// override exists.

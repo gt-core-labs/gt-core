@@ -4,12 +4,31 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "Feature-flag repo port + per-workspace overrides. Consumed by gt-module RootBuilder."
+description = "Feature-flag repo port + per-workspace overrides + FlagsModule (feature.* MCP tools)."
 
 [dependencies]
-serde = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
 async-trait = { workspace = true }
+# Module seam: FlagsModule contributes the `feature.*` tools + the override-table
+# migration through the kernel `GtModule` (hq-mod-flags.4).
+gt-module = { workspace = true }
+gt-module-mcp = { workspace = true }
+semver = { workspace = true }
+schemars = { workspace = true }
+# Source of the `flag_overrides` migration the module surfaces. gt-store-pg
+# depends only on gt-module, so this edge is acyclic (gt-store-pg never depends
+# back on gt-feature-flags).
+gt-store-pg = { workspace = true }
+# Heavy Postgres adapter (`PgFeatureFlags`) lives here behind the off-by-default
+# `pg` feature so the default build stays dependency-light (mirrors gt-workspace).
+sqlx = { workspace = true, optional = true }
+
+[features]
+# Postgres `FeatureFlags` adapter (`PgFeatureFlags`).
+pg = ["dep:sqlx"]
 
 [dev-dependencies]
 serde_json = { workspace = true }
 tokio = { workspace = true }
+# Source of the flag_overrides + workspaces migration SQL for the `pg` contract test.
+gt-store-pg = { workspace = true }
