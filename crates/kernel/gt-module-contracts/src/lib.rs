@@ -11,17 +11,20 @@
 //! - [`SurfaceHash`] — order-independent fingerprint of a module's surface items.
 //! - [`typescript_module`] — TypeScript DTO codegen from a module's JSON Schemas.
 //! - [`ContractBaseline`] + [`DriftCheck`] — frozen baseline + CI drift check.
+//! - [`enforce`] + [`SurfaceChange`] / [`SemverVerdict`] — semver enforcement
+//!   (a breaking surface change must bump *major*, not just any field).
 //!
-//! Part of the gt-core module system (`hq-mod`). Semver enforcement (a breaking
-//! surface change must bump *major*, not just any field) lands in `.4`.
+//! Part of the gt-core module system (`hq-mod`).
 
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
 mod baseline;
 mod codegen;
+mod semver;
 mod version;
 
 pub use baseline::{ContractBaseline, DriftCheck};
 pub use codegen::typescript_module;
+pub use semver::{enforce, version_file_name, SemverVerdict, SurfaceChange};
 pub use version::{ContractVersion, SurfaceHash};
