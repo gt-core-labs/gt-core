@@ -15,6 +15,11 @@
 
 use gt_module::Migration;
 
+mod schema;
+pub use schema::{schema_for, MAX_WORKSPACE_SLUG_LEN, SCHEMA_PREFIX, SHARED_SCHEMA};
+#[cfg(feature = "pg")]
+pub use schema::WorkspacePool;
+
 /// Canonical id of the bootstrap default workspace.
 ///
 /// A single workspace is seeded by the initial migration so the platform is
