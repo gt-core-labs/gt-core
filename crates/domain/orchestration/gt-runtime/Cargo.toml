@@ -1,0 +1,17 @@
+[package]
+name = "gt-runtime"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Per-workspace runtime composition: RootRegistry + RootHandle. Resolves a WorkspaceId to its composed application Root."
+
+[dependencies]
+# Kernel composition primitive (upward dep — orchestration -> kernel).
+gt-module = { workspace = true }
+# Tenant-boundary identifier (orchestration -> domain/platform, allowed by docs/03 dep table).
+gt-workspace = { workspace = true }
+# Lock-free concurrent map: the registry is hit on every per-workspace request.
+dashmap = { workspace = true }
+
+[dev-dependencies]

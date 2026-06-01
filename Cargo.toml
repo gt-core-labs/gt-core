@@ -10,6 +10,7 @@ members = [
     "crates/domain/platform/gt-workspace",
     "crates/domain/orchestration/gt-webhooks",
     "crates/domain/orchestration/gt-dog",
+    "crates/domain/orchestration/gt-runtime",
     "crates/kernel/gt-store-pg",
     "examples/mod-hello",
 ]
@@ -43,6 +44,8 @@ hex = "0.4"
 
 # Storage
 sqlx = { version = "0.8", default-features = false, features = ["postgres", "macros", "runtime-tokio-rustls", "uuid", "chrono"] }
+# Lock-free concurrent map (per-workspace RootRegistry, hq-mt-routing.1).
+dashmap = "6"
 
 # Telemetry
 tracing = "0.1"
@@ -60,6 +63,7 @@ gt-hooks         = { path = "crates/kernel/gt-hooks" }
 gt-workspace     = { path = "crates/domain/platform/gt-workspace" }
 gt-webhooks      = { path = "crates/domain/orchestration/gt-webhooks" }
 gt-dog           = { path = "crates/domain/orchestration/gt-dog" }
+gt-runtime       = { path = "crates/domain/orchestration/gt-runtime" }
 
 gt-store-pg      = { path = "crates/kernel/gt-store-pg" }
 
