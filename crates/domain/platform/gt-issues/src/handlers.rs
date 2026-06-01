@@ -16,7 +16,8 @@ use gt_store_dolt::{AppError, ClaimOutcome, DoltIssues};
 use crate::commands::{
     AdvancePhase, ClaimIssue, CloseIssue, CreateIssue, TransitionIssue, UpdateIssue,
 };
-use crate::surface::SurfaceTree;
+use crate::delivery::{path_touches_surface, CommitInspector};
+use crate::surface::{parse_surface_json, SurfaceTree};
 
 /// Outcome of [`run_claim_issue`]. Carries the CAS result plus, on a won execute,
 /// the post-bump row `version` so a follow-up `issues.update` can chain its
@@ -95,7 +96,20 @@ pub async fn run_transition_issue(
 }
 
 /// `issues.close`: validate (incl. the required `commit_sha`), then (execute
-/// only) record the delivering commit as a note and close with attribution.
+/// only) verify delivery (S2), record the delivering commit as a note, close with
+/// attribution, and stamp `delivered_sha` when verified.
+///
+/// **Phase-2 delivery verification (hq-core-mcp.10, docs/10 §S2).** When an
+/// `inspector` is supplied (the server wires one iff a repo is configured) and
+/// the bead declares at least one non-`planned` surface path, the `commit_sha`
+/// must resolve on `main` AND touch one of those paths — otherwise the close is
+/// rejected before any write (the sha did not deliver the claimed surface). On a
+/// match the resolved full sha is stamped via
+/// [`set_delivered_sha`](DoltIssues::set_delivered_sha). A bead with no
+/// non-`planned` surface (wontfix / pure process) closes without a stamp, leaving
+/// `delivered_sha` NULL — correct, since no artifact was produced. With no
+/// `inspector` (no repo wired) verification is skipped and the close behaves as
+/// before, leaving `delivered_sha` NULL.
 ///
 /// The note is appended **before** the close flips the status, so even a
 /// subsequently-rejected close (e.g. already-closed) leaves the sha breadcrumb.
@@ -105,16 +119,58 @@ pub async fn run_close_issue(
     issues: &DoltIssues,
     args: &CloseIssue,
     actor: &str,
+    inspector: Option<&(dyn CommitInspector + Send + Sync)>,
     validate_only: bool,
 ) -> Result<(), AppError> {
     args.validate()?;
     if validate_only {
         return Ok(());
     }
+    let sha = args.commit_sha.trim();
+
+    // S2 phase-2: confirm the sha delivered a non-planned surface before closing.
+    // `delivered` carries the resolved full sha to stamp once the close lands.
+    let mut delivered: Option<String> = None;
+    if let Some(inspector) = inspector {
+        let detail = issues
+            .get_detail(&args.id)
+            .await?
+            .ok_or_else(|| AppError::NotFound(format!("issue {}", args.id)))?;
+        let non_planned: Vec<String> = parse_surface_json(&detail.surface_json)
+            .into_iter()
+            .filter(|e| !e.planned)
+            .map(|e| e.path)
+            .collect();
+        if !non_planned.is_empty() {
+            let info = inspector.inspect(sha).ok_or_else(|| {
+                AppError::Validation(format!(
+                    "commit_sha {sha} does not resolve to a commit on main — close rejected (docs/10 §S2)"
+                ))
+            })?;
+            let touches = non_planned.iter().any(|surface| {
+                info.changed_paths
+                    .iter()
+                    .any(|changed| path_touches_surface(changed, surface))
+            });
+            if !touches {
+                return Err(AppError::Validation(format!(
+                    "commit {sha} does not touch any non-planned surface of {} — close rejected (docs/10 §S2)",
+                    args.id
+                )));
+            }
+            delivered = Some(info.full_sha);
+        }
+        // No non-planned surface → nothing to deliver; close leaves delivered_sha NULL.
+    }
+
     let session = args.effective_session(actor);
-    let note = format!("closed @ {} (by {})", args.commit_sha.trim(), session);
+    let note = format!("closed @ {sha} (by {session})");
     issues.append_notes(&args.id, &note).await?;
-    issues.close(&args.id, session).await
+    issues.close(&args.id, session).await?;
+    if let Some(full_sha) = delivered {
+        issues.set_delivered_sha(&args.id, &full_sha).await?;
+    }
+    Ok(())
 }
 
 /// `issues.claim`: validate, then (execute only) run the atomic CAS claim for

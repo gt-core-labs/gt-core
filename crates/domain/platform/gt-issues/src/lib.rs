@@ -33,6 +33,7 @@
 #![warn(missing_docs)]
 
 pub mod commands;
+pub mod delivery;
 pub mod handlers;
 pub mod resources;
 pub mod surface;
@@ -42,6 +43,7 @@ mod module;
 pub use commands::{
     AdvancePhase, ClaimIssue, CloseIssue, CreateIssue, TransitionIssue, UpdateIssue,
 };
+pub use delivery::{CommitInfo, CommitInspector};
 pub use module::IssuesModule;
 pub use surface::{AllowAllTree, SurfaceEntry, SurfaceTree};
 pub use taxonomy::Domain;

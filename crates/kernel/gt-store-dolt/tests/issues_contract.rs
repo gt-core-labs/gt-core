@@ -52,7 +52,8 @@ async fn seed(base: &str) -> Result<(), Box<dyn std::error::Error>> {
             surface_json        TEXT NOT NULL DEFAULT '[]',
             depends_on_json     TEXT NOT NULL DEFAULT '[]',
             role_scope          VARCHAR(32),
-            version             BIGINT NOT NULL DEFAULT 0
+            version             BIGINT NOT NULL DEFAULT 0,
+            delivered_sha       CHAR(40)
         )",
     )
     .await?;
@@ -339,6 +340,51 @@ async fn update_patches_visible_fields_and_commits() {
             || err.to_string().to_lowercase().contains("issue hq-missing"),
         "expected NotFound, got `{err}`",
     );
+}
+
+#[tokio::test]
+async fn delivered_sha_round_trips() {
+    // hq-core-mcp.10 (docs/10 §S2): set_delivered_sha stamps the column and it
+    // surfaces in both the list snapshot and get_detail; absent a stamp it is None.
+    let Ok(base) = std::env::var("GT_DOLT_URL") else {
+        eprintln!("GT_DOLT_URL unset — skipping DoltIssues.set_delivered_sha contract");
+        return;
+    };
+    let base = base.trim_end_matches('/').to_string();
+    seed(&base).await.expect("seed");
+
+    let repo = DoltIssues::connect(&format!("{base}/{TEST_DB}")).expect("connect");
+    repo.ensure_schema().await.expect("schema present");
+
+    let id = format!("hq-del-{}", ulid::Ulid::new());
+    repo.insert(&NewIssue {
+        id: id.clone(),
+        title: "deliverable".into(),
+        issue_type: "task".into(),
+        created_by: "test".into(),
+        ..Default::default()
+    })
+    .await
+    .expect("seed insert");
+
+    // No stamp yet → NULL on both read paths.
+    let detail = repo.get_detail(&id).await.expect("ok").expect("present");
+    assert_eq!(detail.delivered_sha, None, "fresh row has no delivered_sha");
+
+    let sha = "0123456789abcdef0123456789abcdef01234567"; // 40 hex
+    repo.set_delivered_sha(&id, sha).await.expect("stamp");
+
+    let detail = repo.get_detail(&id).await.expect("ok").expect("present");
+    assert_eq!(detail.delivered_sha.as_deref(), Some(sha));
+    let rows = repo
+        .list(&IssueFilter { issue_type: Some("task".into()), ..Default::default() })
+        .await
+        .expect("list");
+    let row = rows.iter().find(|r| r.id == id).expect("row present");
+    assert_eq!(row.delivered_sha.as_deref(), Some(sha), "delivered_sha in snapshot");
+
+    // Missing id surfaces NotFound.
+    assert!(repo.set_delivered_sha("hq-missing-zzz", sha).await.is_err());
 }
 
 #[tokio::test]

@@ -1,19 +1,24 @@
-//! Git-tree adapter for surface referential integrity (hq-core-mcp.9, docs/10
-//! §S3). The orchestration tier is where shelling out is allowed, so the
-//! `git ls-tree` invocation lives here rather than in the `gt-issues` domain
-//! crate, which depends only on the [`SurfaceTree`] port.
+//! Git adapters for the tracking-model refactor (docs/10). The orchestration tier
+//! is where shelling out is allowed, so the `git` invocations live here rather
+//! than in the `gt-issues` domain crate, which depends only on the
+//! [`SurfaceTree`] (S3) and [`CommitInspector`] (S2) ports.
 //!
-//! The validator reads the in-process git tree of the gt-core repo the server is
-//! configured to serve (`GT_REPO_DIR`) — no extra clone. When no repo is wired
-//! (the live container has no checkout) the build falls back to the permissive
-//! [`AllowAllTree`], so surface validation degrades to the pre-S3 behaviour
-//! instead of rejecting every write.
+//! - **[`GitSurfaceTree`]** (hq-core-mcp.9, §S3) reads `git ls-tree -r main` so
+//!   `create`/`update` reject a `planned:false` surface path missing on `main`.
+//! - **[`GitCommitInspector`]** (hq-core-mcp.10, §S2) resolves a closing
+//!   `commit_sha` on `main` + the paths it changed so `close` can verify delivery.
+//!
+//! Both read the in-process git tree of the gt-core repo the server is configured
+//! to serve (`GT_REPO_DIR`) — no extra clone. When no repo is wired (the live
+//! container has no checkout) the surface check degrades to the permissive
+//! [`AllowAllTree`] and delivery verification is skipped, so both refinements fall
+//! back to pre-refactor behaviour instead of blocking writes.
 
 use std::collections::HashSet;
 use std::path::Path;
 use std::process::Command;
 
-use gt_issues::{AllowAllTree, SurfaceTree};
+use gt_issues::{AllowAllTree, CommitInfo, CommitInspector, SurfaceTree};
 
 /// A snapshot of the `main` git tree: the flat set of every blob path returned by
 /// `git ls-tree -r --name-only main`. [`SurfaceTree::contains`] treats a surface
@@ -75,6 +80,61 @@ pub fn surface_tree(repo_dir: Option<&Path>) -> Box<dyn SurfaceTree + Send + Syn
         },
         None => Box::new(AllowAllTree),
     }
+}
+
+/// [`CommitInspector`] over a real git checkout (hq-core-mcp.10, §S2). Resolves a
+/// closing `commit_sha` to its full form, verifies it is reachable from `main`,
+/// and lists the paths it changed.
+pub struct GitCommitInspector<'a> {
+    repo_dir: &'a Path,
+}
+
+impl<'a> GitCommitInspector<'a> {
+    fn run(&self, args: &[&str]) -> std::io::Result<std::process::Output> {
+        Command::new("git").arg("-C").arg(self.repo_dir).args(args).output()
+    }
+}
+
+impl CommitInspector for GitCommitInspector<'_> {
+    fn inspect(&self, sha: &str) -> Option<CommitInfo> {
+        // Resolve to a canonical commit sha; rejects a non-commit / unknown ref.
+        let rev = self.run(&["rev-parse", "--verify", &format!("{sha}^{{commit}}")]).ok()?;
+        if !rev.status.success() {
+            return None;
+        }
+        let full_sha = String::from_utf8_lossy(&rev.stdout).trim().to_string();
+        if full_sha.is_empty() {
+            return None;
+        }
+        // The sha must be reachable from `main` — an off-main commit did not
+        // deliver onto the line readiness evaluates against.
+        let anc = self.run(&["merge-base", "--is-ancestor", &full_sha, "main"]).ok()?;
+        if !anc.status.success() {
+            return None;
+        }
+        // Paths the commit changed (empty for a treeless/root edge case — that
+        // simply means it touches no surface, so the close is rejected upstream).
+        let diff = self
+            .run(&["diff-tree", "--no-commit-id", "--name-only", "-r", &full_sha])
+            .ok()?;
+        if !diff.status.success() {
+            return None;
+        }
+        let changed_paths = String::from_utf8_lossy(&diff.stdout)
+            .lines()
+            .map(|l| l.trim_end().to_string())
+            .filter(|l| !l.is_empty())
+            .collect();
+        Some(CommitInfo { full_sha, changed_paths })
+    }
+}
+
+/// Resolve the [`CommitInspector`] for a close: `Some` when a repo is configured,
+/// else `None` (delivery verification skipped, `delivered_sha` left NULL). Unlike
+/// the surface tree, a missing repo yields `None` rather than a permissive
+/// adapter — verification is opt-in, and absent it the close must NOT be rejected.
+pub fn commit_inspector(repo_dir: Option<&Path>) -> Option<GitCommitInspector<'_>> {
+    repo_dir.map(|repo_dir| GitCommitInspector { repo_dir })
 }
 
 #[cfg(test)]

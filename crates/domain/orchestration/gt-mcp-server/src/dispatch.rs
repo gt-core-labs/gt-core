@@ -11,7 +11,10 @@ use gt_issues::handlers::{
     run_advance_phase, run_claim_issue, run_close_issue, run_create_issue, run_transition_issue,
     run_update_issue, ClaimResult,
 };
-use gt_issues::{AdvancePhase, ClaimIssue, CloseIssue, CreateIssue, TransitionIssue, UpdateIssue};
+use gt_issues::{
+    AdvancePhase, ClaimIssue, CloseIssue, CommitInspector, CreateIssue, TransitionIssue,
+    UpdateIssue,
+};
 use gt_meta::ReportGap;
 use gt_module::McpTool;
 use gt_store_dolt::{AppError, ClaimOutcome, DoltIssues, IssueFilter, NewIssue};
@@ -19,7 +22,7 @@ use serde_json::{json, Value};
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use crate::git_tree::surface_tree;
+use crate::git_tree::{commit_inspector, surface_tree};
 
 /// Map a serde deserialization error onto the domain error so a malformed tool
 /// payload surfaces as a validation failure (not a 500).
@@ -93,12 +96,20 @@ pub async fn dispatch(
         }
         "issues.close.validate" => {
             let a: CloseIssue = parse_args(args)?;
-            run_close_issue(store, &a, actor, true).await?;
+            // Validate is shape-only and returns before the S2 delivery check, so
+            // no inspector is needed here.
+            run_close_issue(store, &a, actor, None, true).await?;
             Ok(json!({ "ok": true }))
         }
         "issues.close.execute" => {
             let a: CloseIssue = parse_args(args)?;
-            run_close_issue(store, &a, actor, false).await?;
+            // S2 phase-2: the git inspector verifies the closing sha touches a
+            // non-planned surface and yields the full sha to stamp. `None` (no
+            // repo wired) skips verification and leaves delivered_sha NULL.
+            let inspector = commit_inspector(repo_dir);
+            let inspector_ref =
+                inspector.as_ref().map(|i| i as &(dyn CommitInspector + Send + Sync));
+            run_close_issue(store, &a, actor, inspector_ref, false).await?;
             Ok(json!({ "ok": true }))
         }
         "issues.claim.validate" => {

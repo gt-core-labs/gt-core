@@ -155,6 +155,13 @@ pub struct IssueRow {
     /// a stale edit fail instead of clobbering a concurrent one.
     #[serde(default)]
     pub version: i64,
+    /// Full 40-hex sha that delivered this bead's code (hq-core-mcp.10, docs/10
+    /// §S2). Set by `close` phase-2 when the closing commit_sha actually touches a
+    /// non-`planned` surface path; `None` until then (a wontfix/no-deliverable
+    /// close leaves it null). This — not `status='closed'` — is the trustworthy
+    /// delivery signal dependency readiness (S4) evaluates against.
+    #[serde(default)]
+    pub delivered_sha: Option<String>,
     /// Heavy text bodies, populated only when [`IssueFilter::full`] is set
     /// (hq-gap-issues-list-full). `None` in the cheap default snapshot and
     /// skipped from the JSON entirely, so back-compat consumers see the exact
@@ -221,6 +228,10 @@ pub struct IssueDetail {
     /// show the gate an agent must respect. Defaults to `"P1"` for legacy rows.
     #[serde(default = "default_phase")]
     pub phase: String,
+    /// Delivering commit sha (hq-core-mcp.10, docs/10 §S2). See
+    /// [`IssueRow::delivered_sha`].
+    #[serde(default)]
+    pub delivered_sha: Option<String>,
 }
 
 fn default_phase() -> String {
@@ -421,6 +432,10 @@ impl DoltIssues {
             // `phase` exceeds the `phase_frontier.open_phase` (seeded below).
             ("phase", "ENUM('P1','P2','P3','P4') NOT NULL DEFAULT 'P1'"),
             ("phase_ratified_at", "TIMESTAMP NULL"),
+            // hq-core-mcp.10 (docs/10 §S2) — delivering commit sha, stamped by
+            // `close` phase-2 once the closing sha is verified to touch a
+            // non-planned surface. NULL until delivered; the readiness signal.
+            ("delivered_sha", "CHAR(40) NULL"),
         ];
 
         let mut added_any = false;
@@ -1172,6 +1187,42 @@ impl DoltIssues {
         Ok(())
     }
 
+    /// Stamp the verified delivering commit sha on `id` (hq-core-mcp.10, docs/10
+    /// §S2). Called by `close` phase-2 only after the sha is confirmed to touch a
+    /// non-`planned` surface path, so a non-NULL `delivered_sha` is a trustworthy
+    /// delivery proof. Bumps `version` and stamps an atomic Dolt commit like the
+    /// other write paths. `AppError::NotFound` when no row matches `id`.
+    pub async fn set_delivered_sha(&self, id: &str, sha: &str) -> Result<(), AppError> {
+        let mut conn = self.pool.get_conn().await.map_err(map_err)?;
+        let result = conn
+            .exec_iter(
+                "UPDATE issues
+                 SET delivered_sha = :sha,
+                     updated_at = NOW(),
+                     version = version + 1
+                 WHERE id = :id",
+                mysql_async::params! {
+                    "id" => id,
+                    "sha" => sha,
+                },
+            )
+            .await
+            .map_err(map_err)?;
+        let affected = result.affected_rows();
+        let _ = result.drop_result().await.map_err(map_err)?;
+        if affected == 0 {
+            return Err(AppError::NotFound(format!("issue {id}")));
+        }
+        let commit_msg = format!("deliver {id} @ {sha}");
+        conn.exec_drop(
+            "CALL DOLT_COMMIT('-A', '-m', :msg)",
+            mysql_async::params! { "msg" => commit_msg },
+        )
+        .await
+        .map_err(map_err)?;
+        Ok(())
+    }
+
     /// List issues matching `filter`, newest-updated first. Datetime columns
     /// are formatted server-side to ISO 8601 strings — the workspace pins
     /// `mysql_async` with `minimal` features (no `time`/`chrono` integration),
@@ -1223,9 +1274,9 @@ impl DoltIssues {
         };
 
         // hq-gap-issues-list-full: when `full`, append the heavy text bodies
-        // after `version` (ordinals 17-20) so a sub-epic review reads in one
+        // after `delivered_sha` (ordinals 18-21) so a sub-epic review reads in one
         // call. Kept at the END of the SELECT so the cheap-snapshot ordinals
-        // 0-16 are untouched and `row_to_issue` only has to look past `version`.
+        // 0-17 (incl. `delivered_sha` at 17) are untouched by the `full` flag.
         let body_cols = if filter.full {
             ", description, design, acceptance_criteria, notes"
         } else {
@@ -1237,7 +1288,8 @@ impl DoltIssues {
                     DATE_FORMAT(updated_at, '%Y-%m-%dT%H:%i:%SZ') AS updated_at,
                     DATE_FORMAT(closed_at,  '%Y-%m-%dT%H:%i:%SZ') AS closed_at,
                     external_ref, spec_id,
-                    domain_json, surface_json, depends_on_json, role_scope, version{body_cols}
+                    domain_json, surface_json, depends_on_json, role_scope, version,
+                    delivered_sha{body_cols}
              FROM issues
              {where_clause}
              ORDER BY updated_at DESC, id ASC
@@ -1271,7 +1323,8 @@ impl DoltIssues {
                     DATE_FORMAT(closed_at,  '%Y-%m-%dT%H:%i:%SZ') AS closed_at,
                     external_ref, spec_id,
                     description, design, acceptance_criteria, notes,
-                    domain_json, surface_json, depends_on_json, role_scope, version, phase
+                    domain_json, surface_json, depends_on_json, role_scope, version,
+                    phase, delivered_sha
              FROM issues
              WHERE id = :id
              LIMIT 1";
@@ -1320,6 +1373,7 @@ fn row_to_detail(row: mysql_async::Row) -> Result<IssueDetail, AppError> {
         version: row.take::<i64, _>(20).unwrap_or(0),
         // hq-core-mcp.8 — phase echoed at claim time so the agent sees the gate.
         phase: take_opt(&mut row, 21).unwrap_or_else(|| "P1".to_string()),
+        delivered_sha: take_opt(&mut row, 22),
     })
 }
 
@@ -1358,10 +1412,12 @@ fn row_to_issue(row: mysql_async::Row, full: bool) -> Result<IssueRow, AppError>
         depends_on_json: take_string(&mut row, 14)?,
         role_scope: take_opt(&mut row, 15),
         version: row.take::<i64, _>(16).unwrap_or(0),
-        // Bodies are only SELECTed when `full` — ordinals 17-20 (after version).
-        description: full.then(|| take_opt(&mut row, 17).unwrap_or_default()),
-        design: full.then(|| take_opt(&mut row, 18).unwrap_or_default()),
-        acceptance_criteria: full.then(|| take_opt(&mut row, 19).unwrap_or_default()),
-        notes: full.then(|| take_opt(&mut row, 20).unwrap_or_default()),
+        // `delivered_sha` is always SELECTed (ordinal 17, after version).
+        delivered_sha: take_opt(&mut row, 17),
+        // Bodies are only SELECTed when `full` — ordinals 18-21 (after delivered_sha).
+        description: full.then(|| take_opt(&mut row, 18).unwrap_or_default()),
+        design: full.then(|| take_opt(&mut row, 19).unwrap_or_default()),
+        acceptance_criteria: full.then(|| take_opt(&mut row, 20).unwrap_or_default()),
+        notes: full.then(|| take_opt(&mut row, 21).unwrap_or_default()),
     })
 }
