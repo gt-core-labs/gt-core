@@ -34,6 +34,11 @@ pub const DEFAULT_WORKSPACE_SLUG: &str = "default";
 const WORKSPACE_0001_SQL: &str =
     include_str!("../migrations/gt-workspace/0001_workspaces.sql");
 
+/// Migration #2: `gt_create_workspace_schema(ws)` provisioning function that
+/// clones the default workspace's schema structure into `ws_<slug>`.
+const WORKSPACE_0002_SQL: &str =
+    include_str!("../migrations/gt-workspace/0002_create_workspace_schema_fn.sql");
+
 /// Migrations for the `gt-workspace` catalog, in ascending apply order.
 ///
 /// The `gt-workspace` domain crate exposes only the `WorkspaceRepository` port
@@ -42,7 +47,10 @@ const WORKSPACE_0001_SQL: &str =
 /// so the kernel orders them deterministically alongside every other module's
 /// schema.
 pub fn workspace_migrations() -> Vec<Migration> {
-    vec![Migration::new(1, "0001_workspaces", WORKSPACE_0001_SQL)]
+    vec![
+        Migration::new(1, "0001_workspaces", WORKSPACE_0001_SQL),
+        Migration::new(2, "0002_create_workspace_schema_fn", WORKSPACE_0002_SQL),
+    ]
 }
 
 /// Initial migration: per-workspace `flag_overrides` table.
@@ -65,11 +73,34 @@ mod tests {
     use super::*;
 
     #[test]
-    fn exposes_one_versioned_migration() {
+    fn exposes_versioned_migrations_in_order() {
         let migrations = workspace_migrations();
-        assert_eq!(migrations.len(), 1);
+        assert_eq!(migrations.len(), 2);
         assert_eq!(migrations[0].version, 1);
         assert_eq!(migrations[0].name, "0001_workspaces");
+        assert_eq!(migrations[1].version, 2);
+        assert_eq!(migrations[1].name, "0002_create_workspace_schema_fn");
+    }
+
+    #[test]
+    fn schema_fn_clones_template_structure_idempotently() {
+        let sql = &workspace_migrations()[1].sql;
+        assert!(
+            sql.contains("FUNCTION gt_create_workspace_schema"),
+            "defines the provisioning function",
+        );
+        assert!(sql.to_uppercase().contains("CREATE SCHEMA IF NOT EXISTS"), "creates the schema");
+        assert!(
+            sql.to_uppercase().contains("LIKE") && sql.to_uppercase().contains("INCLUDING ALL"),
+            "clones structure with LIKE ... INCLUDING ALL",
+        );
+        assert!(
+            sql.to_uppercase().contains("CREATE TABLE IF NOT EXISTS"),
+            "table clone is idempotent",
+        );
+        // Names the schema with the same `ws_` convention as `schema_for`.
+        assert!(sql.contains(SCHEMA_PREFIX), "uses the schema_for prefix");
+        assert!(sql.contains("ws_default"), "templates from the default workspace schema");
     }
 
     #[test]
