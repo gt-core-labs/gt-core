@@ -10,15 +10,18 @@
 //! - [`ContractVersion`] — semantic `major.minor.patch` with a compatibility rule.
 //! - [`SurfaceHash`] — order-independent fingerprint of a module's surface items.
 //! - [`typescript_module`] — TypeScript DTO codegen from a module's JSON Schemas.
+//! - [`ContractBaseline`] + [`DriftCheck`] — frozen baseline + CI drift check.
 //!
-//! Part of the gt-core module system (`hq-mod`). The frozen-baseline + CI diff
-//! check lands in `hq-mod-contracts.3`; semver enforcement in `.4`.
+//! Part of the gt-core module system (`hq-mod`). Semver enforcement (a breaking
+//! surface change must bump *major*, not just any field) lands in `.4`.
 
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
+mod baseline;
 mod codegen;
 mod version;
 
+pub use baseline::{ContractBaseline, DriftCheck};
 pub use codegen::typescript_module;
 pub use version::{ContractVersion, SurfaceHash};
