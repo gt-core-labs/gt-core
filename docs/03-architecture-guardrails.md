@@ -5,7 +5,7 @@
 ## TL;DR
 
 1. **Don't improvise the kernel.** Foundation crates (`gt-events`, `gt-bus`, `gt-audit`, `gt-plugin`, `gt-telemetry`) are already designed and tested in gastown. They migrate UP into `crates/kernel/` per Phase 4 — never re-invented here. Open gastown's source before writing any equivalent.
-2. **Don't move folders.** The layered taxonomy (`kernel/` / `domain/{platform,orchestration,lifecycle,roles}/` / `modules/` / `bins/`) is fixed. New crates go INTO the existing tier; new tiers are not added without explicit user approval.
+2. **Don't move folders.** The layered taxonomy (`kernel/` / `domain/{platform,orchestration,lifecycle,roles}/` / `modules/`) is fixed. New crates go INTO the existing tier; new tiers are not added without explicit user approval. There is no `bins/` tier — a binary is an entrypoint, not a domain; when a crate needs one it declares `[[bin]]` inside the crate that owns its logic.
 3. **Don't bypass the module system.** Every feature is a `GtModule`. No hand-wired routes, MCP tools, migrations, or actors in app composition roots.
 4. **Don't cross tier boundaries downward.** Kernel never depends on domain. Domain never depends on modules.
 
@@ -54,8 +54,7 @@ crates/
 │   ├── orchestration/<crate>/            ← runtime coordination (webhooks, dog, scheduling)
 │   ├── lifecycle/<crate>/                ← state-machine entities (agent, polecat)
 │   └── roles/<crate>/                    ← behavioral actors (sheriff, deacon, ...)
-├── modules/<mod-name>/                   ← user-facing features (kanban, pages, ...)
-└── bins/<bin-name>/                      ← own binaries (rare; gastown owns these)
+└── modules/<mod-name>/                   ← user-facing features (kanban, pages, ...)
 
 examples/<crate>/                         ← reference impls (mod-hello only today)
 docs/<NN>-<topic>.md                      ← numbered design docs
@@ -66,6 +65,7 @@ docs/<NN>-<topic>.md                      ← numbered design docs
 - ❌ New top-level dirs (`api/`, `services/`, `lib/`, `pkg/`, etc.). The tree is the tree.
 - ❌ Crates outside `crates/` or `examples/`.
 - ❌ "Helper" crates dumped at `crates/<name>` without a tier. Pick kernel or domain.
+- ❌ A standalone `bins/` tier. gt-core ships libraries; apps (gastown) own their binaries. When a crate genuinely needs an executable, it lives as a `[[bin]]` inside that crate, not in a catch-all tier.
 - ❌ Frontend code anywhere. FE has its own repo.
 - ❌ Compose files / Dockerfiles / deploy scripts. Those live in app repos (gastown).
 
@@ -82,7 +82,9 @@ Does the crate touch any Gas Town concept (workspace, rig, bead, polecat)?
 
 Is it a user-facing feature (Kanban-like, board, page, view)? → modules/
 
-Is it an executable? → bins/  (and you probably shouldn't add one)
+Is it an executable? → a `[[bin]]` inside the crate that owns its logic
+                       (gt-core ships libraries; apps own their binaries — you
+                        probably shouldn't add one here at all)
 ```
 
 ### Naming

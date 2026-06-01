@@ -27,8 +27,7 @@ crates/
 │   │   └── gt-dog                worker + dispatcher + executor     hq-mod-dogs
 │   ├── lifecycle/                (reserved — gt-agent, gt-polecat when ported P4)
 │   └── roles/                    (reserved — sheriff/deacon/etc. when ported P4)
-├── modules/                      (reserved — mod-kanban, mod-pages, etc., P6)
-└── bins/                         (reserved — own binaries; rare)
+└── modules/                      (reserved — mod-kanban, mod-pages, etc., P6)
 
 examples/
 └── mod-hello                     smallest viable module             hq-mod-docs.2

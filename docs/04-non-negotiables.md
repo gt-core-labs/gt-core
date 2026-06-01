@@ -154,7 +154,7 @@ git worktree add /home/nixos/gt-core-wt-<bead-id> -b <bead-id> main
 - **Never `/tmp/wt-*`** — tmpfs RAM, reboot wipes uncommitted work.
 - **Before claiming:** `git log --all --grep <bead-id>` to avoid hijacking a branch another agent is mid-edit on.
 - **Close:** `cargo build` + `cargo test --workspace` green → ff-merge to main from town root (not worktree) → push → delete branch. Close the bead with the commit SHA.
-- **Rebase on main BEFORE merge.** Hotspot files: composition roots (`bins/*/main.rs`, `root.rs`). Conflicts are usually additive unions.
+- **Rebase on main BEFORE merge.** Hotspot files: composition roots (the app entrypoint's `main.rs`, `root.rs`). Conflicts are usually additive unions.
 
 **Provenance:** [11-cutover-roadmap.md §"Reglas para todos los agentes"](file:///home/nixos/gastown/apps/api/docs/11-cutover-roadmap.md), and the [memory](../../.claude/projects/-home-nixos-gt-core/memory/feedback_worktree_hijack_parallel.md) on parallel hijack risk.
 
@@ -202,9 +202,9 @@ Found a gap that no bead covers? `meta.report_gap` mints `hq-gap-<slug>-<ts>`. P
 
 ---
 
-## 14. Single tokio Runtime, lives in bins
+## 14. Single tokio Runtime, lives in the app entrypoint
 
-**One `tokio::Runtime`, created in the binary (`bins/`).** Domain crates never create a runtime; they receive handles.
+**One `tokio::Runtime`, created in the binary** — the app's entrypoint crate's `main` (its `[[bin]]`; for gt-core's consumers that is gastown). Domain crates never create a runtime; they receive handles.
 
 - A domain test runs under `#[tokio::test]` in isolation.
 - Multiple runtimes deadlock under shared `mpsc` channels — a class of bug that disappears when the rule is followed.
