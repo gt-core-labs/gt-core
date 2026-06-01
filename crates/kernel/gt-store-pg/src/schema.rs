@@ -212,4 +212,167 @@ mod tests {
             "search_path {path:?} must include the workspace schema",
         );
     }
+
+    /// Schema-clone completeness invariant (`hq-mt-data.10`).
+    ///
+    /// `gt_create_workspace_schema(ws)` (hq-mt-data.2) must materialize a tenant
+    /// schema that *reproduces the template* (`ws_default`): every table the
+    /// template carries reappears in the provisioned schema with the same
+    /// columns, types, nullability, defaults, identity, CHECK constraints, and
+    /// indexes — but with foreign keys *absent*, because `CREATE TABLE … LIKE …
+    /// INCLUDING ALL` never copies FK constraints (docs/04 §15: per-tenant tables
+    /// are independent copies). The function must also be idempotent.
+    ///
+    /// This is the live counterpart to the string-shape test in `lib.rs`: it
+    /// applies the real migration function against Postgres and introspects the
+    /// catalog to prove the clone is structurally complete. No-op without
+    /// `GT_PG_URL`.
+    ///
+    /// The probe table is created in the shared `ws_default` template, so the
+    /// test drops it again on the way out — otherwise every *real* future
+    /// provision would copy the leftover. All assertions run *after* teardown
+    /// (against captured values) so a failed assertion still cleans up; a
+    /// defensive teardown also runs first to clear any leak from a crashed run.
+    #[cfg(feature = "pg")]
+    #[tokio::test]
+    async fn provisioned_schema_reproduces_template() {
+        use crate::{WORKSPACE_0001_SQL, WORKSPACE_0002_SQL};
+        use sqlx::PgPool;
+
+        let Some(url) = std::env::var("GT_PG_URL").ok() else {
+            eprintln!("GT_PG_URL unset; skipping schema-clone completeness test");
+            return;
+        };
+
+        // Unique-ish names keep the test from colliding with real tenant data or
+        // a parallel session on a shared Postgres.
+        let probe = "_clone_probe_mtdata10";
+        let ws_slug = "clone-probe-mtdata10";
+        let clone_schema = schema_for(ws_slug); // ws_clone_probe_mtdata10
+        let tmpl_table = format!("ws_default.{probe}");
+        let clone_table = format!("{clone_schema}.{probe}");
+
+        // Catalog introspection shared by both schemas.
+        type ColRow = (String, String, String, Option<String>, String, Option<String>);
+        async fn columns(pool: &PgPool, schema: &str, table: &str) -> Vec<ColRow> {
+            sqlx::query_as(
+                "SELECT column_name, data_type, is_nullable, column_default, \
+                        is_identity, identity_generation \
+                 FROM information_schema.columns \
+                 WHERE table_schema = $1 AND table_name = $2 \
+                 ORDER BY column_name",
+            )
+            .bind(schema)
+            .bind(table)
+            .fetch_all(pool)
+            .await
+            .expect("introspect columns")
+        }
+        async fn constraint_count(pool: &PgPool, qualified: &str, contype: &str) -> i64 {
+            sqlx::query_scalar(
+                "SELECT count(*) FROM pg_constraint \
+                 WHERE conrelid = $1::regclass AND contype = $2",
+            )
+            .bind(qualified)
+            .bind(contype)
+            .fetch_one(pool)
+            .await
+            .expect("count constraints")
+        }
+        async fn index_count(pool: &PgPool, schema: &str, table: &str) -> i64 {
+            sqlx::query_scalar(
+                "SELECT count(*) FROM pg_indexes WHERE schemaname = $1 AND tablename = $2",
+            )
+            .bind(schema)
+            .bind(table)
+            .fetch_one(pool)
+            .await
+            .expect("count indexes")
+        }
+
+        let pool = PgPool::connect(&url).await.expect("connect postgres");
+
+        // Defensive teardown: clear any leak from a previously crashed run.
+        let _ = sqlx::raw_sql(&format!("DROP SCHEMA IF EXISTS {clone_schema} CASCADE"))
+            .execute(&pool)
+            .await;
+        let _ = sqlx::raw_sql(&format!("DROP TABLE IF EXISTS {tmpl_table}"))
+            .execute(&pool)
+            .await;
+
+        // Catalog (`workspaces`, FK target) + provisioning function must exist.
+        sqlx::raw_sql(WORKSPACE_0001_SQL)
+            .execute(&pool)
+            .await
+            .expect("apply workspaces migration");
+        sqlx::raw_sql(WORKSPACE_0002_SQL)
+            .execute(&pool)
+            .await
+            .expect("install provisioning function");
+        sqlx::raw_sql("CREATE SCHEMA IF NOT EXISTS ws_default")
+            .execute(&pool)
+            .await
+            .expect("ensure template schema");
+
+        // Probe table exercising every LIKE-copied attribute plus a FK (which
+        // must NOT survive the clone).
+        sqlx::raw_sql(&format!(
+            "CREATE TABLE {tmpl_table} ( \
+                id      BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY, \
+                ws_id   TEXT NOT NULL REFERENCES public.workspaces (id) ON DELETE CASCADE, \
+                label   TEXT NOT NULL DEFAULT 'x', \
+                amount  INTEGER CHECK (amount >= 0) \
+            ); \
+            CREATE INDEX {probe}_label_idx ON {tmpl_table} (label);"
+        ))
+        .execute(&pool)
+        .await
+        .expect("create probe template table");
+
+        // Provision the tenant schema (the unit under test) — twice, to prove
+        // idempotency. A second call must not error.
+        sqlx::query("SELECT gt_create_workspace_schema($1)")
+            .bind(ws_slug)
+            .execute(&pool)
+            .await
+            .expect("first provision");
+        let second = sqlx::query("SELECT gt_create_workspace_schema($1)")
+            .bind(ws_slug)
+            .execute(&pool)
+            .await;
+
+        // Capture everything BEFORE teardown so assertions cannot leak state.
+        let tmpl_cols = columns(&pool, "ws_default", probe).await;
+        let clone_cols = columns(&pool, &clone_schema, probe).await;
+        let tmpl_checks = constraint_count(&pool, &tmpl_table, "c").await;
+        let clone_checks = constraint_count(&pool, &clone_table, "c").await;
+        let tmpl_fks = constraint_count(&pool, &tmpl_table, "f").await;
+        let clone_fks = constraint_count(&pool, &clone_table, "f").await;
+        let tmpl_idx = index_count(&pool, "ws_default", probe).await;
+        let clone_idx = index_count(&pool, &clone_schema, probe).await;
+
+        // Teardown — runs regardless of the assertion outcomes below.
+        let _ = sqlx::raw_sql(&format!("DROP SCHEMA IF EXISTS {clone_schema} CASCADE"))
+            .execute(&pool)
+            .await;
+        let _ = sqlx::raw_sql(&format!("DROP TABLE IF EXISTS {tmpl_table}"))
+            .execute(&pool)
+            .await;
+
+        // --- Completeness invariant ---------------------------------------
+        second.expect("provisioning is idempotent (second call must not error)");
+        assert!(!tmpl_cols.is_empty(), "probe template table must have columns");
+        assert_eq!(
+            clone_cols, tmpl_cols,
+            "clone columns (name/type/nullable/default/identity) must reproduce the template",
+        );
+        assert!(tmpl_checks > 0, "template must carry a CHECK constraint");
+        assert_eq!(clone_checks, tmpl_checks, "CHECK constraints must be reproduced");
+        assert!(tmpl_idx > 0, "template must carry indexes (PK + label)");
+        assert_eq!(clone_idx, tmpl_idx, "indexes (incl. PRIMARY KEY) must be reproduced");
+        // The crux of schema-per-ws independence: FKs are dropped by LIKE, so a
+        // per-tenant table has no cross-schema reference back to the template.
+        assert_eq!(tmpl_fks, 1, "template probe table declares one FK");
+        assert_eq!(clone_fks, 0, "clone must NOT carry the template's foreign key");
+    }
 }
