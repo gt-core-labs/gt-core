@@ -115,6 +115,13 @@ pub struct IssueFilter {
     /// full). Default `false` keeps the snapshot cheap; `true` lets a caller
     /// review a whole sub-epic without a per-bead `gt://issue/{id}` round-trip.
     pub full: bool,
+    /// Narrow the snapshot to **sound** beads only — every readiness clause holds
+    /// (hq-core-mcp.11, docs/10 §S4). NOTE: [`DoltIssues::list`] does **not**
+    /// honour this flag (readiness needs the phase frontier + the delivered index
+    /// + the git tree, which live above the store); the server applies it after
+    /// the query via `gt_issues::resources::filter_ready`. It rides on the filter
+    /// purely so the querystring parser has one place to land `?ready=true`.
+    pub ready: bool,
 }
 
 /// Snapshot row returned by [`DoltIssues::list`]. Mirrors the columns dashboards
@@ -155,6 +162,12 @@ pub struct IssueRow {
     /// a stale edit fail instead of clobbering a concurrent one.
     #[serde(default)]
     pub version: i64,
+    /// Lifecycle phase token (`"P1".."P4"`, hq-core-mcp.7). Exposed on the cheap
+    /// snapshot too (hq-core-mcp.11) so `gt://issues?ready=true` can apply the
+    /// phase gate without a per-bead detail fetch. Defaults to `"P1"` for legacy
+    /// rows.
+    #[serde(default = "default_phase")]
+    pub phase: String,
     /// Full 40-hex sha that delivered this bead's code (hq-core-mcp.10, docs/10
     /// §S2). Set by `close` phase-2 when the closing commit_sha actually touches a
     /// non-`planned` surface path; `None` until then (a wontfix/no-deliverable
@@ -1223,6 +1236,24 @@ impl DoltIssues {
         Ok(())
     }
 
+    /// Map every bead id to whether it has a non-NULL `delivered_sha`
+    /// (hq-core-mcp.11, docs/10 §S4). Unbounded (no `LIMIT`) and column-minimal so
+    /// `gt://issues?ready=true` can resolve a candidate's `depends_on` against the
+    /// trustworthy delivery signal in a single one-hop lookup — a dependency may
+    /// itself be filtered out of the display set, so the index must cover the whole
+    /// table, not just the candidates.
+    pub async fn delivered_index(&self) -> Result<std::collections::HashMap<String, bool>, AppError> {
+        let mut conn = self.pool.get_conn().await.map_err(map_err)?;
+        let rows: Vec<(String, Option<String>)> = conn
+            .exec("SELECT id, delivered_sha FROM issues", mysql_async::Params::Empty)
+            .await
+            .map_err(map_err)?;
+        Ok(rows
+            .into_iter()
+            .map(|(id, sha)| (id, sha.map(|s| !s.trim().is_empty()).unwrap_or(false)))
+            .collect())
+    }
+
     /// List issues matching `filter`, newest-updated first. Datetime columns
     /// are formatted server-side to ISO 8601 strings — the workspace pins
     /// `mysql_async` with `minimal` features (no `time`/`chrono` integration),
@@ -1274,9 +1305,9 @@ impl DoltIssues {
         };
 
         // hq-gap-issues-list-full: when `full`, append the heavy text bodies
-        // after `delivered_sha` (ordinals 18-21) so a sub-epic review reads in one
-        // call. Kept at the END of the SELECT so the cheap-snapshot ordinals
-        // 0-17 (incl. `delivered_sha` at 17) are untouched by the `full` flag.
+        // after `delivered_sha` (ordinals 19-22) so a sub-epic review reads in one
+        // call. Kept at the END of the SELECT so the cheap-snapshot ordinals 0-18
+        // (incl. `phase` at 17, `delivered_sha` at 18) are untouched by `full`.
         let body_cols = if filter.full {
             ", description, design, acceptance_criteria, notes"
         } else {
@@ -1289,7 +1320,7 @@ impl DoltIssues {
                     DATE_FORMAT(closed_at,  '%Y-%m-%dT%H:%i:%SZ') AS closed_at,
                     external_ref, spec_id,
                     domain_json, surface_json, depends_on_json, role_scope, version,
-                    delivered_sha{body_cols}
+                    phase, delivered_sha{body_cols}
              FROM issues
              {where_clause}
              ORDER BY updated_at DESC, id ASC
@@ -1412,12 +1443,13 @@ fn row_to_issue(row: mysql_async::Row, full: bool) -> Result<IssueRow, AppError>
         depends_on_json: take_string(&mut row, 14)?,
         role_scope: take_opt(&mut row, 15),
         version: row.take::<i64, _>(16).unwrap_or(0),
-        // `delivered_sha` is always SELECTed (ordinal 17, after version).
-        delivered_sha: take_opt(&mut row, 17),
-        // Bodies are only SELECTed when `full` — ordinals 18-21 (after delivered_sha).
-        description: full.then(|| take_opt(&mut row, 18).unwrap_or_default()),
-        design: full.then(|| take_opt(&mut row, 19).unwrap_or_default()),
-        acceptance_criteria: full.then(|| take_opt(&mut row, 20).unwrap_or_default()),
-        notes: full.then(|| take_opt(&mut row, 21).unwrap_or_default()),
+        // `phase` + `delivered_sha` always SELECTed (ordinals 17, 18 after version).
+        phase: take_opt(&mut row, 17).unwrap_or_else(|| "P1".to_string()),
+        delivered_sha: take_opt(&mut row, 18),
+        // Bodies are only SELECTed when `full` — ordinals 19-22 (after delivered_sha).
+        description: full.then(|| take_opt(&mut row, 19).unwrap_or_default()),
+        design: full.then(|| take_opt(&mut row, 20).unwrap_or_default()),
+        acceptance_criteria: full.then(|| take_opt(&mut row, 21).unwrap_or_default()),
+        notes: full.then(|| take_opt(&mut row, 22).unwrap_or_default()),
     })
 }

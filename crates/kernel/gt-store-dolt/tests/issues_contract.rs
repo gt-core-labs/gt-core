@@ -53,6 +53,7 @@ async fn seed(base: &str) -> Result<(), Box<dyn std::error::Error>> {
             depends_on_json     TEXT NOT NULL DEFAULT '[]',
             role_scope          VARCHAR(32),
             version             BIGINT NOT NULL DEFAULT 0,
+            phase               ENUM('P1','P2','P3','P4') NOT NULL DEFAULT 'P1',
             delivered_sha       CHAR(40)
         )",
     )

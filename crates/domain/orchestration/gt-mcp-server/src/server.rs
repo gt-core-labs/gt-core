@@ -185,7 +185,10 @@ impl ServerHandler for IssuesServer {
                 "Canonical issues snapshot from Dolt. Filters via querystring: \
                  status=open[,working], priority_max=2, assignee=X, external_ref=Y, \
                  issue_type=epic, limit=N. Pass full=1 to inline the text bodies \
-                 (description/design/acceptance_criteria/notes) on every row.",
+                 (description/design/acceptance_criteria/notes) on every row. Pass \
+                 ready=1 to return only SOUND beads (docs/10 §S4): deps delivered, \
+                 phase open, own non-planned surfaces exist, status=open — claim \
+                 straight from this list without re-checking the graph.",
             ),
             mk(
                 "gt://issue/{id}",
@@ -226,6 +229,19 @@ impl IssuesServer {
         if let Some(qs) = issues_qs {
             let filter = parse_issue_filter(qs)?;
             let rows = gt_issues::resources::read_issues(&self.store, &filter).await?;
+            // hq-core-mcp.11 (docs/10 §S4): `?ready=true` narrows the snapshot to
+            // sound beads. The predicate needs the phase frontier, the (whole-
+            // table) delivered index, and the `main` git tree — gathered here and
+            // applied by the module's `filter_ready`.
+            let rows = if filter.ready {
+                let open_phase = self.store.open_phase().await?;
+                let delivered = self.store.delivered_index().await?;
+                let repo_dir = self.repo_dir.as_deref().map(|p| p.as_path());
+                let tree = crate::git_tree::surface_tree(repo_dir);
+                gt_issues::resources::filter_ready(rows, open_phase, &delivered, tree.as_ref())
+            } else {
+                rows
+            };
             return serde_json::to_value(&rows)
                 .map_err(|e| AppError::Other(format!("encode issues: {e}")));
         }

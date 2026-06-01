@@ -253,6 +253,10 @@ pub fn parse_issue_filter(qs: &str) -> Result<IssueFilter, AppError> {
                 );
             }
             "full" => filter.full = matches!(value, "1" | "true" | "yes"),
+            // hq-core-mcp.11 (docs/10 §S4) — narrow to sound beads. Applied by the
+            // resource handler (needs the phase frontier + delivered index + git
+            // tree), not by the store query.
+            "ready" => filter.ready = matches!(value, "1" | "true" | "yes"),
             other => return Err(AppError::Validation(format!("unknown filter `{other}`"))),
         }
     }
@@ -275,7 +279,17 @@ mod tests {
     #[test]
     fn empty_querystring_is_default() {
         let f = parse_issue_filter("").unwrap();
-        assert!(f.status.is_empty() && !f.full && f.limit.is_none());
+        assert!(f.status.is_empty() && !f.full && f.limit.is_none() && !f.ready);
+    }
+
+    #[test]
+    fn parses_ready_flag() {
+        assert!(parse_issue_filter("ready=1").unwrap().ready);
+        assert!(parse_issue_filter("ready=true").unwrap().ready);
+        // Combinable with other filters; absent ⇒ false.
+        let f = parse_issue_filter("external_ref=hq-core-mcp&ready=yes").unwrap();
+        assert!(f.ready && f.external_ref.as_deref() == Some("hq-core-mcp"));
+        assert!(!parse_issue_filter("status=open").unwrap().ready);
     }
 
     #[test]

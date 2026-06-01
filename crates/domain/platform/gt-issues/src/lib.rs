@@ -35,6 +35,7 @@
 pub mod commands;
 pub mod delivery;
 pub mod handlers;
+pub mod readiness;
 pub mod resources;
 pub mod surface;
 pub mod taxonomy;
@@ -45,5 +46,6 @@ pub use commands::{
 };
 pub use delivery::{CommitInfo, CommitInspector};
 pub use module::IssuesModule;
+pub use readiness::is_ready;
 pub use surface::{AllowAllTree, SurfaceEntry, SurfaceTree};
 pub use taxonomy::Domain;
