@@ -1,0 +1,23 @@
+[package]
+name = "gt-issues"
+edition.workspace = true
+version.workspace = true
+
+# gt-issues — the issues tracker exposed as a `GtModule` (hq-core-host.2).
+#
+# Wraps the lifted Dolt issues store (`gt-store-dolt`, hq-core-host.1) behind the
+# kernel module seam: `IssuesModule` contributes the `issues.*` MCP tools and the
+# read resources, and the tool-arg structs + transport-free handlers ported from
+# gastown `gt-mcp` live here. No rmcp transport — that is the server bin (.3);
+# this crate only contributes to the `McpRegistry`.
+[dependencies]
+gt-module = { workspace = true }
+gt-module-mcp = { workspace = true }
+gt-store-dolt = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+schemars = { workspace = true }
+semver = { workspace = true }
+
+[dev-dependencies]
+gt-module-mcp = { workspace = true }
