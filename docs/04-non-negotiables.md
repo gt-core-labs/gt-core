@@ -218,12 +218,13 @@ Found a gap that no bead covers? `meta.report_gap` mints `hq-gap-<slug>-<ts>`. P
 **Every mutating command carries `workspace_id` server-injected from auth context.** Never from URL, body, or MCP payload.
 
 - All domain repos take `&WorkspaceId` as first arg.
-- All projection tables have `workspace_id` column with FK to `workspaces.id`.
+- **Per-workspace projection data is isolated by Postgres schema-per-workspace**, not a shared-table `workspace_id` column. Each workspace owns a schema `ws_<slug>` (`gt_store_pg::schema_for`); a `WorkspacePool` sets `search_path` to that schema on every connection checkout, so unqualified table names resolve to the tenant's own copy. Cross-tenant leak is prevented structurally — a query physically cannot see another tenant's rows — which is stronger than a `workspace_id` `WHERE` clause that a buggy query can forget.
+- The shared `public` schema holds **only** cross-tenant catalogs — chiefly the `workspaces` table itself. Any table that must live in `public` (e.g. `flag_overrides`) carries a `workspace_id` column with FK to `workspaces.id` so even shared-schema rows stay tenant-anchored.
 - SSE/WS channels keyed `(workspace_id, kind)` — cross-tenant leak is the bug class this prevents.
 
 This is a gt-core extension of the gastown principles to the multi-tenant target.
 
-**Provenance:** new — derived from rules 1, 6 applied to `hq-mt`. See [03-architecture-guardrails.md §6](03-architecture-guardrails.md).
+**Provenance:** new — derived from rules 1, 6 applied to `hq-mt`. See [03-architecture-guardrails.md §6](03-architecture-guardrails.md). The schema-per-workspace clause supersedes the original "every projection table has a `workspace_id` column" wording, which mandated a shared-table model incompatible with the ratified `hq-mt-data` design (`schema_for` + `WorkspacePool`, commit `0e74b84`; `gt_create_workspace_schema`, `4ebb298`). Resolution of gap `hq-gap-spec-conflict-hq-mt-data-partitioning-model`, 2026-05-31.
 
 ---
 

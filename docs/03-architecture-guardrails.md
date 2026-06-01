@@ -231,7 +231,7 @@ is the [version rollover playbook](07-version-rollover.md).
 - `RigCommand::Add` has `workspace_id` server-injected from `WorkspaceContext`.
 - `BeadCommand::Create` has `workspace_id` server-injected.
 - All domain repos take `&WorkspaceId` as first arg.
-- All projection tables have a `workspace_id` column with FK to `workspaces.id`.
+- Per-workspace projection data is isolated by Postgres schema-per-workspace (`ws_<slug>`, `search_path`-scoped); the shared `public` schema holds only cross-tenant catalogs, and any table that must live there carries a `workspace_id` FK to `workspaces.id`. See [04-non-negotiables.md §15](04-non-negotiables.md) for the binding form.
 
 ### Server injects, client never supplies
 
