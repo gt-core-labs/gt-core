@@ -13,3 +13,8 @@ thiserror = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt", "rt-multi-thread", "macros"] }
+# Contract tests (hq-core-mcp.2) drive raw SQL setup (CREATE DATABASE/TABLE,
+# seed) directly against a sandbox Dolt before exercising DoltIssues, and mint
+# unique ids per run.
+mysql_async = { workspace = true }
+ulid = "1"
