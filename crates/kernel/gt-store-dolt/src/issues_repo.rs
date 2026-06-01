@@ -216,6 +216,15 @@ pub struct IssueDetail {
     /// Optimistic-concurrency token (hq-mcp-issues.8). See [`IssueRow::version`].
     #[serde(default)]
     pub version: i64,
+    /// Lifecycle phase token (`"P1".."P4"`, hq-core-mcp.7). Surfaced here so the
+    /// claim echo (hq-core-mcp.8 / docs/10 S5) and the `gt://issue/{id}` resource
+    /// show the gate an agent must respect. Defaults to `"P1"` for legacy rows.
+    #[serde(default = "default_phase")]
+    pub phase: String,
+}
+
+fn default_phase() -> String {
+    "P1".to_string()
 }
 
 /// Maps a patch string to a SQL value where an empty string means `NULL`.
@@ -1262,7 +1271,7 @@ impl DoltIssues {
                     DATE_FORMAT(closed_at,  '%Y-%m-%dT%H:%i:%SZ') AS closed_at,
                     external_ref, spec_id,
                     description, design, acceptance_criteria, notes,
-                    domain_json, surface_json, depends_on_json, role_scope, version
+                    domain_json, surface_json, depends_on_json, role_scope, version, phase
              FROM issues
              WHERE id = :id
              LIMIT 1";
@@ -1309,6 +1318,8 @@ fn row_to_detail(row: mysql_async::Row) -> Result<IssueDetail, AppError> {
         depends_on_json: take_string(&mut row, 18)?,
         role_scope: take_opt(&mut row, 19),
         version: row.take::<i64, _>(20).unwrap_or(0),
+        // hq-core-mcp.8 — phase echoed at claim time so the agent sees the gate.
+        phase: take_opt(&mut row, 21).unwrap_or_else(|| "P1".to_string()),
     })
 }
 

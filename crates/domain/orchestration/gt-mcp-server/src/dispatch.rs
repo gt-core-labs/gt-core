@@ -28,6 +28,22 @@ fn parse_args<T: serde::de::DeserializeOwned>(args: Value) -> Result<T, AppError
         .map_err(|e| AppError::Validation(format!("invalid arguments: {e}")))
 }
 
+/// Inject the S5 claim echo (`description`, `acceptance_criteria`, `phase`) into a
+/// claim response so the agent reads any prose blocker + the phase gate before
+/// working (hq-core-mcp.8 / docs/10 S5). Fields are only added when present (a
+/// missing bead leaves them out rather than emitting `null`).
+fn inject_claim_echo(body: &mut Value, res: &ClaimResult) {
+    if let Some(d) = &res.description {
+        body["description"] = json!(d);
+    }
+    if let Some(ac) = &res.acceptance_criteria {
+        body["acceptance_criteria"] = json!(ac);
+    }
+    if let Some(p) = &res.phase {
+        body["phase"] = json!(p);
+    }
+}
+
 /// Dispatch one `issues.*` tool call. `actor` is the server-injected scope actor
 /// (used as the close/claim attribution). `Ok(value)` is the success payload the
 /// server wraps in a `CallToolResult`; `Err` maps to an MCP error.
@@ -87,18 +103,23 @@ pub async fn dispatch(
         }
         "issues.claim.validate" => {
             let a: ClaimIssue = parse_args(args)?;
-            let _ = run_claim_issue(store, &a, actor, true).await?;
-            Ok(json!({ "outcome": "won" }))
+            let res = run_claim_issue(store, &a, actor, true).await?;
+            let mut body = json!({ "outcome": "won" });
+            inject_claim_echo(&mut body, &res);
+            Ok(body)
         }
         "issues.claim.execute" => {
             let a: ClaimIssue = parse_args(args)?;
-            let ClaimResult { outcome, version } = run_claim_issue(store, &a, actor, false).await?;
-            match outcome {
+            let res = run_claim_issue(store, &a, actor, false).await?;
+            match &res.outcome {
                 ClaimOutcome::Won => {
                     let mut body = json!({ "outcome": "won", "owner": actor });
-                    if let Some(v) = version {
+                    if let Some(v) = res.version {
                         body["version"] = json!(v);
                     }
+                    // S5: echo description/acceptance_criteria/phase so the agent
+                    // sees the prose blocker + the gate before it starts working.
+                    inject_claim_echo(&mut body, &res);
                     Ok(body)
                 }
                 // A lost claim is a hard error so the caller cannot proceed as if

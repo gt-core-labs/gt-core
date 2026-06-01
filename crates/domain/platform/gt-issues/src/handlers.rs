@@ -28,6 +28,15 @@ pub struct ClaimResult {
     /// Post-bump `version` on a won execute; `None` on a validate-only call or a
     /// lost claim (no row was written).
     pub version: Option<i64>,
+    /// The bead's `description`, echoed so the agent sees any prose blocker
+    /// before working (hq-core-mcp.8 / docs/10 S5). `None` only when the bead
+    /// does not exist.
+    pub description: Option<String>,
+    /// The bead's `acceptance_criteria`, echoed alongside the description (S5).
+    pub acceptance_criteria: Option<String>,
+    /// The bead's lifecycle `phase` (`"P1".."P4"`), echoed so the agent sees the
+    /// gate it must respect before claiming (S5). `None` when the bead is absent.
+    pub phase: Option<String>,
 }
 
 /// `issues.create`: validate (shape + S3 surface existence against `tree`), then
@@ -116,6 +125,11 @@ pub async fn run_close_issue(
 /// transport turns it into a hard error naming the holder so the caller stands
 /// down. A validate-only call reports [`ClaimOutcome::Won`] (shape passed) with
 /// no version, since no row is touched.
+///
+/// Both paths echo the bead's `description`, `acceptance_criteria`, and `phase`
+/// (hq-core-mcp.8 / docs/10 S5) so the agent reads any prose blocker + the phase
+/// gate BEFORE working. The detail is read once up front; a missing bead leaves
+/// the echo fields `None` (the claim itself then surfaces the `NotFound`).
 pub async fn run_claim_issue(
     issues: &DoltIssues,
     args: &ClaimIssue,
@@ -123,10 +137,18 @@ pub async fn run_claim_issue(
     validate_only: bool,
 ) -> Result<ClaimResult, AppError> {
     args.validate()?;
+    // S5 echo: pull the prose + phase the agent must see before working.
+    let detail = issues.get_detail(&args.id).await?;
+    let description = detail.as_ref().map(|d| d.description.clone());
+    let acceptance_criteria = detail.as_ref().map(|d| d.acceptance_criteria.clone());
+    let phase = detail.as_ref().map(|d| d.phase.clone());
     if validate_only {
         return Ok(ClaimResult {
             outcome: ClaimOutcome::Won,
             version: None,
+            description,
+            acceptance_criteria,
+            phase,
         });
     }
     let outcome = issues.claim(&args.id, owner).await?;
@@ -134,7 +156,13 @@ pub async fn run_claim_issue(
         ClaimOutcome::Won => issues.current_version(&args.id).await.ok().flatten(),
         ClaimOutcome::Lost { .. } => None,
     };
-    Ok(ClaimResult { outcome, version })
+    Ok(ClaimResult {
+        outcome,
+        version,
+        description,
+        acceptance_criteria,
+        phase,
+    })
 }
 
 /// `issues.phase.advance` (OPERATOR ONLY, hq-core-mcp.7): validate the target

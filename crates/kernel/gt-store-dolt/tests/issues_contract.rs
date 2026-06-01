@@ -615,7 +615,8 @@ async fn phase_frontier_and_per_bead_phase() {
     })
     .await
     .expect("insert default phase");
-    assert_eq!(read_phase(&repo, &def).await.as_deref(), Some("P1"));
+    // get_detail surfaces phase (hq-core-mcp.8) — the claim echo reads the same.
+    assert_eq!(detail_phase(&repo, &def).await, "P1");
 
     // Explicit phase on insert is honoured.
     let gated = format!("hq-ph-{}", ulid::Ulid::new());
@@ -629,20 +630,17 @@ async fn phase_frontier_and_per_bead_phase() {
     })
     .await
     .expect("insert P4");
-    assert_eq!(read_phase(&repo, &gated).await.as_deref(), Some("P4"));
+    assert_eq!(detail_phase(&repo, &gated).await, "P4");
 
     // update overwrites the phase scalar (demote-to-P4 path, docs/10 §5).
     repo.update(&def, &IssuePatch { phase: Some("P4".into()), ..Default::default() })
         .await
         .expect("phase overwrite");
-    assert_eq!(read_phase(&repo, &def).await.as_deref(), Some("P4"));
+    assert_eq!(detail_phase(&repo, &def).await, "P4");
 }
 
-/// Read the raw `phase` ENUM token for a bead (the read structs don't surface it
-/// until hq-core-mcp.8 / .11), so the contract test asserts the column directly.
-async fn read_phase(repo: &DoltIssues, id: &str) -> Option<String> {
-    let mut conn = repo.pool().get_conn().await.expect("conn");
-    conn.exec_first("SELECT phase FROM issues WHERE id = ? LIMIT 1", (id,))
-        .await
-        .expect("select phase")
+/// The `phase` token `get_detail` now surfaces (hq-core-mcp.8) — the same field
+/// the `issues.claim.*` echo returns so an agent sees the gate before working.
+async fn detail_phase(repo: &DoltIssues, id: &str) -> String {
+    repo.get_detail(id).await.expect("get_detail ok").expect("row").phase
 }
