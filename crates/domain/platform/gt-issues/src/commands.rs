@@ -23,7 +23,7 @@
 use std::collections::HashSet;
 
 use gt_module_mcp::taxonomy::{validate as taxonomy_validate, BeadTaxonomy};
-use gt_store_dolt::{AppError, IssuePatch, IssueStatus, NewIssue};
+use gt_store_dolt::{AppError, IssuePatch, IssuePhase, IssueStatus, NewIssue};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
@@ -37,6 +37,17 @@ use crate::taxonomy::Domain;
 /// `validation failed: …` shape as every other shape-rule failure.
 fn taxonomy_err(e: gt_module_mcp::taxonomy::TaxonomyError) -> AppError {
     AppError::Validation(e.to_string())
+}
+
+/// Reject a phase token outside the closed set `P1..P4` (hq-core-mcp.7). Returns
+/// the offending value verbatim so the agent sees exactly what was rejected.
+fn check_phase(phase: &str) -> Result<(), AppError> {
+    if IssuePhase::parse(phase).is_none() {
+        return Err(AppError::Validation(format!(
+            "unknown phase `{phase}` (expected one of P1/P2/P3/P4)"
+        )));
+    }
+    Ok(())
 }
 
 /// Reject a self-edge or a duplicate dependency in a `depends_on` list.
@@ -127,6 +138,12 @@ pub struct CreateIssue {
     /// Responsible role discriminator. Free-form; persisted verbatim.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub role_scope: Option<String>,
+    /// Lifecycle phase (`P1..P4`, hq-core-mcp.7 / docs/10 S1). `None` lets the
+    /// column default to `P1`; `Some(_)` is a scalar overwrite validated against
+    /// the closed set. Stamp `P4` on a bead gated behind the kernel migration so
+    /// `?ready=true` (S4) stops surfacing it while the frontier sits at `P3`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub phase: Option<String>,
 }
 
 impl CreateIssue {
@@ -173,6 +190,9 @@ impl CreateIssue {
         }
         check_depends_on(&self.id, &self.depends_on)?;
         check_surface_shape(&self.surface)?;
+        if let Some(phase) = &self.phase {
+            check_phase(phase)?;
+        }
         Ok(())
     }
 
@@ -205,6 +225,7 @@ impl CreateIssue {
             surface_json: surface_to_json(&self.surface),
             depends_on_json: to_json_array(&self.depends_on),
             role_scope: self.role_scope.clone(),
+            phase: self.phase.clone(),
         }
     }
 }
@@ -264,6 +285,12 @@ pub struct UpdateIssue {
     /// detection runs at execute in the store.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub depends_on: Option<Vec<String>>,
+    /// New lifecycle phase (`P1..P4`, hq-core-mcp.7). `None` leaves the column
+    /// untouched; `Some(_)` is a scalar overwrite validated against the closed
+    /// set (it also re-stamps `phase_ratified_at`). This is how a prose-blocked
+    /// bead gets demoted to `P4` (docs/10 §5 hybrid step 1).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub phase: Option<String>,
     /// Optimistic-concurrency guard. Pass the `version` you read from
     /// `gt://issue/{id}`; the write applies only if the row is still at that
     /// version, else it fails with a `version conflict`. Omit for last-write-wins.
@@ -318,6 +345,9 @@ impl UpdateIssue {
         if let Some(surface) = &self.surface {
             check_surface_shape(surface)?;
         }
+        if let Some(phase) = &self.phase {
+            check_phase(phase)?;
+        }
         if self.to_patch().is_empty() {
             return Err(AppError::Validation("no fields set; nothing to update".into()));
         }
@@ -352,6 +382,7 @@ impl UpdateIssue {
             domain_json: self.domain.as_deref().map(domain_to_json),
             surface_json: self.surface.as_deref().map(surface_to_json),
             depends_on_json: self.depends_on.as_deref().map(to_json_array),
+            phase: self.phase.clone(),
             expected_version: self.expected_version,
         }
     }
@@ -461,6 +492,31 @@ impl ClaimIssue {
     }
 }
 
+/// Input for the operator-only `issues.phase.advance` tool (hq-core-mcp.7,
+/// docs/10 S1). Advances the global `phase_frontier.open_phase`. This is NOT an
+/// agent tool: the RBAC scope (`issues.phase.advance`) is the gate, enforced at
+/// the MCP boundary — an agent's allow-list never grants it. There is no
+/// per-bead id: the frontier is a singleton governing the whole tracker.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct AdvancePhase {
+    /// The phase to open (`P1..P4`). Validated against the closed set; setting
+    /// the same value is an idempotent re-ratification (the timestamp advances).
+    pub open_phase: String,
+}
+
+impl AdvancePhase {
+    /// Shape-only validation: `open_phase` must be a recognised `P1..P4` token.
+    pub fn validate(&self) -> Result<(), AppError> {
+        check_phase(&self.open_phase)?;
+        Ok(())
+    }
+
+    /// The parsed target phase. Call only after [`Self::validate`] succeeds.
+    pub fn phase(&self) -> IssuePhase {
+        IssuePhase::parse(&self.open_phase).expect("validate guards open_phase parse")
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -483,6 +539,7 @@ mod tests {
             surface: vec![],
             depends_on: vec![],
             role_scope: None,
+            phase: None,
         }
     }
 
@@ -607,6 +664,7 @@ mod tests {
             domain: None,
             surface: None,
             depends_on: None,
+            phase: None,
             expected_version: None,
         };
         assert!(u.validate().is_err());
@@ -629,6 +687,7 @@ mod tests {
             domain: None,
             surface: None,
             depends_on: None,
+            phase: None,
             expected_version: Some(7),
         };
         assert!(u.validate().is_ok());
@@ -655,6 +714,7 @@ mod tests {
             domain: None,
             surface: None,
             depends_on: None,
+            phase: None,
             expected_version: None,
         };
         assert!(u.validate().is_err());
@@ -702,5 +762,55 @@ mod tests {
     fn claim_requires_non_empty_id() {
         assert!(ClaimIssue { id: "x".into() }.validate().is_ok());
         assert!(ClaimIssue { id: String::new() }.validate().is_err());
+    }
+
+    #[test]
+    fn create_accepts_valid_phase_and_rejects_bad() {
+        let mut c = base_create();
+        c.phase = Some("P4".into());
+        assert!(c.validate().is_ok());
+        assert_eq!(c.to_new().phase.as_deref(), Some("P4"));
+        let mut c = base_create();
+        c.phase = Some("P5".into());
+        assert!(c.validate().is_err());
+        // Omitted phase round-trips as None (store applies the P1 default).
+        assert_eq!(base_create().to_new().phase, None);
+    }
+
+    #[test]
+    fn update_accepts_phase_overwrite_and_rejects_bad() {
+        let mut u = UpdateIssue {
+            id: "hq-core-mcp.7".into(),
+            title: None,
+            description: None,
+            design: None,
+            acceptance_criteria: None,
+            notes: None,
+            priority: None,
+            issue_type: None,
+            assignee: None,
+            owner: None,
+            external_ref: None,
+            domain: None,
+            surface: None,
+            depends_on: None,
+            phase: Some("P4".into()),
+            expected_version: None,
+        };
+        assert!(u.validate().is_ok());
+        assert_eq!(u.to_patch().phase.as_deref(), Some("P4"));
+        u.phase = Some("nope".into());
+        assert!(u.validate().is_err());
+    }
+
+    #[test]
+    fn advance_phase_parses_known_tokens_only() {
+        assert!(AdvancePhase { open_phase: "P3".into() }.validate().is_ok());
+        assert_eq!(
+            AdvancePhase { open_phase: "P4".into() }.phase(),
+            IssuePhase::P4
+        );
+        assert!(AdvancePhase { open_phase: "p3".into() }.validate().is_err());
+        assert!(AdvancePhase { open_phase: String::new() }.validate().is_err());
     }
 }

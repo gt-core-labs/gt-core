@@ -39,7 +39,9 @@ pub mod surface;
 pub mod taxonomy;
 mod module;
 
-pub use commands::{ClaimIssue, CloseIssue, CreateIssue, TransitionIssue, UpdateIssue};
+pub use commands::{
+    AdvancePhase, ClaimIssue, CloseIssue, CreateIssue, TransitionIssue, UpdateIssue,
+};
 pub use module::IssuesModule;
 pub use surface::{AllowAllTree, SurfaceEntry, SurfaceTree};
 pub use taxonomy::Domain;

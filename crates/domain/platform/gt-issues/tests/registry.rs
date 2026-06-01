@@ -1,12 +1,13 @@
 //! Gate test (hq-core-host.2 acceptance): a `Root` built with [`IssuesModule`]
-//! exposes the ten `issues.*` tools in its `McpRegistry`, and `meta.help` lists
-//! them in the MCP `tools/list` shape.
+//! exposes the `issues.*` tools in its `McpRegistry`, and `meta.help` lists them
+//! in the MCP `tools/list` shape. hq-core-mcp.7 adds the operator-only
+//! `issues.phase.advance` to the set.
 
 use gt_issues::IssuesModule;
 use gt_module::RootBuilder;
 use gt_module_mcp::meta_help;
 
-const EXPECTED: [&str; 10] = [
+const EXPECTED: [&str; 11] = [
     "issues.create.validate",
     "issues.create.execute",
     "issues.update.validate",
@@ -17,6 +18,7 @@ const EXPECTED: [&str; 10] = [
     "issues.close.execute",
     "issues.claim.validate",
     "issues.claim.execute",
+    "issues.phase.advance",
 ];
 
 #[test]

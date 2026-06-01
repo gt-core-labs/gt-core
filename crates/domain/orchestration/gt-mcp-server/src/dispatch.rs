@@ -8,10 +8,10 @@
 //! `version` on update/claim.execute, the `closed @ <sha>` note on close).
 
 use gt_issues::handlers::{
-    run_claim_issue, run_close_issue, run_create_issue, run_transition_issue, run_update_issue,
-    ClaimResult,
+    run_advance_phase, run_claim_issue, run_close_issue, run_create_issue, run_transition_issue,
+    run_update_issue, ClaimResult,
 };
-use gt_issues::{ClaimIssue, CloseIssue, CreateIssue, TransitionIssue, UpdateIssue};
+use gt_issues::{AdvancePhase, ClaimIssue, CloseIssue, CreateIssue, TransitionIssue, UpdateIssue};
 use gt_meta::ReportGap;
 use gt_module::McpTool;
 use gt_store_dolt::{AppError, ClaimOutcome, DoltIssues, IssueFilter, NewIssue};
@@ -107,6 +107,13 @@ pub async fn dispatch(
                     "already claimed: {holder} holds it (status={status})"
                 ))),
             }
+        }
+        // hq-core-mcp.7 (docs/10 S1) — operator-only frontier advance. The scope
+        // check at the MCP boundary (server.rs) is the `never an agent` gate.
+        "issues.phase.advance" => {
+            let a: AdvancePhase = parse_args(args)?;
+            run_advance_phase(store, &a, false).await?;
+            Ok(json!({ "ok": true, "open_phase": a.open_phase }))
         }
         other => Err(AppError::Validation(format!("unknown tool `{other}`"))),
     }

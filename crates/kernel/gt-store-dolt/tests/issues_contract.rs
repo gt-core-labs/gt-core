@@ -14,7 +14,9 @@
 
 use mysql_async::prelude::Queryable;
 
-use gt_store_dolt::{ClaimOutcome, DoltIssues, IssueFilter, IssuePatch, IssueStatus, NewIssue};
+use gt_store_dolt::{
+    ClaimOutcome, DoltIssues, IssueFilter, IssuePatch, IssuePhase, IssueStatus, NewIssue,
+};
 
 const TEST_DB: &str = "gt_rs_issues_test";
 
@@ -576,4 +578,71 @@ async fn claim_cas_is_exclusive_and_attributed() {
         .await
         .expect_err("missing id must error");
     assert!(err.to_string().to_lowercase().contains("not found"), "got `{err}`");
+}
+
+/// hq-core-mcp.7 (docs/10 S1): `ensure_schema` adds the `phase` column + seeds
+/// the singleton `phase_frontier` at `P3`; `advance_phase` moves the frontier;
+/// `insert`/`update` carry the per-bead phase as a scalar overwrite.
+#[tokio::test]
+async fn phase_frontier_and_per_bead_phase() {
+    let Ok(base) = std::env::var("GT_DOLT_URL") else {
+        eprintln!("GT_DOLT_URL unset — skipping DoltIssues phase contract");
+        return;
+    };
+    let base = base.trim_end_matches('/').to_string();
+    seed(&base).await.expect("seed");
+    let repo = DoltIssues::connect(&format!("{base}/{TEST_DB}")).expect("connect");
+    // ensure_schema adds the phase columns + creates/seeds phase_frontier=P3.
+    repo.ensure_schema().await.expect("ensure_schema");
+
+    // Frontier seeded at P3, and re-running ensure_schema does not reseed it.
+    assert_eq!(repo.open_phase().await.expect("open_phase"), IssuePhase::P3);
+    repo.ensure_schema().await.expect("ensure_schema idempotent");
+    assert_eq!(repo.open_phase().await.expect("open_phase 2"), IssuePhase::P3);
+
+    // Operator advances the frontier P3 -> P4.
+    repo.advance_phase(IssuePhase::P4).await.expect("advance");
+    assert_eq!(repo.open_phase().await.expect("open_phase 3"), IssuePhase::P4);
+
+    // Per-bead phase: default P1 on a plain insert.
+    let def = format!("hq-ph-{}", ulid::Ulid::new());
+    repo.insert(&NewIssue {
+        id: def.clone(),
+        title: "default phase".into(),
+        issue_type: "task".into(),
+        created_by: "test".into(),
+        ..Default::default()
+    })
+    .await
+    .expect("insert default phase");
+    assert_eq!(read_phase(&repo, &def).await.as_deref(), Some("P1"));
+
+    // Explicit phase on insert is honoured.
+    let gated = format!("hq-ph-{}", ulid::Ulid::new());
+    repo.insert(&NewIssue {
+        id: gated.clone(),
+        title: "gated".into(),
+        issue_type: "task".into(),
+        created_by: "test".into(),
+        phase: Some("P4".into()),
+        ..Default::default()
+    })
+    .await
+    .expect("insert P4");
+    assert_eq!(read_phase(&repo, &gated).await.as_deref(), Some("P4"));
+
+    // update overwrites the phase scalar (demote-to-P4 path, docs/10 §5).
+    repo.update(&def, &IssuePatch { phase: Some("P4".into()), ..Default::default() })
+        .await
+        .expect("phase overwrite");
+    assert_eq!(read_phase(&repo, &def).await.as_deref(), Some("P4"));
+}
+
+/// Read the raw `phase` ENUM token for a bead (the read structs don't surface it
+/// until hq-core-mcp.8 / .11), so the contract test asserts the column directly.
+async fn read_phase(repo: &DoltIssues, id: &str) -> Option<String> {
+    let mut conn = repo.pool().get_conn().await.expect("conn");
+    conn.exec_first("SELECT phase FROM issues WHERE id = ? LIMIT 1", (id,))
+        .await
+        .expect("select phase")
 }

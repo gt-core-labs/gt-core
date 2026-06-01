@@ -13,7 +13,9 @@
 
 use gt_store_dolt::{AppError, ClaimOutcome, DoltIssues};
 
-use crate::commands::{ClaimIssue, CloseIssue, CreateIssue, TransitionIssue, UpdateIssue};
+use crate::commands::{
+    AdvancePhase, ClaimIssue, CloseIssue, CreateIssue, TransitionIssue, UpdateIssue,
+};
 use crate::surface::SurfaceTree;
 
 /// Outcome of [`run_claim_issue`]. Carries the CAS result plus, on a won execute,
@@ -133,4 +135,20 @@ pub async fn run_claim_issue(
         ClaimOutcome::Lost { .. } => None,
     };
     Ok(ClaimResult { outcome, version })
+}
+
+/// `issues.phase.advance` (OPERATOR ONLY, hq-core-mcp.7): validate the target
+/// phase token, then (execute only) advance the singleton `phase_frontier`. The
+/// caller's RBAC scope is the gate — never an agent — and is checked at the MCP
+/// boundary before this runs; this handler carries no authorization of its own.
+pub async fn run_advance_phase(
+    issues: &DoltIssues,
+    args: &AdvancePhase,
+    validate_only: bool,
+) -> Result<(), AppError> {
+    args.validate()?;
+    if validate_only {
+        return Ok(());
+    }
+    issues.advance_phase(args.phase()).await
 }

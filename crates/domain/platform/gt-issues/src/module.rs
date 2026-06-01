@@ -28,7 +28,9 @@ use gt_module::{Capability, GtModule, McpRegistry, ModuleId, ModuleMeta, Scope};
 use gt_module_mcp::schema_for;
 use semver::Version;
 
-use crate::commands::{ClaimIssue, CloseIssue, CreateIssue, TransitionIssue, UpdateIssue};
+use crate::commands::{
+    AdvancePhase, ClaimIssue, CloseIssue, CreateIssue, TransitionIssue, UpdateIssue,
+};
 
 /// The [`GtModule`] facade over the issues store. Zero-sized: the module owns no
 /// runtime state of its own (the live store is the [`DoltIssues`] the binary
@@ -149,6 +151,18 @@ impl GtModule for IssuesModule {
                  success returns the post-bump version so a follow-up issues.update can pass \
                  it as expected_version without re-reading. Missing id returns NotFound.",
                 schema_for::<ClaimIssue>(),
+            )
+            // hq-core-mcp.7 (docs/10 S1): the OPERATOR-ONLY phase-frontier advance.
+            // A single privileged mutation (no validate/execute split) gated by the
+            // `issues.phase.advance` RBAC grant — never in an agent's allow-list.
+            .tool_with_schema(
+                "issues.phase.advance",
+                "OPERATOR ONLY (RBAC issues.phase.advance — never an agent): advance the global \
+                 phase_frontier.open_phase to {P1..P4} + stamp ratified_at. Beads whose phase \
+                 exceeds open_phase are gated (hidden from ?ready=true). Setting the current \
+                 phase is an idempotent re-ratification. There is no per-bead id — the frontier \
+                 is a singleton governing the whole tracker.",
+                schema_for::<AdvancePhase>(),
             );
     }
 }
@@ -173,7 +187,7 @@ mod tests {
     }
 
     #[test]
-    fn registers_the_ten_issues_tools() {
+    fn registers_the_issues_tools() {
         let mut reg = McpRegistry::new();
         IssuesModule.register_mcp_tools(&mut reg);
         let names: Vec<&str> = reg.tools().iter().map(|t| t.name.as_str()).collect();
@@ -190,6 +204,8 @@ mod tests {
                 "issues.close.execute",
                 "issues.claim.validate",
                 "issues.claim.execute",
+                // hq-core-mcp.7 — operator-only frontier advance (no validate/execute pair).
+                "issues.phase.advance",
             ]
         );
     }
@@ -197,12 +213,18 @@ mod tests {
     #[test]
     fn every_tool_name_is_well_formed_and_namespaced() {
         // Each name is `<module-id>.<action>.<verb>` with module id == `issues`.
+        // The verb is `validate`/`execute` for the command pairs, plus `advance`
+        // for the operator-only `issues.phase.advance` (hq-core-mcp.7).
         let mut reg = McpRegistry::new();
         IssuesModule.register_mcp_tools(&mut reg);
         for tool in reg.tools() {
             let (module, _action, verb) = tool.parse_name().expect("well-formed tool name");
             assert_eq!(module, "issues", "tool {} not namespaced to issues", tool.name);
-            assert!(verb == "validate" || verb == "execute", "unexpected verb in {}", tool.name);
+            assert!(
+                verb == "validate" || verb == "execute" || verb == "advance",
+                "unexpected verb in {}",
+                tool.name
+            );
         }
     }
 

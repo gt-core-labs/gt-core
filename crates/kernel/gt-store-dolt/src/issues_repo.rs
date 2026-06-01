@@ -48,6 +48,48 @@ impl IssueStatus {
     }
 }
 
+/// Lifecycle phase a bead belongs to (docs/10 S1, hq-core-mcp.7). `P1..P4` form
+/// a total order (declaration order is the ordinal): a bead is *phase-gated* when
+/// its `phase` exceeds the [`open_phase`](DoltIssues::open_phase) currently open.
+/// `P4` = kernel migration up from gastown (gated while the frontier sits at
+/// `P3`); `P3` = gt-core multi-tenant work, currently open.
+///
+/// `Ord` is derived so `bead.phase > frontier.open_phase` is the gate predicate
+/// in one comparison. serde (de)serializes the variants verbatim as the wire
+/// tokens `"P1".."P4"`, matching the SQL `ENUM('P1','P2','P3','P4')` column.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub enum IssuePhase {
+    P1,
+    P2,
+    P3,
+    P4,
+}
+
+impl IssuePhase {
+    /// Parse a wire/SQL token (`"P1".."P4"`) into the typed phase. `None` for any
+    /// other string so an out-of-set value is rejected at the frontier instead of
+    /// silently landing in the column.
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "P1" => Some(Self::P1),
+            "P2" => Some(Self::P2),
+            "P3" => Some(Self::P3),
+            "P4" => Some(Self::P4),
+            _ => None,
+        }
+    }
+
+    /// The canonical token (`"P1".."P4"`) stored in the `ENUM` column.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::P1 => "P1",
+            Self::P2 => "P2",
+            Self::P3 => "P3",
+            Self::P4 => "P4",
+        }
+    }
+}
+
 /// Filters applied when listing issues for the `gt://issues` MCP resource
 /// (hq-mcp-issues.1). All fields are optional and combined with `AND`; `None`
 /// means "no filter on this column". `limit` caps the result set so a noisy
@@ -229,6 +271,10 @@ pub struct IssuePatch {
     /// New `depends_on_json` — raw JSON array string of dependency bead ids.
     /// `None` leaves the column alone; `Some(_)` overwrites verbatim.
     pub depends_on_json: Option<String>,
+    /// New lifecycle phase token (`"P1".."P4"`, hq-core-mcp.7). `None` leaves
+    /// the column untouched; `Some(_)` is a scalar overwrite the frontier
+    /// validates against [`IssuePhase`] before the write.
+    pub phase: Option<String>,
     /// Optimistic-concurrency guard (hq-mcp-issues.8). `None` = unguarded
     /// last-write-wins (back-compat). `Some(v)` makes the UPDATE match only when
     /// the row's current `version` equals `v`; a mismatch surfaces as
@@ -255,6 +301,7 @@ impl IssuePatch {
             && self.domain_json.is_none()
             && self.surface_json.is_none()
             && self.depends_on_json.is_none()
+            && self.phase.is_none()
     }
 }
 
@@ -300,6 +347,10 @@ pub struct NewIssue {
     pub depends_on_json: String,
     /// Optional `role_scope` discriminator. `None` stores `NULL`.
     pub role_scope: Option<String>,
+    /// Lifecycle phase token (`"P1".."P4"`, hq-core-mcp.7). `None` lets the
+    /// column's `DEFAULT 'P1'` apply; `Some(_)` is a scalar overwrite the
+    /// frontier validates against [`IssuePhase`] before insert.
+    pub phase: Option<String>,
 }
 
 /// Read-only Dolt adapter for the `issues` table. The canonical bead table is
@@ -356,6 +407,11 @@ impl DoltIssues {
             // write path; `issues.update` can guard on it (expected_version) so
             // a stale edit fails loud instead of clobbering a concurrent write.
             ("version", "BIGINT NOT NULL DEFAULT 0"),
+            // hq-core-mcp.7 (docs/10 S1) — per-bead lifecycle phase + the
+            // timestamp the phase was last ratified. A bead is gated when its
+            // `phase` exceeds the `phase_frontier.open_phase` (seeded below).
+            ("phase", "ENUM('P1','P2','P3','P4') NOT NULL DEFAULT 'P1'"),
+            ("phase_ratified_at", "TIMESTAMP NULL"),
         ];
 
         let mut added_any = false;
@@ -385,6 +441,51 @@ impl DoltIssues {
                 "CALL DOLT_COMMIT('-A', '-m', :msg)",
                 mysql_async::params! {
                     "msg" => "hq-taxon.3: add taxonomy columns to issues".to_string(),
+                },
+            )
+            .await
+            .map_err(map_err)?;
+        }
+
+        // hq-core-mcp.7 (docs/10 S1) — the singleton `phase_frontier` row that
+        // governs the highest phase currently claimable. Created + seeded
+        // `open_phase = 'P3'` (ratified 2026-06-01) the first time `ensure_schema`
+        // runs; idempotent thereafter (the table/row guards skip a second seed).
+        let frontier_table: Option<i64> = conn
+            .query_first(
+                "SELECT 1 FROM information_schema.tables
+                 WHERE table_schema = DATABASE() AND table_name = 'phase_frontier' LIMIT 1",
+            )
+            .await
+            .map_err(map_err)?;
+        if frontier_table.is_none() {
+            conn.query_drop(
+                "CREATE TABLE phase_frontier (
+                    id          TINYINT PRIMARY KEY DEFAULT 1 CHECK (id = 1),
+                    open_phase  ENUM('P1','P2','P3','P4') NOT NULL,
+                    ratified_at TIMESTAMP NOT NULL
+                )",
+            )
+            .await
+            .map_err(map_err)?;
+        }
+        // Seed the singleton row if absent (covers a pre-existing empty table too).
+        let frontier_row: Option<i64> = conn
+            .query_first("SELECT 1 FROM phase_frontier WHERE id = 1 LIMIT 1")
+            .await
+            .map_err(map_err)?;
+        if frontier_row.is_none() {
+            conn.exec_drop(
+                "INSERT INTO phase_frontier (id, open_phase, ratified_at)
+                 VALUES (1, 'P3', NOW())",
+                mysql_async::Params::Empty,
+            )
+            .await
+            .map_err(map_err)?;
+            conn.exec_drop(
+                "CALL DOLT_COMMIT('-A', '-m', :msg)",
+                mysql_async::params! {
+                    "msg" => "hq-core-mcp.7: seed phase_frontier open_phase=P3".to_string(),
                 },
             )
             .await
@@ -485,15 +586,18 @@ impl DoltIssues {
         let domain_json = if row.domain_json.is_empty() { "[]" } else { row.domain_json.as_str() };
         let surface_json = if row.surface_json.is_empty() { "[]" } else { row.surface_json.as_str() };
         let depends_on_json = if row.depends_on_json.is_empty() { "[]" } else { row.depends_on_json.as_str() };
+        // Phase defaults to `P1` (matching the column default) when the caller
+        // omits it; a `Some(_)` is validated against `IssuePhase` upstream.
+        let phase = row.phase.as_deref().unwrap_or("P1");
         conn.exec_drop(
             "INSERT INTO issues
                 (id, title, description, design, acceptance_criteria, notes,
                  status, priority, issue_type, assignee, owner, created_by, external_ref,
-                 domain_json, surface_json, depends_on_json, role_scope)
+                 domain_json, surface_json, depends_on_json, role_scope, phase)
              VALUES
                 (:id, :title, :description, :design, :acceptance_criteria, :notes,
                  'open', :priority, :issue_type, :assignee, :owner, :created_by, :external_ref,
-                 :domain_json, :surface_json, :depends_on_json, :role_scope)",
+                 :domain_json, :surface_json, :depends_on_json, :role_scope, :phase)",
             mysql_async::params! {
                 "id" => &row.id,
                 "title" => &row.title,
@@ -511,6 +615,7 @@ impl DoltIssues {
                 "surface_json" => surface_json,
                 "depends_on_json" => depends_on_json,
                 "role_scope" => row.role_scope.clone(),
+                "phase" => phase,
             },
         )
         .await
@@ -659,6 +764,13 @@ impl DoltIssues {
                 "depends_on_json".to_string(),
                 mysql_async::Value::from(v.clone()),
             ));
+        }
+        // hq-core-mcp.7 — a phase overwrite also stamps `phase_ratified_at` so the
+        // last ratification is auditable, mirroring the frontier's `ratified_at`.
+        if let Some(v) = &patch.phase {
+            set_parts.push("phase = :phase");
+            set_parts.push("phase_ratified_at = NOW()");
+            params_vec.push(("phase".to_string(), mysql_async::Value::from(v.clone())));
         }
 
         set_parts.push("updated_at = NOW()");
@@ -853,6 +965,57 @@ impl DoltIssues {
             .await
             .map_err(map_err)?;
         Ok(row)
+    }
+
+    /// Read the currently open phase from the singleton `phase_frontier`
+    /// (hq-core-mcp.7, docs/10 S1). A bead is phase-gated when its own `phase`
+    /// exceeds this value. Errors if the singleton row is missing (ensure_schema
+    /// seeds it) or holds an unrecognised token.
+    pub async fn open_phase(&self) -> Result<IssuePhase, AppError> {
+        let mut conn = self.pool.get_conn().await.map_err(map_err)?;
+        let raw: Option<String> = conn
+            .query_first("SELECT open_phase FROM phase_frontier WHERE id = 1 LIMIT 1")
+            .await
+            .map_err(map_err)?;
+        match raw {
+            Some(s) => IssuePhase::parse(&s).ok_or_else(|| {
+                AppError::Other(format!("unknown open_phase `{s}` in phase_frontier"))
+            }),
+            None => Err(AppError::Other(
+                "phase_frontier singleton row missing (run ensure_schema)".into(),
+            )),
+        }
+    }
+
+    /// Advance the global `phase_frontier.open_phase` and stamp `ratified_at =
+    /// NOW()` (hq-core-mcp.7, docs/10 S1). OPERATOR ONLY: the caller's RBAC scope
+    /// (`issues.phase.advance`) is the gate — never an agent — and is enforced at
+    /// the MCP boundary before this runs. Setting the same phase is an idempotent
+    /// re-ratification (the timestamp still advances). Atomic Dolt commit on
+    /// success; `NotFound` if the singleton row is absent.
+    pub async fn advance_phase(&self, open_phase: IssuePhase) -> Result<(), AppError> {
+        let mut conn = self.pool.get_conn().await.map_err(map_err)?;
+        let present: Option<i64> = conn
+            .query_first("SELECT 1 FROM phase_frontier WHERE id = 1 LIMIT 1")
+            .await
+            .map_err(map_err)?;
+        if present.is_none() {
+            return Err(AppError::NotFound("phase_frontier singleton row".into()));
+        }
+        conn.exec_drop(
+            "UPDATE phase_frontier SET open_phase = :phase, ratified_at = NOW() WHERE id = 1",
+            mysql_async::params! { "phase" => open_phase.as_str() },
+        )
+        .await
+        .map_err(map_err)?;
+        let commit_msg = format!("phase.advance open_phase -> {}", open_phase.as_str());
+        conn.exec_drop(
+            "CALL DOLT_COMMIT('-A', '-m', :msg)",
+            mysql_async::params! { "msg" => commit_msg },
+        )
+        .await
+        .map_err(map_err)?;
+        Ok(())
     }
 
     /// Move an issue across the [`IssueStatus`] state machine (hq-mcp-issues.4).
