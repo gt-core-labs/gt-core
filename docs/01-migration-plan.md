@@ -34,21 +34,33 @@ Order:
 
 ## Phase 2 — Gastown consumes gt-core (path patch only)
 
-Add to `gastown/apps/api/Cargo.toml`:
+Add the **collision-free module-foundation** crates to `gastown/apps/api/Cargo.toml`
+(done in `hq-mod-refactor.15`; paths reflect the real `crates/kernel/` layout):
 
 ```toml
 [workspace.dependencies]
-gt-module = { path = "../../../gt-core/crates/gt-module" }
-gt-module-routes = { path = "../../../gt-core/crates/gt-module-routes" }
-gt-module-mcp = { path = "../../../gt-core/crates/gt-module-mcp" }
-gt-module-events = { path = "../../../gt-core/crates/gt-module-events" }
-gt-module-migrate = { path = "../../../gt-core/crates/gt-module-migrate" }
-gt-module-contracts = { path = "../../../gt-core/crates/gt-module-contracts" }
-gt-feature-flags = { path = "../../../gt-core/crates/gt-feature-flags" }
-gt-workspace = { path = "../../../gt-core/crates/gt-workspace" }
+gt-module           = { path = "../../../gt-core/crates/kernel/gt-module" }
+gt-module-mcp       = { path = "../../../gt-core/crates/kernel/gt-module-mcp" }
+gt-module-migrate   = { path = "../../../gt-core/crates/kernel/gt-module-migrate" }
+gt-module-contracts = { path = "../../../gt-core/crates/kernel/gt-module-contracts" }
+gt-feature-flags    = { path = "../../../gt-core/crates/kernel/gt-feature-flags" }
+gt-hooks            = { path = "../../../gt-core/crates/kernel/gt-hooks" }
 ```
 
 `cargo build` in gastown picks them up. No domain change yet — just available.
+
+**Not in this list (deliberately):**
+
+- `gt-module-routes` / `gt-module-events` — **dropped**: folded into `gt-module`
+  (`hq-mod-core.9`, commit `5b6ec66`). They never become separate crates.
+- `gt-workspace` — **name collision**: gastown already had a `gt-workspace` (town
+  root / `FindFromCwd`), a different concept from gt-core's tenant `gt-workspace`.
+  Gastown's was renamed to `gt-townroot` (`hq-mod-refactor.15`); gt-core's
+  `gt-workspace` (+ `gt-runtime`, which pulls it) can be path-patched in once the
+  rename lands — needed by Phase 5 (`hq-mt-*`).
+- `gt-store-pg` — gastown already has its own (`QuotaRepository` / audit / outbox
+  adapter); gt-core's (migration host + `schema_for`/`WorkspacePool`) **merges with
+  it in Phase 4**, not a path-patch here.
 
 **Gate:** gastown `cargo build` + `cargo test` still green. Nothing imports gt-core yet, but the deps resolve.
 
