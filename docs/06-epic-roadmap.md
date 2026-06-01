@@ -10,8 +10,11 @@ imprecise hand-set approximation: several sub-epics declared coarse "feels
 right" edges while their child beads implied a *different* dependency set. This
 document records the **derived-correct** ordering — the edges you get when you
 collapse the real child-bead `depends_on` up to the sub-epic granularity — plus
-the two structural anomalies that collapse surfaces (one cross-tier leak, one
-epic-level cycle) and how each is resolved.
+two structural anomalies the collapse surfaces (one cross-tier leak, one
+epic-level cycle). The anomalies are **observations, not decisions**: this doc
+flags them and sketches options, but resolving them is the epic owner's call —
+the stored edges keep the real dependencies so neither anomaly is silently
+papered over.
 
 > Convention (NN-16, doc 04): `epic → sub-epic (external_ref) → bead`. The two
 > top epics are **`hq-mod`** (foundation) and **`hq-mt`** (built on top). Every
@@ -56,7 +59,7 @@ stored epic data was missing.
 | 3 | `hq-mod-frontend` | core, flags | Vite module federation + sidebar/route auto-registry |
 | 3 | `hq-mod-refactor` | core, events, mcp, migrate, routes | Wrap 8 existing domains as Modules |
 | 4 | `hq-mod-hooks` | core, **refactor** `+add` | Lifecycle hooks framework + webhook router |
-| 5 | `hq-mod-dogs` | core, **events** `+add`, hooks | Dog worker + DogDispatcher + Gate evaluator + PluginExecutor |
+| 5 | `hq-mod-dogs` | core, **events** `+add`, hooks, **hq-mt-runtime** ⚠️ | Dog worker + DogDispatcher + Gate evaluator + PluginExecutor |
 | 6 | `hq-mod-docs` | (all of the above) | Author guide (docs/16) + mod-hello sample module — **last** |
 
 Notes on the corrections:
@@ -66,6 +69,10 @@ Notes on the corrections:
   once `hq-mod-refactor` has wrapped it as a Module. The epic missed this edge.
 - **`hq-mod-dogs` += `hq-mod-events`.** The Gate evaluator subscribes to events,
   so Dogs cannot land before the cross-module subscribe API in `hq-mod-events`.
+- **`hq-mod-dogs` → `hq-mt-runtime` ⚠️ tier violation (kept on purpose).** Bead
+  `hq-mod-dogs.8` really depends on `hq-mt-runtime.2`, so the epic edge is stored
+  as-is — see Anomaly 1. It is left visible (not dropped) so the owner decides
+  how to re-tier it rather than the map hiding it.
 - **`hq-mod-docs`** legitimately depends on every sibling — it is the "document
   it last" capstone (author guide + sample module). This wide fan-in is kept
   on purpose, not pruned.
@@ -83,7 +90,7 @@ across the sub-epic boundary).
 |---|----------|------------------------|-------|
 | 0 | `hq-mt-core` | — | gt-workspace crate: WorkspaceId, catalog, commands, events, repo port |
 | 1 | `hq-mt-data` | core | PG schema-per-ws + Dolt DB-per-ws + event log split |
-| 2 | `hq-mt-auth` | core, **data** `+add`, routing† | JWT workspace claim + WorkspaceGuard + scope matrix |
+| 2 | `hq-mt-auth` | core, **data** `+add` | JWT workspace claim + WorkspaceGuard + scope matrix (auth.5→routing.5 lives at bead level only† — would cycle) |
 | 2 | `hq-mt-routing` | core, data, auth† | RootRegistry per workspace + lazy hydrate + idle teardown |
 | 3 | `hq-mt-rigs` | core, data, **auth** `+add` | Rigs scoped per workspace (absorbs worktree_root) |
 | 3 | `hq-mt-bootstrap` | core, data, routing, **`hq-mod-migrate`** `+add` | workspace.create/suspend/archive/restore |
@@ -99,7 +106,11 @@ across the sub-epic boundary).
 
 ---
 
-## Anomalies and their resolution
+## Anomalies (observed — the epic owner resolves)
+
+These are **observations from the data**, not decisions made by this map. The
+stored epic edges keep the real dependencies; the options below are sketches for
+whoever owns the epic, not a chosen design.
 
 ### Anomaly 1 — cross-tier leak: `hq-mod-dogs.8 → hq-mt-runtime.2`
 
@@ -109,20 +120,18 @@ allocator"). Collapsed to the epic level this makes **`hq-mod` depend on
 `hq-mt`**, inverting the tier law (multi-tenant builds on the module system,
 never the reverse).
 
-**Resolution — the edge is dropped at the module tier.** The Dogs *module*
-(`hq-mod-dogs`) must ship a **workspace-agnostic** worker pool: a fixed/config
-pool size with no notion of per-workspace budget. The *per-workspace* pool
-sizing and host-capacity allocation is a multi-tenant concern that belongs to
-`hq-mt-runtime`, which **consumes** the Dogs module and layers the per-ws budget
-on top. Concretely:
+**Status: stored as-is.** `hq-mod-dogs`'s epic `depends_on` keeps the real
+`hq-mt-runtime` edge, so the violation stays visible instead of being silently
+dropped. **Not resolved here.** Options the owner might weigh:
 
-- `hq-mod-dogs.8` is rescoped to "pool size from module config" (no `hq-mt-*`
-  dependency) — or folded into `hq-mt-runtime` as the workspace-aware variant.
-- The per-workspace budget wiring lives in `hq-mt-runtime` (which already
-  depends on the whole `hq-mod` tree transitively via `hq-mt → hq-mod`).
+- Rescope `hq-mod-dogs.8` to a workspace-agnostic pool (config pool size, no
+  `hq-mt-*` dependency) and move per-workspace budget wiring into
+  `hq-mt-runtime` (which consumes the Dogs module).
+- Or re-tier `hq-mod-dogs.8` into `hq-mt` entirely if it is inherently
+  multi-tenant.
 
-Net: `hq-mod-dogs` depends only on `core, events, hooks`. No `hq-mod → hq-mt`
-edge survives.
+Either way the fix is a **bead re-tiering decision**, not something this roadmap
+should encode.
 
 ### Anomaly 2 — epic-level cycle: `hq-mt-auth ↔ hq-mt-routing`
 
@@ -134,24 +143,18 @@ Two child beads cross the boundary in opposite directions:
 - `hq-mt-auth.5` ("gt-mcp tool dispatch resolves RootHandle by workspace before
   command") depends on `hq-mt-routing.5` ("gt-mcp service holds RootRegistry").
 
-Each individual bead edge is **acyclic** and correct; the cycle only appears
-when you collapse to the sub-epic. So this is not a real deadlock — it is a sign
-that `auth` and `routing` are **co-developed**, not strictly sequenced.
+Each individual bead edge is **acyclic**; the cycle only appears when you
+collapse to the sub-epic — `auth` and `routing` are interleaved, not strictly
+sequenced.
 
-**Resolution — split `auth` into a foundational half and a dispatch half.**
-
-1. **Foundational auth** (`hq-mt-auth.1..4`: JWT workspace claim, scope matrix,
-   `WorkspaceGuard`) comes **before** routing — routing's registry swap needs the
-   guard to insert `WorkspaceContext`.
-2. **Dispatch auth** (`hq-mt-auth.5`: gt-mcp resolves `RootHandle` per workspace)
-   comes **after** `hq-mt-routing.5` — it consumes the `RootRegistry`.
-
-So the true order is `core → data → auth(guard+claims) → routing(registry) →
-auth.5(dispatch)`. Treat `auth` and `routing` as one **co-built cluster** in
-scheduling: open them together, land the guard, then the registry, then the
-dispatch bead. The stored epic edges (`routing` deps `auth`) stay; the back-edge
-(`auth` deps `routing`) is documented as the intra-cluster forward reference of
-`auth.5` only — not an epic-wide dependency.
+**Status: only the acyclic direction is stored.** `hq-mt-routing` keeps its
+`depends_on hq-mt-auth` edge; the back-edge (`auth → routing`) is **not** written
+to `hq-mt-auth`'s epic deps because it would store an epic-level cycle (the
+`issues.update` cycle guard rejects it). This is a **storage constraint, not a
+design decision** — the `auth.5 → routing.5` dependency still lives at the bead
+level. Whether to formally split `auth` into a foundational half (`.1..4`) and a
+dispatch half (`.5`) so the epic ordering is unambiguous is the owner's call, not
+decided here.
 
 ---
 
@@ -162,9 +165,12 @@ dispatch bead. The stored epic edges (`routing` deps `auth`) stay; the back-edge
   cross-boundary `depends_on`, this map is stale.
 - Epic-level `depends_on` in `hq.issues` is now patchable via
   `issues.update` (it gained `depends_on`/`surface`/`domain` overwrite — see
-  [[project_nn16_bead_taxonomy]]). This doc is the *intended* shape; reconcile
-  the stored edges to it deliberately, not blindly (the two anomalies above must
-  **not** be written back as literal epic edges).
+  [[project_nn16_bead_taxonomy]]). The stored edges mirror the real child-bead
+  dependencies, **including** the Anomaly-1 tier leak (`hq-mod-dogs →
+  hq-mt-runtime`) — kept visible on purpose. The only edge NOT stored is the
+  Anomaly-2 back-edge (`auth → routing`), and only because it would form a cycle
+  the write path rejects. Don't "resolve" anomalies by editing epic edges to
+  hide them; re-tier the offending **bead** instead.
 - New cross-tier edge from `hq-mod` to `hq-mt`? Stop — it violates the tier law.
   Re-tier the offending bead instead (Anomaly 1 is the template).
 
