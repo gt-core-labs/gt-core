@@ -212,6 +212,9 @@ When you must add/remove/rename a field of a v1 event:
 4. **Frontend / downstream consumers** subscribe to whichever version they handle.
 5. **Never** rewrite the event log to fold v1 → v2. Log is append-only forever.
 
+The full operational procedure — across events, MCP tools, and DTO/contracts —
+is the [version rollover playbook](07-version-rollover.md).
+
 ### Forbidden
 
 - ❌ Emitting an unversioned kind (`bead.created`).
