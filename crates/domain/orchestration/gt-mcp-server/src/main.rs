@@ -13,6 +13,7 @@
 //! - `GT_MCP_SCOPE_CONFIG` — RBAC TOML/JSON path; unset ⇒ deny-by-default.
 
 mod dispatch;
+mod pg_audit;
 mod server;
 
 use std::sync::Arc;
@@ -66,7 +67,25 @@ async fn main() -> anyhow::Result<()> {
         }
     };
 
-    let audit: Arc<dyn AuditSink + Send + Sync> = Arc::new(InMemoryAudit::new());
+    // Audit: durable Postgres sink when GT_PG_AUDIT_URL is set (survives restart);
+    // in-memory otherwise. A PG connect failure degrades to in-memory rather than
+    // taking the server down.
+    let audit: Arc<dyn AuditSink + Send + Sync> = match std::env::var("GT_PG_AUDIT_URL") {
+        Ok(url) => match pg_audit::PgAuditSink::connect(&url).await {
+            Ok(sink) => {
+                eprintln!("[gt-mcp-server] audit: Postgres @ {url}");
+                Arc::new(sink)
+            }
+            Err(e) => {
+                eprintln!("[gt-mcp-server] PG audit disabled — {e}; falling back to in-memory");
+                Arc::new(InMemoryAudit::new())
+            }
+        },
+        Err(_) => {
+            eprintln!("[gt-mcp-server] GT_PG_AUDIT_URL unset; audit is in-memory (lost on restart)");
+            Arc::new(InMemoryAudit::new())
+        }
+    };
     let service = IssuesServer::new(store, scope, audit, tools);
 
     let http = StreamableHttpService::new(
