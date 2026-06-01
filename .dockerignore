@@ -1,0 +1,4 @@
+# Keep the build context small — the compiler rebuilds inside the image.
+target/
+.git/
+**/target/
