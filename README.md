@@ -12,10 +12,10 @@ Foundational module system + multi-tenant primitives for Gas Town and downstream
 crates/
 ├── kernel/                       foundation, no domain logic
 │   ├── gt-module                 GtModule trait + RootBuilder       hq-mod-core
-│   ├── gt-module-routes             axum router composition            hq-mod-routes
-│   ├── gt-module-mcp                MCP tool registry                  hq-mod-mcp
-│   ├── gt-module-events             event versioning .v1/.v2           hq-mod-events
-│   ├── gt-module-migrate            per-module SQL loader              hq-mod-migrate
+│   │                             + router composition (routes.rs)   hq-mod-routes
+│   │                             + event versioning (event_kind.rs) hq-mod-events
+│   ├── gt-module-mcp                MCP tool registry (schemars)       hq-mod-mcp
+│   ├── gt-module-migrate            per-module SQL loader (sqlx)       hq-mod-migrate
 │   ├── gt-module-contracts          schema dump + TS codegen           hq-mod-contracts
 │   ├── gt-feature-flags          FF repo + per-ws overrides         hq-mod-flags
 │   └── gt-hooks                  HookPoint + Handler + Registry     hq-mod-hooks
