@@ -14,6 +14,7 @@ members = [
     "crates/domain/orchestration/gt-dog",
     "crates/domain/orchestration/gt-runtime",
     "crates/domain/orchestration/gt-mcp-server",
+    "crates/domain/orchestration/gt-reconciler",
     "crates/kernel/gt-store-pg",
     "crates/kernel/gt-store-dolt",
     "crates/kernel/gt-rbac",
