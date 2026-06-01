@@ -20,14 +20,17 @@
 //!
 //! ## Scope (`hq-mt-routing.1`)
 //!
-//! The registry + a thin handle. The actor lifecycle a handle owns
-//! (`hq-mt-routing.2`), per-workspace event-log hydration (`.3`), and idle
-//! teardown policy (`.4`) layer on top without changing these types' shape.
+//! The registry + a thin handle. Per-workspace event-log hydration (`.3`) and
+//! idle teardown policy (`.4`) layer on top without changing these types' shape.
+//! The actor lifecycle a handle owns ([`Supervisor`], `hq-mt-routing.2`) is the
+//! seam idle teardown drains and the hydrate closure registers actors against.
 
 #![forbid(unsafe_code)]
 
 mod handle;
+mod lifecycle;
 mod registry;
 
 pub use handle::RootHandle;
+pub use lifecycle::{Phase, Supervisor};
 pub use registry::RootRegistry;

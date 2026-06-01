@@ -13,6 +13,9 @@ gt-module = { workspace = true }
 gt-workspace = { workspace = true }
 # Lock-free concurrent map: the registry is hit on every per-workspace request.
 dashmap = { workspace = true }
+# Actor-stack lifecycle (hq-mt-routing.2): spawn tasks + broadcast the phase the
+# supervisor watches. Orchestration tier may spawn (docs/03); kernel may not.
+tokio = { workspace = true }
 
 [dev-dependencies]
 # Module version literals for the hot-reload rebuild test (hq-mod-flags.6).
