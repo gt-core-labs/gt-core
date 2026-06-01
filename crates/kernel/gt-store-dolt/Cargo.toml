@@ -1,0 +1,15 @@
+[package]
+name = "gt-store-dolt"
+edition.workspace = true
+version.workspace = true
+
+# Dolt issues-store adapter, lifted from gastown (hq-core-host.1). Issues slice
+# only — no gastown domain deps. Local AppError replaces gt-events.
+[dependencies]
+mysql_async = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt", "rt-multi-thread", "macros"] }

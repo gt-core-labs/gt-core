@@ -12,6 +12,7 @@ members = [
     "crates/domain/orchestration/gt-dog",
     "crates/domain/orchestration/gt-runtime",
     "crates/kernel/gt-store-pg",
+    "crates/kernel/gt-store-dolt",
     "examples/mod-hello",
 ]
 
@@ -44,6 +45,10 @@ hex = "0.4"
 
 # Storage
 sqlx = { version = "0.8", default-features = false, features = ["postgres", "macros", "runtime-tokio-rustls", "uuid", "chrono"] }
+# MySQL-wire client for Dolt (:3307); lifted issues store (hq-core-host.1). No
+# TLS (local Dolt), minimal deps.
+mysql_async = { version = "0.34", default-features = false, features = ["minimal"] }
+thiserror = "2"
 # Lock-free concurrent map (per-workspace RootRegistry, hq-mt-routing.1).
 dashmap = "6"
 
@@ -66,6 +71,7 @@ gt-dog           = { path = "crates/domain/orchestration/gt-dog" }
 gt-runtime       = { path = "crates/domain/orchestration/gt-runtime" }
 
 gt-store-pg      = { path = "crates/kernel/gt-store-pg" }
+gt-store-dolt    = { path = "crates/kernel/gt-store-dolt" }
 
 # Reused from gastown until P4 (foundation kernel crates):
 # gt-events, gt-bus, gt-audit, gt-plugin, gt-telemetry remain in gastown.
