@@ -64,6 +64,27 @@ impl RootRegistry {
         self.handles.remove(workspace).map(|(_, h)| h)
     }
 
+    /// Invalidate `workspace`'s cached handle so the next access re-hydrates it
+    /// from current configuration (`hq-mod-flags.6` hot-reload).
+    ///
+    /// The rebuild half of feature-flag hot-reload: when a workspace's flags
+    /// flip, dropping its handle makes the next
+    /// [`get_or_hydrate`](Self::get_or_hydrate) rebuild the `Root` with the new
+    /// flag set (the hydrate closure calls `RootBuilder::build_with_flags`), so a
+    /// dark-launched or rolled-back module appears or disappears without a
+    /// process restart. An idle workspace rebuilds lazily on its next request; a
+    /// hot one rebuilds on the next miss. Returns `true` if a handle was present.
+    ///
+    /// Same drop mechanics as [`remove`](Self::remove); the distinct name records
+    /// intent — config change, not capacity teardown — and is the seam the
+    /// flag-change trigger (PG `LISTEN/NOTIFY` or poll, Phase 4) calls. Draining
+    /// in-flight requests before the swap arrives with the actor lifecycle
+    /// (`hq-mt-routing.2`); until then an in-flight request keeps its
+    /// already-resolved `Arc` and the next request gets the rebuilt one.
+    pub fn invalidate(&self, workspace: &WorkspaceId) -> bool {
+        self.handles.remove(workspace).is_some()
+    }
+
     /// Return `workspace`'s handle, hydrating it with `hydrate` on first access.
     ///
     /// `hydrate` runs only when the workspace is absent. See
@@ -116,14 +137,31 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
 
-    use gt_module::RootBuilder;
+    use gt_module::{
+        AllEnabled, DisabledModules, GtModule, ModuleId, ModuleMeta, RootBuilder,
+    };
     use gt_workspace::WorkspaceId;
+    use semver::Version;
 
     use super::RootRegistry;
     use crate::RootHandle;
 
     fn ws(slug: &str) -> WorkspaceId {
         WorkspaceId::new(slug).unwrap()
+    }
+
+    /// Smallest viable modules for the hot-reload test — identity only.
+    struct ModA;
+    struct ModB;
+    impl GtModule for ModA {
+        fn meta(&self) -> ModuleMeta {
+            ModuleMeta::new(ModuleId::new("mod-a").unwrap(), "A", Version::new(1, 0, 0), "A")
+        }
+    }
+    impl GtModule for ModB {
+        fn meta(&self) -> ModuleMeta {
+            ModuleMeta::new(ModuleId::new("mod-b").unwrap(), "B", Version::new(1, 0, 0), "B")
+        }
     }
 
     /// An empty composed root bound to `slug` — enough to exercise the registry
@@ -208,5 +246,42 @@ mod tests {
             assert!(Arc::ptr_eq(&roots[0], r), "all racers share one handle");
         }
         assert_eq!(reg.len(), 1, "exactly one entry stored");
+    }
+
+    #[test]
+    fn invalidate_rebuilds_with_current_flags() {
+        // hq-mod-flags.6: invalidate drops the cached handle so the next access
+        // re-hydrates with the current flag set — a disabled module disappears
+        // without a restart.
+        let reg = RootRegistry::new();
+        let mod_b = ModuleId::new("mod-b").unwrap();
+
+        // Hydrate with both modules enabled.
+        let build_all = || {
+            let root = RootBuilder::new().module(ModA).module(ModB).build_with_flags(&AllEnabled).unwrap();
+            RootHandle::new(ws("acme"), root)
+        };
+        let before = reg.get_or_hydrate(&ws("acme"), build_all);
+        assert_eq!(before.root().len(), 2);
+        assert!(before.root().module(&mod_b).is_some(), "mod-b live while enabled");
+
+        // Flip: disable mod-b, then invalidate so the next access rebuilds.
+        assert!(reg.invalidate(&ws("acme")), "a handle was present to invalidate");
+        assert!(reg.is_empty(), "invalidate dropped the cached handle");
+
+        let disabled = DisabledModules::new([mod_b.clone()]);
+        let after = reg.get_or_hydrate(&ws("acme"), || {
+            let root = RootBuilder::new().module(ModA).module(ModB).build_with_flags(&disabled).unwrap();
+            RootHandle::new(ws("acme"), root)
+        });
+        assert_eq!(after.root().len(), 1, "rebuilt root dropped the disabled module");
+        assert!(after.root().module(&mod_b).is_none(), "mod-b gone after flag flip + rebuild");
+        assert!(!Arc::ptr_eq(&before, &after), "a new handle replaced the old one");
+    }
+
+    #[test]
+    fn invalidate_absent_is_false() {
+        let reg = RootRegistry::new();
+        assert!(!reg.invalidate(&ws("ghost")));
     }
 }

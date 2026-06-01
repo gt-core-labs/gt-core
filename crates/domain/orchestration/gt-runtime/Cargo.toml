@@ -15,3 +15,5 @@ gt-workspace = { workspace = true }
 dashmap = { workspace = true }
 
 [dev-dependencies]
+# Module version literals for the hot-reload rebuild test (hq-mod-flags.6).
+semver = { workspace = true }
