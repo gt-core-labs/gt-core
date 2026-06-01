@@ -7,3 +7,15 @@ description = "Smallest viable GtModule — learn-by-example reference. Lands in
 
 [dependencies]
 gt-module = { workspace = true }
+axum = { workspace = true }
+serde_json = { workspace = true }
+semver = { workspace = true }
+
+[dev-dependencies]
+# The end-to-end gate assembles the module through the real RootBuilder and
+# drives a Dog worker through the receipt path, so the proof exercises the whole
+# on-ramp — not just the crate in isolation.
+gt-dog = { workspace = true }
+tokio = { workspace = true }
+tower = { workspace = true }
+async-trait = { workspace = true }
