@@ -14,9 +14,9 @@ use gt_rbac::Scope;
 use gt_store_dolt::{AppError, DoltIssues};
 
 use rmcp::model::{
-    CallToolRequestParams, CallToolResult, Content, Implementation, ListResourcesResult,
-    ListToolsResult, PaginatedRequestParams, ReadResourceRequestParams, ReadResourceResult,
-    ResourceContents, ServerCapabilities, ServerInfo, Tool,
+    AnnotateAble, CallToolRequestParams, CallToolResult, Content, Implementation, ListResourcesResult,
+    ListToolsResult, PaginatedRequestParams, RawResource, ReadResourceRequestParams,
+    ReadResourceResult, ResourceContents, ServerCapabilities, ServerInfo, Tool,
 };
 use rmcp::service::{RequestContext, RoleServer};
 use rmcp::{ErrorData as McpError, ServerHandler};
@@ -134,9 +134,31 @@ impl ServerHandler for IssuesServer {
         _request: Option<PaginatedRequestParams>,
         _context: RequestContext<RoleServer>,
     ) -> Result<ListResourcesResult, McpError> {
-        // MVP: the two issues resources are read by explicit URI (gt://issues,
-        // gt://issue/{id}); a richer catalog can follow.
-        Ok(ListResourcesResult::with_all_items(Vec::new()))
+        // Advertise the two issues resources so clients discover them (hq-core-mcp.1)
+        // instead of having to know the URIs out of band.
+        let mk = |uri: &str, name: &str, desc: &str| {
+            let mut r = RawResource::new(uri, name);
+            r.description = Some(desc.to_string());
+            r.mime_type = Some("application/json".to_string());
+            r.no_annotation()
+        };
+        let resources = vec![
+            mk(
+                "gt://issues",
+                "issues",
+                "Canonical issues snapshot from Dolt. Filters via querystring: \
+                 status=open[,working], priority_max=2, assignee=X, external_ref=Y, \
+                 issue_type=epic, limit=N. Pass full=1 to inline the text bodies \
+                 (description/design/acceptance_criteria/notes) on every row.",
+            ),
+            mk(
+                "gt://issue/{id}",
+                "issue.detail",
+                "Single bead WITH full text bodies + taxonomy columns + version. Read \
+                 after claiming a bead to see the actual spec.",
+            ),
+        ];
+        Ok(ListResourcesResult::with_all_items(resources))
     }
 
     async fn read_resource(
