@@ -46,6 +46,7 @@ members = [
     "crates/kernel/gt-rbac",
     "crates/kernel/gt-audit",
     "examples/mod-hello",
+    "examples/composition",
 ]
 
 [workspace.package]
