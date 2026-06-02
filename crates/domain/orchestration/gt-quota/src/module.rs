@@ -32,9 +32,11 @@
 //!    is kebab-only by construction). MCP tool names are declared verbatim with their current
 //!    segments; kebab-normalizing them is `hq-mod-mcp.4`'s job.
 //! 3. **Migration is the module-owned copy** at `migrations/quota/0001__create_quota.sql`,
-//!    verbatim from gt-store-pg's `init_quota`; gt-store-pg keeps the transitional applied copy
-//!    until `hq-mod-migrate` consolidates. `register`/`retire` write this table (they are "not
-//!    event-logged"), so the module must own its schema.
+//!    derived from gt-store-pg's `init_quota` but qualified into the `ws_default` template
+//!    schema (schema-per-ws, hq-mt-data.4 / docs/04 §15) so `gt_create_workspace_schema` clones
+//!    it per tenant; gt-store-pg keeps the transitional applied copy until `hq-mod-migrate`
+//!    consolidates. `register`/`retire` write this table (they are "not event-logged"), so the
+//!    module must own its schema.
 
 use gt_module::{
     Capability, EventKind, GtModule, McpRegistry, Migration, ModuleId, ModuleMeta, Scope,
@@ -209,8 +211,19 @@ mod tests {
         assert_eq!(migs.len(), 1);
         assert_eq!(migs[0].version, 1);
         assert_eq!(migs[0].name, "create_quota");
-        assert!(migs[0].sql.contains("CREATE TABLE IF NOT EXISTS accounts"));
-        assert!(migs[0].sql.contains("CREATE TABLE IF NOT EXISTS token_usage"));
+        // Schema-per-ws (hq-mt-data.4, docs/04 §15): the tables are created in the
+        // `ws_default` template schema so `gt_create_workspace_schema` clones them per
+        // tenant — not in `public` (which holds only cross-tenant catalogs).
+        assert!(migs[0]
+            .sql
+            .contains("CREATE TABLE IF NOT EXISTS ws_default.accounts"));
+        assert!(migs[0]
+            .sql
+            .contains("CREATE TABLE IF NOT EXISTS ws_default.token_usage"));
+        assert!(
+            migs[0].sql.contains("CREATE SCHEMA IF NOT EXISTS ws_default"),
+            "must bootstrap the template schema it populates",
+        );
     }
 
     #[test]
