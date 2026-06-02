@@ -1,0 +1,20 @@
+[package]
+name = "gt-scheduling"
+edition.workspace = true
+version.workspace = true
+
+# Ported up from gastown (hq-core-port.16). Dispatcher queue: enqueue pending beads, dispatch
+# to workers, track lease/capacity. Pure core (time enters as data) so it stays replay-safe;
+# emits SchedEvent and never calls patrol/merge directly (integration-by-events) — it is the
+# consumer of patrol.lease-expired (re-enqueue) and merge.merged (capacity_freed) the
+# composition root reactor wires. Deps gt-events + gt-beads (the BeadId vocabulary).
+#
+# gastown's e2e integration tests (composition root over gt-agent/gt-audit) are NOT ported:
+# that wiring belongs to the composition root (hq-mod-refactor.13/.18), not this leaf crate.
+[dependencies]
+gt-events = { workspace = true }
+gt-beads = { workspace = true }
+tokio.workspace = true
+serde.workspace = true
+# JSON Schema derives for Command arguments — surfaced by gt-mcp.
+schemars.workspace = true
