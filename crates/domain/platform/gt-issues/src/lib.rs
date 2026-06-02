@@ -36,6 +36,7 @@ pub mod commands;
 pub mod delivery;
 pub mod handlers;
 pub mod park;
+pub mod policy;
 pub mod readiness;
 pub mod resources;
 pub mod surface;
@@ -50,6 +51,10 @@ pub use module::IssuesModule;
 pub use park::{
     decide as park_decide, HumanPresence, IrreversibleKind, Operation, ParkDecision, ParkQueue,
     ParkedOp, Reversibility,
+};
+pub use policy::{
+    check_bead as check_bead_policy, invariant, BeadFacts, Enforcement, Invariant, PolicyVerdict,
+    Violation, INVARIANTS,
 };
 pub use readiness::is_ready;
 pub use surface::{AllowAllTree, SurfaceEntry, SurfaceTree};
