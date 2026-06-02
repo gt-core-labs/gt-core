@@ -1,0 +1,7 @@
+[package]
+name = "gt-bus"
+edition.workspace = true
+version.workspace = true
+
+[dependencies]
+gt-events = { workspace = true }
