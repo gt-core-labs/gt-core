@@ -42,3 +42,6 @@ tokio = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "sync", "time"] }
 # Build typed `EventRecord` payloads in the observer-plugin tests.
 serde_json = { workspace = true }
+# The end-to-end composition test assembles a real RootHandle from an (empty) Root.
+gt-module = { workspace = true }
+gt-workspace = { workspace = true }
