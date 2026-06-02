@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "crates/kernel/gt-events",
     "crates/kernel/gt-bus",
+    "crates/kernel/gt-telemetry",
     "crates/kernel/gt-module",
     "crates/kernel/gt-module-mcp",
     "crates/kernel/gt-module-migrate",
@@ -82,6 +83,7 @@ anyhow = "1"
 # Path-centralized here so members never juggle relative paths across tiers.
 gt-events        = { path = "crates/kernel/gt-events" }
 gt-bus           = { path = "crates/kernel/gt-bus" }
+gt-telemetry     = { path = "crates/kernel/gt-telemetry" }
 gt-module        = { path = "crates/kernel/gt-module" }
 gt-module-mcp       = { path = "crates/kernel/gt-module-mcp" }
 gt-module-migrate   = { path = "crates/kernel/gt-module-migrate" }

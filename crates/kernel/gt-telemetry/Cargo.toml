@@ -1,0 +1,29 @@
+[package]
+name = "gt-telemetry"
+edition.workspace = true
+version.workspace = true
+
+# Telemetry plumbing for the workspace: structured `tracing` + OTEL/OTLP span export +
+# Prometheus metrics registry. Lives in the kernel layer (`docs/01-architecture.md`) so any
+# domain can record spans/metrics without importing each-other. The bins (`gt`, `gt-web`,
+# `gt-mcp`) call `init` once at startup and own the resulting `TelemetryGuard` for the
+# lifetime of the process.
+
+[dependencies]
+gt-events = { workspace = true }
+
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+tracing-opentelemetry = { version = "0.33", default-features = false }
+opentelemetry = { version = "0.32", default-features = false, features = ["trace"] }
+opentelemetry_sdk = { version = "0.32", default-features = false, features = ["trace", "rt-tokio"] }
+# OTLP via HTTP/protobuf only — no tonic/gRPC dep chain, no native TLS.
+opentelemetry-otlp = { version = "0.32", default-features = false, features = ["http-proto", "reqwest-blocking-client", "trace"] }
+prometheus = { version = "0.14", default-features = false }
+tokio = { workspace = true }
+thiserror.workspace = true
+
+[dev-dependencies]
+serde = { workspace = true }
+serde_json.workspace = true
+ulid.workspace = true
