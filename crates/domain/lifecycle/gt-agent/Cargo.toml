@@ -1,0 +1,24 @@
+[package]
+name = "gt-agent"
+edition.workspace = true
+version.workspace = true
+
+# Agent/session + polecat lifecycle substrate. Owned events + pure replay reducer
+# + sync `Command` path; the supervisor drives transitions over `gt-bus`. No HTTP,
+# no scope resolution. The CrewModule wrap (composing this with the role crates) is
+# `hq-mod-refactor.7`.
+[dependencies]
+gt-events = { workspace = true }
+gt-bus = { workspace = true }
+# `fs` (heartbeat file) + `process` (polecat child supervision) on top of the workspace
+# tokio feature set (macros/rt/sync/time); the supervisor is an explicit actor crate.
+tokio = { workspace = true, features = ["fs", "process"] }
+serde.workspace = true
+# JSON Schema derives for Command arguments — surfaced by gt-mcp.
+schemars.workspace = true
+
+[dev-dependencies]
+# Replay gate only (the domain does not depend on the log at runtime). `gt-eventlog`
+# is gastown's event-replay store ported up (hq-core-port.8; was `gt-audit`).
+gt-eventlog = { workspace = true }
+serde_json.workspace = true

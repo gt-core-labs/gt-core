@@ -19,6 +19,12 @@ members = [
     "crates/domain/platform/gt-rig",
     "crates/domain/platform/gt-feed",
     "crates/domain/platform/gt-skills",
+    "crates/domain/lifecycle/gt-agent",
+    "crates/domain/roles/gt-sheriff",
+    "crates/domain/roles/gt-deacon",
+    "crates/domain/roles/gt-refinery",
+    "crates/domain/roles/gt-witness",
+    "crates/domain/roles/gt-mayor",
     "crates/domain/orchestration/gt-quota",
     "crates/domain/orchestration/gt-merge",
     "crates/domain/orchestration/gt-orchestration",
@@ -114,6 +120,12 @@ gt-issues        = { path = "crates/domain/platform/gt-issues" }
 gt-rig           = { path = "crates/domain/platform/gt-rig" }
 gt-feed          = { path = "crates/domain/platform/gt-feed" }
 gt-skills        = { path = "crates/domain/platform/gt-skills" }
+gt-agent         = { path = "crates/domain/lifecycle/gt-agent" }
+gt-sheriff       = { path = "crates/domain/roles/gt-sheriff" }
+gt-deacon        = { path = "crates/domain/roles/gt-deacon" }
+gt-refinery      = { path = "crates/domain/roles/gt-refinery" }
+gt-witness       = { path = "crates/domain/roles/gt-witness" }
+gt-mayor         = { path = "crates/domain/roles/gt-mayor" }
 gt-quota         = { path = "crates/domain/orchestration/gt-quota" }
 gt-merge         = { path = "crates/domain/orchestration/gt-merge" }
 gt-orchestration = { path = "crates/domain/orchestration/gt-orchestration" }

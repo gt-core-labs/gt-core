@@ -1,0 +1,24 @@
+[package]
+name = "gt-sheriff"
+edition.workspace = true
+version.workspace = true
+
+[dependencies]
+gt-events = { workspace = true }
+gt-channel = { workspace = true }
+# hq-evks (Paso 9.B) shipped the canonical `Plugin` trait + relay. SheriffPlugin impls it
+# from this crate so the composition root can register Sheriff in the plugin chain.
+gt-plugin = { workspace = true }
+# `Plugin::on_event` takes `&EventRecord`; needed in the trait impl signature.
+# `gt-eventlog` is gastown's event-replay store ported up (hq-core-port.8; was `gt-audit`).
+gt-eventlog = { workspace = true }
+tokio.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+schemars.workspace = true
+# The Plugin trait is `#[async_trait]` (the one place in the kernel where `dyn` is allowed).
+async-trait.workspace = true
+
+[dev-dependencies]
+# Replay gate: round-trips Envelope -> EventRecord -> SheriffEvent through the event log.
+ulid.workspace = true
