@@ -15,6 +15,7 @@ members = [
     "crates/kernel/gt-feature-flags",
     "crates/kernel/gt-hooks",
     "crates/domain/platform/gt-workspace",
+    "crates/domain/platform/gt-auth",
     "crates/domain/platform/gt-issues",
     "crates/domain/platform/gt-meta",
     "crates/domain/platform/gt-rig",
