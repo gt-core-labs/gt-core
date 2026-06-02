@@ -35,6 +35,7 @@
 pub mod commands;
 pub mod delivery;
 pub mod handlers;
+pub mod park;
 pub mod readiness;
 pub mod resources;
 pub mod surface;
@@ -46,6 +47,10 @@ pub use commands::{
 };
 pub use delivery::{CommitInfo, CommitInspector};
 pub use module::IssuesModule;
+pub use park::{
+    decide as park_decide, HumanPresence, IrreversibleKind, Operation, ParkDecision, ParkQueue,
+    ParkedOp, Reversibility,
+};
 pub use readiness::is_ready;
 pub use surface::{AllowAllTree, SurfaceEntry, SurfaceTree};
 pub use taxonomy::Domain;
