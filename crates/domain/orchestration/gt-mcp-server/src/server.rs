@@ -182,13 +182,18 @@ impl ServerHandler for IssuesServer {
             mk(
                 "gt://issues",
                 "issues",
-                "Canonical issues snapshot from Dolt. Filters via querystring: \
+                "Canonical issues snapshot from Dolt, returned as a less-style PAGE: \
+                 {rows, total, next_offset, has_more} in stable order — walk the \
+                 corpus by advancing offset=next_offset until has_more=false (no \
+                 full dump, no silent cap). Filters via querystring: \
                  status=open[,working], priority_max=2, assignee=X, external_ref=Y, \
-                 issue_type=epic, limit=N. Pass full=1 to inline the text bodies \
-                 (description/design/acceptance_criteria/notes) on every row. Pass \
-                 ready=1 to return only SOUND beads (docs/10 §S4): deps delivered, \
-                 phase open, own non-planned surfaces exist, status=open — claim \
-                 straight from this list without re-checking the graph.",
+                 issue_type=epic, limit=N, offset=M (page size default \
+                 GT_ISSUES_DEFAULT_LIMIT, ceiling GT_ISSUES_MAX_LIMIT). Pass full=1 \
+                 to inline the text bodies (description/design/acceptance_criteria/\
+                 notes) on every row. Pass ready=1 for the UNBOUNDED frontier — a \
+                 bare array of only SOUND beads (docs/10 §S4): deps delivered, phase \
+                 open, own non-planned surfaces exist, status=open — claim straight \
+                 from this list without re-checking the graph.",
             ),
             mk(
                 "gt://issue/{id}",
@@ -228,21 +233,28 @@ impl IssuesServer {
         };
         if let Some(qs) = issues_qs {
             let filter = parse_issue_filter(qs)?;
-            let rows = gt_issues::resources::read_issues(&self.store, &filter).await?;
-            // hq-core-mcp.11 (docs/10 §S4): `?ready=true` narrows the snapshot to
-            // sound beads. The predicate needs the phase frontier, the (whole-
-            // table) delivered index, and the `main` git tree — gathered here and
-            // applied by the module's `filter_ready`.
-            let rows = if filter.ready {
+            // hq-core-mcp.11 (docs/10 §S4): `?ready=true` is the unbounded
+            // actionable frontier — pull every row, then narrow to the sound
+            // beads. The predicate needs the phase frontier, the (whole-table)
+            // delivered index, and the `main` git tree, gathered here and applied
+            // by the module's `filter_ready`. It returns a bare array (small,
+            // self-complete) — no pager envelope.
+            if filter.ready {
+                let rows = gt_issues::resources::read_issues(&self.store, &filter).await?;
                 let open_phase = self.store.open_phase().await?;
                 let deps = self.store.dep_index().await?;
                 let repo_dir = self.repo_dir.as_deref().map(|p| p.as_path());
                 let tree = crate::git_tree::surface_tree(repo_dir);
-                gt_issues::resources::filter_ready(rows, open_phase, &deps, tree.as_ref())
-            } else {
-                rows
-            };
-            return serde_json::to_value(&rows)
+                let rows =
+                    gt_issues::resources::filter_ready(rows, open_phase, &deps, tree.as_ref());
+                return serde_json::to_value(&rows)
+                    .map_err(|e| AppError::Other(format!("encode issues: {e}")));
+            }
+            // hq-core-mcp.13: the default snapshot is a less-style PAGE — rows plus
+            // `total`/`next_offset`/`has_more` so no caller mistakes one page for
+            // the whole corpus. `?limit=N&offset=M` positions it.
+            let page = gt_issues::resources::read_issues_page(&self.store, &filter).await?;
+            return serde_json::to_value(&page)
                 .map_err(|e| AppError::Other(format!("encode issues: {e}")));
         }
 

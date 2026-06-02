@@ -19,13 +19,28 @@
 
 use std::collections::HashMap;
 
-use gt_store_dolt::{AppError, DepFact, DoltIssues, IssueDetail, IssueFilter, IssuePhase, IssueRow};
+use gt_store_dolt::{
+    AppError, DepFact, DoltIssues, IssueDetail, IssueFilter, IssuePage, IssuePhase, IssueRow,
+};
 
 use crate::readiness::is_ready;
 use crate::surface::SurfaceTree;
 
-/// Snapshot the issues table under `filter` (the `gt://issues` resource). Set
-/// [`IssueFilter::full`] for the `?full=1` variant that inlines the heavy bodies.
+/// One less-style page of the issues snapshot (the `gt://issues` resource,
+/// hq-core-mcp.13). The returned [`IssuePage`] carries `total`/`next_offset`/
+/// `has_more` so a consumer pages through the corpus without a full dump or a
+/// silent cap. Set [`IssueFilter::full`] for the `?full=1` variant that inlines
+/// the heavy bodies, and `limit`/`offset` to position the page.
+pub async fn read_issues_page(
+    issues: &DoltIssues,
+    filter: &IssueFilter,
+) -> Result<IssuePage, AppError> {
+    issues.list_page(filter).await
+}
+
+/// The bare-row snapshot under `filter`, used for the unbounded `?ready=true`
+/// frontier where the readiness predicate (not a page) bounds the set. The paged
+/// `gt://issues` resource goes through [`read_issues_page`] instead.
 pub async fn read_issues(
     issues: &DoltIssues,
     filter: &IssueFilter,

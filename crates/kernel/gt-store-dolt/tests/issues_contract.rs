@@ -12,6 +12,8 @@
 //! (with `GT_DOLT_URL` pointed at a SANDBOX Dolt, e.g.
 //! `mysql://gastown@<dolt-host>:3307`, never the live `hq`).
 
+use std::collections::BTreeSet;
+
 use mysql_async::prelude::Queryable;
 
 use gt_store_dolt::{
@@ -690,4 +692,133 @@ async fn phase_frontier_and_per_bead_phase() {
 /// the `issues.claim.*` echo returns so an agent sees the gate before working.
 async fn detail_phase(repo: &DoltIssues, id: &str) -> String {
     repo.get_detail(id).await.expect("get_detail ok").expect("row").phase
+}
+
+/// Reseed `TEST_DB.issues` with exactly `n` rows under a fixed `external_ref`
+/// (`pg-walk`) and zero-padded ids so `ORDER BY created_at DESC, id ASC` is a
+/// deterministic permutation — the page-walk gate (hq-core-mcp.13) needs a stable
+/// known corpus to prove no dup/skip.
+async fn seed_paged(base: &str, n: usize) -> Result<(), Box<dyn std::error::Error>> {
+    let pool = gt_store_dolt::connect(base)?;
+    let mut conn = pool.get_conn().await?;
+    conn.query_drop(format!("USE {TEST_DB}")).await?;
+    conn.query_drop("DELETE FROM issues").await?;
+    // Batch the inserts so a 200+ row seed stays one round-trip.
+    let values: Vec<String> = (0..n)
+        .map(|i| {
+            format!(
+                "('pg-{i:04}', 'row {i}', '', '', '', '', 'open', 2, 'task', NULL, 'pg-walk')"
+            )
+        })
+        .collect();
+    conn.query_drop(format!(
+        "INSERT INTO issues (id, title, description, design, acceptance_criteria, notes,
+            status, priority, issue_type, assignee, external_ref) VALUES {}",
+        values.join(", ")
+    ))
+    .await?;
+    Ok(())
+}
+
+/// hq-core-mcp.13: the less-style pager. Walking `offset` from 0 until
+/// `has_more=false` must reconstruct the whole corpus exactly once each, in a
+/// stable order, with a correct `total`; the env-tunable default/ceiling must be
+/// honoured and `?limit` above the ceiling clamped — never the old silent
+/// `unwrap_or(200).min(1000)` cap.
+#[tokio::test]
+async fn pager_walks_corpus_without_dup_or_skip() {
+    let Ok(base) = std::env::var("GT_DOLT_URL") else {
+        eprintln!("GT_DOLT_URL unset — skipping pager contract");
+        return;
+    };
+    let base = base.trim_end_matches('/').to_string();
+    // 230 rows crosses the dead 200 cap so a regression would truncate the walk.
+    const N: usize = 230;
+    seed_paged(&base, N).await.expect("seed paged");
+
+    let repo = DoltIssues::connect(&format!("{base}/{TEST_DB}")).expect("connect");
+
+    // Clear any env from a prior test so the default-page assertions are stable.
+    std::env::remove_var("GT_ISSUES_DEFAULT_LIMIT");
+    std::env::remove_var("GT_ISSUES_MAX_LIMIT");
+
+    let filter = |offset: u32| IssueFilter {
+        external_ref: Some("pg-walk".into()),
+        limit: Some(50),
+        offset: Some(offset),
+        ..Default::default()
+    };
+
+    // ── walk page by page, collecting ids in visitation order.
+    let mut seen: Vec<String> = Vec::new();
+    let mut offset = 0u32;
+    let mut pages = 0;
+    loop {
+        let page = repo.list_page(&filter(offset)).await.expect("list_page");
+        assert_eq!(page.total, N as i64, "total is the full filter count on every page");
+        for r in &page.rows {
+            seen.push(r.id.clone());
+        }
+        pages += 1;
+        if !page.has_more {
+            assert!(page.rows.len() <= 50);
+            break;
+        }
+        assert_eq!(page.rows.len(), 50, "a non-final page is exactly the page size");
+        assert_eq!(page.next_offset, offset + 50);
+        offset = page.next_offset;
+        assert!(pages < 100, "walk must terminate");
+    }
+    assert_eq!(pages, 5, "230 rows / 50 = 5 pages (50*4 + 30)");
+
+    // ── no dup, no skip: exactly the seeded set, each once.
+    assert_eq!(seen.len(), N, "reconstructed row count");
+    let unique: BTreeSet<&str> = seen.iter().map(String::as_str).collect();
+    assert_eq!(unique.len(), N, "every row seen exactly once (no dup)");
+    for i in 0..N {
+        assert!(unique.contains(format!("pg-{i:04}").as_str()), "row pg-{i:04} present (no skip)");
+    }
+
+    // ── stable order: a second full walk yields the identical sequence.
+    let mut seen2: Vec<String> = Vec::new();
+    let mut offset = 0u32;
+    loop {
+        let page = repo.list_page(&filter(offset)).await.expect("list_page 2");
+        for r in &page.rows {
+            seen2.push(r.id.clone());
+        }
+        if !page.has_more {
+            break;
+        }
+        offset = page.next_offset;
+    }
+    assert_eq!(seen, seen2, "page order is stable across walks");
+
+    // ── env override: GT_ISSUES_DEFAULT_LIMIT sets the unset-limit page size.
+    std::env::set_var("GT_ISSUES_DEFAULT_LIMIT", "17");
+    let dflt = repo
+        .list_page(&IssueFilter {
+            external_ref: Some("pg-walk".into()),
+            ..Default::default()
+        })
+        .await
+        .expect("default page");
+    assert_eq!(dflt.rows.len(), 17, "default page size from GT_ISSUES_DEFAULT_LIMIT");
+    assert_eq!(dflt.total, N as i64);
+    assert!(dflt.has_more, "first modest page is not the whole set");
+    std::env::remove_var("GT_ISSUES_DEFAULT_LIMIT");
+
+    // ── ceiling: a limit above GT_ISSUES_MAX_LIMIT is honoured only up to it.
+    std::env::set_var("GT_ISSUES_MAX_LIMIT", "40");
+    let capped = repo
+        .list_page(&IssueFilter {
+            external_ref: Some("pg-walk".into()),
+            limit: Some(9999),
+            ..Default::default()
+        })
+        .await
+        .expect("ceiling page");
+    assert_eq!(capped.rows.len(), 40, "limit>ceiling clamped to GT_ISSUES_MAX_LIMIT");
+    assert!(capped.has_more);
+    std::env::remove_var("GT_ISSUES_MAX_LIMIT");
 }

@@ -16,4 +16,9 @@ RUN apt-get update \
 COPY --from=build /build/target/release/gt-mcp-server /usr/local/bin/gt-mcp-server
 # Env (GT_DOLT_URL, GT_MCP_HTTP_BIND, GT_MCP_ACTOR, GT_MCP_SCOPE_CONFIG) is
 # supplied by the compose service; see docker-compose gt-mcp-server.
+#
+# gt://issues pager tuning (hq-core-mcp.13), both optional:
+#   GT_ISSUES_DEFAULT_LIMIT  page size when ?limit is omitted (default 200)
+#   GT_ISSUES_MAX_LIMIT      hard ceiling a ?limit is clamped to (default 10000)
+# The operator retunes the page size here without recompiling.
 ENTRYPOINT ["gt-mcp-server"]

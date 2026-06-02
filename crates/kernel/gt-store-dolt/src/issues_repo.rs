@@ -108,8 +108,17 @@ pub struct IssueFilter {
     pub external_ref: Option<String>,
     /// Match `issue_type` exactly (`epic`, `task`, `spike`, ...).
     pub issue_type: Option<String>,
-    /// Row cap. Defaults to 200 in [`DoltIssues::list`] when `None`.
+    /// Page size. When `None`, [`DoltIssues::list`] falls back to
+    /// `GT_ISSUES_DEFAULT_LIMIT` (env, fallback 200) and is always clamped to
+    /// `GT_ISSUES_MAX_LIMIT` (env, fallback 10000) — see [`issues_default_limit`]
+    /// / [`issues_max_limit`]. Pairs with [`offset`](IssueFilter::offset) for
+    /// less-style paging (hq-core-mcp.13).
     pub limit: Option<u32>,
+    /// Zero-based row offset into the stable-ordered result set (the `?offset=M`
+    /// querystring). `None` ⇒ start at 0. Advance it by the page size to walk
+    /// forward (less page-down); decrement to walk back. Ignored on the unbounded
+    /// `?ready=true` frontier (hq-core-mcp.13).
+    pub offset: Option<u32>,
     /// Include the heavy text bodies (`description`/`design`/
     /// `acceptance_criteria`/`notes`) inline on every row (hq-gap-issues-list-
     /// full). Default `false` keeps the snapshot cheap; `true` lets a caller
@@ -191,6 +200,47 @@ pub struct IssueRow {
 
 fn default_json_array() -> String {
     "[]".to_string()
+}
+
+/// One less-style page of the `gt://issues` snapshot (hq-core-mcp.13). Carries
+/// the slice plus enough metadata that a caller never mistakes a page for the
+/// whole set: `total` is the full count of the filter (pre-pagination),
+/// `next_offset` is where the following page begins, and `has_more` says whether
+/// another page exists. A consumer walks the corpus by advancing `offset` to
+/// `next_offset` until `has_more` is `false`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IssuePage {
+    /// The rows on this page (already `ORDER BY`-stable, see [`DoltIssues::list`]).
+    pub rows: Vec<IssueRow>,
+    /// Full count of rows matching the filter, independent of `limit`/`offset`.
+    pub total: i64,
+    /// Offset of the next page = `offset + rows.len()`. Feed it back as `?offset=`
+    /// to page forward.
+    pub next_offset: u32,
+    /// `true` while `next_offset < total` — another page remains.
+    pub has_more: bool,
+}
+
+/// Default page size for [`DoltIssues::list`] when `IssueFilter::limit` is unset:
+/// `GT_ISSUES_DEFAULT_LIMIT` (env), falling back to 200. The operator retunes the
+/// page size without recompiling (hq-core-mcp.13).
+pub fn issues_default_limit() -> u32 {
+    std::env::var("GT_ISSUES_DEFAULT_LIMIT")
+        .ok()
+        .and_then(|v| v.trim().parse::<u32>().ok())
+        .filter(|n| *n > 0)
+        .unwrap_or(200)
+}
+
+/// Hard ceiling every [`DoltIssues::list`] page is clamped to:
+/// `GT_ISSUES_MAX_LIMIT` (env), falling back to 10000. A `?limit=` above this is
+/// honoured only up to the ceiling (hq-core-mcp.13).
+pub fn issues_max_limit() -> u32 {
+    std::env::var("GT_ISSUES_MAX_LIMIT")
+        .ok()
+        .and_then(|v| v.trim().parse::<u32>().ok())
+        .filter(|n| *n > 0)
+        .unwrap_or(10_000)
 }
 
 /// Result of [`DoltIssues::claim`]. `Won` means this caller now holds the bead
@@ -1293,13 +1343,11 @@ impl DoltIssues {
             .collect())
     }
 
-    /// List issues matching `filter`, newest-updated first. Datetime columns
-    /// are formatted server-side to ISO 8601 strings — the workspace pins
-    /// `mysql_async` with `minimal` features (no `time`/`chrono` integration),
-    /// so converting in SQL keeps the rust deserialization to plain `String`.
-    pub async fn list(&self, filter: &IssueFilter) -> Result<Vec<IssueRow>, AppError> {
-        let mut conn = self.pool.get_conn().await.map_err(map_err)?;
-
+    /// Build the shared `WHERE` clause + bound params for the list/count queries
+    /// from `filter`. Returns `("" | "WHERE ...", params)`. Both `list` and
+    /// `count` go through this so a page's rows and its `total` are computed
+    /// against an identical predicate (hq-core-mcp.13).
+    fn build_where(filter: &IssueFilter) -> (String, Vec<(String, mysql_async::Value)>) {
         let mut where_parts: Vec<String> = Vec::new();
         let mut params_vec: Vec<(String, mysql_async::Value)> = Vec::new();
 
@@ -1335,12 +1383,75 @@ impl DoltIssues {
             params_vec.push(("issue_type".to_string(), mysql_async::Value::from(t.clone())));
         }
 
-        let limit = filter.limit.unwrap_or(200).min(1000);
-
         let where_clause = if where_parts.is_empty() {
             String::new()
         } else {
             format!("WHERE {}", where_parts.join(" AND "))
+        };
+        (where_clause, params_vec)
+    }
+
+    /// Full count of rows matching `filter`, independent of `limit`/`offset`.
+    /// Feeds [`IssuePage::total`] so a page is self-describing (hq-core-mcp.13).
+    pub async fn count(&self, filter: &IssueFilter) -> Result<i64, AppError> {
+        let mut conn = self.pool.get_conn().await.map_err(map_err)?;
+        let (where_clause, params_vec) = Self::build_where(filter);
+        let sql = format!("SELECT COUNT(*) FROM issues {where_clause}");
+        let params = if params_vec.is_empty() {
+            mysql_async::Params::Empty
+        } else {
+            mysql_async::Params::from(params_vec)
+        };
+        let total: Option<i64> = conn.exec_first(sql, params).await.map_err(map_err)?;
+        Ok(total.unwrap_or(0))
+    }
+
+    /// One less-style page of the snapshot (hq-core-mcp.13): the [`list`](Self::list)
+    /// rows wrapped with `total` (full filter count) + `next_offset` + `has_more`,
+    /// so a consumer walks the corpus by advancing `offset` until `has_more` is
+    /// false — no full dump, no silent truncation. The `?ready=true` frontier is
+    /// served directly off [`list`](Self::list) (unbounded) and does not page.
+    pub async fn list_page(&self, filter: &IssueFilter) -> Result<IssuePage, AppError> {
+        let total = self.count(filter).await?;
+        let rows = self.list(filter).await?;
+        let offset = filter.offset.unwrap_or(0);
+        let next_offset = offset.saturating_add(rows.len() as u32);
+        let has_more = (next_offset as i64) < total;
+        Ok(IssuePage {
+            rows,
+            total,
+            next_offset,
+            has_more,
+        })
+    }
+
+    /// List issues matching `filter` in a **stable, immutable order**
+    /// (`created_at DESC, id ASC`) so a `limit`+`offset` page-walk never shuffles
+    /// or repeats a row between calls (hq-core-mcp.13). The page size is
+    /// `filter.limit` (or [`issues_default_limit`]) clamped to
+    /// [`issues_max_limit`], skipped past `filter.offset` rows. `?ready=true`
+    /// rides in unbounded (the small actionable frontier is filtered above the
+    /// store). Datetime columns are formatted server-side to ISO 8601 strings —
+    /// the workspace pins `mysql_async` with `minimal` features (no
+    /// `time`/`chrono` integration), so converting in SQL keeps the rust
+    /// deserialization to plain `String`.
+    pub async fn list(&self, filter: &IssueFilter) -> Result<Vec<IssueRow>, AppError> {
+        let mut conn = self.pool.get_conn().await.map_err(map_err)?;
+
+        let (where_clause, params_vec) = Self::build_where(filter);
+
+        // `?ready=true` is the unbounded actionable frontier (hq-core-mcp.13 §5) —
+        // no LIMIT/OFFSET. Otherwise resolve the page size from the env-tunable
+        // default and clamp to the env ceiling, then skip past `offset` rows.
+        let limit_clause = if filter.ready {
+            String::new()
+        } else {
+            let limit = filter
+                .limit
+                .unwrap_or_else(issues_default_limit)
+                .min(issues_max_limit());
+            let offset = filter.offset.unwrap_or(0);
+            format!("LIMIT {limit} OFFSET {offset}")
         };
 
         // hq-gap-issues-list-full: when `full`, append the heavy text bodies
@@ -1362,8 +1473,8 @@ impl DoltIssues {
                     phase, delivered_sha{body_cols}
              FROM issues
              {where_clause}
-             ORDER BY updated_at DESC, id ASC
-             LIMIT {limit}"
+             ORDER BY created_at DESC, id ASC
+             {limit_clause}"
         );
 
         let params = if params_vec.is_empty() {

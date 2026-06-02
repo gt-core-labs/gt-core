@@ -252,6 +252,15 @@ pub fn parse_issue_filter(qs: &str) -> Result<IssueFilter, AppError> {
                         .map_err(|e| AppError::Validation(format!("limit: {e}")))?,
                 );
             }
+            // hq-core-mcp.13 — zero-based page offset for less-style paging. Pair
+            // with `limit`; advance to the page's `next_offset` to walk forward.
+            "offset" => {
+                filter.offset = Some(
+                    value
+                        .parse::<u32>()
+                        .map_err(|e| AppError::Validation(format!("offset: {e}")))?,
+                );
+            }
             "full" => filter.full = matches!(value, "1" | "true" | "yes"),
             // hq-core-mcp.11 (docs/10 §S4) — narrow to sound beads. Applied by the
             // resource handler (needs the phase frontier + delivered index + git
@@ -274,6 +283,21 @@ mod tests {
         assert_eq!(f.priority_max, Some(1));
         assert!(f.full);
         assert_eq!(f.limit, Some(5));
+    }
+
+    #[test]
+    fn parses_limit_and_offset() {
+        // hq-core-mcp.13: less-style paging querystring.
+        let f = parse_issue_filter("limit=50&offset=100").unwrap();
+        assert_eq!(f.limit, Some(50));
+        assert_eq!(f.offset, Some(100));
+        // Defaults: no offset ⇒ start at 0 (None).
+        assert!(parse_issue_filter("limit=10").unwrap().offset.is_none());
+        // Malformed offset surfaces instead of silently defaulting.
+        assert!(parse_issue_filter("offset=abc")
+            .unwrap_err()
+            .to_string()
+            .contains("offset"));
     }
 
     #[test]
