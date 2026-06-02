@@ -236,6 +236,26 @@ mod tests {
     }
 
     #[test]
+    fn stale_surface_pileup_halts_then_repair_heals() {
+        // Regression for hq-core-mcp.14: 21 closed beads carried surface paths
+        // absent at HEAD in both repos (apps/api/ prefixes, gt-core/ double
+        // prefixes, crates renamed/dropped/relocated). 21 > the stale ceiling of
+        // 10, so the breaker must HALT and escalate rather than let autonomous
+        // generation keep building on a graph it cannot ground in real code.
+        let dirty = HealthMetrics { stale_surfaces: 21, ..Default::default() };
+        let v = evaluate(&dirty, &Thresholds::default());
+        assert!(v.should_halt(), "21 stale surfaces must trip the breaker");
+        assert!(
+            v.reasons().iter().any(|r| r.contains("stale surface paths")),
+            "the HALT must name the stale-surface metric so the human knows what to repair"
+        );
+        // Repointing every surface to its real delivered path drives the count
+        // to zero, which clears the breaker — the loop may resume on its own.
+        let repaired = HealthMetrics { stale_surfaces: 0, ..Default::default() };
+        assert_eq!(evaluate(&repaired, &Thresholds::default()), Health::Healthy);
+    }
+
+    #[test]
     fn custom_thresholds_are_honoured() {
         let m = HealthMetrics { missing_shas: 1, ..Default::default() };
         // Default: warn 0 → degraded. Relaxed: tolerate 1.
