@@ -120,6 +120,34 @@ impl IssuesServer {
         }
     }
 
+    /// Authorize one tool call: resolve the caller's scope from its extensions
+    /// (the `X-Actor` header when RBAC is wired, else the boot default) and run
+    /// the deny-by-default [`Scope::check`]. A rejection is recorded as an
+    /// `Unauthorized` audit row and surfaces as an `invalid_request` the caller
+    /// cannot retry; on success the resolved scope is returned so the caller
+    /// reuses its `actor` for store dispatch + the `Invoked` audit attribution.
+    ///
+    /// Carved out of [`call_tool`](Self::call_tool) so the scope→audit→error
+    /// boundary is testable end to end: the rmcp [`RequestContext`] that
+    /// `call_tool` receives wraps a `Peer` whose constructor is crate-private, so
+    /// the wired gate cannot be exercised through `call_tool` itself — only
+    /// through this seam (`tests::*` build the `Extensions` directly).
+    fn authorize(
+        &self,
+        tool: &str,
+        args: &serde_json::Value,
+        ext: &Extensions,
+    ) -> Result<Cow<'_, Scope>, McpError> {
+        let scope = self.resolve_scope(ext);
+        if let Err(e) = scope.check(tool) {
+            let _ = self
+                .audit
+                .record(AuditRecord::unauthorized(&scope.actor, tool, args.clone()));
+            return Err(McpError::invalid_request(e.to_string(), None));
+        }
+        Ok(scope)
+    }
+
     /// Map a domain error onto an MCP error. Validation / not-found are caller
     /// faults (invalid_request); everything else is an internal error.
     fn to_mcp_error(err: &AppError) -> McpError {
@@ -173,16 +201,10 @@ impl ServerHandler for IssuesServer {
 
         // Per-connection scope (hq-core-mcp.6): the X-Actor header picks the
         // allow-list + the attribution actor, falling back to the boot default.
-        let scope = self.resolve_scope(&context.extensions);
-
-        // Scope check FIRST — deny-by-default. A rejection is audited as
-        // Unauthorized and surfaces as an invalid_request the caller cannot retry.
-        if let Err(e) = scope.check(&tool) {
-            let _ = self
-                .audit
-                .record(AuditRecord::unauthorized(&scope.actor, &tool, args));
-            return Err(McpError::invalid_request(e.to_string(), None));
-        }
+        // Deny-by-default — a rejection is audited as Unauthorized here and
+        // surfaces as an invalid_request the caller cannot retry (hq-core-mcp.15
+        // covers this gate end to end through `authorize`).
+        let scope = self.authorize(&tool, &args, &context.extensions)?;
 
         // Per-request workspace (hq-mt-routing.5): the X-Workspace header selects
         // the tenant's store; absent it, the default-workspace store. Resolved
@@ -346,8 +368,13 @@ fn actor_from_ext(ext: &Extensions) -> Option<&str> {
 
 #[cfg(test)]
 mod tests {
-    use super::actor_from_ext;
-    use rmcp::model::Extensions;
+    use super::{actor_from_ext, IssuesServer};
+    use gt_audit::{AuditSink, InMemoryAudit, Outcome};
+    use gt_rbac::{RbacConfig, Scope};
+    use gt_store_dolt::DoltIssues;
+    use rmcp::model::{ErrorCode, Extensions};
+    use serde_json::json;
+    use std::sync::Arc;
 
     fn ext_with_header(name: &str, value: &str) -> Extensions {
         let parts = axum::http::Request::builder()
@@ -377,5 +404,126 @@ mod tests {
     fn none_without_parts_or_header() {
         assert_eq!(actor_from_ext(&Extensions::new()), None);
         assert_eq!(actor_from_ext(&ext_with_header("x-other", "alice")), None);
+    }
+
+    // ----- hq-core-mcp.15: the wired authorization gate, end to end ----------
+    //
+    // `call_tool` cannot be driven directly (its rmcp `RequestContext` wraps a
+    // `Peer` with a crate-private constructor), so these exercise the same
+    // `authorize` seam `call_tool` calls: resolve_scope (from the X-Actor header
+    // or the boot default) -> Scope::check -> Unauthorized audit + invalid_request.
+
+    /// Build a server over a shared in-memory audit sink. The Dolt URL is
+    /// well-formed but unreachable: every authorization assertion here is a deny
+    /// (which returns before any store I/O), and `mysql_async` pools are lazy, so
+    /// no connection is ever attempted.
+    fn server(
+        default_scope: Scope,
+        rbac: Option<Arc<RbacConfig>>,
+        audit: Arc<InMemoryAudit>,
+    ) -> IssuesServer {
+        let store = Arc::new(
+            DoltIssues::connect("mysql://gt@127.0.0.1:1/none").expect("lazy pool url parses"),
+        );
+        IssuesServer::new(store, default_scope, rbac, audit, vec![], None)
+    }
+
+    fn rbac(toml: &str) -> Arc<RbacConfig> {
+        Arc::new(RbacConfig::from_toml(toml).expect("rbac toml parses"))
+    }
+
+    #[test]
+    fn denied_default_scope_rejects_and_audits_unauthorized() {
+        let audit = Arc::new(InMemoryAudit::new());
+        let srv = server(Scope::denied("boot"), None, audit.clone());
+
+        let err = srv
+            .authorize("issues.create.execute", &json!({}), &Extensions::new())
+            .expect_err("a closed scope must deny every tool");
+        // invalid_request, not internal — a caller-side fault it cannot retry.
+        assert_eq!(err.code, ErrorCode::INVALID_REQUEST);
+
+        let rows = audit.read_all().unwrap();
+        assert_eq!(rows.len(), 1, "exactly one rejection is audited");
+        assert_eq!(rows[0].outcome, Outcome::Unauthorized);
+        assert_eq!(rows[0].actor, "boot");
+        assert_eq!(rows[0].tool, "issues.create.execute");
+    }
+
+    #[test]
+    fn wrong_scope_actor_is_denied_with_its_own_attribution() {
+        // `watcher` may touch issues.update.*, nothing else; the X-Actor header
+        // selects that allow-list per connection (hq-core-mcp.6).
+        let cfg = rbac(
+            r#"
+[actors.watcher]
+allow = ["issues.update.*"]
+"#,
+        );
+        let audit = Arc::new(InMemoryAudit::new());
+        // Boot default is admin: the deny must come from the *resolved* per-actor
+        // scope, not the fallback — proving the header drives the gate.
+        let srv = server(Scope::admin("boot"), Some(cfg), audit.clone());
+
+        let err = srv
+            .authorize(
+                "issues.create.execute",
+                &json!({}),
+                &ext_with_header("x-actor", "watcher"),
+            )
+            .expect_err("create is outside watcher's update-only allow-list");
+        assert_eq!(err.code, ErrorCode::INVALID_REQUEST);
+
+        let rows = audit.read_all().unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].outcome, Outcome::Unauthorized);
+        // The rejection is attributed to the resolved actor, not the boot default.
+        assert_eq!(rows[0].actor, "watcher");
+    }
+
+    #[test]
+    fn validate_only_actor_is_denied_execute_but_allowed_validate() {
+        let cfg = rbac(
+            r#"
+[actors.readonly]
+allow = ["*"]
+validate_only = true
+"#,
+        );
+        let audit = Arc::new(InMemoryAudit::new());
+        let srv = server(Scope::denied("boot"), Some(cfg), audit.clone());
+        let ext = ext_with_header("x-actor", "readonly");
+
+        // `.execute` is barred even with a `*` allow-list...
+        let err = srv
+            .authorize("issues.create.execute", &json!({}), &ext)
+            .expect_err("validate_only must block execute");
+        assert_eq!(err.code, ErrorCode::INVALID_REQUEST);
+
+        // ...while the matching `.validate` passes the gate.
+        let scope = srv
+            .authorize("issues.create.validate", &json!({}), &ext)
+            .expect("validate is permitted for a validate_only scope");
+        assert_eq!(scope.actor, "readonly");
+
+        let rows = audit.read_all().unwrap();
+        assert_eq!(rows.len(), 1, "only the execute denial is audited");
+        assert_eq!(rows[0].outcome, Outcome::Unauthorized);
+        assert_eq!(rows[0].tool, "issues.create.execute");
+    }
+
+    #[test]
+    fn allowed_call_passes_the_gate_without_an_unauthorized_row() {
+        let audit = Arc::new(InMemoryAudit::new());
+        let srv = server(Scope::admin("boot"), None, audit.clone());
+
+        let scope = srv
+            .authorize("issues.close.execute", &json!({}), &Extensions::new())
+            .expect("admin scope permits every tool");
+        // The resolved scope flows out for store dispatch + Invoked attribution.
+        assert_eq!(scope.actor, "boot");
+        // `authorize` only records the deny path; the Invoked row is the caller's
+        // to write after dispatch, so nothing is audited on the allow path here.
+        assert!(audit.read_all().unwrap().is_empty());
     }
 }
