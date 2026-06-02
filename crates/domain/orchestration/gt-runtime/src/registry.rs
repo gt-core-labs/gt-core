@@ -1,5 +1,6 @@
 //! [`RootRegistry`] — resolves a [`WorkspaceId`] to its [`RootHandle`].
 
+use std::future::Future;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -176,6 +177,72 @@ impl RootRegistry {
         }
     }
 
+    /// Async [`get_or_hydrate`](Self::get_or_hydrate): return the cached handle, else build one
+    /// with the async `hydrate`.
+    ///
+    /// The production composition root assembles a [`RootHandle`] *asynchronously* — it spawns
+    /// and anchors actors (`gt_roles::RoleStack::register`), starts the supervisor, and spawns
+    /// the plugin relay — none of which the synchronous [`get_or_hydrate`](Self::get_or_hydrate)
+    /// closure can express. This variant awaits the builder, so the registry can host the real
+    /// per-workspace assembler (see `examples/composition::compose_workspace`).
+    pub async fn get_or_hydrate_async<F, Fut>(
+        &self,
+        workspace: &WorkspaceId,
+        hydrate: F,
+    ) -> Arc<RootHandle>
+    where
+        F: FnOnce() -> Fut,
+        Fut: Future<Output = RootHandle>,
+    {
+        match self
+            .get_or_try_hydrate_async(workspace, || async {
+                Ok::<_, std::convert::Infallible>(hydrate().await)
+            })
+            .await
+        {
+            Ok(handle) => handle,
+        }
+    }
+
+    /// Fallible async [`get_or_hydrate_async`](Self::get_or_hydrate_async): the async sibling of
+    /// [`get_or_try_hydrate`](Self::get_or_try_hydrate).
+    ///
+    /// Same race semantics: two callers may both run `hydrate`, exactly one handle is stored and
+    /// both receive that same `Arc`; the loser's build is dropped. The `.await` happens entirely
+    /// outside the map locks (between the fast-path read and the entry re-check), so no lock is
+    /// held across the suspension point. `hydrate` must be free of observable side effects beyond
+    /// producing the handle — note that a discarded loser handle is dropped, which drains/stops
+    /// any actors it already started.
+    pub async fn get_or_try_hydrate_async<E, F, Fut>(
+        &self,
+        workspace: &WorkspaceId,
+        hydrate: F,
+    ) -> Result<Arc<RootHandle>, E>
+    where
+        F: FnOnce() -> Fut,
+        Fut: Future<Output = Result<RootHandle, E>>,
+    {
+        // Fast path: already hydrated. The read guard is dropped before the await + entry lock.
+        if let Some(existing) = self.handles.get(workspace) {
+            existing.touch(self.now_ms());
+            return Ok(Arc::clone(&existing.handle));
+        }
+        // Build outside the map lock (hydration is async + fallible); no lock held across await.
+        let built = Arc::new(hydrate().await?);
+        let now = self.now_ms();
+        // Re-check under the entry lock: a concurrent caller may have won while we awaited.
+        match self.handles.entry(workspace.clone()) {
+            Entry::Occupied(occupied) => {
+                occupied.get().touch(now);
+                Ok(Arc::clone(&occupied.get().handle))
+            }
+            Entry::Vacant(vacant) => {
+                vacant.insert(Hydrated::new(Arc::clone(&built), now));
+                Ok(built)
+            }
+        }
+    }
+
     /// Evict every workspace idle for at least `idle` and not currently in use,
     /// returning the ids actually reaped. The reaper loop calls this; it is
     /// public so tests and an operator endpoint can force a sweep.
@@ -279,6 +346,33 @@ mod tests {
         assert!(Arc::ptr_eq(&first, &second), "same handle instance is returned");
         assert_eq!(reg.len(), 1);
         assert!(reg.contains(&ws("acme")));
+    }
+
+    #[tokio::test]
+    async fn async_hydrates_once_then_caches() {
+        let reg = RootRegistry::new();
+        let calls = AtomicUsize::new(0);
+        let build = || async {
+            calls.fetch_add(1, Ordering::SeqCst);
+            handle("acme")
+        };
+
+        let first = reg.get_or_hydrate_async(&ws("acme"), build).await;
+        let second = reg.get_or_hydrate_async(&ws("acme"), build).await;
+
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "second access must not rebuild");
+        assert!(Arc::ptr_eq(&first, &second), "same handle instance is returned");
+        assert_eq!(reg.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn async_try_hydrate_propagates_error_and_stores_nothing() {
+        let reg = RootRegistry::new();
+        let out: Result<_, &str> = reg
+            .get_or_try_hydrate_async(&ws("acme"), || async { Err("boom") })
+            .await;
+        assert_eq!(out.err(), Some("boom"));
+        assert!(reg.is_empty(), "a failed async hydrate caches nothing");
     }
 
     #[test]
