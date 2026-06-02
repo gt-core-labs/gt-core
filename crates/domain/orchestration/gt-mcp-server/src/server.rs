@@ -25,13 +25,21 @@ use rmcp::service::{RequestContext, RoleServer};
 use rmcp::{ErrorData as McpError, ServerHandler};
 
 use crate::dispatch::{dispatch, dispatch_meta, parse_issue_filter};
+use crate::workspace::{workspace_from_ext, WorkspaceStores};
 
 /// The shared MCP service. Cheap to clone (every field is `Arc`-backed) so the
 /// streamable-HTTP session manager hands each connection its own handle over the
 /// one store + scope + audit + descriptor set.
 #[derive(Clone)]
 pub struct IssuesServer {
+    /// The default-workspace store: the tenant a request resolves to when it
+    /// carries no `X-Workspace` header (the single-tenant `hq` database today).
     store: Arc<DoltIssues>,
+    /// Multi-tenant resolver (hq-mt-routing.5). `Some` when a base Dolt URL is
+    /// wired: a request's `X-Workspace` header then resolves that tenant's own
+    /// `hq_<ws>` store per call. `None` pins every request to [`store`](Self::store),
+    /// so the server behaves exactly as the single-tenant build did.
+    workspaces: Option<Arc<WorkspaceStores>>,
     /// Scope used when a request carries no `X-Actor` header (the boot
     /// `GT_MCP_ACTOR`, or a closed deny-all when no RBAC config is wired).
     default_scope: Arc<Scope>,
@@ -65,11 +73,33 @@ impl IssuesServer {
     ) -> Self {
         Self {
             store,
+            workspaces: None,
             default_scope: Arc::new(default_scope),
             rbac,
             audit,
             tools: Arc::new(tools),
             repo_dir: repo_dir.map(Arc::new),
+        }
+    }
+
+    /// Enable per-request workspace resolution (hq-mt-routing.5). With a resolver
+    /// wired, a request carrying an `X-Workspace` header dispatches against that
+    /// tenant's `hq_<ws>` store; a request without the header still uses the
+    /// default-workspace [`store`](Self::store), so the change is additive.
+    pub fn with_workspaces(mut self, workspaces: Arc<WorkspaceStores>) -> Self {
+        self.workspaces = Some(workspaces);
+        self
+    }
+
+    /// Resolve the store for one request from its extensions. When a workspace
+    /// resolver is wired and the request carries an `X-Workspace` header, the
+    /// tenant's own store is built (cheap: a lazily-pooled `DoltIssues`);
+    /// otherwise the default-workspace store is used. A malformed/unknown slug is
+    /// rejected here, before any dispatch.
+    fn resolve_store(&self, ext: &Extensions) -> Result<Arc<DoltIssues>, AppError> {
+        match (&self.workspaces, workspace_from_ext(ext)) {
+            (Some(ws), Some(slug)) => Ok(Arc::new(ws.store_for(slug)?)),
+            _ => Ok(self.store.clone()),
         }
     }
 
@@ -147,11 +177,20 @@ impl ServerHandler for IssuesServer {
             return Err(McpError::invalid_request(e.to_string(), None));
         }
 
+        // Per-request workspace (hq-mt-routing.5): the X-Workspace header selects
+        // the tenant's store; absent it, the default-workspace store. Resolved
+        // after the scope check so a malformed slug from an unauthorized caller is
+        // never built.
+        let store = match self.resolve_store(&context.extensions) {
+            Ok(store) => store,
+            Err(e) => return Err(Self::to_mcp_error(&e)),
+        };
+
         let result = if tool.starts_with("meta.") {
-            dispatch_meta(&self.store, &tool, args.clone(), &scope.actor, &self.tools).await
+            dispatch_meta(&store, &tool, args.clone(), &scope.actor, &self.tools).await
         } else {
             let repo_dir = self.repo_dir.as_deref().map(|p| p.as_path());
-            dispatch(&self.store, &tool, args.clone(), &scope.actor, repo_dir).await
+            dispatch(&store, &tool, args.clone(), &scope.actor, repo_dir).await
         };
         let _ = self
             .audit
@@ -208,11 +247,16 @@ impl ServerHandler for IssuesServer {
     async fn read_resource(
         &self,
         request: ReadResourceRequestParams,
-        _context: RequestContext<RoleServer>,
+        context: RequestContext<RoleServer>,
     ) -> Result<ReadResourceResult, McpError> {
         let uri = request.uri.as_str();
+        // Resources are tenant data too: resolve the per-request workspace store
+        // so a read reflects the caller's workspace, not just the default one.
+        let store = self
+            .resolve_store(&context.extensions)
+            .map_err(|e| Self::to_mcp_error(&e))?;
         let value = self
-            .read_resource_json(uri)
+            .read_resource_json(&store, uri)
             .await
             .map_err(|e| Self::to_mcp_error(&e))?;
         let text = serde_json::to_string_pretty(&value).unwrap_or_else(|_| value.to_string());
@@ -223,8 +267,13 @@ impl ServerHandler for IssuesServer {
 }
 
 impl IssuesServer {
-    /// Resolve a `gt://issues...` / `gt://issue/{id}` URI to its JSON payload.
-    async fn read_resource_json(&self, uri: &str) -> Result<serde_json::Value, AppError> {
+    /// Resolve a `gt://issues...` / `gt://issue/{id}` URI to its JSON payload
+    /// against `store` (the per-request workspace store, hq-mt-routing.5).
+    async fn read_resource_json(
+        &self,
+        store: &DoltIssues,
+        uri: &str,
+    ) -> Result<serde_json::Value, AppError> {
         // gt://issues[?filter] — the snapshot (optionally ?full=1).
         let issues_qs = match uri.strip_prefix("gt://issues") {
             Some("") => Some(""),
@@ -240,9 +289,9 @@ impl IssuesServer {
             // by the module's `filter_ready`. It returns a bare array (small,
             // self-complete) — no pager envelope.
             if filter.ready {
-                let rows = gt_issues::resources::read_issues(&self.store, &filter).await?;
-                let open_phase = self.store.open_phase().await?;
-                let deps = self.store.dep_index().await?;
+                let rows = gt_issues::resources::read_issues(store, &filter).await?;
+                let open_phase = store.open_phase().await?;
+                let deps = store.dep_index().await?;
                 let repo_dir = self.repo_dir.as_deref().map(|p| p.as_path());
                 let tree = crate::git_tree::surface_tree(repo_dir);
                 let rows =
@@ -253,7 +302,7 @@ impl IssuesServer {
             // hq-core-mcp.13: the default snapshot is a less-style PAGE — rows plus
             // `total`/`next_offset`/`has_more` so no caller mistakes one page for
             // the whole corpus. `?limit=N&offset=M` positions it.
-            let page = gt_issues::resources::read_issues_page(&self.store, &filter).await?;
+            let page = gt_issues::resources::read_issues_page(store, &filter).await?;
             return serde_json::to_value(&page)
                 .map_err(|e| AppError::Other(format!("encode issues: {e}")));
         }
@@ -265,7 +314,7 @@ impl IssuesServer {
                     "gt://issue/<id> expects a single non-empty path segment".into(),
                 ));
             }
-            return match gt_issues::resources::read_issue(&self.store, id).await? {
+            return match gt_issues::resources::read_issue(store, id).await? {
                 Some(detail) => serde_json::to_value(&detail)
                     .map_err(|e| AppError::Other(format!("encode issue: {e}"))),
                 None => Err(AppError::NotFound(format!("issue {id}"))),

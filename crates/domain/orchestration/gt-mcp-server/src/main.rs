@@ -18,6 +18,7 @@ mod dispatch;
 mod git_tree;
 mod pg_audit;
 mod server;
+mod workspace;
 
 use std::sync::Arc;
 
@@ -35,6 +36,7 @@ use gt_rbac::{RbacConfig, Scope};
 use gt_store_dolt::DoltIssues;
 
 use server::IssuesServer;
+use workspace::WorkspaceStores;
 
 /// Path the MCP endpoint mounts at (mirrors the gastown gt-mcp).
 const MCP_PATH: &str = "/mcp";
@@ -112,7 +114,27 @@ async fn main() -> anyhow::Result<()> {
             "[gt-mcp-server] GT_REPO_DIR unset; surface existence checks skipped (accept-all)"
         ),
     }
-    let service = IssuesServer::new(store, default_scope, rbac, audit, tools, repo_dir);
+    let mut service = IssuesServer::new(store, default_scope, rbac, audit, tools, repo_dir);
+
+    // Multi-tenant routing (hq-mt-routing.5): when GT_DOLT_BASE_URL is set, a
+    // request's X-Workspace header resolves that tenant's own `hq_<ws>` store per
+    // call. Unset ⇒ single-tenant on GT_DOLT_URL exactly as before (the live
+    // server's default), so enabling tenancy is an opt-in env, not a behaviour
+    // change. The base URL carries server coordinates only; the per-workspace
+    // database is selected per tenant.
+    match std::env::var("GT_DOLT_BASE_URL") {
+        Ok(base) => {
+            let stores = WorkspaceStores::from_base_url(&base)
+                .context("GT_DOLT_BASE_URL is malformed")?;
+            service = service.with_workspaces(Arc::new(stores));
+            eprintln!(
+                "[gt-mcp-server] multi-tenant routing on; X-Workspace selects hq_<ws> via {base}"
+            );
+        }
+        Err(_) => eprintln!(
+            "[gt-mcp-server] GT_DOLT_BASE_URL unset; single-tenant on GT_DOLT_URL (X-Workspace ignored)"
+        ),
+    }
 
     let http = StreamableHttpService::new(
         move || Ok(service.clone()),
