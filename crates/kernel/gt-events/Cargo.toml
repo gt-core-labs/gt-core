@@ -1,0 +1,9 @@
+[package]
+name = "gt-events"
+edition.workspace = true
+version.workspace = true
+
+[dependencies]
+thiserror.workspace = true
+ulid.workspace = true
+time.workspace = true

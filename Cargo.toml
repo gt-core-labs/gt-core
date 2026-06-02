@@ -1,6 +1,7 @@
 [workspace]
 resolver = "2"
 members = [
+    "crates/kernel/gt-events",
     "crates/kernel/gt-module",
     "crates/kernel/gt-module-mcp",
     "crates/kernel/gt-module-migrate",
@@ -57,6 +58,9 @@ sqlx = { version = "0.8", default-features = false, features = ["postgres", "mac
 # TLS (local Dolt), minimal deps.
 mysql_async = { version = "0.34", default-features = false, features = ["minimal"] }
 thiserror = "2"
+# Event kernel (hq-core-port.10) — ulid for Envelope event ids, time for RFC3339 stamps.
+ulid = "1"
+time = { version = "0.3", features = ["std", "formatting"] }
 # RBAC config parser — gt-rbac reads TOML or JSON (hq-core-host.4).
 toml = "0.8"
 # Lock-free concurrent map (per-workspace RootRegistry, hq-mt-routing.1).
@@ -75,6 +79,7 @@ anyhow = "1"
 
 # Internal crates — referenced as `<name> = { workspace = true }` from member Cargo.toml.
 # Path-centralized here so members never juggle relative paths across tiers.
+gt-events        = { path = "crates/kernel/gt-events" }
 gt-module        = { path = "crates/kernel/gt-module" }
 gt-module-mcp       = { path = "crates/kernel/gt-module-mcp" }
 gt-module-migrate   = { path = "crates/kernel/gt-module-migrate" }
@@ -96,10 +101,12 @@ gt-rbac          = { path = "crates/kernel/gt-rbac" }
 gt-audit         = { path = "crates/kernel/gt-audit" }
 
 # Reused from gastown until P4 (foundation kernel crates):
-# gt-events, gt-bus, gt-plugin, gt-telemetry remain in gastown. NOTE: gt-core's
-# gt-audit here is the MCP dispatch audit SINK (hq-core-host.4), a different
-# concept from gastown's event-replay gt-audit (EventStore) that migrates up in
-# P4 — a name collision to resolve then (cf. gt-workspace → gt-townroot).
+# gt-bus, gt-plugin, gt-telemetry remain in gastown. gt-events PORTED UP
+# (hq-core-port.10, 2026-06-02) now the freeze gate refactor.10..12 closed
+# replay-green. NOTE: gt-core's gt-audit here is the MCP dispatch audit SINK
+# (hq-core-host.4), a different concept from gastown's event-replay gt-audit
+# (EventStore) that migrates up in P4 — a name collision to resolve then
+# (cf. gt-workspace → gt-townroot).
 
 [profile.release]
 lto = "thin"
