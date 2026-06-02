@@ -40,10 +40,12 @@ mod executor;
 mod gate;
 pub mod mcp;
 mod notify;
+mod pool;
 mod state;
 mod tracking;
 
 pub use dispatcher::{Dispatch, DispatchError, DogDispatcher, DogEvent};
+pub use pool::WorkspaceDogPool;
 pub use dog::{Dog, DogReport};
 pub use executor::{ExecBackend, ExecError, ExecutionKind, ExecutionType, PluginExecutor};
 pub use gate::{evaluate as evaluate_gate, GateContext, GateDecision, GateError};
