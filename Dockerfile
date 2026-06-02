@@ -10,12 +10,19 @@ COPY . .
 RUN cargo build --release -p gt-mcp-server
 
 FROM debian:bookworm-slim
+# `git` backs the S3 readiness clause (docs/10 §S4): GitSurfaceTree shells out to
+# `git ls-tree -r main` over the GT_REPO_DIR checkout so `?ready=true` hides a bead
+# whose own non-`planned` surface is absent from gt-core's `main`. Without git the
+# check degrades to accept-all and the frontier surfaces beads whose surfaces live
+# only in a source repo (gastown) — the gap hq-gap-ready-set-has-no-unblocked-gt-core-work.
+# The operator wires GT_REPO_DIR + a read-only checkout via compose (out of this repo).
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends ca-certificates \
+    && apt-get install -y --no-install-recommends ca-certificates git \
     && rm -rf /var/lib/apt/lists/*
 COPY --from=build /build/target/release/gt-mcp-server /usr/local/bin/gt-mcp-server
-# Env (GT_DOLT_URL, GT_MCP_HTTP_BIND, GT_MCP_ACTOR, GT_MCP_SCOPE_CONFIG) is
-# supplied by the compose service; see docker-compose gt-mcp-server.
+# Env (GT_DOLT_URL, GT_MCP_HTTP_BIND, GT_MCP_ACTOR, GT_MCP_SCOPE_CONFIG, and
+# optionally GT_REPO_DIR for S3 surface validation) is supplied by the compose
+# service; see docker-compose gt-mcp-server.
 #
 # gt://issues pager tuning (hq-core-mcp.13), both optional:
 #   GT_ISSUES_DEFAULT_LIMIT  page size when ?limit is omitted (default 200)
