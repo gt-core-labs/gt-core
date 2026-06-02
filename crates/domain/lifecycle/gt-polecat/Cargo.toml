@@ -1,0 +1,22 @@
+[package]
+name = "gt-polecat"
+edition.workspace = true
+version.workspace = true
+
+[dependencies]
+gt-events = { workspace = true }
+gt-agent = { workspace = true }
+# The kernel module seam — `SessionsModule` declares the sessions surface's identity +
+# capability so the `RootBuilder` harvests them (`hq-mod-refactor.3`); the lifecycle
+# driver logic is untouched.
+gt-module = { workspace = true }
+# `semver::Version` for the module's `ModuleMeta`.
+semver = { workspace = true }
+tokio.workspace = true
+serde.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+# `test-util` enables `#[tokio::test(start_paused = true)]` for the supervise_daemon tests
+# so backoff sleeps auto-advance instead of blocking the test thread.
+tokio = { workspace = true, features = ["test-util"] }

@@ -22,6 +22,7 @@ members = [
     "crates/domain/platform/gt-feed",
     "crates/domain/platform/gt-skills",
     "crates/domain/lifecycle/gt-agent",
+    "crates/domain/lifecycle/gt-polecat",
     "crates/domain/roles/gt-sheriff",
     "crates/domain/roles/gt-deacon",
     "crates/domain/roles/gt-refinery",
@@ -129,6 +130,7 @@ gt-rig           = { path = "crates/domain/platform/gt-rig" }
 gt-feed          = { path = "crates/domain/platform/gt-feed" }
 gt-skills        = { path = "crates/domain/platform/gt-skills" }
 gt-agent         = { path = "crates/domain/lifecycle/gt-agent" }
+gt-polecat       = { path = "crates/domain/lifecycle/gt-polecat" }
 gt-sheriff       = { path = "crates/domain/roles/gt-sheriff" }
 gt-deacon        = { path = "crates/domain/roles/gt-deacon" }
 gt-refinery      = { path = "crates/domain/roles/gt-refinery" }
