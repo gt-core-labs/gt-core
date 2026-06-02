@@ -1,0 +1,11 @@
+[package]
+name = "gt-channel"
+edition.workspace = true
+version.workspace = true
+
+[dependencies]
+gt-events = { workspace = true }
+tokio.workspace = true
+notify.workspace = true
+ulid.workspace = true
+thiserror.workspace = true

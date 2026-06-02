@@ -4,6 +4,7 @@ members = [
     "crates/kernel/gt-events",
     "crates/kernel/gt-eventlog",
     "crates/kernel/gt-bus",
+    "crates/kernel/gt-channel",
     "crates/kernel/gt-telemetry",
     "crates/kernel/gt-plugin",
     "crates/kernel/gt-module",
@@ -70,6 +71,8 @@ ulid = "1"
 fs2 = "0.4"
 # Temp dirs/files — gt-plugin descriptor scanner + its tests (hq-core-port.11).
 tempfile = "3"
+# Filesystem watch for the gt-channel mailbox (hq-core-port.14).
+notify = "6"
 time = { version = "0.3", features = ["std", "formatting"] }
 # RBAC config parser — gt-rbac reads TOML or JSON (hq-core-host.4).
 toml = "0.8"
@@ -92,6 +95,7 @@ anyhow = "1"
 gt-events        = { path = "crates/kernel/gt-events" }
 gt-eventlog      = { path = "crates/kernel/gt-eventlog" }
 gt-bus           = { path = "crates/kernel/gt-bus" }
+gt-channel       = { path = "crates/kernel/gt-channel" }
 gt-telemetry     = { path = "crates/kernel/gt-telemetry" }
 gt-plugin        = { path = "crates/kernel/gt-plugin" }
 gt-module        = { path = "crates/kernel/gt-module" }
