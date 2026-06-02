@@ -19,7 +19,7 @@
 //! `RootRegistry::get_or_hydrate` is synchronous so it cannot host this async assembly yet (see
 //! the gap filed with `.22`).
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use tokio::sync::mpsc;
@@ -33,7 +33,7 @@ use gt_module::RootBuilder;
 use gt_patrol::PatrolEvent;
 use gt_plugin::Plugin;
 use gt_roles::{RoleSinks, RoleStack};
-use gt_runtime::RootHandle;
+use gt_runtime::{RootHandle, RootRegistry};
 use gt_scheduling::actor::SchedHandle;
 use gt_scheduling::SchedEvent;
 use gt_workspace::WorkspaceId;
@@ -170,4 +170,97 @@ pub async fn compose_workspace(ws: WorkspaceId) -> Composed {
     handle.start().await;
 
     Composed { handle, sched, merge, sched_events, merge_events, roles }
+}
+
+/// A read-only observer that records every kind it sees on the hub, in order — a test probe for
+/// watching a reaction cascade flow through the event hub.
+pub struct ProbePlugin {
+    seen: Arc<Mutex<Vec<String>>>,
+}
+
+impl ProbePlugin {
+    /// Record observed kinds into the shared `seen` log.
+    pub fn new(seen: Arc<Mutex<Vec<String>>>) -> Self {
+        Self { seen }
+    }
+}
+
+#[async_trait]
+impl Plugin for ProbePlugin {
+    fn name(&self) -> &'static str {
+        "probe"
+    }
+
+    async fn on_event(&self, record: &EventRecord) -> Result<(), AppError> {
+        self.seen.lock().unwrap().push(record.kind.clone());
+        Ok(())
+    }
+}
+
+/// The production-shaped per-workspace composition root: resolve `ws` through the
+/// [`RootRegistry`], hydrating it asynchronously on first access into a fully **owned** and
+/// **drained** root. The hydrate closure assembles everything from the gt-core primitives:
+///
+/// - builds the [`RootHandle`] (event hub),
+/// - spawns the scheduler + merge actors and **anchors** them to the handle's supervisor
+///   (`Supervisor::anchor`) so they live for the workspace lifetime — the registry returns only
+///   an `Arc<RootHandle>`, so nothing else holds them,
+/// - **drains** each actor's event sink onto the hub (`RootHandle::drain_events_from`), so a
+///   domain's output flows back through the hub to the observers (function #3),
+/// - registers the role observers + the scheduler/merge reactor arms + the `ProbePlugin`, and
+///   starts the actor stack.
+///
+/// The result is cached by the registry: a second call returns the same `Arc` without
+/// re-hydrating. `probe` is wired into the hydrated root so a caller can watch the cascade; it
+/// is ignored on a cache hit (the closure does not run).
+pub async fn live_root(
+    reg: &RootRegistry,
+    ws: WorkspaceId,
+    probe: Arc<Mutex<Vec<String>>>,
+) -> Arc<RootHandle> {
+    let key = ws.clone();
+    reg.get_or_hydrate_async(&key, move || async move {
+        let handle = RootHandle::new(ws, RootBuilder::new().build().expect("empty root builds"));
+
+        let (sched_tx, sched_rx) = mpsc::channel(64);
+        let sched = gt_scheduling::actor::spawn(InMemoryBeads::default(), sched_tx, 4);
+        let (merge_tx, merge_rx) = mpsc::channel(64);
+        let merge = gt_merge::actor::spawn(InMemoryMergeRepo::default(), merge_tx);
+
+        // Own the domain actors for the workspace lifetime, and flow their output to the hub.
+        handle
+            .supervisor()
+            .anchor(sched.clone())
+            .await
+            .expect("anchors while Built");
+        handle
+            .supervisor()
+            .anchor(merge.clone())
+            .await
+            .expect("anchors while Built");
+        handle.drain_events_from(sched_rx);
+        handle.drain_events_from(merge_rx);
+
+        let (st, _sr) = mpsc::channel(16);
+        let (wt, _wr) = mpsc::channel(16);
+        let (dt, _dr) = mpsc::channel(16);
+        let (mt, _mr) = mpsc::channel(16);
+        let (rt, _rr) = mpsc::channel(16);
+        let roles = RoleStack::register(
+            handle.supervisor(),
+            RoleSinks { sheriff: st, witness: wt, deacon: dt, mayor: mt, refinery: rt },
+        )
+        .await
+        .expect("role stack registers while the supervisor is Built");
+
+        let registry = roles
+            .plugin_registry()
+            .register(SchedulerPlugin::new(sched))
+            .register(MergePlugin::new(merge))
+            .register(ProbePlugin::new(probe));
+        handle.spawn_plugins(Arc::new(registry));
+        handle.start().await;
+        handle
+    })
+    .await
 }
