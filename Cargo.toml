@@ -16,6 +16,7 @@ members = [
     "crates/domain/orchestration/gt-mcp-server",
     "crates/domain/orchestration/gt-reconciler",
     "crates/domain/orchestration/gt-memory",
+    "crates/domain/orchestration/gt-planner",
     "crates/kernel/gt-store-pg",
     "crates/kernel/gt-store-dolt",
     "crates/kernel/gt-rbac",
@@ -87,6 +88,7 @@ gt-webhooks      = { path = "crates/domain/orchestration/gt-webhooks" }
 gt-dog           = { path = "crates/domain/orchestration/gt-dog" }
 gt-runtime       = { path = "crates/domain/orchestration/gt-runtime" }
 gt-memory        = { path = "crates/domain/orchestration/gt-memory" }
+gt-planner       = { path = "crates/domain/orchestration/gt-planner" }
 
 gt-store-pg      = { path = "crates/kernel/gt-store-pg" }
 gt-store-dolt    = { path = "crates/kernel/gt-store-dolt" }

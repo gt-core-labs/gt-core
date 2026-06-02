@@ -1,0 +1,17 @@
+[package]
+name = "gt-planner"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Autonomous planner (Plan tier): decompose a goal into beads + intent edges + phase as graph structure, never prose. Routes irreversible forks to the park queue and carries a planner-distinct RBAC scope."
+
+[dependencies]
+# Reuse the park/reversibility safety floor (hq-auto.3) — the planner classifies
+# irreversible forks with the SAME taxonomy the dispatcher enforces, never a fork.
+gt-issues = { workspace = true }
+# Frontier authorization: the planner scope (create/edge/phase) is built here,
+# distinct from the worker scope (claim/close).
+gt-rbac = { workspace = true }
+# MAPE-K Knowledge (hq-auto.8): the planner reads operating rules before planning.
+gt-memory = { workspace = true }
