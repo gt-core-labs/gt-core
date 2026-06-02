@@ -1,0 +1,29 @@
+[package]
+name = "gt-quota"
+edition.workspace = true
+version.workspace = true
+
+[dependencies]
+gt-events = { workspace = true }
+# The module seam: QuotaModule declares gt-quota's contributions to RootBuilder
+# (hq-mod-refactor.5), mirroring RigsModule.
+gt-module = { workspace = true }
+semver = { workspace = true }
+tokio.workspace = true
+serde.workspace = true
+# `parsing` is enabled here (not in the workspace default) so `probe.rs` can read the RFC
+# 3339 `anthropic-ratelimit-*-reset` timestamps; other quota state does not need it.
+time = { workspace = true, features = ["parsing"] }
+# JSON Schema derives for Command arguments — surfaced by gt-mcp.
+schemars.workspace = true
+
+# Linux-only: platform keychain via Secret Service / kwallet / fallback file. Pulled in
+# behind `cfg(target_os = "linux")` so non-Linux builds skip it. `linux-native` uses
+# `libsecret` (Secret Service over D-Bus) without a sync-blocking executor.
+[target.'cfg(target_os = "linux")'.dependencies]
+keyring = { version = "3", default-features = false, features = ["linux-native"] }
+
+[dev-dependencies]
+# The event-log store (replay test harness), ported from gastown's gt-audit (port.8).
+gt-eventlog = { workspace = true }
+serde_json.workspace = true
