@@ -3,11 +3,13 @@
 use std::fmt;
 use std::sync::{Arc, Mutex};
 
+use gt_events::{Envelope, EventKind};
 use gt_eventlog::EventRecord;
 use gt_module::Root;
 use gt_plugin::{spawn_plugin_relay, PluginRegistry};
 use gt_workspace::WorkspaceId;
-use tokio::sync::broadcast;
+use serde::Serialize;
+use tokio::sync::{broadcast, mpsc};
 use tokio::task::JoinHandle;
 
 use crate::lifecycle::Supervisor;
@@ -58,6 +60,9 @@ pub struct RootHandle {
     /// The observer-relay task spawned by [`spawn_plugins`](Self::spawn_plugins), kept so
     /// [`shutdown`](Self::shutdown) can abort it. `None` until plugins are wired.
     relay: Mutex<Option<JoinHandle<()>>>,
+    /// Per-domain drain tasks spawned by [`drain_events_from`](Self::drain_events_from), each
+    /// forwarding one actor's event sink onto the hub; aborted on [`shutdown`](Self::shutdown).
+    drains: Mutex<Vec<JoinHandle<()>>>,
 }
 
 impl RootHandle {
@@ -71,6 +76,7 @@ impl RootHandle {
             supervisor: Supervisor::new(),
             events,
             relay: Mutex::new(None),
+            drains: Mutex::new(Vec::new()),
         }
     }
 
@@ -100,6 +106,35 @@ impl RootHandle {
         if let Some(old) = self.relay.lock().expect("relay mutex poisoned").replace(task) {
             old.abort();
         }
+    }
+
+    /// Drain a per-domain actor's typed event sink onto the workspace event hub
+    /// (composition-root function #3). Spawns a task that, for every [`Envelope<E>`] the actor
+    /// emits on `rx`, converts it to its type-erased [`EventRecord`]
+    /// ([`EventRecord::from_envelope`]) and publishes it through [`events_sender`].
+    ///
+    /// This is how each domain actor's output reaches the hub — and thus the observer relay
+    /// (`spawn_plugins`) + (later) the event log + SSE — closing the reactor loop: a domain emits
+    /// → hub → observers react → another domain emits → hub. Must run inside a Tokio runtime; the
+    /// task ends when the actor's sink closes, and [`shutdown`](Self::shutdown) aborts it. An
+    /// `Envelope` whose payload fails to serialize is skipped (the hub stays append-only).
+    ///
+    /// [`events_sender`]: Self::events_sender
+    pub fn drain_events_from<E>(&self, mut rx: mpsc::Receiver<Envelope<E>>)
+    where
+        E: EventKind + Serialize + Send + 'static,
+    {
+        let hub = self.events.clone();
+        let task = tokio::spawn(async move {
+            while let Some(env) = rx.recv().await {
+                if let Ok(record) = EventRecord::from_envelope(&env) {
+                    // A closed hub (no subscribers) is not an error: the record is simply not
+                    // observed. The drain keeps running so a later subscriber sees future events.
+                    let _ = hub.send(record);
+                }
+            }
+        });
+        self.drains.lock().expect("drains mutex poisoned").push(task);
     }
 
     /// The workspace this root serves.
@@ -142,6 +177,9 @@ impl RootHandle {
         if let Some(task) = self.relay.lock().expect("relay mutex poisoned").take() {
             task.abort();
         }
+        for task in self.drains.lock().expect("drains mutex poisoned").drain(..) {
+            task.abort();
+        }
     }
 }
 
@@ -156,6 +194,7 @@ impl fmt::Debug for RootHandle {
                 "relay_active",
                 &self.relay.lock().expect("relay mutex poisoned").is_some(),
             )
+            .field("drains", &self.drains.lock().expect("drains mutex poisoned").len())
             .finish()
     }
 }
@@ -254,5 +293,31 @@ mod tests {
             h.relay.lock().unwrap().is_none(),
             "shutdown clears the relay handle"
         );
+    }
+
+    #[derive(serde::Serialize)]
+    enum TestEv {
+        Ping,
+    }
+    impl gt_events::EventKind for TestEv {
+        fn kind(&self) -> &'static str {
+            "test.ping.v1"
+        }
+    }
+
+    #[tokio::test]
+    async fn drain_events_from_forwards_typed_actor_events_onto_the_hub() {
+        let h = handle();
+        let mut hub = h.subscribe_events();
+        let (tx, rx) = mpsc::channel::<Envelope<TestEv>>(8);
+        h.drain_events_from(rx);
+
+        tx.send(Envelope::root(TestEv::Ping)).await.unwrap();
+
+        let got = tokio::time::timeout(std::time::Duration::from_secs(5), hub.recv())
+            .await
+            .expect("drain forwarded before timeout")
+            .expect("hub open");
+        assert_eq!(got.kind, "test.ping.v1", "typed event reaches the hub type-erased");
     }
 }

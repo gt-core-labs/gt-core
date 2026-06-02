@@ -15,6 +15,10 @@ gt-module = { workspace = true }
 gt-plugin = { workspace = true }
 # `EventRecord` — the type-erased wire form the hub broadcasts to plugins + SSE.
 gt-eventlog = { workspace = true }
+# `Envelope`/`EventKind` — the typed actor events `drain_events_from` converts to `EventRecord`
+# (hq-mod-refactor.24); `serde::Serialize` is the bound `EventRecord::from_envelope` needs.
+gt-events = { workspace = true }
+serde = { workspace = true }
 # Tenant-boundary identifier (orchestration -> domain/platform, allowed by docs/03 dep table).
 gt-workspace = { workspace = true }
 # Lock-free concurrent map: the registry is hit on every per-workspace request.
@@ -30,5 +34,3 @@ semver = { workspace = true }
 # (hq-mod-refactor.18).
 serde_json = { workspace = true }
 async-trait = { workspace = true }
-# `AppError` — the `Plugin::on_event` return type the test spies implement.
-gt-events = { workspace = true }
