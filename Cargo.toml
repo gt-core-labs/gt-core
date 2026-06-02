@@ -17,6 +17,7 @@ members = [
     "crates/domain/platform/gt-issues",
     "crates/domain/platform/gt-meta",
     "crates/domain/platform/gt-rig",
+    "crates/domain/platform/gt-feed",
     "crates/domain/orchestration/gt-quota",
     "crates/domain/orchestration/gt-merge",
     "crates/domain/orchestration/gt-orchestration",
@@ -110,6 +111,7 @@ gt-workspace     = { path = "crates/domain/platform/gt-workspace" }
 gt-meta          = { path = "crates/domain/platform/gt-meta" }
 gt-issues        = { path = "crates/domain/platform/gt-issues" }
 gt-rig           = { path = "crates/domain/platform/gt-rig" }
+gt-feed          = { path = "crates/domain/platform/gt-feed" }
 gt-quota         = { path = "crates/domain/orchestration/gt-quota" }
 gt-merge         = { path = "crates/domain/orchestration/gt-merge" }
 gt-orchestration = { path = "crates/domain/orchestration/gt-orchestration" }

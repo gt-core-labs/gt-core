@@ -1,0 +1,25 @@
+[package]
+name = "gt-feed"
+edition.workspace = true
+version.workspace = true
+
+# CONSUMIDOR PURO del log de eventos. Solo depende del kernel (gt-eventlog / gt-events).
+# No conoce dominios — opera sobre EventRecord type-erased (kind + payload JSON).
+# `gt-eventlog` is gastown's event-replay store ported up (hq-core-port.8); it owns the
+# `EventRecord` type the feed folds. (In gastown this crate was `gt-audit`.)
+[dependencies]
+gt-eventlog = { workspace = true }
+gt-events = { workspace = true }
+# The kernel module seam — `FeedModule` declares the feed's identity + capability so the
+# `RootBuilder` harvests them (`hq-mod-refactor.8`); the projection logic is untouched.
+gt-module = { workspace = true }
+# `semver::Version` for the module's `ModuleMeta`.
+semver = { workspace = true }
+serde.workspace = true
+serde_json.workspace = true
+# RFC3339 timestamp parsing in the activity view (hq-mysw). Parsing is pure + clock-free, so
+# the curator/reducer stay deterministic; only the activity projection reads `now` (injected).
+time = { workspace = true, features = ["parsing"] }
+
+[dev-dependencies]
+time.workspace = true
