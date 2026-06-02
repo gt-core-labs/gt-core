@@ -9,3 +9,8 @@ description = "Per-module SQL migration loader. sqlx multi-source aggregation."
 [dependencies]
 sqlx = { workspace = true }
 gt-module = { workspace = true }
+
+[dev-dependencies]
+# Async runtime for the GT_PG_URL-gated apply/disable/reactivate/purge
+# integration test (hq-mod-migrate.5).
+tokio = { workspace = true }

@@ -78,6 +78,16 @@ impl MigrationReport {
     }
 }
 
+/// Outcome of a [`purge`] run.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct PurgeReport {
+    /// Number of teardown statements executed against the database.
+    pub statements: usize,
+    /// Number of `(module_id, version)` tracking rows forgotten — the purged
+    /// module's retained history.
+    pub forgotten: u64,
+}
+
 /// What can go wrong while applying a plan.
 #[derive(Debug)]
 pub enum MigrateError {
@@ -95,6 +105,10 @@ pub enum MigrateError {
     /// A database error not attributable to a single migration (creating the
     /// tracking table or reading the applied set).
     Loader(sqlx::Error),
+    /// [`purge`] was asked to reclaim a module that is still in the active plan.
+    /// Purging a live module would drop tables out from under it, so the loader
+    /// refuses. Carries the offending module id.
+    LiveModule(String),
 }
 
 impl From<sqlx::Error> for MigrateError {
@@ -110,6 +124,9 @@ impl std::fmt::Display for MigrateError {
                 write!(f, "migration {module}/{version} failed: {source}")
             }
             MigrateError::Loader(source) => write!(f, "migration loader: {source}"),
+            MigrateError::LiveModule(module) => {
+                write!(f, "refusing to purge live module {module} (still in the active plan)")
+            }
         }
     }
 }
@@ -118,6 +135,7 @@ impl std::error::Error for MigrateError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             MigrateError::Apply { source, .. } | MigrateError::Loader(source) => Some(source),
+            MigrateError::LiveModule(_) => None,
         }
     }
 }
@@ -183,6 +201,84 @@ pub fn retained(
         .filter(|(module, version)| !in_plan.contains(&(module.as_str(), *version)))
         .cloned()
         .collect()
+}
+
+/// Reclaim a disabled module's schema: run its teardown SQL and forget its
+/// applied-migration history, atomically.
+///
+/// Opt-in and never automatic. [`apply`] only ever *adds*: dropping a module
+/// from the plan leaves its tables and its tracking rows in place (see the
+/// crate-level *Disable-safe* section). `purge` is the separate, deliberate path
+/// that reclaims that schema — the `gt module purge <id>` story from
+/// `hq-mod-migrate.3`.
+///
+/// A module owns its schema, so it owns the reverse DDL too. [`Migration`]
+/// carries only forward SQL, so the caller supplies `teardown` (typically
+/// `DROP TABLE IF EXISTS ...` statements). They run in the given order in one
+/// transaction together with the deletion of the module's `(module_id, *)` rows
+/// from [`MIGRATIONS_TABLE`]: either the schema is gone *and* the history is
+/// cleared, or — on any error — nothing changed.
+///
+/// Guarded against purging a *live* module: if `module` still appears in
+/// `active_plan`, `purge` returns [`MigrateError::LiveModule`] without touching
+/// the database, so an enabled module can never have its tables dropped from
+/// under it. Pass [`Root::migrations`](gt_module::Root::migrations) — the same
+/// plan you hand [`apply`] — as the guard.
+pub async fn purge(
+    pool: &PgPool,
+    module: &ModuleId,
+    teardown: &[String],
+    active_plan: &[(&ModuleId, &Migration)],
+) -> Result<PurgeReport, MigrateError> {
+    if is_in_plan(module, active_plan) {
+        return Err(MigrateError::LiveModule(module.as_str().to_owned()));
+    }
+
+    ensure_table(pool).await?;
+
+    let map_err = |source: sqlx::Error| MigrateError::Apply {
+        module: module.as_str().to_owned(),
+        version: 0,
+        source,
+    };
+
+    let mut tx: Transaction<'_, Postgres> = pool.begin().await.map_err(map_err)?;
+
+    for stmt in teardown {
+        sqlx::query(stmt).execute(&mut *tx).await.map_err(map_err)?;
+    }
+
+    let delete = format!("DELETE FROM {MIGRATIONS_TABLE} WHERE module_id = $1");
+    let forgotten = sqlx::query(&delete)
+        .bind(module.as_str())
+        .execute(&mut *tx)
+        .await
+        .map_err(map_err)?
+        .rows_affected();
+
+    tx.commit().await.map_err(map_err)?;
+
+    Ok(PurgeReport { statements: teardown.len(), forgotten })
+}
+
+/// Whether `module` still contributes any migration to `plan` — i.e. is enabled.
+///
+/// Pure and database-free so [`purge`]'s live-module guard is unit-testable
+/// without Postgres. A module is "live" if any plan entry is owned by it.
+pub fn is_in_plan(module: &ModuleId, plan: &[(&ModuleId, &Migration)]) -> bool {
+    plan.iter().any(|(m, _)| m.as_str() == module.as_str())
+}
+
+/// Read the `(module_id, version)` migrations the database records as applied.
+///
+/// The public companion to [`retained`]: callers pair this snapshot with the
+/// current plan to discover which applied migrations belong to disabled modules
+/// (candidates for [`purge`]) without reaching into the tracking table directly.
+/// Ensures the tracking table exists first, so it is safe to call before any
+/// [`apply`] has run — it returns an empty set in that case.
+pub async fn applied(pool: &PgPool) -> Result<HashSet<(String, u32)>, MigrateError> {
+    ensure_table(pool).await?;
+    Ok(applied_set(pool).await?)
 }
 
 /// Create the tracking table if it does not yet exist.
@@ -347,5 +443,22 @@ mod tests {
         assert!(!report.changed());
         report.applied.push(("beads".to_owned(), 1, "a".to_owned()));
         assert!(report.changed());
+    }
+
+    #[test]
+    fn is_in_plan_detects_enabled_module() {
+        // beads is in the plan (live), rigs is not (disabled): purge must refuse
+        // the former and allow the latter.
+        let (beads, rigs) = (id("beads"), id("rigs"));
+        let m = Migration::new(1, "a", "SELECT 1");
+        let plan = vec![(&beads, &m)];
+        assert!(is_in_plan(&beads, &plan));
+        assert!(!is_in_plan(&rigs, &plan));
+    }
+
+    #[test]
+    fn is_in_plan_false_for_empty_plan() {
+        let beads = id("beads");
+        assert!(!is_in_plan(&beads, &[]));
     }
 }
