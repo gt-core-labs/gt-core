@@ -12,6 +12,13 @@ serde_json = { workspace = true }
 async-trait = { workspace = true }
 gt-module = { workspace = true }
 gt-hooks = { workspace = true }
+# gt-plugin owns the canonical Gate/GateType descriptor (now ported up, hq-core-port.11);
+# the Gate evaluator (hq-mod-dogs.3) reads it directly instead of re-mirroring. kernel <-
+# orchestration is the allowed one-way dep.
+gt-plugin = { workspace = true }
+# Cron gate: parse + next-tick. cron pulls chrono, which the evaluator's injected clock uses.
+cron = "0.16"
+chrono = { version = "0.4", default-features = false, features = ["std"] }
 
 [dev-dependencies]
 tokio = { workspace = true }

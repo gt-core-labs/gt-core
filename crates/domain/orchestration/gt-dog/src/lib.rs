@@ -24,9 +24,12 @@
 //!
 //! - [`mcp`] — the `dog.claim.{validate,execute}`, `dog.release.execute`,
 //!   `dog.status.read` MCP tools and their payload parsing (`hq-mod-dogs.7`).
+//! - [`evaluate_gate`] + [`GateContext`] + [`GateDecision`] — the pure Gate
+//!   evaluator deciding whether a claim may fire now, across all five gate
+//!   types (`hq-mod-dogs.3`).
 //!
-//! Still to come on this epic: the `Gate` evaluator (`.3`), the per-workspace
-//! pool (`.8`), and the end-to-end test (`.9`).
+//! Still to come on this epic: the per-workspace pool (`.8`) and the end-to-end
+//! test (`.9`).
 
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
@@ -34,6 +37,7 @@
 mod dispatcher;
 mod dog;
 mod executor;
+mod gate;
 pub mod mcp;
 mod notify;
 mod state;
@@ -42,6 +46,7 @@ mod tracking;
 pub use dispatcher::{Dispatch, DispatchError, DogDispatcher, DogEvent};
 pub use dog::{Dog, DogReport};
 pub use executor::{ExecBackend, ExecError, ExecutionKind, ExecutionType, PluginExecutor};
+pub use gate::{evaluate as evaluate_gate, GateContext, GateDecision, GateError};
 pub use notify::{notify_failure, InMemoryNotifier, Notification, NotifyError, Notifier};
 pub use tracking::{
     Digest, InMemoryReceipts, Outcome, ReceiptError, ReceiptSink, TrackingLabels,
