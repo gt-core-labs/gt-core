@@ -159,6 +159,34 @@ impl Supervisor {
         Ok(())
     }
 
+    /// Anchor an arbitrary actor handle to this supervisor's lifetime.
+    ///
+    /// The composition root spawns per-workspace domain actors (scheduler, merge, …) whose
+    /// `tokio::spawn`ed task stays alive only while a handle to it is held. Registering the
+    /// handle here parks it inside a tiny anchor future ([`spawn_actor`](Self::spawn_actor)) that
+    /// holds it until [`Phase::Draining`], so the supervisor — owned by the workspace's
+    /// `RootHandle` — keeps every per-ws actor alive for the workspace's lifetime and drops them
+    /// together on drain/shutdown. This answers "what owns the per-ws domain actors": the
+    /// supervisor, via `anchor`. `gt_roles::RoleStack` anchors the five role actors the same way.
+    ///
+    /// Only valid while [`Built`](Phase::Built) (same contract as `spawn_actor`); the anchor
+    /// future winds down when the phase reaches `Draining` or the supervisor drops.
+    pub async fn anchor<H: Send + 'static>(&self, handle: H) -> Result<(), Phase> {
+        self.spawn_actor(move |mut phase_rx| async move {
+            // Hold the handle for the life of the stack; it drops when this future returns.
+            let _anchor = handle;
+            loop {
+                if *phase_rx.borrow_and_update() >= Phase::Draining {
+                    return;
+                }
+                if phase_rx.changed().await.is_err() {
+                    return; // supervisor dropped — wind down.
+                }
+            }
+        })
+        .await
+    }
+
     /// Spawn the registered actors. `Built -> Started`, idempotent: a second call
     /// (or one on an already-draining/stopped handle) is a no-op returning
     /// `false`. Returns `true` only on the transition that actually started them.
@@ -279,6 +307,31 @@ mod tests {
         assert!(sup.start().await, "first start transitions");
         assert_eq!(sup.phase(), Phase::Started);
         assert!(!sup.start().await, "second start is a no-op");
+    }
+
+    #[tokio::test]
+    async fn anchor_holds_a_handle_then_releases_it_on_shutdown() {
+        let sup = Supervisor::new();
+        let held = Arc::new(());
+        sup.anchor(held.clone()).await.expect("anchors while Built");
+        // Anchor future holds a clone: caller + anchor == 2.
+        assert_eq!(Arc::strong_count(&held), 2);
+
+        sup.start().await;
+        sup.shutdown().await; // awaits the anchor future, which drops its clone.
+        assert_eq!(sup.phase(), Phase::Stopped);
+        assert_eq!(
+            Arc::strong_count(&held),
+            1,
+            "shutdown winds the anchor down and releases the handle",
+        );
+    }
+
+    #[tokio::test]
+    async fn anchor_after_start_is_rejected() {
+        let sup = Supervisor::new();
+        sup.start().await;
+        assert_eq!(sup.anchor(Arc::new(())).await, Err(Phase::Started));
     }
 
     #[tokio::test]

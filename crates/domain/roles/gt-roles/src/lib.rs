@@ -109,13 +109,14 @@ impl RoleStack {
         let mayor = gt_mayor::spawn(InMemoryMayorRepo::default(), sinks.mayor);
         let refinery = gt_refinery::spawn(InMemoryRefineryRepo::default(), sinks.refinery);
 
-        // Anchor each actor to the supervisor lifecycle. A clone keeps the actor alive while
-        // the supervisor runs; the original stays in the returned stack for command access.
-        anchor(supervisor, sheriff.clone()).await?;
-        anchor(supervisor, witness.clone()).await?;
-        anchor(supervisor, deacon.clone()).await?;
-        anchor(supervisor, mayor.clone()).await?;
-        anchor(supervisor, refinery.clone()).await?;
+        // Anchor each actor to the supervisor lifecycle (Supervisor::anchor, hq-mod-refactor.23).
+        // A clone keeps the actor alive while the supervisor runs; the original stays in the
+        // returned stack for command access.
+        supervisor.anchor(sheriff.clone()).await?;
+        supervisor.anchor(witness.clone()).await?;
+        supervisor.anchor(deacon.clone()).await?;
+        supervisor.anchor(mayor.clone()).await?;
+        supervisor.anchor(refinery.clone()).await?;
 
         Ok(RoleStack { sheriff, witness, deacon, mayor, refinery })
     }
@@ -144,30 +145,6 @@ impl RoleStack {
     pub fn refinery(&self) -> &RefineryHandle {
         &self.refinery
     }
-}
-
-/// Register a role handle as a supervisor lifecycle anchor.
-///
-/// The anchor future holds `handle` and parks on the phase watch until the stack reaches
-/// [`Phase::Draining`] (or the supervisor is dropped, closing the channel), then returns —
-/// releasing its clone. It is the supervisor-managed task that [`drain`](Supervisor::drain)
-/// and [`shutdown`](Supervisor::shutdown) await; the role's own detached task ends once every
-/// handle (including the caller's [`RoleStack`]) is dropped.
-async fn anchor<H: Send + 'static>(supervisor: &Supervisor, handle: H) -> Result<(), Phase> {
-    supervisor
-        .spawn_actor(move |mut phase_rx| async move {
-            // Hold the handle for the life of the stack; it drops when this future returns.
-            let _anchor = handle;
-            loop {
-                if *phase_rx.borrow_and_update() >= Phase::Draining {
-                    return;
-                }
-                if phase_rx.changed().await.is_err() {
-                    return; // supervisor dropped — wind down.
-                }
-            }
-        })
-        .await
 }
 
 #[cfg(test)]
