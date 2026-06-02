@@ -10,9 +10,11 @@ mod state;
 
 pub mod actor;
 pub mod commands;
+pub mod module;
 pub mod supervisor;
 
 pub use commands::{AddSession, AgentCommand, RemoveSession, TransitionSession};
 pub use events::AgentEvent;
+pub use module::AgentModule;
 pub use repo::{InMemorySessions, SessionQueries, SessionWriter};
 pub use state::{DogKind, Session, SessionRegistry, SessionRole, SessionState};

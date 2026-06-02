@@ -5,11 +5,16 @@ version.workspace = true
 
 # Agent/session + polecat lifecycle substrate. Owned events + pure replay reducer
 # + sync `Command` path; the supervisor drives transitions over `gt-bus`. No HTTP,
-# no scope resolution. The CrewModule wrap (composing this with the role crates) is
-# `hq-mod-refactor.7`.
+# no scope resolution. The `AgentModule` GtModule wrap (`hq-mod-refactor.7`, re-scoped
+# from the abandoned CrewModule aggregate) declares this crate's contributions to the
+# kernel module seam; roles-as-observers wiring is `hq-mod-refactor.16`.
 [dependencies]
 gt-events = { workspace = true }
 gt-bus = { workspace = true }
+# The kernel module seam the `AgentModule` wrap declares against (GtModule/Capability/
+# McpRegistry/EventKind/Scope). `semver` supplies the `ModuleMeta` version.
+gt-module = { workspace = true }
+semver = { workspace = true }
 # `fs` (heartbeat file) + `process` (polecat child supervision) on top of the workspace
 # tokio feature set (macros/rt/sync/time); the supervisor is an explicit actor crate.
 tokio = { workspace = true, features = ["fs", "process"] }
