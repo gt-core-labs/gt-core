@@ -172,6 +172,16 @@ pub async fn dispatch_meta(
                 .unwrap_or(0);
             let id = format!("hq-gap-{}-{ts}", slugify(&g.operation));
             let priority = g.priority.unwrap_or(2);
+            // Parent the gap under a sub-epic so it is NN-16-sound on mint
+            // instead of orphaned; default to the gaps catalog sub-epic, which we
+            // ensure exists first so the ref is never dangling.
+            let external_ref = match g.external_ref.as_deref().map(str::trim) {
+                Some(r) if !r.is_empty() => r.to_string(),
+                _ => {
+                    ensure_catalog_epic(store).await?;
+                    GAP_CATALOG_EPIC.to_string()
+                }
+            };
             let new = NewIssue {
                 id: id.clone(),
                 title: format!("gap: {}", g.operation),
@@ -179,12 +189,65 @@ pub async fn dispatch_meta(
                 created_by: actor.into(),
                 notes: g.notes.unwrap_or_default(),
                 priority,
+                external_ref: Some(external_ref.clone()),
+                // Seed the graph columns so native-surface filtering + reconciler
+                // edge derivation pick the bead up without a manual issues.update.
+                domain_json: json_array(g.domain.as_deref()),
+                surface_json: json_array(g.surface.as_deref()),
+                depends_on_json: json_array(g.depends_on.as_deref()),
                 ..Default::default()
             };
             store.insert(&new).await?;
-            Ok(json!({ "bead": id, "operation": g.operation, "priority": priority }))
+            Ok(json!({
+                "bead": id,
+                "operation": g.operation,
+                "priority": priority,
+                "external_ref": external_ref,
+            }))
         }
         other => Err(AppError::Validation(format!("unknown tool `{other}`"))),
+    }
+}
+
+/// The catalog sub-epic every auto-minted gap parents under when the caller
+/// supplies no `external_ref`, so reported gaps satisfy NN-16 instead of landing
+/// orphaned.
+const GAP_CATALOG_EPIC: &str = "hq-gaps";
+
+/// Idempotently ensure the [`GAP_CATALOG_EPIC`] bead exists before a gap is
+/// parented under it, so the `external_ref` is never dangling. A no-op once the
+/// epic is present.
+async fn ensure_catalog_epic(store: &DoltIssues) -> Result<(), AppError> {
+    if store.get_detail(GAP_CATALOG_EPIC).await?.is_some() {
+        return Ok(());
+    }
+    let epic = NewIssue {
+        id: GAP_CATALOG_EPIC.into(),
+        title: "Reported tooling/spec gaps (catalog)".into(),
+        issue_type: "epic".into(),
+        created_by: "meta.report-gap".into(),
+        notes: "Auto-created home for gaps minted by meta.report-gap.execute \
+                without an explicit external_ref."
+            .into(),
+        priority: 2,
+        ..Default::default()
+    };
+    // A concurrent reporter may have inserted it between the check and here;
+    // treat a duplicate-id insert as success (the epic now exists either way).
+    match store.insert(&epic).await {
+        Ok(()) => Ok(()),
+        Err(_) if store.get_detail(GAP_CATALOG_EPIC).await?.is_some() => Ok(()),
+        Err(e) => Err(e),
+    }
+}
+
+/// Serialize an optional list of strings into a JSON-array column value. `None`
+/// or an empty list yields `"[]"`, matching the `NOT NULL` `[]` invariant
+/// [`DoltIssues::insert`] normalises to.
+fn json_array(items: Option<&[String]>) -> String {
+    match items {
+        Some(v) if !v.is_empty() => serde_json::to_string(v).unwrap_or_else(|_| "[]".into()),
+        _ => "[]".into(),
     }
 }
 
@@ -274,7 +337,27 @@ pub fn parse_issue_filter(qs: &str) -> Result<IssueFilter, AppError> {
 
 #[cfg(test)]
 mod tests {
-    use super::parse_issue_filter;
+    use super::{json_array, parse_issue_filter, slugify, GAP_CATALOG_EPIC};
+
+    #[test]
+    fn json_array_seeds_columns_or_empties() {
+        assert_eq!(json_array(None), "[]");
+        assert_eq!(json_array(Some(&[])), "[]");
+        assert_eq!(
+            json_array(Some(&["crates/kernel/gt-meta".to_string()])),
+            "[\"crates/kernel/gt-meta\"]"
+        );
+        assert_eq!(
+            json_array(Some(&["a".to_string(), "b".to_string()])),
+            "[\"a\",\"b\"]"
+        );
+    }
+
+    #[test]
+    fn catalog_epic_id_is_taxonomy_shaped() {
+        // The default parent must be a valid bead id (lowercase kebab).
+        assert_eq!(slugify(GAP_CATALOG_EPIC), GAP_CATALOG_EPIC);
+    }
 
     #[test]
     fn parses_full_and_filters() {
