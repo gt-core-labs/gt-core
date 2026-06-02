@@ -173,15 +173,17 @@ pub async fn dispatch_meta(
             let id = format!("hq-gap-{}-{ts}", slugify(&g.operation));
             let priority = g.priority.unwrap_or(2);
             // Parent the gap under a sub-epic so it is NN-16-sound on mint
-            // instead of orphaned; default to the gaps catalog sub-epic, which we
-            // ensure exists first so the ref is never dangling.
+            // instead of orphaned; default to the gaps catalog sub-epic.
             let external_ref = match g.external_ref.as_deref().map(str::trim) {
                 Some(r) if !r.is_empty() => r.to_string(),
-                _ => {
-                    ensure_catalog_epic(store).await?;
-                    GAP_CATALOG_EPIC.to_string()
-                }
+                _ => GAP_CATALOG_EPIC.to_string(),
             };
+            // Ensure the catalog sub-epic exists whenever a gap parents under it —
+            // whether defaulted or named explicitly — so the ref is never
+            // dangling. A custom external_ref is the caller's to have created.
+            if external_ref == GAP_CATALOG_EPIC {
+                ensure_catalog_epic(store).await?;
+            }
             let new = NewIssue {
                 id: id.clone(),
                 title: format!("gap: {}", g.operation),

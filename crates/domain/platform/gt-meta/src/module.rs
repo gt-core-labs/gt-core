@@ -41,7 +41,11 @@ impl GtModule for MetaModule {
                 "meta.report-gap.execute",
                 "Surface a missing MCP operation: the server mints a hq-gap-<slug>-<ts> bead \
                  so the gap enters the routine catalog. Input: { operation (required), notes?, \
-                 priority? (0=P0..2=P2, default 2) }.",
+                 priority? (0=P0..2=P2, default 2), external_ref? (sub-epic; defaults to the \
+                 hq-gaps catalog so the bead is NN-16-sound, never orphaned), surface? \
+                 (crate/path strings), domain? (domain discriminators), depends_on? (blocker \
+                 bead ids) }. The surface/domain/depends_on seeds make the gap visible to \
+                 ?ready=true filtering + reconciler edge derivation without a manual update.",
                 schema_for::<ReportGap>(),
             );
     }
