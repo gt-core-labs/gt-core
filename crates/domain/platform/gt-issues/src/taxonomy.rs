@@ -50,6 +50,10 @@ pub enum Domain {
     OrchQuota,
     #[serde(rename = "orch.convoy")]
     OrchConvoy,
+    /// The login / PTY session driver (gt-login) — added for the gt-web port wave
+    /// (hq-gap-domain-taxonomy-…-doc-14); gt-login sits in the orchestration tier.
+    #[serde(rename = "orch.login")]
+    OrchLogin,
     #[serde(rename = "platform.feed")]
     PlatformFeed,
     #[serde(rename = "platform.notify")]
@@ -62,6 +66,10 @@ pub enum Domain {
     /// closed set was missing (hq-gap-domain-platform-skills, folded here).
     #[serde(rename = "platform.skills")]
     PlatformSkills,
+    /// The dock-terminal / PTY-attach surface (gt-terminal) — added for the gt-web
+    /// port wave (hq-gap-domain-taxonomy-…-doc-14); gt-terminal sits in the platform tier.
+    #[serde(rename = "platform.terminal")]
+    PlatformTerminal,
     #[serde(rename = "role.sheriff")]
     RoleSheriff,
     #[serde(rename = "role.deacon")]
@@ -123,5 +131,13 @@ mod tests {
     fn skills_variant_present() {
         let d: Domain = serde_json::from_str("\"platform.skills\"").unwrap();
         assert_eq!(d, Domain::PlatformSkills);
+    }
+
+    #[test]
+    fn login_and_terminal_variants_present() {
+        let login: Domain = serde_json::from_str("\"orch.login\"").unwrap();
+        assert_eq!(login, Domain::OrchLogin);
+        let terminal: Domain = serde_json::from_str("\"platform.terminal\"").unwrap();
+        assert_eq!(terminal, Domain::PlatformTerminal);
     }
 }
