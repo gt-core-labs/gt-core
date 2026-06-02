@@ -1,0 +1,19 @@
+[package]
+name = "mod-beads"
+edition.workspace = true
+version.workspace = true
+
+# hq-mod-refactor.2 — `BeadsModule`, the GtModule wrap of the dispatcher bead queue.
+#
+# Beads are the orchestrator's work units and the backing store of the kanban board
+# (`/api/beads`), so the feature lives in the `modules/` tier (docs/03 flowchart:
+# user-facing board → modules/). It fronts the `gt-beads` kernel domain (the `Bead`
+# vocabulary + `BeadRepository` port); the concrete store is Dolt (`gt-store-dolt`),
+# NOT a Postgres projection, so this module owns no migration.
+[dependencies]
+# The module foundation: `GtModule`, `Capability`, `Scope`, `ModuleMeta`, `ModuleId`.
+gt-module = { workspace = true }
+# The bead domain this module fronts (vocabulary + repository port).
+gt-beads = { workspace = true }
+# `semver::Version` for the module's `ModuleMeta`.
+semver = { workspace = true }

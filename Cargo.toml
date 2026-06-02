@@ -36,6 +36,7 @@ members = [
     "crates/domain/orchestration/gt-reconciler",
     "crates/domain/orchestration/gt-memory",
     "crates/domain/orchestration/gt-planner",
+    "crates/modules/mod-beads",
     "crates/kernel/gt-store-pg",
     "crates/kernel/gt-store-dolt",
     "crates/kernel/gt-rbac",
