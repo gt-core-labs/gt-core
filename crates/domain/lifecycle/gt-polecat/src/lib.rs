@@ -13,11 +13,13 @@
 pub mod hooks;
 pub mod lifecycle;
 pub mod module;
+pub mod pool;
 pub mod restart;
 pub mod supervisor;
 pub mod tmux;
 
 pub use hooks::{hook_bead_for_spawn, hook_env, resolve_env_hook_bead, GT_HOOK_BEAD};
+pub use pool::{AllocError, ExhaustedScope, PoolAllocator};
 pub use module::SessionsModule;
 pub use lifecycle::{
     spawn_process, spawn_tmux, PolecatLifecycle, SpawnSpec, SpawnTemplate, SpawnedPolecat,
