@@ -21,16 +21,16 @@ container.
 |-------|-----------------|-------------------------|----------------|
 | Postgres (projections) | single PG, `gt-pgdata` volume | schema `ws_<slug>` (`gt_store_pg::schema_for`) | `gt_create_workspace_schema(ws)` — `hq-mt-data.2` |
 | Dolt (issues / versioned domain) | single `dolt sql-server`, `dolt-data` volume | database `hq_<ws>` | `hq-mt-data.6/.7/.12` |
-| Event log (append-only) | `gt-eventlog` named volume at `/var/lib/gastown` | subdir `/var/lib/gastown/<ws>/events.jsonl` | created on first workspace resolution — `hq-mt-data.8` |
+| Event log (append-only) | `gt-eventlog` named volume at `/var/lib/gt-core` | subdir `/var/lib/gt-core/<ws>/events.jsonl` | created on first workspace resolution — `hq-mt-data.8` |
 
 The bootstrap `default` workspace occupies `ws_default` / `hq_default` /
-`/var/lib/gastown/default/`, so a single-tenant deployment is just the
+`/var/lib/gt-core/default/`, so a single-tenant deployment is just the
 multi-tenant layout with one workspace.
 
 ## Event-log filesystem layout
 
 ```
-/var/lib/gastown/              # gt-eventlog volume mount
+/var/lib/gt-core/              # gt-eventlog volume mount
 ├── default/
 │   └── events.jsonl
 ├── <ws-a>/
@@ -41,7 +41,7 @@ multi-tenant layout with one workspace.
 
 Each workspace gets its own append-only log under its subdirectory. The
 directory is created lazily the first time a workspace is resolved
-(`mkdir -p /var/lib/gastown/<ws>/`, idempotent) — the filesystem mirror of how
+(`mkdir -p /var/lib/gt-core/<ws>/`, idempotent) — the filesystem mirror of how
 `gt_create_workspace_schema` provisions a PG schema on demand. The log itself
 stays append-only forever ([docs/03](03-architecture-guardrails.md) rule: never
 rewrite the event log).
@@ -69,7 +69,7 @@ Dolt databases are created through their own provisioning calls, not compose.
 Per-workspace backup (`hq-mt-deploy.6`) and the DR runbook (`hq-mt-deploy.7`)
 iterate exactly these three partitions for a given workspace: `pg_dump` the
 `ws_<slug>` schema, `dolt dump` the `hq_<ws>` database, and tar the
-`/var/lib/gastown/<ws>/` log directory. A workspace's entire durable state is
+`/var/lib/gt-core/<ws>/` log directory. A workspace's entire durable state is
 the union of those three partitions — nothing tenant-specific lives outside
 them.
 
