@@ -74,6 +74,14 @@ pub struct TmuxCli {
     retry_delay: Duration,
 }
 
+/// The tmux server socket name for a workspace: `gt-<workspace>` (`hq-mt-runtime.1`).
+///
+/// One home for the convention so the lifecycle, runtime, and any e-stop / capacity code
+/// (`hq-mt-runtime.2/.9`) derive the same socket from a workspace slug.
+pub fn tmux_server_name(workspace: &str) -> String {
+    format!("gt-{workspace}")
+}
+
 impl TmuxCli {
     pub fn new() -> Self {
         Self {
@@ -93,11 +101,27 @@ impl TmuxCli {
         }
     }
 
+    /// A `TmuxCli` pinned to a workspace's own tmux server (`tmux -L gt-<workspace>`), so every
+    /// polecat slung for that workspace lives on a per-tenant server instead of the single
+    /// shared default (`hq-mt-runtime.1`). `workspace` is the workspace slug — a plain string at
+    /// this boundary, so the lifecycle tier never has to depend on the platform `gt-workspace`
+    /// type (the composition root, which holds the `WorkspaceId`, formats it). The server is
+    /// created lazily by tmux on the first session; capping the per-host server count is
+    /// `hq-mt-runtime.2`.
+    pub fn for_workspace(workspace: &str) -> Self {
+        Self::new().with_socket(tmux_server_name(workspace))
+    }
+
     /// Pin a private server socket (`tmux -L <socket>`). Isolation for tests and for
     /// deployments that segregate tmux servers per role.
     pub fn with_socket(mut self, socket: impl Into<String>) -> Self {
         self.socket = Some(socket.into());
         self
+    }
+
+    /// The `-L` server socket this adapter targets, or `None` for the shared default server.
+    pub fn socket(&self) -> Option<&str> {
+        self.socket.as_deref()
     }
 
     /// Override the per-invocation timeout.
@@ -365,6 +389,23 @@ impl Tmux for FakeTmux {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn server_name_is_gt_dash_workspace() {
+        assert_eq!(tmux_server_name("acme"), "gt-acme");
+        assert_eq!(tmux_server_name("default"), "gt-default");
+    }
+
+    #[test]
+    fn for_workspace_pins_the_per_ws_socket() {
+        let cli = TmuxCli::for_workspace("acme");
+        assert_eq!(cli.socket(), Some("gt-acme"));
+    }
+
+    #[test]
+    fn new_targets_the_shared_default_server() {
+        assert_eq!(TmuxCli::new().socket(), None);
+    }
 
     #[test]
     fn parse_set_and_unset() {

@@ -26,4 +26,4 @@ pub use restart::{RestartConfig, RestartTracker};
 pub use supervisor::{
     supervise_daemon, supervise_polecat, watch, PolecatSupervisor, RespawnPolicy, WatchOutcome,
 };
-pub use tmux::{FakeTmux, Tmux, TmuxCli};
+pub use tmux::{tmux_server_name, FakeTmux, Tmux, TmuxCli};
