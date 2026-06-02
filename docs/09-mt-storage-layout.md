@@ -21,7 +21,7 @@ container.
 |-------|-----------------|-------------------------|----------------|
 | Postgres (projections) | single PG, `gt-pgdata` volume | schema `ws_<slug>` (`gt_store_pg::schema_for`) | `gt_create_workspace_schema(ws)` — `hq-mt-data.2` |
 | Dolt (issues / versioned domain) | single `dolt sql-server`, `dolt-data` volume | database `hq_<ws>` | `hq-mt-data.6/.7/.12` |
-| Event log (append-only) | `gt-eventlog` named volume at `/var/lib/gt-core` | subdir `/var/lib/gt-core/<ws>/events.jsonl` | created on first workspace resolution — `hq-mt-data.8` |
+| Event log (append-only) | `gt-eventlog` named volume at `/var/lib/gt-core` | subdir `/var/lib/gt-core/<ws>/` with daily segments `events-YYYY-MM-DD.jsonl` | created on first workspace resolution — `hq-mt-data.8` |
 
 The bootstrap `default` workspace occupies `ws_default` / `hq_default` /
 `/var/lib/gt-core/default/`, so a single-tenant deployment is just the
@@ -30,21 +30,27 @@ multi-tenant layout with one workspace.
 ## Event-log filesystem layout
 
 ```
-/var/lib/gt-core/              # gt-eventlog volume mount
+/var/lib/gt-core/                  # gt-eventlog volume mount
 ├── default/
-│   └── events.jsonl
+│   ├── events-2026-06-01.jsonl
+│   └── events-2026-06-02.jsonl
 ├── <ws-a>/
-│   └── events.jsonl
+│   └── events-2026-06-02.jsonl
 └── <ws-b>/
-    └── events.jsonl
+    └── events-2026-06-02.jsonl
 ```
 
-Each workspace gets its own append-only log under its subdirectory. The
-directory is created lazily the first time a workspace is resolved
+Each workspace gets its own append-only log under its subdirectory, **rotated
+into one segment per UTC day** (`events-YYYY-MM-DD.jsonl`). The directory is
+created lazily the first time a workspace is resolved
 (`mkdir -p /var/lib/gt-core/<ws>/`, idempotent) — the filesystem mirror of how
-`gt_create_workspace_schema` provisions a PG schema on demand. The log itself
-stays append-only forever ([docs/03](03-architecture-guardrails.md) rule: never
-rewrite the event log).
+`gt_create_workspace_schema` provisions a PG schema on demand. The day for a
+record is taken from the **event's own `ts`**, not a wall clock, so the writer
+stays pure and replay re-routes byte-identically to the same segments. The
+reader concatenates segments in chronological order (the ISO segment name sorts
+lexicographically = chronologically). Rotation does **not** rewrite the log
+([docs/03](03-architecture-guardrails.md) rule: never rewrite the event log) —
+it only opens a new file when the day rolls over; old segments stay immutable.
 
 ## Compose footprint
 

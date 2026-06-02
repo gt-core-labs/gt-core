@@ -10,7 +10,8 @@ version.workspace = true
 gt-events = { workspace = true }
 serde.workspace = true
 serde_json.workspace = true
-time.workspace = true
+# `parsing` para extraer la fecha UTC del `ts` RFC3339 y rotar a un segmento por día (hq-mt-data.8).
+time = { workspace = true, features = ["parsing"] }
 fs2.workspace = true
 
 [dev-dependencies]

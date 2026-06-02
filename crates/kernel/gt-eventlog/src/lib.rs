@@ -15,4 +15,7 @@ pub use reader::{read_all, since, tail};
 pub use record::EventRecord;
 pub use replay::replay;
 pub use store::EventStore;
-pub use writer::{workspace_log_path, JsonlWriter, DEFAULT_EVENTLOG_ROOT, EVENTLOG_FILE};
+pub use writer::{
+    segment_file_name, workspace_log_dir, JsonlWriter, DEFAULT_EVENTLOG_ROOT, SEGMENT_EXT,
+    SEGMENT_PREFIX,
+};
