@@ -36,6 +36,50 @@ pub trait Plugin: Send + Sync {
     async fn on_event(&self, record: &EventRecord) -> Result<(), AppError>;
 }
 
+/// Read-only handler for a **filtered** cross-module subscription (see
+/// [`PluginRegistry::subscribe`]). Like [`Plugin`] it must not publish back into the domain
+/// bus or mutate actors — the subscription is an observer, so replay stays byte-identical
+/// (guardrail Rule: cross-module communication is event-driven + read-only). The relay only
+/// invokes `on_match` for records whose versioned `kind` matched the subscribed `(kind,
+/// version)`, so the handler never has to re-check the kind.
+#[async_trait]
+pub trait Subscriber: Send + Sync {
+    /// Fired once per matching [`EventRecord`]. Returning `Err` routes the failure to the
+    /// relay's [`PluginDeadLetter`] under the subscriber's `module_id` and continues the
+    /// fan-out, exactly like a [`Plugin`] error.
+    async fn on_match(&self, record: &EventRecord) -> Result<(), AppError>;
+}
+
+/// A `(kind, version)`-filtered observer: a [`Subscriber`] adapted to the [`Plugin`] fan-out
+/// so cross-module subscriptions ride the **same** relay, ordering and dead-letter machinery
+/// as full observers. The kind filter is applied here — inside the relay's call path, before
+/// the handler fires — so `on_match` only ever sees the records it asked for. Built by
+/// [`PluginRegistry::subscribe`]; not constructed directly.
+struct FilteredSubscription {
+    /// Stable subscriber identity, surfaced in dead-letter entries (e.g. `"dogs"`).
+    module_id: &'static str,
+    /// The full versioned kind this subscription matches, e.g. `bead.created.v1`.
+    want_kind: String,
+    handler: Arc<dyn Subscriber>,
+}
+
+#[async_trait]
+impl Plugin for FilteredSubscription {
+    fn name(&self) -> &'static str {
+        self.module_id
+    }
+
+    async fn on_event(&self, record: &EventRecord) -> Result<(), AppError> {
+        // Filter in the relay path: non-matching kinds are a no-op, so v1 and v2 of the same
+        // noun route to distinct subscriptions and unrelated kinds never reach the handler.
+        if record.kind == self.want_kind {
+            self.handler.on_match(record).await
+        } else {
+            Ok(())
+        }
+    }
+}
+
 /// Dead-letter entry produced by the plugin relay. Errors carry a `'static` plugin name and
 /// the event kind that triggered them; `Lagged` is recorded when a slow plugin fell behind
 /// the broadcast ring and skipped some events (mirrors `tokio::broadcast::RecvError::Lagged`).
@@ -141,6 +185,31 @@ impl PluginRegistry {
     pub fn register_arc(mut self, plugin: Arc<dyn Plugin>) -> Self {
         self.plugins.push(plugin);
         self
+    }
+
+    /// Register a **cross-module subscription**: `handler` fires only for records whose
+    /// versioned kind equals `<kind>.v<version>` (e.g. `subscribe("dogs", "bead.created", 1,
+    /// …)` matches `bead.created.v1`). The match is evaluated in the relay before the handler
+    /// runs, so a subscriber to `bead.created.v1` never sees `bead.created.v2` — versions
+    /// coexist as distinct subscriptions.
+    ///
+    /// Builder-style and order-preserving: the subscription joins the same ordered fan-out as
+    /// full [`Plugin`] observers and shares the relay's [`PluginDeadLetter`], so a handler
+    /// error is recorded under `module_id` without breaking the chain. Existing all-events
+    /// observers (e.g. [`SheriffPlugin`](crate::SheriffPlugin) via [`register`](Self::register))
+    /// are unaffected — this is purely additive.
+    pub fn subscribe(
+        self,
+        module_id: &'static str,
+        kind: &str,
+        version: u32,
+        handler: Arc<dyn Subscriber>,
+    ) -> Self {
+        self.register(FilteredSubscription {
+            module_id,
+            want_kind: format!("{kind}.v{version}"),
+            handler,
+        })
     }
 
     pub fn plugins(&self) -> &[Arc<dyn Plugin>] {

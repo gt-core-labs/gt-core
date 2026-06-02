@@ -17,7 +17,7 @@ use tokio::time::sleep;
 use gt_eventlog::EventRecord;
 use gt_events::AppError;
 use gt_plugin::{
-    spawn_plugin_relay, Plugin, PluginDeadLetterEntry, PluginRegistry, SheriffPlugin,
+    spawn_plugin_relay, Plugin, PluginDeadLetterEntry, PluginRegistry, SheriffPlugin, Subscriber,
 };
 
 fn rec(kind: &str, n: u64) -> EventRecord {
@@ -216,6 +216,69 @@ async fn lagged_subscriber_is_recorded_not_dropped() {
             .iter()
             .any(|e| matches!(e, PluginDeadLetterEntry::Lagged { skipped } if *skipped > 0)),
         "expected at least one Lagged entry: {entries:?}",
+    );
+
+    drop(tx);
+    let _ = task.await;
+}
+
+/// Counts the records a subscription actually received (after the relay's kind filter).
+struct CountingSubscriber {
+    seen: Arc<Mutex<Vec<String>>>,
+}
+
+#[async_trait]
+impl Subscriber for CountingSubscriber {
+    async fn on_match(&self, record: &EventRecord) -> Result<(), AppError> {
+        self.seen.lock().unwrap().push(record.kind.clone());
+        Ok(())
+    }
+}
+
+/// A `(kind, version)` subscription fires only for its matched kind — `bead.created.v1` —
+/// while `bead.created.v2` and unrelated kinds are filtered out in the relay. A full observer
+/// registered alongside still sees every record (backwards-compatible all-events path).
+#[tokio::test(flavor = "current_thread")]
+async fn subscription_filters_by_kind_and_version_while_observer_sees_all() {
+    let (tx, rx) = broadcast::channel::<EventRecord>(16);
+    let matched = Arc::new(Mutex::new(Vec::new()));
+    let all = Arc::new(Mutex::new(Vec::new()));
+
+    let registry = Arc::new(
+        PluginRegistry::new()
+            // Full observer: must keep seeing every record.
+            .register(RecorderPlugin {
+                name: "observer",
+                log: all.clone(),
+            })
+            // Filtered subscription: only `bead.created.v1`.
+            .subscribe(
+                "subscriber",
+                "bead.created",
+                1,
+                Arc::new(CountingSubscriber {
+                    seen: matched.clone(),
+                }),
+            ),
+    );
+    let task = spawn_plugin_relay(rx, registry);
+
+    tx.send(rec("bead.created.v1", 1)).unwrap();
+    tx.send(rec("bead.created.v2", 2)).unwrap(); // same noun, different version → filtered out
+    tx.send(rec("quota.usage_probed.v1", 3)).unwrap(); // unrelated kind → filtered out
+
+    // Observer sees all three; once it has, the relay has processed every record.
+    drain_until(|| all.lock().unwrap().len() == 3, Duration::from_secs(2)).await;
+
+    assert_eq!(
+        *matched.lock().unwrap(),
+        vec!["bead.created.v1".to_string()],
+        "subscription must fire only for the matched (kind, version)"
+    );
+    assert_eq!(
+        all.lock().unwrap().len(),
+        3,
+        "full observer must still see every record"
     );
 
     drop(tx);

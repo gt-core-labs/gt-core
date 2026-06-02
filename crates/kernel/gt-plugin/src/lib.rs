@@ -27,5 +27,6 @@ pub mod sync;
 
 pub use plugin::{
     spawn_plugin_relay, Plugin, PluginDeadLetter, PluginDeadLetterEntry, PluginRegistry,
+    Subscriber,
 };
 pub use sheriff::SheriffPlugin;
