@@ -15,6 +15,7 @@ members = [
     "crates/domain/platform/gt-workspace",
     "crates/domain/platform/gt-issues",
     "crates/domain/platform/gt-meta",
+    "crates/domain/platform/gt-rig",
     "crates/domain/orchestration/gt-webhooks",
     "crates/domain/orchestration/gt-dog",
     "crates/domain/orchestration/gt-runtime",
@@ -101,6 +102,7 @@ gt-hooks         = { path = "crates/kernel/gt-hooks" }
 gt-workspace     = { path = "crates/domain/platform/gt-workspace" }
 gt-meta          = { path = "crates/domain/platform/gt-meta" }
 gt-issues        = { path = "crates/domain/platform/gt-issues" }
+gt-rig           = { path = "crates/domain/platform/gt-rig" }
 gt-webhooks      = { path = "crates/domain/orchestration/gt-webhooks" }
 gt-dog           = { path = "crates/domain/orchestration/gt-dog" }
 gt-runtime       = { path = "crates/domain/orchestration/gt-runtime" }

@@ -1,0 +1,31 @@
+[package]
+name = "gt-rig"
+edition.workspace = true
+version.workspace = true
+
+# hq-mc72.12.29 — rig catalog as orchestrator state.
+#
+# A rig is a managed repository in the workspace (Go: `internal/rig`). This crate models the
+# *orchestrator-state* facet only: the registry of rigs, their identity (name, beads prefix,
+# git remotes, default branch) and a sync `Command` path that mutates that registry via
+# domain events. Filesystem bootstrap (clone, bd init, redirects, dolt orphan cleanup,
+# identity verify) is classified B1 and lives under `deploy/bootstrap` — this crate does NO
+# I/O.
+#
+# Same shape as `gt-quota` / `gt-merge`: owned `RigEvent`, mutable `RigCatalog` inside one
+# actor, pure replay reducer (`RigState`), inverted `RigRepository` port. Time enters as
+# `now_secs` data so the reducer is byte-for-byte replayable.
+[dependencies]
+gt-events = { workspace = true }
+# gt-core module foundation (hq-mod-refactor.1): the `GtModule` trait the rig catalog is
+# wrapped in (`module.rs`). Path-available via the workspace dep declared in hq-mod-refactor.15.
+gt-module = { workspace = true }
+tokio.workspace = true
+serde.workspace = true
+# JSON Schema derives for Command arguments — surfaced by gt-mcp.
+schemars.workspace = true
+# `semver::Version` for the module's `ModuleMeta`.
+semver = { workspace = true }
+
+[dev-dependencies]
+serde_json.workspace = true
