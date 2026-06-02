@@ -45,6 +45,10 @@
 
 #![forbid(unsafe_code)]
 
+mod plugins;
+
+pub use plugins::DeaconPlugin;
+
 use gt_events::Envelope;
 use gt_runtime::{Phase, Supervisor};
 use tokio::sync::mpsc;
@@ -207,6 +211,16 @@ mod tests {
         assert_eq!(sup.phase(), Phase::Started);
         // Keep the stack alive past start.
         drop(stack);
+    }
+
+    #[tokio::test]
+    async fn plugin_registry_holds_the_two_observer_roles_in_order() {
+        let sup = Supervisor::new();
+        let (sinks, _rx) = sinks();
+        let stack = RoleStack::register(&sup, sinks).await.unwrap();
+        // Only sheriff + deacon are broadcast observers (witness/refinery/mayor are not
+        // plugins — see plugins.rs); registration order is the relay fan-out order.
+        assert_eq!(stack.plugin_registry().names(), vec!["sheriff", "deacon"]);
     }
 
     #[tokio::test]

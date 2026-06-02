@@ -20,9 +20,22 @@ gt-witness = { workspace = true }
 gt-deacon = { workspace = true }
 gt-mayor = { workspace = true }
 gt-refinery = { workspace = true }
+# Observer-plugin seam (hq-mod-refactor.16/.18): build the PluginRegistry the RootHandle
+# event hub relays to. `EventRecord` is the relayed wire form.
+gt-plugin = { workspace = true }
+gt-eventlog = { workspace = true }
+# The deacon observer decodes the typed merge events it tracks (roles -> orchestration dep,
+# allowed by docs/03 Rule 4). Keeps gt-deacon itself decoupled from the merge enum.
+gt-merge = { workspace = true }
+# `#[async_trait]` for the `Plugin` impl; RFC3339 -> epoch for the edge `at` field
+# (the `parsing` feature is not in the workspace default set).
+async-trait = { workspace = true }
+time = { workspace = true, features = ["parsing"] }
 # `mpsc`/`watch` for the event sinks + the lifecycle-anchor future.
 tokio = { workspace = true }
 
 [dev-dependencies]
 # The smoke + lifecycle tests drive actors and await transitions.
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "sync", "time"] }
+# Build typed `EventRecord` payloads in the observer-plugin tests.
+serde_json = { workspace = true }
