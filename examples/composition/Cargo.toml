@@ -3,24 +3,27 @@ name = "composition"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "Composition-root PROOF (hq-mod-refactor.21): the cross-domain reactor (#4) as observer plugins. Lives in examples/ (may dep anything) so the production composition-root home stays an open decision (refactor.13)."
+description = "Composition-root PROOF (hq-mod-refactor.21/.22): the cross-domain reactor (#4) as observer plugins + compose_workspace assembler (#9). Lives in examples/ (may dep anything) so the production composition-root home stays an open decision (refactor.13)."
 
 # examples/* may depend on anything (docs/03 Rule 4 table) — the only tier that can name the
-# scheduling + patrol + merge orchestration crates together, which the cross-domain reactor
-# needs. Keeping it here proves approach A end-to-end without committing a production home.
+# scheduling + patrol + merge orchestration crates together, which the cross-domain reactor +
+# the per-ws assembler need. Keeping it here proves approach A end-to-end without committing a
+# production home.
 [dependencies]
 gt-plugin = { workspace = true }
 gt-eventlog = { workspace = true }
 gt-events = { workspace = true }
 gt-scheduling = { workspace = true }
+gt-merge = { workspace = true }
 gt-patrol = { workspace = true }
-async-trait = { workspace = true }
-
-[dev-dependencies]
 gt-runtime = { workspace = true }
 gt-roles = { workspace = true }
 gt-beads = { workspace = true }
 gt-module = { workspace = true }
 gt-workspace = { workspace = true }
+async-trait = { workspace = true }
+tokio = { workspace = true }
+
+[dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "sync", "time"] }
 serde_json = { workspace = true }

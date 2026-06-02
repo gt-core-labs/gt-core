@@ -1,91 +1,79 @@
-//! End-to-end proof (`hq-mod-refactor.21`): the cross-domain reactor as observers. Assemble a
-//! per-workspace [`RootHandle`] event hub, register the role observers + the [`SchedulerPlugin`]
-//! onto it, publish a `patrol.lease-expired.v1` through the hub, and assert the scheduler
-//! re-enqueues the freed bead — through the REAL `gt_plugin` relay, no direct `on_event` call.
+//! End-to-end proof (`hq-mod-refactor.22`): [`compose_workspace`] wires the whole per-workspace
+//! composition root, and both cross-domain reactor arms fire through the REAL `gt_plugin` relay.
+//!
+//! - `patrol.lease-expired.v1` → the scheduler re-enqueues the freed bead.
+//! - `merge.ready.v1` → the merge actor advances the slot to `Merging`.
 
-use std::sync::Arc;
+use std::time::Duration;
 
-use composition::SchedulerPlugin;
-use gt_beads::InMemoryBeads;
+use composition::{compose_workspace, Composed};
 use gt_events::Envelope;
 use gt_eventlog::EventRecord;
-use gt_module::RootBuilder;
+use gt_merge::MergeEvent;
 use gt_patrol::PatrolEvent;
-use gt_roles::{RoleSinks, RoleStack};
-use gt_runtime::RootHandle;
 use gt_scheduling::SchedEvent;
 use gt_workspace::WorkspaceId;
 use tokio::sync::mpsc;
 
+fn record(kind: &str, payload: serde_json::Value) -> EventRecord {
+    EventRecord {
+        event_id: "e".into(),
+        correlation_id: "c".into(),
+        causation_id: None,
+        ts: "2026-06-02T12:00:00Z".into(),
+        kind: kind.into(),
+        payload,
+    }
+}
+
+fn publish(c: &Composed, kind: &str, payload: serde_json::Value) {
+    c.handle
+        .events_sender()
+        .send(record(kind, payload))
+        .expect("hub has subscribers");
+}
+
+async fn next<T: gt_events::EventKind>(rx: &mut mpsc::Receiver<Envelope<T>>) -> T {
+    tokio::time::timeout(Duration::from_secs(5), rx.recv())
+        .await
+        .expect("actor reacted before timeout")
+        .expect("sink open")
+        .payload
+}
+
 #[tokio::test]
-async fn lease_expiry_reenqueues_through_the_scheduler_observer() {
-    // Per-workspace root + event hub.
-    let ws = WorkspaceId::new("acme").expect("valid slug");
-    let handle = RootHandle::new(ws, RootBuilder::new().build().expect("empty root builds"));
+async fn compose_workspace_wires_both_reactor_arms() {
+    let mut c = compose_workspace(WorkspaceId::new("acme").expect("valid slug")).await;
 
-    // Scheduler actor; keep its event sink to observe the reaction.
-    let (sched_tx, mut sched_rx) = mpsc::channel::<Envelope<SchedEvent>>(16);
-    let sched = gt_scheduling::actor::spawn(InMemoryBeads::default(), sched_tx, 4);
-
-    // Role actors anchored to the handle's supervisor (sinks parked).
-    let (st, _sr) = mpsc::channel(16);
-    let (wt, _wr) = mpsc::channel(16);
-    let (dt, _dr) = mpsc::channel(16);
-    let (mt, _mr) = mpsc::channel(16);
-    let (rt, _rr) = mpsc::channel(16);
-    let stack = RoleStack::register(
-        handle.supervisor(),
-        RoleSinks { sheriff: st, witness: wt, deacon: dt, mayor: mt, refinery: rt },
-    )
-    .await
-    .expect("registers while Built");
-
-    // Full registry = the role observers + the cross-domain scheduler arm, on one hub.
-    let registry = stack
-        .plugin_registry()
-        .register(SchedulerPlugin::new(sched.clone()));
-    handle.spawn_plugins(Arc::new(registry));
-    assert!(handle.start().await, "supervisor starts the role actors");
-
-    // A lease expired: publish it through the hub.
-    let ev = PatrolEvent::LeaseExpired {
+    // ARM 1 — patrol.lease-expired.v1 → scheduler re-enqueue.
+    let le = PatrolEvent::LeaseExpired {
         bead: "gg-7".into(),
         worker: "polecat-3".into(),
         priority: 1,
     };
-    let record = EventRecord {
-        event_id: "e1".into(),
-        correlation_id: "c1".into(),
-        causation_id: None,
-        ts: "2026-06-02T12:00:00Z".into(),
-        kind: "patrol.lease-expired.v1".into(),
-        payload: serde_json::to_value(&ev).unwrap(),
-    };
-    handle.events_sender().send(record).expect("hub has subscribers");
-
-    // The scheduler observer should re-enqueue the bead — its actor emits SchedEvent::Enqueue
-    // (the auto-pump then dispatch-fails it since the bead is not a pending row in the repo,
-    // which is fine; the re-enqueue reaction is what we assert). All through the real relay.
-    let emitted = tokio::time::timeout(std::time::Duration::from_secs(5), sched_rx.recv())
-        .await
-        .expect("scheduler reacted before timeout")
-        .expect("sched sink open");
+    publish(&c, "patrol.lease-expired.v1", serde_json::to_value(&le).unwrap());
     assert!(
-        matches!(emitted.payload, SchedEvent::Enqueue { ref bead, priority } if bead == "gg-7" && priority == 1),
-        "lease expiry should re-enqueue the freed bead, got {:?}",
-        emitted.payload
+        matches!(next(&mut c.sched_events).await, SchedEvent::Enqueue { ref bead, priority } if bead == "gg-7" && priority == 1),
+        "lease expiry should re-enqueue the freed bead through the relay",
     );
 
-    // merge.merged frees a slot — just exercise the arm end-to-end (no queued work to pump).
-    let merged = EventRecord {
-        event_id: "e2".into(),
-        correlation_id: "c2".into(),
-        causation_id: None,
-        ts: "2026-06-02T12:00:01Z".into(),
-        kind: "merge.merged.v1".into(),
-        payload: serde_json::json!({ "Merged": { "bead": "gg-7", "sha": "abc1234" } }),
+    // ARM 2 — merge.ready.v1 → merge.start. Pre-submit so the slot exists in Ready, then drain
+    // the submit's own Ready event before publishing the observed-ready through the hub.
+    c.merge.submit("gg-9", "wt/gg-9", "01ABC.event").await;
+    assert!(
+        matches!(next(&mut c.merge_events).await, MergeEvent::Ready { ref bead, .. } if bead == "gg-9"),
+        "submit creates the Ready slot",
+    );
+    let ready = MergeEvent::Ready {
+        bead: "gg-9".into(),
+        branch: "wt/gg-9".into(),
+        channel_msg_id: "01ABC.event".into(),
     };
-    handle.events_sender().send(merged).expect("hub open");
+    publish(&c, "merge.ready.v1", serde_json::to_value(&ready).unwrap());
+    assert!(
+        matches!(next(&mut c.merge_events).await, MergeEvent::Started { ref bead } if bead == "gg-9"),
+        "observed-ready should advance the slot to Merging through the relay",
+    );
 
-    handle.shutdown().await;
+    c.handle.shutdown().await;
 }
