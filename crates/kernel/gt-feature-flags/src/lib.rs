@@ -22,6 +22,7 @@
 #![warn(missing_docs)]
 
 mod commands;
+mod deps;
 mod handlers;
 mod key;
 mod module;
@@ -30,6 +31,7 @@ mod repo;
 mod pg;
 
 pub use commands::{DisableFeature, EnableFeature, FeatureCmdError, ListFeatures};
+pub use deps::{blocking_dependents, module_id_of, ModuleDepGraph};
 pub use handlers::{run_disable_feature, run_enable_feature, run_list_features, FeatureOverride};
 pub use key::{FlagKey, FlagKeyError};
 pub use module::FlagsModule;
