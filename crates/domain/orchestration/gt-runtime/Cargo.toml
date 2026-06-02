@@ -9,6 +9,12 @@ description = "Per-workspace runtime composition: RootRegistry + RootHandle. Res
 [dependencies]
 # Kernel composition primitive (upward dep — orchestration -> kernel).
 gt-module = { workspace = true }
+# Observer-plugin relay (hq-mod-refactor.18): the per-ws event hub spawns
+# `spawn_plugin_relay` over a `broadcast::Receiver<EventRecord>`; role observers
+# (sheriff/witness/deacon/mayor/refinery) register here, not as central match arms.
+gt-plugin = { workspace = true }
+# `EventRecord` — the type-erased wire form the hub broadcasts to plugins + SSE.
+gt-eventlog = { workspace = true }
 # Tenant-boundary identifier (orchestration -> domain/platform, allowed by docs/03 dep table).
 gt-workspace = { workspace = true }
 # Lock-free concurrent map: the registry is hit on every per-workspace request.
@@ -20,3 +26,9 @@ tokio = { workspace = true }
 [dev-dependencies]
 # Module version literals for the hot-reload rebuild test (hq-mod-flags.6).
 semver = { workspace = true }
+# Build an `EventRecord` payload + impl the `Plugin` trait in the event-hub tests
+# (hq-mod-refactor.18).
+serde_json = { workspace = true }
+async-trait = { workspace = true }
+# `AppError` — the `Plugin::on_event` return type the test spies implement.
+gt-events = { workspace = true }
