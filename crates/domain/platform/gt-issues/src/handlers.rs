@@ -135,24 +135,44 @@ pub async fn run_close_issue(
     validate_only: bool,
 ) -> Result<(), AppError> {
     args.validate()?;
-    if validate_only {
-        return Ok(());
-    }
-    let sha = args.commit_sha.trim();
+    let sha = args.sha();
 
-    // S2 phase-2: confirm the sha delivered a non-planned surface before closing.
-    // `delivered` carries the resolved full sha to stamp once the close lands.
-    let mut delivered: Option<String> = None;
-    if let Some(inspector) = inspector {
-        let detail = issues
-            .get_detail(&args.id)
-            .await?
-            .ok_or_else(|| AppError::NotFound(format!("issue {}", args.id)))?;
-        let non_planned: Vec<String> = parse_surface_json(&detail.surface_json)
+    // The bead's non-planned surface decides whether a `commit_sha` is mandatory:
+    // a code surface still demands delivered-code proof, but a metadata/process
+    // bead (no non-planned surface) closes without one — agents no longer have to
+    // fabricate a sha for pure-tracking work (hq-gap-issues-close-for-metadata-only-beads).
+    // Loaded once and reused for the S2 delivery check below. A missing row is
+    // deferred to the `close` call's existence check, as before.
+    let non_planned: Vec<String> = match issues.get_detail(&args.id).await? {
+        Some(detail) => parse_surface_json(&detail.surface_json)
             .into_iter()
             .filter(|e| !e.planned)
             .map(|e| e.path)
-            .collect();
+            .collect(),
+        None => Vec::new(),
+    };
+
+    if !non_planned.is_empty() && sha.is_none() {
+        return Err(AppError::Validation(format!(
+            "issue {} declares a non-planned code surface; close requires commit_sha \
+             (delivered-code proof). Omit commit_sha only for metadata/process beads \
+             with no code surface.",
+            args.id
+        )));
+    }
+
+    // Report the requirement on the `validate` tool too — but stop before any
+    // state change.
+    if validate_only {
+        return Ok(());
+    }
+
+    // S2 phase-2: confirm the sha delivered a non-planned surface before closing.
+    // `delivered` carries the resolved full sha to stamp once the close lands.
+    // Only runs for a code-bearing bead with a sha and a repo wired; a
+    // metadata-only close skips it and leaves `delivered_sha` NULL.
+    let mut delivered: Option<String> = None;
+    if let (Some(inspector), Some(sha)) = (inspector, sha) {
         if !non_planned.is_empty() {
             let info = inspector.inspect(sha).ok_or_else(|| {
                 AppError::Validation(format!(
@@ -172,11 +192,13 @@ pub async fn run_close_issue(
             }
             delivered = Some(info.full_sha);
         }
-        // No non-planned surface → nothing to deliver; close leaves delivered_sha NULL.
     }
 
     let session = args.effective_session(actor);
-    let note = format!("closed @ {sha} (by {session})");
+    let note = match sha {
+        Some(sha) => format!("closed @ {sha} (by {session})"),
+        None => format!("closed (metadata-only, no commit) (by {session})"),
+    };
     issues.append_notes(&args.id, &note).await?;
     issues.close(&args.id, session).await?;
     if let Some(full_sha) = delivered {

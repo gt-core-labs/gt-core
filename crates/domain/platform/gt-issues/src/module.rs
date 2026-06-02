@@ -124,16 +124,18 @@ impl GtModule for IssuesModule {
             .tool_with_schema(
                 "issues.close.validate",
                 "Check whether closing an issue (status open|working -> closed) would be \
-                 accepted, including the required commit_sha (7+ hex) delivered-code proof. \
-                 No state change.",
+                 accepted. commit_sha (7+ hex) is required when the bead declares a \
+                 non-planned code surface (delivered-code proof); omit it for a \
+                 metadata/process bead with no code surface. No state change.",
                 schema_for::<CloseIssue>(),
             )
             .tool_with_schema(
                 "issues.close.execute",
                 "Close hq.issues row + stamp closed_at + closed_by_session (defaults to MCP \
-                 actor) + record delivering commit_sha (required, 7+ hex) as a note + atomic \
-                 Dolt commit. Close without commit_sha is rejected (delivered-code proof). \
-                 Already-closed rows reject; missing id returns NotFound.",
+                 actor) + record the delivering commit_sha as a note + atomic Dolt commit. \
+                 commit_sha (7+ hex) is required for a bead with a non-planned code surface \
+                 and rejected-if-absent; a metadata/process bead with no code surface closes \
+                 without one. Already-closed rows reject; missing id returns NotFound.",
                 schema_for::<CloseIssue>(),
             )
             .tool_with_schema(

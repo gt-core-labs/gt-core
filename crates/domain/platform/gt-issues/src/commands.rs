@@ -445,11 +445,16 @@ pub struct CloseIssue {
     /// Target bead id. Non-empty.
     pub id: String,
     /// Commit SHA proving the bead's code actually landed (hq-mod-mcp.11).
-    /// Required and non-empty — a `closed` bead must reference a delivered
-    /// commit, so a no-deliverable close is rejected by the server, not left to
-    /// caller honesty. Format: 7+ hex chars (git short or full sha). Existence of
-    /// the sha in the repo is NOT verified here — that is a later phase.
-    pub commit_sha: String,
+    /// Required (7+ hex, git short or full sha) for a bead that declares a
+    /// non-planned code surface — that close still needs delivered-code proof.
+    /// Optional (omit) for a metadata/process bead with NO non-planned surface:
+    /// a pure-tracking mutation produces no commit, so demanding a sha forced
+    /// agents to fabricate one (hq-gap-issues-close-for-metadata-only-beads). The
+    /// surface-based requirement is enforced store-side in
+    /// [`run_close_issue`](crate::handlers::run_close_issue); existence of the sha
+    /// in the repo is verified in a later phase (S2).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub commit_sha: Option<String>,
     /// Optional explicit session id for the attribution column. When omitted,
     /// `closed_by_session` defaults to the MCP scope actor.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -457,21 +462,20 @@ pub struct CloseIssue {
 }
 
 impl CloseIssue {
-    /// Shape-only validation, including the required well-formed `commit_sha`.
+    /// Shape-only validation. A supplied `commit_sha` must be well-formed (7+
+    /// hex); whether one is *required* depends on the bead's surface and is
+    /// decided store-side in [`run_close_issue`](crate::handlers::run_close_issue),
+    /// which the shape-only guard cannot see.
     pub fn validate(&self) -> Result<(), AppError> {
         if self.id.is_empty() {
             return Err(AppError::Validation("issue id is empty".into()));
         }
-        let sha = self.commit_sha.trim();
-        if sha.is_empty() {
-            return Err(AppError::Validation(
-                "close requires commit_sha (delivered-code proof)".into(),
-            ));
-        }
-        if sha.len() < 7 || !sha.chars().all(|c| c.is_ascii_hexdigit()) {
-            return Err(AppError::Validation(
-                "commit_sha must be 7+ hex chars (git short or full sha)".into(),
-            ));
+        if let Some(sha) = self.sha() {
+            if sha.len() < 7 || !sha.chars().all(|c| c.is_ascii_hexdigit()) {
+                return Err(AppError::Validation(
+                    "commit_sha must be 7+ hex chars (git short or full sha)".into(),
+                ));
+            }
         }
         if matches!(&self.closed_by_session, Some(s) if s.is_empty()) {
             return Err(AppError::Validation(
@@ -479,6 +483,16 @@ impl CloseIssue {
             ));
         }
         Ok(())
+    }
+
+    /// The trimmed `commit_sha`, or `None` when omitted or blank. A blank/empty
+    /// string is treated the same as omission so a caller cannot slip past the
+    /// code-surface requirement with whitespace.
+    pub fn sha(&self) -> Option<&str> {
+        self.commit_sha
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
     }
 
     /// Resolve the attribution string, falling back to the scope actor when the
@@ -811,31 +825,42 @@ mod tests {
     }
 
     #[test]
-    fn close_requires_well_formed_commit_sha() {
-        assert!(CloseIssue { id: "x".into(), commit_sha: "bbd0579".into(), closed_by_session: None }
+    fn close_validates_supplied_commit_sha_but_no_longer_requires_one() {
+        // Well-formed sha passes.
+        assert!(CloseIssue { id: "x".into(), commit_sha: Some("bbd0579".into()), closed_by_session: None }
             .validate()
             .is_ok());
         // Too short.
-        assert!(CloseIssue { id: "x".into(), commit_sha: "abc".into(), closed_by_session: None }
+        assert!(CloseIssue { id: "x".into(), commit_sha: Some("abc".into()), closed_by_session: None }
             .validate()
             .is_err());
         // Non-hex.
-        assert!(CloseIssue { id: "x".into(), commit_sha: "zzzzzzz".into(), closed_by_session: None }
+        assert!(CloseIssue { id: "x".into(), commit_sha: Some("zzzzzzz".into()), closed_by_session: None }
             .validate()
             .is_err());
-        // Missing.
-        assert!(CloseIssue { id: "x".into(), commit_sha: String::new(), closed_by_session: None }
+        // Omitted (None) now passes shape — the code-surface requirement is
+        // enforced store-side, so a metadata bead can close without a sha
+        // (hq-gap-issues-close-for-metadata-only-beads).
+        assert!(CloseIssue { id: "x".into(), commit_sha: None, closed_by_session: None }
             .validate()
-            .is_err());
+            .is_ok());
+        // A blank/whitespace sha is treated as omitted, not as a malformed value.
+        assert!(CloseIssue { id: "x".into(), commit_sha: Some("   ".into()), closed_by_session: None }
+            .validate()
+            .is_ok());
+        assert_eq!(
+            CloseIssue { id: "x".into(), commit_sha: Some("  bbd0579 ".into()), closed_by_session: None }.sha(),
+            Some("bbd0579")
+        );
     }
 
     #[test]
     fn close_effective_session_falls_back_to_actor() {
-        let c = CloseIssue { id: "x".into(), commit_sha: "bbd0579".into(), closed_by_session: None };
+        let c = CloseIssue { id: "x".into(), commit_sha: Some("bbd0579".into()), closed_by_session: None };
         assert_eq!(c.effective_session("mcp-local"), "mcp-local");
         let c = CloseIssue {
             id: "x".into(),
-            commit_sha: "bbd0579".into(),
+            commit_sha: Some("bbd0579".into()),
             closed_by_session: Some("sess-42".into()),
         };
         assert_eq!(c.effective_session("mcp-local"), "sess-42");
