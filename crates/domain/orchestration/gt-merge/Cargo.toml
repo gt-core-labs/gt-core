@@ -1,0 +1,22 @@
+[package]
+name = "gt-merge"
+edition.workspace = true
+version.workspace = true
+
+[dependencies]
+gt-events = { workspace = true }
+gt-channel = { workspace = true }
+# The module seam: MergeModule declares gt-merge's contributions to RootBuilder
+# (hq-mod-refactor.4), mirroring RigsModule. semver comes transitively via gt-module.
+gt-module = { workspace = true }
+semver.workspace = true
+tokio.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+# JSON Schema derives for Command arguments — surfaced by gt-mcp.
+schemars.workspace = true
+
+[dev-dependencies]
+# El gate test cablea el flujo entero (refinery+actor+channel) y reconstruye con replay.
+gt-eventlog = { workspace = true }
+ulid.workspace = true
