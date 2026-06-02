@@ -38,7 +38,7 @@ See [README.md](README.md) for crate table. [docs/00-overview.md](docs/00-overvi
 - Hand-wiring routes / MCP tools / migrations in app composition root. Use `RootBuilder::new(ws).module(...).build()`.
 - Re-using a `/tmp/wt-*` worktree someone else created.
 - **Re-inventing kernel primitives** — all now live in `crates/kernel/`: `gt-events`, `gt-bus`, `gt-telemetry`, `gt-plugin`, and the event-replay store `gt-eventlog` (was gastown's `gt-audit`). Use them; don't fork.
-- **Adding top-level folders** outside `crates/`, `examples/`, `docs/`. The taxonomy is fixed.
+- **Adding top-level folders** outside `crates/`, `examples/`, `docs/`, `.github/`. The taxonomy is fixed (`.github/` is CI-only, owner-ratified `hq-test-regress.3`).
 - **Cross-tier downward deps** (kernel depending on domain, domain depending on modules). One-way only.
 - **Unversioned event kinds** (`bead.created` instead of `bead.created.v1`).
 - **Workspace_id in MCP payload / URL / body.** Server-injected from auth ctx; spoofing rejected.

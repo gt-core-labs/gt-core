@@ -58,11 +58,12 @@ crates/
 
 examples/<crate>/                         ← reference impls (mod-hello only today)
 docs/<NN>-<topic>.md                      ← numbered design docs
+.github/workflows/                        ← CI workflows ONLY (build/test/contract gates)
 ```
 
 ### Forbidden
 
-- ❌ New top-level dirs (`api/`, `services/`, `lib/`, `pkg/`, etc.). The tree is the tree.
+- ❌ New top-level dirs (`api/`, `services/`, `lib/`, `pkg/`, etc.). The tree is the tree. **Sole exception: `.github/` for CI workflows** (`hq-test-regress.3`, owner-ratified) — build/test/contract gates only, no app or deploy code.
 - ❌ Crates outside `crates/` or `examples/`.
 - ❌ "Helper" crates dumped at `crates/<name>` without a tier. Pick kernel or domain.
 - ❌ A standalone `bins/` tier. gt-core ships libraries; apps (gastown) own their binaries. When a crate genuinely needs an executable, it lives as a `[[bin]]` inside that crate, not in a catch-all tier.

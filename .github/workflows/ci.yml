@@ -1,0 +1,101 @@
+# gt-core CI (hq-test-regress.3).
+#
+# Two jobs:
+#   build-test — HARD gate. `cargo build` + `cargo test` over the workspace. The
+#                workspace test run also exercises the event-replay determinism
+#                checks in gt-events (docs/03 Rule 7), so the byte-for-byte gate
+#                is covered here without a bespoke command. fmt + clippy run as
+#                REPORT-ONLY (continue-on-error) because `main` still carries
+#                rustfmt + clippy debt and CLAUDE.md forbids a blanket
+#                `cargo fmt` (it collides with live worktrees + an advancing
+#                main). Flip these to hard gates once the debt is cleared.
+#   contract   — HARD gate. Boots the same engines the gated contract suites
+#                need (Dolt + Postgres) as services and runs the suites that
+#                otherwise SKIP for lack of GT_DOLT_URL / GT_PG_URL — i.e. today
+#                they run nowhere. This is the headline win of wiring CI.
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: build
+        run: cargo build --workspace --all-targets
+      - name: test
+        run: cargo test --workspace
+      # Report-only until the standing debt is cleared (see header).
+      - name: fmt (report-only)
+        run: cargo fmt --all --check
+        continue-on-error: true
+      - name: clippy (report-only)
+        run: cargo clippy --workspace --all-targets
+        continue-on-error: true
+
+  contract:
+    runs-on: ubuntu-latest
+    services:
+      # A fresh dolthub image only grants root@localhost; a connection through
+      # the runner's port map arrives from a non-local host, so root@'%' is
+      # required for the test to authenticate (DOLT_ROOT_HOST=%).
+      dolt:
+        image: dolthub/dolt-sql-server:latest
+        env:
+          DOLT_ROOT_HOST: "%"
+        ports:
+          - 3306:3306
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: gastown
+          POSTGRES_PASSWORD: test
+          POSTGRES_DB: gastown
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U gastown"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: wait for dolt
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq default-mysql-client
+          for _ in $(seq 1 30); do
+            if mysqladmin ping -h 127.0.0.1 -P 3306 -u root --silent 2>/dev/null; then
+              echo "dolt ready"
+              exit 0
+            fi
+            sleep 2
+          done
+          echo "dolt did not become ready" >&2
+          exit 1
+      # Dolt-backed issues store. SERIAL: the suite reseeds one shared
+      # gt_rs_issues_test table (never the live hq), so parallel threads race.
+      - name: dolt contract
+        env:
+          GT_DOLT_URL: mysql://root@127.0.0.1:3306
+        run: cargo test -p gt-store-dolt --test issues_contract -- --test-threads=1
+      # Postgres-backed schema migration + workspace-scoped feature flags.
+      - name: pg contract
+        env:
+          GT_PG_URL: postgres://gastown:test@127.0.0.1:5432/gastown
+        run: |
+          cargo test -p gt-store-pg
+          cargo test -p gt-feature-flags
