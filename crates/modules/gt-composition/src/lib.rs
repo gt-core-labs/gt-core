@@ -1,23 +1,32 @@
-//! Composition-root PROOF (`hq-mod-refactor.21`/`.22`): the cross-domain reactor — function #4
-//! of the composition root — as **observer plugins** (approach A), plus [`compose_workspace`],
-//! a single-function per-workspace assembler (function #9).
+//! Composition root: per-workspace assembly of the module `Root` + the cross-domain reactor as
+//! **observer plugins** (approach A) + the role observers, exposed as [`compose_workspace`] (a
+//! direct assembler returning the handles) and [`live_root`] (registry-hosted, owned + drained).
 //!
-//! gt-core has no single `GtEvent` enum to match on (one event-kind namespace per module), so a
-//! cross-domain reaction is just another `gt_plugin::Plugin` on the per-workspace event hub,
-//! like the role observers (`gt_roles::DeaconPlugin` / `WitnessPlugin`). This crate adds the two
-//! orchestration arms the gastown `Reactor::react` expressed and that need no edge effects:
+//! This crate is the **app composition entry, not a `GtModule`**. gt-core has no single
+//! `GtEvent` enum to match on (one event-kind namespace per module), so a cross-domain reaction
+//! is just another `gt_plugin::Plugin` on the per-workspace event hub, like the role observers
+//! (`gt_roles::DeaconPlugin` / `WitnessPlugin`). The two orchestration arms the gastown
+//! `Reactor::react` expressed and that need no edge effects:
 //!
 //! - [`SchedulerPlugin`] — `patrol.lease-expired.v1` → re-enqueue; `merge.merged.v1` → free a slot.
 //! - [`MergePlugin`] — `merge.ready.v1` → advance the slot to `Merging`.
 //!
-//! and assembles them with the role observers into one live root via [`compose_workspace`].
+//! ## Tier placement
 //!
-//! Lives under `examples/` (the only dep tier that may name `gt-scheduling` + `gt-patrol` +
-//! `gt-merge` together) so the production composition-root home stays the open decision tracked
-//! by `hq-mod-refactor.13`. This is a working proof, not that home. The edge-effect arms
-//! (sling/rotate/`git merge`/lease release) and hydration are deferred to the real root, and
-//! `RootRegistry::get_or_hydrate` is synchronous so it cannot host this async assembly yet (see
-//! the gap filed with `.22`).
+//! The root must name `gt-scheduling` + `gt-patrol` + `gt-merge` + `gt-roles` together; the
+//! docs/03 Rule 4 table permits only `roles`, `modules`, and `examples` to depend on all
+//! `domain/*`. It lives in the `modules` tier as the dependency-legal production home
+//! (`hq-mod-refactor.26`, owner call) even though it is not a `GtModule`; a dedicated
+//! `crates/app/` tier would be the semantically-pure home but needs a Rule-2 tier approval
+//! (open under `hq-mod-refactor.13`).
+//!
+//! ## What is still deferred
+//!
+//! The edge-effect arms (sling/rotate/`git merge`/lease release, function #6), hydration (#7),
+//! and real PG/Dolt repos (#8) are not wired here — they are the remaining production I/O. The
+//! pattern itself (functions #1–#5, #9) is complete: [`live_root`] resolves a workspace through
+//! `RootRegistry::get_or_hydrate_async`, owns its actors via `Supervisor::anchor`, and drains
+//! their events onto the hub via `RootHandle::drain_events_from`.
 
 use std::sync::{Arc, Mutex};
 

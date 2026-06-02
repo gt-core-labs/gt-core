@@ -9,7 +9,7 @@
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use composition::live_root;
+use gt_composition::live_root;
 use gt_eventlog::EventRecord;
 use gt_patrol::PatrolEvent;
 use gt_runtime::RootRegistry;

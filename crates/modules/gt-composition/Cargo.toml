@@ -1,0 +1,31 @@
+[package]
+name = "gt-composition"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Composition root: per-workspace assembly of the module Root + role/scheduler/merge observers on the event hub (compose_workspace / live_root). The app entry, not a GtModule."
+
+# The composition root is the app entry that assembles every domain into one per-workspace Root.
+# It is NOT a GtModule — but it must name scheduling + patrol + merge + roles together, and the
+# docs/03 Rule 4 table permits exactly `roles`, `modules`, and `examples` to depend on all
+# `domain/*`. It lives in the `modules` tier as the dependency-legal production home (owner call,
+# hq-mod-refactor.26); a dedicated `crates/app/` tier would be the semantically-pure home but
+# needs a Rule-2 tier approval (still open under refactor.13).
+[dependencies]
+gt-plugin = { workspace = true }
+gt-eventlog = { workspace = true }
+gt-events = { workspace = true }
+gt-scheduling = { workspace = true }
+gt-merge = { workspace = true }
+gt-patrol = { workspace = true }
+gt-runtime = { workspace = true }
+gt-roles = { workspace = true }
+gt-beads = { workspace = true }
+gt-module = { workspace = true }
+gt-workspace = { workspace = true }
+async-trait = { workspace = true }
+tokio = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "sync", "time"] }
+serde_json = { workspace = true }

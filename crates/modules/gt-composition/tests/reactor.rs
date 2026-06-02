@@ -6,7 +6,7 @@
 
 use std::time::Duration;
 
-use composition::{compose_workspace, Composed};
+use gt_composition::{compose_workspace, Composed};
 use gt_events::Envelope;
 use gt_eventlog::EventRecord;
 use gt_merge::MergeEvent;
