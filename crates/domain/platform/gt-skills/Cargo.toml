@@ -1,0 +1,16 @@
+[package]
+name = "gt-skills"
+edition.workspace = true
+version.workspace = true
+
+# Skills + role-binding domain (`hq-fe-skills.1`). Same shape as gt-rig / gt-quota:
+# owned events + pure replay reducer + sync `Command` path. No HTTP, no scope
+# resolution. The `SkillsModule` wrap is `hq-mod-refactor.14`, not this port.
+[dependencies]
+gt-events = { workspace = true }
+tokio.workspace = true
+serde.workspace = true
+schemars.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true
