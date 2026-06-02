@@ -30,6 +30,7 @@ members = [
     "crates/domain/roles/gt-roles",
     "crates/domain/orchestration/gt-quota",
     "crates/domain/orchestration/gt-merge",
+    "crates/domain/orchestration/gt-patrol",
     "crates/domain/orchestration/gt-orchestration",
     "crates/domain/orchestration/gt-webhooks",
     "crates/domain/orchestration/gt-dog",

@@ -1,0 +1,21 @@
+[package]
+name = "gt-patrol"
+edition.workspace = true
+version.workspace = true
+
+# Ported up from gastown (hq-core-port.15). Lease-expiry detector: turns a dispatched bead
+# whose worker stops heart-beating into a `PatrolEvent::LeaseExpired` the composition root
+# reacts to (re-enqueue) — and the source the witness role observes (hq-mod-refactor.16). Pure
+# detector (compares ages given as data, never reads the clock) so it stays replay-safe. No
+# domain deps: emits events, never calls scheduling/beads directly (integration-by-events).
+#
+# The gastown crate's e2e integration tests (tests/orchestration.rs, stale_lease_edges.rs)
+# played composition root over gt-scheduling/gt-agent/gt-audit and are NOT ported here:
+# gt-scheduling is not yet in gt-core, and that wiring belongs to the composition root
+# (hq-mod-refactor.13/.18), not this leaf crate. The crate's own unit tests come up with it.
+[dependencies]
+gt-events = { workspace = true }
+tokio.workspace = true
+serde.workspace = true
+# JSON Schema derives for Command arguments — surfaced by gt-mcp.
+schemars.workspace = true
