@@ -5,6 +5,7 @@ members = [
     "crates/kernel/gt-eventlog",
     "crates/kernel/gt-bus",
     "crates/kernel/gt-telemetry",
+    "crates/kernel/gt-plugin",
     "crates/kernel/gt-module",
     "crates/kernel/gt-module-mcp",
     "crates/kernel/gt-module-migrate",
@@ -65,6 +66,8 @@ thiserror = "2"
 ulid = "1"
 # Cross-platform advisory file lock for the gt-eventlog jsonl writer (hq-core-port.8).
 fs2 = "0.4"
+# Temp dirs/files — gt-plugin descriptor scanner + its tests (hq-core-port.11).
+tempfile = "3"
 time = { version = "0.3", features = ["std", "formatting"] }
 # RBAC config parser — gt-rbac reads TOML or JSON (hq-core-host.4).
 toml = "0.8"
@@ -88,6 +91,7 @@ gt-events        = { path = "crates/kernel/gt-events" }
 gt-eventlog      = { path = "crates/kernel/gt-eventlog" }
 gt-bus           = { path = "crates/kernel/gt-bus" }
 gt-telemetry     = { path = "crates/kernel/gt-telemetry" }
+gt-plugin        = { path = "crates/kernel/gt-plugin" }
 gt-module        = { path = "crates/kernel/gt-module" }
 gt-module-mcp       = { path = "crates/kernel/gt-module-mcp" }
 gt-module-migrate   = { path = "crates/kernel/gt-module-migrate" }

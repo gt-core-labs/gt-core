@@ -16,7 +16,7 @@ Foundational module system + multi-tenant primitives for Gas Town and downstream
 - `cargo build` green + replay byte-for-byte gate green before PR (gate required on every change touching events/reducers).
 - One bead per branch, conventional commits (`feat(gt-module): ...`). ff-merge to `main` from TOWN ROOT, never from a worktree.
 - **Anti-overlap:** never `git merge` straight to `main`. Use `git mainmerge <branch>` (`~/.claude/bin/gt-main-merge.sh`): flock serializes concurrent sessions + `--ff-only` ancestry check fails clean if main advanced (orchestrator race) → rebase and re-run. Don't bypass with a raw merge.
-- Migration from gastown to gt-core is crate-by-crate (see [docs/01-migration-plan.md](docs/01-migration-plan.md)). The P4 kernel freeze LIFTED 2026-06-02 (`hq-mod-refactor.10..12` closed replay-green). PORTED UP: `gt-events` (`hq-core-port.10`), `gt-bus` (`.12`), `gt-telemetry` (`.13`), and gastown's event-replay `gt-audit` (EventStore) as **`gt-eventlog`** (`.8`) — renamed because `gt-audit` is taken in gt-core by the RBAC dispatch audit sink. `gt-plugin` (`.11`) remains (depends on gt-eventlog).
+- Migration from gastown to gt-core is crate-by-crate (see [docs/01-migration-plan.md](docs/01-migration-plan.md)). The P4 kernel freeze LIFTED 2026-06-02 (`hq-mod-refactor.10..12` closed replay-green). The kernel wave is COMPLETE — PORTED UP: `gt-events` (`hq-core-port.10`), `gt-bus` (`.12`), `gt-telemetry` (`.13`), gastown's event-replay `gt-audit` (EventStore) as **`gt-eventlog`** (`.8`, renamed because `gt-audit` is taken in gt-core by the RBAC dispatch audit sink), and `gt-plugin` (`.11`). Next = the domain ports (`hq-core-port.1/.2/.3/.4/.5/.6/.7/.9`).
 - gastown stays the consumer while gt-core stabilizes. Don't touch gastown except for wiring (path patch) or a planned crate port.
 - Gap in tooling/spec → `meta.report_gap`, never improvise. Stop-the-line on any conflict with docs/04.
 
@@ -37,7 +37,7 @@ See [README.md](README.md) for crate table. [docs/00-overview.md](docs/00-overvi
 - Mutating domain state from observer subscriptions. Cross-module communication is event-driven only.
 - Hand-wiring routes / MCP tools / migrations in app composition root. Use `RootBuilder::new(ws).module(...).build()`.
 - Re-using a `/tmp/wt-*` worktree someone else created.
-- **Re-inventing kernel primitives** that already exist in gastown (`gt-plugin` remains; `gt-events`/`gt-bus`/`gt-telemetry` now live in `crates/kernel/`, and the event-replay store is `crates/kernel/gt-eventlog`). They migrate up in P4 — don't fork them.
+- **Re-inventing kernel primitives** — all now live in `crates/kernel/`: `gt-events`, `gt-bus`, `gt-telemetry`, `gt-plugin`, and the event-replay store `gt-eventlog` (was gastown's `gt-audit`). Use them; don't fork.
 - **Adding top-level folders** outside `crates/`, `examples/`, `docs/`. The taxonomy is fixed.
 - **Cross-tier downward deps** (kernel depending on domain, domain depending on modules). One-way only.
 - **Unversioned event kinds** (`bead.created` instead of `bead.created.v1`).

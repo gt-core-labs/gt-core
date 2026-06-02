@@ -1,0 +1,20 @@
+[package]
+name = "gt-plugin"
+edition.workspace = true
+version.workspace = true
+
+[dependencies]
+gt-events = { workspace = true }
+# The event-log store, ported from gastown's gt-audit (hq-core-port.8).
+gt-eventlog = { workspace = true }
+async-trait.workspace = true
+tokio.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+toml.workspace = true
+sha2.workspace = true
+thiserror.workspace = true
+tempfile.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true
