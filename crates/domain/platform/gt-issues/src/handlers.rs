@@ -71,6 +71,18 @@ pub async fn run_update_issue(
 ) -> Result<Option<i64>, AppError> {
     args.validate()?;
     args.validate_surface(tree)?;
+    // NN-16 epic-exemption parity (hq-gap-issues-update-external-ref): when the
+    // patch re-points `external_ref` but omits `issue_type`, the shape-only
+    // `validate()` cannot tell an epic (exempt) from a bead. Resolve the type
+    // from the existing row so re-parenting a dash-named epic (e.g. `hq-core-host`
+    // -> `hq-core`) is accepted just like `issues.create` accepts it. Runs before
+    // the `validate_only` return so the `.validate` tool reports it too. A missing
+    // row is left to the execute path's `affected_rows == 0` existence check.
+    if args.issue_type.is_none() && args.external_ref.as_deref().is_some_and(|r| !r.is_empty()) {
+        if let Some(detail) = issues.get_detail(&args.id).await? {
+            args.check_taxonomy(&detail.issue_type)?;
+        }
+    }
     if validate_only {
         return Ok(None);
     }

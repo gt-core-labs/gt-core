@@ -317,19 +317,16 @@ impl UpdateIssue {
                 return Err(AppError::Validation(format!("priority must be 0..=2, got {p}")));
             }
         }
-        // NN-16 is only checkable when the caller (re)points `external_ref`,
-        // since a partial patch otherwise lacks the row's id/external_ref pair.
-        // When `issue_type` is not also being set, assume a non-epic bead
-        // (`task`) — the strictest interpretation, matching gastown's guard.
-        if let Some(external_ref) = &self.external_ref {
-            if !external_ref.is_empty() {
-                taxonomy_validate(&BeadTaxonomy {
-                    id: &self.id,
-                    issue_type: self.issue_type.as_deref().unwrap_or("task"),
-                    external_ref,
-                })
-                .map_err(taxonomy_err)?;
-            }
+        // NN-16 is only checkable when the caller (re)points `external_ref`, and
+        // only the shape-only part here: when the patch ALSO carries `issue_type`
+        // the post-update type is known, so validate against it (epics exempt).
+        // When `issue_type` is omitted, a partial patch cannot tell an epic
+        // (exempt) from a bead, so this guard defers — the store-aware
+        // `run_update_issue` re-checks against the EXISTING row's type. Assuming
+        // `task` here wrongly rejected re-parenting a dash-named epic like
+        // `hq-core-host` -> `hq-core` (hq-gap-issues-update-external-ref).
+        if let Some(issue_type) = &self.issue_type {
+            self.check_taxonomy(issue_type)?;
         }
         if let Some(domain) = &self.domain {
             if domain.is_empty() {
@@ -350,6 +347,25 @@ impl UpdateIssue {
         }
         if self.to_patch().is_empty() {
             return Err(AppError::Validation("no fields set; nothing to update".into()));
+        }
+        Ok(())
+    }
+
+    /// NN-16 re-check for a re-pointed `external_ref`, against a resolved
+    /// `issue_type` — the patch's own when present, else the existing row's type
+    /// (the store-aware [`run_update_issue`](crate::handlers::run_update_issue)
+    /// supplies it). Epics are exempt, matching `issues.create`. A no-op when the
+    /// patch does not set `external_ref` to a non-empty value.
+    pub fn check_taxonomy(&self, issue_type: &str) -> Result<(), AppError> {
+        if let Some(external_ref) = &self.external_ref {
+            if !external_ref.is_empty() {
+                taxonomy_validate(&BeadTaxonomy {
+                    id: &self.id,
+                    issue_type,
+                    external_ref,
+                })
+                .map_err(taxonomy_err)?;
+            }
         }
         Ok(())
     }
@@ -543,6 +559,28 @@ mod tests {
         }
     }
 
+    /// An all-`None` patch (every field omitted) — fill in the field under test.
+    fn base_update() -> UpdateIssue {
+        UpdateIssue {
+            id: "hq-core-host".into(),
+            title: None,
+            description: None,
+            design: None,
+            acceptance_criteria: None,
+            notes: None,
+            priority: None,
+            issue_type: None,
+            assignee: None,
+            owner: None,
+            external_ref: None,
+            domain: None,
+            surface: None,
+            depends_on: None,
+            phase: None,
+            expected_version: None,
+        }
+    }
+
     #[test]
     fn create_accepts_well_formed_bead() {
         assert!(base_create().validate().is_ok());
@@ -718,6 +756,51 @@ mod tests {
             expected_version: None,
         };
         assert!(u.validate().is_err());
+    }
+
+    #[test]
+    fn update_reparent_to_epic_passes_shape_validate_when_type_in_patch() {
+        // Re-parenting a dash-named epic (`hq-core-host` -> ext_ref `hq-core`)
+        // is accepted when the patch declares `issue_type=epic` — epics are
+        // exempt from the `<external_ref>.<n>` id rule, same as create.
+        let mut u = base_update();
+        u.external_ref = Some("hq-core".into());
+        u.issue_type = Some("epic".into());
+        assert!(u.validate().is_ok());
+    }
+
+    #[test]
+    fn update_reparent_defers_taxonomy_when_type_omitted() {
+        // With `issue_type` omitted the shape-only guard cannot tell an epic from
+        // a bead, so it no longer assumes `task`; the store-aware handler
+        // re-checks against the row's real type (hq-gap-issues-update-external-ref).
+        let mut u = base_update();
+        u.external_ref = Some("hq-core".into());
+        assert!(u.validate().is_ok());
+    }
+
+    #[test]
+    fn update_reparent_rejects_bead_with_wrong_type_in_patch() {
+        // When the patch declares a non-epic type, the strict bead rule applies:
+        // `hq-core-host` is not `<hq-core>.<n>`.
+        let mut u = base_update();
+        u.external_ref = Some("hq-core".into());
+        u.issue_type = Some("task".into());
+        assert!(matches!(u.validate(), Err(AppError::Validation(_))));
+    }
+
+    #[test]
+    fn check_taxonomy_exempts_epic_and_rejects_mismatched_bead() {
+        let mut u = base_update();
+        u.id = "hq-core-host".into();
+        u.external_ref = Some("hq-core".into());
+        // Resolved as epic -> exempt.
+        assert!(u.check_taxonomy("epic").is_ok());
+        // Resolved as a bead -> id must be `<hq-core>.<n>`, which it is not.
+        assert!(u.check_taxonomy("task").is_err());
+        // No external_ref repoint -> no-op regardless of type.
+        let u = base_update();
+        assert!(u.check_taxonomy("task").is_ok());
     }
 
     #[test]
