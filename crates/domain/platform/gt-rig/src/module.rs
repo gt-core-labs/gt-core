@@ -217,7 +217,14 @@ mod tests {
         assert_eq!(migs.len(), 1);
         assert_eq!(migs[0].version, 1);
         assert_eq!(migs[0].name, "create_rigs");
-        assert!(migs[0].sql.contains("CREATE TABLE IF NOT EXISTS rigs"));
+        // Schema-per-ws (hq-mt-data.3, docs/04 §15): the table is created in the
+        // `ws_default` template schema so `gt_create_workspace_schema` clones it per
+        // tenant — not in `public` (which holds only cross-tenant catalogs).
+        assert!(migs[0].sql.contains("CREATE TABLE IF NOT EXISTS ws_default.rigs"));
+        assert!(
+            migs[0].sql.contains("CREATE SCHEMA IF NOT EXISTS ws_default"),
+            "must bootstrap the template schema it populates",
+        );
     }
 
     #[test]
