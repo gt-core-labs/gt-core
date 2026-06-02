@@ -19,7 +19,7 @@
 
 use std::collections::HashMap;
 
-use gt_store_dolt::{AppError, DoltIssues, IssueDetail, IssueFilter, IssuePhase, IssueRow};
+use gt_store_dolt::{AppError, DepFact, DoltIssues, IssueDetail, IssueFilter, IssuePhase, IssueRow};
 
 use crate::readiness::is_ready;
 use crate::surface::SurfaceTree;
@@ -41,27 +41,21 @@ pub async fn read_issue(issues: &DoltIssues, id: &str) -> Result<Option<IssueDet
 }
 
 /// Narrow a candidate snapshot to only the **sound** beads (`gt://issues?ready=true`,
-/// hq-core-mcp.11, docs/10 §S4): each surviving row passes all four readiness
-/// clauses via [`is_ready`]. The server supplies the gathered inputs — `open_phase`
-/// from the frontier, `delivered` from
-/// [`delivered_index`](DoltIssues::delivered_index) (covering the whole table so a
-/// dependency outside the candidate set is still resolvable), and the `main` git
-/// `tree`. Keeping the fan-out here means the readiness contract lives with the
-/// module that owns the issues data rather than in the transport bin.
+/// hq-core-mcp.11/.12, docs/10 §S4 + §C): each surviving row passes all four
+/// readiness clauses via [`is_ready`]. The server supplies the gathered inputs —
+/// `open_phase` from the frontier, `deps` from
+/// [`dep_index`](DoltIssues::dep_index) (covering the whole table so a dependency
+/// outside the candidate set is still resolvable, and carrying `issue_type`/
+/// `status` so the epic-dep rule applies), and the `main` git `tree`. Keeping the
+/// fan-out here means the readiness contract lives with the module that owns the
+/// issues data rather than in the transport bin.
 pub fn filter_ready(
     rows: Vec<IssueRow>,
     open_phase: IssuePhase,
-    delivered: &HashMap<String, bool>,
+    deps: &HashMap<String, DepFact>,
     tree: &(dyn SurfaceTree + Sync),
 ) -> Vec<IssueRow> {
     rows.into_iter()
-        .filter(|r| {
-            is_ready(
-                r,
-                open_phase,
-                &|id| delivered.get(id).copied().unwrap_or(false),
-                tree,
-            )
-        })
+        .filter(|r| is_ready(r, open_phase, &|id| deps.get(id).cloned(), tree))
         .collect()
 }

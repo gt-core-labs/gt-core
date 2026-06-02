@@ -203,6 +203,26 @@ pub enum ClaimOutcome {
     Lost { status: String, holder: String },
 }
 
+/// The per-dependency facts readiness needs to decide whether a `depends_on`
+/// edge is satisfied (hq-core-mcp.12 §C, docs/10 §S4). Built once for the whole
+/// table by [`DoltIssues::dep_index`] so `gt://issues?ready=true` resolves each
+/// edge with a single one-hop lookup.
+///
+/// The epic-dep rule lives in the readiness predicate, not here: an `epic`
+/// dependency delivers-by-close (`status == "closed"`; epics have no single
+/// `delivered_sha`), a non-epic dependency by `delivered` (`delivered_sha` is
+/// non-NULL).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DepFact {
+    /// The dependency's `issue_type` (`epic` is treated specially).
+    pub issue_type: String,
+    /// The dependency's lifecycle `status` (`closed` satisfies an epic dep).
+    pub status: String,
+    /// Whether the dependency has a non-NULL `delivered_sha` (satisfies a
+    /// non-epic dep).
+    pub delivered: bool,
+}
+
 /// Full single-issue row returned by [`DoltIssues::get_detail`]. Superset of
 /// [`IssueRow`] that also carries the heavy text bodies (`description`,
 /// `design`, `acceptance_criteria`, `notes`) the list snapshot omits to stay
@@ -1236,21 +1256,40 @@ impl DoltIssues {
         Ok(())
     }
 
-    /// Map every bead id to whether it has a non-NULL `delivered_sha`
-    /// (hq-core-mcp.11, docs/10 §S4). Unbounded (no `LIMIT`) and column-minimal so
-    /// `gt://issues?ready=true` can resolve a candidate's `depends_on` against the
-    /// trustworthy delivery signal in a single one-hop lookup — a dependency may
-    /// itself be filtered out of the display set, so the index must cover the whole
-    /// table, not just the candidates.
-    pub async fn delivered_index(&self) -> Result<std::collections::HashMap<String, bool>, AppError> {
+    /// Map every bead id to the [`DepFact`] readiness needs to judge whether it
+    /// satisfies a downstream dependency (hq-core-mcp.11/.12, docs/10 §S4 + §C).
+    /// Unbounded (no `LIMIT`) and column-minimal so `gt://issues?ready=true` can
+    /// resolve a candidate's `depends_on` in a single one-hop lookup — a dependency
+    /// may itself be filtered out of the display set, so the index must cover the
+    /// whole table, not just the candidates.
+    ///
+    /// Carries `issue_type` + `status` alongside the delivered flag so the
+    /// readiness predicate can apply the epic-dep rule (hq-core-mcp.12 §C): an
+    /// `epic` dependency delivers-by-close, a non-epic dependency by a non-NULL
+    /// `delivered_sha`.
+    pub async fn dep_index(
+        &self,
+    ) -> Result<std::collections::HashMap<String, DepFact>, AppError> {
         let mut conn = self.pool.get_conn().await.map_err(map_err)?;
-        let rows: Vec<(String, Option<String>)> = conn
-            .exec("SELECT id, delivered_sha FROM issues", mysql_async::Params::Empty)
+        let rows: Vec<(String, String, String, Option<String>)> = conn
+            .exec(
+                "SELECT id, issue_type, status, delivered_sha FROM issues",
+                mysql_async::Params::Empty,
+            )
             .await
             .map_err(map_err)?;
         Ok(rows
             .into_iter()
-            .map(|(id, sha)| (id, sha.map(|s| !s.trim().is_empty()).unwrap_or(false)))
+            .map(|(id, issue_type, status, sha)| {
+                (
+                    id,
+                    DepFact {
+                        issue_type,
+                        status,
+                        delivered: sha.map(|s| !s.trim().is_empty()).unwrap_or(false),
+                    },
+                )
+            })
             .collect())
     }
 

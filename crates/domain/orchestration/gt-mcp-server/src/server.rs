@@ -235,10 +235,10 @@ impl IssuesServer {
             // applied by the module's `filter_ready`.
             let rows = if filter.ready {
                 let open_phase = self.store.open_phase().await?;
-                let delivered = self.store.delivered_index().await?;
+                let deps = self.store.dep_index().await?;
                 let repo_dir = self.repo_dir.as_deref().map(|p| p.as_path());
                 let tree = crate::git_tree::surface_tree(repo_dir);
-                gt_issues::resources::filter_ready(rows, open_phase, &delivered, tree.as_ref())
+                gt_issues::resources::filter_ready(rows, open_phase, &deps, tree.as_ref())
             } else {
                 rows
             };

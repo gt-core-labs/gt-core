@@ -20,6 +20,6 @@ pub use commit::{commit, diff_summary, rollback};
 pub use conn::connect;
 pub use error::AppError;
 pub use issues_repo::{
-    ClaimOutcome, DoltIssues, IssueDetail, IssueFilter, IssuePatch, IssuePhase, IssueRow,
+    ClaimOutcome, DepFact, DoltIssues, IssueDetail, IssueFilter, IssuePatch, IssuePhase, IssueRow,
     IssueStatus, NewIssue,
 };

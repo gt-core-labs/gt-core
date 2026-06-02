@@ -20,23 +20,44 @@
 //! without a second predicate. The pure predicate lives here; the server gathers
 //! the inputs (the delivered index, the open phase, the git tree) and applies it.
 
-use gt_store_dolt::{IssuePhase, IssueRow};
+use gt_store_dolt::{DepFact, IssuePhase, IssueRow};
 
 use crate::surface::{parse_surface_json, SurfaceTree};
+
+/// The epic-dep rule (hq-core-mcp.12 §C): when does a `depends_on` edge count as
+/// satisfied?
+///
+/// - An **epic** dependency delivers-by-close — epics have no single
+///   `delivered_sha` (they are satisfied by the union of their children closing),
+///   so `status == "closed"` is the signal.
+/// - A **non-epic** dependency (task/spike/…) is satisfied only by a non-NULL
+///   `delivered_sha` — `closed` alone is not enough (a wontfix close delivers no
+///   artifact), per docs/10 §S2.
+///
+/// Before this rule a dep-on-a-closed-epic could never go ready (epics never
+/// stamp `delivered_sha`), false-hiding every bead that depends on an epic.
+pub fn dep_satisfied(fact: &DepFact) -> bool {
+    if fact.issue_type == "epic" {
+        fact.status == "closed"
+    } else {
+        fact.delivered
+    }
+}
 
 /// True when `row` passes all four readiness clauses (§S4).
 ///
 /// - `open_phase` is the current `phase_frontier.open_phase`.
-/// - `is_delivered(dep_id)` reports whether a dependency has a non-NULL
-///   `delivered_sha` (the [`delivered_index`](gt_store_dolt::DoltIssues::delivered_index)
-///   lookup); an unknown dep id counts as **not** delivered.
+/// - `dep_fact(dep_id)` looks up a dependency's [`DepFact`] (the
+///   [`dep_index`](gt_store_dolt::DoltIssues::dep_index) lookup); an unknown dep
+///   id counts as **not** satisfied. The edge is judged by [`dep_satisfied`]
+///   (the epic-dep rule, §C).
 /// - `tree` is the `main` git tree the bead's own non-`planned` surfaces are
 ///   checked against (an [`AllowAllTree`](crate::AllowAllTree) when no repo is
 ///   wired, so the surface clause passes — mirroring the §S3 degradation).
 pub fn is_ready(
     row: &IssueRow,
     open_phase: IssuePhase,
-    is_delivered: &dyn Fn(&str) -> bool,
+    dep_fact: &dyn Fn(&str) -> Option<DepFact>,
     tree: &(dyn SurfaceTree + Sync),
 ) -> bool {
     // Clause 4: only an open bead is claimable.
@@ -49,10 +70,13 @@ pub fn is_ready(
         Some(phase) if phase <= open_phase => {}
         _ => return false,
     }
-    // Clause 1 (S2): every dependency must have delivered (sha on main), not just
-    // be marked closed.
+    // Clause 1 (S2 + §C): every dependency must be satisfied — a non-epic dep by
+    // delivery (sha on main), an epic dep by close — not merely be marked closed.
     let deps: Vec<String> = serde_json::from_str(&row.depends_on_json).unwrap_or_default();
-    if !deps.iter().all(|d| is_delivered(d)) {
+    if !deps
+        .iter()
+        .all(|d| dep_fact(d).as_ref().map(dep_satisfied).unwrap_or(false))
+    {
         return false;
     }
     // Clause 3 (S3): the bead's own non-`planned` surfaces must exist on `main`.
@@ -98,11 +122,18 @@ mod tests {
         }
     }
 
-    fn none_delivered(_: &str) -> bool {
-        false
+    /// No dep is resolvable → every edge unsatisfied (unknown ids count as not
+    /// satisfied).
+    fn none_delivered(_: &str) -> Option<DepFact> {
+        None
     }
-    fn all_delivered(_: &str) -> bool {
-        true
+    /// Every dep is a delivered non-epic task → every edge satisfied.
+    fn all_delivered(_: &str) -> Option<DepFact> {
+        Some(DepFact {
+            issue_type: "task".into(),
+            status: "closed".into(),
+            delivered: true,
+        })
     }
 
     #[test]
@@ -130,6 +161,44 @@ mod tests {
         let r = row("open", "P1", r#"["hq-dep.1"]"#, "[]");
         assert!(!is_ready(&r, IssuePhase::P3, &none_delivered, &AllowAllTree));
         assert!(is_ready(&r, IssuePhase::P3, &all_delivered, &AllowAllTree));
+    }
+
+    #[test]
+    fn epic_dep_rule_closed_epic_satisfies_undelivered_task_does_not() {
+        // §C: a dep that is a CLOSED EPIC satisfies (epics deliver-by-close, never
+        // stamp a single delivered_sha) — so a bead depending on it is ready even
+        // though the epic has delivered_sha NULL.
+        let closed_epic = |_: &str| {
+            Some(DepFact {
+                issue_type: "epic".into(),
+                status: "closed".into(),
+                delivered: false,
+            })
+        };
+        let r = row("open", "P1", r#"["hq-epic"]"#, "[]");
+        assert!(is_ready(&r, IssuePhase::P3, &closed_epic, &AllowAllTree));
+
+        // §C: a dep that is a CLOSED TASK with delivered_sha NULL does NOT satisfy
+        // (a wontfix/no-deliverable close produced no artifact).
+        let closed_task_no_sha = |_: &str| {
+            Some(DepFact {
+                issue_type: "task".into(),
+                status: "closed".into(),
+                delivered: false,
+            })
+        };
+        let r = row("open", "P1", r#"["hq-task.1"]"#, "[]");
+        assert!(!is_ready(&r, IssuePhase::P3, &closed_task_no_sha, &AllowAllTree));
+
+        // An OPEN epic does not satisfy (deliver-by-close requires the close).
+        let open_epic = |_: &str| {
+            Some(DepFact {
+                issue_type: "epic".into(),
+                status: "open".into(),
+                delivered: false,
+            })
+        };
+        assert!(!is_ready(&r, IssuePhase::P3, &open_epic, &AllowAllTree));
     }
 
     #[test]
