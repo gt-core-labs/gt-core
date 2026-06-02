@@ -30,6 +30,7 @@
 mod cargo_graph;
 mod delivered;
 mod edges;
+mod fitness;
 mod health;
 mod model;
 mod provenance;
@@ -45,6 +46,7 @@ use gt_store_dolt::{DepFact, DoltIssues, IssueFilter, IssuePatch, IssueRow};
 use cargo_graph::CrateGraph;
 use delivered::{pick_delivered_sha, ShaCandidate};
 use edges::{derive_missing_edges, filter_acyclic};
+use fitness::{Fitness, FitnessInputs};
 use health::{evaluate, HealthMetrics, Thresholds};
 use model::Bead;
 use provenance::{already_stamped, resolve_origin, SourceRepo};
@@ -266,6 +268,26 @@ async fn main() -> anyhow::Result<()> {
     println!("beads-unhidden (est.)  : {unhidden}");
     if !apply {
         println!("\n(dry-run — re-run with --apply to write)");
+    }
+
+    // ── fitness (hq-auto.6): fold the same pass into the self-improve scorecard.
+    // Counts come straight from the data already loaded/derived above, so this
+    // adds no query. Emitted before the circuit-breaker so the scorecard prints
+    // even on a HALT exit.
+    let closed_tasks = beads.iter().filter(|b| b.status == "closed" && b.issue_type == "task");
+    let closed_task_count = closed_tasks.clone().count();
+    let delivered_task_count = closed_tasks.filter(|b| b.delivered).count();
+    let fit = Fitness::assess(&FitnessInputs {
+        closed_tasks: closed_task_count,
+        delivered_tasks: delivered_task_count,
+        dep_edges_present: beads.iter().map(|b| b.depends_on.len()).sum(),
+        dep_edges_missing: derivation.missing_edges.len(),
+        traps_claimed: missing_shas,
+        false_hidden: unhidden,
+    });
+    println!("\n── fitness ── {}", fit.label());
+    for line in fit.report_lines() {
+        println!("  {line}");
     }
 
     // ── circuit-breaker (hq-auto.5): fold the pass's health signals through the
