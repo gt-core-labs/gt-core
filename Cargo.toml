@@ -2,6 +2,7 @@
 resolver = "2"
 members = [
     "crates/kernel/gt-events",
+    "crates/kernel/gt-eventlog",
     "crates/kernel/gt-bus",
     "crates/kernel/gt-telemetry",
     "crates/kernel/gt-module",
@@ -62,6 +63,8 @@ mysql_async = { version = "0.34", default-features = false, features = ["minimal
 thiserror = "2"
 # Event kernel (hq-core-port.10) — ulid for Envelope event ids, time for RFC3339 stamps.
 ulid = "1"
+# Cross-platform advisory file lock for the gt-eventlog jsonl writer (hq-core-port.8).
+fs2 = "0.4"
 time = { version = "0.3", features = ["std", "formatting"] }
 # RBAC config parser — gt-rbac reads TOML or JSON (hq-core-host.4).
 toml = "0.8"
@@ -82,6 +85,7 @@ anyhow = "1"
 # Internal crates — referenced as `<name> = { workspace = true }` from member Cargo.toml.
 # Path-centralized here so members never juggle relative paths across tiers.
 gt-events        = { path = "crates/kernel/gt-events" }
+gt-eventlog      = { path = "crates/kernel/gt-eventlog" }
 gt-bus           = { path = "crates/kernel/gt-bus" }
 gt-telemetry     = { path = "crates/kernel/gt-telemetry" }
 gt-module        = { path = "crates/kernel/gt-module" }

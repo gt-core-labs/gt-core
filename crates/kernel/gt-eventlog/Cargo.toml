@@ -1,0 +1,14 @@
+# gt-eventlog — renamed from gastown's `gt-audit` on port-up (hq-core-port.8): the
+# event-log persistence + deterministic replay engine. The name `gt-audit` is taken in
+# gt-core by the RBAC dispatch audit sink (hq-core-host.4) — a different concept.
+[package]
+name = "gt-eventlog"
+edition.workspace = true
+version.workspace = true
+
+[dependencies]
+gt-events = { workspace = true }
+serde.workspace = true
+serde_json.workspace = true
+time.workspace = true
+fs2.workspace = true
