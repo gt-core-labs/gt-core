@@ -18,3 +18,11 @@ tokio = { workspace = true }
 tower = { workspace = true, features = ["util"] }
 axum = { workspace = true }
 utoipa = { workspace = true }
+# hq-mod-events.7 integration test exercises the full versioned-events stack end to end:
+# gt-eventlog replay/reader + gt-plugin cross-module subscribe alongside this crate's
+# Capability deprecation API. Dev-only — neither crate depends on gt-module, so no cycle.
+gt-events = { workspace = true }
+gt-eventlog = { workspace = true }
+gt-plugin = { workspace = true }
+async-trait = { workspace = true }
+tempfile = { workspace = true }
