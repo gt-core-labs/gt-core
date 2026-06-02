@@ -13,7 +13,7 @@ mod writer;
 
 pub use reader::{read_all, since, tail};
 pub use record::EventRecord;
-pub use replay::replay;
+pub use replay::{replay, replay_dispatch};
 pub use store::EventStore;
 pub use writer::{
     segment_file_name, workspace_log_dir, JsonlWriter, DEFAULT_EVENTLOG_ROOT, SEGMENT_EXT,
