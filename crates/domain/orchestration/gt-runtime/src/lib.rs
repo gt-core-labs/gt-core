@@ -29,12 +29,14 @@
 
 mod dispatch;
 mod handle;
+mod hydrate;
 mod idle;
 mod lifecycle;
 mod registry;
 
 pub use dispatch::{plan, BeadId, DispatchError, Dispatcher, ReadySource, Worker};
 pub use handle::RootHandle;
+pub use hydrate::{workspace_event_records, workspace_event_records_default};
 pub use idle::{idle_from_env, DEFAULT_IDLE_SECS};
 pub use lifecycle::{Phase, Supervisor};
 pub use registry::RootRegistry;

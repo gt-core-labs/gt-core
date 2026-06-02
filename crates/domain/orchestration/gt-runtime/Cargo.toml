@@ -34,3 +34,5 @@ semver = { workspace = true }
 # (hq-mod-refactor.18).
 serde_json = { workspace = true }
 async-trait = { workspace = true }
+# Throwaway eventlog volume root for the per-workspace hydration tests (hq-mt-routing.3).
+tempfile = { workspace = true }
