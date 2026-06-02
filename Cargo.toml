@@ -59,6 +59,8 @@ thiserror = "2"
 toml = "0.8"
 # Lock-free concurrent map (per-workspace RootRegistry, hq-mt-routing.1).
 dashmap = "6"
+# Raw flock(2) for the per-workspace Dolt data-dir guard (hq-mt-data.12).
+libc = "0.2"
 
 # Telemetry
 tracing = "0.1"

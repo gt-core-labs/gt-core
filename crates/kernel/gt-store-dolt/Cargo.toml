@@ -12,6 +12,8 @@ serde_json = { workspace = true }
 thiserror = { workspace = true }
 # Lock-free per-workspace pool registry (hq-mt-data.7).
 dashmap = { workspace = true }
+# Per-workspace flock guard against Dolt data-dir split-brain (hq-mt-data.12).
+libc = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt", "rt-multi-thread", "macros"] }
