@@ -104,6 +104,55 @@ pub fn derive_missing_edges(graph: &CrateGraph, beads: &[Bead]) -> EdgeDerivatio
     }
 }
 
+/// True when `goal` is reachable from `start` by following `depends_on` edges in
+/// `adj` (`adj[x]` = the ids `x` depends on). Used to detect that adding
+/// `from → to` would close a cycle (i.e. `to` already reaches `from`).
+fn reachable(adj: &BTreeMap<String, BTreeSet<String>>, start: &str, goal: &str) -> bool {
+    let mut stack = vec![start.to_string()];
+    let mut seen: BTreeSet<String> = BTreeSet::new();
+    while let Some(node) = stack.pop() {
+        if node == goal {
+            return true;
+        }
+        if !seen.insert(node.clone()) {
+            continue;
+        }
+        if let Some(deps) = adj.get(&node) {
+            stack.extend(deps.iter().cloned());
+        }
+    }
+    false
+}
+
+/// Filter proposed edges to those that do NOT create a cycle, given the existing
+/// `depends_on` graph (the server rejects cyclic `depends_on`). Edges are taken in
+/// the given order; each accepted edge updates the working adjacency so the batch
+/// itself also stays acyclic. Returns `(acyclic, skipped_cyclic)`.
+///
+/// An edge `from → to` is cyclic when `to` already reaches `from` — adding it
+/// would let `from` reach itself. The pre-existing reverse edge is left untouched
+/// (we only ever add), so the skip is reported, not resolved here.
+pub fn filter_acyclic(
+    beads: &[Bead],
+    proposed: &[(String, String)],
+) -> (Vec<(String, String)>, Vec<(String, String)>) {
+    let mut adj: BTreeMap<String, BTreeSet<String>> = beads
+        .iter()
+        .map(|b| (b.id.clone(), b.depends_on.iter().cloned().collect()))
+        .collect();
+    let mut acyclic = Vec::new();
+    let mut skipped = Vec::new();
+    for (from, to) in proposed {
+        if from == to || reachable(&adj, to, from) {
+            skipped.push((from.clone(), to.clone()));
+        } else {
+            adj.entry(from.clone()).or_default().insert(to.clone());
+            acyclic.push((from.clone(), to.clone()));
+        }
+    }
+    (acyclic, skipped)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -169,6 +218,22 @@ mod tests {
         ];
         let d = derive_missing_edges(&g, &beads);
         assert_eq!(d.missing_edges, vec![("x".into(), "early".into())]);
+    }
+
+    #[test]
+    fn cyclic_edge_is_skipped() {
+        // existing: b depends_on a. proposed: a -> b would cycle (b reaches a).
+        let beads = vec![
+            bead("a", "open", None, &[], &[]),
+            bead("b", "open", None, &[], &["a"]),
+        ];
+        let (ok, skipped) = filter_acyclic(&beads, &[("a".into(), "b".into())]);
+        assert!(ok.is_empty());
+        assert_eq!(skipped, vec![("a".into(), "b".into())]);
+        // a non-cyclic edge is kept.
+        let (ok, skipped) = filter_acyclic(&beads, &[("a".into(), "c".into())]);
+        assert_eq!(ok, vec![("a".into(), "c".into())]);
+        assert!(skipped.is_empty());
     }
 
     #[test]

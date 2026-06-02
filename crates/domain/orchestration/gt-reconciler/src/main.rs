@@ -43,7 +43,7 @@ use gt_store_dolt::{DepFact, DoltIssues, IssueFilter, IssuePatch, IssueRow};
 
 use cargo_graph::CrateGraph;
 use delivered::{pick_delivered_sha, ShaCandidate};
-use edges::derive_missing_edges;
+use edges::{derive_missing_edges, filter_acyclic};
 use model::Bead;
 use provenance::{already_stamped, resolve_origin, SourceRepo};
 
@@ -99,14 +99,18 @@ async fn main() -> anyhow::Result<()> {
     // ── §A — auto-derive depends_on edges from the Cargo graph.
     let graph = load_crate_graph(&core_repo)?;
     let derivation = derive_missing_edges(&graph, &beads);
+    // The server rejects cyclic depends_on; drop any proposed edge that would
+    // close a cycle against the existing graph (we only ever ADD, never remove the
+    // pre-existing reverse edge).
+    let (acyclic, skipped_cyclic) = filter_acyclic(&beads, &derivation.missing_edges);
     let mut edges_created = 0usize;
     // bead_id -> the new targets we are adding (for the unhidden calc).
     let mut added: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
-    if derivation.missing_edges.is_empty() {
+    if acyclic.is_empty() {
         println!("\n§A edges: none missing (graph matches Cargo).");
     } else {
-        println!("\n§A missing depends_on edges ({}):", derivation.missing_edges.len());
-        for (bead_id, target) in &derivation.missing_edges {
+        println!("\n§A missing depends_on edges ({}):", acyclic.len());
+        for (bead_id, target) in &acyclic {
             println!("  {bead_id} -> {target}");
             added.entry(bead_id.clone()).or_default().insert(target.clone());
         }
@@ -120,7 +124,7 @@ async fn main() -> anyhow::Result<()> {
                     continue; // nothing new (idempotent guard).
                 }
                 let json = serde_json::to_string(&merged.into_iter().collect::<Vec<_>>())?;
-                store
+                match store
                     .update(
                         bead_id,
                         &IssuePatch {
@@ -128,9 +132,18 @@ async fn main() -> anyhow::Result<()> {
                             ..Default::default()
                         },
                     )
-                    .await?;
-                edges_created += targets.len();
+                    .await
+                {
+                    Ok(_) => edges_created += targets.len(),
+                    Err(e) => eprintln!("  ! skip {bead_id} edge update: {e}"),
+                }
             }
+        }
+    }
+    if !skipped_cyclic.is_empty() {
+        println!("\n§A SKIPPED (would create a cycle, existing reverse edge kept):");
+        for (from, to) in &skipped_cyclic {
+            println!("  {from} -> {to}");
         }
     }
     if !derivation.missing_producers.is_empty() {
@@ -175,7 +188,7 @@ async fn main() -> anyhow::Result<()> {
                 } else {
                     format!("{mark}\n{existing}")
                 };
-                store
+                match store
                     .update(
                         id,
                         &IssuePatch {
@@ -183,8 +196,11 @@ async fn main() -> anyhow::Result<()> {
                             ..Default::default()
                         },
                     )
-                    .await?;
-                provenance_stamped += 1;
+                    .await
+                {
+                    Ok(_) => provenance_stamped += 1,
+                    Err(e) => eprintln!("  ! skip {id} design stamp: {e}"),
+                }
             }
         }
     }
@@ -217,8 +233,10 @@ async fn main() -> anyhow::Result<()> {
         }
         if apply {
             for (id, sha) in &sha_plan {
-                store.set_delivered_sha(id, sha).await?;
-                sha_stamped += 1;
+                match store.set_delivered_sha(id, sha).await {
+                    Ok(_) => sha_stamped += 1,
+                    Err(e) => eprintln!("  ! skip {id} delivered_sha: {e}"),
+                }
             }
         }
     }
