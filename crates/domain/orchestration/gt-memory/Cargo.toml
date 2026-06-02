@@ -1,0 +1,12 @@
+[package]
+name = "gt-memory"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "MAPE-K Knowledge: machine-consume the memory corpus (feedback/project/reference lessons) — RECALL by relevance, APPLY by kind, render for write-back."
+
+# Dependency-light by design: the corpus parser + relevance recall are pure std,
+# so the planner (hq-auto.2) and workers can link this without pulling a YAML or
+# serde stack into the autonomous loop.
+[dependencies]
