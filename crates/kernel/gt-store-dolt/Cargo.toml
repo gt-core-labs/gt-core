@@ -10,6 +10,8 @@ mysql_async = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
+# Lock-free per-workspace pool registry (hq-mt-data.7).
+dashmap = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt", "rt-multi-thread", "macros"] }

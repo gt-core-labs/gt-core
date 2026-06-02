@@ -44,7 +44,7 @@ pub fn dolt_db_name(ws: &str) -> String {
 /// This duplicates `WorkspaceId::new` on purpose: the kernel may not import the
 /// platform type, and DDL interpolation is exactly where a second guard earns
 /// its keep.
-fn validate_slug(ws: &str) -> Result<(), AppError> {
+pub(crate) fn validate_slug(ws: &str) -> Result<(), AppError> {
     if ws.is_empty() {
         return Err(AppError::Validation("workspace slug is empty".into()));
     }
