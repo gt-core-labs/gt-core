@@ -91,6 +91,13 @@ impl IssuesServer {
         self
     }
 
+    /// The workspace resolver, if multi-tenant routing is wired. The health
+    /// endpoints (hq-mt-routing.8) share it to report `workspaces_loaded` and
+    /// per-workspace Dolt readiness.
+    pub fn workspaces(&self) -> Option<Arc<WorkspaceStores>> {
+        self.workspaces.clone()
+    }
+
     /// Resolve the store for one request from its extensions. When a workspace
     /// resolver is wired and the request carries an `X-Workspace` header, the
     /// tenant's own store is built (cheap: a lazily-pooled `DoltIssues`);

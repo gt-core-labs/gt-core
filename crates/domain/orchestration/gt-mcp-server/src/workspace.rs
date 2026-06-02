@@ -63,6 +63,27 @@ impl WorkspaceStores {
     pub fn store_for(&self, ws: &str) -> Result<DoltIssues, AppError> {
         Ok(DoltIssues::new(self.pools.pool_for(ws)?))
     }
+
+    /// Number of workspaces with a live pool — the `workspaces_loaded` gauge the
+    /// `/health` endpoint reports (hq-mt-routing.8).
+    pub fn live_pools(&self) -> usize {
+        self.pools.len()
+    }
+
+    /// Slugs of the workspaces with a live pool, sorted for a stable `/readyz`
+    /// listing (hq-mt-routing.8).
+    pub fn loaded_workspaces(&self) -> Vec<String> {
+        let mut ws = self.pools.workspaces();
+        ws.sort();
+        ws
+    }
+
+    /// Health-probe a workspace's pool (`SELECT 1`), surfacing a dead Dolt server
+    /// or a missing `hq_<ws>` database. Backs the per-workspace `dolt_ok` in
+    /// `/readyz` (hq-mt-routing.8).
+    pub async fn health(&self, ws: &str) -> Result<(), AppError> {
+        self.pools.health(ws).await
+    }
 }
 
 /// Extract the server-injected workspace slug from a request's extensions.

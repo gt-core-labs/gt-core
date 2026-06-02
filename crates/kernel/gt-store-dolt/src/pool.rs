@@ -118,6 +118,13 @@ impl WorkspacePools {
         self.pools.len()
     }
 
+    /// Slugs of the workspaces that currently have a live pool, for readiness
+    /// reporting (hq-mt-routing.8). Order is unspecified (DashMap iteration);
+    /// callers that need stability sort the result.
+    pub fn workspaces(&self) -> Vec<String> {
+        self.pools.iter().map(|e| e.key().clone()).collect()
+    }
+
     /// Whether no pools have been created yet.
     pub fn is_empty(&self) -> bool {
         self.pools.is_empty()
@@ -179,6 +186,17 @@ mod tests {
         assert_eq!(p.len(), 1);
         let _ = p.pool_for("beta").unwrap();
         assert_eq!(p.len(), 2);
+    }
+
+    #[test]
+    fn workspaces_lists_live_pool_slugs() {
+        let p = pools();
+        assert!(p.workspaces().is_empty());
+        let _ = p.pool_for("acme").unwrap();
+        let _ = p.pool_for("beta").unwrap();
+        let mut ws = p.workspaces();
+        ws.sort();
+        assert_eq!(ws, ["acme", "beta"]);
     }
 
     #[test]

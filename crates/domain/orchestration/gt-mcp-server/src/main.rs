@@ -16,6 +16,7 @@
 
 mod dispatch;
 mod git_tree;
+mod health;
 mod pg_audit;
 mod server;
 mod workspace;
@@ -35,6 +36,7 @@ use gt_module::RootBuilder;
 use gt_rbac::{RbacConfig, Scope};
 use gt_store_dolt::DoltIssues;
 
+use health::HealthState;
 use server::IssuesServer;
 use workspace::WorkspaceStores;
 
@@ -136,14 +138,21 @@ async fn main() -> anyhow::Result<()> {
         ),
     }
 
+    // Ops endpoints (hq-mt-routing.8) share the server's workspace resolver to
+    // report workspaces_loaded + per-workspace Dolt readiness. Capture it before
+    // `service` is moved into the transport factory below.
+    let health_state = HealthState::new(service.workspaces());
+
     let http = StreamableHttpService::new(
         move || Ok(service.clone()),
         Arc::new(LocalSessionManager::default()),
         StreamableHttpServerConfig::default(),
     );
     let app = Router::new()
-        .nest_service(MCP_PATH, http)
-        .route("/health", get(|| async { "ok" }));
+        .route("/health", get(health::health))
+        .route("/readyz", get(health::readyz))
+        .with_state(health_state)
+        .nest_service(MCP_PATH, http);
 
     let listener = tokio::net::TcpListener::bind(&bind).await?;
     eprintln!(
