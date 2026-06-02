@@ -135,6 +135,7 @@ gt-mayor         = { path = "crates/domain/roles/gt-mayor" }
 gt-roles         = { path = "crates/domain/roles/gt-roles" }
 gt-quota         = { path = "crates/domain/orchestration/gt-quota" }
 gt-merge         = { path = "crates/domain/orchestration/gt-merge" }
+gt-patrol        = { path = "crates/domain/orchestration/gt-patrol" }
 gt-orchestration = { path = "crates/domain/orchestration/gt-orchestration" }
 gt-webhooks      = { path = "crates/domain/orchestration/gt-webhooks" }
 gt-dog           = { path = "crates/domain/orchestration/gt-dog" }

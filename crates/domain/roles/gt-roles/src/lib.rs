@@ -214,13 +214,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn plugin_registry_holds_the_two_observer_roles_in_order() {
+    async fn plugin_registry_holds_the_observer_roles_in_order() {
         let sup = Supervisor::new();
         let (sinks, _rx) = sinks();
         let stack = RoleStack::register(&sup, sinks).await.unwrap();
-        // Only sheriff + deacon are broadcast observers (witness/refinery/mayor are not
-        // plugins — see plugins.rs); registration order is the relay fan-out order.
-        assert_eq!(stack.plugin_registry().names(), vec!["sheriff", "deacon"]);
+        // sheriff + deacon + witness are broadcast observers (refinery/mayor are not plugins —
+        // see plugins.rs); registration order is the relay fan-out order.
+        assert_eq!(
+            stack.plugin_registry().names(),
+            vec!["sheriff", "deacon", "witness"]
+        );
     }
 
     #[tokio::test]

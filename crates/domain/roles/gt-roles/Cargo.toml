@@ -27,6 +27,9 @@ gt-eventlog = { workspace = true }
 # The deacon observer decodes the typed merge events it tracks (roles -> orchestration dep,
 # allowed by docs/03 Rule 4). Keeps gt-deacon itself decoupled from the merge enum.
 gt-merge = { workspace = true }
+# The witness observer decodes patrol.lease-expired.v1 (the lease-expiry source, hq-core-port.15)
+# to watch the dead worker. Same roles -> orchestration dep, keeps gt-witness decoupled.
+gt-patrol = { workspace = true }
 # `#[async_trait]` for the `Plugin` impl; RFC3339 -> epoch for the edge `at` field
 # (the `parsing` feature is not in the workspace default set).
 async-trait = { workspace = true }
