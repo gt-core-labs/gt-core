@@ -1,0 +1,8 @@
+[package]
+name = "gt-beads"
+edition.workspace = true
+version.workspace = true
+
+[dependencies]
+gt-events = { workspace = true }
+serde = { workspace = true }

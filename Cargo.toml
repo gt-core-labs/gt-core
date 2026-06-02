@@ -2,6 +2,7 @@
 resolver = "2"
 members = [
     "crates/kernel/gt-events",
+    "crates/kernel/gt-beads",
     "crates/kernel/gt-eventlog",
     "crates/kernel/gt-bus",
     "crates/kernel/gt-channel",
@@ -103,6 +104,7 @@ anyhow = "1"
 # Internal crates — referenced as `<name> = { workspace = true }` from member Cargo.toml.
 # Path-centralized here so members never juggle relative paths across tiers.
 gt-events        = { path = "crates/kernel/gt-events" }
+gt-beads         = { path = "crates/kernel/gt-beads" }
 gt-eventlog      = { path = "crates/kernel/gt-eventlog" }
 gt-bus           = { path = "crates/kernel/gt-bus" }
 gt-channel       = { path = "crates/kernel/gt-channel" }
