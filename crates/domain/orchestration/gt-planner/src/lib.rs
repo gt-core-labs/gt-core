@@ -26,9 +26,11 @@
 //! unit-tested without a store, a model, or async. Applying a [`Plan`] (issuing
 //! `issues.create` under the planner scope) lives a tier up.
 
+mod meta;
 mod plan;
 mod scope;
 
+pub use meta::{learn, reflect, BeadOutcome, Cycle, Outcome, Reflection};
 pub use plan::{
     decompose, planning_brief, CreateBead, Goal, Intent, ParkedFork, Plan, PlanningBrief,
 };
