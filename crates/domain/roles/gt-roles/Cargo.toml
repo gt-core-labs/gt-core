@@ -1,0 +1,28 @@
+[package]
+name = "gt-roles"
+edition.workspace = true
+version.workspace = true
+
+# Per-workspace role-actor stack (`hq-mt-runtime.8`). Composes the five role actors
+# (mayor/sheriff/witness/refinery/deacon) against a `gt-runtime::Supervisor` so they
+# start, drain, and stop with their workspace's lifecycle. This is a `domain/roles`
+# crate because it depends on both `domain/orchestration` (gt-runtime) and its sibling
+# role crates — and only `domain/roles/*` may depend on all `domain/*` (docs/03 Rule 4),
+# so the orchestration tier could not host it (orchestration may not depend on roles).
+[dependencies]
+# The actor-stack lifecycle seam (Supervisor/Phase) the stack registers against.
+gt-runtime = { workspace = true }
+# Envelope wraps each role's emitted events on the relay to the per-ws bus.
+gt-events = { workspace = true }
+# The five role-actor crates this stack instances.
+gt-sheriff = { workspace = true }
+gt-witness = { workspace = true }
+gt-deacon = { workspace = true }
+gt-mayor = { workspace = true }
+gt-refinery = { workspace = true }
+# `mpsc`/`watch` for the event sinks + the lifecycle-anchor future.
+tokio = { workspace = true }
+
+[dev-dependencies]
+# The smoke + lifecycle tests drive actors and await transitions.
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "sync", "time"] }
