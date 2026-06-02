@@ -30,6 +30,7 @@
 mod cargo_graph;
 mod delivered;
 mod edges;
+mod health;
 mod model;
 mod provenance;
 
@@ -44,6 +45,7 @@ use gt_store_dolt::{DepFact, DoltIssues, IssueFilter, IssuePatch, IssueRow};
 use cargo_graph::CrateGraph;
 use delivered::{pick_delivered_sha, ShaCandidate};
 use edges::{derive_missing_edges, filter_acyclic};
+use health::{evaluate, HealthMetrics, Thresholds};
 use model::Bead;
 use provenance::{already_stamped, resolve_origin, SourceRepo};
 
@@ -94,7 +96,7 @@ async fn main() -> anyhow::Result<()> {
     );
 
     // ── legacy audit (mcp.4): recorded-sha existence + stale non-planned surfaces.
-    audit(&rows, &repos);
+    let (missing_shas, stale_surfaces) = audit(&rows, &repos);
 
     // ── §A — auto-derive depends_on edges from the Cargo graph.
     let graph = load_crate_graph(&core_repo)?;
@@ -265,6 +267,29 @@ async fn main() -> anyhow::Result<()> {
     if !apply {
         println!("\n(dry-run — re-run with --apply to write)");
     }
+
+    // ── circuit-breaker (hq-auto.5): fold the pass's health signals through the
+    // thresholds. A HALT verdict exits non-zero so the surrounding autonomous
+    // loop stops *generating* and escalates to a human, before a slightly-wrong
+    // model can amplify over many cycles.
+    let metrics = HealthMetrics {
+        cyclic_edges: skipped_cyclic.len(),
+        no_producer_crates: derivation.missing_producers.len(),
+        missing_shas,
+        stale_surfaces,
+    };
+    let verdict = evaluate(&metrics, &Thresholds::default());
+    println!("\n── health ── {}", verdict.label());
+    for reason in verdict.reasons() {
+        println!("  ! {reason}");
+    }
+    if verdict.should_halt() {
+        eprintln!(
+            "\ngt-reconciler: HALT — graph health degraded past circuit-breaker ceiling; \
+             autonomous generation must stop and a human review the reasons above."
+        );
+        std::process::exit(2);
+    }
     Ok(())
 }
 
@@ -421,8 +446,9 @@ fn count_unhidden(
 
 /// Legacy mcp.4 audit: report recorded close-shas absent from every repo and
 /// non-`planned` surface paths absent at HEAD. Informational (no exit-fail) — the
-/// .12 parts are the actionable output.
-fn audit(rows: &[IssueRow], repos: &[String]) {
+/// .12 parts are the actionable output. Returns `(missing_shas, stale_surfaces)`
+/// so the circuit-breaker (hq-auto.5) can fold them into [`HealthMetrics`].
+fn audit(rows: &[IssueRow], repos: &[String]) -> (usize, usize) {
     let mut bad_sha: Vec<(String, String)> = Vec::new();
     let mut stale_surface: Vec<(String, String)> = Vec::new();
     for r in rows {
@@ -448,6 +474,7 @@ fn audit(rows: &[IssueRow], repos: &[String]) {
     for (id, sha) in &bad_sha {
         println!("  MISSING sha {id} {sha}");
     }
+    (bad_sha.len(), stale_surface.len())
 }
 
 /// Pull the delivering sha out of a close note (`closed @ <sha> (by ...)`).
