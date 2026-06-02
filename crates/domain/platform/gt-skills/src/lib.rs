@@ -23,9 +23,11 @@ pub mod commands;
 pub mod repo;
 
 mod events;
+pub mod module;
 mod state;
 
 pub use actor::{spawn, spawn_hydrated, SkillHandle, SkillMsg};
+pub use module::SkillsModule;
 pub use commands::{
     DisableSkillForRole, EnableSkillForRole, RegisterSkill, RetireSkill, SkillCommand,
 };

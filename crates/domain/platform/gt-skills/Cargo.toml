@@ -8,9 +8,14 @@ version.workspace = true
 # resolution. The `SkillsModule` wrap is `hq-mod-refactor.14`, not this port.
 [dependencies]
 gt-events = { workspace = true }
+# gt-core module foundation (hq-mod-refactor.14): the `GtModule` trait the skills catalog is
+# wrapped in (`module.rs`).
+gt-module = { workspace = true }
 tokio.workspace = true
 serde.workspace = true
 schemars.workspace = true
+# `semver::Version` for the module's `ModuleMeta`.
+semver = { workspace = true }
 
 [dev-dependencies]
 serde_json.workspace = true
