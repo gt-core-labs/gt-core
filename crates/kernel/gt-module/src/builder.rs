@@ -107,10 +107,16 @@ impl RootBuilder {
     pub fn module<M: GtModule>(mut self, module: M) -> Self {
         let mut mcp = McpRegistry::new();
         module.register_mcp_tools(&mut mcp);
+        let depends_on = module.dependencies();
+        let mut meta = module.meta();
+        // Stamp the declared dependencies onto the meta so a built `Root` exposes
+        // the dependency graph at runtime without module authors repeating their
+        // deps in `meta()` (the sole declaration stays `dependencies()`).
+        meta.depends_on = depends_on.clone();
         self.entries.push(ModuleEntry {
-            meta: module.meta(),
+            meta,
             capability: module.capability(),
-            depends_on: module.dependencies(),
+            depends_on,
             mcp_tools: mcp.into_tools(),
             migrations: module.migrations(),
             openapi: module.openapi(),
@@ -479,6 +485,26 @@ impl Root {
             .find(|m| &m.id == id)
     }
 
+    /// The dependency graph as `(dependent, dependency)` id-string edges, one per
+    /// declared edge across all *enabled* modules (disabled modules never reach
+    /// the [`Root`]). This is the runtime bridge a composition or hot-reload root
+    /// feeds straight into a string-keyed dependency snapshot — e.g.
+    /// `gt-feature-flags`'s `ModuleDepGraph::from_edges` — so `feature.disable` can
+    /// reject a toggle that would orphan a still-enabled dependent, long after the
+    /// builder's compose-time check ran. Strings, not [`ModuleId`], keep the
+    /// consumer dependency-light (no `gt-module` dep). Order follows module init
+    /// order then per-module dependency declaration order; a module with no
+    /// dependencies contributes nothing.
+    pub fn dependency_edges(&self) -> impl Iterator<Item = (String, String)> + '_ {
+        self.entries.iter().flat_map(|e| {
+            let dependent = e.meta.id.as_str().to_string();
+            e.meta
+                .depends_on
+                .iter()
+                .map(move |dep| (dependent.clone(), dep.as_str().to_string()))
+        })
+    }
+
     /// Every MCP tool contributed by the loaded modules, in module init order
     /// then per-module declaration order (`hq-mod-mcp.1`).
     ///
@@ -670,6 +696,33 @@ mod tests {
         let root = RootBuilder::new().module(Merge).module(Beads).build().unwrap();
         let ids: Vec<&str> = root.modules().map(|m| m.id.as_str()).collect();
         assert_eq!(ids, ["beads", "merge"]);
+    }
+
+    #[test]
+    fn build_stamps_declared_dependencies_onto_meta() {
+        // The builder copies `dependencies()` onto `ModuleMeta.depends_on`, so a
+        // built Root surfaces the graph without the module repeating its deps.
+        let root = RootBuilder::new().module(Merge).module(Beads).build().unwrap();
+        let merge = root.module(&ModuleId::new("merge").unwrap()).unwrap();
+        let deps: Vec<&str> = merge.depends_on.iter().map(ModuleId::as_str).collect();
+        assert_eq!(deps, ["beads"]);
+        // A standalone module carries no dependency edges.
+        let beads = root.module(&ModuleId::new("beads").unwrap()).unwrap();
+        assert!(beads.depends_on.is_empty());
+    }
+
+    #[test]
+    fn dependency_edges_yields_dependent_dependency_pairs() {
+        let root = RootBuilder::new().module(Merge).module(Beads).build().unwrap();
+        let edges: Vec<(String, String)> = root.dependency_edges().collect();
+        // Exactly the one declared edge: merge depends on beads.
+        assert_eq!(edges, [("merge".to_string(), "beads".to_string())]);
+    }
+
+    #[test]
+    fn dependency_edges_empty_without_declarations() {
+        let root = RootBuilder::new().module(Beads).module(Rigs).build().unwrap();
+        assert_eq!(root.dependency_edges().count(), 0);
     }
 
     #[test]

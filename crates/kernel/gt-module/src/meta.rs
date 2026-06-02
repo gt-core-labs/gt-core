@@ -125,10 +125,20 @@ pub struct ModuleMeta {
     pub version: Version,
     /// One-line summary shown in module listings and `meta.help`.
     pub description: String,
+    /// Ids this module directly depends on, as declared via
+    /// [`GtModule::dependencies`](crate::GtModule::dependencies). Empty for a
+    /// standalone module. Stamped by [`RootBuilder`](crate::RootBuilder) at
+    /// registration — module authors declare deps once in `dependencies()`, not
+    /// here — so a built [`Root`](crate::Root) can surface the dependency graph at
+    /// runtime (e.g. for `feature.disable` dep-safety; see
+    /// [`Root::dependency_edges`](crate::Root::dependency_edges)).
+    pub depends_on: Vec<ModuleId>,
 }
 
 impl ModuleMeta {
-    /// Construct metadata from already-validated parts.
+    /// Construct metadata from already-validated parts. `depends_on` starts empty;
+    /// the [`RootBuilder`](crate::RootBuilder) stamps the module's declared
+    /// dependencies on registration, so module `meta()` impls never repeat them.
     pub fn new(
         id: ModuleId,
         name: impl Into<String>,
@@ -140,6 +150,7 @@ impl ModuleMeta {
             name: name.into(),
             version,
             description: description.into(),
+            depends_on: Vec::new(),
         }
     }
 }
