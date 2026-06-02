@@ -1,0 +1,24 @@
+[package]
+name = "gt-orchestration"
+edition.workspace = true
+version.workspace = true
+
+[dependencies]
+gt-events = { workspace = true }
+# The kernel module seam — `ConvoyModule` declares the convoy domain's identity + capability
+# + MCP tools so the `RootBuilder` harvests them (`hq-mod-refactor.6`); the aggregate logic
+# is untouched.
+gt-module = { workspace = true }
+# `semver::Version` for the module's `ModuleMeta`.
+semver = { workspace = true }
+tokio.workspace = true
+serde.workspace = true
+# JSON Schema derives for Command arguments — surfaced by gt-mcp.
+schemars.workspace = true
+
+[dev-dependencies]
+# The gate test plays the composition-root role (wires actor + records + replays).
+# gt-eventlog is the log/replay machinery; ulid only seeds unique temp paths. The library
+# itself depends ONLY on the kernel (gt-events) — never on another domain.
+gt-eventlog = { workspace = true }
+ulid.workspace = true

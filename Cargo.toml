@@ -19,6 +19,7 @@ members = [
     "crates/domain/platform/gt-rig",
     "crates/domain/orchestration/gt-quota",
     "crates/domain/orchestration/gt-merge",
+    "crates/domain/orchestration/gt-orchestration",
     "crates/domain/orchestration/gt-webhooks",
     "crates/domain/orchestration/gt-dog",
     "crates/domain/orchestration/gt-runtime",
@@ -111,6 +112,7 @@ gt-issues        = { path = "crates/domain/platform/gt-issues" }
 gt-rig           = { path = "crates/domain/platform/gt-rig" }
 gt-quota         = { path = "crates/domain/orchestration/gt-quota" }
 gt-merge         = { path = "crates/domain/orchestration/gt-merge" }
+gt-orchestration = { path = "crates/domain/orchestration/gt-orchestration" }
 gt-webhooks      = { path = "crates/domain/orchestration/gt-webhooks" }
 gt-dog           = { path = "crates/domain/orchestration/gt-dog" }
 gt-runtime       = { path = "crates/domain/orchestration/gt-runtime" }
