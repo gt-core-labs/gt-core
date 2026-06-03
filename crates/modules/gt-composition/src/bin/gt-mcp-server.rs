@@ -232,27 +232,40 @@ async fn metrics_text() -> axum::response::Response {
 
 /// Apply the public-schema PG catalog migrations on boot: the `workspaces` table
 /// (+ bootstrap default row + the `gt_create_workspace_schema` provisioning
-/// function) and the `feature` flag-overrides table. These are the `public`-schema
+/// function), the `feature` flag-overrides table, and the per-workspace projection
+/// tables seeded into the `ws_default` template (currently `rig`). These are the
 /// tables the domain dispatch handlers read on the very first call, so a fresh
 /// deploy must seed them before serving. `gt_module_migrate::apply` records each
 /// migration in the tracking table and skips ones already applied, so this is safe
 /// to run on every boot.
 ///
-/// The module ids (`workspace`, `feature`) match the owning modules' namespaces so
-/// the tracking rows line up with any future module-driven apply (the workspace
-/// schema currently has no `GtModule`, so its id is named explicitly here).
+/// The `rig` migrations are schema-qualified (`CREATE SCHEMA IF NOT EXISTS
+/// ws_default` + `ws_default.rigs`), so they bootstrap the very template
+/// `gt_create_workspace_schema` clones from. Without them the template has no `rigs`
+/// table, every tenant schema cloned from it lacks one, and `rig.*` dispatch fails
+/// with `relation "rigs" does not exist` — the gap this seed closes (hq-mcp-test.2).
+/// They belong here, not in a per-tenant step: the template is global and the
+/// provisioner is structure-only (it never clones a table absent from `ws_default`).
+///
+/// The module ids (`workspace`, `feature`, `rig`) match the owning modules'
+/// namespaces so the tracking rows line up with any future module-driven apply (the
+/// workspace schema currently has no `GtModule`, so its id is named explicitly here).
 async fn apply_pg_catalog(pool: &sqlx::PgPool) -> anyhow::Result<()> {
-    use gt_module::ModuleId;
+    use gt_module::{GtModule, ModuleId};
+    use gt_rig::RigsModule;
 
     let workspace_id = ModuleId::new("workspace").expect("`workspace` is a valid module id");
     let feature_id = ModuleId::new("feature").expect("`feature` is a valid module id");
+    let rig_id = ModuleId::new("rig").expect("`rig` is a valid module id");
     let workspace_migs = gt_store_pg::workspace_migrations();
     let feature_migs = gt_store_pg::feature_flags_migrations();
+    let rig_migs = RigsModule.migrations();
 
     let plan: Vec<_> = workspace_migs
         .iter()
         .map(|m| (&workspace_id, m))
         .chain(feature_migs.iter().map(|m| (&feature_id, m)))
+        .chain(rig_migs.iter().map(|m| (&rig_id, m)))
         .collect();
 
     let report = gt_module_migrate::apply(pool, &plan)
