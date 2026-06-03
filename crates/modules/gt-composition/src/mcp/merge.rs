@@ -15,27 +15,71 @@ use serde::de::DeserializeOwned;
 use serde_json::{json, Value};
 
 use gt_events::Command;
+use gt_graphwarden::{MarkStale, WardenCommand, WardenState};
+use gt_mcp_server::prefixes::bead_prefix;
 use gt_mcp_server::{DomainCtx, DomainHandler};
 use gt_merge::{
     CompleteMerge, FailMerge, MergeBoard, MergeEvent, MergeSlot, MergeState, StartMerge, SubmitMerge,
 };
+use gt_rig::{PgRigs, RigRepository};
 use gt_store_dolt::AppError;
 
 use super::eventlog::EventLog;
-use super::util::{ev_err, parse, str_arg};
+use super::pools::WsPools;
+use super::util::{ev_err, now_secs, parse, str_arg};
 
 /// The event-log kind prefix for every merge event (`merge.*.v1`).
 const NS: &str = "merge.";
+/// The warden event-log kind prefix, replayed to check graph custody (`hq-graphrig.7`).
+const WARDEN_NS: &str = "graphwarden.";
 
 /// Event-sourced handler for the `merge.*` tool namespace.
 pub struct MergeHandler {
     log: Arc<EventLog>,
+    /// Optional rig-catalog pools: when set, a completed merge marks the owning rig's
+    /// graph stale so the custodian knows to refresh it (`hq-graphrig.7`). `None` keeps the
+    /// handler a pure merge handler (tests, issues-only builds).
+    rig_pools: Option<Arc<WsPools>>,
 }
 
 impl MergeHandler {
-    /// Wrap the per-workspace event log.
+    /// Wrap the per-workspace event log. No graph custody side-effect.
     pub fn new(log: Arc<EventLog>) -> Self {
-        Self { log }
+        Self { log, rig_pools: None }
+    }
+
+    /// Also mark the owning rig's graph stale on a completed merge, resolving the rig from
+    /// the merged bead's prefix via `pools`' per-workspace rig catalog.
+    pub fn with_rig_pools(mut self, pools: Arc<WsPools>) -> Self {
+        self.rig_pools = Some(pools);
+        self
+    }
+
+    /// Best-effort: mark the graph of the rig owning `bead` stale, so the custodian's next
+    /// `graph.refresh` picks it up. Silent on every miss (no pools, prefix unmapped, rig not
+    /// under graph custody) — a merge must never fail because of a graph side-effect.
+    async fn mark_owning_rig_stale(&self, ws: Option<&str>, bead: &str) {
+        let Some(pools) = &self.rig_pools else { return };
+        let Ok(pool) = pools.get(ws).await else { return };
+        let repo = PgRigs::new(pool.pool().clone());
+        let Ok(Some(rig)) = repo.prefix_owner(bead_prefix(bead)).await else { return };
+
+        // Only mark stale if the rig is actually under graph custody.
+        let state = self
+            .log
+            .replay_domain(ws, WARDEN_NS, WardenState::default(), |s, e| {
+                let _ = s.apply(e);
+            })
+            .unwrap_or_default();
+        if !state.rigs.contains_key(&rig) {
+            return;
+        }
+        let cmd = WardenCommand::MarkStale(MarkStale { rig, changed: 1, now_secs: now_secs() });
+        if let Ok(events) = cmd.execute(&state) {
+            for ev in events {
+                let _ = self.log.append(ws, ev);
+            }
+        }
     }
 
     /// Rebuild the board from the workspace's merge events.
@@ -71,7 +115,16 @@ impl DomainHandler for MergeHandler {
         match tool {
             "merge.submit" => self.run::<SubmitMerge>(ws, ctx.args),
             "merge.start" => self.run::<StartMerge>(ws, ctx.args),
-            "merge.complete" => self.run::<CompleteMerge>(ws, ctx.args),
+            "merge.complete" => {
+                // Mark the owning rig's graph stale after a successful completion —
+                // best-effort, never fails the merge (hq-graphrig.7).
+                let bead = str_arg(&ctx.args, "bead").ok().map(str::to_string);
+                let out = self.run::<CompleteMerge>(ws, ctx.args)?;
+                if let Some(bead) = bead {
+                    self.mark_owning_rig_stale(ws, &bead).await;
+                }
+                Ok(out)
+            }
             "merge.fail" => self.run::<FailMerge>(ws, ctx.args),
             "merge.list" => {
                 let board = self.board(ws)?;

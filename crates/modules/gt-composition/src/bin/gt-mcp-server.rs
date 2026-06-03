@@ -221,7 +221,10 @@ async fn build_domain_router(
     let router = DomainRouter::new()
         .register(Arc::new(WorkspaceHandler::new(pool.clone())))
         .register(Arc::new(RigHandler::new(ws_pools.clone())))
-        .register(Arc::new(MergeHandler::new(event_log.clone())))
+        // A completed merge marks the owning rig's graph stale (hq-graphrig.7).
+        .register(Arc::new(
+            MergeHandler::new(event_log.clone()).with_rig_pools(ws_pools.clone()),
+        ))
         .register(Arc::new(ConvoyHandler::new(event_log.clone())))
         .register(Arc::new(AgentHandler::new(event_log.clone())))
         .register(Arc::new(QuotaHandler::new(event_log.clone())))
