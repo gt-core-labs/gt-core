@@ -106,3 +106,7 @@ jobs:
         run: |
           cargo test -p gt-store-pg
           cargo test -p gt-feature-flags
+          # The durable Postgres audit sink (hq-mcp-test.6): per-tenant isolation +
+          # the restart-durability proof (write, drop the pool, reconnect, the trail
+          # is still there). SERIAL — both gated tests reseed the one mcp_audit table.
+          cargo test -p gt-mcp-server -- --test-threads=1

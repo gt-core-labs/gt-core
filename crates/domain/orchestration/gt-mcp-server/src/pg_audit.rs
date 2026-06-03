@@ -227,4 +227,47 @@ mod tests {
         );
         assert_eq!(recs[0].outcome, Outcome::Invoked);
     }
+
+    /// The durability guarantee (hq-mcp-test.6): the trail survives a server
+    /// **restart**. Writes land through one pool; that pool is then closed (the
+    /// process exit), a brand-new pool connects to the same database, and the
+    /// trail `audit.tail` reads (`select_all`) still returns the prior entries —
+    /// proving the sink is Postgres-durable, not in-memory (which would lose them).
+    ///
+    /// Gated on `GT_PG_URL`; shares the one `mcp_audit` table with the test above,
+    /// so the suite runs serially in CI (`-- --test-threads=1`).
+    #[tokio::test]
+    async fn audit_trail_survives_a_reconnect() {
+        let Ok(url) = std::env::var("GT_PG_URL") else {
+            eprintln!("skipping: GT_PG_URL unset");
+            return;
+        };
+
+        // --- "first boot": connect, seed the schema, record two calls -----------
+        let pool_a = PgPoolOptions::new().max_connections(2).connect(&url).await.expect("connect a");
+        sqlx::query("DROP TABLE IF EXISTS mcp_audit").execute(&pool_a).await.unwrap();
+        ensure_schema(&pool_a).await.expect("schema");
+        insert(&pool_a, &AuditRecord::invoked("a", "issues.read", json!({})).in_workspace("acme"))
+            .await
+            .unwrap();
+        insert(
+            &pool_a,
+            &AuditRecord::invoked("b", "issues.close.execute", json!({})).in_workspace("acme"),
+        )
+        .await
+        .unwrap();
+
+        // --- "shutdown": drop every connection, as a process exit would ---------
+        pool_a.close().await;
+
+        // --- "restart": a fresh pool to the same DB — no re-seed, no re-insert --
+        let pool_b = PgPoolOptions::new().max_connections(2).connect(&url).await.expect("connect b");
+        let all = select_all(&pool_b).await.expect("read trail after restart");
+        let recs: Vec<AuditRecord> = all.into_iter().map(row_to_record).collect();
+
+        assert_eq!(recs.len(), 2, "the prior trail survived the reconnect (durable, not in-memory)");
+        assert_eq!(recs[0].actor, "a", "append order preserved across restart");
+        assert_eq!(recs[1].tool, "issues.close.execute");
+        assert!(recs.iter().all(|r| r.workspace_id == "acme"), "per-tenant attribution survives");
+    }
 }
