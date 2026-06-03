@@ -11,6 +11,7 @@
 //! a shared [`PgPool`](sqlx::PgPool), so a `create` then a `list` see the same
 //! durable state across calls (the actors hydrate from Postgres per request).
 
+pub mod agent;
 pub mod convoy;
 pub mod eventlog;
 pub mod merge;
@@ -19,6 +20,7 @@ pub mod rig;
 pub mod util;
 pub mod workspace;
 
+pub use agent::AgentHandler;
 pub use convoy::ConvoyHandler;
 pub use eventlog::EventLog;
 pub use merge::MergeHandler;

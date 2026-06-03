@@ -31,7 +31,7 @@ use rmcp::transport::{StreamableHttpServerConfig, StreamableHttpService};
 
 use gt_audit::{AuditSink, InMemoryAudit};
 use gt_composition::mcp::{
-    ConvoyHandler, EventLog, MergeHandler, RigHandler, WorkspaceHandler, WsPools,
+    AgentHandler, ConvoyHandler, EventLog, MergeHandler, RigHandler, WorkspaceHandler, WsPools,
 };
 use gt_issues::IssuesModule;
 use gt_mcp_server::{health, DomainRouter, HealthState, IssuesServer, PgAuditSink, WorkspaceStores};
@@ -195,7 +195,8 @@ async fn build_domain_router() -> anyhow::Result<DomainRouter> {
         .register(Arc::new(WorkspaceHandler::new(pool.clone())))
         .register(Arc::new(RigHandler::new(ws_pools.clone())))
         .register(Arc::new(MergeHandler::new(event_log.clone())))
-        .register(Arc::new(ConvoyHandler::new(event_log.clone())));
+        .register(Arc::new(ConvoyHandler::new(event_log.clone())))
+        .register(Arc::new(AgentHandler::new(event_log.clone())));
     eprintln!(
         "[gt-mcp-server] domain namespaces: {:?}",
         router.namespaces()
