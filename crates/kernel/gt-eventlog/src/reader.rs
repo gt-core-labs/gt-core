@@ -15,10 +15,9 @@ use crate::record::EventRecord;
 /// kind tallies — need the uniform form).
 ///
 /// The set is closed on purpose: only kinds whose owning domain has since been versioned are
-/// upgraded. Kinds still emitted bare by their domain (`skills.*`, `quota.login_*`,
-/// `scheduling.*`, …) pass through untouched — blindly appending `.v1` to every bare kind would
-/// corrupt them. A kind that already carries any `.vN` suffix is not in this set, so it is
-/// left as-is.
+/// upgraded. Kinds still emitted bare by their domain (`quota.login_*`, `scheduling.*`, …)
+/// pass through untouched — blindly appending `.v1` to every bare kind would corrupt them. A
+/// kind that already carries any `.vN` suffix is not in this set, so it is left as-is.
 const LEGACY_BARE_KINDS_V1: &[&str] = &[
     // gt-rig
     "rig.added",
@@ -43,6 +42,9 @@ const LEGACY_BARE_KINDS_V1: &[&str] = &[
     "agent.spawned",
     "agent.heartbeat",
     "agent.killed",
+    // gt-skills (hq-mod-events.9; enabled/disabled-for-role are kebab renames, see LEGACY_RENAMED_KINDS)
+    "skills.registered",
+    "skills.retired",
 ];
 
 /// Legacy convoy kinds that were not just version-suffixed but **re-namespaced**
@@ -63,6 +65,9 @@ const LEGACY_RENAMED_KINDS: &[(&str, &str)] = &[
     ("orch.convoy_failed", "convoy.failed.v1"),
     // gt-agent: snake -> kebab leaf rename (siblings use LEGACY_BARE_KINDS_V1).
     ("agent.session_end", "agent.session-end.v1"),
+    // gt-skills: snake -> kebab leaf rename (hq-mod-events.9; registered/retired use LEGACY_BARE_KINDS_V1).
+    ("skills.enabled_for_role", "skills.enabled-for-role.v1"),
+    ("skills.disabled_for_role", "skills.disabled-for-role.v1"),
 ];
 
 /// Upgrade a legacy kind to its current form in place: a bare `.v1` suffix for the events.2
@@ -183,6 +188,34 @@ mod tests {
         assert_eq!(recs[2].kind, "agent.killed.v1", "bare -> v1");
         assert_eq!(recs[3].kind, "agent.session-end.v1", "snake -> kebab leaf rename");
         assert_eq!(recs[4].kind, "agent.spawned.v1", "already forward untouched");
+        assert_eq!(recs[5].kind, "scheduling.tick", "out-of-set kind untouched");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn legacy_skills_kinds_are_canonicalized() {
+        let dir =
+            std::env::temp_dir().join(format!("gt-eventlog-reader-skills-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("legacy.jsonl");
+        let mut f = std::fs::File::create(&path).unwrap();
+        // Two bare skills kinds that version with a plain `.v1` append, the two `*_for_role`
+        // leaves that also kebab-rename, a current forward kind, and an out-of-set kind.
+        writeln!(f, "{}", rec_line("skills.registered")).unwrap();
+        writeln!(f, "{}", rec_line("skills.retired")).unwrap();
+        writeln!(f, "{}", rec_line("skills.enabled_for_role")).unwrap();
+        writeln!(f, "{}", rec_line("skills.disabled_for_role")).unwrap();
+        writeln!(f, "{}", rec_line("skills.registered.v1")).unwrap();
+        writeln!(f, "{}", rec_line("scheduling.tick")).unwrap();
+        drop(f);
+
+        let recs = read_all(&path).unwrap();
+        assert_eq!(recs[0].kind, "skills.registered.v1", "bare -> v1");
+        assert_eq!(recs[1].kind, "skills.retired.v1", "bare -> v1");
+        assert_eq!(recs[2].kind, "skills.enabled-for-role.v1", "snake -> kebab leaf rename");
+        assert_eq!(recs[3].kind, "skills.disabled-for-role.v1", "snake -> kebab leaf rename");
+        assert_eq!(recs[4].kind, "skills.registered.v1", "already forward untouched");
         assert_eq!(recs[5].kind, "scheduling.tick", "out-of-set kind untouched");
 
         let _ = std::fs::remove_dir_all(&dir);

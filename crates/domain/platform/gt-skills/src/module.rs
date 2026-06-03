@@ -139,9 +139,10 @@ mod tests {
 
     #[test]
     fn declared_kinds_cover_every_skill_event_variant() {
-        // Anchor the declared contract to the domain: each SkillEvent variant's legacy kind,
-        // kebab-normalized + `.v1`, must appear in the module's emitted set, so a new variant
-        // forces a capability update.
+        // Anchor the declared contract to the domain: each SkillEvent variant's emitted kind
+        // must appear verbatim in the module's declared set, so a new variant forces a
+        // capability update. `kind()` now emits the canonical kebab `.v1` form directly, so
+        // the comparison is exact — no normalization transform.
         use crate::SkillEvent;
         // Bring the domain's `EventKind::kind` method into scope (the gt-events trait),
         // distinct from gt_module's `EventKind` struct already imported above.
@@ -160,11 +161,10 @@ mod tests {
             SkillEvent::EnabledForRole { role: "r".into(), skill: "s".into(), now_secs: 0 },
             SkillEvent::DisabledForRole { role: "r".into(), skill: "s".into(), now_secs: 0 },
         ] {
-            let forward = format!("{}.v1", ev.kind().replace('_', "-"));
+            let emitted = ev.kind();
             assert!(
-                declared.contains(&forward.as_str()),
-                "missing declared kind for {:?}: {forward}",
-                ev.kind(),
+                declared.contains(&emitted),
+                "emitted kind not declared: {emitted}",
             );
         }
     }

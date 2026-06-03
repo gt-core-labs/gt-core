@@ -41,10 +41,10 @@ pub enum SkillEvent {
 impl EventKind for SkillEvent {
     fn kind(&self) -> &'static str {
         match self {
-            SkillEvent::Registered { .. } => "skills.registered",
-            SkillEvent::Retired { .. } => "skills.retired",
-            SkillEvent::EnabledForRole { .. } => "skills.enabled_for_role",
-            SkillEvent::DisabledForRole { .. } => "skills.disabled_for_role",
+            SkillEvent::Registered { .. } => "skills.registered.v1",
+            SkillEvent::Retired { .. } => "skills.retired.v1",
+            SkillEvent::EnabledForRole { .. } => "skills.enabled-for-role.v1",
+            SkillEvent::DisabledForRole { .. } => "skills.disabled-for-role.v1",
         }
     }
 }
