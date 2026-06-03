@@ -69,6 +69,22 @@ impl DomainHandler for WorkspaceHandler {
                     "status": status_str(WorkspaceStatus::Active),
                 }))
             }
+            "workspace.suspend" => {
+                // Reversibly disable an active workspace. The decide layer rejects a
+                // non-active source (IllegalTransition) as a validation fault, so a
+                // suspended/archived workspace cannot be re-suspended.
+                let id = workspace_id(str_arg(&ctx.args, "id")?)?;
+                let mut actor = WorkspaceActor::hydrate(self.repo()).await.map_err(actor_err)?;
+                actor
+                    .handle(WorkspaceCommand::Suspend { id: id.clone() })
+                    .await
+                    .map_err(actor_err)?;
+                Ok(json!({
+                    "ok": true,
+                    "id": id.as_str(),
+                    "status": status_str(WorkspaceStatus::Suspended),
+                }))
+            }
             "workspace.list" => {
                 let entries = self.repo().list().await.map_err(repo_err)?;
                 Ok(json!({
@@ -157,6 +173,16 @@ mod tests {
         assert!(matches!(err, AppError::Validation(_)));
     }
 
+    /// `workspace.suspend` rejects a payload without an `id` before any I/O.
+    #[tokio::test]
+    async fn suspend_requires_id() {
+        let pool = PgPool::connect_lazy("postgres://gt@127.0.0.1:1/none").unwrap();
+        let handler = WorkspaceHandler::new(pool);
+        let ctx = DomainCtx { workspace: None, actor: "tester", args: json!({}) };
+        let err = handler.dispatch("workspace.suspend", ctx).await.unwrap_err();
+        assert!(matches!(err, AppError::Validation(_)));
+    }
+
     /// An unknown verb in the namespace is a validation fault, not a panic.
     #[tokio::test]
     async fn unknown_verb_is_validation() {
@@ -241,6 +267,57 @@ mod tests {
 
         sqlx::query("DELETE FROM workspaces WHERE id = $1")
             .bind("dispatch-test")
+            .execute(&pool)
+            .await
+            .unwrap();
+    }
+
+    /// PG-backed: `workspace.suspend` transitions Active → Suspended and persists it;
+    /// a second suspend is an illegal transition (validation fault).
+    #[tokio::test]
+    async fn suspend_transitions_active_then_rejects_resuspend() {
+        let Some(pool) = pool_or_skip().await else {
+            eprintln!("GT_PG_URL unset; skipping WorkspaceHandler suspend test");
+            return;
+        };
+        let sql = &gt_store_pg::workspace_migrations()[0].sql;
+        sqlx::raw_sql(sql).execute(&pool).await.expect("apply workspaces migration");
+        sqlx::query("DELETE FROM workspaces WHERE id = $1")
+            .bind("suspend-test")
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let handler = WorkspaceHandler::new(pool.clone());
+        let ctx = |args| DomainCtx { workspace: None, actor: "tester", args };
+
+        handler
+            .dispatch("workspace.create", ctx(json!({ "id": "suspend-test", "name": "S" })))
+            .await
+            .unwrap();
+
+        let suspended = handler
+            .dispatch("workspace.suspend", ctx(json!({ "id": "suspend-test" })))
+            .await
+            .unwrap();
+        assert_eq!(suspended["status"], "suspended");
+
+        // Persisted: info reads back the suspended status.
+        let info = handler
+            .dispatch("workspace.info", ctx(json!({ "id": "suspend-test" })))
+            .await
+            .unwrap();
+        assert_eq!(info["status"], "suspended");
+
+        // Re-suspend is an illegal transition (Suspended is not Active) → validation.
+        let again = handler
+            .dispatch("workspace.suspend", ctx(json!({ "id": "suspend-test" })))
+            .await
+            .unwrap_err();
+        assert!(matches!(again, AppError::Validation(_)));
+
+        sqlx::query("DELETE FROM workspaces WHERE id = $1")
+            .bind("suspend-test")
             .execute(&pool)
             .await
             .unwrap();
