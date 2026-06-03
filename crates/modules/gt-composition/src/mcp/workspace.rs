@@ -89,6 +89,27 @@ impl DomainHandler for WorkspaceHandler {
                     "status": status_str(WorkspaceStatus::Suspended),
                 }))
             }
+            "workspace.resume" => {
+                // Restore a suspended workspace to active (the suspend counterpart,
+                // hq-mt-bootstrap.4). The decide layer rejects a non-suspended source
+                // (IllegalTransition) as a validation fault. The on-disk restore —
+                // untar the snapshot, pg_restore, replay the event log, verify the
+                // checksum — is a deploy-edge step (like archive's teardown); this
+                // tool records only the orchestrator's status change back to active.
+                // The suspend/archive gate (hq-mt-bootstrap.8) whitelists this tool,
+                // so a suspended tenant can be brought back.
+                let id = workspace_id(str_arg(&ctx.args, "id")?)?;
+                let mut actor = WorkspaceActor::hydrate(self.repo()).await.map_err(actor_err)?;
+                actor
+                    .handle(WorkspaceCommand::Resume { id: id.clone() })
+                    .await
+                    .map_err(actor_err)?;
+                Ok(json!({
+                    "ok": true,
+                    "id": id.as_str(),
+                    "status": status_str(WorkspaceStatus::Active),
+                }))
+            }
             "workspace.archive" => {
                 // Terminal transition from Active or Suspended. The decide layer rejects an
                 // already-archived workspace (IllegalTransition) as a validation fault. The
@@ -270,6 +291,16 @@ mod tests {
         assert!(matches!(err, AppError::Validation(_)));
     }
 
+    /// `workspace.resume` rejects a payload without an `id` before any I/O.
+    #[tokio::test]
+    async fn resume_requires_id() {
+        let pool = PgPool::connect_lazy("postgres://gt@127.0.0.1:1/none").unwrap();
+        let handler = WorkspaceHandler::new(pool);
+        let ctx = DomainCtx { workspace: None, actor: "tester", args: json!({}) };
+        let err = handler.dispatch("workspace.resume", ctx).await.unwrap_err();
+        assert!(matches!(err, AppError::Validation(_)));
+    }
+
     /// `workspace.archive` rejects a payload without an `id` before any I/O.
     #[tokio::test]
     async fn archive_requires_id() {
@@ -415,6 +446,54 @@ mod tests {
 
         sqlx::query("DELETE FROM workspaces WHERE id = $1")
             .bind("suspend-test")
+            .execute(&pool)
+            .await
+            .unwrap();
+    }
+
+    /// PG-backed: `workspace.resume` transitions Suspended → Active and persists it;
+    /// resuming an already-active workspace is an illegal transition (validation fault).
+    #[tokio::test]
+    async fn resume_transitions_suspended_back_to_active() {
+        let Some(pool) = pool_or_skip().await else {
+            eprintln!("GT_PG_URL unset; skipping WorkspaceHandler resume test");
+            return;
+        };
+        let sql = &gt_store_pg::workspace_migrations()[0].sql;
+        sqlx::raw_sql(sql).execute(&pool).await.expect("apply workspaces migration");
+        sqlx::query("DELETE FROM workspaces WHERE id = $1")
+            .bind("resume-test")
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let handler = WorkspaceHandler::new(pool.clone());
+        let ctx = |args| DomainCtx { workspace: None, actor: "tester", args };
+
+        handler
+            .dispatch("workspace.create", ctx(json!({ "id": "resume-test", "name": "R" })))
+            .await
+            .unwrap();
+        // Resuming an active workspace is illegal (nothing to restore).
+        let illegal = handler
+            .dispatch("workspace.resume", ctx(json!({ "id": "resume-test" })))
+            .await
+            .unwrap_err();
+        assert!(matches!(illegal, AppError::Validation(_)));
+
+        handler.dispatch("workspace.suspend", ctx(json!({ "id": "resume-test" }))).await.unwrap();
+        let resumed = handler
+            .dispatch("workspace.resume", ctx(json!({ "id": "resume-test" })))
+            .await
+            .unwrap();
+        assert_eq!(resumed["status"], "active");
+
+        // Persisted: info reads back active.
+        let info = handler.dispatch("workspace.info", ctx(json!({ "id": "resume-test" }))).await.unwrap();
+        assert_eq!(info["status"], "active");
+
+        sqlx::query("DELETE FROM workspaces WHERE id = $1")
+            .bind("resume-test")
             .execute(&pool)
             .await
             .unwrap();

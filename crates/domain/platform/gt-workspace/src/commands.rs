@@ -10,7 +10,8 @@
 //! authoritative (non-negotiable #4).
 //!
 //! Legal lifecycle: a workspace is born [`Active`](WorkspaceStatus::Active), may
-//! be [`Suspended`](WorkspaceStatus::Suspended) from `Active`, and
+//! be [`Suspended`](WorkspaceStatus::Suspended) from `Active` and
+//! [`Resume`](WorkspaceCommand::Resume)d back to `Active` from `Suspended`, and
 //! [`Archived`](WorkspaceStatus::Archived) from either `Active` or `Suspended`.
 //! `Archived` is terminal. The reducer primitives in [`state`](crate::state)
 //! deliberately enforce none of this — they apply already-decided events — so
@@ -44,6 +45,15 @@ pub enum WorkspaceCommand {
     /// Suspend an active workspace.
     Suspend {
         /// The workspace to suspend.
+        id: WorkspaceId,
+    },
+    /// Resume a suspended workspace back to active (the restore counterpart of
+    /// `Suspend`). The on-disk restore — untar the snapshot, `pg_restore`, replay
+    /// the event log, verify the checksum — is a deploy-edge step (mirroring how
+    /// `Archive`'s teardown lives outside the domain); this command records only
+    /// the orchestrator's status transition back to [`Active`](WorkspaceStatus::Active).
+    Resume {
+        /// The workspace to resume.
         id: WorkspaceId,
     },
     /// Archive a workspace (terminal).
@@ -123,6 +133,19 @@ impl WorkspaceCommand {
                     });
                 }
                 Ok(vec![WorkspaceEvent::Suspended { id: id.clone() }])
+            }
+            WorkspaceCommand::Resume { id } => {
+                let status = require_present(catalog, id)?;
+                // Only a suspended workspace may be resumed; an active one is a
+                // no-op illegal transition, and archived is terminal.
+                if status != WorkspaceStatus::Suspended {
+                    return Err(WorkspaceError::IllegalTransition {
+                        id: id.clone(),
+                        from: status,
+                        action: "resume",
+                    });
+                }
+                Ok(vec![WorkspaceEvent::Resumed { id: id.clone() }])
             }
             WorkspaceCommand::Archive { id } => {
                 let status = require_present(catalog, id)?;
@@ -237,6 +260,38 @@ mod tests {
                 from: WorkspaceStatus::Suspended,
                 action: "suspend",
             })
+        );
+    }
+
+    #[test]
+    fn resume_only_from_suspended() {
+        let suspended = run(with_acme(), &WorkspaceCommand::Suspend { id: id("acme") });
+        // Suspended -> Active via Resume.
+        let resumed = run(suspended, &WorkspaceCommand::Resume { id: id("acme") });
+        assert_eq!(resumed.get(&id("acme")).unwrap().status, WorkspaceStatus::Active);
+        // Resuming an active workspace is illegal.
+        assert_eq!(
+            WorkspaceCommand::Resume { id: id("acme") }.decide(&resumed),
+            Err(WorkspaceError::IllegalTransition {
+                id: id("acme"),
+                from: WorkspaceStatus::Active,
+                action: "resume",
+            })
+        );
+        // Resuming an archived (terminal) workspace is illegal.
+        let archived = run(with_acme(), &WorkspaceCommand::Archive { id: id("acme") });
+        assert_eq!(
+            WorkspaceCommand::Resume { id: id("acme") }.decide(&archived),
+            Err(WorkspaceError::IllegalTransition {
+                id: id("acme"),
+                from: WorkspaceStatus::Archived,
+                action: "resume",
+            })
+        );
+        // Resuming an absent workspace is not-found.
+        assert_eq!(
+            WorkspaceCommand::Resume { id: id("ghost") }.decide(&WorkspaceCatalog::new()),
+            Err(WorkspaceError::NotFound(id("ghost")))
         );
     }
 

@@ -211,6 +211,8 @@ mod tests {
         actor.handle(create("beta")).await.unwrap();
         actor.handle(WorkspaceCommand::Rename { id: id("acme"), name: "Acme Corp".into() }).await.unwrap();
         actor.handle(WorkspaceCommand::Suspend { id: id("beta") }).await.unwrap();
+        // Suspend then resume beta — the resume reducer must replay deterministically too.
+        actor.handle(WorkspaceCommand::Resume { id: id("beta") }).await.unwrap();
         actor.handle(WorkspaceCommand::Archive { id: id("acme") }).await.unwrap();
 
         // The byte-for-byte gate: replay reproduces the live catalog exactly.

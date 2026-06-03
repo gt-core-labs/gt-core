@@ -47,6 +47,11 @@ pub enum WorkspaceEvent {
         /// The workspace suspended.
         id: WorkspaceId,
     },
+    /// A suspended workspace was resumed back to active.
+    Resumed {
+        /// The workspace resumed.
+        id: WorkspaceId,
+    },
     /// A workspace was archived (terminal).
     Archived {
         /// The workspace archived.
@@ -61,6 +66,7 @@ impl WorkspaceEvent {
             WorkspaceEvent::Created { id, .. }
             | WorkspaceEvent::Renamed { id, .. }
             | WorkspaceEvent::Suspended { id }
+            | WorkspaceEvent::Resumed { id }
             | WorkspaceEvent::Archived { id } => id,
         }
     }
@@ -71,6 +77,7 @@ impl WorkspaceEvent {
             WorkspaceEvent::Created { .. } => "workspace.created.v1",
             WorkspaceEvent::Renamed { .. } => "workspace.renamed.v1",
             WorkspaceEvent::Suspended { .. } => "workspace.suspended.v1",
+            WorkspaceEvent::Resumed { .. } => "workspace.resumed.v1",
             WorkspaceEvent::Archived { .. } => "workspace.archived.v1",
         }
     }
@@ -88,6 +95,7 @@ impl WorkspaceEvent {
             WorkspaceEvent::Suspended { id } => {
                 catalog.set_status(id, WorkspaceStatus::Suspended)
             }
+            WorkspaceEvent::Resumed { id } => catalog.set_status(id, WorkspaceStatus::Active),
             WorkspaceEvent::Archived { id } => catalog.set_status(id, WorkspaceStatus::Archived),
         }
     }
@@ -109,6 +117,7 @@ mod tests {
         );
         assert_eq!(WorkspaceEvent::Renamed { id: id("a"), name: "B".into() }.kind(), "workspace.renamed.v1");
         assert_eq!(WorkspaceEvent::Suspended { id: id("a") }.kind(), "workspace.suspended.v1");
+        assert_eq!(WorkspaceEvent::Resumed { id: id("a") }.kind(), "workspace.resumed.v1");
         assert_eq!(WorkspaceEvent::Archived { id: id("a") }.kind(), "workspace.archived.v1");
     }
 
@@ -132,6 +141,9 @@ mod tests {
 
         WorkspaceEvent::Suspended { id: id("acme") }.apply(&mut cat).unwrap();
         assert_eq!(cat.get(&id("acme")).unwrap().status, WorkspaceStatus::Suspended);
+
+        WorkspaceEvent::Resumed { id: id("acme") }.apply(&mut cat).unwrap();
+        assert_eq!(cat.get(&id("acme")).unwrap().status, WorkspaceStatus::Active);
 
         WorkspaceEvent::Archived { id: id("acme") }.apply(&mut cat).unwrap();
         assert_eq!(cat.get(&id("acme")).unwrap().status, WorkspaceStatus::Archived);
