@@ -4,18 +4,21 @@ use gt_events::AppError;
 
 use crate::record::EventRecord;
 
-/// Read-side compatibility adapter (hq-mod-events.2).
+/// Read-side compatibility adapter (hq-mod-events.2, extended for `agent.*` in hq-mcp-dispatch.11).
 ///
-/// The domain event kinds (`rig.*`, `quota.*`, `merge.*`) were backfilled with an explicit
-/// `.v1` version suffix so the log carries versioned kinds (docs/03 non-negotiable). Logs
-/// written *before* that backfill hold the bare kind (`"quota.rotated"`); those `events.jsonl`
-/// files are **never rewritten**. So on read we upgrade a known bare kind to its `.v1` form,
-/// making legacy and current records indistinguishable to every downstream consumer.
+/// The domain event kinds (`rig.*`, `quota.*`, `merge.*`, and `agent.*`) were backfilled with an
+/// explicit `.v1` version suffix so the log carries versioned kinds (docs/03 non-negotiable).
+/// Logs written *before* that backfill hold the bare kind (`"quota.rotated"`, `"agent.spawned"`);
+/// those `events.jsonl` files are **never rewritten**. So on read we upgrade a known bare kind to
+/// its current form, making legacy and current records indistinguishable to every downstream
+/// consumer (replay folds by struct shape, but consumers that key on the kind string — feeds,
+/// kind tallies — need the uniform form).
 ///
-/// The set is closed on purpose: only the kinds renamed by this bead are upgraded. Unversioned
-/// kinds owned by other domains (`agent.*`, `skills.*`, `quota.login_*`, `scheduling.*`, …)
-/// pass through untouched — blindly appending `.v1` to every bare kind would corrupt them.
-/// A kind that already carries any `.vN` suffix is not in this set, so it is left as-is.
+/// The set is closed on purpose: only kinds whose owning domain has since been versioned are
+/// upgraded. Kinds still emitted bare by their domain (`skills.*`, `quota.login_*`,
+/// `scheduling.*`, …) pass through untouched — blindly appending `.v1` to every bare kind would
+/// corrupt them. A kind that already carries any `.vN` suffix is not in this set, so it is
+/// left as-is.
 const LEGACY_BARE_KINDS_V1: &[&str] = &[
     // gt-rig
     "rig.added",
@@ -36,14 +39,20 @@ const LEGACY_BARE_KINDS_V1: &[&str] = &[
     "merge.started",
     "merge.merged",
     "merge.failed",
+    // gt-agent (hq-mcp-dispatch.11; `agent.session_end` is a rename, see LEGACY_RENAMED_KINDS)
+    "agent.spawned",
+    "agent.heartbeat",
+    "agent.killed",
 ];
 
 /// Legacy convoy kinds that were not just version-suffixed but **re-namespaced**
 /// (`hq-mod-events.8`). events.2 left `gt-orchestration` on the `orch.*` family prefix; the
 /// convoy domain was later aligned to the `convoy.*.v1` leaf namespace its siblings use. A
 /// bare suffix-append cannot express that (the module segment + noun both change), so these
-/// are a full `legacy -> forward` remap. Closed set: only the seven convoy kinds. Other
-/// `orch.*` strings (none emitted today) pass through untouched.
+/// are a full `legacy -> forward` remap. The convoy kinds are joined by `agent.session_end`
+/// (hq-mcp-dispatch.11): its sibling agent kinds version with a plain `.v1` append, but the
+/// `session_end` leaf was also kebab-normalized to `session-end` when gt-agent aligned to the
+/// declared `agent.session-end.v1` shape, so a bare suffix-append cannot express it.
 const LEGACY_RENAMED_KINDS: &[(&str, &str)] = &[
     ("orch.convoy_created", "convoy.created.v1"),
     ("orch.convoy_launched", "convoy.launched.v1"),
@@ -52,6 +61,8 @@ const LEGACY_RENAMED_KINDS: &[(&str, &str)] = &[
     ("orch.member_failed", "convoy.member_failed.v1"),
     ("orch.convoy_closed", "convoy.closed.v1"),
     ("orch.convoy_failed", "convoy.failed.v1"),
+    // gt-agent: snake -> kebab leaf rename (siblings use LEGACY_BARE_KINDS_V1).
+    ("agent.session_end", "agent.session-end.v1"),
 ];
 
 /// Upgrade a legacy kind to its current form in place: a bare `.v1` suffix for the events.2
@@ -134,16 +145,45 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("legacy.jsonl");
         let mut f = std::fs::File::create(&path).unwrap();
-        // A legacy bare kind, a current `.v1` kind, and an out-of-set kind.
+        // A legacy bare kind, a current `.v1` kind, and an out-of-set kind (`scheduling.*` is
+        // still emitted bare by its domain, so it must pass through untouched).
         writeln!(f, "{}", rec_line("quota.rotated")).unwrap();
         writeln!(f, "{}", rec_line("merge.merged.v1")).unwrap();
-        writeln!(f, "{}", rec_line("agent.spawned")).unwrap();
+        writeln!(f, "{}", rec_line("scheduling.tick")).unwrap();
         drop(f);
 
         let recs = read_all(&path).unwrap();
         assert_eq!(recs[0].kind, "quota.rotated.v1", "legacy bare -> v1");
         assert_eq!(recs[1].kind, "merge.merged.v1", "already versioned untouched");
-        assert_eq!(recs[2].kind, "agent.spawned", "out-of-set kind untouched");
+        assert_eq!(recs[2].kind, "scheduling.tick", "out-of-set kind untouched");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn legacy_agent_kinds_are_canonicalized() {
+        let dir =
+            std::env::temp_dir().join(format!("gt-eventlog-reader-agent-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("legacy.jsonl");
+        let mut f = std::fs::File::create(&path).unwrap();
+        // Three bare agent kinds that version with a plain `.v1` append, the `session_end` leaf
+        // that also kebab-renames, a current forward kind, and an out-of-set kind.
+        writeln!(f, "{}", rec_line("agent.spawned")).unwrap();
+        writeln!(f, "{}", rec_line("agent.heartbeat")).unwrap();
+        writeln!(f, "{}", rec_line("agent.killed")).unwrap();
+        writeln!(f, "{}", rec_line("agent.session_end")).unwrap();
+        writeln!(f, "{}", rec_line("agent.spawned.v1")).unwrap();
+        writeln!(f, "{}", rec_line("scheduling.tick")).unwrap();
+        drop(f);
+
+        let recs = read_all(&path).unwrap();
+        assert_eq!(recs[0].kind, "agent.spawned.v1", "bare -> v1");
+        assert_eq!(recs[1].kind, "agent.heartbeat.v1", "bare -> v1");
+        assert_eq!(recs[2].kind, "agent.killed.v1", "bare -> v1");
+        assert_eq!(recs[3].kind, "agent.session-end.v1", "snake -> kebab leaf rename");
+        assert_eq!(recs[4].kind, "agent.spawned.v1", "already forward untouched");
+        assert_eq!(recs[5].kind, "scheduling.tick", "out-of-set kind untouched");
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -160,14 +200,14 @@ mod tests {
         writeln!(f, "{}", rec_line("orch.convoy_created")).unwrap();
         writeln!(f, "{}", rec_line("orch.member_dispatched")).unwrap();
         writeln!(f, "{}", rec_line("convoy.closed.v1")).unwrap();
-        writeln!(f, "{}", rec_line("agent.spawned")).unwrap();
+        writeln!(f, "{}", rec_line("scheduling.tick")).unwrap();
         drop(f);
 
         let recs = read_all(&path).unwrap();
         assert_eq!(recs[0].kind, "convoy.created.v1", "legacy orch.* -> convoy.*.v1");
         assert_eq!(recs[1].kind, "convoy.member_dispatched.v1", "member re-namespaced");
         assert_eq!(recs[2].kind, "convoy.closed.v1", "already forward untouched");
-        assert_eq!(recs[3].kind, "agent.spawned", "out-of-set kind untouched");
+        assert_eq!(recs[3].kind, "scheduling.tick", "out-of-set kind untouched");
 
         let _ = std::fs::remove_dir_all(&dir);
     }
