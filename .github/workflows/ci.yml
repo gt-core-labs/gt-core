@@ -92,6 +92,13 @@ jobs:
         env:
           GT_DOLT_URL: mysql://root@127.0.0.1:3306
         run: cargo test -p gt-store-dolt --test issues_contract -- --test-threads=1
+      # The issues MCP resource reads (gt://issues page envelope + gt://issue/{id}
+      # NotFound, hq-mcp-test.3). Own throwaway DB (gt_rs_resources_test), so it
+      # neither touches live hq nor races the store fixture above.
+      - name: issues resources contract
+        env:
+          GT_DOLT_URL: mysql://root@127.0.0.1:3306
+        run: cargo test -p gt-issues --test resources_contract
       # Postgres-backed schema migration + workspace-scoped feature flags.
       - name: pg contract
         env:

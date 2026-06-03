@@ -21,3 +21,7 @@ semver = { workspace = true }
 
 [dev-dependencies]
 gt-module-mcp = { workspace = true }
+# Dolt-gated resources contract (hq-mcp-test.3): async runtime + a raw client to
+# seed the throwaway test database the resource passthroughs read back.
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+mysql_async = { workspace = true }
