@@ -21,6 +21,8 @@ gt-merge = { workspace = true }
 gt-orchestration = { workspace = true }
 # agent.* dispatch (hq-mcp-dispatch.7): event-sourced SessionRegistry.
 gt-agent = { workspace = true }
+# quota.* dispatch (hq-mcp-dispatch.4): event-sourced AccountRegistry.
+gt-quota = { workspace = true }
 gt-patrol = { workspace = true }
 gt-runtime = { workspace = true }
 gt-roles = { workspace = true }
