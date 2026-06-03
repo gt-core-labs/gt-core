@@ -18,8 +18,13 @@ use tokio::sync::mpsc::{unbounded_channel, UnboundedSender};
 
 /// A durable audit sink that forwards records to a background Postgres writer.
 /// Cloneable via the `Arc` the server holds; the sender is cheap to share.
+///
+/// The `pool` is retained alongside the writer channel so [`AuditSink::read_all`]
+/// can serve the per-tenant audit dump (`audit.tail`, hq-mt-ops.3): writes flow
+/// through the non-blocking channel, reads query Postgres directly.
 pub struct PgAuditSink {
     tx: UnboundedSender<AuditRecord>,
+    pool: PgPool,
 }
 
 impl PgAuditSink {
@@ -29,16 +34,18 @@ impl PgAuditSink {
         let pool = PgPoolOptions::new().max_connections(2).connect(url).await?;
         ensure_schema(&pool).await?;
         let (tx, mut rx) = unbounded_channel::<AuditRecord>();
+        // The drain owns its own pool handle; the struct keeps a clone for reads.
+        let writer_pool = pool.clone();
         // Detached drain: lives for the process. Each record is one INSERT; a
         // failure is logged, not propagated — the server keeps serving.
         tokio::spawn(async move {
             while let Some(rec) = rx.recv().await {
-                if let Err(e) = insert(&pool, &rec).await {
+                if let Err(e) = insert(&writer_pool, &rec).await {
                     eprintln!("[gt-mcp-server] PG audit insert failed ({}): {e}", rec.tool);
                 }
             }
         });
-        Ok(Self { tx })
+        Ok(Self { tx, pool })
     }
 }
 
@@ -49,11 +56,49 @@ impl AuditSink for PgAuditSink {
             .map_err(|_| AppError::Sink("audit drain task is gone".into()))
     }
 
+    /// Read the whole append-ordered trail from Postgres. `read_all` is a sync
+    /// trait method (the kernel `gt-audit` port stays tokio-free), but the query
+    /// is async — so we bridge through `block_in_place` + `block_on` on the
+    /// server's multi-threaded runtime. The caller (`audit.tail`) applies the
+    /// per-tenant + field filters and the `limit` window on the result; a future
+    /// optimisation can push the `WHERE workspace_id` down to SQL if the trail
+    /// grows large.
     fn read_all(&self) -> Result<Vec<AuditRecord>, AppError> {
-        // The durable trail lives in Postgres; the server never reads it back
-        // through the sink (queries go straight to PG). Not supported here.
-        Err(AppError::Sink("read_all is not supported by PgAuditSink".into()))
+        let pool = self.pool.clone();
+        let rows = tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current().block_on(async move { select_all(&pool).await })
+        })
+        .map_err(|e| AppError::Sink(format!("audit read_all query failed: {e}")))?;
+        Ok(rows.into_iter().map(row_to_record).collect())
     }
+}
+
+/// One `mcp_audit` row in the column order [`select_all`] projects: workspace_id,
+/// actor, tool, args (JSON text), outcome (`invoked`/`unauthorized`), ts (RFC3339).
+type AuditRow = (String, String, String, String, String, String);
+
+/// Read every row in append order (`id`). `ts` is rendered UTC RFC3339 in SQL so
+/// the record's `ts` round-trips the same string shape the in-memory sink carries.
+async fn select_all(pool: &PgPool) -> Result<Vec<AuditRow>, sqlx::Error> {
+    sqlx::query_as::<_, AuditRow>(
+        "SELECT workspace_id, actor, tool, args, outcome, \
+         to_char(ts AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"') \
+         FROM mcp_audit ORDER BY id",
+    )
+    .fetch_all(pool)
+    .await
+}
+
+/// Rebuild an [`AuditRecord`] from a projected row. A malformed `args` text (should
+/// not happen — we wrote it) degrades to JSON null rather than failing the dump; an
+/// unknown outcome string maps to `Invoked` (the only non-`unauthorized` value).
+fn row_to_record((workspace_id, actor, tool, args, outcome, ts): AuditRow) -> AuditRecord {
+    let args = serde_json::from_str(&args).unwrap_or(serde_json::Value::Null);
+    let outcome = match outcome.as_str() {
+        "unauthorized" => Outcome::Unauthorized,
+        _ => Outcome::Invoked,
+    };
+    AuditRecord { workspace_id, actor, tool, args, outcome, ts }
 }
 
 /// Idempotent table create — append-only audit of every tool dispatch.
@@ -169,5 +214,17 @@ mod tests {
                 .unwrap();
         assert_eq!(acme, 1, "acme tenant trail is isolated");
         assert_eq!(default, 1, "3-arg record falls under default tenant");
+
+        // read_all (audit.tail backend) returns every row, append-ordered, with a
+        // round-tripped RFC3339 ts (hq-mt-ops.3).
+        let all = select_all(&pool).await.unwrap();
+        assert_eq!(all.len(), 3, "read_all sees all tenants' rows");
+        let recs: Vec<AuditRecord> = all.into_iter().map(row_to_record).collect();
+        assert_eq!(recs[0].actor, "a", "append order preserved");
+        assert!(
+            recs.iter().all(|r| r.ts.ends_with('Z') && r.ts.contains('T')),
+            "ts rendered as UTC RFC3339"
+        );
+        assert_eq!(recs[0].outcome, Outcome::Invoked);
     }
 }
