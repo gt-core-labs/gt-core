@@ -199,9 +199,12 @@ impl IssuesServer {
         };
 
         if let Err(e) = scope.check(tool) {
-            let _ = self
-                .audit
-                .record(AuditRecord::unauthorized(&scope.actor, tool, args.clone()));
+            // The tenant is already resolved here (the token was verified), so an
+            // out-of-scope denial is attributed to its workspace — not "default".
+            let _ = self.audit.record(
+                AuditRecord::unauthorized(&scope.actor, tool, args.clone())
+                    .in_workspace(workspace_or_default(&workspace)),
+            );
             return Err(McpError::invalid_request(e.to_string(), None));
         }
         Ok((scope, workspace))
@@ -351,9 +354,14 @@ impl ServerHandler for IssuesServer {
                 }
             }
         };
-        let _ = self
-            .audit
-            .record(AuditRecord::invoked(&scope.actor, &tool, args));
+        // Attribute the invocation to the authoritative tenant (the JWT claim's
+        // workspace, hq-mcp-dispatch.9) so the audit trail is per-tenant filterable
+        // (hq-mt-auth.7 SOC2 dump). Absent a resolved workspace (legacy header mode
+        // with no X-Workspace) it falls back to the default tenant.
+        let _ = self.audit.record(
+            AuditRecord::invoked(&scope.actor, &tool, args)
+                .in_workspace(workspace_or_default(&workspace)),
+        );
 
         match result {
             Ok(payload) => Ok(CallToolResult::success(vec![Content::text(
@@ -527,6 +535,13 @@ fn now_secs() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0)
+}
+
+/// The resolved tenant for an audit record, or `"default"` when no workspace was
+/// resolved (legacy header mode with no `X-Workspace`). Mirrors the `mcp_audit`
+/// column default so the trail never carries a NULL tenant.
+fn workspace_or_default(workspace: &Option<String>) -> &str {
+    workspace.as_deref().unwrap_or("default")
 }
 
 #[cfg(test)]
@@ -816,5 +831,34 @@ validate_only = true
             .authorize("workspace.create", &json!({}), &ext_bearer("mem", Some("acme")))
             .expect_err("a member cannot provision a tenant");
         assert_eq!(err.code, ErrorCode::INVALID_REQUEST);
+
+        // hq-mt-auth.8: the out-of-scope denial is attributed to the token's
+        // workspace, not the default tenant — the trail is per-tenant filterable.
+        let rows = audit.read_all().unwrap();
+        let denial = rows.last().expect("the denial was audited");
+        assert_eq!(denial.outcome, Outcome::Unauthorized);
+        assert_eq!(denial.workspace_id, "acme");
+    }
+
+    /// Legacy header mode (no authenticator): an out-of-scope denial is attributed to
+    /// the `X-Workspace` header, and a request with no header falls back to "default".
+    #[test]
+    fn legacy_denial_is_attributed_to_x_workspace_then_default() {
+        let audit = Arc::new(InMemoryAudit::new());
+        // A closed boot scope denies every tool, so each call audits one Unauthorized row.
+        let srv = server(Scope::denied("watcher"), None, audit.clone());
+
+        srv.authorize(
+            "issues.create.execute",
+            &json!({}),
+            &ext_with_header("x-workspace", "globex"),
+        )
+        .expect_err("execute is out of scope");
+        srv.authorize("issues.create.execute", &json!({}), &Extensions::new())
+            .expect_err("execute is out of scope");
+
+        let rows = audit.read_all().unwrap();
+        assert_eq!(rows[0].workspace_id, "globex", "header tenant attributed");
+        assert_eq!(rows[1].workspace_id, "default", "no header falls back to default");
     }
 }
