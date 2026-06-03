@@ -22,10 +22,11 @@ use serde_json::{json, Value};
 use gt_graphindex::{ensure_ignored, GraphError, GraphIndexer, IndexStats};
 use gt_graphwarden::{MarkRefreshed, RegisterRig, WardenCommand, WardenState};
 use gt_mcp_server::{DomainCtx, DomainHandler};
+use gt_module::McpTool;
 use gt_store_dolt::AppError;
 
 use super::eventlog::EventLog;
-use super::util::{now_secs, str_arg};
+use super::util::{descriptor, now_secs, opt, req, str_arg};
 
 /// The warden event-log kind prefix the handler replays to resolve rigs.
 const NS: &str = "graphwarden.";
@@ -131,6 +132,29 @@ fn graph_err(e: GraphError) -> AppError {
 impl DomainHandler for GraphHandler {
     fn namespace(&self) -> &'static str {
         "graph"
+    }
+
+    fn descriptors(&self) -> Vec<McpTool> {
+        vec![
+            descriptor(
+                "graph.query",
+                "Ask a natural-language question against a rig's codebase knowledge graph.",
+                &[req("rig", "string"), req("question", "string")],
+            ),
+            descriptor(
+                "graph.explain",
+                "Explain one node (crate/concept) in a rig's knowledge graph.",
+                &[req("rig", "string"), req("node", "string")],
+            ),
+            descriptor("graph.status", "Report a rig's graph freshness + index stats.", &[req("rig", "string")]),
+            descriptor(
+                "graph.refresh",
+                "Rebuild a rig's knowledge graph; optionally over an explicit repo_dir.",
+                &[req("rig", "string"), opt("repo_dir", "string")],
+            ),
+            descriptor("graph.refresh-stale", "Rebuild every rig whose graph the warden marked stale.", &[]),
+            descriptor("graph.list", "List the rigs under warden custody with their freshness.", &[]),
+        ]
     }
 
     async fn dispatch(&self, tool: &str, ctx: DomainCtx<'_>) -> Result<Value, AppError> {

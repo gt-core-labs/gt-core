@@ -26,7 +26,10 @@ use serde_json::{json, Value};
 
 use gt_audit::{AuditRecord, AuditSink};
 use gt_mcp_server::{DomainCtx, DomainHandler};
+use gt_module::McpTool;
 use gt_store_dolt::AppError;
+
+use super::util::{descriptor, opt};
 
 use super::util::parse;
 
@@ -123,6 +126,22 @@ fn record_matches(r: &AuditRecord, ws: &str, q: &AuditQuery) -> bool {
 impl DomainHandler for AuditHandler {
     fn namespace(&self) -> &'static str {
         "audit"
+    }
+
+    fn descriptors(&self) -> Vec<McpTool> {
+        vec![descriptor(
+            "audit.tail",
+            "Tail the MCP audit trail for the caller's workspace, most recent first. \
+             Optional actor/tool/outcome exact-match filters, an RFC3339 `since` lower \
+             bound, and a `limit` (default 20).",
+            &[
+                opt("actor", "string"),
+                opt("tool", "string"),
+                opt("outcome", "string"),
+                opt("since", "string"),
+                opt("limit", "integer"),
+            ],
+        )]
     }
 
     async fn dispatch(&self, tool: &str, ctx: DomainCtx<'_>) -> Result<Value, AppError> {

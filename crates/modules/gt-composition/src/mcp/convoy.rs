@@ -17,13 +17,14 @@ use serde_json::{json, Value};
 
 use gt_events::{Command, EventKind};
 use gt_mcp_server::{DomainCtx, DomainHandler};
+use gt_module::McpTool;
 use gt_orchestration::{
     CompleteMember, Convoy, ConvoyBoard, FailMember, LaunchConvoy, OrchEvent, OrchState,
 };
 use gt_store_dolt::AppError;
 
 use super::eventlog::EventLog;
-use super::util::{ev_err, parse, str_arg};
+use super::util::{descriptor, ev_err, parse, req, str_arg};
 
 /// The event-log kind prefix for every convoy event (`convoy.*.v1`).
 const NS: &str = "convoy.";
@@ -67,6 +68,28 @@ impl ConvoyHandler {
 impl DomainHandler for ConvoyHandler {
     fn namespace(&self) -> &'static str {
         "convoy"
+    }
+
+    fn descriptors(&self) -> Vec<McpTool> {
+        vec![
+            descriptor(
+                "convoy.launch",
+                "Launch a convoy over an ordered list of member beads; dispatches the first member.",
+                &[req("convoy", "string"), req("members", "array")],
+            ),
+            descriptor(
+                "convoy.complete-member",
+                "Mark a convoy member done; hands off to the next member, closing the convoy when all are done.",
+                &[req("convoy", "string"), req("member", "string")],
+            ),
+            descriptor(
+                "convoy.fail-member",
+                "Mark a convoy member failed with a reason.",
+                &[req("convoy", "string"), req("member", "string"), req("reason", "string")],
+            ),
+            descriptor("convoy.list", "List every convoy in the workspace with its state + members.", &[]),
+            descriptor("convoy.info", "Show one convoy's state + members.", &[req("convoy", "string")]),
+        ]
     }
 
     async fn dispatch(&self, tool: &str, ctx: DomainCtx<'_>) -> Result<Value, AppError> {

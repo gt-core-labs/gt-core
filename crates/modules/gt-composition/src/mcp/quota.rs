@@ -22,13 +22,14 @@ use serde_json::{json, Value};
 
 use gt_events::{Command, EventKind};
 use gt_mcp_server::{DomainCtx, DomainHandler};
+use gt_module::McpTool;
 use gt_quota::{
     Account, AccountRegistry, ProbeWindow, QuotaEvent, QuotaState, RotateAccount, SampleTokens,
 };
 use gt_store_dolt::AppError;
 
 use super::eventlog::EventLog;
-use super::util::{ev_err, parse_cmd, str_arg};
+use super::util::{descriptor, ev_err, parse_cmd, req, str_arg};
 
 /// The event-log kind prefix for every quota event (`quota.*.v1`).
 const NS: &str = "quota.";
@@ -73,6 +74,36 @@ impl QuotaHandler {
 impl DomainHandler for QuotaHandler {
     fn namespace(&self) -> &'static str {
         "quota"
+    }
+
+    fn descriptors(&self) -> Vec<McpTool> {
+        vec![
+            descriptor(
+                "quota.sample",
+                "Record a token-usage sample for an account/session/model.",
+                &[
+                    req("account", "string"),
+                    req("session", "string"),
+                    req("model", "string"),
+                    req("input", "integer"),
+                    req("output", "integer"),
+                    req("cache_read", "integer"),
+                    req("cache_creation", "integer"),
+                ],
+            ),
+            descriptor(
+                "quota.probe",
+                "Record a rate-limit probe: remaining budget + reset time for an account.",
+                &[req("account", "string"), req("remaining", "integer"), req("resets_at_secs", "integer")],
+            ),
+            descriptor(
+                "quota.rotate",
+                "Rotate active usage from one account to another.",
+                &[req("from_account", "string"), req("to_account", "string")],
+            ),
+            descriptor("quota.list", "List every tracked account with its usage.", &[]),
+            descriptor("quota.info", "Show one account's usage + window.", &[req("account", "string")]),
+        ]
     }
 
     async fn dispatch(&self, tool: &str, ctx: DomainCtx<'_>) -> Result<Value, AppError> {

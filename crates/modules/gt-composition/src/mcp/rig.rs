@@ -21,6 +21,7 @@ use serde_json::{json, Value};
 
 use gt_events::Command;
 use gt_mcp_server::{DomainCtx, DomainHandler, WorkspaceRigPrefixes};
+use gt_module::McpTool;
 use gt_rig::{
     AddRig, AdoptRig, PgRigs, RemoveRig, RigCatalog, RigEntry, RigRepository, SetRigDefaultBranch,
     SetRigPrefix, SetRigWorktreeRoot, RESERVED_RIG_NAMES,
@@ -28,6 +29,7 @@ use gt_rig::{
 use gt_store_dolt::AppError;
 
 use super::pools::WsPools;
+use super::util::{descriptor, opt, req};
 
 /// PG-backed handler for the `rig.*` tool namespace.
 pub struct RigHandler {
@@ -45,6 +47,48 @@ impl RigHandler {
 impl DomainHandler for RigHandler {
     fn namespace(&self) -> &'static str {
         "rig"
+    }
+
+    fn descriptors(&self) -> Vec<McpTool> {
+        // add/adopt share the same shape (name + prefix + git_url + default_branch,
+        // optional push/upstream urls); `workspace_id` + `now_secs` are server-supplied.
+        let provision = || {
+            vec![
+                req("name", "string"),
+                req("prefix", "string"),
+                req("git_url", "string"),
+                req("default_branch", "string"),
+                opt("push_url", "string"),
+                opt("upstream_url", "string"),
+            ]
+        };
+        vec![
+            descriptor("rig.add", "Register a new rig (repo) in the workspace catalog.", &provision()),
+            descriptor("rig.adopt", "Adopt an existing repo as a rig in the catalog.", &provision()),
+            descriptor(
+                "rig.set-prefix",
+                "Change a rig's bead-id prefix.",
+                &[req("name", "string"), req("new_prefix", "string")],
+            ),
+            descriptor(
+                "rig.set-default-branch",
+                "Change a rig's default branch.",
+                &[req("name", "string"), req("new_branch", "string")],
+            ),
+            descriptor(
+                "rig.set-worktree-root",
+                "Change a rig's worktree root path.",
+                &[req("name", "string"), req("new_root", "string")],
+            ),
+            descriptor("rig.remove", "Remove a rig from the catalog.", &[req("name", "string")]),
+            descriptor("rig.list", "List every rig in the workspace catalog.", &[]),
+            descriptor("rig.info", "Show one rig's catalog entry.", &[req("name", "string")]),
+            descriptor(
+                "rig.lookup-by-prefix",
+                "Resolve the rig owning a given bead-id prefix.",
+                &[req("prefix", "string")],
+            ),
+        ]
     }
 
     async fn dispatch(&self, tool: &str, ctx: DomainCtx<'_>) -> Result<Value, AppError> {

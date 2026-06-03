@@ -29,10 +29,11 @@ use serde_json::{json, Value};
 
 use gt_agent::{AgentEvent, Session, SessionRegistry, SessionRole, SessionState};
 use gt_mcp_server::{DomainCtx, DomainHandler};
+use gt_module::McpTool;
 use gt_store_dolt::AppError;
 
 use super::eventlog::EventLog;
-use super::util::{parse, str_arg};
+use super::util::{descriptor, opt, parse, req, str_arg};
 
 /// The event-log kind prefix for every agent event (`agent.*`).
 const NS: &str = "agent.";
@@ -80,6 +81,25 @@ struct SpawnArgs {
 impl DomainHandler for AgentHandler {
     fn namespace(&self) -> &'static str {
         "agent"
+    }
+
+    fn descriptors(&self) -> Vec<McpTool> {
+        vec![
+            descriptor(
+                "agent.spawn",
+                "Record a new agent session (spawn) under a session id + rig.",
+                &[req("session", "string"), req("rig", "string"), opt("role", "string"), opt("crew", "string")],
+            ),
+            descriptor("agent.heartbeat", "Record a liveness heartbeat for a session.", &[req("session", "string")]),
+            descriptor("agent.end", "Record a session's normal end.", &[req("session", "string")]),
+            descriptor(
+                "agent.kill",
+                "Record a session forcibly killed with a reason.",
+                &[req("session", "string"), req("reason", "string")],
+            ),
+            descriptor("agent.list", "List every agent session in the workspace.", &[]),
+            descriptor("agent.info", "Show one agent session's state.", &[req("session", "string")]),
+        ]
     }
 
     async fn dispatch(&self, tool: &str, ctx: DomainCtx<'_>) -> Result<Value, AppError> {

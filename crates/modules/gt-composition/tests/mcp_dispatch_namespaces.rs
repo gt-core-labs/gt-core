@@ -77,6 +77,50 @@ async fn event_log_namespaces_respond_over_an_empty_log() {
     );
 }
 
+/// hq-mcp-native.3: every tool a handler *advertises* (`descriptors()`) is one the
+/// router *dispatches* — the discovery↔dispatch bridge the old contract QA missed.
+/// That QA round-tripped a reconstructed `issues+meta` harvest against itself
+/// (`help_names == served_names`, both from the same `harvest_tools()`), so it could
+/// never catch a domain tool that dispatched but was never advertised. Here both
+/// sides come from one router instance, so they cannot be reconciled by construction.
+#[tokio::test]
+async fn advertised_domain_tools_are_dispatchable() {
+    let tmp = TempDir::new().expect("tempdir");
+    let log = Arc::new(EventLog::new(Some(tmp.path().to_path_buf())));
+    let router = DomainRouter::new()
+        .register(Arc::new(MergeHandler::new(log.clone())))
+        .register(Arc::new(ConvoyHandler::new(log.clone())))
+        .register(Arc::new(AgentHandler::new(log.clone())))
+        .register(Arc::new(QuotaHandler::new(log.clone())));
+
+    let descriptors = router.descriptors();
+    assert!(!descriptors.is_empty(), "the registered handlers must advertise tools");
+
+    for tool in &descriptors {
+        // The advertised tool's namespace is owned — dispatch is not Ok(None). An
+        // empty payload makes a mutation fail validation (Err, owned), never appends.
+        assert!(
+            responds(&router, &tool.name).await,
+            "advertised `{}` is not dispatchable (Ok(None))",
+            tool.name
+        );
+        // A complete tools/list / meta.help entry: non-empty description + object schema.
+        assert!(!tool.description.is_empty(), "`{}` has no description", tool.name);
+        assert_eq!(
+            tool.input_schema["type"], "object",
+            "`{}` input schema is not an object",
+            tool.name
+        );
+    }
+
+    // The four event-log namespaces each surface their representative tools.
+    let names: std::collections::BTreeSet<&str> =
+        descriptors.iter().map(|t| t.name.as_str()).collect();
+    for expected in ["merge.submit", "convoy.launch", "agent.spawn", "quota.sample"] {
+        assert!(names.contains(expected), "`{expected}` missing from the advertised set");
+    }
+}
+
 #[tokio::test]
 async fn all_seven_domain_namespaces_registered_and_respond() {
     let Some(pg_url) = std::env::var("GT_PG_URL").ok() else {

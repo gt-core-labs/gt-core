@@ -16,11 +16,14 @@ use sqlx::PgPool;
 use tokio::sync::RwLock;
 
 use gt_mcp_server::{DomainCtx, DomainHandler, GateStatus, WorkspaceStatusGate};
+use gt_module::McpTool;
 use gt_store_dolt::AppError;
 use gt_workspace::{
     ActorError, PgWorkspaces, WorkspaceActor, WorkspaceCommand, WorkspaceEntry, WorkspaceError,
     WorkspaceId, WorkspaceRepository, WorkspaceStatus,
 };
+
+use super::util::{descriptor, req};
 
 /// PG-backed handler for the `workspace.*` tool namespace.
 ///
@@ -48,6 +51,33 @@ impl WorkspaceHandler {
 impl DomainHandler for WorkspaceHandler {
     fn namespace(&self) -> &'static str {
         "workspace"
+    }
+
+    fn descriptors(&self) -> Vec<McpTool> {
+        vec![
+            descriptor(
+                "workspace.create",
+                "Provision a new workspace (tenant) in the catalog.",
+                &[req("id", "string"), req("name", "string")],
+            ),
+            descriptor(
+                "workspace.suspend",
+                "Reversibly disable an active workspace.",
+                &[req("id", "string")],
+            ),
+            descriptor(
+                "workspace.resume",
+                "Restore a suspended workspace to active.",
+                &[req("id", "string")],
+            ),
+            descriptor(
+                "workspace.archive",
+                "Archive a workspace (terminal transition from active or suspended).",
+                &[req("id", "string")],
+            ),
+            descriptor("workspace.list", "List every workspace in the catalog.", &[]),
+            descriptor("workspace.info", "Show one workspace's id, name + status.", &[req("id", "string")]),
+        ]
     }
 
     async fn dispatch(&self, tool: &str, ctx: DomainCtx<'_>) -> Result<Value, AppError> {

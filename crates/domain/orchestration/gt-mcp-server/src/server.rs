@@ -145,6 +145,23 @@ impl IssuesServer {
     /// [`DomainHandler`](crate::domain::DomainHandler). Additive — without it the
     /// server serves issues + meta only.
     pub fn with_domains(mut self, domains: Arc<DomainRouter>) -> Self {
+        // Surface the handlers' tool descriptors (hq-mcp-native.3): fold them into
+        // the advertised set so `tools/list` + `meta.help` list workspace.*/rig.*/…
+        // alongside issues.*/meta.*, and extend the sanitized→canonical alias map so
+        // a native client can invoke them by the sanitized name. Without this the
+        // domain tools dispatch but stay undiscoverable. Additive — an empty router
+        // (no `GT_PG_URL`) contributes nothing, so the issues-only build is unchanged.
+        let domain_tools = domains.descriptors();
+        if !domain_tools.is_empty() {
+            let mut tools = (*self.tools).clone();
+            let mut aliases = (*self.tool_aliases).clone();
+            for tool in &domain_tools {
+                aliases.insert(sanitize_tool_name(&tool.name), tool.name.clone());
+            }
+            tools.extend(domain_tools);
+            self.tools = Arc::new(tools);
+            self.tool_aliases = Arc::new(aliases);
+        }
         self.domains = domains;
         self
     }
@@ -857,6 +874,79 @@ mod tests {
         // A name never advertised (canonical dotted, or a domain tool) is absent, so
         // `call_tool` passes it through unchanged.
         assert!(srv.tool_aliases.get("issues.create.execute").is_none());
+    }
+
+    // ----- hq-mcp-native.3: domain descriptors surface in the served tool set ----
+
+    use crate::domain::{DomainCtx, DomainHandler, DomainRouter};
+
+    /// Advertises one two-segment domain tool, to prove `with_domains` folds a
+    /// handler's descriptors into the served set + the sanitized alias map.
+    struct DescribedHandler;
+
+    #[async_trait::async_trait]
+    impl DomainHandler for DescribedHandler {
+        fn namespace(&self) -> &'static str {
+            "workspace"
+        }
+        async fn dispatch(
+            &self,
+            _tool: &str,
+            _ctx: DomainCtx<'_>,
+        ) -> Result<serde_json::Value, gt_store_dolt::AppError> {
+            Ok(serde_json::json!({}))
+        }
+        fn descriptors(&self) -> Vec<McpTool> {
+            vec![McpTool::with_schema(
+                "workspace.create",
+                "Provision a workspace.",
+                serde_json::json!({
+                    "type": "object",
+                    "properties": { "id": { "type": "string" } },
+                    "required": ["id"],
+                }),
+            )]
+        }
+    }
+
+    /// `with_domains` surfaces every registered handler's descriptors in the served
+    /// tool set and registers the sanitized→canonical alias — without this the tool
+    /// dispatches but is undiscoverable (the hq-mcp-native.3 gap). The served set and
+    /// the router come from one wiring, so this is not a reconstructed-harvest
+    /// tautology: it asserts the fold the binary actually performs.
+    #[test]
+    fn with_domains_folds_handler_descriptors_into_the_served_set() {
+        let tool = |name: &str| McpTool::new(name, "");
+        let srv = IssuesServer::new(
+            Arc::new(
+                DoltIssues::connect("mysql://gt@127.0.0.1:1/none").expect("lazy pool url parses"),
+            ),
+            Scope::admin("boot"),
+            None,
+            Arc::new(InMemoryAudit::new()),
+            vec![tool("issues.create.execute")],
+            None,
+        )
+        .with_domains(Arc::new(
+            DomainRouter::new().register(Arc::new(DescribedHandler)),
+        ));
+
+        // The domain tool now rides alongside the issues tool in the advertised set,
+        let wc = srv
+            .tools
+            .iter()
+            .find(|t| t.name == "workspace.create")
+            .expect("domain descriptor folded into the served tool set");
+        // carries a complete entry (non-empty description + object input schema),
+        assert!(!wc.description.is_empty());
+        assert_eq!(wc.input_schema["type"], "object");
+        // the issues tool is still served,
+        assert!(srv.tools.iter().any(|t| t.name == "issues.create.execute"));
+        // and the sanitized name maps back so a native client can invoke it.
+        assert_eq!(
+            srv.tool_aliases.get("workspace_create").map(String::as_str),
+            Some("workspace.create"),
+        );
     }
 
     #[test]

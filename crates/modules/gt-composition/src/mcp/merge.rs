@@ -21,12 +21,13 @@ use gt_mcp_server::{DomainCtx, DomainHandler};
 use gt_merge::{
     CompleteMerge, FailMerge, MergeBoard, MergeEvent, MergeSlot, MergeState, StartMerge, SubmitMerge,
 };
+use gt_module::McpTool;
 use gt_rig::{PgRigs, RigRepository};
 use gt_store_dolt::AppError;
 
 use super::eventlog::EventLog;
 use super::pools::WsPools;
-use super::util::{ev_err, now_secs, parse, str_arg};
+use super::util::{descriptor, ev_err, now_secs, parse, req, str_arg};
 
 /// The event-log kind prefix for every merge event (`merge.*.v1`).
 const NS: &str = "merge.";
@@ -108,6 +109,29 @@ impl MergeHandler {
 impl DomainHandler for MergeHandler {
     fn namespace(&self) -> &'static str {
         "merge"
+    }
+
+    fn descriptors(&self) -> Vec<McpTool> {
+        vec![
+            descriptor(
+                "merge.submit",
+                "Submit a bead's branch into the merge queue.",
+                &[req("bead", "string"), req("branch", "string"), req("channel_msg_id", "string")],
+            ),
+            descriptor("merge.start", "Start merging a queued bead.", &[req("bead", "string")]),
+            descriptor(
+                "merge.complete",
+                "Mark a bead's merge complete with the landed commit sha.",
+                &[req("bead", "string"), req("sha", "string")],
+            ),
+            descriptor(
+                "merge.fail",
+                "Mark a bead's merge failed with a reason.",
+                &[req("bead", "string"), req("reason", "string")],
+            ),
+            descriptor("merge.list", "List every slot on the merge board.", &[]),
+            descriptor("merge.info", "Show one bead's merge slot.", &[req("bead", "string")]),
+        ]
     }
 
     async fn dispatch(&self, tool: &str, ctx: DomainCtx<'_>) -> Result<Value, AppError> {

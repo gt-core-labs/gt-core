@@ -18,6 +18,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use gt_module::McpTool;
 use gt_store_dolt::AppError;
 use serde_json::Value;
 
@@ -44,6 +45,18 @@ pub trait DomainHandler: Send + Sync {
 
     /// Run one `<namespace>.<verb>` tool call.
     async fn dispatch(&self, tool: &str, ctx: DomainCtx<'_>) -> Result<Value, AppError>;
+
+    /// The tool descriptors (name + description + input schema) this namespace
+    /// advertises (hq-mcp-native.3). The server folds these into `self.tools` so
+    /// `tools/list` + `meta.help` surface every dispatchable domain tool — without
+    /// this, a tool routes but is undiscoverable to a native client. Each name is
+    /// the two-segment `<namespace>.<verb>` the handler's `dispatch` matches.
+    ///
+    /// Default empty: a handler surfaces nothing until it overrides this, so adding
+    /// the method is additive (a not-yet-described handler still dispatches).
+    fn descriptors(&self) -> Vec<McpTool> {
+        Vec::new()
+    }
 }
 
 /// Registry of [`DomainHandler`]s keyed by namespace. Built once at composition time, handed to
@@ -72,6 +85,20 @@ impl DomainRouter {
         let mut ns: Vec<&'static str> = self.handlers.keys().copied().collect();
         ns.sort_unstable();
         ns
+    }
+
+    /// Every registered handler's tool descriptors (hq-mcp-native.3), sorted by
+    /// name for a stable `tools/list` order. The server folds these into the
+    /// advertised tool set so the domain namespaces are discoverable, not just
+    /// dispatchable.
+    pub fn descriptors(&self) -> Vec<McpTool> {
+        let mut tools: Vec<McpTool> = self
+            .handlers
+            .values()
+            .flat_map(|h| h.descriptors())
+            .collect();
+        tools.sort_by(|a, b| a.name.cmp(&b.name));
+        tools
     }
 
     /// Dispatch `tool` to the handler owning its namespace.

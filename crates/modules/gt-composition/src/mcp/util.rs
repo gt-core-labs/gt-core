@@ -4,6 +4,7 @@
 use serde::de::DeserializeOwned;
 use serde_json::{json, Value};
 
+use gt_module::McpTool;
 use gt_store_dolt::AppError;
 
 /// Pull a required string argument, rejecting a missing/non-string value as a
@@ -39,6 +40,51 @@ pub fn parse_cmd<T: DeserializeOwned>(mut args: Value) -> Result<T, AppError> {
     }
     serde_json::from_value(args)
         .map_err(|e| AppError::Validation(format!("invalid arguments: {e}")))
+}
+
+/// One input-schema property: its name, JSON Schema type, and whether the handler
+/// requires it. Server-injected args (`workspace_id`) and server-stamped ones
+/// (`now_secs`) are never fields — they are not the caller's to supply.
+pub struct Field {
+    /// The argument key, as the handler reads it from the payload.
+    pub name: &'static str,
+    /// The JSON Schema `type` (`"string"`, `"integer"`, `"array"`, …).
+    pub ty: &'static str,
+    /// Whether the handler rejects the call when the key is absent.
+    pub required: bool,
+}
+
+/// A required field of the given JSON Schema type.
+pub fn req(name: &'static str, ty: &'static str) -> Field {
+    Field { name, ty, required: true }
+}
+
+/// An optional field of the given JSON Schema type.
+pub fn opt(name: &'static str, ty: &'static str) -> Field {
+    Field { name, ty, required: false }
+}
+
+/// Build a tool descriptor (hq-mcp-native.3) with an object input schema derived
+/// from `fields`, mirroring the arguments the handler's `dispatch` reads. The
+/// server folds these into `tools/list` + `meta.help` so the domain tool is
+/// discoverable, not just dispatchable. The schema documents the call for a native
+/// client; the handler still validates the payload on dispatch (discovery, not
+/// enforcement).
+pub fn descriptor(name: &str, description: &str, fields: &[Field]) -> McpTool {
+    let mut properties = serde_json::Map::new();
+    let mut required = Vec::new();
+    for f in fields {
+        properties.insert(f.name.to_string(), json!({ "type": f.ty }));
+        if f.required {
+            required.push(json!(f.name));
+        }
+    }
+    let schema = json!({
+        "type": "object",
+        "properties": Value::Object(properties),
+        "required": Value::Array(required),
+    });
+    McpTool::with_schema(name, description, schema)
 }
 
 /// Map a `gt-events` domain error onto the `gt-store-dolt` error space the MCP
