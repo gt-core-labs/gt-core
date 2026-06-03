@@ -27,11 +27,16 @@ pub enum AgentEvent {
 
 impl EventKind for AgentEvent {
     fn kind(&self) -> &'static str {
+        // Versioned + kebab-only kinds (docs/04 "versioned event kinds"), matching the
+        // canonical shape `AgentModule::capability` already declares. The ported kinds were
+        // bare/underscored (`agent.spawned`, `agent.session_end`) — a gastown carry-over the
+        // rig/quota/merge kinds were `.v1`-backfilled for in events.2 but agent missed. The
+        // event-log NS filter is the `agent.` prefix, so old bare-kind records still replay.
         match self {
-            AgentEvent::Spawned { .. } => "agent.spawned",
-            AgentEvent::Heartbeat { .. } => "agent.heartbeat",
-            AgentEvent::SessionEnd { .. } => "agent.session_end",
-            AgentEvent::Killed { .. } => "agent.killed",
+            AgentEvent::Spawned { .. } => "agent.spawned.v1",
+            AgentEvent::Heartbeat { .. } => "agent.heartbeat.v1",
+            AgentEvent::SessionEnd { .. } => "agent.session-end.v1",
+            AgentEvent::Killed { .. } => "agent.killed.v1",
         }
     }
 }

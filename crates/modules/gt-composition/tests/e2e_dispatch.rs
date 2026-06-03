@@ -105,7 +105,7 @@ async fn create_workspace_rig_and_session_via_dispatch() {
         json!({ "session": "p1", "rig": "plane" }),
     )
     .await;
-    assert_eq!(session["event"], "agent.spawned");
+    assert_eq!(session["event"], "agent.spawned.v1");
 
     // --- 4. Read all three back through the same router ------------------------
     let ws_info = call(&router, "workspace.info", None, json!({ "id": WS })).await;

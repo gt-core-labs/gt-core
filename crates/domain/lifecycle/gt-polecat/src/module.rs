@@ -18,7 +18,7 @@
 //! ## Boundary with `CrewModule` (refactor.7) — whose are the `agent.*` events?
 //!
 //! `gt-polecat` *drives* a session but emits [`gt_agent::AgentEvent`]
-//! (`agent.spawned`/`agent.heartbeat`/`agent.session_end`/`agent.killed`): those kinds, the
+//! (`agent.spawned.v1`/`agent.heartbeat.v1`/`agent.session-end.v1`/`agent.killed.v1`): those kinds, the
 //! `agent.*` commands, and their MCP tools are **`gt-agent`'s contract**, wrapped by
 //! `CrewModule` (`hq-mod-refactor.7`). So `SessionsModule` declares **no emitted kinds** —
 //! it would otherwise double-own a namespace whose prefix (`agent`) isn't its id, breaking

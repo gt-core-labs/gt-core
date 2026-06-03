@@ -16,9 +16,10 @@
 //! (spawn → heartbeat → end/kill). So the durable dispatch surfaces it directly:
 //! `agent.spawn` / `agent.heartbeat` / `agent.end` / `agent.kill` + the reads.
 //!
-//! NOTE: the ported `AgentEvent` kinds are unversioned (`agent.spawned`, not
-//! `…​.v1`) — a docs/04 §"versioned event kinds" deviation carried over from
-//! gastown, tracked separately, not fixed here.
+//! The emitted kinds are versioned + kebab-only (`agent.spawned.v1`,
+//! `agent.session-end.v1`, …) per docs/04 §"versioned event kinds", matching the
+//! shape `AgentModule::capability` declares. The dispatch `tool` names above stay
+//! bare (`agent.spawn`/…) — that is the MCP-tool namespace, not the event vocab.
 
 use std::sync::Arc;
 

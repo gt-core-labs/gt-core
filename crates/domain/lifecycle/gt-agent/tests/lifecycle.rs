@@ -27,7 +27,7 @@ async fn fake_polecat_lifecycle_emits_session_end() {
     let seen: Rc<RefCell<Vec<String>>> = Rc::new(RefCell::new(Vec::new()));
     {
         let seen = Rc::clone(&seen);
-        bus.subscribe("agent.session_end", move |_ctx, env| {
+        bus.subscribe("agent.session-end.v1", move |_ctx, env| {
             if let AgentEvent::SessionEnd { session } = &env.payload {
                 seen.borrow_mut().push(session.clone());
             }

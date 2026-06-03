@@ -36,14 +36,14 @@
 //!
 //! ## Event kinds are declared kebab + `.v1`
 //!
-//! [`crate::AgentEvent::kind`] still returns the legacy bare/underscore form
-//! (`agent.session_end`); the kernel [`EventKind`] type is versioned + kebab-only by
-//! construction, so the *declared* contract is the canonical forward shape
-//! (`agent.session-end.v1`). Aligning the *emitted* strings to `.v1` is the cross-cutting
-//! job of an events-versioning pass (cf. `hq-mod-events.2`, which covered rig/quota/merge but
-//! not agent), intentionally out of scope for the wrap. Likewise the MCP tool names are
-//! declared verbatim with their current shape; kebab-normalization is `hq-mod-mcp.4`'s
-//! concern when the builder's name rule runs.
+//! [`crate::AgentEvent::kind`] emits the versioned + kebab-only form
+//! (`agent.spawned.v1` / `agent.session-end.v1` / …), matching what this module's
+//! capability declares. The emitted strings were the legacy bare/underscore shape until the
+//! events-versioning follow-up to `hq-mod-events.2` (which had covered rig/quota/merge but
+//! not agent) aligned them. Old log records keep their bare kind; the event-log NS filter is
+//! the `agent.` prefix, so they still replay. The MCP tool names stay declared verbatim with
+//! their current shape; kebab-normalization is `hq-mod-mcp.4`'s concern when the builder's
+//! name rule runs.
 
 use gt_module::{Capability, EventKind, GtModule, McpRegistry, ModuleId, ModuleMeta, Scope};
 use semver::Version;
@@ -102,7 +102,7 @@ impl GtModule for AgentModule {
             )
             .tool(
                 "agent.add.execute",
-                "Spawn a new agent session on a rig. Emits agent.spawned.",
+                "Spawn a new agent session on a rig. Emits agent.spawned.v1.",
             )
             .tool(
                 "agent.remove.validate",
@@ -111,7 +111,7 @@ impl GtModule for AgentModule {
             )
             .tool(
                 "agent.remove.execute",
-                "Remove a session from the registry. Emits agent.session_end.",
+                "Remove a session from the registry. Emits agent.session-end.v1.",
             )
             .tool(
                 "agent.transition.validate",
