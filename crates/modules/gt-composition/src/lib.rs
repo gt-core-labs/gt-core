@@ -31,6 +31,7 @@
 pub mod mcp;
 pub mod stream;
 
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
@@ -38,7 +39,7 @@ use tokio::sync::mpsc;
 
 use gt_beads::InMemoryBeads;
 use gt_events::{AppError, Envelope};
-use gt_eventlog::EventRecord;
+use gt_eventlog::{EventRecord, EventStore, JsonlWriter};
 use gt_merge::actor::MergeHandle;
 use gt_merge::{InMemoryMergeRepo, MergeEvent};
 use gt_module::RootBuilder;
@@ -119,6 +120,42 @@ impl Plugin for MergePlugin {
             }
         }
         Ok(())
+    }
+}
+
+/// Observer that **persists** every record on the workspace hub to the durable per-workspace
+/// event log (`gt_eventlog`). This is what makes the autonomous daemon's [`live_root`] survive a
+/// restart (`hq-orchd.2`): gt-core persists domain state by **event-sourcing this log** — the same
+/// substrate the request-driven MCP handlers use (`mcp::eventlog`) — not via Dolt/PG domain tables.
+/// The in-memory domain actors (the scheduler queue, the merge board) are projections; the log is
+/// their source of truth, so boot hydration (`hq-orchd.5`) can rebuild them by replaying it.
+///
+/// The writer is a single rotated [`JsonlWriter`] bound to the workspace's log partition at
+/// hydration time; each [`on_event`](Plugin::on_event) is one file-locked append. Registered ahead
+/// of the reactor arms so the triggering event is durable before any observer reacts — a failed
+/// append surfaces as the plugin's error (recorded to the relay dead-letter) rather than aborting
+/// the reaction chain.
+pub struct EventLogPlugin {
+    writer: JsonlWriter,
+}
+
+impl EventLogPlugin {
+    /// Bind a persistence sink to workspace `ws`'s log partition under `root` (creating
+    /// `<root>/<ws>/` lazily). `root` is the production event-log volume (`GT_EVENTLOG_ROOT`,
+    /// defaulting to `/var/lib/gt-core`); tests pass a tempdir.
+    pub fn for_workspace_in(root: impl AsRef<std::path::Path>, ws: &str) -> Result<Self, AppError> {
+        Ok(Self { writer: JsonlWriter::for_workspace_in(root, ws)? })
+    }
+}
+
+#[async_trait]
+impl Plugin for EventLogPlugin {
+    fn name(&self) -> &'static str {
+        "eventlog"
+    }
+
+    async fn on_event(&self, record: &EventRecord) -> Result<(), AppError> {
+        self.writer.append(record)
     }
 }
 
@@ -225,13 +262,24 @@ impl Plugin for ProbePlugin {
 /// The result is cached by the registry: a second call returns the same `Arc` without
 /// re-hydrating. `probe` is wired into the hydrated root so a caller can watch the cascade; it
 /// is ignored on a cache hit (the closure does not run).
+///
+/// ## Durability (`hq-orchd.2`)
+///
+/// When `log_root` is `Some`, an [`EventLogPlugin`] is registered ahead of the reactor arms so
+/// every record on the hub is appended to the workspace's durable log under that root — the
+/// autonomous daemon's state then survives a restart (boot hydration `hq-orchd.5` replays it).
+/// `None` keeps the root purely in-memory (the capstone reaction test); production passes the
+/// `GT_EVENTLOG_ROOT` volume. A non-writable root is a boot misconfiguration and panics here,
+/// like the other infallible assembly steps in this closure.
 pub async fn live_root(
     reg: &RootRegistry,
     ws: WorkspaceId,
+    log_root: Option<PathBuf>,
     probe: Arc<Mutex<Vec<String>>>,
 ) -> Arc<RootHandle> {
     let key = ws.clone();
     reg.get_or_hydrate_async(&key, move || async move {
+        let ws_slug = ws.as_str().to_string();
         let handle = RootHandle::new(ws, RootBuilder::new().build().expect("empty root builds"));
 
         let (sched_tx, sched_rx) = mpsc::channel(64);
@@ -265,8 +313,16 @@ pub async fn live_root(
         .await
         .expect("role stack registers while the supervisor is Built");
 
-        let registry = roles
-            .plugin_registry()
+        let mut registry = roles.plugin_registry();
+        if let Some(root) = log_root {
+            // Persist before the reactor arms observe, so the triggering event is durable even if
+            // a downstream reaction crashes mid-chain.
+            registry = registry.register(
+                EventLogPlugin::for_workspace_in(&root, &ws_slug)
+                    .expect("event log root is writable"),
+            );
+        }
+        let registry = registry
             .register(SchedulerPlugin::new(sched))
             .register(MergePlugin::new(merge))
             .register(ProbePlugin::new(probe));

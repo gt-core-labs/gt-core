@@ -10,7 +10,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use gt_composition::live_root;
-use gt_eventlog::EventRecord;
+use gt_eventlog::{EventRecord, EventStore, JsonlWriter};
 use gt_patrol::PatrolEvent;
 use gt_runtime::RootRegistry;
 use gt_workspace::WorkspaceId;
@@ -19,7 +19,13 @@ use gt_workspace::WorkspaceId;
 async fn live_root_round_trips_a_reaction_through_the_hub_and_caches() {
     let reg = RootRegistry::new();
     let probe = Arc::new(Mutex::new(Vec::new()));
-    let h = live_root(&reg, WorkspaceId::new("acme").expect("valid slug"), probe.clone()).await;
+    let h = live_root(
+        &reg,
+        WorkspaceId::new("acme").expect("valid slug"),
+        None,
+        probe.clone(),
+    )
+    .await;
 
     // Publish a lease expiry onto the hub. Expected loop: hub -> SchedulerPlugin -> scheduler
     // actor enqueues -> emits SchedEvent::Enqueue -> drain_events_from -> hub -> ProbePlugin.
@@ -62,11 +68,74 @@ async fn live_root_round_trips_a_reaction_through_the_hub_and_caches() {
     let again = live_root(
         &reg,
         WorkspaceId::new("acme").expect("valid slug"),
+        None,
         Arc::new(Mutex::new(Vec::new())),
     )
     .await;
     assert!(Arc::ptr_eq(&h, &again), "second resolve returns the cached root");
     assert_eq!(reg.len(), 1);
+
+    h.shutdown().await;
+}
+
+/// `hq-orchd.2`: a `live_root` with a `log_root` persists every hub record to the workspace's
+/// durable event log. Both the injected trigger and the scheduler's reaction must land on disk,
+/// so a restart can rebuild the in-memory projections by replaying the log (boot hydration,
+/// `hq-orchd.5`). This is the durability the gastown-model "Dolt-backed repos" bead asked for,
+/// realized over gt-core's event-sourced substrate.
+#[tokio::test]
+async fn live_root_persists_hub_records_to_the_durable_log() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let reg = RootRegistry::new();
+    let probe = Arc::new(Mutex::new(Vec::new()));
+    let h = live_root(
+        &reg,
+        WorkspaceId::new("acme").expect("valid slug"),
+        Some(dir.path().to_path_buf()),
+        probe.clone(),
+    )
+    .await;
+
+    let le = PatrolEvent::LeaseExpired {
+        bead: "gg-9".into(),
+        worker: "polecat-1".into(),
+        priority: 2,
+    };
+    h.events_sender()
+        .send(EventRecord {
+            event_id: "e9".into(),
+            correlation_id: "c9".into(),
+            causation_id: None,
+            ts: "2026-06-03T12:00:00Z".into(),
+            kind: "patrol.lease-expired.v1".into(),
+            payload: serde_json::to_value(&le).unwrap(),
+        })
+        .expect("hub has subscribers");
+
+    // Read the workspace's durable partition until the scheduler's reaction has been persisted
+    // (which also proves the trigger reached disk, since the persistence plugin runs first).
+    let log = JsonlWriter::for_workspace_in(dir.path(), "acme").expect("open log partition");
+    let mut kinds: Vec<String> = Vec::new();
+    for _ in 0..200 {
+        kinds = log
+            .read_all()
+            .expect("read log")
+            .into_iter()
+            .map(|r| r.kind)
+            .collect();
+        if kinds.iter().any(|k| k == "scheduling.enqueue.v1") {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(
+        kinds.iter().any(|k| k == "patrol.lease-expired.v1"),
+        "the trigger event must be persisted; log saw {kinds:?}"
+    );
+    assert!(
+        kinds.iter().any(|k| k == "scheduling.enqueue.v1"),
+        "the scheduler reaction must be persisted; log saw {kinds:?}"
+    );
 
     h.shutdown().await;
 }
