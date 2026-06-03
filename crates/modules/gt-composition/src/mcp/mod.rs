@@ -21,6 +21,7 @@
 pub mod agent;
 pub mod convoy;
 pub mod eventlog;
+pub mod graph;
 pub mod merge;
 pub mod pools;
 pub mod quota;
@@ -31,6 +32,7 @@ pub mod workspace;
 pub use agent::AgentHandler;
 pub use convoy::ConvoyHandler;
 pub use eventlog::EventLog;
+pub use graph::GraphHandler;
 pub use merge::MergeHandler;
 pub use pools::WsPools;
 pub use quota::QuotaHandler;

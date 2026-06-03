@@ -31,9 +31,10 @@ use rmcp::transport::{StreamableHttpServerConfig, StreamableHttpService};
 
 use gt_audit::{AuditSink, InMemoryAudit};
 use gt_composition::mcp::{
-    AgentHandler, ConvoyHandler, EventLog, MergeHandler, PgRigPrefixes, QuotaHandler, RigHandler,
-    WorkspaceHandler, WsPools,
+    AgentHandler, ConvoyHandler, EventLog, GraphHandler, MergeHandler, PgRigPrefixes, QuotaHandler,
+    RigHandler, WorkspaceHandler, WsPools,
 };
+use gt_graphindex::GraphifyIndexer;
 use gt_composition::stream::{feed_router, FeedState};
 use gt_issues::IssuesModule;
 use gt_mcp_server::{
@@ -223,7 +224,13 @@ async fn build_domain_router(
         .register(Arc::new(MergeHandler::new(event_log.clone())))
         .register(Arc::new(ConvoyHandler::new(event_log.clone())))
         .register(Arc::new(AgentHandler::new(event_log.clone())))
-        .register(Arc::new(QuotaHandler::new(event_log.clone())));
+        .register(Arc::new(QuotaHandler::new(event_log.clone())))
+        // graph.* read-only queries (hq-graphrig.10): graphify-backed indexer; the
+        // warden state (replayed from event_log) resolves rig -> repo_dir.
+        .register(Arc::new(GraphHandler::new(
+            event_log.clone(),
+            Arc::new(GraphifyIndexer::new()),
+        )));
     eprintln!(
         "[gt-mcp-server] domain namespaces: {:?}",
         router.namespaces()

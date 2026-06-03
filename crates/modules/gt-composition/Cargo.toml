@@ -33,6 +33,10 @@ gt-module = { workspace = true }
 gt-workspace = { workspace = true, features = ["pg"] }
 # rig.* dispatch (hq-mcp-dispatch.3): PgRigs over a per-workspace schema pool.
 gt-rig = { workspace = true, features = ["pg"] }
+# graph.* read-only dispatch (hq-graphrig.10): GraphIndexer port (+ graphify adapter for
+# the live server) and the warden state replayed to resolve rig -> repo_dir.
+gt-graphindex = { workspace = true, features = ["graphify"] }
+gt-graphwarden = { workspace = true }
 # Per-workspace schema isolation: WorkspacePool sets search_path per connection.
 gt-store-pg = { workspace = true, features = ["pg"] }
 async-trait = { workspace = true }
