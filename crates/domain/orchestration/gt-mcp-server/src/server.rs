@@ -431,6 +431,13 @@ impl ServerHandler for IssuesServer {
         // trace tree carries the tenant.
         let span = call_span(&tool, workspace.as_deref());
 
+        // Per-workspace request counter (hq-mt-deploy.8): one bump per dispatched
+        // call, labelled by the resolved tenant (or `"default"` in legacy header
+        // mode). Counted after authorize + the suspend gate so a denied call — which
+        // returned above — is not a cost-attributable request. No-op until the bin's
+        // `gt_telemetry::init` registers the counter.
+        gt_telemetry::metrics::observe_workspace_request(workspace_or_default(&workspace));
+
         // Route by namespace (the segment before the first dot): meta.* self-
         // description, issues.* the tracker dispatch, everything else the domain
         // router (hq-mcp-dispatch). An unowned namespace is an unknown tool.

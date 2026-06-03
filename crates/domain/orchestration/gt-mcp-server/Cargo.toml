@@ -28,6 +28,9 @@ async-trait = { workspace = true }
 # Per-call tracing span (hq-mt-ops.2): the request-root span carries
 # `workspace.id` so Tempo traces are searchable per tenant.
 tracing = { workspace = true }
+# Per-workspace request counter (hq-mt-deploy.8): bump gt_workspace_requests_total
+# with the resolved tenant label on every dispatched call.
+gt-telemetry = { workspace = true }
 rmcp = { workspace = true, features = ["server", "transport-streamable-http-server"] }
 axum = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "net", "signal"] }

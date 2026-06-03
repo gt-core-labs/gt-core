@@ -78,7 +78,20 @@ impl DomainHandler for QuotaHandler {
     async fn dispatch(&self, tool: &str, ctx: DomainCtx<'_>) -> Result<Value, AppError> {
         let ws = ctx.workspace;
         match tool {
-            "quota.sample" => self.run::<SampleTokens>(ws, ctx.args),
+            "quota.sample" => {
+                // Per-workspace cost attribution (hq-mt-deploy.8): tally the sample's
+                // total tokens onto `gt_workspace_quota_consumed`, only once the event
+                // is durably appended (so a rejected sample doesn't inflate the count).
+                // The label mirrors the audit "default" tenant fallback. No-op until the
+                // bin's `gt_telemetry::init` registers the counter.
+                let consumed = sample_tokens(&ctx.args);
+                let out = self.run::<SampleTokens>(ws, ctx.args)?;
+                gt_telemetry::metrics::observe_workspace_quota_consumed(
+                    ws.unwrap_or("default"),
+                    consumed,
+                );
+                Ok(out)
+            }
             "quota.probe" => self.run::<ProbeWindow>(ws, ctx.args),
             "quota.rotate" => self.run::<RotateAccount>(ws, ctx.args),
             "quota.list" => {
@@ -101,6 +114,19 @@ impl DomainHandler for QuotaHandler {
 /// derives `Serialize`, so the projection is the domain type verbatim.
 fn account_json(account: &Account) -> Value {
     serde_json::to_value(account).unwrap_or_else(|_| json!({}))
+}
+
+/// Total tokens in a `quota.sample` payload — the raw sum of the four usage
+/// counters (`input`/`output`/`cache_read`/`cache_creation`), each defaulting to
+/// `0` when absent (hq-mt-deploy.8). Raw, unweighted: the per-tenant dashboard
+/// tracks token volume, leaving per-model cost weighting to `gt-quota`'s own
+/// accounting. Read here rather than off the produced [`QuotaEvent`] so the
+/// generic `run::<SampleTokens>` append path stays untouched.
+fn sample_tokens(args: &Value) -> u64 {
+    ["input", "output", "cache_read", "cache_creation"]
+        .iter()
+        .map(|k| args.get(*k).and_then(Value::as_u64).unwrap_or(0))
+        .sum()
 }
 
 #[cfg(test)]
@@ -172,6 +198,20 @@ mod tests {
             .unwrap()
             .iter()
             .any(|a| a["id"] == "acc-1"));
+    }
+
+    /// The per-workspace consumed metric sums the four usage counters and treats a
+    /// missing field as zero — the raw token volume fed to `gt_workspace_quota_consumed`.
+    #[test]
+    fn sample_tokens_sums_usage_counters_defaulting_zero() {
+        assert_eq!(
+            sample_tokens(&json!({
+                "input": 100, "output": 50, "cache_read": 10, "cache_creation": 5
+            })),
+            165
+        );
+        assert_eq!(sample_tokens(&json!({ "input": 7 })), 7, "absent fields default to 0");
+        assert_eq!(sample_tokens(&json!({})), 0);
     }
 
     /// A rotation onto itself is a validation fault, and info on an unknown

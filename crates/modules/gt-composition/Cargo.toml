@@ -23,6 +23,9 @@ gt-orchestration = { workspace = true }
 gt-agent = { workspace = true }
 # quota.* dispatch (hq-mcp-dispatch.4): event-sourced AccountRegistry.
 gt-quota = { workspace = true }
+# Per-workspace consumed-token counter (hq-mt-deploy.8): bump
+# gt_workspace_quota_consumed on each quota.sample.
+gt-telemetry = { workspace = true }
 gt-patrol = { workspace = true }
 gt-runtime = { workspace = true }
 gt-roles = { workspace = true }

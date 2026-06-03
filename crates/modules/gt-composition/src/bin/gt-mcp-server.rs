@@ -51,6 +51,11 @@ const MCP_PATH: &str = "/mcp";
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    // Register the process-global Prometheus counters (hq-mt-deploy.8) before any
+    // dispatch can fire, so the per-workspace cost counters (gt_workspace_requests_total,
+    // gt_workspace_quota_consumed) record from the first call and surface on /metrics.
+    gt_telemetry::metrics::ensure_registered();
+
     let dolt_url = std::env::var("GT_DOLT_URL")
         .context("GT_DOLT_URL is required (e.g. mysql://gastown@127.0.0.1:3307/hq)")?;
     let bind = std::env::var("GT_MCP_HTTP_BIND").unwrap_or_else(|_| "127.0.0.1:8765".into());
@@ -196,6 +201,10 @@ async fn main() -> anyhow::Result<()> {
     let app = Router::new()
         .route("/health", get(health::health))
         .route("/readyz", get(health::readyz))
+        // Prometheus scrape endpoint (hq-mt-deploy.8): the per-workspace cost
+        // counters + the golden event/dead-letter metrics in text exposition format.
+        // Ignores the health state, so it composes with the `with_state` below.
+        .route("/metrics", get(metrics_text))
         .with_state(health_state)
         .merge(feed)
         .nest_service(MCP_PATH, http);
@@ -207,6 +216,18 @@ async fn main() -> anyhow::Result<()> {
     );
     axum::serve(listener, app).await?;
     Ok(())
+}
+
+/// Prometheus scrape endpoint (hq-mt-deploy.8): render the process-global registry
+/// — the per-workspace cost counters plus the golden event/dead-letter metrics — in
+/// the text exposition format. An encode failure surfaces as a 500 rather than a
+/// silent empty scrape.
+async fn metrics_text() -> axum::response::Response {
+    use axum::response::IntoResponse;
+    match gt_telemetry::metrics::render_text() {
+        Ok(body) => (axum::http::StatusCode::OK, body).into_response(),
+        Err(e) => (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+    }
 }
 
 /// Build the domain dispatch router from `GT_PG_URL`. Unset ⇒ an empty router
