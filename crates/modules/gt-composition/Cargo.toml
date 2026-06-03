@@ -17,6 +17,8 @@ gt-eventlog = { workspace = true }
 gt-events = { workspace = true }
 gt-scheduling = { workspace = true }
 gt-merge = { workspace = true }
+# convoy.* dispatch (hq-mcp-dispatch.6): event-sourced ConvoyBoard.
+gt-orchestration = { workspace = true }
 gt-patrol = { workspace = true }
 gt-runtime = { workspace = true }
 gt-roles = { workspace = true }
