@@ -36,11 +36,13 @@
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
+pub mod artifacts;
 #[cfg(feature = "graphify")]
 mod graphify;
 mod memory;
 mod port;
 
+pub use artifacts::{patterns_for, NEUTRAL_UMBRELLA};
 #[cfg(feature = "graphify")]
 pub use graphify::GraphifyIndexer;
 pub use memory::InMemoryGraphIndexer;

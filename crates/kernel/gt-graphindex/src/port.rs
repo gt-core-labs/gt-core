@@ -89,6 +89,13 @@ pub trait GraphIndexer: Send + Sync {
     /// (`hq-graphrig.3`).
     fn tool(&self) -> &str;
 
+    /// VCS-ignore patterns for this tool's artifacts, so a repo never tracks its
+    /// graph. The default reads the active tool name; an adapter rarely overrides
+    /// it. This is the source the per-rig propagation consumes (`hq-graphrig.11`).
+    fn ignore_patterns(&self) -> Vec<String> {
+        crate::artifacts::patterns_for(self.tool())
+    }
+
     /// Build the full graph for `repo` from scratch. Returns the resulting size.
     async fn build(&self, repo: &Path) -> Result<IndexStats, GraphError>;
 
