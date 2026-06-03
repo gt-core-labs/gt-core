@@ -7,10 +7,7 @@ Cargo.lock
 .vscode/
 node_modules/
 .envrc.local
-.claude/*
-!.claude/skills/
-.claude/skills/*
-!.claude/skills/mcp-cli/
+.claude/
 # Graph artifacts — neutral umbrella (any tool) + graphify's concrete paths.
 # Canonical set lives in gt-graphindex::artifacts::patterns_for (hq-graphrig.3/.11).
 .graphindex/
