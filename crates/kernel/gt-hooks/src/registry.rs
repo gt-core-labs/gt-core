@@ -1,20 +1,22 @@
 //! [`HookRegistry`] — the per-[`HookPoint`] collection of registered handlers.
 //!
-//! `hq-mod-hooks.1` provides registration and lookup. Wiring the registry into
-//! `Capability`/`RootBuilder` (so modules declare their hooks declaratively) is
-//! `hq-mod-hooks.3`; actually invoking handlers and honoring a veto is the
-//! dispatcher in that same bead. This type holds only handlers and is built once
-//! at composition time, then read-only during dispatch.
+//! `hq-mod-hooks.1` provides registration and lookup; `hq-mod-hooks.9` adds
+//! [`dispatch`](HookRegistry::dispatch), which invokes the registered handlers
+//! and honors a [`Reject`](crate::HookOutcome::Reject) veto at a vetoable point.
+//! Wiring the registry into `Capability`/`RootBuilder` (so modules declare their
+//! hooks declaratively) is `hq-mod-hooks.3`. The registry is built once at
+//! composition time, then read-only while dispatch borrows it.
 
 use std::collections::HashMap;
 
-use crate::handler::HookHandler;
+use crate::handler::{HookContext, HookHandler, HookOutcome};
 use crate::points::HookPoint;
 
 /// Collects [`HookHandler`]s keyed by the [`HookPoint`] they observe.
 ///
 /// Handlers register against a point and are returned in registration order on
-/// lookup, giving deterministic dispatch (`hq-mod-hooks.3` relies on this order).
+/// lookup, giving deterministic dispatch ([`dispatch`](HookRegistry::dispatch)
+/// relies on this order).
 /// Stores boxed trait objects — the sanctioned observer-plugin use of `dyn` (see
 /// [`crate::HookHandler`] docs for the NN#1 reconciliation).
 #[derive(Default)]
@@ -42,6 +44,33 @@ impl HookRegistry {
         self.by_point.get(&point).map(Vec::as_slice).unwrap_or(&[])
     }
 
+    /// Run every handler registered at `ctx.point`, in registration order, and
+    /// return the aggregate [`HookOutcome`].
+    ///
+    /// At a vetoable point ([`HookPoint::is_vetoable`] — only
+    /// [`BeforeCommand`](HookPoint::BeforeCommand)) the first handler to
+    /// [`Reject`](HookOutcome::Reject) short-circuits dispatch and its veto is
+    /// returned, so no later handler runs and the in-flight operation is stopped
+    /// before any effect. At an observe-only point every handler runs and a
+    /// `Reject` is ignored — the point fires on a settled fact, nothing is left to
+    /// veto. Returns [`Continue`](HookOutcome::Continue) when no handler vetoes.
+    ///
+    /// A handler that reacts to only one command matches on
+    /// [`HookContext::command`] itself (set via
+    /// [`with_command`](HookContext::with_command), `hq-mod-hooks.8`); the registry
+    /// does not pre-filter by command. `async` because handlers live at the I/O
+    /// edge — never call this from the sync replay core (non-negotiable #2).
+    pub async fn dispatch(&self, ctx: &HookContext) -> HookOutcome {
+        let vetoable = ctx.point.is_vetoable();
+        for handler in self.handlers(ctx.point) {
+            let outcome = handler.handle(ctx).await;
+            if vetoable && matches!(outcome, HookOutcome::Reject(_)) {
+                return outcome;
+            }
+        }
+        HookOutcome::Continue
+    }
+
     /// Total number of registered handlers across every point.
     pub fn len(&self) -> usize {
         self.by_point.values().map(Vec::len).sum()
@@ -56,7 +85,9 @@ impl HookRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::handler::{HookContext, HookOutcome};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+
     use async_trait::async_trait;
 
     struct Named(&'static str);
@@ -67,6 +98,25 @@ mod tests {
         }
         async fn handle(&self, _ctx: &HookContext) -> HookOutcome {
             HookOutcome::Continue
+        }
+    }
+
+    /// Counts its invocations and returns a fixed outcome, so a test can assert
+    /// both the aggregate result and exactly how many handlers actually ran
+    /// (proving short-circuit vs run-all).
+    struct Recorder {
+        name: &'static str,
+        ran: Arc<AtomicUsize>,
+        outcome: HookOutcome,
+    }
+    #[async_trait]
+    impl HookHandler for Recorder {
+        fn name(&self) -> &str {
+            self.name
+        }
+        async fn handle(&self, _ctx: &HookContext) -> HookOutcome {
+            self.ran.fetch_add(1, Ordering::SeqCst);
+            self.outcome.clone()
         }
     }
 
@@ -110,5 +160,119 @@ mod tests {
         let h = &reg.handlers(HookPoint::AfterCommand)[0];
         let out = h.handle(&HookContext::new(HookPoint::AfterCommand)).await;
         assert_eq!(out, HookOutcome::Continue);
+    }
+
+    #[tokio::test]
+    async fn dispatch_continues_when_no_handler_vetoes() {
+        let mut reg = HookRegistry::new();
+        reg.register(HookPoint::BeforeCommand, Box::new(Named("a")))
+            .register(HookPoint::BeforeCommand, Box::new(Named("b")));
+        let out = reg.dispatch(&HookContext::new(HookPoint::BeforeCommand)).await;
+        assert_eq!(out, HookOutcome::Continue);
+    }
+
+    #[tokio::test]
+    async fn dispatch_on_a_point_with_no_handlers_continues() {
+        let reg = HookRegistry::new();
+        let out = reg.dispatch(&HookContext::new(HookPoint::BeforeCommand)).await;
+        assert_eq!(out, HookOutcome::Continue);
+    }
+
+    #[tokio::test]
+    async fn dispatch_short_circuits_first_reject_at_vetoable_point() {
+        let ran = Arc::new(AtomicUsize::new(0));
+        let mut reg = HookRegistry::new();
+        reg.register(
+            HookPoint::BeforeCommand,
+            Box::new(Recorder {
+                name: "veto",
+                ran: ran.clone(),
+                outcome: HookOutcome::Reject("stop".into()),
+            }),
+        )
+        .register(
+            HookPoint::BeforeCommand,
+            Box::new(Recorder {
+                name: "after-veto",
+                ran: ran.clone(),
+                outcome: HookOutcome::Continue,
+            }),
+        );
+
+        let out = reg.dispatch(&HookContext::new(HookPoint::BeforeCommand)).await;
+        assert_eq!(out, HookOutcome::Reject("stop".into()));
+        assert_eq!(
+            ran.load(Ordering::SeqCst),
+            1,
+            "the handler after a veto must not run at a vetoable point"
+        );
+    }
+
+    #[tokio::test]
+    async fn dispatch_ignores_reject_at_observe_only_point() {
+        let ran = Arc::new(AtomicUsize::new(0));
+        let mut reg = HookRegistry::new();
+        reg.register(
+            HookPoint::AfterCommand,
+            Box::new(Recorder {
+                name: "obs-1",
+                ran: ran.clone(),
+                outcome: HookOutcome::Reject("ignored".into()),
+            }),
+        )
+        .register(
+            HookPoint::AfterCommand,
+            Box::new(Recorder {
+                name: "obs-2",
+                ran: ran.clone(),
+                outcome: HookOutcome::Continue,
+            }),
+        );
+
+        let out = reg.dispatch(&HookContext::new(HookPoint::AfterCommand)).await;
+        assert_eq!(
+            out,
+            HookOutcome::Continue,
+            "a Reject at an observe-only point is not honored"
+        );
+        assert_eq!(
+            ran.load(Ordering::SeqCst),
+            2,
+            "every observer runs at an observe-only point"
+        );
+    }
+
+    /// The command-gated seam (`hq-mod-hooks.8` + this dispatcher): a handler
+    /// registered once on `BeforeCommand` vetoes only its target command, reading
+    /// [`HookContext::command`] itself — the registry does not pre-filter.
+    #[tokio::test]
+    async fn handler_self_filters_on_command_to_gate_one_command() {
+        struct MergeGuard;
+        #[async_trait]
+        impl HookHandler for MergeGuard {
+            fn name(&self) -> &str {
+                "sheriff.premerge"
+            }
+            async fn handle(&self, ctx: &HookContext) -> HookOutcome {
+                if ctx.command() == Some("merge.submit") {
+                    HookOutcome::Reject("merge gated".into())
+                } else {
+                    HookOutcome::Continue
+                }
+            }
+        }
+
+        let mut reg = HookRegistry::new();
+        reg.register(HookPoint::BeforeCommand, Box::new(MergeGuard));
+
+        let gated = reg
+            .dispatch(&HookContext::new(HookPoint::BeforeCommand).with_command("merge.submit"))
+            .await;
+        assert_eq!(gated, HookOutcome::Reject("merge gated".into()));
+
+        let passed = reg
+            .dispatch(&HookContext::new(HookPoint::BeforeCommand).with_command("bead.claim"))
+            .await;
+        assert_eq!(passed, HookOutcome::Continue);
     }
 }

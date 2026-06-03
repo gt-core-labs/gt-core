@@ -4,8 +4,8 @@
 //! A module declares the points it cares about (via
 //! [`Capability::subscribing`](gt_module::Capability::subscribing),
 //! `hq-mod-hooks.3`) and supplies a [`HookHandler`]; the [`HookRegistry`] holds
-//! those handlers keyed by [`HookPoint`], and the dispatcher (`hq-mod-hooks.3+`)
-//! invokes them when the kernel reaches a point, honoring a
+//! those handlers keyed by [`HookPoint`], and [`HookRegistry::dispatch`]
+//! (`hq-mod-hooks.9`) invokes them when the kernel reaches a point, honoring a
 //! [`HookOutcome::Reject`] veto at vetoable points.
 //!
 //! ## Landed so far
@@ -16,7 +16,8 @@
 //! - [`HookHandler`] + [`HookContext`] + [`HookOutcome`] — the observer trait and
 //!   its in/out types (`hq-mod-hooks.1`).
 //! - [`HookRegistry`] — per-point, registration-ordered handler collection
-//!   (`hq-mod-hooks.1`).
+//!   (`hq-mod-hooks.1`); [`HookRegistry::dispatch`] invokes handlers and honors a
+//!   veto at vetoable points (`hq-mod-hooks.9`).
 //!
 //! ## Boundary (NN#1)
 //!
