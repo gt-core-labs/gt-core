@@ -57,19 +57,38 @@ impl AuditSink for PgAuditSink {
 }
 
 /// Idempotent table create — append-only audit of every tool dispatch.
+///
+/// `mcp_audit` lives in the `public` schema, not a per-tenant `ws_<slug>` schema:
+/// a SOC2 per-tenant audit dump must read every tenant's trail from one place, so
+/// the table stays cross-tenant and partitions by the `workspace_id` column instead
+/// (docs/04 §15 — public-schema tables keep a `workspace_id` discriminator).
 async fn ensure_schema(pool: &PgPool) -> Result<(), sqlx::Error> {
     sqlx::query(
         "CREATE TABLE IF NOT EXISTS mcp_audit (
-            id      bigserial PRIMARY KEY,
-            actor   text NOT NULL,
-            tool    text NOT NULL,
-            args    text NOT NULL,
-            outcome text NOT NULL,
-            ts      timestamptz NOT NULL DEFAULT now()
+            id           bigserial PRIMARY KEY,
+            workspace_id text NOT NULL DEFAULT 'default',
+            actor        text NOT NULL,
+            tool         text NOT NULL,
+            args         text NOT NULL,
+            outcome      text NOT NULL,
+            ts           timestamptz NOT NULL DEFAULT now()
         )",
     )
     .execute(pool)
     .await?;
+    // Idempotent upgrade for a table created before the tenant column existed
+    // (hq-mt-auth.7). Backfills NULLs to 'default' via the column default.
+    sqlx::query(
+        "ALTER TABLE mcp_audit
+            ADD COLUMN IF NOT EXISTS workspace_id text NOT NULL DEFAULT 'default'",
+    )
+    .execute(pool)
+    .await?;
+    // Per-tenant audit queries filter on this column; index it so a SOC2 dump for
+    // one workspace does not scan the whole cross-tenant trail.
+    sqlx::query("CREATE INDEX IF NOT EXISTS mcp_audit_workspace_idx ON mcp_audit (workspace_id)")
+        .execute(pool)
+        .await?;
     Ok(())
 }
 
@@ -80,12 +99,75 @@ async fn insert(pool: &PgPool, rec: &AuditRecord) -> Result<(), sqlx::Error> {
         Outcome::Invoked => "invoked",
         Outcome::Unauthorized => "unauthorized",
     };
-    sqlx::query("INSERT INTO mcp_audit (actor, tool, args, outcome) VALUES ($1, $2, $3, $4)")
-        .bind(&rec.actor)
-        .bind(&rec.tool)
-        .bind(rec.args.to_string())
-        .bind(outcome)
-        .execute(pool)
-        .await?;
+    sqlx::query(
+        "INSERT INTO mcp_audit (workspace_id, actor, tool, args, outcome) \
+         VALUES ($1, $2, $3, $4, $5)",
+    )
+    .bind(&rec.workspace_id)
+    .bind(&rec.actor)
+    .bind(&rec.tool)
+    .bind(rec.args.to_string())
+    .bind(outcome)
+    .execute(pool)
+    .await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    /// End-to-end against a throwaway Postgres (gated on `GT_PG_URL`): the schema
+    /// gains the `workspace_id` column and a per-tenant query returns only that
+    /// tenant's rows. Run with a sandbox PG (see reference_sandbox_dolt_pg_gated_tests):
+    /// `GT_PG_URL=postgres://postgres@127.0.0.1:PORT/postgres cargo test -p gt-mcp-server`.
+    #[tokio::test]
+    async fn workspace_id_persists_and_filters_per_tenant() {
+        let Ok(url) = std::env::var("GT_PG_URL") else {
+            eprintln!("skipping: GT_PG_URL unset");
+            return;
+        };
+        let pool = PgPoolOptions::new()
+            .max_connections(2)
+            .connect(&url)
+            .await
+            .expect("connect");
+        // Isolate from any prior run sharing the table.
+        sqlx::query("DROP TABLE IF EXISTS mcp_audit")
+            .execute(&pool)
+            .await
+            .unwrap();
+        ensure_schema(&pool).await.expect("schema");
+
+        insert(
+            &pool,
+            &AuditRecord::invoked("a", "issues.read", json!({})).in_workspace("acme"),
+        )
+        .await
+        .unwrap();
+        insert(
+            &pool,
+            &AuditRecord::invoked("b", "issues.read", json!({})).in_workspace("globex"),
+        )
+        .await
+        .unwrap();
+        // A 3-arg record (no explicit tenant) lands under the default tenant.
+        insert(&pool, &AuditRecord::invoked("c", "issues.read", json!({})))
+            .await
+            .unwrap();
+
+        let acme: i64 = sqlx::query_scalar("SELECT count(*) FROM mcp_audit WHERE workspace_id = $1")
+            .bind("acme")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        let default: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM mcp_audit WHERE workspace_id = 'default'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(acme, 1, "acme tenant trail is isolated");
+        assert_eq!(default, 1, "3-arg record falls under default tenant");
+    }
 }
