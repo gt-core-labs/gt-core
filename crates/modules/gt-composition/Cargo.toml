@@ -68,6 +68,10 @@ sqlx = { workspace = true }
 name = "gt-mcp-server"
 path = "src/bin/gt-mcp-server.rs"
 
+[[bin]]
+name = "gt-orch-server"
+path = "src/bin/gt-orch-server.rs"
+
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "sync", "time"] }
 serde_json = { workspace = true }
