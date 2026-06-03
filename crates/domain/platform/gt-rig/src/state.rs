@@ -63,6 +63,20 @@ impl RigEntry {
             worktree_root: None,
         }
     }
+
+    /// Resolve the absolute worktree root the orchestrator carves this rig's polecat
+    /// checkouts under, within a workspace. An explicit [`Self::worktree_root`] override wins;
+    /// otherwise the convention default `<home>/gastown-wt/<ws>/<name>` is derived.
+    ///
+    /// `ws` is the workspace slug as `&str`, NOT a `gt-workspace::WorkspaceId`: gt-rig is a
+    /// `domain/platform` crate and must not take a `gt-workspace` dep (docs/03 Rule 4 forbids
+    /// `platform → platform`). The higher-tier caller passes `ws.as_str()` — the same seam
+    /// gt-auth uses to stay free of the dep (`gt-auth/src/lib.rs`).
+    pub fn resolved_worktree_root(&self, ws: &str, home: &Path) -> PathBuf {
+        self.worktree_root
+            .clone()
+            .unwrap_or_else(|| home.join("gastown-wt").join(ws).join(&self.name))
+    }
 }
 
 /// Live rig catalog (what the actor owns). `BTreeMap` so iteration is sorted and the
@@ -444,6 +458,26 @@ mod tests {
         assert!(
             validate_worktree_root(Path::new(&long)).is_err(),
             "over max length"
+        );
+    }
+
+    #[test]
+    fn resolved_worktree_root_prefers_override_then_convention() {
+        let home = Path::new("/home/nixos");
+
+        // No override → convention default `<home>/gastown-wt/<ws>/<name>`.
+        let plain = RigEntry::new("plane", "pl", "git@github.com:o/plane.git", "main", 1);
+        assert_eq!(
+            plain.resolved_worktree_root("acme", home),
+            PathBuf::from("/home/nixos/gastown-wt/acme/plane")
+        );
+
+        // Explicit override wins, ignoring ws/home.
+        let mut pinned = plain.clone();
+        pinned.worktree_root = Some(PathBuf::from("/srv/checkouts/plane"));
+        assert_eq!(
+            pinned.resolved_worktree_root("acme", home),
+            PathBuf::from("/srv/checkouts/plane")
         );
     }
 
