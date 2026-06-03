@@ -31,6 +31,47 @@ pub fn patterns_for(tool: &str) -> Vec<String> {
     out
 }
 
+/// Idempotently ensure `repo`'s git checkout ignores `tool`'s graph artifacts.
+///
+/// Writes the missing [`patterns_for`] lines into `<repo>/.git/info/exclude` — the
+/// **local, uncommitted** ignore list — never the repo's tracked `.gitignore`. That is
+/// deliberate: a rig may be a repo we do not own, so the per-rig propagation
+/// (`hq-graphrig.11`) must not dirty its committed files. Re-running is a no-op once the
+/// patterns are present.
+///
+/// Returns the patterns newly added (empty when everything was already excluded). If the
+/// repo has no `.git` dir (not a checkout yet) the exclude file's parent is created so the
+/// call still succeeds for a freshly-init'd repo.
+pub fn ensure_ignored(repo: &std::path::Path, tool: &str) -> std::io::Result<Vec<String>> {
+    let exclude = repo.join(".git").join("info").join("exclude");
+    if let Some(parent) = exclude.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let existing = std::fs::read_to_string(&exclude).unwrap_or_default();
+    let have: std::collections::HashSet<&str> =
+        existing.lines().map(str::trim).collect();
+
+    let missing: Vec<String> = patterns_for(tool)
+        .into_iter()
+        .filter(|p| !have.contains(p.as_str()))
+        .collect();
+    if missing.is_empty() {
+        return Ok(missing);
+    }
+
+    let mut body = existing;
+    if !body.is_empty() && !body.ends_with('\n') {
+        body.push('\n');
+    }
+    body.push_str("# graph artifacts (gt-graphindex, do not track)\n");
+    for p in &missing {
+        body.push_str(p);
+        body.push('\n');
+    }
+    std::fs::write(&exclude, body)?;
+    Ok(missing)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -47,5 +88,39 @@ mod tests {
     #[test]
     fn unknown_tool_gets_umbrella_only() {
         assert_eq!(patterns_for("future-tool"), vec![NEUTRAL_UMBRELLA.to_string()]);
+    }
+
+    #[test]
+    fn ensure_ignored_writes_then_is_idempotent() {
+        let dir = std::env::temp_dir().join(format!("gi-ignore-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join(".git/info")).unwrap();
+
+        let added = ensure_ignored(&dir, "graphify").unwrap();
+        assert_eq!(added, patterns_for("graphify"));
+        let body = std::fs::read_to_string(dir.join(".git/info/exclude")).unwrap();
+        assert!(body.contains("graphify-out/"));
+        assert!(body.contains(".graphindex/"));
+
+        // Second run adds nothing.
+        let again = ensure_ignored(&dir, "graphify").unwrap();
+        assert!(again.is_empty());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn ensure_ignored_preserves_existing_excludes() {
+        let dir = std::env::temp_dir().join(format!("gi-ignore-keep-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join(".git/info")).unwrap();
+        std::fs::write(dir.join(".git/info/exclude"), "*.log\n").unwrap();
+
+        ensure_ignored(&dir, "graphify").unwrap();
+        let body = std::fs::read_to_string(dir.join(".git/info/exclude")).unwrap();
+        assert!(body.contains("*.log"), "pre-existing rule must survive");
+        assert!(body.contains(".graphindex/"));
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

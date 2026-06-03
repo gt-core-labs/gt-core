@@ -42,7 +42,7 @@ mod graphify;
 mod memory;
 mod port;
 
-pub use artifacts::{patterns_for, NEUTRAL_UMBRELLA};
+pub use artifacts::{ensure_ignored, patterns_for, NEUTRAL_UMBRELLA};
 #[cfg(feature = "graphify")]
 pub use graphify::GraphifyIndexer;
 pub use memory::InMemoryGraphIndexer;
