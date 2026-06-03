@@ -7,6 +7,7 @@
 //! the `gt-rbac` scope check, and the `gt-audit` record per call.
 
 use std::borrow::Cow;
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -55,6 +56,16 @@ pub struct IssuesServer {
     rbac: Option<Arc<RbacConfig>>,
     audit: Arc<dyn AuditSink + Send + Sync>,
     tools: Arc<Vec<McpTool>>,
+    /// Map from a sanitized tool name (dots → underscores) back to its canonical
+    /// dotted name (hq-mcp-native.1). The kernel namespaces tools with dots
+    /// (`issues.create.execute`), but an MCP function name an Anthropic client can
+    /// surface must match `^[a-zA-Z0-9_-]+$` — a dotted name is silently dropped, so
+    /// native clients never see the tools. `list_tools` therefore advertises the
+    /// sanitized form, and `call_tool` translates the inbound name back through this
+    /// map before authorize / dispatch (which key on the canonical dotted name).
+    /// Built once from `tools`; a call whose name is absent (a legacy client invoking
+    /// the canonical dotted name directly, or a domain tool) passes through unchanged.
+    tool_aliases: Arc<HashMap<String, String>>,
     /// Git repo whose `main` tree backs surface referential integrity (S3,
     /// hq-core-mcp.9). `Some` when `GT_REPO_DIR` is set: `issues.create`/`.update`
     /// reject a `planned:false` surface path absent from `main`. `None` (no
@@ -99,6 +110,10 @@ impl IssuesServer {
         tools: Vec<McpTool>,
         repo_dir: Option<PathBuf>,
     ) -> Self {
+        let tool_aliases = tools
+            .iter()
+            .map(|t| (sanitize_tool_name(&t.name), t.name.clone()))
+            .collect();
         Self {
             store,
             workspaces: None,
@@ -106,6 +121,7 @@ impl IssuesServer {
             rbac,
             audit,
             tools: Arc::new(tools),
+            tool_aliases: Arc::new(tool_aliases),
             repo_dir: repo_dir.map(Arc::new),
             domains: Arc::new(DomainRouter::new()),
             authenticator: None,
@@ -385,7 +401,13 @@ impl ServerHandler for IssuesServer {
                     .as_object()
                     .cloned()
                     .unwrap_or_default();
-                Tool::new(t.name.clone(), t.description.clone(), Arc::new(schema))
+                // Advertise the sanitized name (dots → underscores) so an Anthropic
+                // client surfaces the tool; `call_tool` maps it back (hq-mcp-native.1).
+                Tool::new(
+                    sanitize_tool_name(&t.name),
+                    t.description.clone(),
+                    Arc::new(schema),
+                )
             })
             .collect();
         Ok(ListToolsResult::with_all_items(tools))
@@ -396,7 +418,17 @@ impl ServerHandler for IssuesServer {
         request: CallToolRequestParams,
         context: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
-        let tool = request.name.to_string();
+        // Translate the inbound name back to its canonical dotted form
+        // (hq-mcp-native.1): a native Anthropic client invokes the sanitized name
+        // `list_tools` advertised. Absent from the map ⇒ pass through unchanged (a
+        // legacy client calling the dotted name directly, or a domain-router tool).
+        // Everything below — authorize, the suspend gate, `is_mutation`, dispatch,
+        // audit — keys on this canonical name.
+        let tool = self
+            .tool_aliases
+            .get(request.name.as_ref())
+            .cloned()
+            .unwrap_or_else(|| request.name.to_string());
         let args = serde_json::Value::Object(request.arguments.clone().unwrap_or_default());
 
         // Per-connection scope (hq-core-mcp.6): the X-Actor header picks the
@@ -716,6 +748,17 @@ fn is_mutation(tool: &str) -> bool {
     )
 }
 
+/// Sanitize a canonical dotted tool name (`issues.create.execute`) into an MCP
+/// function name an Anthropic client accepts (hq-mcp-native.1). The kernel
+/// namespaces tools with dots, but a surfaced `mcp__<server>__<tool>` name must
+/// match `^[a-zA-Z0-9_-]+$` — a dot makes the whole name invalid and the client
+/// drops the tool. Dots become underscores; dashes (e.g. `report-gap`) are already
+/// valid and kept. The kernel's name segments never contain underscores, so the map
+/// keyed on this output stays collision-free across the descriptor set.
+fn sanitize_tool_name(name: &str) -> String {
+    name.replace('.', "_")
+}
+
 #[cfg(test)]
 mod tests {
     use super::{actor_from_ext, call_span, IssuesServer};
@@ -769,6 +812,51 @@ mod tests {
     fn reads_x_actor_header() {
         let ext = ext_with_header("x-actor", "alice");
         assert_eq!(actor_from_ext(&ext), Some("alice"));
+    }
+
+    // ----- hq-mcp-native.1: dotted-name sanitization for native MCP clients ----
+
+    use super::sanitize_tool_name;
+    use gt_module::McpTool;
+
+    /// Dots become underscores; dashes (`report-gap`) survive — the output matches
+    /// the Anthropic function-name charset `^[a-zA-Z0-9_-]+$`.
+    #[test]
+    fn sanitize_replaces_dots_keeps_dashes() {
+        assert_eq!(sanitize_tool_name("issues.create.execute"), "issues_create_execute");
+        assert_eq!(sanitize_tool_name("meta.report-gap.execute"), "meta_report-gap_execute");
+        // No dots ⇒ unchanged (a domain tool already underscore-free stays put).
+        assert_eq!(sanitize_tool_name("workspace_list"), "workspace_list");
+    }
+
+    /// `new` builds the alias map keyed on the sanitized name, valued by the canonical
+    /// dotted name — the exact lookup `call_tool` does to translate an inbound native
+    /// call back before authorize/dispatch.
+    #[test]
+    fn new_builds_sanitized_to_canonical_alias_map() {
+        let tool = |name: &str| McpTool::new(name, "");
+        let srv = IssuesServer::new(
+            Arc::new(
+                DoltIssues::connect("mysql://gt@127.0.0.1:1/none").expect("lazy pool url parses"),
+            ),
+            Scope::admin("boot"),
+            None,
+            Arc::new(InMemoryAudit::new()),
+            vec![tool("issues.create.execute"), tool("meta.report-gap.execute")],
+            None,
+        );
+        assert_eq!(
+            srv.tool_aliases.get("issues_create_execute").map(String::as_str),
+            Some("issues.create.execute"),
+            "sanitized name maps back to the canonical dotted name"
+        );
+        assert_eq!(
+            srv.tool_aliases.get("meta_report-gap_execute").map(String::as_str),
+            Some("meta.report-gap.execute")
+        );
+        // A name never advertised (canonical dotted, or a domain tool) is absent, so
+        // `call_tool` passes it through unchanged.
+        assert!(srv.tool_aliases.get("issues.create.execute").is_none());
     }
 
     #[test]
