@@ -35,6 +35,7 @@ members = [
     "crates/domain/orchestration/gt-merge",
     "crates/domain/orchestration/gt-patrol",
     "crates/domain/orchestration/gt-scheduling",
+    "crates/domain/orchestration/gt-login",
     "crates/domain/orchestration/gt-orchestration",
     "crates/domain/orchestration/gt-webhooks",
     "crates/domain/orchestration/gt-dog",

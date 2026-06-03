@@ -1,0 +1,24 @@
+[package]
+name = "gt-login"
+edition.workspace = true
+version.workspace = true
+
+# Ported up from gastown (hq-core-port.18; was hq-fe-auth.1). PTY driver for `claude /login`:
+# spawns the Anthropic CLI's OAuth flow under a pseudo-terminal, extracts the authorization
+# URL, writes the user-pasted token back over stdin, and emits LoginEvent state transitions.
+# Pure state machine + URL parser (replay-safe, no wallclock) behind a `Pty` port; only the
+# real PortablePty adapter pulls portable-pty so the FakePty driver test runs on every target.
+# LoginEvent is an ephemeral SSE surface (not a versioned replay-store event) — no reducer.
+[dependencies]
+gt-events = { workspace = true }
+serde = { workspace = true }
+schemars = { workspace = true }
+thiserror = { workspace = true }
+regex = "1"
+
+# Only the real PTY adapter pulls portable-pty. The domain state machine + Pty trait stay
+# platform-neutral so the FakePty driver test runs on every target.
+portable-pty = "0.8"
+
+[dev-dependencies]
+serde_json = { workspace = true }
