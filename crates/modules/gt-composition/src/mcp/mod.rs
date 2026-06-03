@@ -11,6 +11,10 @@
 //! a shared [`PgPool`](sqlx::PgPool), so a `create` then a `list` see the same
 //! durable state across calls (the actors hydrate from Postgres per request).
 
+pub mod pools;
+pub mod rig;
 pub mod workspace;
 
+pub use pools::WsPools;
+pub use rig::RigHandler;
 pub use workspace::WorkspaceHandler;

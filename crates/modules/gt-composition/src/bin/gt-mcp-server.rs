@@ -30,7 +30,7 @@ use rmcp::transport::streamable_http_server::session::local::LocalSessionManager
 use rmcp::transport::{StreamableHttpServerConfig, StreamableHttpService};
 
 use gt_audit::{AuditSink, InMemoryAudit};
-use gt_composition::mcp::WorkspaceHandler;
+use gt_composition::mcp::{RigHandler, WorkspaceHandler, WsPools};
 use gt_issues::IssuesModule;
 use gt_mcp_server::{health, DomainRouter, HealthState, IssuesServer, PgAuditSink, WorkspaceStores};
 use gt_meta::MetaModule;
@@ -177,11 +177,17 @@ async fn build_domain_router() -> anyhow::Result<DomainRouter> {
         );
         return Ok(DomainRouter::new());
     };
+    // The workspace catalog lives in the shared `public` schema, so it uses a
+    // plain pool; the per-workspace domains (rig, …) resolve their `ws_<slug>`
+    // schema through a search_path-scoped WorkspacePool cache over the same URL.
     let pool = sqlx::PgPool::connect(&pg_url)
         .await
         .context("GT_PG_URL must point at a reachable Postgres")?;
     eprintln!("[gt-mcp-server] domain dispatch: Postgres @ {pg_url}");
-    let router = DomainRouter::new().register(Arc::new(WorkspaceHandler::new(pool.clone())));
+    let ws_pools = Arc::new(WsPools::new(pg_url));
+    let router = DomainRouter::new()
+        .register(Arc::new(WorkspaceHandler::new(pool.clone())))
+        .register(Arc::new(RigHandler::new(ws_pools.clone())));
     eprintln!(
         "[gt-mcp-server] domain namespaces: {:?}",
         router.namespaces()

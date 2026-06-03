@@ -23,10 +23,15 @@
 pub mod actor;
 pub mod commands;
 pub mod module;
+#[cfg(feature = "pg")]
+mod pg;
 pub mod repo;
 
 mod events;
 mod state;
+
+#[cfg(feature = "pg")]
+pub use pg::PgRigs;
 
 pub use actor::{spawn, spawn_hydrated, RigHandle, RigMsg};
 pub use module::RigsModule;

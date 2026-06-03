@@ -25,6 +25,10 @@ gt-module = { workspace = true }
 # PG-backed domain dispatch (hq-mcp-dispatch.2): the workspace handler drives the
 # `pg` adapter (PgWorkspaces) of the gt-workspace port over a shared PgPool.
 gt-workspace = { workspace = true, features = ["pg"] }
+# rig.* dispatch (hq-mcp-dispatch.3): PgRigs over a per-workspace schema pool.
+gt-rig = { workspace = true, features = ["pg"] }
+# Per-workspace schema isolation: WorkspacePool sets search_path per connection.
+gt-store-pg = { workspace = true, features = ["pg"] }
 async-trait = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "net", "signal", "sync", "time"] }
 
@@ -40,6 +44,7 @@ gt-store-dolt = { workspace = true }
 rmcp = { workspace = true, features = ["server", "transport-streamable-http-server"] }
 axum = { workspace = true }
 anyhow = { workspace = true }
+serde = { workspace = true }
 serde_json = { workspace = true }
 sqlx = { workspace = true }
 
@@ -50,5 +55,3 @@ path = "src/bin/gt-mcp-server.rs"
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "sync", "time"] }
 serde_json = { workspace = true }
-# Schema for the PG-backed domain dispatch contract tests (GT_PG_URL-gated).
-gt-store-pg = { workspace = true }

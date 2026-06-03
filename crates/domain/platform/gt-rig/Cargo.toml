@@ -26,6 +26,14 @@ serde.workspace = true
 schemars.workspace = true
 # `semver::Version` for the module's `ModuleMeta`.
 semver = { workspace = true }
+# Postgres `RigRepository` adapter (`PgRigs`, hq-mcp-dispatch.3). Off-by-default so
+# the core build stays dependency-light; the heavy sqlx stack is pulled only when
+# the PG-backed dispatch handler wires it (docs/03 — adapter lives beside the port).
+sqlx = { workspace = true, optional = true }
+
+[features]
+# Postgres adapter for the RigRepository port.
+pg = ["dep:sqlx"]
 
 [dev-dependencies]
 serde_json.workspace = true
