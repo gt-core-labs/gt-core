@@ -10,24 +10,28 @@
 //! Skipped unless `GT_DOLT_URL` is set, so host CI without a Dolt sidecar still
 //! compiles. The container/CI runs invoke it via `cargo test -p gt-issues`.
 //!
-//! Uses its own throwaway database (`gt_rs_resources_test`) so it never touches
-//! the live `hq` nor races the `gt-store-dolt` `issues_contract` fixture.
+//! Each test uses its **own** throwaway database (`gt_rs_resources_<test>`) so it
+//! never touches the live `hq`, never races the `gt-store-dolt` `issues_contract`
+//! fixture, and — crucially — never races a sibling test in this file. cargo runs
+//! the `#[tokio::test]`s in parallel; a single shared DB let one test's
+//! `DELETE`+`INSERT` interleave with another's, producing `duplicate primary key
+//! [res-1]` (Dolt 1062). A DB per test removes the shared table entirely
+//! (hq-mcp-test.11).
 
 use mysql_async::prelude::Queryable;
 
 use gt_issues::resources::{read_issue, read_issues_page};
 use gt_store_dolt::{DoltIssues, IssueFilter};
 
-const TEST_DB: &str = "gt_rs_resources_test";
-
-/// Create the throwaway DB + `issues` table and seed four rows with a stable
-/// order (all share the default `created_at`, so the `created_at DESC, id ASC`
-/// ordering reduces to `id ASC`: `res-1`, `res-2`, `res-3`, `res-4`).
-async fn seed(base: &str) -> Result<(), Box<dyn std::error::Error>> {
+/// Create a throwaway DB named `db` + its `issues` table and seed four rows with a
+/// stable order (all share the default `created_at`, so the `created_at DESC, id
+/// ASC` ordering reduces to `id ASC`: `res-1`, `res-2`, `res-3`, `res-4`). Each
+/// test passes its own `db` so the parallel seeds never share a table.
+async fn seed(base: &str, db: &str) -> Result<(), Box<dyn std::error::Error>> {
     let pool = gt_store_dolt::connect(base)?;
     let mut conn = pool.get_conn().await?;
-    conn.query_drop(format!("CREATE DATABASE IF NOT EXISTS {TEST_DB}")).await?;
-    conn.query_drop(format!("USE {TEST_DB}")).await?;
+    conn.query_drop(format!("CREATE DATABASE IF NOT EXISTS {db}")).await?;
+    conn.query_drop(format!("USE {db}")).await?;
     conn.query_drop(
         "CREATE TABLE IF NOT EXISTS issues (
             id                  VARCHAR(255) PRIMARY KEY,
@@ -73,9 +77,9 @@ async fn seed(base: &str) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-/// Connect a [`DoltIssues`] against the seeded throwaway DB.
-async fn repo(base: &str) -> DoltIssues {
-    let repo = DoltIssues::connect(&format!("{base}/{TEST_DB}")).expect("connect");
+/// Connect a [`DoltIssues`] against the seeded throwaway DB `db`.
+async fn repo(base: &str, db: &str) -> DoltIssues {
+    let repo = DoltIssues::connect(&format!("{base}/{db}")).expect("connect");
     repo.ensure_schema().await.expect("schema present");
     repo
 }
@@ -90,8 +94,9 @@ async fn issues_page_envelope_walks_the_corpus() {
         return;
     };
     let base = base.trim_end_matches('/').to_string();
-    seed(&base).await.expect("seed");
-    let repo = repo(&base).await;
+    let db = "gt_rs_resources_envelope";
+    seed(&base, db).await.expect("seed");
+    let repo = repo(&base, db).await;
 
     // Page 1: limit=2, offset=0 — two rows, four total, more to come.
     let p1 = read_issues_page(
@@ -131,8 +136,9 @@ async fn issues_page_total_respects_the_filter() {
         return;
     };
     let base = base.trim_end_matches('/').to_string();
-    seed(&base).await.expect("seed");
-    let repo = repo(&base).await;
+    let db = "gt_rs_resources_filter";
+    seed(&base, db).await.expect("seed");
+    let repo = repo(&base, db).await;
 
     let open = read_issues_page(
         &repo,
@@ -154,8 +160,9 @@ async fn issue_detail_present_and_not_found() {
         return;
     };
     let base = base.trim_end_matches('/').to_string();
-    seed(&base).await.expect("seed");
-    let repo = repo(&base).await;
+    let db = "gt_rs_resources_detail";
+    seed(&base, db).await.expect("seed");
+    let repo = repo(&base, db).await;
 
     let detail = read_issue(&repo, "res-1").await.expect("read").expect("res-1 exists");
     assert_eq!(detail.id, "res-1");
