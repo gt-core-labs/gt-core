@@ -21,8 +21,20 @@ use gt_agent::supervisor::touch_heartbeat;
 use gt_agent::{AgentEvent, SessionRole};
 use gt_events::Envelope;
 
-use crate::hooks::hook_env;
+use crate::hooks::{hook_env, GT_HOOK_BEAD};
 use crate::tmux::Tmux;
+
+/// The workspace a polecat belongs to, pinned into its tmux session env so
+/// `tmux show-environment GT_WORKSPACE` resolves the tenant for dashboard attribution
+/// (hq-mt-runtime.5). The value is supplied by the caller through [`SpawnSpec::env`]
+/// (the composition root layers it onto `base_env`); a spec without it simply skips the pin.
+pub const GT_WORKSPACE: &str = "GT_WORKSPACE";
+
+/// Session-level env keys re-applied via an explicit `set-environment` after `new-session`
+/// (belt-and-suspenders): the attribution vars a reader resolves with `show-environment`
+/// regardless of which path it trusts. `GT_HOOK_BEAD` identifies the hooked bead;
+/// `GT_WORKSPACE` identifies the tenant.
+const SESSION_ATTRIBUTION_KEYS: [&str; 2] = [GT_HOOK_BEAD, GT_WORKSPACE];
 
 /// Everything needed to (re)spawn one polecat. Cloneable so the restart loop can re-spawn
 /// from the same spec after a crash.
@@ -135,15 +147,18 @@ pub async fn spawn_process(spec: &SpawnSpec) -> io::Result<SpawnedPolecat> {
     })
 }
 
-/// Create the production tmux-backed polecat session, pinning `GT_HOOK_BEAD` both at creation
-/// (via `-e`) and again with an explicit `set-environment` — mirrors the Go session_manager
-/// belt-and-suspenders so `show-environment` resolves the bead regardless of which path a
-/// reader trusts.
+/// Create the production tmux-backed polecat session, pinning the
+/// [attribution vars](SESSION_ATTRIBUTION_KEYS) (`GT_HOOK_BEAD`, `GT_WORKSPACE`) both at
+/// creation (via `-e`) and again with an explicit `set-environment` — mirrors the Go
+/// session_manager belt-and-suspenders so `show-environment` resolves each regardless of which
+/// path a reader trusts. Only keys actually present in the spec env are re-applied.
 pub fn spawn_tmux(tmux: &dyn Tmux, spec: &SpawnSpec) -> io::Result<()> {
     let env = spec.env_with_hook();
     tmux.new_session(&spec.session, &spec.workdir, &spec.command, &spec.args, &env)?;
-    if let Some((key, value)) = hook_env(spec.hook_bead.as_deref(), spec.issue.as_deref()) {
-        tmux.set_environment(&spec.session, &key, &value)?;
+    for key in SESSION_ATTRIBUTION_KEYS {
+        if let Some((_, value)) = env.iter().find(|(k, _)| k == key) {
+            tmux.set_environment(&spec.session, key, value)?;
+        }
     }
     Ok(())
 }
@@ -295,5 +310,33 @@ mod lifecycle_tests {
             probe.show_environment("gt-hq-9", "GT_CONVOY").unwrap().as_deref(),
             Some("cv-9")
         );
+    }
+
+    #[test]
+    fn spawn_tmux_pins_workspace_alongside_hook() {
+        // A workspace-tagged base env: the composition root layers GT_WORKSPACE onto base_env.
+        let mut tmpl = template();
+        tmpl.base_env.push((GT_WORKSPACE.to_string(), "acme".to_string()));
+        let spec = tmpl.spec_for("cv-7", "hq-7");
+        let probe = FakeTmux::new();
+        spawn_tmux(&probe, &spec).unwrap();
+        // Both attribution vars resolve via show-environment for dashboard attribution.
+        assert_eq!(
+            probe.show_environment("gt-hq-7", GT_WORKSPACE).unwrap().as_deref(),
+            Some("acme")
+        );
+        assert_eq!(
+            probe.show_environment("gt-hq-7", GT_HOOK_BEAD).unwrap().as_deref(),
+            Some("hq-7")
+        );
+    }
+
+    #[test]
+    fn spawn_tmux_skips_workspace_pin_when_absent() {
+        // No GT_WORKSPACE in base env → the pin is simply skipped (no spurious empty var).
+        let spec = template().spec_for("cv-1", "hq-1");
+        let probe = FakeTmux::new();
+        spawn_tmux(&probe, &spec).unwrap();
+        assert!(probe.show_environment("gt-hq-1", GT_WORKSPACE).unwrap().is_none());
     }
 }

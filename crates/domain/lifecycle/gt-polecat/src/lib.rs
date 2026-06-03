@@ -23,6 +23,7 @@ pub use pool::{AllocError, ExhaustedScope, PoolAllocator};
 pub use module::SessionsModule;
 pub use lifecycle::{
     spawn_process, spawn_tmux, PolecatLifecycle, SpawnSpec, SpawnTemplate, SpawnedPolecat,
+    GT_WORKSPACE,
 };
 pub use restart::{RestartConfig, RestartTracker};
 pub use supervisor::{
