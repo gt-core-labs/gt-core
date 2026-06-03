@@ -30,7 +30,7 @@ use rmcp::transport::streamable_http_server::session::local::LocalSessionManager
 use rmcp::transport::{StreamableHttpServerConfig, StreamableHttpService};
 
 use gt_audit::{AuditSink, InMemoryAudit};
-use gt_composition::mcp::{RigHandler, WorkspaceHandler, WsPools};
+use gt_composition::mcp::{EventLog, MergeHandler, RigHandler, WorkspaceHandler, WsPools};
 use gt_issues::IssuesModule;
 use gt_mcp_server::{health, DomainRouter, HealthState, IssuesServer, PgAuditSink, WorkspaceStores};
 use gt_meta::MetaModule;
@@ -185,9 +185,14 @@ async fn build_domain_router() -> anyhow::Result<DomainRouter> {
         .context("GT_PG_URL must point at a reachable Postgres")?;
     eprintln!("[gt-mcp-server] domain dispatch: Postgres @ {pg_url}");
     let ws_pools = Arc::new(WsPools::new(pg_url));
+    // Event-sourced domains (merge, …) keep no table — their durable store is the
+    // per-workspace event log under GT_EVENTLOG_ROOT (default /var/lib/gt-core).
+    let event_root = std::env::var("GT_EVENTLOG_ROOT").ok().map(std::path::PathBuf::from);
+    let event_log = Arc::new(EventLog::new(event_root));
     let router = DomainRouter::new()
         .register(Arc::new(WorkspaceHandler::new(pool.clone())))
-        .register(Arc::new(RigHandler::new(ws_pools.clone())));
+        .register(Arc::new(RigHandler::new(ws_pools.clone())))
+        .register(Arc::new(MergeHandler::new(event_log.clone())));
     eprintln!(
         "[gt-mcp-server] domain namespaces: {:?}",
         router.namespaces()

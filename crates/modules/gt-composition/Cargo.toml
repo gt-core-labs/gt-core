@@ -55,3 +55,5 @@ path = "src/bin/gt-mcp-server.rs"
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "sync", "time"] }
 serde_json = { workspace = true }
+# Tempdir-rooted event logs for the event-sourced handler tests.
+tempfile = { workspace = true }
