@@ -1,0 +1,33 @@
+[package]
+name = "gt-terminal"
+edition.workspace = true
+version.workspace = true
+
+# Ported up from gastown (hq-core-port.21; was hq-fe-term.1). Substrate for the dashboard's
+# dock terminal. Owns the `Attach` port the term WS route plugs into, plus three adapters:
+#
+# - `TmuxPipeAttach` — primary, attaches to a live tmux session via `tmux pipe-pane -O`
+#   (pane bytes -> fifo) + `tmux send-keys` (keystrokes back). Avoids spawning a fresh PTY
+#   per attach since tmux is already the multiplexer.
+# - `PtyAttach` — fallback for non-tmux targets, wraps `gt_login::pty::Pty` over a fresh
+#   pseudo-terminal — re-uses gt-login's substrate so pty handling is not forked per call-site.
+# - `FakeAttach` — in-memory adapter for unit tests (scripted reads, recorded writes).
+#
+# Sync ports: each adapter call is a short tmux invocation or a single pty op. Transport
+# substrate — emits no events, owns no schema, so replay-safe. (gt-polecat is a doc-link-only
+# dep: the rustdoc reference to its tmux::Tmux trait.)
+[dependencies]
+gt-events = { workspace = true }
+gt-login = { path = "../../orchestration/gt-login" }
+gt-polecat = { path = "../../lifecycle/gt-polecat" }
+# The kernel module seam — `TerminalModule` declares the dashboard-sidebar surface's
+# identity + capability so the `RootBuilder` harvests them (`hq-mod-refactor.9`); the
+# attach adapters are untouched.
+gt-module = { workspace = true }
+# `semver::Version` for the module's `ModuleMeta`.
+semver = { workspace = true }
+serde = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+serde_json = { workspace = true }
