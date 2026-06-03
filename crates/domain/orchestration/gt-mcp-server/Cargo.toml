@@ -20,6 +20,8 @@ gt-meta = { workspace = true }
 gt-store-dolt = { workspace = true }
 gt-rbac = { workspace = true }
 gt-audit = { workspace = true }
+# Domain dispatch handlers (hq-mcp-dispatch.1) implement an async trait.
+async-trait = { workspace = true }
 rmcp = { workspace = true, features = ["server", "transport-streamable-http-server"] }
 axum = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "net", "signal"] }

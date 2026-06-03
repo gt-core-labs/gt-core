@@ -15,6 +15,7 @@
 //!   (S3, hq-core-mcp.9); unset ⇒ surface existence checks are skipped.
 
 mod dispatch;
+mod domain;
 mod git_tree;
 mod health;
 mod pg_audit;

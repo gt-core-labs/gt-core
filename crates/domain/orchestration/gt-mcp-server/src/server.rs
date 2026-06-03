@@ -25,6 +25,7 @@ use rmcp::service::{RequestContext, RoleServer};
 use rmcp::{ErrorData as McpError, ServerHandler};
 
 use crate::dispatch::{dispatch, dispatch_meta, parse_issue_filter};
+use crate::domain::{DomainCtx, DomainRouter};
 use crate::workspace::{workspace_from_ext, WorkspaceStores};
 
 /// The shared MCP service. Cheap to clone (every field is `Arc`-backed) so the
@@ -55,6 +56,10 @@ pub struct IssuesServer {
     /// reject a `planned:false` surface path absent from `main`. `None` (no
     /// checkout, e.g. the live container) degrades to accept-all, no validation.
     repo_dir: Option<Arc<PathBuf>>,
+    /// Handlers for non-issues/non-meta tool namespaces (workspace.*/rig.*/…),
+    /// the `hq-mcp-dispatch` seam. Empty by default, so a server with no domain
+    /// handlers wired behaves exactly as the issues-only build.
+    domains: Arc<DomainRouter>,
 }
 
 impl IssuesServer {
@@ -79,7 +84,17 @@ impl IssuesServer {
             audit,
             tools: Arc::new(tools),
             repo_dir: repo_dir.map(Arc::new),
+            domains: Arc::new(DomainRouter::new()),
         }
+    }
+
+    /// Wire the domain dispatch router (`hq-mcp-dispatch.1`): tool namespaces
+    /// beyond `issues.*`/`meta.*` (workspace.*/rig.*/…) route to their registered
+    /// [`DomainHandler`](crate::domain::DomainHandler). Additive — without it the
+    /// server serves issues + meta only.
+    pub fn with_domains(mut self, domains: Arc<DomainRouter>) -> Self {
+        self.domains = domains;
+        self
     }
 
     /// Enable per-request workspace resolution (hq-mt-routing.5). With a resolver
@@ -215,11 +230,27 @@ impl ServerHandler for IssuesServer {
             Err(e) => return Err(Self::to_mcp_error(&e)),
         };
 
-        let result = if tool.starts_with("meta.") {
-            dispatch_meta(&store, &tool, args.clone(), &scope.actor, &self.tools).await
-        } else {
-            let repo_dir = self.repo_dir.as_deref().map(|p| p.as_path());
-            dispatch(&store, &tool, args.clone(), &scope.actor, repo_dir).await
+        // Route by namespace (the segment before the first dot): meta.* self-
+        // description, issues.* the tracker dispatch, everything else the domain
+        // router (hq-mcp-dispatch). An unowned namespace is an unknown tool.
+        let result = match tool.split('.').next().unwrap_or("") {
+            "meta" => dispatch_meta(&store, &tool, args.clone(), &scope.actor, &self.tools).await,
+            "issues" => {
+                let repo_dir = self.repo_dir.as_deref().map(|p| p.as_path());
+                dispatch(&store, &tool, args.clone(), &scope.actor, repo_dir).await
+            }
+            _ => {
+                let ctx = DomainCtx {
+                    workspace: workspace_from_ext(&context.extensions),
+                    actor: &scope.actor,
+                    args: args.clone(),
+                };
+                match self.domains.dispatch(&tool, ctx).await {
+                    Ok(Some(value)) => Ok(value),
+                    Ok(None) => Err(AppError::NotFound(format!("unknown tool `{tool}`"))),
+                    Err(e) => Err(e),
+                }
+            }
         };
         let _ = self
             .audit
