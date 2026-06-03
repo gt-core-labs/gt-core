@@ -12,10 +12,11 @@
 //!
 //! - **Identity** ([`GtModule::meta`]) — id `rig`, semver, description.
 //! - **Capability** ([`GtModule::capability`]) — the `rig.read` / `rig.write` scopes the
-//!   module owns and the five versioned event kinds it emits.
-//! - **MCP tools** ([`GtModule::register_mcp_tools`]) — the ten `rig.*` validate/execute
+//!   module owns and the six versioned event kinds it emits.
+//! - **MCP tools** ([`GtModule::register_mcp_tools`]) — the twelve `rig.*` validate/execute
 //!   tools, named and described verbatim from the current `gt-mcp` service.
-//! - **Migrations** ([`GtModule::migrations`]) — the `rigs` table, owned by the module.
+//! - **Migrations** ([`GtModule::migrations`]) — the `rigs` table + its `worktree_root`
+//!   column, owned by the module.
 //!
 //! It does **not** override `register_routes`/`openapi`: a rig is managed over MCP only
 //! (the orchestrator-state facet has no HTTP surface of its own — `gt-web` exposes only a
@@ -71,7 +72,7 @@ impl GtModule for RigsModule {
 
     fn capability(&self) -> Capability {
         // The `rig.read` / `rig.write` scopes the module owns (the same `<resource>.<verb>`
-        // convention `gt-merge` and `gt-quota` already follow). The five emitted kinds mirror
+        // convention `gt-merge` and `gt-quota` already follow). The six emitted kinds mirror
         // `RigEvent`'s variants, declared in the canonical versioned + kebab shape.
         Capability::empty()
             .claiming_all([
@@ -84,6 +85,7 @@ impl GtModule for RigsModule {
                 EventKind::new("rig.removed.v1").expect("valid event kind"),
                 EventKind::new("rig.prefix-changed.v1").expect("valid event kind"),
                 EventKind::new("rig.default-branch-changed.v1").expect("valid event kind"),
+                EventKind::new("rig.worktree-root-changed.v1").expect("valid event kind"),
             ])
     }
 
@@ -139,6 +141,17 @@ impl GtModule for RigsModule {
             .tool(
                 "rig.set-default-branch.execute",
                 "Change the default branch tracked for a rig. Emits rig.default_branch_changed.",
+            )
+            .tool(
+                "rig.set-worktree-root.validate",
+                "Check whether pinning a rig's worktree-root override would be accepted \
+                 (absolute path, no `..`, length <= 256, not a no-op). No state change.",
+            )
+            .tool(
+                "rig.set-worktree-root.execute",
+                "Pin the absolute worktree root the orchestrator carves a rig's polecat \
+                 checkouts under (the filesystem move is a deploy-edge side-effect). Emits \
+                 rig.worktree_root_changed.",
             );
     }
 
@@ -146,11 +159,18 @@ impl GtModule for RigsModule {
         // The `rigs` table backing `RigRepository`. The module owns its schema (the SQL lives
         // in `migrations/rig/`); `gt-store-pg` keeps a transitional applied copy until
         // `hq-mod-migrate` consolidates module-owned migrations as the single source.
-        vec![Migration::new(
-            1,
-            "create_rigs",
-            include_str!("../migrations/rig/0001__create_rigs.sql"),
-        )]
+        vec![
+            Migration::new(
+                1,
+                "create_rigs",
+                include_str!("../migrations/rig/0001__create_rigs.sql"),
+            ),
+            Migration::new(
+                2,
+                "add_worktree_root",
+                include_str!("../migrations/rig/0002__add_worktree_root.sql"),
+            ),
+        ]
     }
 }
 
@@ -166,7 +186,7 @@ mod tests {
     }
 
     #[test]
-    fn capability_owns_rig_scopes_and_five_versioned_kinds() {
+    fn capability_owns_rig_scopes_and_six_versioned_kinds() {
         let cap = RigsModule.capability();
 
         let scopes: Vec<&str> = cap.scopes().iter().map(Scope::as_str).collect();
@@ -181,6 +201,7 @@ mod tests {
                 "rig.removed.v1",
                 "rig.prefix-changed.v1",
                 "rig.default-branch-changed.v1",
+                "rig.worktree-root-changed.v1",
             ]
         );
         // Every declared kind is owned by this module (prefix == meta id).
@@ -190,7 +211,7 @@ mod tests {
     }
 
     #[test]
-    fn registers_the_ten_existing_rig_tools() {
+    fn registers_the_twelve_existing_rig_tools() {
         let mut reg = McpRegistry::new();
         RigsModule.register_mcp_tools(&mut reg);
         let names: Vec<&str> = reg.tools().iter().map(|t| t.name.as_str()).collect();
@@ -207,6 +228,8 @@ mod tests {
                 "rig.set-prefix.execute",
                 "rig.set-default-branch.validate",
                 "rig.set-default-branch.execute",
+                "rig.set-worktree-root.validate",
+                "rig.set-worktree-root.execute",
             ]
         );
     }
@@ -214,15 +237,26 @@ mod tests {
     #[test]
     fn owns_the_rigs_table_migration() {
         let migs = RigsModule.migrations();
-        assert_eq!(migs.len(), 1);
+        assert_eq!(migs.len(), 2);
         assert_eq!(migs[0].version, 1);
         assert_eq!(migs[0].name, "create_rigs");
+        // The worktree_root column override (hq-mt-rigs.5) is a follow-on migration, never
+        // an edit of the applied 0001 (sqlx checksum-validates).
+        assert_eq!(migs[1].version, 2);
+        assert_eq!(migs[1].name, "add_worktree_root");
+        assert!(migs[1]
+            .sql
+            .contains("ADD COLUMN IF NOT EXISTS worktree_root"));
         // Schema-per-ws (hq-mt-data.3, docs/04 §15): the table is created in the
         // `ws_default` template schema so `gt_create_workspace_schema` clones it per
         // tenant — not in `public` (which holds only cross-tenant catalogs).
-        assert!(migs[0].sql.contains("CREATE TABLE IF NOT EXISTS ws_default.rigs"));
+        assert!(migs[0]
+            .sql
+            .contains("CREATE TABLE IF NOT EXISTS ws_default.rigs"));
         assert!(
-            migs[0].sql.contains("CREATE SCHEMA IF NOT EXISTS ws_default"),
+            migs[0]
+                .sql
+                .contains("CREATE SCHEMA IF NOT EXISTS ws_default"),
             "must bootstrap the template schema it populates",
         );
     }

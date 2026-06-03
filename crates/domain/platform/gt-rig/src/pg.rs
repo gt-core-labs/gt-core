@@ -15,6 +15,7 @@
 //! `gt-rig` build stays pure.
 
 use std::future::Future;
+use std::path::PathBuf;
 
 use sqlx::postgres::PgRow;
 use sqlx::{PgPool, Row};
@@ -52,6 +53,7 @@ fn backend(e: sqlx::Error) -> AppError {
 /// Build a [`RigEntry`] from a `rigs` row.
 fn row_to_entry(row: &PgRow) -> Result<RigEntry, AppError> {
     let registered_at: i64 = row.try_get("registered_at").map_err(backend)?;
+    let worktree_root: Option<String> = row.try_get("worktree_root").map_err(backend)?;
     Ok(RigEntry {
         name: row.try_get("name").map_err(backend)?,
         prefix: row.try_get("prefix").map_err(backend)?,
@@ -60,10 +62,7 @@ fn row_to_entry(row: &PgRow) -> Result<RigEntry, AppError> {
         upstream_url: row.try_get("upstream_url").map_err(backend)?,
         default_branch: row.try_get("default_branch").map_err(backend)?,
         registered_at_secs: registered_at as u64,
-        // The `rigs` table has no worktree_root column yet — projecting the override into PG
-        // lands with the rig.set-worktree-root tool wiring (hq-mt-rigs.5). The event log is
-        // the source of truth for replay until then.
-        worktree_root: None,
+        worktree_root: worktree_root.map(PathBuf::from),
     })
 }
 
@@ -74,16 +73,25 @@ impl RigRepository for PgRigs {
         async move {
             // Upsert by name (the catalog identity). On re-save the mutable
             // columns change; `registered_at` is preserved from the first insert.
+            // Path → TEXT. A worktree root always arrives as a UTF-8 JSON string, so `to_str`
+            // is `Some`; a (pathological) non-UTF-8 path stores NULL rather than corrupting.
+            let worktree_root = entry
+                .worktree_root
+                .as_ref()
+                .and_then(|p| p.to_str())
+                .map(str::to_string);
             sqlx::query(
                 "INSERT INTO rigs \
-                   (name, prefix, git_url, push_url, upstream_url, default_branch, registered_at) \
-                 VALUES ($1, $2, $3, $4, $5, $6, $7) \
+                   (name, prefix, git_url, push_url, upstream_url, default_branch, registered_at, \
+                    worktree_root) \
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8) \
                  ON CONFLICT (name) DO UPDATE SET \
                    prefix = EXCLUDED.prefix, \
                    git_url = EXCLUDED.git_url, \
                    push_url = EXCLUDED.push_url, \
                    upstream_url = EXCLUDED.upstream_url, \
-                   default_branch = EXCLUDED.default_branch",
+                   default_branch = EXCLUDED.default_branch, \
+                   worktree_root = EXCLUDED.worktree_root",
             )
             .bind(&entry.name)
             .bind(&entry.prefix)
@@ -92,6 +100,7 @@ impl RigRepository for PgRigs {
             .bind(&entry.upstream_url)
             .bind(&entry.default_branch)
             .bind(entry.registered_at_secs as i64)
+            .bind(&worktree_root)
             .execute(&pool)
             .await
             .map_err(backend)?;
@@ -118,7 +127,7 @@ impl RigRepository for PgRigs {
         async move {
             let row = sqlx::query(
                 "SELECT name, prefix, git_url, push_url, upstream_url, default_branch, \
-                        registered_at \
+                        registered_at, worktree_root \
                  FROM rigs WHERE name = $1",
             )
             .bind(&name)
@@ -151,7 +160,7 @@ impl RigRepository for PgRigs {
         async move {
             let rows = sqlx::query(
                 "SELECT name, prefix, git_url, push_url, upstream_url, default_branch, \
-                        registered_at \
+                        registered_at, worktree_root \
                  FROM rigs ORDER BY name",
             )
             .fetch_all(&pool)

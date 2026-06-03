@@ -1,9 +1,9 @@
 //! `rig.*` domain dispatch (`hq-mcp-dispatch.3`).
 //!
 //! Routes the rig catalog tools — `rig.add`, `rig.adopt`, `rig.remove`,
-//! `rig.set-prefix`, `rig.set-default-branch`, plus the `rig.list` / `rig.info`
-//! reads — onto the [`RigCommand`] decide/apply layer over the PG-backed
-//! [`PgRigs`] adapter.
+//! `rig.set-prefix`, `rig.set-default-branch`, `rig.set-worktree-root`, plus the
+//! `rig.list` / `rig.info` / `rig.lookup-by-prefix` reads — onto the [`RigCommand`]
+//! decide/apply layer over the PG-backed [`PgRigs`] adapter.
 //!
 //! Each mutation hydrates the [`RigCatalog`] from the tenant's `rigs` table,
 //! runs the command's `execute` (validate + mutate the in-memory catalog,
@@ -23,7 +23,7 @@ use gt_events::Command;
 use gt_mcp_server::{DomainCtx, DomainHandler};
 use gt_rig::{
     AddRig, AdoptRig, PgRigs, RemoveRig, RigCatalog, RigEntry, RigRepository, SetRigDefaultBranch,
-    SetRigPrefix,
+    SetRigPrefix, SetRigWorktreeRoot,
 };
 use gt_store_dolt::AppError;
 
@@ -68,6 +68,10 @@ impl DomainHandler for RigHandler {
                 let cmd: SetRigDefaultBranch = parse_cmd(ctx.args)?;
                 apply_and_upsert(&repo, cmd.name.clone(), &cmd).await
             }
+            "rig.set-worktree-root" => {
+                let cmd: SetRigWorktreeRoot = parse_cmd(ctx.args)?;
+                apply_and_upsert(&repo, cmd.name.clone(), &cmd).await
+            }
             "rig.remove" => {
                 let cmd: RemoveRig = parse_cmd(ctx.args)?;
                 // Decide against the live catalog (rejects an absent rig as
@@ -86,6 +90,21 @@ impl DomainHandler for RigHandler {
                 match repo.get(name).await.map_err(ev_err)? {
                     Some(entry) => Ok(entry_json(&entry)),
                     None => Err(AppError::NotFound(format!("rig {name}"))),
+                }
+            }
+            "rig.lookup-by-prefix" => {
+                // Resolve a bead prefix to its owning rig within the caller's workspace —
+                // the read CLI helpers need to turn a `<prefix>-<slug>` bead id back into a
+                // rig. The prefix index is per-tenant (schema-local UNIQUE), so this never
+                // crosses a workspace boundary.
+                let prefix = str_arg(&ctx.args, "prefix")?;
+                let owner = repo.prefix_owner(prefix).await.map_err(ev_err)?;
+                match owner {
+                    Some(name) => match repo.get(&name).await.map_err(ev_err)? {
+                        Some(entry) => Ok(entry_json(&entry)),
+                        None => Err(AppError::NotFound(format!("rig {name}"))),
+                    },
+                    None => Err(AppError::NotFound(format!("rig for prefix {prefix:?}"))),
                 }
             }
             other => Err(AppError::Validation(format!("unknown tool `{other}`"))),
@@ -157,6 +176,7 @@ fn entry_json(entry: &RigEntry) -> Value {
         "upstream_url": entry.upstream_url,
         "default_branch": entry.default_branch,
         "registered_at_secs": entry.registered_at_secs,
+        "worktree_root": entry.worktree_root,
     })
 }
 
@@ -211,25 +231,38 @@ mod tests {
         let pool = PgPool::connect(&url).await.expect("connect postgres");
         // The module owns the `rigs` schema (ws_default template); apply it.
         let migs = gt_rig::RigsModule.migrations();
-        sqlx::raw_sql(&migs[0].sql).execute(&pool).await.expect("apply rigs migration");
+        sqlx::raw_sql(&migs[0].sql)
+            .execute(&pool)
+            .await
+            .expect("apply rigs migration");
         sqlx::raw_sql("DELETE FROM ws_default.rigs WHERE name = 'dispatchrig'")
             .execute(&pool)
             .await
             .ok();
 
         let handler = RigHandler::new(Arc::new(WsPools::new(url)));
-        let ctx = |args| DomainCtx { workspace: None, actor: "tester", args };
+        let ctx = |args| DomainCtx {
+            workspace: None,
+            actor: "tester",
+            args,
+        };
         let add_args = json!({
             "name": "dispatchrig", "prefix": "dr",
             "git_url": "git@x:y/d.git", "default_branch": "main"
         });
 
-        let added = handler.dispatch("rig.add", ctx(add_args.clone())).await.unwrap();
+        let added = handler
+            .dispatch("rig.add", ctx(add_args.clone()))
+            .await
+            .unwrap();
         assert_eq!(added["ok"], true);
         assert_eq!(added["rig"], "dispatchrig");
 
         // Re-add is rejected (name + prefix collision) as a validation fault.
-        let dup = handler.dispatch("rig.add", ctx(add_args)).await.unwrap_err();
+        let dup = handler
+            .dispatch("rig.add", ctx(add_args))
+            .await
+            .unwrap_err();
         assert!(matches!(dup, AppError::Validation(_)));
 
         let info = handler
@@ -240,7 +273,10 @@ mod tests {
         assert_eq!(info["default_branch"], "main");
 
         handler
-            .dispatch("rig.set-prefix", ctx(json!({ "name": "dispatchrig", "new_prefix": "dx" })))
+            .dispatch(
+                "rig.set-prefix",
+                ctx(json!({ "name": "dispatchrig", "new_prefix": "dx" })),
+            )
             .await
             .unwrap();
         let info2 = handler
@@ -248,6 +284,35 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(info2["prefix"], "dx", "prefix change persisted to PG");
+
+        // Pin a worktree-root override; it round-trips through the new PG column.
+        handler
+            .dispatch(
+                "rig.set-worktree-root",
+                ctx(json!({ "name": "dispatchrig", "new_root": "/srv/wt/dispatchrig" })),
+            )
+            .await
+            .unwrap();
+        let info3 = handler
+            .dispatch("rig.info", ctx(json!({ "name": "dispatchrig" })))
+            .await
+            .unwrap();
+        assert_eq!(
+            info3["worktree_root"], "/srv/wt/dispatchrig",
+            "worktree_root override persisted to PG"
+        );
+
+        // Resolve the rig back from its (changed) prefix.
+        let by_prefix = handler
+            .dispatch("rig.lookup-by-prefix", ctx(json!({ "prefix": "dx" })))
+            .await
+            .unwrap();
+        assert_eq!(by_prefix["name"], "dispatchrig");
+        let missing_prefix = handler
+            .dispatch("rig.lookup-by-prefix", ctx(json!({ "prefix": "nope" })))
+            .await
+            .unwrap_err();
+        assert!(matches!(missing_prefix, AppError::NotFound(_)));
 
         let list = handler.dispatch("rig.list", ctx(json!({}))).await.unwrap();
         assert!(list["rigs"]
@@ -298,11 +363,17 @@ mod tests {
 
         // 1. Catalog table + the `gt_create_workspace_schema` provisioning fn.
         for mig in gt_store_pg::workspace_migrations() {
-            sqlx::raw_sql(&mig.sql).execute(&pool).await.expect("apply workspace migration");
+            sqlx::raw_sql(&mig.sql)
+                .execute(&pool)
+                .await
+                .expect("apply workspace migration");
         }
         // 2. The `rigs` template in `ws_default` (the provisioner clones from it).
         let migs = gt_rig::RigsModule.migrations();
-        sqlx::raw_sql(&migs[0].sql).execute(&pool).await.expect("apply rigs migration");
+        sqlx::raw_sql(&migs[0].sql)
+            .execute(&pool)
+            .await
+            .expect("apply rigs migration");
         // 3. Provision two tenant schemas — each gets its own `rigs` table with a
         //    schema-local UNIQUE(prefix) (idempotent; safe across reruns).
         for ws in ["a", "b"] {
@@ -318,32 +389,53 @@ mod tests {
         }
 
         let handler = RigHandler::new(Arc::new(WsPools::new(url)));
-        let ctx = |ws: &'static str, args| DomainCtx { workspace: Some(ws), actor: "tester", args };
-        let shared = || json!({
-            "name": "granite", "prefix": "gr",
-            "git_url": "git@x:y/granite.git", "default_branch": "main"
-        });
+        let ctx = |ws: &'static str, args| DomainCtx {
+            workspace: Some(ws),
+            actor: "tester",
+            args,
+        };
+        let shared = || {
+            json!({
+                "name": "granite", "prefix": "gr",
+                "git_url": "git@x:y/granite.git", "default_branch": "main"
+            })
+        };
 
         // Property 1: the SAME name + prefix registers cleanly in BOTH tenants.
-        let in_a = handler.dispatch("rig.add", ctx("a", shared())).await.unwrap();
+        let in_a = handler
+            .dispatch("rig.add", ctx("a", shared()))
+            .await
+            .unwrap();
         assert_eq!(in_a["ok"], true);
-        let in_b = handler.dispatch("rig.add", ctx("b", shared())).await.unwrap();
-        assert_eq!(in_b["ok"], true, "same prefix in a distinct ws must not collide");
+        let in_b = handler
+            .dispatch("rig.add", ctx("b", shared()))
+            .await
+            .unwrap();
+        assert_eq!(
+            in_b["ok"], true,
+            "same prefix in a distinct ws must not collide"
+        );
 
         // A rig that lives only in tenant `a`.
         handler
             .dispatch(
                 "rig.add",
-                ctx("a", json!({
-                    "name": "plane", "prefix": "pl",
-                    "git_url": "git@x:y/plane.git", "default_branch": "main"
-                })),
+                ctx(
+                    "a",
+                    json!({
+                        "name": "plane", "prefix": "pl",
+                        "git_url": "git@x:y/plane.git", "default_branch": "main"
+                    }),
+                ),
             )
             .await
             .unwrap();
 
         // Property 2: `b` sees only its own `granite`, never `a`'s `plane`.
-        let list_b = handler.dispatch("rig.list", ctx("b", json!({}))).await.unwrap();
+        let list_b = handler
+            .dispatch("rig.list", ctx("b", json!({})))
+            .await
+            .unwrap();
         let names_b: Vec<&str> = list_b["rigs"]
             .as_array()
             .unwrap()
@@ -351,15 +443,24 @@ mod tests {
             .filter_map(|r| r["name"].as_str())
             .collect();
         assert!(names_b.contains(&"granite"), "b keeps its own rig");
-        assert!(!names_b.contains(&"plane"), "no cross-tenant leak from a into b");
+        assert!(
+            !names_b.contains(&"plane"),
+            "no cross-tenant leak from a into b"
+        );
         let leaked = handler
             .dispatch("rig.info", ctx("b", json!({ "name": "plane" })))
             .await
             .unwrap_err();
-        assert!(matches!(leaked, AppError::NotFound(_)), "a's rig is not found in b");
+        assert!(
+            matches!(leaked, AppError::NotFound(_)),
+            "a's rig is not found in b"
+        );
 
         // `a` has both.
-        let list_a = handler.dispatch("rig.list", ctx("a", json!({}))).await.unwrap();
+        let list_a = handler
+            .dispatch("rig.list", ctx("a", json!({})))
+            .await
+            .unwrap();
         let names_a: Vec<&str> = list_a["rigs"]
             .as_array()
             .unwrap()
