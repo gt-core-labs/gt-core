@@ -36,6 +36,9 @@ gt-rig = { workspace = true, features = ["pg"] }
 # Per-workspace schema isolation: WorkspacePool sets search_path per connection.
 gt-store-pg = { workspace = true, features = ["pg"] }
 async-trait = { workspace = true }
+# Per-workspace SSE event stream (hq-mcp-dispatch.10): the poll-tail feed stream.
+async-stream = { workspace = true }
+futures-core = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "net", "signal", "sync", "time"] }
 
 # The gt-mcp-server binary lives here (hq-mcp-dispatch): the modules tier is the

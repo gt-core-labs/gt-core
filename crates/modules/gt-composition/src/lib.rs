@@ -29,6 +29,7 @@
 //! their events onto the hub via `RootHandle::drain_events_from`.
 
 pub mod mcp;
+pub mod stream;
 
 use std::sync::{Arc, Mutex};
 

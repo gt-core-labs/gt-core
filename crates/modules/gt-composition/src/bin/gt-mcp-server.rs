@@ -34,6 +34,7 @@ use gt_composition::mcp::{
     AgentHandler, ConvoyHandler, EventLog, MergeHandler, QuotaHandler, RigHandler, WorkspaceHandler,
     WsPools,
 };
+use gt_composition::stream::{feed_router, FeedState};
 use gt_issues::IssuesModule;
 use gt_mcp_server::{health, DomainRouter, HealthState, IssuesServer, PgAuditSink, WorkspaceStores};
 use gt_meta::MetaModule;
@@ -119,11 +120,18 @@ async fn main() -> anyhow::Result<()> {
     }
     let mut service = IssuesServer::new(store, default_scope, rbac, audit, tools, repo_dir);
 
+    // The per-workspace event log (the event-sourced domains' durable store +
+    // the SSE feed's source) is path-partitioned under GT_EVENTLOG_ROOT (default
+    // /var/lib/gt-core). Built once, shared by the domain dispatch handlers and the
+    // streaming feed route.
+    let event_root = std::env::var("GT_EVENTLOG_ROOT").ok().map(std::path::PathBuf::from);
+    let event_log = Arc::new(EventLog::new(event_root));
+
     // Domain dispatch (hq-mcp-dispatch): tool namespaces beyond issues.*/meta.*
     // (workspace.*, rig.*, …) route to PG-backed handlers. Wired only when
     // GT_PG_URL is set; unset ⇒ an empty router, so the server serves issues +
     // meta exactly as before.
-    let domains = build_domain_router().await?;
+    let domains = build_domain_router(event_log.clone()).await?;
     service = service.with_domains(Arc::new(domains));
 
     // Multi-tenant routing (hq-mt-routing.5): when GT_DOLT_BASE_URL is set, a
@@ -155,10 +163,18 @@ async fn main() -> anyhow::Result<()> {
         Arc::new(LocalSessionManager::default()),
         StreamableHttpServerConfig::default(),
     );
+    // Per-workspace SSE event feed (hq-mcp-dispatch.10): GET /stream fans the
+    // caller's workspace log out as Server-Sent Events, keyed per (workspace,
+    // channel) with Last-Event-ID resume + KeepAlive (docs/02). Merged as its own
+    // sub-router so it carries FeedState without disturbing the health state.
+    let feed = feed_router(FeedState::new(event_log.clone()));
+    eprintln!("[gt-mcp-server] SSE feed on GET /stream (per-workspace, X-Workspace keyed)");
+
     let app = Router::new()
         .route("/health", get(health::health))
         .route("/readyz", get(health::readyz))
         .with_state(health_state)
+        .merge(feed)
         .nest_service(MCP_PATH, http);
 
     let listener = tokio::net::TcpListener::bind(&bind).await?;
@@ -172,8 +188,10 @@ async fn main() -> anyhow::Result<()> {
 
 /// Build the domain dispatch router from `GT_PG_URL`. Unset ⇒ an empty router
 /// (issues + meta only). The per-domain `DomainHandler`s (`hq-mcp-dispatch.2..7`)
-/// are registered here as they land.
-async fn build_domain_router() -> anyhow::Result<DomainRouter> {
+/// are registered here as they land. `event_log` (the shared, path-partitioned
+/// per-workspace log) backs the event-sourced domains — it is the same handle the
+/// SSE feed streams from.
+async fn build_domain_router(event_log: Arc<EventLog>) -> anyhow::Result<DomainRouter> {
     let Ok(pg_url) = std::env::var("GT_PG_URL") else {
         eprintln!(
             "[gt-mcp-server] GT_PG_URL unset; domain dispatch disabled (issues + meta only)"
@@ -188,10 +206,6 @@ async fn build_domain_router() -> anyhow::Result<DomainRouter> {
         .context("GT_PG_URL must point at a reachable Postgres")?;
     eprintln!("[gt-mcp-server] domain dispatch: Postgres @ {pg_url}");
     let ws_pools = Arc::new(WsPools::new(pg_url));
-    // Event-sourced domains (merge, …) keep no table — their durable store is the
-    // per-workspace event log under GT_EVENTLOG_ROOT (default /var/lib/gt-core).
-    let event_root = std::env::var("GT_EVENTLOG_ROOT").ok().map(std::path::PathBuf::from);
-    let event_log = Arc::new(EventLog::new(event_root));
     let router = DomainRouter::new()
         .register(Arc::new(WorkspaceHandler::new(pool.clone())))
         .register(Arc::new(RigHandler::new(ws_pools.clone())))
