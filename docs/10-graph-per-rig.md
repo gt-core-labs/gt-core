@@ -135,3 +135,63 @@ owning rig from the merged bead via `PgRigs::prefix_owner(bead_prefix(bead))` an
 graph stale (best-effort). Still open for the operator:
 `hq-gap-domain-taxonomy-add-discriminators-kernel-graphindex-role-graphwarden` (add the domain
 enum discriminators; the beads were tagged provisionally).
+
+## Operating it (turnkey)
+
+The gt-core code is complete; running it live is three operator steps.
+
+### 1. RBAC grants (who can call what)
+
+Enforcement is already on — `Scope::check` is a deny-by-default per-actor allow-list, so a
+graph tool is callable only if the actor's scope lists its pattern. The read/write split is
+purely which patterns each role gets (no code):
+
+```toml
+# mcp-scope.toml (operator-owned; loaded by RbacConfig::load)
+
+# Regular agents — READ ONLY (consult for context, never mutate the graph).
+[actors.agent]
+allow = ["graph.query", "graph.explain", "graph.status", "graph.list"]
+
+# The custodian — the only actor that may refresh (write).
+[actors.graph-custodian]
+allow = ["graph.query", "graph.status", "graph.list", "graph.refresh", "graph.refresh-stale"]
+```
+
+Because `graph.refresh*` are distinct tool names, the "only the custodian writes" guarantee is
+enforced by the allow-list, not just by convention. Tokens carry the actor's scopes.
+
+### 2. Deploy hook (attach → initial build)
+
+`rig.add` is FS-free; the repo clone is a deploy/bootstrap step. After the checkout exists,
+the bootstrap calls the refresh once:
+
+```sh
+# in the rig bootstrap, after `git clone` and `bd init`:
+gt-mcp-cli call graph.refresh --json "{\"rig\":\"$RIG\",\"repo_dir\":\"$CHECKOUT\"}"
+```
+
+That registers custody (`graphwarden.rig-registered.v1`), writes the artifact patterns into
+`$CHECKOUT/.git/info/exclude`, builds the graph, and marks it fresh.
+
+### 3. Custodian loop (stale → refresh)
+
+A merge marks the owning rig stale; the custodian periodically drains the stale set. The loop
+is operational — any scheduler driving the one batch tool:
+
+```sh
+# every 5 minutes, as the graph-custodian actor:
+/loop 5m  gt-mcp-cli call graph.refresh-stale --json '{}'
+# or cron / a long-running gt agent on graph.agent.backend (default: haiku)
+```
+
+`graph.refresh-stale` is the whole custodian in one call: it updates every rig currently stale
+and records each refresh. An empty stale set is a no-op.
+
+### What stays out of gt-core
+
+- The semantic (LLM) enrichment pass — the adapter runs graphify's deterministic AST path; a
+  richer semantic re-extraction is the custodian *agent's* job (it is why `graph.agent.backend`
+  is a Claude/Haiku binding, not a fixed function).
+- Domain-taxonomy discriminators for the new crates (`kernel.graphindex`, `role.graphwarden`) —
+  an operator enum addition, tracked by the open taxonomy gap.
