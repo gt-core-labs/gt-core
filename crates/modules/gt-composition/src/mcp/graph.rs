@@ -19,13 +19,13 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use serde_json::{json, Value};
 
-use gt_graphindex::{GraphError, GraphIndexer};
-use gt_graphwarden::WardenState;
+use gt_graphindex::{ensure_ignored, GraphError, GraphIndexer};
+use gt_graphwarden::{MarkRefreshed, RegisterRig, WardenCommand, WardenState};
 use gt_mcp_server::{DomainCtx, DomainHandler};
 use gt_store_dolt::AppError;
 
 use super::eventlog::EventLog;
-use super::util::str_arg;
+use super::util::{now_secs, str_arg};
 
 /// The warden event-log kind prefix the handler replays to resolve rigs.
 const NS: &str = "graphwarden.";
@@ -58,6 +58,37 @@ impl GraphHandler {
             .map(|g| PathBuf::from(&g.repo_dir))
             .ok_or_else(|| AppError::NotFound(format!("no graph custody for rig `{rig}`")))
     }
+
+    /// Run a warden command against the replayed state and append its events to the log,
+    /// so the next replay (read or refresh) sees the new freshness state.
+    fn warden_apply(&self, ws: Option<&str>, cmd: WardenCommand) -> Result<(), AppError> {
+        let state = self.warden(ws)?;
+        let events = cmd.execute(&state).map_err(ev_err)?;
+        for ev in events {
+            self.log.append(ws, ev)?;
+        }
+        Ok(())
+    }
+}
+
+/// `git -C <repo> rev-parse --short HEAD`, or `"unknown"` if it cannot be read — the warden
+/// requires a non-empty commit and an unknown checkout still refreshes the graph.
+fn head_commit(repo: &std::path::Path) -> String {
+    std::process::Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(["rev-parse", "--short", "HEAD"])
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "unknown".to_string())
+}
+
+/// Map a `gt_events::AppError` (warden command path) onto the server error type.
+fn ev_err(e: gt_events::AppError) -> AppError {
+    AppError::Validation(e.to_string())
 }
 
 /// Map an indexer failure onto the MCP-server error type.
@@ -102,6 +133,62 @@ impl DomainHandler for GraphHandler {
                     "edges": st.stats.map(|s| s.edges),
                     "communities": st.stats.map(|s| s.communities),
                     "built_at_commit": st.built_at_commit,
+                }))
+            }
+            "graph.refresh" => {
+                // The custodian's write trigger: register the rig (first time, given a
+                // repo_dir), ensure its artifacts are ignored, build-or-update the graph,
+                // and record the refresh. Idempotent — re-running updates in place.
+                let rig = str_arg(&ctx.args, "rig")?;
+                let state = self.warden(ws)?;
+                // repo_dir from the arg (first registration) or the existing custody record.
+                let repo: PathBuf = match ctx.args.get("repo_dir").and_then(|v| v.as_str()) {
+                    Some(d) => PathBuf::from(d),
+                    None => state
+                        .rigs
+                        .get(rig)
+                        .map(|g| PathBuf::from(&g.repo_dir))
+                        .ok_or_else(|| {
+                            AppError::Validation(format!(
+                                "rig `{rig}` not under custody — pass repo_dir to register it"
+                            ))
+                        })?,
+                };
+                if !state.rigs.contains_key(rig) {
+                    self.warden_apply(
+                        ws,
+                        WardenCommand::Register(RegisterRig {
+                            rig: rig.to_string(),
+                            repo_dir: repo.to_string_lossy().into_owned(),
+                            now_secs: now_secs(),
+                        }),
+                    )?;
+                }
+                // Keep the repo's local git excludes carrying the tool's artifacts.
+                let _ = ensure_ignored(&repo, self.indexer.tool());
+                // Build the graph if it does not exist yet, else update it in place.
+                let built = self.indexer.status(&repo).await.map_err(graph_err)?.built;
+                let stats = if built {
+                    self.indexer.update(&repo, &[]).await.map_err(graph_err)?.after
+                } else {
+                    self.indexer.build(&repo).await.map_err(graph_err)?
+                };
+                let commit = head_commit(&repo);
+                self.warden_apply(
+                    ws,
+                    WardenCommand::MarkRefreshed(MarkRefreshed {
+                        rig: rig.to_string(),
+                        commit: commit.clone(),
+                        now_secs: now_secs(),
+                    }),
+                )?;
+                Ok(json!({
+                    "ok": true,
+                    "rig": rig,
+                    "commit": commit,
+                    "nodes": stats.nodes,
+                    "edges": stats.edges,
+                    "communities": stats.communities,
                 }))
             }
             "graph.list" => {
@@ -172,6 +259,51 @@ mod tests {
         let st = h.dispatch("graph.status", ctx(json!({ "rig": "alpha" }))).await.unwrap();
         assert_eq!(st["built"], true);
         assert_eq!(st["tool"], "inmemory");
+    }
+
+    /// `graph.refresh` registers a fresh rig, builds it, marks it fresh — then it is
+    /// queryable and listed as not-stale.
+    #[tokio::test]
+    async fn refresh_registers_builds_and_marks_fresh() {
+        let dir = TempDir::new().unwrap();
+        let log = Arc::new(EventLog::new(Some(dir.path().to_path_buf())));
+        let h = GraphHandler::new(log, Arc::new(InMemoryGraphIndexer::new()));
+
+        // First refresh registers the rig (needs repo_dir) and builds the graph.
+        let out = h
+            .dispatch(
+                "graph.refresh",
+                ctx(json!({ "rig": "alpha", "repo_dir": "/repo/alpha" })),
+            )
+            .await
+            .unwrap();
+        assert_eq!(out["ok"], true);
+        assert_eq!(out["rig"], "alpha");
+
+        // Now listed, not stale (just refreshed).
+        let list = h.dispatch("graph.list", ctx(json!({}))).await.unwrap();
+        assert_eq!(list["rigs"][0]["stale"], false);
+
+        // And queryable (the graph now exists).
+        let q = h
+            .dispatch("graph.query", ctx(json!({ "rig": "alpha", "question": "x term" })))
+            .await
+            .unwrap();
+        assert!(q["text"].is_string());
+
+        // Second refresh without repo_dir resolves it from custody and updates in place.
+        let again = h.dispatch("graph.refresh", ctx(json!({ "rig": "alpha" }))).await.unwrap();
+        assert_eq!(again["ok"], true);
+    }
+
+    /// Refreshing an unregistered rig without a repo_dir is rejected.
+    #[tokio::test]
+    async fn refresh_unregistered_without_repo_dir_is_rejected() {
+        let dir = TempDir::new().unwrap();
+        let log = Arc::new(EventLog::new(Some(dir.path().to_path_buf())));
+        let h = GraphHandler::new(log, Arc::new(InMemoryGraphIndexer::new()));
+        let err = h.dispatch("graph.refresh", ctx(json!({ "rig": "ghost" }))).await.unwrap_err();
+        assert!(matches!(err, AppError::Validation(_)));
     }
 
     /// A rig the warden never registered has no custody → NotFound.
