@@ -156,6 +156,7 @@ mod tests {
             upstream_url: None,
             default_branch: "main".into(),
             now_secs: now,
+            workspace_id: "default".into(),
         })
     }
 
@@ -183,6 +184,7 @@ mod tests {
             .exec(RigCommand::Remove(RemoveRig {
                 name: "plane".into(),
                 now_secs: 3,
+                workspace_id: "default".into(),
             }))
             .await
             .unwrap();

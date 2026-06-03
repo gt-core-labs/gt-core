@@ -14,6 +14,13 @@ use gt_events::{AppError, Command};
 use crate::events::RigEvent;
 use crate::state::{validate_prefix, validate_rig_name, RigCatalog, RigEntry};
 
+/// Default tenant for a command built without an explicit workspace. The server stamps the
+/// real one from the auth context (see [`RigCommand::in_workspace`]); a command parsed from
+/// external tool args lands here because `workspace_id` is `skip_deserializing` (anti-spoof).
+fn default_workspace() -> String {
+    "default".to_string()
+}
+
 /// Register a new rig in the catalog. The on-disk clone is the bootstrap edge's job; this
 /// command only records that the orchestrator now routes work for the rig.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -28,6 +35,13 @@ pub struct AddRig {
     pub default_branch: String,
     /// UTC epoch seconds, stamped at the edge.
     pub now_secs: u64,
+    /// Server-injected tenant. NOT read from the tool payload (`skip_deserializing`) and
+    /// hidden from the tool schema (`schemars(skip)`) so an external caller cannot spoof
+    /// which workspace a rig mutation targets; the server stamps it from the auth context
+    /// via [`RigCommand::in_workspace`] (hq-mt-rigs.1).
+    #[serde(skip_deserializing, default = "default_workspace")]
+    #[schemars(skip)]
+    pub workspace_id: String,
 }
 
 impl AddRig {
@@ -110,6 +124,10 @@ pub struct AdoptRig {
     pub upstream_url: Option<String>,
     pub default_branch: String,
     pub now_secs: u64,
+    /// Server-injected tenant — see [`AddRig::workspace_id`].
+    #[serde(skip_deserializing, default = "default_workspace")]
+    #[schemars(skip)]
+    pub workspace_id: String,
 }
 
 impl AdoptRig {
@@ -122,6 +140,7 @@ impl AdoptRig {
             upstream_url: self.upstream_url.clone(),
             default_branch: self.default_branch.clone(),
             now_secs: self.now_secs,
+            workspace_id: self.workspace_id.clone(),
         }
     }
 }
@@ -155,6 +174,10 @@ impl Command for AdoptRig {
 pub struct RemoveRig {
     pub name: String,
     pub now_secs: u64,
+    /// Server-injected tenant — see [`AddRig::workspace_id`].
+    #[serde(skip_deserializing, default = "default_workspace")]
+    #[schemars(skip)]
+    pub workspace_id: String,
 }
 
 impl Command for RemoveRig {
@@ -188,6 +211,10 @@ pub struct SetRigPrefix {
     pub name: String,
     pub new_prefix: String,
     pub now_secs: u64,
+    /// Server-injected tenant — see [`AddRig::workspace_id`].
+    #[serde(skip_deserializing, default = "default_workspace")]
+    #[schemars(skip)]
+    pub workspace_id: String,
 }
 
 impl Command for SetRigPrefix {
@@ -239,6 +266,10 @@ pub struct SetRigDefaultBranch {
     pub name: String,
     pub new_branch: String,
     pub now_secs: u64,
+    /// Server-injected tenant — see [`AddRig::workspace_id`].
+    #[serde(skip_deserializing, default = "default_workspace")]
+    #[schemars(skip)]
+    pub workspace_id: String,
 }
 
 impl Command for SetRigDefaultBranch {
@@ -303,6 +334,34 @@ impl RigCommand {
             Self::SetDefaultBranch(_) => "rig.set-default-branch",
         }
     }
+
+    /// The tenant this command targets. Server-injected; `"default"` until the server stamps
+    /// the resolved workspace (the dispatch layer routes the catalog by this value).
+    pub fn workspace_id(&self) -> &str {
+        match self {
+            Self::Add(c) => &c.workspace_id,
+            Self::Adopt(c) => &c.workspace_id,
+            Self::Remove(c) => &c.workspace_id,
+            Self::SetPrefix(c) => &c.workspace_id,
+            Self::SetDefaultBranch(c) => &c.workspace_id,
+        }
+    }
+
+    /// Stamp the resolved tenant onto the command (builder style). The dispatch layer parses
+    /// a command from the tool args — where `workspace_id` is `skip_deserializing`, so the
+    /// caller cannot set it — then calls this with the workspace from the auth context. This
+    /// is the only path that sets `workspace_id`, which is what makes it server-injected.
+    pub fn in_workspace(mut self, workspace_id: impl Into<String>) -> Self {
+        let ws = workspace_id.into();
+        match &mut self {
+            Self::Add(c) => c.workspace_id = ws,
+            Self::Adopt(c) => c.workspace_id = ws,
+            Self::Remove(c) => c.workspace_id = ws,
+            Self::SetPrefix(c) => c.workspace_id = ws,
+            Self::SetDefaultBranch(c) => c.workspace_id = ws,
+        }
+        self
+    }
 }
 
 impl Command for RigCommand {
@@ -343,6 +402,7 @@ mod tests {
             upstream_url: None,
             default_branch: "main".into(),
             now_secs: now,
+            workspace_id: "default".into(),
         }
     }
 
@@ -399,6 +459,7 @@ mod tests {
             upstream_url: None,
             default_branch: "main".into(),
             now_secs: 10,
+            workspace_id: "default".into(),
         };
         let ev = cmd.execute(&mut catalog).unwrap();
         assert!(matches!(ev, RigEvent::Adopted { .. }));
@@ -412,6 +473,7 @@ mod tests {
         let rm = RemoveRig {
             name: "plane".into(),
             now_secs: 9,
+            workspace_id: "default".into(),
         };
         let ev = rm.execute(&mut catalog).unwrap();
         assert!(matches!(ev, RigEvent::Removed { .. }));
@@ -431,6 +493,7 @@ mod tests {
             name: "plane".into(),
             new_prefix: "pl".into(),
             now_secs: 3,
+            workspace_id: "default".into(),
         };
         assert!(matches!(
             no_op.validate(&catalog),
@@ -441,6 +504,7 @@ mod tests {
             name: "plane".into(),
             new_prefix: "gt".into(),
             now_secs: 4,
+            workspace_id: "default".into(),
         };
         assert!(matches!(
             collide.validate(&catalog),
@@ -451,6 +515,7 @@ mod tests {
             name: "plane".into(),
             new_prefix: "pln".into(),
             now_secs: 5,
+            workspace_id: "default".into(),
         };
         let ev = ok.execute(&mut catalog).unwrap();
         match ev {
@@ -472,6 +537,7 @@ mod tests {
             name: "plane".into(),
             new_branch: "master".into(),
             now_secs: 2,
+            workspace_id: "default".into(),
         };
         let ev = cmd.execute(&mut catalog).unwrap();
         assert!(matches!(ev, RigEvent::DefaultBranchChanged { .. }));
@@ -485,5 +551,21 @@ mod tests {
         assert_eq!(cmd.tool_name(), "rig.add");
         let ev = cmd.execute(&mut catalog).unwrap();
         assert!(matches!(ev, RigEvent::Added { .. }));
+    }
+
+    #[test]
+    fn workspace_id_is_not_spoofable_from_payload_and_server_stamps_it() {
+        // A caller embeds `workspace_id` in the tool args trying to target another tenant.
+        let spoofed = serde_json::json!({
+            "name": "plane", "prefix": "pl", "git_url": "git@x:y/p.git",
+            "default_branch": "main", "now_secs": 1, "workspace_id": "victim"
+        });
+        let cmd: AddRig = serde_json::from_value(spoofed).unwrap();
+        // skip_deserializing ignored the payload value: it lands on the default tenant.
+        assert_eq!(cmd.workspace_id, "default", "payload must not set workspace_id");
+
+        // The server stamps the resolved tenant via the sum-type builder.
+        let stamped = RigCommand::Add(cmd).in_workspace("acme");
+        assert_eq!(stamped.workspace_id(), "acme");
     }
 }
