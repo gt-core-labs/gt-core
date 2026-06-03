@@ -1,0 +1,24 @@
+[package]
+name = "gt-graphindex"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+# Tool-neutral knowledge-graph indexing port (`hq-graphrig.1`). Heavy, tool-specific
+# adapters (e.g. the graphify CLI bridge) live in this same crate behind off-by-default
+# features so the core build stays dependency-light — the same hexagonal shape gt-quota
+# uses for its `pg`/`axum` adapters (docs/03 Rule 4).
+[features]
+default = []
+# graphify = []   # enabled by `hq-graphrig.2` when the GraphifyIndexer adapter lands.
+
+[dependencies]
+async-trait = { workspace = true }
+serde = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true }
+serde_json = { workspace = true }

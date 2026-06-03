@@ -14,6 +14,7 @@ members = [
     "crates/kernel/gt-module-contracts",
     "crates/kernel/gt-feature-flags",
     "crates/kernel/gt-hooks",
+    "crates/kernel/gt-graphindex",
     "crates/domain/platform/gt-workspace",
     "crates/domain/platform/gt-auth",
     "crates/domain/platform/gt-issues",
@@ -125,6 +126,7 @@ gt-module-migrate   = { path = "crates/kernel/gt-module-migrate" }
 gt-module-contracts = { path = "crates/kernel/gt-module-contracts" }
 gt-feature-flags = { path = "crates/kernel/gt-feature-flags" }
 gt-hooks         = { path = "crates/kernel/gt-hooks" }
+gt-graphindex    = { path = "crates/kernel/gt-graphindex" }
 gt-workspace     = { path = "crates/domain/platform/gt-workspace" }
 gt-auth          = { path = "crates/domain/platform/gt-auth" }
 gt-meta          = { path = "crates/domain/platform/gt-meta" }
