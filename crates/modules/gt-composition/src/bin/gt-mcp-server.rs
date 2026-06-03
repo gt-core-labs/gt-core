@@ -230,6 +230,42 @@ async fn metrics_text() -> axum::response::Response {
     }
 }
 
+/// Apply the public-schema PG catalog migrations on boot: the `workspaces` table
+/// (+ bootstrap default row + the `gt_create_workspace_schema` provisioning
+/// function) and the `feature` flag-overrides table. These are the `public`-schema
+/// tables the domain dispatch handlers read on the very first call, so a fresh
+/// deploy must seed them before serving. `gt_module_migrate::apply` records each
+/// migration in the tracking table and skips ones already applied, so this is safe
+/// to run on every boot.
+///
+/// The module ids (`workspace`, `feature`) match the owning modules' namespaces so
+/// the tracking rows line up with any future module-driven apply (the workspace
+/// schema currently has no `GtModule`, so its id is named explicitly here).
+async fn apply_pg_catalog(pool: &sqlx::PgPool) -> anyhow::Result<()> {
+    use gt_module::ModuleId;
+
+    let workspace_id = ModuleId::new("workspace").expect("`workspace` is a valid module id");
+    let feature_id = ModuleId::new("feature").expect("`feature` is a valid module id");
+    let workspace_migs = gt_store_pg::workspace_migrations();
+    let feature_migs = gt_store_pg::feature_flags_migrations();
+
+    let plan: Vec<_> = workspace_migs
+        .iter()
+        .map(|m| (&workspace_id, m))
+        .chain(feature_migs.iter().map(|m| (&feature_id, m)))
+        .collect();
+
+    let report = gt_module_migrate::apply(pool, &plan)
+        .await
+        .context("apply public-schema PG catalog migrations")?;
+    eprintln!(
+        "[gt-mcp-server] PG catalog migrations: {} applied, {} already present",
+        report.applied.len(),
+        report.skipped
+    );
+    Ok(())
+}
+
 /// Build the domain dispatch router from `GT_PG_URL`. Unset ⇒ an empty router
 /// (issues + meta only). The per-domain `DomainHandler`s (`hq-mcp-dispatch.2..7`)
 /// are registered here as they land. `event_log` (the shared, path-partitioned
@@ -255,6 +291,14 @@ async fn build_domain_router(
         .await
         .context("GT_PG_URL must point at a reachable Postgres")?;
     eprintln!("[gt-mcp-server] domain dispatch: Postgres @ {pg_url}");
+
+    // Self-seed the public-schema catalog on boot (hq-mcp-deploy): the workspace.*
+    // handler and the suspend/archive gate need the `workspaces` table (+ its
+    // bootstrap default row) and `feature` flag overrides to exist. A fresh deploy
+    // ships an empty Postgres, so the server runs the migrations itself rather than
+    // depending on an operator step. Idempotent — `apply` skips already-recorded
+    // migrations, so a restart against a seeded DB is a no-op.
+    apply_pg_catalog(&pool).await?;
     let ws_pools = Arc::new(WsPools::new(pg_url));
     let router = DomainRouter::new()
         .register(Arc::new(WorkspaceHandler::new(pool.clone())))

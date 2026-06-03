@@ -323,7 +323,12 @@ async fn apply_one(
 
     let mut tx: Transaction<'_, Postgres> = pool.begin().await.map_err(map_err)?;
 
-    sqlx::query(&migration.sql)
+    // `raw_sql` (simple query protocol), not `query` (extended/prepared): a single
+    // migration may carry several statements (e.g. CREATE TABLE + its bootstrap
+    // INSERT), and the prepared path rejects multiple commands per statement. The
+    // SQL is compile-time embedded and trusted (no caller input), so the simple
+    // protocol is safe here.
+    sqlx::raw_sql(&migration.sql)
         .execute(&mut *tx)
         .await
         .map_err(map_err)?;

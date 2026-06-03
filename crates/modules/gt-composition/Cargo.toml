@@ -47,6 +47,9 @@ gt-graphindex = { workspace = true, features = ["graphify"] }
 gt-graphwarden = { workspace = true }
 # Per-workspace schema isolation: WorkspacePool sets search_path per connection.
 gt-store-pg = { workspace = true, features = ["pg"] }
+# Boot-time PG migration apply: gt-mcp-server self-seeds the public catalog
+# (workspaces + feature flags) so a fresh deploy needs no operator migration step.
+gt-module-migrate = { workspace = true }
 async-trait = { workspace = true }
 # Per-workspace SSE event stream (hq-mcp-dispatch.10): the poll-tail feed stream.
 async-stream = { workspace = true }
