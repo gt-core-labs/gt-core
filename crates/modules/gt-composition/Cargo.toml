@@ -27,6 +27,8 @@ gt-quota = { workspace = true }
 # gt_workspace_quota_consumed on each quota.sample.
 gt-telemetry = { workspace = true }
 gt-patrol = { workspace = true }
+# Refinery MERGE_READY loop (hq-orchd.4): the daemon awaits MERGE_READY on a gt-channel.
+gt-channel = { workspace = true }
 # Polecat supervision (hq-orchd.3): the daemon slings spawn_tmux polecats on dispatch +
 # re-slings dead ones via PolecatSupervisor, bounded by the PoolAllocator admission core.
 gt-polecat = { workspace = true }

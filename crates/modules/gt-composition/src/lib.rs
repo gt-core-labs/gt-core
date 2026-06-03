@@ -44,8 +44,10 @@ use gt_eventlog::{EventRecord, EventStore, JsonlWriter};
 use gt_merge::actor::MergeHandle;
 use gt_merge::{InMemoryMergeRepo, MergeBoard, MergeEvent, MergeState};
 use gt_module::RootBuilder;
-use gt_patrol::PatrolEvent;
-use gt_plugin::Plugin;
+use gt_patrol::actor::PatrolHandle;
+use gt_patrol::{InMemoryPatrolRepo, PatrolEvent};
+use gt_plugin::{Plugin, SheriffPlugin};
+use gt_quota::actor::QuotaHandle;
 use gt_roles::{RoleSinks, RoleStack};
 use gt_runtime::{RootHandle, RootRegistry};
 use gt_scheduling::actor::SchedHandle;
@@ -397,4 +399,95 @@ pub async fn live_root(
         handle
     })
     .await
+}
+
+/// The durable, hydrated production root for the autonomous daemon, plus the domain handles its
+/// edge loops drive (`hq-orchd.4`). Unlike [`live_root`] (registry-cached, used by the capstone
+/// test and shaped to return only the `Arc<RootHandle>`), [`daemon_root`] is built once for the
+/// daemon's single workspace and **returns the actor handles** so the bin can drive the patrol
+/// lease-expiry tick, the quota predictive auto-rotation tick, and submit MERGE_READY to the merge
+/// actor from the Refinery channel loop — none of which can reach an actor through the hub alone.
+pub struct DaemonRoot {
+    /// The composed root (event hub + supervisor), owned for the process lifetime.
+    pub handle: Arc<RootHandle>,
+    /// Merge command handle — the Refinery loop submits MERGE_READY beads here.
+    pub merge: MergeHandle,
+    /// Patrol command handle — the lease-expiry ticker drives [`PatrolHandle::tick`].
+    pub patrol: PatrolHandle,
+    /// Quota command handle — the auto-rotation ticker drives [`QuotaHandle::tick`].
+    pub quota: QuotaHandle,
+}
+
+/// Assemble the autonomous daemon's per-workspace root over the durable log (`hq-orchd.4`,
+/// building on `.2`/`.5`). Same event-sourced substrate as [`live_root`] — hydrate scheduler +
+/// merge from the log, anchor the actors to the supervisor, drain their output onto the hub,
+/// register the persistence sink + role observers + the scheduler/merge reactor arms — and
+/// additionally:
+///
+/// - spawns the **patrol** + **quota** actors (anchored + drained), so lease-expiry and quota
+///   events flow through the hub (the [`SchedulerPlugin`] re-enqueues on `patrol.lease-expired.v1`);
+/// - registers the **sheriff** observer ([`SheriffPlugin`]) on the hub;
+/// - returns the merge/patrol/quota handles for the bin's edge timers + Refinery loop.
+///
+/// Patrol leases + quota accounts are spawned **fresh** (not hydrated): leases are short-lived and
+/// re-registered as work dispatches; quota hydration is a follow-up to the `hq-orchd.5` pattern.
+/// No registry — the daemon owns one root for one workspace.
+pub async fn daemon_root(ws: WorkspaceId, log_root: PathBuf) -> DaemonRoot {
+    let ws_slug = ws.as_str().to_string();
+    let handle = Arc::new(RootHandle::new(
+        ws,
+        RootBuilder::new().build().expect("empty root builds"),
+    ));
+
+    // Boot hydration (hq-orchd.5): rebuild the pending scheduler queue + in-flight merge board
+    // from the durable log before spawning the actors. A corrupt log at boot is fatal.
+    let log = EventLog::new(Some(log_root.clone()));
+    let sched_pending =
+        replay_scheduling_pending(&log, &ws_slug).expect("replay scheduling log");
+    let merge_board = replay_merge_board(&log, &ws_slug).expect("replay merge log");
+
+    let (sched_tx, sched_rx) = mpsc::channel(64);
+    let sched =
+        gt_scheduling::actor::spawn_hydrated(InMemoryBeads::default(), sched_tx, 4, sched_pending);
+    let (merge_tx, merge_rx) = mpsc::channel(64);
+    let merge = gt_merge::actor::spawn_hydrated(InMemoryMergeRepo::default(), merge_tx, merge_board);
+    let (patrol_tx, patrol_rx) = mpsc::channel(64);
+    let patrol = gt_patrol::actor::spawn(InMemoryPatrolRepo::default(), patrol_tx);
+    let (quota_tx, quota_rx) = mpsc::channel(64);
+    let quota = gt_quota::actor::spawn(quota_tx, std::collections::HashMap::new());
+
+    handle.supervisor().anchor(sched.clone()).await.expect("anchors while Built");
+    handle.supervisor().anchor(merge.clone()).await.expect("anchors while Built");
+    handle.supervisor().anchor(patrol.clone()).await.expect("anchors while Built");
+    handle.supervisor().anchor(quota.clone()).await.expect("anchors while Built");
+    handle.drain_events_from(sched_rx);
+    handle.drain_events_from(merge_rx);
+    handle.drain_events_from(patrol_rx);
+    handle.drain_events_from(quota_rx);
+
+    let (st, _sr) = mpsc::channel(16);
+    let (wt, _wr) = mpsc::channel(16);
+    let (dt, _dr) = mpsc::channel(16);
+    let (mt, _mr) = mpsc::channel(16);
+    let (rt, _rr) = mpsc::channel(16);
+    let roles = RoleStack::register(
+        handle.supervisor(),
+        RoleSinks { sheriff: st, witness: wt, deacon: dt, mayor: mt, refinery: rt },
+    )
+    .await
+    .expect("role stack registers while the supervisor is Built");
+
+    let registry = roles
+        .plugin_registry()
+        .register(
+            EventLogPlugin::for_workspace_in(&log_root, &ws_slug)
+                .expect("event log root is writable"),
+        )
+        .register(SchedulerPlugin::new(sched))
+        .register(MergePlugin::new(merge.clone()))
+        .register(SheriffPlugin::new());
+    handle.spawn_plugins(Arc::new(registry));
+    handle.start().await;
+
+    DaemonRoot { handle, merge, patrol, quota }
 }

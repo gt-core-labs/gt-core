@@ -31,17 +31,23 @@
 //! - `GT_POLECAT_TICK_SECS` — supervision + capacity timer interval (default 15).
 //! - `GT_RIG` / `GT_RIG_PATH` / `GT_POLECAT_CMD` / `GT_POLECAT_PREFIX` / `GT_HEARTBEAT_DIR` —
 //!   the rig's [`SpawnTemplate`] (see [`SpawnTemplate::from_env`]).
+//! - `GT_PATROL_TICK_SECS` (30) / `GT_LEASE_TIMEOUT_SECS` (300) — patrol lease-expiry ticker.
+//! - `GT_QUOTA_TICK_SECS` (60) / `GT_QUOTA_THRESHOLD_SECS` (300) — quota auto-rotation ticker.
+//! - `GT_CHANNEL_ROOT` (`/gt/.channels`) / `GT_MERGE_READY_CHANNEL` (`merge-ready`) — the
+//!   Refinery MERGE_READY gt-channel; absent/unopenable ⇒ the loop is disabled, the daemon boots.
 
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use gt_composition::live_root;
+use gt_channel::Channel;
 use gt_composition::polecat::{host_cap_from_metrics, PolecatSupervisorPlugin};
+use gt_composition::{daemon_root, DaemonRoot};
 use gt_eventlog::DEFAULT_EVENTLOG_ROOT;
 use gt_plugin::{spawn_plugin_relay, PluginRegistry};
-use gt_polecat::{PoolAllocator, PolecatSupervisor, RestartConfig, SpawnTemplate, Tmux, TmuxCli};
-use gt_runtime::RootRegistry;
+use gt_polecat::{
+    PoolAllocator, PolecatSupervisor, RestartConfig, RestartTracker, SpawnTemplate, Tmux, TmuxCli,
+};
 use gt_workspace::WorkspaceId;
 
 /// Edge-stamped unix seconds for the supervisor clock.
@@ -81,16 +87,13 @@ async fn main() -> anyhow::Result<()> {
         event_root.display()
     );
 
-    // One registry owns the per-workspace root for the process lifetime. `live_root`
-    // hydrates from the durable log, anchors the scheduler + merge actors to the
-    // supervisor, drains their events onto the hub, and registers the persistence sink
-    // + role observers + reactor arms. The daemon does not inspect the cascade, so the
-    // probe sink is parked.
-    let reg = RootRegistry::new();
-    let probe = Arc::new(Mutex::new(Vec::new()));
-    let handle = live_root(&reg, ws, Some(event_root), probe).await;
+    // Build the durable, hydrated daemon root: hydrate scheduler + merge from the log, anchor the
+    // scheduler/merge/patrol/quota actors, drain their events onto the hub, and register the
+    // persistence sink + role observers + scheduler/merge reactor arms + the sheriff observer. The
+    // returned handles drive the edge loops below (patrol/quota ticks + the Refinery channel).
+    let DaemonRoot { handle, merge, patrol, quota } = daemon_root(ws, event_root).await;
     eprintln!(
-        "[gt-orch-server] live_root up — scheduler + merge actors anchored, role observers + reactor arms running"
+        "[gt-orch-server] daemon root up — scheduler + merge + patrol + quota actors anchored; persistence + roles + reactor arms + sheriff observer running"
     );
     eprintln!(
         "[gt-orch-server] durable: hub records persisted to the per-workspace log; restart rehydrates pending queue + merge board"
@@ -148,15 +151,92 @@ async fn main() -> anyhow::Result<()> {
         }
     });
 
+    // --- Reactor loops (hq-orchd.4) ---
+    // Patrol lease-expiry ticker: a pure timer drives PatrolHandle::tick; an expired lease emits
+    // patrol.lease-expired.v1 onto the hub, where the scheduler reactor arm re-enqueues the bead.
+    let patrol_tick_secs = env_usize("GT_PATROL_TICK_SECS", 30) as u64;
+    let lease_timeout = env_usize("GT_LEASE_TIMEOUT_SECS", 300) as u64;
+    let patrol_timer = tokio::spawn(async move {
+        let mut tick = tokio::time::interval(Duration::from_secs(patrol_tick_secs));
+        tick.tick().await; // skip the immediate first fire (no leases yet)
+        loop {
+            tick.tick().await;
+            patrol.tick(now_secs(), lease_timeout).await;
+        }
+    });
+
+    // Quota predictive auto-rotation ticker: drives QuotaHandle::tick; an account whose projected
+    // consumption crosses the threshold within its window emits the rotation chain on the hub.
+    let quota_tick_secs = env_usize("GT_QUOTA_TICK_SECS", 60) as u64;
+    let quota_threshold = env_usize("GT_QUOTA_THRESHOLD_SECS", 300) as u64;
+    let quota_timer = tokio::spawn(async move {
+        let mut tick = tokio::time::interval(Duration::from_secs(quota_tick_secs));
+        tick.tick().await;
+        loop {
+            tick.tick().await;
+            quota.tick(now_secs(), quota_threshold).await;
+        }
+    });
+    eprintln!(
+        "[gt-orch-server] reactor loops on — patrol tick {patrol_tick_secs}s (lease timeout {lease_timeout}s), quota tick {quota_tick_secs}s (threshold {quota_threshold}s)"
+    );
+
+    // Refinery MERGE_READY live loop: await MERGE_READY messages on a gt-channel and submit each to
+    // the merge actor, under a restart+backoff supervisor (gt-core agents may instead submit via
+    // the MCP merge.submit path — both feed the same event-sourced board). Absent/unopenable
+    // channel ⇒ the loop is disabled and the daemon still boots.
+    let channel_root =
+        std::env::var("GT_CHANNEL_ROOT").unwrap_or_else(|_| "/gt/.channels".to_string());
+    let merge_ready_channel =
+        std::env::var("GT_MERGE_READY_CHANNEL").unwrap_or_else(|_| "merge-ready".to_string());
+    let refinery_task = match Channel::open(&channel_root, &merge_ready_channel) {
+        Ok(channel) => {
+            eprintln!(
+                "[gt-orch-server] refinery: MERGE_READY channel {}",
+                channel.dir().display()
+            );
+            Some(tokio::spawn(async move {
+                let mut tracker = RestartTracker::new(RestartConfig::default());
+                let make = || {
+                    let channel = channel.clone();
+                    let merge = merge.clone();
+                    async move {
+                        if let Err(e) = gt_merge::refinery::run(channel, merge).await {
+                            eprintln!("[gt-orch-server] refinery channel error: {e} — supervisor will restart");
+                        }
+                    }
+                };
+                gt_polecat::supervise_daemon("refinery", make, &mut tracker, u32::MAX, now_secs)
+                    .await;
+            }))
+        }
+        Err(e) => {
+            eprintln!(
+                "[gt-orch-server] refinery disabled — channel open failed at {channel_root}/{merge_ready_channel}: {e}"
+            );
+            None
+        }
+    };
+
     wait_for_signal().await;
 
     eprintln!("[gt-orch-server] signal received — draining actor stack");
-    // Stop the polecat timer + the sling observer first: no new polecats are slung or re-slung
+    // Stop the edge loops first: no new polecats slung/re-slung, no ticks, no MERGE_READY submits
     // during teardown. Live tmux polecats keep running — the daemon is going down, not the town.
     pol_timer.abort();
     pol_relay.abort();
+    patrol_timer.abort();
+    quota_timer.abort();
+    if let Some(task) = &refinery_task {
+        task.abort();
+    }
     let _ = pol_timer.await;
     let _ = pol_relay.await;
+    let _ = patrol_timer.await;
+    let _ = quota_timer.await;
+    if let Some(task) = refinery_task {
+        let _ = task.await;
+    }
     // Cancel the actor stack + stop the observer relay and the per-domain drains. The
     // durable log already holds every record appended up to this point.
     handle.shutdown().await;

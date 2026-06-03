@@ -10,7 +10,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use gt_composition::mcp::eventlog::EventLog;
-use gt_composition::{live_root, replay_merge_board, replay_scheduling_pending};
+use gt_composition::{daemon_root, live_root, replay_merge_board, replay_scheduling_pending};
 use gt_eventlog::{EventRecord, EventStore, JsonlWriter};
 use gt_merge::{MergeEvent, MergeSlotState};
 use gt_patrol::PatrolEvent;
@@ -194,4 +194,42 @@ async fn live_root_persists_hub_records_to_the_durable_log() {
     );
 
     h.shutdown().await;
+}
+
+/// `hq-orchd.4`: the daemon root wires the patrol actor into the hub. Registering a lease and
+/// ticking past its timeout emits `patrol.lease-expired.v1`, which the scheduler reactor arm turns
+/// into a re-enqueue — both events land durably in the workspace log, proving patrol → hub →
+/// scheduler round-trips through `daemon_root` (and that its actors are anchored + drained).
+#[tokio::test]
+async fn daemon_root_patrol_expiry_re_enqueues_through_the_hub() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let root = daemon_root(
+        WorkspaceId::new("acme").expect("valid slug"),
+        dir.path().to_path_buf(),
+    )
+    .await;
+
+    // Register a lease at t=1000, then tick at t=1600 with a 300s timeout → the lease has expired.
+    root.patrol.register("gg-7", "polecat-1", 1, 1000).await;
+    root.patrol.tick(1600, 300).await;
+
+    let log = JsonlWriter::for_workspace_in(dir.path(), "acme").expect("open log partition");
+    let mut kinds: Vec<String> = Vec::new();
+    for _ in 0..200 {
+        kinds = log.read_all().expect("read log").into_iter().map(|r| r.kind).collect();
+        if kinds.iter().any(|k| k == "scheduling.enqueue.v1") {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(
+        kinds.iter().any(|k| k == "patrol.lease-expired.v1"),
+        "lease expiry must be persisted; log saw {kinds:?}"
+    );
+    assert!(
+        kinds.iter().any(|k| k == "scheduling.enqueue.v1"),
+        "scheduler must re-enqueue the freed bead via the hub; log saw {kinds:?}"
+    );
+
+    root.handle.shutdown().await;
 }
