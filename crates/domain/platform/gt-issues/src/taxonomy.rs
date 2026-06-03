@@ -36,6 +36,11 @@ pub enum Domain {
     KernelChannel,
     #[serde(rename = "kernel.root")]
     KernelRoot,
+    /// The semantic graph index (gt-graphindex) — the kernel-tier indexer the
+    /// per-rig knowledge graph is built over (hq-graphrig); added by
+    /// hq-gap-domain-taxonomy-add-discriminators-kernel-graphindex-role-graphwarden.
+    #[serde(rename = "kernel.graphindex")]
+    KernelGraphindex,
     #[serde(rename = "lifecycle.agent")]
     LifecycleAgent,
     #[serde(rename = "lifecycle.polecat")]
@@ -80,6 +85,11 @@ pub enum Domain {
     RoleWitness,
     #[serde(rename = "role.mayor")]
     RoleMayor,
+    /// The per-rig graph warden (gt-graphwarden) — the role that owns rebuilding
+    /// and serving a rig's knowledge graph (hq-graphrig); added by
+    /// hq-gap-domain-taxonomy-add-discriminators-kernel-graphindex-role-graphwarden.
+    #[serde(rename = "role.graphwarden")]
+    RoleGraphwarden,
     #[serde(rename = "bin.gt")]
     BinGt,
     #[serde(rename = "bin.gt-web")]
@@ -139,5 +149,13 @@ mod tests {
         assert_eq!(login, Domain::OrchLogin);
         let terminal: Domain = serde_json::from_str("\"platform.terminal\"").unwrap();
         assert_eq!(terminal, Domain::PlatformTerminal);
+    }
+
+    #[test]
+    fn graph_variants_present() {
+        let index: Domain = serde_json::from_str("\"kernel.graphindex\"").unwrap();
+        assert_eq!(index, Domain::KernelGraphindex);
+        let warden: Domain = serde_json::from_str("\"role.graphwarden\"").unwrap();
+        assert_eq!(warden, Domain::RoleGraphwarden);
     }
 }
