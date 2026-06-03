@@ -22,9 +22,11 @@
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
+use tokio::sync::broadcast;
 
+use gt_agent::{AgentEvent, SessionRole};
 use gt_eventlog::EventRecord;
-use gt_events::AppError;
+use gt_events::{AppError, Envelope};
 use gt_merge::MergeEvent;
 use gt_polecat::{spawn_tmux, PoolAllocator, PolecatSupervisor, SpawnTemplate, Tmux};
 use gt_plugin::Plugin;
@@ -39,6 +41,9 @@ pub struct PolecatSupervisorPlugin {
     template: SpawnTemplate,
     supervisor: Arc<PolecatSupervisor>,
     allocator: Arc<Mutex<PoolAllocator>>,
+    /// Hub sender for the agent session lifecycle events (`hq-orchd.6`). `None` ⇒ no emission
+    /// (the `.3` tests construct the plugin without a hub).
+    events: Option<broadcast::Sender<EventRecord>>,
 }
 
 impl PolecatSupervisorPlugin {
@@ -53,7 +58,33 @@ impl PolecatSupervisorPlugin {
         supervisor: Arc<PolecatSupervisor>,
         allocator: Arc<Mutex<PoolAllocator>>,
     ) -> Self {
-        Self { workspace: workspace.into(), tmux, template, supervisor, allocator }
+        Self {
+            workspace: workspace.into(),
+            tmux,
+            template,
+            supervisor,
+            allocator,
+            events: None,
+        }
+    }
+
+    /// Emit the agent session lifecycle events (`agent.spawned.v1` on sling, `agent.session-end.v1`
+    /// when the bead merges) onto `events` (`hq-orchd.6`). These flow through the hub to the
+    /// session-minutes projector (and the durable log), so a slung polecat's runtime feeds the
+    /// `gt_workspace_session_minutes` cost counter. Without this, the plugin only supervises.
+    pub fn with_session_events(mut self, events: broadcast::Sender<EventRecord>) -> Self {
+        self.events = Some(events);
+        self
+    }
+
+    /// Publish an [`AgentEvent`] onto the hub if a sender is wired (best-effort: a closed hub or an
+    /// encode failure is swallowed — session metrics are observational, never load-bearing).
+    fn emit(&self, event: AgentEvent) {
+        if let Some(tx) = &self.events {
+            if let Ok(record) = EventRecord::from_envelope(&Envelope::root(event)) {
+                let _ = tx.send(record);
+            }
+        }
     }
 }
 
@@ -86,6 +117,15 @@ impl Plugin for PolecatSupervisorPlugin {
                     eprintln!("[polecat] sling failed for {bead}: {e}");
                     return Ok(());
                 }
+                // Open the agent session (hq-orchd.6): the slung polecat IS the session; its start
+                // timestamp anchors the session-minutes projection. Built before `watch` consumes
+                // the spec.
+                self.emit(AgentEvent::Spawned {
+                    session: spec.session.clone(),
+                    rig: spec.rig.clone(),
+                    role: SessionRole::default(),
+                    crew: spec.crew.clone(),
+                });
                 self.supervisor.watch(spec);
                 Ok(())
             }
@@ -96,6 +136,10 @@ impl Plugin for PolecatSupervisorPlugin {
                 };
                 self.supervisor.unwatch_member(&bead);
                 self.allocator.lock().expect("pool mutex").release(&self.workspace);
+                // Close the agent session for that bead (hq-orchd.6): the session id is the
+                // deterministic `spec_for` session, so it matches the `Spawned` emitted at sling.
+                let session = self.template.spec_for(&self.workspace, &bead).session;
+                self.emit(AgentEvent::SessionEnd { session });
                 Ok(())
             }
             _ => Ok(()),
@@ -211,5 +255,27 @@ mod tests {
     #[test]
     fn host_cap_is_at_least_one() {
         assert!(host_cap_from_metrics() >= 1);
+    }
+
+    #[tokio::test]
+    async fn sling_and_merge_emit_agent_session_lifecycle_events() {
+        // hq-orchd.6: with a hub wired, a dispatch opens the session (agent.spawned.v1) and the
+        // bead's merge closes it (agent.session-end.v1) — the two records the projector pairs.
+        let alloc = Arc::new(Mutex::new(PoolAllocator::new(10, 5)));
+        let (p, _sup) = plugin(alloc);
+        let (tx, mut rx) = broadcast::channel::<EventRecord>(16);
+        let p = p.with_session_events(tx);
+
+        p.on_event(&record(SchedEvent::Dispatched { bead: "gg-1".into(), worker: "w1".into() }))
+            .await
+            .unwrap();
+        let opened = rx.try_recv().expect("a session-open record was emitted");
+        assert_eq!(opened.kind, "agent.spawned.v1");
+
+        p.on_event(&record(MergeEvent::Merged { bead: "gg-1".into(), sha: "abc".into() }))
+            .await
+            .unwrap();
+        let closed = rx.try_recv().expect("a session-close record was emitted");
+        assert_eq!(closed.kind, "agent.session-end.v1");
     }
 }

@@ -31,6 +31,11 @@ static WS_REQUESTS_COUNTER: OnceLock<IntCounterVec> = OnceLock::new();
 /// Per-workspace consumed-token counter (hq-mt-deploy.8). Bumped by the quota
 /// handler on each `quota.sample`, labelled by `workspace`.
 static WS_QUOTA_CONSUMED_COUNTER: OnceLock<IntCounterVec> = OnceLock::new();
+/// Per-workspace agent-session-minutes counter (hq-mt-deploy.8, third counter,
+/// unblocked by hq-orchd.6). Bumped by the daemon's session-minutes projector when a
+/// session closes, with the wall-clock duration between the `agent.spawned.v1` and the
+/// `agent.session-end.v1` records (both carry the per-record `ts`); labelled by `workspace`.
+static WS_SESSION_MINUTES_COUNTER: OnceLock<IntCounterVec> = OnceLock::new();
 
 /// Borrow the process-wide registry (Prometheus' scrape target).
 pub fn registry() -> &'static Registry {
@@ -77,6 +82,15 @@ pub fn ensure_registered() {
         )
         .expect("register gt_workspace_quota_consumed")
     });
+    WS_SESSION_MINUTES_COUNTER.get_or_init(|| {
+        register_int_counter_vec_with_registry!(
+            "gt_workspace_session_minutes",
+            "Total agent-session minutes, labelled by workspace (per-tenant cost attribution)",
+            &["workspace"],
+            reg
+        )
+        .expect("register gt_workspace_session_minutes")
+    });
 }
 
 /// Increment `gt_events_total{kind=…}`. Used by [`crate::record_envelope`] and by the bus on
@@ -110,6 +124,16 @@ pub fn observe_workspace_request(workspace: &str) {
 pub fn observe_workspace_quota_consumed(workspace: &str, tokens: u64) {
     if let Some(c) = WS_QUOTA_CONSUMED_COUNTER.get() {
         c.with_label_values(&[workspace]).inc_by(tokens);
+    }
+}
+
+/// Add `minutes` to `gt_workspace_session_minutes{workspace=…}` (hq-mt-deploy.8, third
+/// counter — hq-orchd.6). Called by the daemon's session-minutes projector when a session
+/// closes, with the wall-clock duration (rounded to whole minutes) between its
+/// `agent.spawned.v1` and `agent.session-end.v1` records.
+pub fn observe_workspace_session_minutes(workspace: &str, minutes: u64) {
+    if let Some(c) = WS_SESSION_MINUTES_COUNTER.get() {
+        c.with_label_values(&[workspace]).inc_by(minutes);
     }
 }
 

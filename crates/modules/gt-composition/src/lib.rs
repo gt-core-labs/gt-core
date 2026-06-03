@@ -32,12 +32,16 @@ pub mod mcp;
 pub mod polecat;
 pub mod stream;
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
+use time::format_description::well_known::Rfc3339;
+use time::OffsetDateTime;
 use tokio::sync::mpsc;
 
+use gt_agent::AgentEvent;
 use gt_beads::InMemoryBeads;
 use gt_events::{AppError, Envelope};
 use gt_eventlog::{EventRecord, EventStore, JsonlWriter};
@@ -161,6 +165,78 @@ impl Plugin for EventLogPlugin {
 
     async fn on_event(&self, record: &EventRecord) -> Result<(), AppError> {
         self.writer.append(record)
+    }
+}
+
+/// Whole minutes between two RFC3339 record timestamps (`hq-orchd.6`). `None` if either fails to
+/// parse or `end` precedes `start` — a malformed or out-of-order pair is skipped, never negative.
+fn minutes_between(start_ts: &str, end_ts: &str) -> Option<u64> {
+    let start = OffsetDateTime::parse(start_ts, &Rfc3339).ok()?;
+    let end = OffsetDateTime::parse(end_ts, &Rfc3339).ok()?;
+    let secs = (end - start).whole_seconds();
+    (secs >= 0).then_some(secs as u64 / 60)
+}
+
+/// Observer that projects agent-session **durations** into the per-workspace
+/// `gt_workspace_session_minutes` metric (`hq-orchd.6`, the third `hq-mt-deploy.8` cost counter).
+///
+/// On `agent.spawned.v1` it stashes the session's start timestamp (the record `ts`); on
+/// `agent.session-end.v1` / `agent.killed.v1` it computes the wall-clock duration to the close
+/// record's `ts`, rounds down to whole minutes, and bumps the counter for `workspace`. The
+/// per-record `ts` is the source of truth, so **no `AgentEvent` change** is needed (and no
+/// replay-gate impact) — the absence of a session-close-with-duration *event* is exactly what
+/// blocked this counter; deriving it from the two record timestamps unblocks it without touching
+/// the event vocabulary. Sessions still open at restart lose their start (in-memory map), so only
+/// sessions that both open and close within one daemon run are counted — acceptable for a live
+/// operational metric (matches gastown's in-memory session tracking).
+pub struct SessionMinutesPlugin {
+    workspace: String,
+    /// session id → its `agent.spawned.v1` record `ts`, pending a close.
+    starts: Mutex<HashMap<String, String>>,
+}
+
+impl SessionMinutesPlugin {
+    /// Project session minutes for `workspace` (the daemon's single tenant).
+    pub fn new(workspace: impl Into<String>) -> Self {
+        Self { workspace: workspace.into(), starts: Mutex::new(HashMap::new()) }
+    }
+}
+
+#[async_trait]
+impl Plugin for SessionMinutesPlugin {
+    fn name(&self) -> &'static str {
+        "session-minutes"
+    }
+
+    async fn on_event(&self, record: &EventRecord) -> Result<(), AppError> {
+        match record.kind.as_str() {
+            "agent.spawned.v1" => {
+                if let AgentEvent::Spawned { session, .. } = record.decode::<AgentEvent>()? {
+                    self.starts
+                        .lock()
+                        .expect("starts mutex")
+                        .insert(session, record.ts.clone());
+                }
+            }
+            "agent.session-end.v1" | "agent.killed.v1" => {
+                let session = match record.decode::<AgentEvent>()? {
+                    AgentEvent::SessionEnd { session } => session,
+                    AgentEvent::Killed { session, .. } => session,
+                    _ => return Ok(()),
+                };
+                let start = self.starts.lock().expect("starts mutex").remove(&session);
+                if let Some(start_ts) = start {
+                    if let Some(minutes) = minutes_between(&start_ts, &record.ts) {
+                        gt_telemetry::metrics::observe_workspace_session_minutes(
+                            &self.workspace,
+                            minutes,
+                        );
+                    }
+                }
+            }
+            _ => {}
+        }
+        Ok(())
     }
 }
 
@@ -485,9 +561,87 @@ pub async fn daemon_root(ws: WorkspaceId, log_root: PathBuf) -> DaemonRoot {
         )
         .register(SchedulerPlugin::new(sched))
         .register(MergePlugin::new(merge.clone()))
-        .register(SheriffPlugin::new());
+        .register(SheriffPlugin::new())
+        .register(SessionMinutesPlugin::new(ws_slug.clone()));
     handle.spawn_plugins(Arc::new(registry));
     handle.start().await;
 
     DaemonRoot { handle, merge, patrol, quota }
+}
+
+#[cfg(test)]
+mod session_minutes_tests {
+    use super::*;
+    use gt_plugin::Plugin;
+
+    fn agent_record(kind: &str, event: AgentEvent, ts: &str) -> EventRecord {
+        EventRecord {
+            event_id: "e".into(),
+            correlation_id: "c".into(),
+            causation_id: None,
+            ts: ts.into(),
+            kind: kind.into(),
+            payload: serde_json::to_value(&event).expect("encode agent event"),
+        }
+    }
+
+    #[tokio::test]
+    async fn projector_bumps_the_session_minutes_counter() {
+        // End-to-end: a spawned→session-end pair 5 minutes apart drives the projector to add 5 to
+        // gt_workspace_session_minutes for its workspace, which then surfaces in the /metrics text.
+        gt_telemetry::metrics::ensure_registered();
+        let p = SessionMinutesPlugin::new("acme-smt"); // unique label → deterministic assertion
+        p.on_event(&agent_record(
+            "agent.spawned.v1",
+            AgentEvent::Spawned {
+                session: "s1".into(),
+                rig: "hq".into(),
+                role: Default::default(),
+                crew: None,
+            },
+            "2026-06-03T12:00:00Z",
+        ))
+        .await
+        .unwrap();
+        p.on_event(&agent_record(
+            "agent.session-end.v1",
+            AgentEvent::SessionEnd { session: "s1".into() },
+            "2026-06-03T12:05:00Z",
+        ))
+        .await
+        .unwrap();
+
+        let text = gt_telemetry::metrics::render_text().expect("render");
+        assert!(
+            text.contains("gt_workspace_session_minutes{workspace=\"acme-smt\"} 5"),
+            "expected the projector to add 5 minutes; /metrics text was:\n{text}"
+        );
+    }
+
+    #[test]
+    fn whole_minutes_between_rfc3339_timestamps() {
+        // 5 minutes (300s) → 5; 90s → 1 (floored); sub-minute → 0.
+        assert_eq!(
+            minutes_between("2026-06-03T12:00:00Z", "2026-06-03T12:05:00Z"),
+            Some(5)
+        );
+        assert_eq!(
+            minutes_between("2026-06-03T12:00:00Z", "2026-06-03T12:01:30Z"),
+            Some(1)
+        );
+        assert_eq!(
+            minutes_between("2026-06-03T12:00:00Z", "2026-06-03T12:00:45Z"),
+            Some(0)
+        );
+    }
+
+    #[test]
+    fn out_of_order_or_malformed_is_skipped() {
+        // end before start → None (never a negative duration).
+        assert_eq!(
+            minutes_between("2026-06-03T12:05:00Z", "2026-06-03T12:00:00Z"),
+            None
+        );
+        assert_eq!(minutes_between("not-a-ts", "2026-06-03T12:00:00Z"), None);
+    }
 }

@@ -35,6 +35,8 @@
 //! - `GT_QUOTA_TICK_SECS` (60) / `GT_QUOTA_THRESHOLD_SECS` (300) — quota auto-rotation ticker.
 //! - `GT_CHANNEL_ROOT` (`/gt/.channels`) / `GT_MERGE_READY_CHANNEL` (`merge-ready`) — the
 //!   Refinery MERGE_READY gt-channel; absent/unopenable ⇒ the loop is disabled, the daemon boots.
+//! - `GT_METRICS_BIND` (`127.0.0.1:9099`) — Prometheus `/metrics` scrape endpoint (exposes
+//!   `gt_workspace_session_minutes` + the golden counters from this daemon process).
 
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -72,6 +74,17 @@ async fn main() -> anyhow::Result<()> {
     // Register the process-global Prometheus counters before any actor can emit, so the
     // golden event/dead-letter metrics record from boot onward (mirrors gt-mcp-server).
     gt_telemetry::metrics::ensure_registered();
+
+    // Prometheus scrape endpoint (hq-orchd.6): expose THIS process's registry — including
+    // gt_workspace_session_minutes, bumped by the session-minutes projector — so the per-tenant
+    // cost dashboard scrapes the daemon (a separate process from gt-mcp-server's /metrics).
+    // Detached + best-effort: a bind failure logs but never aborts the orchestrator.
+    let metrics_bind = std::env::var("GT_METRICS_BIND").unwrap_or_else(|_| "127.0.0.1:9099".into());
+    tokio::spawn(async move {
+        if let Err(e) = serve_metrics(&metrics_bind).await {
+            eprintln!("[gt-orch-server] metrics http server stopped: {e}");
+        }
+    });
 
     // The daemon always persists — durability is its whole point — so an unset
     // GT_EVENTLOG_ROOT falls back to the production volume, never to the in-memory
@@ -115,13 +128,20 @@ async fn main() -> anyhow::Result<()> {
 
     // Observe the SAME hub the root drains actor output onto: a fresh broadcast receiver, so the
     // sling observer runs independently of the root's own plugin relay (durability/roles/reactor).
-    let pol_registry = Arc::new(PluginRegistry::new().register(PolecatSupervisorPlugin::new(
-        ws_slug.clone(),
-        tmux.clone(),
-        template,
-        supervisor.clone(),
-        allocator.clone(),
-    )));
+    let pol_registry = Arc::new(
+        PluginRegistry::new().register(
+            PolecatSupervisorPlugin::new(
+                ws_slug.clone(),
+                tmux.clone(),
+                template,
+                supervisor.clone(),
+                allocator.clone(),
+            )
+            // Emit agent.spawned/session-end onto the hub (hq-orchd.6) so the session-minutes
+            // projector (registered inside daemon_root) feeds gt_workspace_session_minutes.
+            .with_session_events(handle.events_sender()),
+        ),
+    );
     let pol_relay = spawn_plugin_relay(handle.subscribe_events(), pol_registry);
     eprintln!(
         "[gt-orch-server] polecat supervision on — pool_size={pool_size}, host_cap={} (cpu+ram), max_restarts={max_restarts}",
@@ -242,6 +262,30 @@ async fn main() -> anyhow::Result<()> {
     handle.shutdown().await;
     eprintln!("[gt-orch-server] shutdown complete");
     Ok(())
+}
+
+/// Serve the Prometheus text exposition of this process's registry on `GET /metrics`
+/// (`hq-orchd.6`). Bound to `GT_METRICS_BIND` (default `127.0.0.1:9099`).
+async fn serve_metrics(bind: &str) -> anyhow::Result<()> {
+    use axum::routing::get;
+    use axum::Router;
+    let app = Router::new().route("/metrics", get(metrics_text));
+    let listener = tokio::net::TcpListener::bind(bind).await?;
+    eprintln!(
+        "[gt-orch-server] metrics on http://{}/metrics",
+        listener.local_addr()?
+    );
+    axum::serve(listener, app).await?;
+    Ok(())
+}
+
+/// Render the process-global metric registry, or a 500 on encode failure (mirrors gt-mcp-server).
+async fn metrics_text() -> axum::response::Response {
+    use axum::response::IntoResponse;
+    match gt_telemetry::metrics::render_text() {
+        Ok(body) => (axum::http::StatusCode::OK, body).into_response(),
+        Err(e) => (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+    }
 }
 
 /// Wait for SIGTERM or SIGINT. If signal install fails (non-Unix), the future never
