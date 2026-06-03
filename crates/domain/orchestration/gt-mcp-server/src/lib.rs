@@ -25,6 +25,7 @@ pub mod pg_audit;
 pub mod prefixes;
 pub mod server;
 pub mod workspace;
+pub mod ws_status;
 
 pub use domain::{DomainCtx, DomainHandler, DomainRouter};
 pub use health::HealthState;
@@ -32,3 +33,4 @@ pub use pg_audit::PgAuditSink;
 pub use prefixes::{bead_prefix, WorkspaceRigPrefixes};
 pub use server::IssuesServer;
 pub use workspace::{workspace_from_ext, WorkspaceStores, WORKSPACE_HEADER};
+pub use ws_status::{GateStatus, WorkspaceStatusGate};

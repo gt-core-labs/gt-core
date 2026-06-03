@@ -29,6 +29,7 @@ use crate::dispatch::{dispatch, dispatch_meta, parse_issue_filter};
 use crate::domain::{DomainCtx, DomainRouter};
 use crate::prefixes::WorkspaceRigPrefixes;
 use crate::workspace::{workspace_from_ext, WorkspaceStores};
+use crate::ws_status::WorkspaceStatusGate;
 
 /// The shared MCP service. Cheap to clone (every field is `Arc`-backed) so the
 /// streamable-HTTP session manager hands each connection its own handle over the
@@ -75,6 +76,12 @@ pub struct IssuesServer {
     /// prefix is rejected. `None` keeps the legacy accept-all create behaviour, so
     /// single-tenant / no-Postgres builds are unaffected.
     rig_prefixes: Option<Arc<dyn WorkspaceRigPrefixes>>,
+    /// Per-workspace lifecycle gate for the suspend/archive enforcement
+    /// (hq-mt-bootstrap.8). `Some` when the composition root wires the workspace
+    /// catalog: a *mutating* tool call whose resolved tenant is suspended/archived
+    /// is rejected (reads + `workspace.resume` still pass). `None` keeps the legacy
+    /// accept-all behaviour, so single-tenant / no-Postgres builds are unaffected.
+    workspace_status: Option<Arc<dyn WorkspaceStatusGate>>,
 }
 
 impl IssuesServer {
@@ -102,6 +109,7 @@ impl IssuesServer {
             domains: Arc::new(DomainRouter::new()),
             authenticator: None,
             rig_prefixes: None,
+            workspace_status: None,
         }
     }
 
@@ -139,6 +147,15 @@ impl IssuesServer {
     /// the server accepts any prefix, exactly as before.
     pub fn with_rig_prefixes(mut self, rig_prefixes: Arc<dyn WorkspaceRigPrefixes>) -> Self {
         self.rig_prefixes = Some(rig_prefixes);
+        self
+    }
+
+    /// Wire the workspace lifecycle gate (hq-mt-bootstrap.8). With it, a *mutating*
+    /// tool call whose resolved tenant is suspended/archived is rejected — reads and
+    /// `workspace.resume` still pass. Additive — without it the server accepts
+    /// mutations regardless of workspace status, exactly as before.
+    pub fn with_workspace_status(mut self, gate: Arc<dyn WorkspaceStatusGate>) -> Self {
+        self.workspace_status = Some(gate);
         self
     }
 
@@ -225,6 +242,57 @@ impl IssuesServer {
             return Err(McpError::invalid_request(e.to_string(), None));
         }
         Ok((scope, workspace))
+    }
+
+    /// Reject a *mutating* tool call against a suspended / archived workspace
+    /// (hq-mt-bootstrap.8) — the enforcement half of the suspend/archive
+    /// transitions. Runs after [`authorize`](Self::authorize) (so the tenant is
+    /// resolved + authenticated) and before any store I/O.
+    ///
+    /// A no-op when no [`WorkspaceStatusGate`] is wired, when the call resolved no
+    /// workspace (the default tenant), when the tool is [non-mutating](is_mutation),
+    /// or when the status is [`Active`](crate::GateStatus) / unknown. Only a known
+    /// suspended/archived status blocks, and only for a mutation; `workspace.resume`
+    /// is the recovery exception (classified as a read by [`is_mutation`]) so a
+    /// suspended tenant can be brought back. A block is recorded as an
+    /// `Unauthorized` audit row and surfaces as an `invalid_request`.
+    async fn enforce_workspace_active(
+        &self,
+        tool: &str,
+        args: &serde_json::Value,
+        scope: &Scope,
+        workspace: Option<&str>,
+    ) -> Result<(), McpError> {
+        let (Some(gate), Some(ws)) = (&self.workspace_status, workspace) else {
+            return Ok(());
+        };
+        if !is_mutation(tool) {
+            return Ok(());
+        }
+        // A lookup failure is the backend's fault, not the caller's: surface it as
+        // an internal error rather than silently letting a mutation through.
+        let status = gate
+            .status(ws)
+            .await
+            .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+        match status {
+            Some(s) if !s.allows_mutation() => {
+                let _ = self.audit.record(
+                    AuditRecord::unauthorized(&scope.actor, tool, args.clone()).in_workspace(ws),
+                );
+                Err(McpError::invalid_request(
+                    format!(
+                        "workspace `{ws}` is {} — mutating tool `{tool}` is rejected; \
+                         reads still work, and `workspace.resume` restores it",
+                        s.label()
+                    ),
+                    None,
+                ))
+            }
+            // Active, or unknown (not in the catalog — the legacy/default tenant or a
+            // not-yet-provisioned id, neither of which this gate governs).
+            _ => Ok(()),
+        }
     }
 
     /// Verify the request's bearer token and run the cross-workspace leak gate,
@@ -339,6 +407,12 @@ impl ServerHandler for IssuesServer {
         // workspace leak; the authoritative workspace (the claim's tenant, or the
         // X-Workspace header in legacy mode) flows out for store + domain dispatch.
         let (scope, workspace) = self.authorize(&tool, &args, &context.extensions)?;
+
+        // Suspend/archive enforcement (hq-mt-bootstrap.8): a mutating call against a
+        // suspended/archived tenant is rejected here, after the tenant is resolved
+        // and before any store I/O. Reads + `workspace.resume` pass through.
+        self.enforce_workspace_active(&tool, &args, &scope, workspace.as_deref())
+            .await?;
 
         // Per-request workspace (hq-mt-routing.5): the resolved slug selects the
         // tenant's store; absent it, the default-workspace store. Resolved after
@@ -568,6 +642,40 @@ fn now_secs() -> u64 {
 /// column default so the trail never carries a NULL tenant.
 fn workspace_or_default(workspace: &Option<String>) -> &str {
     workspace.as_deref().unwrap_or("default")
+}
+
+/// Whether a tool call mutates tenant state, for the suspend/archive gate
+/// (hq-mt-bootstrap.8). The classification is by the tool's *verb* (its last
+/// dot-segment), so it holds across the two name shapes the server dispatches:
+/// `issues.<action>.<verb>` (e.g. `issues.create.execute`) and the domain
+/// `<namespace>.<verb>` (e.g. `workspace.list`).
+///
+/// A call is a **read** (never blocked) when:
+/// - its verb is `validate` — a dry-run that by construction changes nothing;
+/// - its verb is a known read (`list`/`info`/`get`/`status`/`query`/`explain`/
+///   `owner`/`prefix`/`read`);
+/// - it is `meta.help.execute` — a pure descriptor read despite the `execute` verb;
+/// - it is `workspace.resume` — the recovery exception: a suspended tenant must be
+///   able to come back, so its resume is allowed even though it mutates.
+///
+/// Everything else (every `.execute`, `meta.report-gap`, `workspace.create/suspend/
+/// archive`, `rig.add`, …) is treated as a **mutation**. Defaulting unknown verbs to
+/// "mutation" is the safe bias: a new write tool is gated until proven a read,
+/// rather than silently slipping past a suspended workspace.
+fn is_mutation(tool: &str) -> bool {
+    // Recovery + pure-read exceptions that the verb rule alone would misclassify.
+    if tool == "workspace.resume" {
+        return false;
+    }
+    if tool == "meta.help.execute" {
+        return false;
+    }
+    let verb = tool.rsplit('.').next().unwrap_or(tool);
+    !matches!(
+        verb,
+        "validate" | "list" | "info" | "get" | "status" | "query" | "explain" | "owner"
+            | "prefix" | "read"
+    )
 }
 
 #[cfg(test)]
@@ -886,5 +994,142 @@ validate_only = true
         let rows = audit.read_all().unwrap();
         assert_eq!(rows[0].workspace_id, "globex", "header tenant attributed");
         assert_eq!(rows[1].workspace_id, "default", "no header falls back to default");
+    }
+
+    // ----- hq-mt-bootstrap.8: the suspend/archive enforcement gate -------------
+
+    use super::is_mutation;
+    use crate::ws_status::{GateStatus, WorkspaceStatusGate};
+    use async_trait::async_trait;
+
+    /// A read is never a mutation; the verb (last dot-segment) drives it across both
+    /// name shapes, with `meta.help.execute` + `workspace.resume` as the exceptions.
+    #[test]
+    fn classifies_reads_writes_and_exceptions() {
+        // Writes: every .execute, and the domain mutators.
+        for w in [
+            "issues.create.execute",
+            "issues.close.execute",
+            "issues.claim.execute",
+            "issues.phase.advance",
+            "meta.report-gap.execute",
+            "workspace.create",
+            "workspace.suspend",
+            "workspace.archive",
+            "rig.add",
+        ] {
+            assert!(is_mutation(w), "{w} should be a mutation");
+        }
+        // Reads: .validate dry-runs + the read verbs across namespaces.
+        for r in [
+            "issues.create.validate",
+            "issues.close.validate",
+            "workspace.list",
+            "workspace.info",
+            "rig.owner",
+            "rig.prefix",
+            "graph.query",
+            "graph.explain",
+            "graph.status",
+        ] {
+            assert!(!is_mutation(r), "{r} should be a read");
+        }
+        // The two exceptions the verb rule alone would misclassify.
+        assert!(!is_mutation("meta.help.execute"), "help is a pure read");
+        assert!(!is_mutation("workspace.resume"), "resume is the recovery exception");
+    }
+
+    /// Stub gate: maps a fixed set of slugs to a status; anything else is unknown.
+    struct StubStatus;
+    #[async_trait]
+    impl WorkspaceStatusGate for StubStatus {
+        async fn status(&self, ws: &str) -> Result<Option<GateStatus>, gt_store_dolt::AppError> {
+            Ok(match ws {
+                "live" => Some(GateStatus::Active),
+                "paused" => Some(GateStatus::Suspended),
+                "dead" => Some(GateStatus::Archived),
+                _ => None,
+            })
+        }
+    }
+
+    /// Build a server with the stub workspace-status gate wired (admin boot scope so
+    /// the gate, not RBAC, is the only thing that can deny).
+    fn gated_server(audit: Arc<InMemoryAudit>) -> IssuesServer {
+        server(Scope::admin("boot"), None, audit).with_workspace_status(Arc::new(StubStatus))
+    }
+
+    /// A mutation against a suspended workspace is rejected + audited; against an
+    /// archived one too. The audit row is attributed to the resolved tenant.
+    #[tokio::test]
+    async fn mutation_on_suspended_or_archived_is_blocked() {
+        let audit = Arc::new(InMemoryAudit::new());
+        let srv = gated_server(audit.clone());
+
+        let err = srv
+            .enforce_workspace_active("issues.create.execute", &json!({}), &Scope::admin("boot"), Some("paused"))
+            .await
+            .expect_err("a suspended tenant rejects mutations");
+        assert_eq!(err.code, ErrorCode::INVALID_REQUEST);
+
+        srv.enforce_workspace_active("workspace.create", &json!({}), &Scope::admin("boot"), Some("dead"))
+            .await
+            .expect_err("an archived tenant rejects mutations");
+
+        let rows = audit.read_all().unwrap();
+        assert_eq!(rows.len(), 2, "each block is one Unauthorized row");
+        assert!(rows.iter().all(|r| r.outcome == Outcome::Unauthorized));
+        assert_eq!(rows[0].workspace_id, "paused", "attributed to the resolved tenant");
+        assert_eq!(rows[1].workspace_id, "dead");
+    }
+
+    /// Reads + `workspace.resume` pass even on a suspended workspace; nothing audited.
+    #[tokio::test]
+    async fn reads_and_resume_pass_on_suspended() {
+        let audit = Arc::new(InMemoryAudit::new());
+        let srv = gated_server(audit.clone());
+        let boot = Scope::admin("boot");
+
+        for tool in ["issues.create.validate", "workspace.list", "workspace.info", "workspace.resume"] {
+            srv.enforce_workspace_active(tool, &json!({}), &boot, Some("paused"))
+                .await
+                .unwrap_or_else(|_| panic!("{tool} must pass on a suspended workspace"));
+        }
+        assert!(audit.read_all().unwrap().is_empty(), "a pass audits nothing");
+    }
+
+    /// A mutation on an active workspace passes; an unknown slug passes (the gate only
+    /// governs known suspended/archived tenants).
+    #[tokio::test]
+    async fn mutation_on_active_or_unknown_passes() {
+        let audit = Arc::new(InMemoryAudit::new());
+        let srv = gated_server(audit.clone());
+        let boot = Scope::admin("boot");
+
+        srv.enforce_workspace_active("issues.create.execute", &json!({}), &boot, Some("live"))
+            .await
+            .expect("an active tenant permits mutations");
+        srv.enforce_workspace_active("issues.create.execute", &json!({}), &boot, Some("ghost"))
+            .await
+            .expect("an unknown tenant is not governed by the gate");
+        assert!(audit.read_all().unwrap().is_empty());
+    }
+
+    /// No gate wired, or no resolved workspace ⇒ a no-op (legacy accept-all).
+    #[tokio::test]
+    async fn no_gate_or_no_workspace_is_noop() {
+        let audit = Arc::new(InMemoryAudit::new());
+        // No gate: even a mutation with a workspace passes.
+        let ungated = server(Scope::admin("boot"), None, audit.clone());
+        ungated
+            .enforce_workspace_active("issues.create.execute", &json!({}), &Scope::admin("boot"), Some("paused"))
+            .await
+            .expect("no gate wired ⇒ accept-all");
+        // Gate wired but no resolved workspace (default tenant) ⇒ pass.
+        let srv = gated_server(audit.clone());
+        srv.enforce_workspace_active("issues.create.execute", &json!({}), &Scope::admin("boot"), None)
+            .await
+            .expect("no resolved workspace ⇒ the default tenant, ungoverned");
+        assert!(audit.read_all().unwrap().is_empty());
     }
 }

@@ -7,11 +7,15 @@
 //! persist → log) so the catalog is mutated only through replayable events;
 //! `list` / `info` are pure reads straight off the repository.
 
+use std::collections::HashMap;
+use std::time::{Duration, Instant};
+
 use async_trait::async_trait;
 use serde_json::{json, Value};
 use sqlx::PgPool;
+use tokio::sync::RwLock;
 
-use gt_mcp_server::{DomainCtx, DomainHandler};
+use gt_mcp_server::{DomainCtx, DomainHandler, GateStatus, WorkspaceStatusGate};
 use gt_store_dolt::AppError;
 use gt_workspace::{
     ActorError, PgWorkspaces, WorkspaceActor, WorkspaceCommand, WorkspaceEntry, WorkspaceError,
@@ -168,6 +172,72 @@ fn actor_err(e: ActorError) -> AppError {
 /// not a caller fault).
 fn repo_err(e: gt_workspace::RepoError) -> AppError {
     AppError::Other(e.to_string())
+}
+
+/// Map a `gt-workspace` lifecycle status onto the orchestration-tier
+/// [`GateStatus`] the server speaks (it owns no platform-domain type).
+fn gate_status(status: WorkspaceStatus) -> GateStatus {
+    match status {
+        WorkspaceStatus::Active => GateStatus::Active,
+        WorkspaceStatus::Suspended => GateStatus::Suspended,
+        WorkspaceStatus::Archived => GateStatus::Archived,
+    }
+}
+
+/// How long a looked-up status is trusted before it is re-read from Postgres. Keeps
+/// the suspend/archive gate off the per-call hot path (one PG read per tenant per
+/// window, not per request) at the cost of a bounded lag: a just-suspended tenant
+/// may still mutate for up to this long. A few seconds is the right trade — fast
+/// enough that "suspend" feels immediate, slow enough that a burst of calls is one
+/// read.
+const STATUS_TTL: Duration = Duration::from_secs(5);
+
+/// PG-backed [`WorkspaceStatusGate`] for the suspend/archive enforcement
+/// (hq-mt-bootstrap.8). Reads the workspace catalog status from the shared `public`
+/// pool — the same catalog [`WorkspaceHandler`] mutates — behind a small TTL cache
+/// so a mutating call does not pay a Postgres round trip every time.
+pub struct PgWorkspaceStatus {
+    pool: PgPool,
+    /// Per-slug cached status + when it was read. `None` caches a known-absent slug
+    /// too, so a flood of calls for an unknown tenant is one read, not many.
+    cache: RwLock<HashMap<String, (Option<GateStatus>, Instant)>>,
+}
+
+impl PgWorkspaceStatus {
+    /// Wrap the shared catalog pool (the `public`-schema `workspaces` table).
+    pub fn new(pool: PgPool) -> Self {
+        Self { pool, cache: RwLock::new(HashMap::new()) }
+    }
+
+    /// Read a fresh (within [`STATUS_TTL`]) cached entry for `ws`, if any.
+    async fn cached(&self, ws: &str) -> Option<Option<GateStatus>> {
+        let cache = self.cache.read().await;
+        cache
+            .get(ws)
+            .filter(|(_, at)| at.elapsed() < STATUS_TTL)
+            .map(|(s, _)| *s)
+    }
+}
+
+#[async_trait]
+impl WorkspaceStatusGate for PgWorkspaceStatus {
+    async fn status(&self, ws: &str) -> Result<Option<GateStatus>, AppError> {
+        if let Some(hit) = self.cached(ws).await {
+            return Ok(hit);
+        }
+        // A malformed slug is not this gate's to reject — it passes here (as unknown)
+        // and the server's `resolve_store` surfaces the real validation error.
+        let Ok(id) = WorkspaceId::new(ws) else {
+            return Ok(None);
+        };
+        let status = PgWorkspaces::new(self.pool.clone())
+            .load(&id)
+            .await
+            .map_err(repo_err)?
+            .map(|entry| gate_status(entry.status));
+        self.cache.write().await.insert(ws.to_string(), (status, Instant::now()));
+        Ok(status)
+    }
 }
 
 #[cfg(test)]
@@ -410,5 +480,67 @@ mod tests {
             let serde = serde_json::to_value(s).unwrap();
             assert_eq!(serde, json!(status_str(s)));
         }
+    }
+
+    #[test]
+    fn gate_status_maps_every_variant() {
+        assert_eq!(gate_status(WorkspaceStatus::Active), GateStatus::Active);
+        assert_eq!(gate_status(WorkspaceStatus::Suspended), GateStatus::Suspended);
+        assert_eq!(gate_status(WorkspaceStatus::Archived), GateStatus::Archived);
+    }
+
+    /// An unknown slug is `None` (passes the gate); a malformed slug is also `None`,
+    /// offline — no Postgres needed, since both return before any I/O via the cache
+    /// miss + a lazy pool that is never hit for the malformed case.
+    #[tokio::test]
+    async fn status_unknown_and_malformed_are_none() {
+        let pool = PgPool::connect_lazy("postgres://gt@127.0.0.1:1/none").unwrap();
+        let gate = PgWorkspaceStatus::new(pool);
+        // Malformed slug rejected by WorkspaceId::new ⇒ None, no I/O attempted.
+        assert_eq!(gate.status("Not A Slug!").await.unwrap(), None);
+    }
+
+    /// PG-backed: the gate reflects the catalog status — Active right after create,
+    /// then Suspended once the actor transitions it (read by a fresh gate so the TTL
+    /// cache does not mask the change).
+    #[tokio::test]
+    async fn pg_status_gate_reflects_lifecycle() {
+        let Some(pool) = pool_or_skip().await else {
+            eprintln!("GT_PG_URL unset; skipping PgWorkspaceStatus contract test");
+            return;
+        };
+        let sql = &gt_store_pg::workspace_migrations()[0].sql;
+        sqlx::raw_sql(sql).execute(&pool).await.expect("apply workspaces migration");
+        sqlx::query("DELETE FROM workspaces WHERE id = $1")
+            .bind("gate-test")
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let handler = WorkspaceHandler::new(pool.clone());
+        let ctx = |args| DomainCtx { workspace: None, actor: "tester", args };
+        handler
+            .dispatch("workspace.create", ctx(json!({ "id": "gate-test", "name": "G" })))
+            .await
+            .unwrap();
+
+        // Active right after create; an unknown slug is None.
+        let gate = PgWorkspaceStatus::new(pool.clone());
+        assert_eq!(gate.status("gate-test").await.unwrap(), Some(GateStatus::Active));
+        assert_eq!(gate.status("no-such-ws").await.unwrap(), None);
+
+        // Suspend it, then read with a *fresh* gate (the first gate cached Active).
+        handler.dispatch("workspace.suspend", ctx(json!({ "id": "gate-test" }))).await.unwrap();
+        let fresh = PgWorkspaceStatus::new(pool.clone());
+        assert_eq!(fresh.status("gate-test").await.unwrap(), Some(GateStatus::Suspended));
+        // The stale gate still serves its cached Active within the TTL — the
+        // documented bounded lag, proving the cache is in force.
+        assert_eq!(gate.status("gate-test").await.unwrap(), Some(GateStatus::Active));
+
+        sqlx::query("DELETE FROM workspaces WHERE id = $1")
+            .bind("gate-test")
+            .execute(&pool)
+            .await
+            .unwrap();
     }
 }
