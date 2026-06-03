@@ -7,3 +7,8 @@ Cargo.lock
 .vscode/
 node_modules/
 .envrc.local
+.claude/
+.graphify-venv/
+graphify-out/
+.graphify_*
+CLAUDE.md
