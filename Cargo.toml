@@ -28,6 +28,7 @@ members = [
     "crates/domain/roles/gt-deacon",
     "crates/domain/roles/gt-refinery",
     "crates/domain/roles/gt-witness",
+    "crates/domain/roles/gt-graphwarden",
     "crates/domain/roles/gt-mayor",
     "crates/domain/roles/gt-roles",
     "crates/domain/orchestration/gt-quota",
@@ -140,6 +141,7 @@ gt-sheriff       = { path = "crates/domain/roles/gt-sheriff" }
 gt-deacon        = { path = "crates/domain/roles/gt-deacon" }
 gt-refinery      = { path = "crates/domain/roles/gt-refinery" }
 gt-witness       = { path = "crates/domain/roles/gt-witness" }
+gt-graphwarden   = { path = "crates/domain/roles/gt-graphwarden" }
 gt-mayor         = { path = "crates/domain/roles/gt-mayor" }
 gt-roles         = { path = "crates/domain/roles/gt-roles" }
 gt-quota         = { path = "crates/domain/orchestration/gt-quota" }
