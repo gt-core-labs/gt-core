@@ -24,6 +24,7 @@ use rmcp::model::{
 };
 use rmcp::service::{RequestContext, RoleServer};
 use rmcp::{ErrorData as McpError, ServerHandler};
+use tracing::Instrument;
 
 use crate::dispatch::{dispatch, dispatch_meta, parse_issue_filter};
 use crate::domain::{DomainCtx, DomainRouter};
@@ -423,37 +424,50 @@ impl ServerHandler for IssuesServer {
             Err(e) => return Err(Self::to_mcp_error(&e)),
         };
 
+        // Per-call request-root span (hq-mt-ops.2): the authoritative tenant is
+        // recorded as the `workspace.id` attribute so every exported Tempo trace
+        // is searchable per tenant. Every span opened deeper in the dispatch path
+        // (domain handlers, `record_envelope`) hangs under this root, so the whole
+        // trace tree carries the tenant.
+        let span = call_span(&tool, workspace.as_deref());
+
         // Route by namespace (the segment before the first dot): meta.* self-
         // description, issues.* the tracker dispatch, everything else the domain
         // router (hq-mcp-dispatch). An unowned namespace is an unknown tool.
-        let result = match tool.split('.').next().unwrap_or("") {
-            "meta" => dispatch_meta(&store, &tool, args.clone(), &scope.actor, &self.tools).await,
-            "issues" => {
-                let repo_dir = self.repo_dir.as_deref().map(|p| p.as_path());
-                dispatch(
-                    &store,
-                    &tool,
-                    args.clone(),
-                    &scope.actor,
-                    repo_dir,
-                    workspace.as_deref(),
-                    self.rig_prefixes.as_deref(),
-                )
-                .await
-            }
-            _ => {
-                let ctx = DomainCtx {
-                    workspace: workspace.as_deref(),
-                    actor: &scope.actor,
-                    args: args.clone(),
-                };
-                match self.domains.dispatch(&tool, ctx).await {
-                    Ok(Some(value)) => Ok(value),
-                    Ok(None) => Err(AppError::NotFound(format!("unknown tool `{tool}`"))),
-                    Err(e) => Err(e),
+        let result = async {
+            match tool.split('.').next().unwrap_or("") {
+                "meta" => {
+                    dispatch_meta(&store, &tool, args.clone(), &scope.actor, &self.tools).await
+                }
+                "issues" => {
+                    let repo_dir = self.repo_dir.as_deref().map(|p| p.as_path());
+                    dispatch(
+                        &store,
+                        &tool,
+                        args.clone(),
+                        &scope.actor,
+                        repo_dir,
+                        workspace.as_deref(),
+                        self.rig_prefixes.as_deref(),
+                    )
+                    .await
+                }
+                _ => {
+                    let ctx = DomainCtx {
+                        workspace: workspace.as_deref(),
+                        actor: &scope.actor,
+                        args: args.clone(),
+                    };
+                    match self.domains.dispatch(&tool, ctx).await {
+                        Ok(Some(value)) => Ok(value),
+                        Ok(None) => Err(AppError::NotFound(format!("unknown tool `{tool}`"))),
+                        Err(e) => Err(e),
+                    }
                 }
             }
-        };
+        }
+        .instrument(span)
+        .await;
         // Attribute the invocation to the authoritative tenant (the JWT claim's
         // workspace, hq-mcp-dispatch.9) so the audit trail is per-tenant filterable
         // (hq-mt-auth.7 SOC2 dump). Absent a resolved workspace (legacy header mode
@@ -644,6 +658,23 @@ fn workspace_or_default(workspace: &Option<String>) -> &str {
     workspace.as_deref().unwrap_or("default")
 }
 
+/// Build the per-call request-root span (hq-mt-ops.2). It always carries the
+/// `tool` and declares a `workspace.id` field, which is recorded only when a
+/// tenant resolved — so a legacy header-mode call (no `X-Workspace`) leaves it
+/// empty rather than guessing `default`, while a tenant-scoped call makes the
+/// whole exported trace searchable by `workspace.id` in Tempo.
+fn call_span(tool: &str, workspace: Option<&str>) -> tracing::Span {
+    let span = tracing::info_span!(
+        "mcp.call_tool",
+        tool = %tool,
+        workspace.id = tracing::field::Empty,
+    );
+    if let Some(ws) = workspace {
+        span.record("workspace.id", ws);
+    }
+    span
+}
+
 /// Whether a tool call mutates tenant state, for the suspend/archive gate
 /// (hq-mt-bootstrap.8). The classification is by the tool's *verb* (its last
 /// dot-segment), so it holds across the two name shapes the server dispatches:
@@ -680,7 +711,7 @@ fn is_mutation(tool: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{actor_from_ext, IssuesServer};
+    use super::{actor_from_ext, call_span, IssuesServer};
     use gt_audit::{AuditSink, InMemoryAudit, Outcome};
     use gt_auth::{InMemoryAuthenticator, JwtClaims};
     use gt_rbac::{RbacConfig, Scope, WORKSPACE_ADMIN, WORKSPACE_MEMBER};
@@ -1131,5 +1162,73 @@ validate_only = true
             .await
             .expect("no resolved workspace ⇒ the default tenant, ungoverned");
         assert!(audit.read_all().unwrap().is_empty());
+    }
+
+    // --- hq-mt-ops.2: the per-call span carries `workspace.id` for Tempo ---
+
+    use std::sync::Mutex;
+    use tracing::field::{Field, Visit};
+    use tracing::span;
+    use tracing_subscriber::layer::{Context, SubscriberExt};
+    use tracing_subscriber::Layer;
+
+    /// A test [`Layer`] that records every `(field, value)` set on any span,
+    /// capturing both the values bound at creation and those filled in later via
+    /// [`tracing::Span::record`] (the path `call_span` uses for `workspace.id`).
+    #[derive(Clone, Default)]
+    struct Captured(Arc<Mutex<Vec<(String, String)>>>);
+
+    struct FieldVisitor<'a>(&'a Captured);
+    impl Visit for FieldVisitor<'_> {
+        fn record_str(&mut self, field: &Field, value: &str) {
+            self.0 .0.lock().unwrap().push((field.name().into(), value.into()));
+        }
+        fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
+            self.0 .0.lock().unwrap().push((field.name().into(), format!("{value:?}")));
+        }
+    }
+
+    impl<S: tracing::Subscriber> Layer<S> for Captured {
+        fn on_new_span(&self, attrs: &span::Attributes<'_>, _id: &span::Id, _ctx: Context<'_, S>) {
+            attrs.record(&mut FieldVisitor(self));
+        }
+        fn on_record(&self, _id: &span::Id, values: &span::Record<'_>, _ctx: Context<'_, S>) {
+            values.record(&mut FieldVisitor(self));
+        }
+    }
+
+    /// Capture the fields recorded while building (and entering) a `call_span`.
+    fn fields_for(tool: &str, workspace: Option<&str>) -> Vec<(String, String)> {
+        let cap = Captured::default();
+        let subscriber = tracing_subscriber::registry().with(cap.clone());
+        tracing::subscriber::with_default(subscriber, || {
+            let span = call_span(tool, workspace);
+            let _enter = span.enter();
+        });
+        let out = cap.0.lock().unwrap().clone();
+        out
+    }
+
+    #[test]
+    fn call_span_records_resolved_workspace_id() {
+        let fields = fields_for("workspace.list", Some("acme"));
+        assert!(
+            fields.iter().any(|(k, v)| k == "workspace.id" && v == "acme"),
+            "span must carry workspace.id=acme, got {fields:?}"
+        );
+        assert!(
+            fields.iter().any(|(k, v)| k == "tool" && v.contains("workspace.list")),
+            "span must carry the tool name, got {fields:?}"
+        );
+    }
+
+    #[test]
+    fn call_span_leaves_workspace_id_empty_in_legacy_mode() {
+        let fields = fields_for("issues.list.execute", None);
+        // No tenant resolved ⇒ workspace.id is never recorded with a value.
+        assert!(
+            !fields.iter().any(|(k, v)| k == "workspace.id" && !v.is_empty()),
+            "workspace.id must stay empty without a resolved tenant, got {fields:?}"
+        );
     }
 }

@@ -25,6 +25,9 @@ gt-audit = { workspace = true }
 gt-auth = { workspace = true }
 # Domain dispatch handlers (hq-mcp-dispatch.1) implement an async trait.
 async-trait = { workspace = true }
+# Per-call tracing span (hq-mt-ops.2): the request-root span carries
+# `workspace.id` so Tempo traces are searchable per tenant.
+tracing = { workspace = true }
 rmcp = { workspace = true, features = ["server", "transport-streamable-http-server"] }
 axum = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "net", "signal"] }
@@ -34,3 +37,7 @@ anyhow = { workspace = true }
 # Durable Postgres audit sink (hq-core-host.6) — runtime query API (no compile-
 # time macros), stores args as text so no sqlx `json` feature is needed.
 sqlx = { workspace = true }
+
+[dev-dependencies]
+# Capturing subscriber for the `call_span` workspace.id assertion (hq-mt-ops.2).
+tracing-subscriber = { workspace = true }
