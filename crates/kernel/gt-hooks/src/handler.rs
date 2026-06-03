@@ -32,21 +32,43 @@ pub enum HookOutcome {
 
 /// Context handed to a handler when a hook point fires.
 ///
-/// `.1` carries only the firing [`HookPoint`]; richer payload (the command name,
-/// envelope, actor scope) is added by `hq-mod-hooks.2`/`.3` as the builtin points
-/// and dispatcher land. `#[non_exhaustive]` keeps that growth additive.
+/// `point` is the firing [`HookPoint`]; `command` carries the name of the command
+/// in flight at the [`BeforeCommand`](HookPoint::BeforeCommand) /
+/// [`AfterCommand`](HookPoint::AfterCommand) points so a handler can discriminate
+/// *which* command fired (e.g. only veto `merge.submit`). It is `None` at the
+/// non-command points (the event pair, claim/release, transition), which carry no
+/// command. Richer payload (envelope, actor scope) can still be added later;
+/// `#[non_exhaustive]` keeps that growth additive (`hq-mod-hooks.8`).
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct HookContext {
     /// The lifecycle point that fired this invocation.
     pub point: HookPoint,
+    /// The command in flight, at the command points; `None` elsewhere. Set via
+    /// [`with_command`](HookContext::with_command); read via
+    /// [`command`](HookContext::command).
+    pub command: Option<String>,
 }
 
 impl HookContext {
-    /// Build a context for `point`. Future fields gain dedicated setters as the
-    /// payload grows, so this constructor stays stable.
+    /// Build a context for `point` with no command attached. Stays stable as the
+    /// payload grows — command-scoped callers add the command with
+    /// [`with_command`](HookContext::with_command).
     pub fn new(point: HookPoint) -> Self {
-        HookContext { point }
+        HookContext { point, command: None }
+    }
+
+    /// Attach the in-flight command name, for the
+    /// [`BeforeCommand`](HookPoint::BeforeCommand) /
+    /// [`AfterCommand`](HookPoint::AfterCommand) points. Chainable.
+    pub fn with_command(mut self, command: impl Into<String>) -> Self {
+        self.command = Some(command.into());
+        self
+    }
+
+    /// The command in flight, or `None` at a non-command point.
+    pub fn command(&self) -> Option<&str> {
+        self.command.as_deref()
     }
 }
 
@@ -105,5 +127,45 @@ mod tests {
     async fn handler_can_veto_with_reason() {
         let out = Veto.handle(&HookContext::new(HookPoint::BeforeCommand)).await;
         assert_eq!(out, HookOutcome::Reject("blocked at BeforeCommand".to_string()));
+    }
+
+    #[test]
+    fn new_context_has_no_command() {
+        let ctx = HookContext::new(HookPoint::AfterCommand);
+        assert_eq!(ctx.command(), None);
+    }
+
+    #[test]
+    fn with_command_attaches_and_reads_back() {
+        let ctx = HookContext::new(HookPoint::BeforeCommand).with_command("merge.submit");
+        assert_eq!(ctx.command(), Some("merge.submit"));
+        assert_eq!(ctx.point, HookPoint::BeforeCommand);
+    }
+
+    /// A handler discriminates on the command name — the seam `hq-mod-hooks.7`
+    /// (Sheriff pre-merge watchdog) needs: veto only `merge.submit`, ignore the
+    /// rest.
+    struct MergeGate;
+    #[async_trait]
+    impl HookHandler for MergeGate {
+        fn name(&self) -> &str {
+            "test.merge-gate"
+        }
+        async fn handle(&self, ctx: &HookContext) -> HookOutcome {
+            match ctx.command() {
+                Some("merge.submit") => HookOutcome::Reject("watchdog".to_string()),
+                _ => HookOutcome::Continue,
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn handler_discriminates_by_command() {
+        let gate = MergeGate;
+        let targeted = HookContext::new(HookPoint::BeforeCommand).with_command("merge.submit");
+        let other = HookContext::new(HookPoint::BeforeCommand).with_command("bead.claim");
+        assert_eq!(gate.handle(&targeted).await, HookOutcome::Reject("watchdog".to_string()));
+        assert_eq!(gate.handle(&other).await, HookOutcome::Continue);
+        assert_eq!(gate.handle(&HookContext::new(HookPoint::BeforeCommand)).await, HookOutcome::Continue);
     }
 }
