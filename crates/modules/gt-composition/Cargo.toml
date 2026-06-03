@@ -87,3 +87,6 @@ tokio = { workspace = true, features = ["macros", "rt-multi-thread", "sync", "ti
 serde_json = { workspace = true }
 # Tempdir-rooted event logs for the event-sourced handler tests.
 tempfile = { workspace = true }
+# Per-run throwaway Dolt database creation for the resources contract test
+# (hq-mcp-test.3) — CREATE DATABASE before DoltIssues::connect.
+mysql_async = { workspace = true }
