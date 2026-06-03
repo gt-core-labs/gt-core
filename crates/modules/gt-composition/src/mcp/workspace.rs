@@ -85,6 +85,23 @@ impl DomainHandler for WorkspaceHandler {
                     "status": status_str(WorkspaceStatus::Suspended),
                 }))
             }
+            "workspace.archive" => {
+                // Terminal transition from Active or Suspended. The decide layer rejects an
+                // already-archived workspace (IllegalTransition) as a validation fault. The
+                // on-disk teardown (Dolt snapshot + tar the event log) is a deploy-edge step;
+                // this tool records only the orchestrator's status change.
+                let id = workspace_id(str_arg(&ctx.args, "id")?)?;
+                let mut actor = WorkspaceActor::hydrate(self.repo()).await.map_err(actor_err)?;
+                actor
+                    .handle(WorkspaceCommand::Archive { id: id.clone() })
+                    .await
+                    .map_err(actor_err)?;
+                Ok(json!({
+                    "ok": true,
+                    "id": id.as_str(),
+                    "status": status_str(WorkspaceStatus::Archived),
+                }))
+            }
             "workspace.list" => {
                 let entries = self.repo().list().await.map_err(repo_err)?;
                 Ok(json!({
@@ -180,6 +197,16 @@ mod tests {
         let handler = WorkspaceHandler::new(pool);
         let ctx = DomainCtx { workspace: None, actor: "tester", args: json!({}) };
         let err = handler.dispatch("workspace.suspend", ctx).await.unwrap_err();
+        assert!(matches!(err, AppError::Validation(_)));
+    }
+
+    /// `workspace.archive` rejects a payload without an `id` before any I/O.
+    #[tokio::test]
+    async fn archive_requires_id() {
+        let pool = PgPool::connect_lazy("postgres://gt@127.0.0.1:1/none").unwrap();
+        let handler = WorkspaceHandler::new(pool);
+        let ctx = DomainCtx { workspace: None, actor: "tester", args: json!({}) };
+        let err = handler.dispatch("workspace.archive", ctx).await.unwrap_err();
         assert!(matches!(err, AppError::Validation(_)));
     }
 
@@ -318,6 +345,56 @@ mod tests {
 
         sqlx::query("DELETE FROM workspaces WHERE id = $1")
             .bind("suspend-test")
+            .execute(&pool)
+            .await
+            .unwrap();
+    }
+
+    /// PG-backed: `workspace.archive` transitions Suspended → Archived (terminal) and
+    /// persists it; a second archive is an illegal transition (validation fault).
+    #[tokio::test]
+    async fn archive_is_terminal_and_rejects_rearchive() {
+        let Some(pool) = pool_or_skip().await else {
+            eprintln!("GT_PG_URL unset; skipping WorkspaceHandler archive test");
+            return;
+        };
+        let sql = &gt_store_pg::workspace_migrations()[0].sql;
+        sqlx::raw_sql(sql).execute(&pool).await.expect("apply workspaces migration");
+        sqlx::query("DELETE FROM workspaces WHERE id = $1")
+            .bind("archive-test")
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let handler = WorkspaceHandler::new(pool.clone());
+        let ctx = |args| DomainCtx { workspace: None, actor: "tester", args };
+
+        handler
+            .dispatch("workspace.create", ctx(json!({ "id": "archive-test", "name": "A" })))
+            .await
+            .unwrap();
+        // Archive straight from Active is allowed too, but go via Suspended to prove both.
+        handler.dispatch("workspace.suspend", ctx(json!({ "id": "archive-test" }))).await.unwrap();
+
+        let archived = handler
+            .dispatch("workspace.archive", ctx(json!({ "id": "archive-test" })))
+            .await
+            .unwrap();
+        assert_eq!(archived["status"], "archived");
+
+        // Persisted.
+        let info = handler.dispatch("workspace.info", ctx(json!({ "id": "archive-test" }))).await.unwrap();
+        assert_eq!(info["status"], "archived");
+
+        // Re-archive rejected (Archived is terminal) → validation.
+        let again = handler
+            .dispatch("workspace.archive", ctx(json!({ "id": "archive-test" })))
+            .await
+            .unwrap_err();
+        assert!(matches!(again, AppError::Validation(_)));
+
+        sqlx::query("DELETE FROM workspaces WHERE id = $1")
+            .bind("archive-test")
             .execute(&pool)
             .await
             .unwrap();
