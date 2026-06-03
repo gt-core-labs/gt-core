@@ -19,7 +19,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use serde_json::{json, Value};
 
-use gt_graphindex::{ensure_ignored, GraphError, GraphIndexer};
+use gt_graphindex::{ensure_ignored, GraphError, GraphIndexer, IndexStats};
 use gt_graphwarden::{MarkRefreshed, RegisterRig, WardenCommand, WardenState};
 use gt_mcp_server::{DomainCtx, DomainHandler};
 use gt_store_dolt::AppError;
@@ -68,6 +68,34 @@ impl GraphHandler {
             self.log.append(ws, ev)?;
         }
         Ok(())
+    }
+
+    /// Ensure-ignore, build-or-update `repo`'s graph, and record the refresh on the warden
+    /// log. The rig must already be under custody (caller registers first). Shared by the
+    /// single-rig `graph.refresh` and the batch `graph.refresh-stale`.
+    async fn refresh_one(
+        &self,
+        ws: Option<&str>,
+        rig: &str,
+        repo: &std::path::Path,
+    ) -> Result<(String, IndexStats), AppError> {
+        let _ = ensure_ignored(repo, self.indexer.tool());
+        let built = self.indexer.status(repo).await.map_err(graph_err)?.built;
+        let stats = if built {
+            self.indexer.update(repo, &[]).await.map_err(graph_err)?.after
+        } else {
+            self.indexer.build(repo).await.map_err(graph_err)?
+        };
+        let commit = head_commit(repo);
+        self.warden_apply(
+            ws,
+            WardenCommand::MarkRefreshed(MarkRefreshed {
+                rig: rig.to_string(),
+                commit: commit.clone(),
+                now_secs: now_secs(),
+            }),
+        )?;
+        Ok((commit, stats))
     }
 }
 
@@ -164,24 +192,7 @@ impl DomainHandler for GraphHandler {
                         }),
                     )?;
                 }
-                // Keep the repo's local git excludes carrying the tool's artifacts.
-                let _ = ensure_ignored(&repo, self.indexer.tool());
-                // Build the graph if it does not exist yet, else update it in place.
-                let built = self.indexer.status(&repo).await.map_err(graph_err)?.built;
-                let stats = if built {
-                    self.indexer.update(&repo, &[]).await.map_err(graph_err)?.after
-                } else {
-                    self.indexer.build(&repo).await.map_err(graph_err)?
-                };
-                let commit = head_commit(&repo);
-                self.warden_apply(
-                    ws,
-                    WardenCommand::MarkRefreshed(MarkRefreshed {
-                        rig: rig.to_string(),
-                        commit: commit.clone(),
-                        now_secs: now_secs(),
-                    }),
-                )?;
+                let (commit, stats) = self.refresh_one(ws, rig, &repo).await?;
                 Ok(json!({
                     "ok": true,
                     "rig": rig,
@@ -190,6 +201,23 @@ impl DomainHandler for GraphHandler {
                     "edges": stats.edges,
                     "communities": stats.communities,
                 }))
+            }
+            "graph.refresh-stale" => {
+                // The custodian's batch tick: refresh every rig currently marked stale. A
+                // loop/cron invokes this; `graph.agent.backend` is who runs the loop.
+                let state = self.warden(ws)?;
+                let stale: Vec<(String, PathBuf)> = state
+                    .rigs
+                    .values()
+                    .filter(|g| g.stale)
+                    .map(|g| (g.rig.clone(), PathBuf::from(&g.repo_dir)))
+                    .collect();
+                let mut refreshed = Vec::new();
+                for (rig, repo) in stale {
+                    let (commit, stats) = self.refresh_one(ws, &rig, &repo).await?;
+                    refreshed.push(json!({ "rig": rig, "commit": commit, "nodes": stats.nodes }));
+                }
+                Ok(json!({ "ok": true, "refreshed": refreshed }))
             }
             "graph.list" => {
                 let state = self.warden(ws)?;
