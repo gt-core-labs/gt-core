@@ -12,6 +12,16 @@ use std::collections::BTreeSet;
 use crate::config::RbacConfig;
 use crate::error::AppError;
 
+/// JWT scope identifier for a workspace administrator — full tool authority within
+/// the token's workspace (`hq-mcp-dispatch.9`). The workspace *confinement* (a token
+/// for ws A cannot operate ws B) is enforced one tier up, at the MCP server boundary;
+/// this constant names the *tool* grant the claim carries.
+pub const WORKSPACE_ADMIN: &str = "workspace.admin";
+
+/// JWT scope identifier for a workspace member — every operational tool except the
+/// workspace-catalog mutations that provision/retire a tenant (an admin act).
+pub const WORKSPACE_MEMBER: &str = "workspace.member";
+
 #[derive(Debug, Clone)]
 pub struct Scope {
     pub actor: String,
@@ -47,6 +57,53 @@ impl Scope {
             actor: actor.into(),
             allow: BTreeSet::new(),
             validate_only: true,
+        }
+    }
+
+    /// A workspace administrator's tool grant: every tool (the `*` allow-list),
+    /// identical in tool-reach to [`Scope::admin`]. Named distinctly so the call
+    /// site reads as "the admin of one workspace" — the tenant confinement is the
+    /// MCP server's [`WorkspaceGuard`] (`hq-mcp-dispatch.9`), not this scope.
+    pub fn workspace_admin(actor: impl Into<String>) -> Self {
+        Self::admin(actor)
+    }
+
+    /// A workspace member's tool grant: every operational namespace, but **not** the
+    /// workspace-catalog mutations (`workspace.create` — provisioning a tenant is an
+    /// admin act). `workspace.info`/`workspace.list` reads stay allowed.
+    pub fn workspace_member(actor: impl Into<String>) -> Self {
+        let allow = [
+            "issues.*",
+            "meta.*",
+            "rig.*",
+            "quota.*",
+            "merge.*",
+            "convoy.*",
+            "agent.*",
+            "workspace.info",
+            "workspace.list",
+        ]
+        .into_iter()
+        .map(String::from)
+        .collect();
+        Self {
+            actor: actor.into(),
+            allow,
+            validate_only: false,
+        }
+    }
+
+    /// Resolve a [`Scope`] from a JWT claim's granted scope strings. A claim bearing
+    /// [`WORKSPACE_ADMIN`] gets the admin grant, [`WORKSPACE_MEMBER`] the member grant;
+    /// anything else folds to [`Scope::denied`] — deny by default, never admin. Admin
+    /// wins when both are present.
+    pub fn from_workspace_claim(actor: &str, scopes: &[String]) -> Self {
+        if scopes.iter().any(|s| s == WORKSPACE_ADMIN) {
+            Self::workspace_admin(actor)
+        } else if scopes.iter().any(|s| s == WORKSPACE_MEMBER) {
+            Self::workspace_member(actor)
+        } else {
+            Self::denied(actor)
         }
     }
 
@@ -144,6 +201,45 @@ mod tests {
         let s = Scope::denied("ghost");
         assert!(s.check("agent.add.validate").is_err());
         assert!(s.check("agent.add.execute").is_err());
+    }
+
+    #[test]
+    fn workspace_member_allows_ops_but_not_workspace_create() {
+        let s = Scope::workspace_member("member");
+        s.check("issues.close.execute").unwrap();
+        s.check("rig.add.execute").unwrap();
+        s.check("workspace.info").unwrap();
+        s.check("workspace.list").unwrap();
+        // Provisioning a tenant is an admin act, outside the member grant.
+        assert!(s.check("workspace.create").is_err());
+    }
+
+    #[test]
+    fn workspace_admin_allows_everything_including_create() {
+        let s = Scope::workspace_admin("admin");
+        s.check("workspace.create").unwrap();
+        s.check("issues.close.execute").unwrap();
+    }
+
+    #[test]
+    fn from_workspace_claim_maps_scopes_deny_by_default() {
+        let admin = Scope::from_workspace_claim("a", &[WORKSPACE_ADMIN.to_string()]);
+        admin.check("workspace.create").unwrap();
+
+        let member = Scope::from_workspace_claim("m", &[WORKSPACE_MEMBER.to_string()]);
+        member.check("rig.add.execute").unwrap();
+        assert!(member.check("workspace.create").is_err());
+
+        // Admin wins when both are present.
+        let both = Scope::from_workspace_claim(
+            "b",
+            &[WORKSPACE_MEMBER.to_string(), WORKSPACE_ADMIN.to_string()],
+        );
+        both.check("workspace.create").unwrap();
+
+        // No recognised workspace scope -> closed.
+        let none = Scope::from_workspace_claim("n", &["some.other.scope".to_string()]);
+        assert!(none.check("issues.read").is_err());
     }
 
     const TOML_CFG: &str = r#"

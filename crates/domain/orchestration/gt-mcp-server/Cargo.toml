@@ -20,6 +20,9 @@ gt-meta = { workspace = true }
 gt-store-dolt = { workspace = true }
 gt-rbac = { workspace = true }
 gt-audit = { workspace = true }
+# Per-workspace JWT auth at the server boundary (hq-mcp-dispatch.9): verify the
+# bearer token's workspace claim + derive the scope from its workspace role.
+gt-auth = { workspace = true }
 # Domain dispatch handlers (hq-mcp-dispatch.1) implement an async trait.
 async-trait = { workspace = true }
 rmcp = { workspace = true, features = ["server", "transport-streamable-http-server"] }

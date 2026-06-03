@@ -13,4 +13,4 @@ mod scope;
 
 pub use config::{ActorSpec, RbacConfig, RoleSpec, WebGrant};
 pub use error::AppError;
-pub use scope::{ResolveScope, Scope};
+pub use scope::{ResolveScope, Scope, WORKSPACE_ADMIN, WORKSPACE_MEMBER};

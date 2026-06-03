@@ -11,6 +11,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use gt_audit::{AuditRecord, AuditSink};
+use gt_auth::Authenticator;
 use gt_module::McpTool;
 use gt_rbac::{RbacConfig, Scope};
 use gt_store_dolt::{AppError, DoltIssues};
@@ -60,6 +61,13 @@ pub struct IssuesServer {
     /// the `hq-mcp-dispatch` seam. Empty by default, so a server with no domain
     /// handlers wired behaves exactly as the issues-only build.
     domains: Arc<DomainRouter>,
+    /// Per-workspace JWT auth (`hq-mcp-dispatch.9`). `Some` when a bearer-token
+    /// verifier is wired: a request's `Authorization: Bearer` token is verified,
+    /// its `workspace` claim becomes the authoritative tenant (a spoofed
+    /// `X-Workspace` for another tenant is rejected — the cross-workspace leak
+    /// gate), and the scope is derived from the claim's workspace role. `None`
+    /// keeps the legacy `X-Actor`/`X-Workspace` header behaviour exactly.
+    authenticator: Option<Arc<dyn Authenticator + Send + Sync>>,
 }
 
 impl IssuesServer {
@@ -85,7 +93,18 @@ impl IssuesServer {
             tools: Arc::new(tools),
             repo_dir: repo_dir.map(Arc::new),
             domains: Arc::new(DomainRouter::new()),
+            authenticator: None,
         }
+    }
+
+    /// Enable per-workspace JWT auth (`hq-mcp-dispatch.9`). With a verifier wired,
+    /// every call must carry a valid `Authorization: Bearer` token; its `workspace`
+    /// claim is the authoritative tenant (an `X-Workspace` header naming a different
+    /// tenant is rejected) and its workspace-role scopes drive the per-tool check.
+    /// Additive — without it the server keeps the `X-Actor`/`X-Workspace` behaviour.
+    pub fn with_authenticator(mut self, authenticator: Arc<dyn Authenticator + Send + Sync>) -> Self {
+        self.authenticator = Some(authenticator);
+        self
     }
 
     /// Wire the domain dispatch router (`hq-mcp-dispatch.1`): tool namespaces
@@ -113,13 +132,14 @@ impl IssuesServer {
         self.workspaces.clone()
     }
 
-    /// Resolve the store for one request from its extensions. When a workspace
-    /// resolver is wired and the request carries an `X-Workspace` header, the
-    /// tenant's own store is built (cheap: a lazily-pooled `DoltIssues`);
-    /// otherwise the default-workspace store is used. A malformed/unknown slug is
-    /// rejected here, before any dispatch.
-    fn resolve_store(&self, ext: &Extensions) -> Result<Arc<DoltIssues>, AppError> {
-        match (&self.workspaces, workspace_from_ext(ext)) {
+    /// Resolve the store for one request, given its authoritative workspace slug
+    /// (the JWT claim's tenant when auth is wired, else the `X-Workspace` header).
+    /// When a workspace resolver is wired and a slug is present, the tenant's own
+    /// store is built (cheap: a lazily-pooled `DoltIssues`); otherwise the
+    /// default-workspace store is used. A malformed/unknown slug is rejected here,
+    /// before any dispatch.
+    fn resolve_store(&self, workspace: Option<&str>) -> Result<Arc<DoltIssues>, AppError> {
+        match (&self.workspaces, workspace) {
             (Some(ws), Some(slug)) => Ok(Arc::new(ws.store_for(slug)?)),
             _ => Ok(self.store.clone()),
         }
@@ -135,14 +155,28 @@ impl IssuesServer {
         }
     }
 
-    /// Authorize one tool call: resolve the caller's scope from its extensions
-    /// (the `X-Actor` header when RBAC is wired, else the boot default) and run
-    /// the deny-by-default [`Scope::check`]. A rejection is recorded as an
-    /// `Unauthorized` audit row and surfaces as an `invalid_request` the caller
-    /// cannot retry; on success the resolved scope is returned so the caller
-    /// reuses its `actor` for store dispatch + the `Invoked` audit attribution.
+    /// Authorize one tool call and resolve its authoritative workspace.
     ///
-    /// Carved out of [`call_tool`](Self::call_tool) so the scope→audit→error
+    /// Two modes, selected by whether a JWT [`Authenticator`] is wired:
+    ///
+    /// - **JWT mode** (`hq-mcp-dispatch.9`): the `Authorization: Bearer` token is
+    ///   verified, its claim validated (expiry + workspace presence), and the
+    ///   request's `X-Workspace` header — if present — is reconciled against the
+    ///   claim's `workspace`. A mismatch is the **cross-workspace leak gate**: a
+    ///   token minted for tenant A cannot operate tenant B. The scope is derived
+    ///   from the claim's workspace role ([`Scope::from_workspace_claim`]), and the
+    ///   authoritative workspace returned is the claim's — never a spoofable header.
+    /// - **Legacy mode** (no authenticator): the `X-Actor` header resolves the
+    ///   scope (or the boot default) and the `X-Workspace` header the tenant,
+    ///   exactly as before.
+    ///
+    /// Either way the deny-by-default [`Scope::check`] runs; a rejection (failed
+    /// auth, leak, or out-of-scope tool) is recorded as an `Unauthorized` audit row
+    /// and surfaces as an `invalid_request` the caller cannot retry. On success the
+    /// resolved scope + authoritative workspace flow out for store dispatch + the
+    /// `Invoked` audit attribution.
+    ///
+    /// Carved out of [`call_tool`](Self::call_tool) so the auth→scope→audit→error
     /// boundary is testable end to end: the rmcp [`RequestContext`] that
     /// `call_tool` receives wraps a `Peer` whose constructor is crate-private, so
     /// the wired gate cannot be exercised through `call_tool` itself — only
@@ -152,15 +186,77 @@ impl IssuesServer {
         tool: &str,
         args: &serde_json::Value,
         ext: &Extensions,
-    ) -> Result<Cow<'_, Scope>, McpError> {
-        let scope = self.resolve_scope(ext);
+    ) -> Result<(Cow<'_, Scope>, Option<String>), McpError> {
+        let (scope, workspace) = match self.authenticate_claims(tool, args, ext)? {
+            Some(claims) => (
+                Cow::Owned(Scope::from_workspace_claim(&claims.sub, &claims.scopes)),
+                Some(claims.workspace),
+            ),
+            None => (
+                self.resolve_scope(ext),
+                workspace_from_ext(ext).map(str::to_string),
+            ),
+        };
+
         if let Err(e) = scope.check(tool) {
             let _ = self
                 .audit
                 .record(AuditRecord::unauthorized(&scope.actor, tool, args.clone()));
             return Err(McpError::invalid_request(e.to_string(), None));
         }
-        Ok(scope)
+        Ok((scope, workspace))
+    }
+
+    /// Verify the request's bearer token and run the cross-workspace leak gate,
+    /// returning the validated [`JwtClaims`] (whose `workspace` is the authoritative
+    /// tenant). `None` when no authenticator is wired — the legacy header path. Used
+    /// by both [`authorize`](Self::authorize) and `read_resource` so a resource read
+    /// cannot dodge the tenant binding a tool call is held to. `op` labels an audit
+    /// denial (the tool name or resource URI).
+    fn authenticate_claims(
+        &self,
+        op: &str,
+        args: &serde_json::Value,
+        ext: &Extensions,
+    ) -> Result<Option<gt_auth::JwtClaims>, McpError> {
+        let Some(auth) = &self.authenticator else {
+            return Ok(None);
+        };
+        // Bearer token is mandatory in JWT mode.
+        let token = bearer_from_ext(ext)
+            .ok_or_else(|| self.deny(op, args, "<anonymous>", "missing bearer token"))?;
+        let claims = auth
+            .authenticate(token)
+            .map_err(|e| self.deny(op, args, "<unverified>", &e.to_string()))?;
+        // Cheap semantic gate: expiry + workspace-claim presence.
+        claims
+            .validate(now_secs(), JWT_WORKSPACE_OPTIONAL)
+            .map_err(|e| self.deny(op, args, &claims.sub, &e.to_string()))?;
+        // Cross-workspace leak gate: an X-Workspace naming a different tenant than
+        // the token's claim is rejected outright.
+        if let Some(requested) = workspace_from_ext(ext) {
+            if requested != claims.workspace {
+                return Err(self.deny(
+                    op,
+                    args,
+                    &claims.sub,
+                    &format!(
+                        "token for workspace `{}` cannot operate workspace `{requested}`",
+                        claims.workspace
+                    ),
+                ));
+            }
+        }
+        Ok(Some(claims))
+    }
+
+    /// Record an `Unauthorized` audit row and build the matching `invalid_request`
+    /// — the single deny path for every auth failure (bad token, leak, expiry).
+    fn deny(&self, op: &str, args: &serde_json::Value, actor: &str, reason: &str) -> McpError {
+        let _ = self
+            .audit
+            .record(AuditRecord::unauthorized(actor, op, args.clone()));
+        McpError::invalid_request(reason.to_string(), None)
     }
 
     /// Map a domain error onto an MCP error. Validation / not-found are caller
@@ -219,13 +315,16 @@ impl ServerHandler for IssuesServer {
         // Deny-by-default — a rejection is audited as Unauthorized here and
         // surfaces as an invalid_request the caller cannot retry (hq-core-mcp.15
         // covers this gate end to end through `authorize`).
-        let scope = self.authorize(&tool, &args, &context.extensions)?;
+        // In JWT mode this also verifies the bearer token + closes the cross-
+        // workspace leak; the authoritative workspace (the claim's tenant, or the
+        // X-Workspace header in legacy mode) flows out for store + domain dispatch.
+        let (scope, workspace) = self.authorize(&tool, &args, &context.extensions)?;
 
-        // Per-request workspace (hq-mt-routing.5): the X-Workspace header selects
-        // the tenant's store; absent it, the default-workspace store. Resolved
-        // after the scope check so a malformed slug from an unauthorized caller is
-        // never built.
-        let store = match self.resolve_store(&context.extensions) {
+        // Per-request workspace (hq-mt-routing.5): the resolved slug selects the
+        // tenant's store; absent it, the default-workspace store. Resolved after
+        // the scope check so a malformed slug from an unauthorized caller is never
+        // built.
+        let store = match self.resolve_store(workspace.as_deref()) {
             Ok(store) => store,
             Err(e) => return Err(Self::to_mcp_error(&e)),
         };
@@ -241,7 +340,7 @@ impl ServerHandler for IssuesServer {
             }
             _ => {
                 let ctx = DomainCtx {
-                    workspace: workspace_from_ext(&context.extensions),
+                    workspace: workspace.as_deref(),
                     actor: &scope.actor,
                     args: args.clone(),
                 };
@@ -310,10 +409,15 @@ impl ServerHandler for IssuesServer {
         context: RequestContext<RoleServer>,
     ) -> Result<ReadResourceResult, McpError> {
         let uri = request.uri.as_str();
-        // Resources are tenant data too: resolve the per-request workspace store
-        // so a read reflects the caller's workspace, not just the default one.
+        // Resources are tenant data too: run the same JWT/leak gate as a tool call
+        // (a token for ws A must not read ws B's resources), then resolve that
+        // tenant's store so a read reflects the caller's workspace.
+        let workspace = match self.authenticate_claims(uri, &serde_json::json!({}), &context.extensions)? {
+            Some(claims) => Some(claims.workspace),
+            None => workspace_from_ext(&context.extensions).map(str::to_string),
+        };
         let store = self
-            .resolve_store(&context.extensions)
+            .resolve_store(workspace.as_deref())
             .map_err(|e| Self::to_mcp_error(&e))?;
         let value = self
             .read_resource_json(&store, uri)
@@ -397,11 +501,40 @@ fn actor_from_ext(ext: &Extensions) -> Option<&str> {
         .filter(|s| !s.is_empty())
 }
 
+/// The MCP boundary requires the workspace claim — a token without it cannot pin a
+/// tenant, so the grace flag stays off here. (`gt-auth`'s `GT_JWT_WS_OPTIONAL` grace
+/// is for issuers mid-rollout; an enforcement point that *binds* the workspace can't
+/// honour a blank one.)
+const JWT_WORKSPACE_OPTIONAL: bool = false;
+
+/// Extract the bearer token from a request's `Authorization` header. rmcp injects
+/// the HTTP `Parts` into each call's extensions, so the `Bearer <token>` value (the
+/// scheme matched case-insensitively per RFC 6750) names the credential. `None` when
+/// there is no Parts, no header, or no `Bearer` scheme.
+fn bearer_from_ext(ext: &Extensions) -> Option<&str> {
+    let raw = ext
+        .get::<axum::http::request::Parts>()
+        .and_then(|p| p.headers.get(axum::http::header::AUTHORIZATION))
+        .and_then(|v| v.to_str().ok())?;
+    let token = raw.strip_prefix("Bearer ").or_else(|| raw.strip_prefix("bearer "))?;
+    let token = token.trim();
+    (!token.is_empty()).then_some(token)
+}
+
+/// Server-side wall clock (epoch seconds) for JWT expiry checks.
+fn now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
 #[cfg(test)]
 mod tests {
     use super::{actor_from_ext, IssuesServer};
     use gt_audit::{AuditSink, InMemoryAudit, Outcome};
-    use gt_rbac::{RbacConfig, Scope};
+    use gt_auth::{InMemoryAuthenticator, JwtClaims};
+    use gt_rbac::{RbacConfig, Scope, WORKSPACE_ADMIN, WORKSPACE_MEMBER};
     use gt_store_dolt::DoltIssues;
     use rmcp::model::{ErrorCode, Extensions};
     use serde_json::json;
@@ -417,6 +550,32 @@ mod tests {
         let mut ext = Extensions::new();
         ext.insert(parts);
         ext
+    }
+
+    /// Build extensions carrying an `Authorization: Bearer <token>` plus an optional
+    /// `X-Workspace` header — the shape a JWT-mode request arrives with.
+    fn ext_bearer(token: &str, workspace: Option<&str>) -> Extensions {
+        let mut builder =
+            axum::http::Request::builder().header("authorization", format!("Bearer {token}"));
+        if let Some(ws) = workspace {
+            builder = builder.header("x-workspace", ws);
+        }
+        let parts = builder.body(()).unwrap().into_parts().0;
+        let mut ext = Extensions::new();
+        ext.insert(parts);
+        ext
+    }
+
+    /// A token whose claim is scoped to `workspace` with the given role scope, well
+    /// clear of expiry (year 2286).
+    fn token(sub: &str, workspace: &str, scope: &str) -> JwtClaims {
+        JwtClaims {
+            sub: sub.into(),
+            workspace: workspace.into(),
+            scopes: vec![scope.into()],
+            exp: 9_999_999_999,
+            iat: 0,
+        }
     }
 
     #[test]
@@ -532,7 +691,7 @@ validate_only = true
         assert_eq!(err.code, ErrorCode::INVALID_REQUEST);
 
         // ...while the matching `.validate` passes the gate.
-        let scope = srv
+        let (scope, _ws) = srv
             .authorize("issues.create.validate", &json!({}), &ext)
             .expect("validate is permitted for a validate_only scope");
         assert_eq!(scope.actor, "readonly");
@@ -548,7 +707,7 @@ validate_only = true
         let audit = Arc::new(InMemoryAudit::new());
         let srv = server(Scope::admin("boot"), None, audit.clone());
 
-        let scope = srv
+        let (scope, _ws) = srv
             .authorize("issues.close.execute", &json!({}), &Extensions::new())
             .expect("admin scope permits every tool");
         // The resolved scope flows out for store dispatch + Invoked attribution.
@@ -556,5 +715,106 @@ validate_only = true
         // `authorize` only records the deny path; the Invoked row is the caller's
         // to write after dispatch, so nothing is audited on the allow path here.
         assert!(audit.read_all().unwrap().is_empty());
+    }
+
+    // ----- hq-mcp-dispatch.9: per-workspace JWT auth + the leak gate ----------
+
+    /// Build a server with a JWT verifier wired. The boot default is intentionally
+    /// admin so a deny can only come from the JWT/workspace gate, not the fallback.
+    fn auth_server(auth: InMemoryAuthenticator, audit: Arc<InMemoryAudit>) -> IssuesServer {
+        server(Scope::admin("boot"), None, audit).with_authenticator(Arc::new(auth))
+    }
+
+    /// The headline guarantee: a token minted for workspace A cannot operate
+    /// workspace B. Same-workspace passes (and pins the tenant to the claim);
+    /// a mismatched `X-Workspace` is denied + audited; an absent header pins to the
+    /// claim's workspace rather than trusting any header.
+    #[test]
+    fn jwt_token_bound_to_its_workspace_blocks_cross_tenant() {
+        let audit = Arc::new(InMemoryAudit::new());
+        let auth = InMemoryAuthenticator::new().with_token("tokA", token("agent-a", "acme", WORKSPACE_ADMIN));
+        let srv = auth_server(auth, audit.clone());
+
+        // Operating its own workspace: authorized, scope from the claim, tenant = acme.
+        let (scope, ws) = srv
+            .authorize("issues.close.execute", &json!({}), &ext_bearer("tokA", Some("acme")))
+            .expect("a token operating its own workspace is allowed");
+        assert_eq!(scope.actor, "agent-a", "attribution is the token subject");
+        assert_eq!(ws.as_deref(), Some("acme"), "tenant resolved from the claim");
+
+        // Cross-workspace: X-Workspace=beta with an acme token — the leak gate fires.
+        let err = srv
+            .authorize("issues.close.execute", &json!({}), &ext_bearer("tokA", Some("beta")))
+            .expect_err("a token for acme must not operate beta");
+        assert_eq!(err.code, ErrorCode::INVALID_REQUEST);
+
+        // No X-Workspace header: pinned to the claim's workspace, never a header.
+        let (_s, ws) = srv
+            .authorize("issues.close.execute", &json!({}), &ext_bearer("tokA", None))
+            .expect("an absent header pins to the claim");
+        assert_eq!(ws.as_deref(), Some("acme"));
+
+        let rows = audit.read_all().unwrap();
+        let denials = rows.iter().filter(|r| r.outcome == Outcome::Unauthorized).count();
+        assert_eq!(denials, 1, "only the cross-tenant attempt is audited");
+        assert_eq!(rows[0].actor, "agent-a");
+    }
+
+    /// JWT mode requires a verifiable bearer token: a missing or unknown token is
+    /// denied even though the boot default scope is admin.
+    #[test]
+    fn jwt_missing_or_unverifiable_token_is_denied() {
+        let audit = Arc::new(InMemoryAudit::new());
+        let auth = InMemoryAuthenticator::new().with_token("good", token("a", "acme", WORKSPACE_ADMIN));
+        let srv = auth_server(auth, audit.clone());
+
+        let no_token = srv
+            .authorize("issues.read", &json!({}), &Extensions::new())
+            .expect_err("JWT mode requires a bearer token");
+        assert_eq!(no_token.code, ErrorCode::INVALID_REQUEST);
+
+        let bad_token = srv
+            .authorize("issues.read", &json!({}), &ext_bearer("nope", Some("acme")))
+            .expect_err("an unverifiable token is denied");
+        assert_eq!(bad_token.code, ErrorCode::INVALID_REQUEST);
+
+        assert_eq!(audit.read_all().unwrap().len(), 2, "both failures are audited");
+    }
+
+    /// An expired token is rejected by the claim's semantic gate.
+    #[test]
+    fn jwt_expired_token_is_denied() {
+        let audit = Arc::new(InMemoryAudit::new());
+        let expired = JwtClaims {
+            sub: "stale".into(),
+            workspace: "acme".into(),
+            scopes: vec![WORKSPACE_ADMIN.into()],
+            exp: 1, // 1970 — well past
+            iat: 0,
+        };
+        let auth = InMemoryAuthenticator::new().with_token("old", expired);
+        let srv = auth_server(auth, audit.clone());
+
+        let err = srv
+            .authorize("issues.read", &json!({}), &ext_bearer("old", Some("acme")))
+            .expect_err("an expired token is denied");
+        assert_eq!(err.code, ErrorCode::INVALID_REQUEST);
+    }
+
+    /// The claim's workspace role drives the per-tool scope: a member may run the
+    /// operational tools but not provision a tenant (`workspace.create`).
+    #[test]
+    fn jwt_member_role_cannot_create_a_workspace() {
+        let audit = Arc::new(InMemoryAudit::new());
+        let auth = InMemoryAuthenticator::new().with_token("mem", token("m", "acme", WORKSPACE_MEMBER));
+        let srv = auth_server(auth, audit.clone());
+
+        srv.authorize("issues.close.execute", &json!({}), &ext_bearer("mem", Some("acme")))
+            .expect("a member operates the issue tools");
+
+        let err = srv
+            .authorize("workspace.create", &json!({}), &ext_bearer("mem", Some("acme")))
+            .expect_err("a member cannot provision a tenant");
+        assert_eq!(err.code, ErrorCode::INVALID_REQUEST);
     }
 }
