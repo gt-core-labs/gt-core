@@ -266,4 +266,114 @@ mod tests {
             .unwrap_err();
         assert!(matches!(gone, AppError::NotFound(_)));
     }
+
+    /// Per-workspace rig isolation (`hq-mt-rigs.2`, re-scoped to a verification
+    /// bead per the docs/04 §15 conflict gap).
+    ///
+    /// rigs.2 originally specified a multi-tenant `RigCatalog` keyed by
+    /// `WorkspaceId` — the shared-table model **rejected** by the schema-per-ws
+    /// partitioning resolution. There is no such catalog: `RigHandler` hydrates a
+    /// fresh single-tenant catalog per request, scoped by the `WorkspacePool`'s
+    /// `search_path` to the caller's `ws_<slug>.rigs`. This test *proves* the two
+    /// properties rigs.2 wanted are already delivered structurally:
+    ///
+    /// 1. **same prefix in distinct workspaces does not collide** — the `rigs`
+    ///    `UNIQUE(prefix)` constraint is per-schema, so tenant `a` and tenant `b`
+    ///    can each register a rig with the same name + prefix (a shared
+    ///    `WorkspaceId`-keyed table would reject the second on the unique index);
+    /// 2. **no cross-tenant leak** — a rig registered only in `a` is invisible to
+    ///    `b`'s reads.
+    ///
+    /// No-op without `GT_PG_URL`.
+    #[tokio::test]
+    async fn rig_per_workspace_isolation_pg() {
+        use gt_module::GtModule;
+        use sqlx::PgPool;
+
+        let Some(url) = std::env::var("GT_PG_URL").ok() else {
+            eprintln!("GT_PG_URL unset; skipping per-workspace rig isolation test");
+            return;
+        };
+        let pool = PgPool::connect(&url).await.expect("connect postgres");
+
+        // 1. Catalog table + the `gt_create_workspace_schema` provisioning fn.
+        for mig in gt_store_pg::workspace_migrations() {
+            sqlx::raw_sql(&mig.sql).execute(&pool).await.expect("apply workspace migration");
+        }
+        // 2. The `rigs` template in `ws_default` (the provisioner clones from it).
+        let migs = gt_rig::RigsModule.migrations();
+        sqlx::raw_sql(&migs[0].sql).execute(&pool).await.expect("apply rigs migration");
+        // 3. Provision two tenant schemas — each gets its own `rigs` table with a
+        //    schema-local UNIQUE(prefix) (idempotent; safe across reruns).
+        for ws in ["a", "b"] {
+            sqlx::query("SELECT gt_create_workspace_schema($1)")
+                .bind(ws) // bare slug; the fn prepends `ws_` (→ schema `ws_a`/`ws_b`)
+                .execute(&pool)
+                .await
+                .unwrap_or_else(|e| panic!("provision ws_{ws}: {e}"));
+            sqlx::raw_sql(&format!("DELETE FROM ws_{ws}.rigs"))
+                .execute(&pool)
+                .await
+                .ok();
+        }
+
+        let handler = RigHandler::new(Arc::new(WsPools::new(url)));
+        let ctx = |ws: &'static str, args| DomainCtx { workspace: Some(ws), actor: "tester", args };
+        let shared = || json!({
+            "name": "granite", "prefix": "gr",
+            "git_url": "git@x:y/granite.git", "default_branch": "main"
+        });
+
+        // Property 1: the SAME name + prefix registers cleanly in BOTH tenants.
+        let in_a = handler.dispatch("rig.add", ctx("a", shared())).await.unwrap();
+        assert_eq!(in_a["ok"], true);
+        let in_b = handler.dispatch("rig.add", ctx("b", shared())).await.unwrap();
+        assert_eq!(in_b["ok"], true, "same prefix in a distinct ws must not collide");
+
+        // A rig that lives only in tenant `a`.
+        handler
+            .dispatch(
+                "rig.add",
+                ctx("a", json!({
+                    "name": "plane", "prefix": "pl",
+                    "git_url": "git@x:y/plane.git", "default_branch": "main"
+                })),
+            )
+            .await
+            .unwrap();
+
+        // Property 2: `b` sees only its own `granite`, never `a`'s `plane`.
+        let list_b = handler.dispatch("rig.list", ctx("b", json!({}))).await.unwrap();
+        let names_b: Vec<&str> = list_b["rigs"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|r| r["name"].as_str())
+            .collect();
+        assert!(names_b.contains(&"granite"), "b keeps its own rig");
+        assert!(!names_b.contains(&"plane"), "no cross-tenant leak from a into b");
+        let leaked = handler
+            .dispatch("rig.info", ctx("b", json!({ "name": "plane" })))
+            .await
+            .unwrap_err();
+        assert!(matches!(leaked, AppError::NotFound(_)), "a's rig is not found in b");
+
+        // `a` has both.
+        let list_a = handler.dispatch("rig.list", ctx("a", json!({}))).await.unwrap();
+        let names_a: Vec<&str> = list_a["rigs"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|r| r["name"].as_str())
+            .collect();
+        assert!(names_a.contains(&"granite") && names_a.contains(&"plane"));
+
+        // Cleanup so the test is rerunnable.
+        for ws in ["a", "b"] {
+            sqlx::raw_sql(&format!("DELETE FROM ws_{ws}.rigs"))
+                .execute(&pool)
+                .await
+                .ok();
+        }
+    }
 }
