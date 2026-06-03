@@ -60,6 +60,10 @@ fn row_to_entry(row: &PgRow) -> Result<RigEntry, AppError> {
         upstream_url: row.try_get("upstream_url").map_err(backend)?,
         default_branch: row.try_get("default_branch").map_err(backend)?,
         registered_at_secs: registered_at as u64,
+        // The `rigs` table has no worktree_root column yet — projecting the override into PG
+        // lands with the rig.set-worktree-root tool wiring (hq-mt-rigs.5). The event log is
+        // the source of truth for replay until then.
+        worktree_root: None,
     })
 }
 

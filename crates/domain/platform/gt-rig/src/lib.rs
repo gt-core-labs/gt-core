@@ -34,13 +34,13 @@ mod state;
 pub use pg::PgRigs;
 
 pub use actor::{spawn, spawn_hydrated, RigHandle, RigMsg};
-pub use module::RigsModule;
 pub use commands::{
-    AddRig, AdoptRig, RemoveRig, RigCommand, SetRigDefaultBranch, SetRigPrefix,
+    AddRig, AdoptRig, RemoveRig, RigCommand, SetRigDefaultBranch, SetRigPrefix, SetRigWorktreeRoot,
 };
 pub use events::RigEvent;
+pub use module::RigsModule;
 pub use repo::{InMemoryRigs, RigRepository};
 pub use state::{
-    validate_prefix, validate_rig_name, RigCatalog, RigEntry, RigState, MAX_PREFIX_LEN,
-    RESERVED_RIG_NAMES,
+    validate_prefix, validate_rig_name, validate_worktree_root, RigCatalog, RigEntry, RigState,
+    MAX_PREFIX_LEN, MAX_WORKTREE_ROOT_LEN, RESERVED_RIG_NAMES,
 };

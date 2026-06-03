@@ -1,3 +1,5 @@
+use std::path::PathBuf;
+
 use serde::{Deserialize, Serialize};
 
 use gt_events::EventKind;
@@ -52,6 +54,16 @@ pub enum RigEvent {
         new: String,
         now_secs: u64,
     },
+    /// The worktree root the orchestrator carves polecat checkouts under changed. `old` is
+    /// the prior override (`None` if the rig was still on the convention default); `new` is
+    /// the explicit root now pinned for the rig. Filesystem moves are a deploy-edge concern;
+    /// this event records only the orchestrator's routing override (hq-mt-rigs.3).
+    WorktreeRootChanged {
+        rig: String,
+        old: Option<PathBuf>,
+        new: PathBuf,
+        now_secs: u64,
+    },
 }
 
 impl EventKind for RigEvent {
@@ -62,6 +74,7 @@ impl EventKind for RigEvent {
             RigEvent::Removed { .. } => "rig.removed.v1",
             RigEvent::PrefixChanged { .. } => "rig.prefix_changed.v1",
             RigEvent::DefaultBranchChanged { .. } => "rig.default_branch_changed.v1",
+            RigEvent::WorktreeRootChanged { .. } => "rig.worktree_root_changed.v1",
         }
     }
 }

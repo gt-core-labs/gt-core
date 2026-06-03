@@ -5,6 +5,7 @@
 //! rebuilt one byte-for-byte.
 
 use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
@@ -17,6 +18,10 @@ pub const RESERVED_RIG_NAMES: &[&str] = &["hq"];
 /// Maximum length of a beads prefix. Mirrors the Go validator in
 /// `internal/rig/manager.go::isValidBeadsPrefix`.
 pub const MAX_PREFIX_LEN: usize = 20;
+
+/// Maximum length of a worktree-root override path. A guard against an unbounded string
+/// reaching the deploy edge; 256 covers any sane filesystem layout.
+pub const MAX_WORKTREE_ROOT_LEN: usize = 256;
 
 /// A rig entry in the catalog. Identity is `name`; the rest is what the orchestrator needs
 /// to route work and reason about the rig's git topology. Mirrors the orchestrator-relevant
@@ -32,6 +37,11 @@ pub struct RigEntry {
     pub default_branch: String,
     /// UTC epoch seconds the orchestrator first learned about this rig.
     pub registered_at_secs: u64,
+    /// Explicit worktree-root override for the rig's polecat checkouts. `None` means the rig
+    /// follows the convention default (resolved against `$HOME` at the edge — hq-mt-rigs.4);
+    /// `Some(path)` pins an absolute root set via [`crate::SetRigWorktreeRoot`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub worktree_root: Option<PathBuf>,
 }
 
 impl RigEntry {
@@ -50,6 +60,7 @@ impl RigEntry {
             upstream_url: None,
             default_branch: default_branch.into(),
             registered_at_secs,
+            worktree_root: None,
         }
     }
 }
@@ -138,6 +149,18 @@ impl RigCatalog {
         }
     }
 
+    /// Pin (or clear) the worktree-root override for a rig. Mirrors the actor's mutation so
+    /// the command path and direct messages stay in lockstep.
+    pub fn apply_worktree_root_change(&mut self, name: &str, new_root: Option<PathBuf>) -> bool {
+        match self.rigs.get_mut(name) {
+            Some(entry) => {
+                entry.worktree_root = new_root;
+                true
+            }
+            None => false,
+        }
+    }
+
     /// Snapshot of the catalog as a sorted vector. Cheap clone; used by the actor's
     /// `Snapshot` reply path.
     pub fn snapshot(&self) -> Vec<RigEntry> {
@@ -166,6 +189,8 @@ pub struct RigState {
     pub prefix_changes: Vec<(String, String, String)>,
     /// Sequence of `(rig, old_branch, new_branch)` default-branch transitions.
     pub default_branch_changes: Vec<(String, String, String)>,
+    /// Sequence of `(rig, old_root, new_root)` worktree-root override transitions.
+    pub worktree_root_changes: Vec<(String, Option<PathBuf>, PathBuf)>,
 }
 
 impl RigState {
@@ -199,6 +224,7 @@ impl RigState {
                         upstream_url: upstream_url.clone(),
                         default_branch: default_branch.clone(),
                         registered_at_secs: *now_secs,
+                        worktree_root: None,
                     },
                 );
             }
@@ -221,6 +247,13 @@ impl RigState {
                         .push((rig.clone(), old.clone(), new.clone()));
                 }
             }
+            RigEvent::WorktreeRootChanged { rig, old, new, .. } => {
+                if let Some(entry) = self.rigs.get_mut(rig) {
+                    entry.worktree_root = Some(new.clone());
+                    self.worktree_root_changes
+                        .push((rig.clone(), old.clone(), new.clone()));
+                }
+            }
         }
     }
 }
@@ -232,7 +265,10 @@ pub fn validate_rig_name(name: &str) -> Result<(), String> {
     if name.is_empty() {
         return Err("rig name is empty".into());
     }
-    if name.chars().any(|c| matches!(c, '-' | '.' | ' ' | '/' | '\\')) {
+    if name
+        .chars()
+        .any(|c| matches!(c, '-' | '.' | ' ' | '/' | '\\'))
+    {
         return Err(format!(
             "rig name {name:?} contains invalid characters; hyphens, dots, spaces, and path \
              separators are not allowed"
@@ -276,6 +312,34 @@ pub fn validate_prefix(prefix: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// Validate a worktree-root override. The orchestrator carves polecat checkouts under this
+/// path, so it must be absolute (no ambiguity about the base), contain no `..` component (no
+/// escaping the configured tree), and stay within [`MAX_WORKTREE_ROOT_LEN`].
+pub fn validate_worktree_root(root: &Path) -> Result<(), String> {
+    use std::path::Component;
+
+    let display = root.display();
+    if root.as_os_str().is_empty() {
+        return Err("worktree_root is empty".into());
+    }
+    if !root.is_absolute() {
+        return Err(format!(
+            "worktree_root {display:?} must be an absolute path"
+        ));
+    }
+    if root.as_os_str().len() > MAX_WORKTREE_ROOT_LEN {
+        return Err(format!(
+            "worktree_root {display:?} exceeds max length {MAX_WORKTREE_ROOT_LEN}"
+        ));
+    }
+    if root.components().any(|c| matches!(c, Component::ParentDir)) {
+        return Err(format!(
+            "worktree_root {display:?} must not contain a `..` component"
+        ));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -287,7 +351,10 @@ mod tests {
         assert!(validate_rig_name("my-rig").is_err(), "hyphen forbidden");
         assert!(validate_rig_name("a.b").is_err(), "dot forbidden");
         assert!(validate_rig_name("hq").is_err(), "reserved");
-        assert!(validate_rig_name("HQ").is_err(), "reserved case-insensitive");
+        assert!(
+            validate_rig_name("HQ").is_err(),
+            "reserved case-insensitive"
+        );
         assert!(validate_rig_name("").is_err());
     }
 
@@ -359,6 +426,67 @@ mod tests {
         assert_eq!(catalog.prefix_owner("pl"), None);
         assert_eq!(catalog.prefix_owner("pln"), Some("plane"));
         assert_eq!(catalog.get("plane").unwrap().prefix, "pln");
+    }
+
+    #[test]
+    fn validate_worktree_root_enforces_absolute_no_dotdot_and_length() {
+        assert!(validate_worktree_root(Path::new("/home/nixos/gastown-wt/acme/plane")).is_ok());
+        assert!(
+            validate_worktree_root(Path::new("relative/path")).is_err(),
+            "must be absolute"
+        );
+        assert!(
+            validate_worktree_root(Path::new("/home/../etc")).is_err(),
+            "no `..` component"
+        );
+        assert!(validate_worktree_root(Path::new("")).is_err(), "non-empty");
+        let long = format!("/{}", "a".repeat(MAX_WORKTREE_ROOT_LEN));
+        assert!(
+            validate_worktree_root(Path::new(&long)).is_err(),
+            "over max length"
+        );
+    }
+
+    #[test]
+    fn worktree_root_change_round_trips_through_state() {
+        let mut catalog = RigCatalog::default();
+        catalog.apply_add(RigEntry::new(
+            "plane",
+            "pl",
+            "git@github.com:o/plane.git",
+            "main",
+            1,
+        ));
+        let root = PathBuf::from("/home/nixos/gastown-wt/acme/plane");
+        assert!(catalog.apply_worktree_root_change("plane", Some(root.clone())));
+        assert_eq!(
+            catalog.get("plane").unwrap().worktree_root.as_ref(),
+            Some(&root)
+        );
+
+        let mut state = RigState::default();
+        state.apply(&RigEvent::Added {
+            rig: "plane".into(),
+            prefix: "pl".into(),
+            git_url: "git@github.com:o/plane.git".into(),
+            push_url: None,
+            upstream_url: None,
+            default_branch: "main".into(),
+            now_secs: 1,
+        });
+        state.apply(&RigEvent::WorktreeRootChanged {
+            rig: "plane".into(),
+            old: None,
+            new: root.clone(),
+            now_secs: 2,
+        });
+        assert_eq!(
+            state.worktree_root_changes,
+            vec![("plane".to_string(), None, root.clone())]
+        );
+
+        let rebuilt = RigCatalog::from_state(&state);
+        assert_eq!(rebuilt, catalog);
     }
 
     #[test]

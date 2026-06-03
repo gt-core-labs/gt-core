@@ -6,13 +6,17 @@
 //! the shared `RigCatalog::apply_*` methods so the actor messages and this path stay in
 //! lockstep) and returns the [`RigEvent`] for the actor to emit on the relay.
 
+use std::path::PathBuf;
+
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use gt_events::{AppError, Command};
 
 use crate::events::RigEvent;
-use crate::state::{validate_prefix, validate_rig_name, RigCatalog, RigEntry};
+use crate::state::{
+    validate_prefix, validate_rig_name, validate_worktree_root, RigCatalog, RigEntry,
+};
 
 /// Default tenant for a command built without an explicit workspace. The server stamps the
 /// real one from the auth context (see [`RigCommand::in_workspace`]); a command parsed from
@@ -82,6 +86,7 @@ impl AddRig {
             upstream_url: self.upstream_url.clone(),
             default_branch: self.default_branch.clone(),
             registered_at_secs: self.now_secs,
+            worktree_root: None,
         }
     }
 }
@@ -312,6 +317,58 @@ impl Command for SetRigDefaultBranch {
     }
 }
 
+/// Pin the worktree root the orchestrator carves polecat checkouts under for a rig. The
+/// matching filesystem move is a deploy-edge side-effect; this command records the override.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct SetRigWorktreeRoot {
+    pub name: String,
+    pub new_root: PathBuf,
+    pub now_secs: u64,
+    /// Server-injected tenant — see [`AddRig::workspace_id`].
+    #[serde(skip_deserializing, default = "default_workspace")]
+    #[schemars(skip)]
+    pub workspace_id: String,
+}
+
+impl Command for SetRigWorktreeRoot {
+    type Output = RigEvent;
+    type State = RigCatalog;
+
+    fn validate(&self, state: &Self::State) -> Result<(), AppError> {
+        if self.name.is_empty() {
+            return Err(AppError::Validation("rig name is empty".into()));
+        }
+        validate_worktree_root(&self.new_root).map_err(AppError::Validation)?;
+        let Some(current) = state.get(&self.name) else {
+            return Err(AppError::NotFound(format!("rig {:?}", self.name)));
+        };
+        if current.worktree_root.as_deref() == Some(self.new_root.as_path()) {
+            return Err(AppError::Validation(format!(
+                "worktree_root already {:?}",
+                self.new_root.display()
+            )));
+        }
+        Ok(())
+    }
+
+    fn execute(&self, state: &mut Self::State) -> Result<Self::Output, AppError> {
+        self.validate(state)?;
+        // `validate` proved the rig exists; unwrap is safe.
+        let old = state
+            .get(&self.name)
+            .expect("rig present")
+            .worktree_root
+            .clone();
+        state.apply_worktree_root_change(&self.name, Some(self.new_root.clone()));
+        Ok(RigEvent::WorktreeRootChanged {
+            rig: self.name.clone(),
+            old,
+            new: self.new_root.clone(),
+            now_secs: self.now_secs,
+        })
+    }
+}
+
 /// Sum type so the actor routes any rig command through a single message variant.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(tag = "kind", rename_all = "snake_case")]
@@ -321,6 +378,7 @@ pub enum RigCommand {
     Remove(RemoveRig),
     SetPrefix(SetRigPrefix),
     SetDefaultBranch(SetRigDefaultBranch),
+    SetWorktreeRoot(SetRigWorktreeRoot),
 }
 
 impl RigCommand {
@@ -332,6 +390,7 @@ impl RigCommand {
             Self::Remove(_) => "rig.remove",
             Self::SetPrefix(_) => "rig.set-prefix",
             Self::SetDefaultBranch(_) => "rig.set-default-branch",
+            Self::SetWorktreeRoot(_) => "rig.set-worktree-root",
         }
     }
 
@@ -344,6 +403,7 @@ impl RigCommand {
             Self::Remove(c) => &c.workspace_id,
             Self::SetPrefix(c) => &c.workspace_id,
             Self::SetDefaultBranch(c) => &c.workspace_id,
+            Self::SetWorktreeRoot(c) => &c.workspace_id,
         }
     }
 
@@ -359,6 +419,7 @@ impl RigCommand {
             Self::Remove(c) => c.workspace_id = ws,
             Self::SetPrefix(c) => c.workspace_id = ws,
             Self::SetDefaultBranch(c) => c.workspace_id = ws,
+            Self::SetWorktreeRoot(c) => c.workspace_id = ws,
         }
         self
     }
@@ -375,6 +436,7 @@ impl Command for RigCommand {
             Self::Remove(c) => c.validate(state),
             Self::SetPrefix(c) => c.validate(state),
             Self::SetDefaultBranch(c) => c.validate(state),
+            Self::SetWorktreeRoot(c) => c.validate(state),
         }
     }
 
@@ -385,6 +447,7 @@ impl Command for RigCommand {
             Self::Remove(c) => c.execute(state),
             Self::SetPrefix(c) => c.execute(state),
             Self::SetDefaultBranch(c) => c.execute(state),
+            Self::SetWorktreeRoot(c) => c.execute(state),
         }
     }
 }
@@ -485,9 +548,7 @@ mod tests {
     fn set_prefix_rejects_collision_and_no_op() {
         let mut catalog = RigCatalog::default();
         add_cmd("plane", "pl", 1).execute(&mut catalog).unwrap();
-        add_cmd("gastown", "gt", 2)
-            .execute(&mut catalog)
-            .unwrap();
+        add_cmd("gastown", "gt", 2).execute(&mut catalog).unwrap();
 
         let no_op = SetRigPrefix {
             name: "plane".into(),
@@ -545,6 +606,61 @@ mod tests {
     }
 
     #[test]
+    fn set_worktree_root_round_trip_and_validation() {
+        let mut catalog = RigCatalog::default();
+        add_cmd("plane", "pl", 1).execute(&mut catalog).unwrap();
+
+        // Relative path is rejected before the rig is even consulted.
+        let relative = SetRigWorktreeRoot {
+            name: "plane".into(),
+            new_root: "relative/path".into(),
+            now_secs: 2,
+            workspace_id: "default".into(),
+        };
+        assert!(matches!(
+            relative.validate(&catalog),
+            Err(AppError::Validation(_))
+        ));
+
+        // Unknown rig is a NotFound.
+        let missing = SetRigWorktreeRoot {
+            name: "ghost".into(),
+            new_root: "/srv/wt/ghost".into(),
+            now_secs: 3,
+            workspace_id: "default".into(),
+        };
+        assert!(matches!(
+            missing.validate(&catalog),
+            Err(AppError::NotFound(_))
+        ));
+
+        let ok = SetRigWorktreeRoot {
+            name: "plane".into(),
+            new_root: "/srv/wt/plane".into(),
+            now_secs: 4,
+            workspace_id: "default".into(),
+        };
+        let ev = ok.execute(&mut catalog).unwrap();
+        match ev {
+            RigEvent::WorktreeRootChanged { old, new, .. } => {
+                assert_eq!(old, None);
+                assert_eq!(new, PathBuf::from("/srv/wt/plane"));
+            }
+            _ => panic!("expected WorktreeRootChanged"),
+        }
+        assert_eq!(
+            catalog.get("plane").unwrap().worktree_root,
+            Some(PathBuf::from("/srv/wt/plane"))
+        );
+
+        // Re-pinning the same root is a no-op rejection.
+        assert!(matches!(
+            ok.validate(&catalog),
+            Err(AppError::Validation(_))
+        ));
+    }
+
+    #[test]
     fn command_routes_through_sum_type() {
         let mut catalog = RigCatalog::default();
         let cmd = RigCommand::Add(add_cmd("plane", "pl", 1));
@@ -562,7 +678,10 @@ mod tests {
         });
         let cmd: AddRig = serde_json::from_value(spoofed).unwrap();
         // skip_deserializing ignored the payload value: it lands on the default tenant.
-        assert_eq!(cmd.workspace_id, "default", "payload must not set workspace_id");
+        assert_eq!(
+            cmd.workspace_id, "default",
+            "payload must not set workspace_id"
+        );
 
         // The server stamps the resolved tenant via the sum-type builder.
         let stamped = RigCommand::Add(cmd).in_workspace("acme");
