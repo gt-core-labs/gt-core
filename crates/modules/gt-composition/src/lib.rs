@@ -41,7 +41,7 @@ use gt_beads::InMemoryBeads;
 use gt_events::{AppError, Envelope};
 use gt_eventlog::{EventRecord, EventStore, JsonlWriter};
 use gt_merge::actor::MergeHandle;
-use gt_merge::{InMemoryMergeRepo, MergeEvent};
+use gt_merge::{InMemoryMergeRepo, MergeBoard, MergeEvent, MergeState};
 use gt_module::RootBuilder;
 use gt_patrol::PatrolEvent;
 use gt_plugin::Plugin;
@@ -50,6 +50,8 @@ use gt_runtime::{RootHandle, RootRegistry};
 use gt_scheduling::actor::SchedHandle;
 use gt_scheduling::SchedEvent;
 use gt_workspace::WorkspaceId;
+
+use crate::mcp::eventlog::EventLog;
 
 /// Observer that drives the scheduler from other domains' events — the scheduler reactor arm:
 /// `patrol.lease-expired.v1` → re-enqueue the freed bead (`SchedHandle::enqueue`);
@@ -259,9 +261,55 @@ impl Plugin for ProbePlugin {
 /// - registers the role observers + the scheduler/merge reactor arms + the `ProbePlugin`, and
 ///   starts the actor stack.
 ///
+/// Replay the workspace's scheduling log into the still-pending dispatch queue (`hq-orchd.5`).
+///
+/// Folds `scheduling.*` records keeping each bead's priority (the shared [`gt_scheduling`] replay
+/// reducer drops it, so this keeps a local `(bead, priority)` accumulator) and drops any bead that
+/// later dispatched / failed / timed out — what remains is the queue that was still waiting when
+/// the daemon stopped. The result seeds [`gt_scheduling::actor::spawn_hydrated`] so a restart
+/// restores the queue without re-emitting `Enqueue` events.
+pub fn replay_scheduling_pending(
+    log: &EventLog,
+    ws: &str,
+) -> Result<Vec<(String, u8)>, gt_store_dolt::AppError> {
+    log.replay_domain::<Vec<(String, u8)>, SchedEvent, _>(
+        Some(ws),
+        "scheduling.",
+        Vec::new(),
+        |acc, e| match e {
+            SchedEvent::Enqueue { bead, priority } => acc.push((bead.clone(), *priority)),
+            SchedEvent::Dispatched { bead, .. }
+            | SchedEvent::DispatchFailed { bead, .. }
+            | SchedEvent::DispatchTimeout { bead } => acc.retain(|(b, _)| b != bead),
+        },
+    )
+}
+
+/// Replay the workspace's merge log into the in-flight [`MergeBoard`] (`hq-orchd.5`) through the
+/// domain reducer, so a restart restores open merge slots before the actor starts processing
+/// edge messages. Seeds [`gt_merge::actor::spawn_hydrated`].
+pub fn replay_merge_board(
+    log: &EventLog,
+    ws: &str,
+) -> Result<MergeBoard, gt_store_dolt::AppError> {
+    let state = log.replay_domain::<MergeState, MergeEvent, _>(
+        Some(ws),
+        "merge.",
+        MergeState::default(),
+        MergeState::apply,
+    )?;
+    Ok(MergeBoard::from_state(&state))
+}
+
 /// The result is cached by the registry: a second call returns the same `Arc` without
 /// re-hydrating. `probe` is wired into the hydrated root so a caller can watch the cascade; it
 /// is ignored on a cache hit (the closure does not run).
+///
+/// ## Durability (`hq-orchd.2`) + boot hydration (`hq-orchd.5`)
+///
+/// On hydration the closure first replays the durable log (when `log_root` is `Some`) into the
+/// pending scheduler queue + the merge board via [`replay_scheduling_pending`] /
+/// [`replay_merge_board`], seeding the actors so in-flight work survives a restart.
 ///
 /// ## Durability (`hq-orchd.2`)
 ///
@@ -282,10 +330,27 @@ pub async fn live_root(
         let ws_slug = ws.as_str().to_string();
         let handle = RootHandle::new(ws, RootBuilder::new().build().expect("empty root builds"));
 
+        // Boot hydration (hq-orchd.5): when persisting, replay the durable log into the pending
+        // scheduler queue + the in-flight merge board BEFORE spawning the actors, so a restart
+        // resumes still-open work. A fresh/empty log yields empty state. `None` (in-memory test)
+        // skips replay. A corrupt log at boot is fatal — fail loudly, like the other steps here.
+        let (sched_pending, merge_board) = match &log_root {
+            Some(root) => {
+                let log = EventLog::new(Some(root.clone()));
+                (
+                    replay_scheduling_pending(&log, &ws_slug).expect("replay scheduling log"),
+                    replay_merge_board(&log, &ws_slug).expect("replay merge log"),
+                )
+            }
+            None => (Vec::new(), MergeBoard::default()),
+        };
+
         let (sched_tx, sched_rx) = mpsc::channel(64);
-        let sched = gt_scheduling::actor::spawn(InMemoryBeads::default(), sched_tx, 4);
+        let sched =
+            gt_scheduling::actor::spawn_hydrated(InMemoryBeads::default(), sched_tx, 4, sched_pending);
         let (merge_tx, merge_rx) = mpsc::channel(64);
-        let merge = gt_merge::actor::spawn(InMemoryMergeRepo::default(), merge_tx);
+        let merge =
+            gt_merge::actor::spawn_hydrated(InMemoryMergeRepo::default(), merge_tx, merge_board);
 
         // Own the domain actors for the workspace lifetime, and flow their output to the hub.
         handle

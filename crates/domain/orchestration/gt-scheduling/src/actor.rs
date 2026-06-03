@@ -132,9 +132,31 @@ pub fn spawn<R>(repo: R, events: mpsc::Sender<Envelope<SchedEvent>>, max: usize)
 where
     R: BeadRepository + Send + Sync + 'static,
 {
+    spawn_hydrated(repo, events, max, Vec::new())
+}
+
+/// Boot hydration (`hq-orchd.5`): same as [`spawn`] but seeds the dispatcher's pending queue
+/// with `(bead, priority)` pairs reconstructed by replaying the workspace event log, so a daemon
+/// restart restores still-pending dispatch work before the actor processes any edge message.
+/// Seeding the queue directly (rather than re-sending `Enqueue` commands) means hydration emits
+/// **no** events — the restored beads are not re-logged. The capacity governor starts empty: a
+/// restart assumes the previous run's in-flight polecats are gone, so freed slots resume from
+/// zero (polecat re-supervision is `hq-orchd.3`).
+pub fn spawn_hydrated<R>(
+    repo: R,
+    events: mpsc::Sender<Envelope<SchedEvent>>,
+    max: usize,
+    pending: Vec<(String, u8)>,
+) -> SchedHandle
+where
+    R: BeadRepository + Send + Sync + 'static,
+{
     let (tx, mut rx) = mpsc::channel::<SchedMsg>(64);
     tokio::spawn(async move {
         let mut core = SchedCore::new(max);
+        for (bead, priority) in pending {
+            core.queue.enqueue(bead, priority);
+        }
         let mut worker_seq: u64 = 0;
 
         while let Some(msg) = rx.recv().await {

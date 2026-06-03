@@ -9,10 +9,13 @@
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use gt_composition::live_root;
+use gt_composition::mcp::eventlog::EventLog;
+use gt_composition::{live_root, replay_merge_board, replay_scheduling_pending};
 use gt_eventlog::{EventRecord, EventStore, JsonlWriter};
+use gt_merge::{MergeEvent, MergeSlotState};
 use gt_patrol::PatrolEvent;
 use gt_runtime::RootRegistry;
+use gt_scheduling::SchedEvent;
 use gt_workspace::WorkspaceId;
 
 #[tokio::test]
@@ -76,6 +79,59 @@ async fn live_root_round_trips_a_reaction_through_the_hub_and_caches() {
     assert_eq!(reg.len(), 1);
 
     h.shutdown().await;
+}
+
+/// `hq-orchd.5`: boot hydration replays the durable workspace log back into the pending scheduler
+/// queue + the in-flight merge board, so a daemon restart resumes still-open work. Drives the two
+/// replay helpers `live_root` calls on hydration directly (the cached handle does not expose the
+/// domain handles), over a hand-seeded log: a dispatched bead must NOT come back as pending, an
+/// open merge slot must be restored at its last state.
+#[test]
+fn boot_hydration_replays_pending_queue_and_merge_board() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let log = EventLog::new(Some(dir.path().to_path_buf()));
+
+    // scheduling: g1 enqueued then dispatched (gone), g2 + g3 still pending.
+    log.append(Some("acme"), SchedEvent::Enqueue { bead: "g1".into(), priority: 0 })
+        .unwrap();
+    log.append(Some("acme"), SchedEvent::Enqueue { bead: "g2".into(), priority: 2 })
+        .unwrap();
+    log.append(
+        Some("acme"),
+        SchedEvent::Dispatched { bead: "g1".into(), worker: "w1".into() },
+    )
+    .unwrap();
+    log.append(Some("acme"), SchedEvent::Enqueue { bead: "g3".into(), priority: 1 })
+        .unwrap();
+
+    let pending = replay_scheduling_pending(&log, "acme").expect("replay scheduling");
+    assert_eq!(
+        pending,
+        vec![("g2".to_string(), 2u8), ("g3".to_string(), 1u8)],
+        "dispatched bead dropped, pending beads restored with priority"
+    );
+
+    // merge: m1 ready, m2 ready→merging — both open slots, m2 at Merging.
+    log.append(
+        Some("acme"),
+        MergeEvent::Ready { bead: "m1".into(), branch: "b1".into(), channel_msg_id: "x1".into() },
+    )
+    .unwrap();
+    log.append(
+        Some("acme"),
+        MergeEvent::Ready { bead: "m2".into(), branch: "b2".into(), channel_msg_id: "x2".into() },
+    )
+    .unwrap();
+    log.append(Some("acme"), MergeEvent::Started { bead: "m2".into() })
+        .unwrap();
+
+    let board = replay_merge_board(&log, "acme").expect("replay merge");
+    assert_eq!(board.len(), 2, "both merge slots restored");
+    assert_eq!(board.get("m1").expect("m1 slot").state, MergeSlotState::Ready);
+    assert_eq!(board.get("m2").expect("m2 slot").state, MergeSlotState::Merging);
+
+    // Isolation: a different workspace's log is empty (path-partitioned per tenant).
+    assert!(replay_scheduling_pending(&log, "other").unwrap().is_empty());
 }
 
 /// `hq-orchd.2`: a `live_root` with a `log_root` persists every hub record to the workspace's
