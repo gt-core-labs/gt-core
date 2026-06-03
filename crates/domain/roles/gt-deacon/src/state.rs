@@ -21,12 +21,16 @@ pub struct DrainItem {
 
 /// Aggregate state of the deacon domain. `draining = false` is the steady-state ("the
 /// town is up"). `pending` is the open set the deacon is waiting on, empty when nothing
-/// needs to finish before exit.
+/// needs to finish before exit. `stopped` latches an emergency stop for this workspace —
+/// a one-way flag, since an e-stop is irreversible for the remainder of the process.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct DeaconState {
     pub draining: bool,
     pub completed: bool,
     pub pending: BTreeMap<String, DrainItem>,
+    /// Emergency stop latched (per workspace). Once true, further drain/e-stop commands
+    /// no-op; the actual session kill is performed by the cross-domain reaction, not here.
+    pub stopped: bool,
 }
 
 impl DeaconState {
@@ -53,6 +57,12 @@ impl DeaconState {
             }
             DeaconEvent::DrainComplete { .. } => {
                 self.completed = true;
+            }
+            DeaconEvent::EmergencyStopped { .. } => {
+                // Latch the e-stop. `pending` is left intact as the historical record of
+                // what was in flight when the operator pulled the cord; the cross-domain
+                // reaction (composition root → polecat) performs the real session kill.
+                self.stopped = true;
             }
         }
         Ok(())

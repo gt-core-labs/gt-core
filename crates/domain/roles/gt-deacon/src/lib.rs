@@ -17,7 +17,7 @@ mod repo;
 mod state;
 
 pub use actor::{spawn, spawn_hydrated, DeaconHandle, DeaconMsg};
-pub use commands::{BeginDrain, DeaconCommand, FinishItem, TrackItem};
+pub use commands::{BeginDrain, DeaconCommand, EmergencyStop, FinishItem, TrackItem};
 pub use events::DeaconEvent;
 pub use repo::{DeaconRepository, InMemoryDeaconRepo};
 pub use state::{DeaconState, DrainItem};

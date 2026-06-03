@@ -24,6 +24,13 @@ pub enum DeaconEvent {
     /// Pending set hit zero while drain was active. Terminal; emitted at most once per
     /// `DrainRequested` cycle. Operators wait on this before tearing the runtime down.
     DrainComplete { at: u64 },
+    /// Emergency stop latched for THIS workspace's deacon. Unlike `DrainRequested` (which
+    /// waits for the pending set to finish), an e-stop is an immediate kill decision: the
+    /// flag is recorded here and a cross-domain reaction (composition root → polecat) kills
+    /// the workspace's live sessions. Per-workspace by construction — one deacon actor per
+    /// workspace, so an e-stop never reaches another tenant (hq-mt-runtime.9). `by` is the
+    /// operator identity; `at` is edge-stamped epoch seconds for clock-free replay.
+    EmergencyStopped { by: String, at: u64 },
 }
 
 impl EventKind for DeaconEvent {
@@ -33,6 +40,7 @@ impl EventKind for DeaconEvent {
             DeaconEvent::ItemBegun { .. } => "deacon.item_begun",
             DeaconEvent::ItemFinished { .. } => "deacon.item_finished",
             DeaconEvent::DrainComplete { .. } => "deacon.drain_complete",
+            DeaconEvent::EmergencyStopped { .. } => "deacon.emergency_stop",
         }
     }
 }

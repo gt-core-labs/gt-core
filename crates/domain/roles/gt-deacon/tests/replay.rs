@@ -9,8 +9,8 @@ use tokio::sync::mpsc;
 
 use gt_eventlog::{read_all, EventRecord, EventStore, JsonlWriter};
 use gt_deacon::{
-    actor as deacon_actor, BeginDrain, DeaconCommand, DeaconEvent, DeaconState, FinishItem,
-    InMemoryDeaconRepo, TrackItem,
+    actor as deacon_actor, BeginDrain, DeaconCommand, DeaconEvent, DeaconState, EmergencyStop,
+    FinishItem, InMemoryDeaconRepo, TrackItem,
 };
 use gt_events::Envelope;
 
@@ -115,6 +115,24 @@ async fn live_actor_state_matches_replay_byte_identical() {
         .await
         .expect("finish b (closes drain)");
 
+    // Emergency stop trips the per-workspace e-stop latch — emits one EmergencyStopped.
+    handle
+        .exec(DeaconCommand::EmergencyStop(EmergencyStop {
+            by: "mayor".into(),
+            at: 1_030,
+        }))
+        .await
+        .expect("emergency stop");
+
+    // Re-issuing e-stop is idempotent: already stopped → zero events.
+    handle
+        .exec(DeaconCommand::EmergencyStop(EmergencyStop {
+            by: "mayor".into(),
+            at: 1_031,
+        }))
+        .await
+        .expect("emergency stop (idempotent)");
+
     drop(handle);
     let live_log = drain_to_log(&mut rx, &writer).await;
 
@@ -126,6 +144,7 @@ async fn live_actor_state_matches_replay_byte_identical() {
             DeaconEvent::DrainRequested { .. } => "drain_requested",
             DeaconEvent::ItemFinished { .. } => "item_finished",
             DeaconEvent::DrainComplete { .. } => "drain_complete",
+            DeaconEvent::EmergencyStopped { .. } => "emergency_stop",
         })
         .collect();
     assert_eq!(
@@ -138,6 +157,8 @@ async fn live_actor_state_matches_replay_byte_identical() {
             "item_finished",   // finish a
             "item_finished",   // finish b
             "drain_complete",  // pending empty + draining
+            "emergency_stop",  // first EmergencyStop
+            // second EmergencyStop was idempotent: no event
         ],
         "unexpected event sequence in log",
     );
@@ -160,4 +181,5 @@ async fn live_actor_state_matches_replay_byte_identical() {
     assert!(replayed.draining, "drain flag should remain set");
     assert!(replayed.completed, "completion flag should be set");
     assert!(replayed.pending.is_empty(), "pending set should be empty");
+    assert!(replayed.stopped, "e-stop latch should be set after EmergencyStop");
 }

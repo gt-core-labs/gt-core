@@ -123,9 +123,12 @@ pub fn spawn_hydrated<R: DeaconRepository + 'static>(
                                             let _ = repo.remove_item(id).await;
                                         }
                                         DeaconEvent::DrainRequested { .. }
-                                        | DeaconEvent::DrainComplete { .. } => {
-                                            // No per-item repo write — the drain flag lives
-                                            // on the actor snapshot, not the per-item table.
+                                        | DeaconEvent::DrainComplete { .. }
+                                        | DeaconEvent::EmergencyStopped { .. } => {
+                                            // No per-item repo write — the drain/stop flags
+                                            // live on the actor snapshot, not the per-item
+                                            // table. The e-stop's real session kill is the
+                                            // composition root's cross-domain reaction.
                                         }
                                     }
                                 }

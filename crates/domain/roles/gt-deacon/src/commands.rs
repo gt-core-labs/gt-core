@@ -41,12 +41,24 @@ pub struct FinishItem {
     pub at: u64,
 }
 
+/// Trip the emergency stop for this workspace's deacon. Idempotent: re-issuing while already
+/// stopped is a no-op (returns `Ok(vec![])`). Distinct from `BeginDrain` — an e-stop does not
+/// wait for the pending set, it records an immediate kill decision the composition root acts on.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct EmergencyStop {
+    /// Operator identity that pulled the cord (`"mayor"`, an operator name, …).
+    pub by: String,
+    /// Edge-stamped epoch seconds — recorded so replay does not depend on a clock.
+    pub at: u64,
+}
+
 /// The set of mutations the deacon actor accepts.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub enum DeaconCommand {
     BeginDrain(BeginDrain),
     Track(TrackItem),
     Finish(FinishItem),
+    EmergencyStop(EmergencyStop),
 }
 
 impl DeaconCommand {
@@ -80,6 +92,12 @@ impl DeaconCommand {
                 }
                 if !state.pending.contains_key(&f.id) {
                     return Err(AppError::NotFound(format!("item {} not tracked", f.id)));
+                }
+                Ok(())
+            }
+            DeaconCommand::EmergencyStop(e) => {
+                if e.by.is_empty() {
+                    return Err(AppError::Validation("e-stop `by` empty".into()));
                 }
                 Ok(())
             }
@@ -133,6 +151,59 @@ impl DeaconCommand {
                 }
                 Ok(out)
             }
+            DeaconCommand::EmergencyStop(e) => {
+                // Idempotent: an already-stopped workspace emits nothing so a doubled
+                // operator press (or replay) does not re-latch.
+                if state.stopped {
+                    Ok(Vec::new())
+                } else {
+                    Ok(vec![DeaconEvent::EmergencyStopped {
+                        by: e.by.clone(),
+                        at: e.at,
+                    }])
+                }
+            }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn emergency_stop_rejects_empty_by() {
+        let st = DeaconState::default();
+        let err = DeaconCommand::EmergencyStop(EmergencyStop { by: String::new(), at: 1 })
+            .validate(&st)
+            .unwrap_err();
+        assert!(matches!(err, AppError::Validation(_)));
+    }
+
+    #[test]
+    fn emergency_stop_emits_once_then_idempotent() {
+        let mut st = DeaconState::default();
+        let evs = DeaconCommand::EmergencyStop(EmergencyStop { by: "mayor".into(), at: 7 })
+            .execute(&st)
+            .unwrap();
+        assert_eq!(evs.len(), 1);
+        assert!(matches!(evs[0], DeaconEvent::EmergencyStopped { at: 7, .. }));
+        for ev in &evs { st.apply(ev).unwrap(); }
+        assert!(st.stopped);
+        let again = DeaconCommand::EmergencyStop(EmergencyStop { by: "mayor".into(), at: 8 })
+            .execute(&st)
+            .unwrap();
+        assert!(again.is_empty(), "already-stopped e-stop must emit nothing");
+    }
+
+    #[test]
+    fn emergency_stop_preserves_pending_as_historical_record() {
+        // E-stop latches `stopped` but does NOT clear pending — the in-flight set is the
+        // record of what was killed; the real session kill is the cross-domain reaction.
+        let mut st = DeaconState::default();
+        st.apply(&DeaconEvent::ItemBegun { id: "x".into(), kind: "merge".into() }).unwrap();
+        st.apply(&DeaconEvent::EmergencyStopped { by: "op".into(), at: 1 }).unwrap();
+        assert!(st.stopped);
+        assert!(st.pending.contains_key("x"), "pending preserved on e-stop");
     }
 }
