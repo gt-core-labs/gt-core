@@ -20,6 +20,7 @@ members = [
     "crates/domain/platform/gt-issues",
     "crates/domain/platform/gt-meta",
     "crates/domain/platform/gt-rig",
+    "crates/domain/platform/gt-wisp",
     "crates/domain/platform/gt-feed",
     "crates/domain/platform/gt-skills",
     "crates/domain/lifecycle/gt-agent",
