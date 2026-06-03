@@ -21,6 +21,7 @@ members = [
     "crates/domain/platform/gt-meta",
     "crates/domain/platform/gt-rig",
     "crates/domain/platform/gt-wisp",
+    "crates/domain/platform/gt-notify",
     "crates/domain/platform/gt-feed",
     "crates/domain/platform/gt-skills",
     "crates/domain/lifecycle/gt-agent",
