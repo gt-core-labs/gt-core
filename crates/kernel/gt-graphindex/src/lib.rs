@@ -36,8 +36,12 @@
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
+#[cfg(feature = "graphify")]
+mod graphify;
 mod memory;
 mod port;
 
+#[cfg(feature = "graphify")]
+pub use graphify::GraphifyIndexer;
 pub use memory::InMemoryGraphIndexer;
 pub use port::{GraphAnswer, GraphError, GraphIndexer, IndexDiff, IndexStats, IndexStatus};

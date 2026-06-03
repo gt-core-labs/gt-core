@@ -12,12 +12,18 @@ authors.workspace = true
 # uses for its `pg`/`axum` adapters (docs/03 Rule 4).
 [features]
 default = []
-# graphify = []   # enabled by `hq-graphrig.2` when the GraphifyIndexer adapter lands.
+# The graphify CLI bridge. Off by default so the core build pulls neither tokio's
+# process machinery nor serde_json — only consumers that wire the real adapter
+# (the composition edge) turn it on.
+graphify = ["dep:tokio", "dep:serde_json"]
 
 [dependencies]
 async-trait = { workspace = true }
 serde = { workspace = true }
 thiserror = { workspace = true }
+# Edge-only deps for the `graphify` adapter (spawn the venv python, parse its JSON).
+tokio = { workspace = true, optional = true, features = ["process", "io-util"] }
+serde_json = { workspace = true, optional = true }
 
 [dev-dependencies]
 tokio = { workspace = true }
