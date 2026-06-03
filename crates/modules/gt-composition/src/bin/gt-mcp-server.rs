@@ -31,7 +31,7 @@ use rmcp::transport::{StreamableHttpServerConfig, StreamableHttpService};
 
 use gt_audit::{AuditSink, InMemoryAudit};
 use gt_composition::mcp::{
-    AgentHandler, ConvoyHandler, EventLog, GraphHandler, MergeHandler, PgRigPrefixes,
+    AgentHandler, AuditHandler, ConvoyHandler, EventLog, GraphHandler, MergeHandler, PgRigPrefixes,
     PgWorkspaceStatus, QuotaHandler, RigHandler, WorkspaceHandler, WsPools,
 };
 use gt_graphindex::GraphifyIndexer;
@@ -122,7 +122,8 @@ async fn main() -> anyhow::Result<()> {
             "[gt-mcp-server] GT_REPO_DIR unset; surface existence checks skipped (accept-all)"
         ),
     }
-    let mut service = IssuesServer::new(store, default_scope, rbac, audit, tools, repo_dir);
+    let mut service =
+        IssuesServer::new(store, default_scope, rbac, audit.clone(), tools, repo_dir);
 
     // The per-workspace event log (the event-sourced domains' durable store +
     // the SSE feed's source) is path-partitioned under GT_EVENTLOG_ROOT (default
@@ -136,6 +137,11 @@ async fn main() -> anyhow::Result<()> {
     // GT_PG_URL is set; unset ⇒ an empty router, so the server serves issues +
     // meta exactly as before.
     let (domains, rig_prefixes, ws_status) = build_domain_router(event_log.clone()).await?;
+    // audit.* tails the same audit sink the server records into (hq-mt-ops.3).
+    // Registered unconditionally — it reads the in-memory or Postgres sink, so it
+    // works even when GT_PG_URL is unset and the rest of the router is empty.
+    let domains = domains.register(Arc::new(AuditHandler::new(audit.clone())));
+    eprintln!("[gt-mcp-server] audit.tail dispatch on (per-workspace audit trail)");
     service = service.with_domains(Arc::new(domains));
     // Wire issues.create rig-prefix routing (hq-mt-rigs.6) when the PG rig catalog
     // is present; without it the server accepts any bead-id prefix as before.

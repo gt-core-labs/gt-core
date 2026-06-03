@@ -19,6 +19,7 @@
 //!   log, executes, and appends the produced event(s) back (see [`EventLog`]).
 
 pub mod agent;
+pub mod audit;
 pub mod convoy;
 pub mod eventlog;
 pub mod graph;
@@ -30,6 +31,7 @@ pub mod util;
 pub mod workspace;
 
 pub use agent::AgentHandler;
+pub use audit::AuditHandler;
 pub use convoy::ConvoyHandler;
 pub use eventlog::EventLog;
 pub use graph::GraphHandler;
