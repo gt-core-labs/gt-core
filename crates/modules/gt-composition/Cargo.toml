@@ -87,6 +87,10 @@ tokio = { workspace = true, features = ["macros", "rt-multi-thread", "sync", "ti
 serde_json = { workspace = true }
 # Tempdir-rooted event logs for the event-sourced handler tests.
 tempfile = { workspace = true }
+# Drive the SSE feed router in-process (hq-mcp-test.7): `oneshot` a request and
+# poll the streaming body frames.
+tower = { version = "0.5", features = ["util"] }
+http-body-util = "0.1"
 # Per-run throwaway Dolt database creation for the resources contract test
 # (hq-mcp-test.3) — CREATE DATABASE before DoltIssues::connect.
 mysql_async = { workspace = true }
