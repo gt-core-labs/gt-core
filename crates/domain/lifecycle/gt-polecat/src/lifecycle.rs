@@ -192,6 +192,42 @@ pub struct SpawnTemplate {
 }
 
 impl SpawnTemplate {
+    /// Build a production [`SpawnTemplate`] from the daemon's environment (`hq-orchd.3`), the
+    /// gt-core counterpart of the env the gastown `gt` bin read (`GT_RIG`/`GT_RIG_PATH`/
+    /// `GT_POLECAT_CMD`/…). `workspace` is layered into `base_env` as [`GT_WORKSPACE`] so every
+    /// slung polecat carries its tenant for dashboard attribution (`hq-mt-runtime.5`).
+    ///
+    /// - `GT_RIG` → rig name (default `hq`); `GT_POLECAT_PREFIX` → session-name prefix
+    ///   (default = the rig name).
+    /// - `GT_RIG_PATH` → working directory (default `.`).
+    /// - `GT_POLECAT_CMD` → agent command (default `claude`).
+    /// - `GT_HEARTBEAT_DIR` → heartbeat directory (default the system temp dir).
+    pub fn from_env(workspace: &str) -> Self {
+        let env = |k: &str| std::env::var(k).ok().filter(|v| !v.is_empty());
+        let rig = env("GT_RIG").unwrap_or_else(|| "hq".to_string());
+        let prefix = env("GT_POLECAT_PREFIX").unwrap_or_else(|| rig.clone());
+        let workdir = PathBuf::from(env("GT_RIG_PATH").unwrap_or_else(|| ".".to_string()));
+        let command = env("GT_POLECAT_CMD").unwrap_or_else(|| "claude".to_string());
+        let heartbeat_dir = env("GT_HEARTBEAT_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(std::env::temp_dir);
+        let base_env = vec![
+            ("GT_ROLE".to_string(), "polecat".to_string()),
+            ("GT_RIG".to_string(), rig.clone()),
+            ("GT_RIG_PATH".to_string(), workdir.display().to_string()),
+            (GT_WORKSPACE.to_string(), workspace.to_string()),
+        ];
+        SpawnTemplate {
+            rig,
+            prefix,
+            workdir,
+            command,
+            args: Vec::new(),
+            base_env,
+            heartbeat_dir,
+        }
+    }
+
     /// Build the per-member [`SpawnSpec`]. `member` is the dispatched convoy member / slung
     /// bead: it becomes both the polecat-name suffix and the pinned `GT_HOOK_BEAD`. `convoy`
     /// is carried in `GT_CONVOY` for context (mirrors the Go `gt sling <convoy> <member>`

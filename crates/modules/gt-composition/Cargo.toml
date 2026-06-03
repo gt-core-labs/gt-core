@@ -27,6 +27,9 @@ gt-quota = { workspace = true }
 # gt_workspace_quota_consumed on each quota.sample.
 gt-telemetry = { workspace = true }
 gt-patrol = { workspace = true }
+# Polecat supervision (hq-orchd.3): the daemon slings spawn_tmux polecats on dispatch +
+# re-slings dead ones via PolecatSupervisor, bounded by the PoolAllocator admission core.
+gt-polecat = { workspace = true }
 gt-runtime = { workspace = true }
 gt-roles = { workspace = true }
 gt-beads = { workspace = true }

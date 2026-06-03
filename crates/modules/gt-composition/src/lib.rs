@@ -29,6 +29,7 @@
 //! their events onto the hub via `RootHandle::drain_events_from`.
 
 pub mod mcp;
+pub mod polecat;
 pub mod stream;
 
 use std::path::PathBuf;

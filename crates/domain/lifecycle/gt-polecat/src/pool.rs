@@ -96,6 +96,21 @@ impl PoolAllocator {
         self.pool_size.insert(workspace.into(), size);
     }
 
+    /// The current host-wide cap (sum of live polecats across all workspaces).
+    pub fn host_cap(&self) -> usize {
+        self.host_cap
+    }
+
+    /// Update the host-wide cap. The autonomous daemon's capacity loop (`hq-orchd.3`) recomputes
+    /// this from live host metrics (CPU cores + available RAM) and calls it on a timer, so the
+    /// admission ceiling tracks real headroom. Shrinking below the current `total_in_flight` is
+    /// allowed — it is admission-side, like [`set_pool_size`](Self::set_pool_size): no new claim is
+    /// admitted until live polecats finish and bring the total back under, but running polecats are
+    /// never evicted (eviction is side-effecting and stays at the edge, NN#2).
+    pub fn set_host_cap(&mut self, cap: usize) {
+        self.host_cap = cap;
+    }
+
     /// The configured pool size for `workspace` (its explicit value, else the default).
     pub fn pool_size(&self, workspace: &str) -> usize {
         self.pool_size
