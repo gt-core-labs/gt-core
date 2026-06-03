@@ -20,10 +20,10 @@ use serde::de::DeserializeOwned;
 use serde_json::{json, Value};
 
 use gt_events::Command;
-use gt_mcp_server::{DomainCtx, DomainHandler};
+use gt_mcp_server::{DomainCtx, DomainHandler, WorkspaceRigPrefixes};
 use gt_rig::{
     AddRig, AdoptRig, PgRigs, RemoveRig, RigCatalog, RigEntry, RigRepository, SetRigDefaultBranch,
-    SetRigPrefix, SetRigWorktreeRoot,
+    SetRigPrefix, SetRigWorktreeRoot, RESERVED_RIG_NAMES,
 };
 use gt_store_dolt::AppError;
 
@@ -109,6 +109,38 @@ impl DomainHandler for RigHandler {
             }
             other => Err(AppError::Validation(format!("unknown tool `{other}`"))),
         }
+    }
+}
+
+/// PG-backed [`WorkspaceRigPrefixes`] for `issues.create` prefix routing
+/// (hq-mt-rigs.6). Shares the same per-workspace pool cache as [`RigHandler`], so a
+/// prefix is checked against exactly the caller workspace's `rigs` table.
+pub struct PgRigPrefixes {
+    pools: Arc<WsPools>,
+}
+
+impl PgRigPrefixes {
+    /// Wrap the per-workspace pool cache (the same one the `rig.*` handler uses).
+    pub fn new(pools: Arc<WsPools>) -> Self {
+        Self { pools }
+    }
+}
+
+#[async_trait]
+impl WorkspaceRigPrefixes for PgRigPrefixes {
+    async fn is_allowed(&self, ws: &str, prefix: &str) -> Result<bool, AppError> {
+        // Reserved/infra prefixes (e.g. the tracker's own `hq`) are never registered
+        // as rigs but must always route, or every reserved-prefix bead would be
+        // rejected and the tracker bricked.
+        if RESERVED_RIG_NAMES.contains(&prefix) {
+            return Ok(true);
+        }
+        let pool = self.pools.get(Some(ws)).await?;
+        let repo = PgRigs::new(pool.pool().clone());
+        // The connection's `search_path` scopes this read to the caller's
+        // `ws_<slug>` schema, so a prefix registered only in another workspace is
+        // absent here — per-workspace routing, no global uniqueness, no leak.
+        Ok(repo.prefix_owner(prefix).await.map_err(ev_err)?.is_some())
     }
 }
 

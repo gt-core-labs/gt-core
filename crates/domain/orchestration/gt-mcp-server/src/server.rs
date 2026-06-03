@@ -27,6 +27,7 @@ use rmcp::{ErrorData as McpError, ServerHandler};
 
 use crate::dispatch::{dispatch, dispatch_meta, parse_issue_filter};
 use crate::domain::{DomainCtx, DomainRouter};
+use crate::prefixes::WorkspaceRigPrefixes;
 use crate::workspace::{workspace_from_ext, WorkspaceStores};
 
 /// The shared MCP service. Cheap to clone (every field is `Arc`-backed) so the
@@ -68,6 +69,12 @@ pub struct IssuesServer {
     /// gate), and the scope is derived from the claim's workspace role. `None`
     /// keeps the legacy `X-Actor`/`X-Workspace` header behaviour exactly.
     authenticator: Option<Arc<dyn Authenticator + Send + Sync>>,
+    /// Per-workspace rig-prefix policy for `issues.create` (hq-mt-rigs.6). `Some`
+    /// when the composition root wires a rig catalog: a new bead whose id prefix is
+    /// neither a registered rig prefix in the caller's workspace nor a reserved
+    /// prefix is rejected. `None` keeps the legacy accept-all create behaviour, so
+    /// single-tenant / no-Postgres builds are unaffected.
+    rig_prefixes: Option<Arc<dyn WorkspaceRigPrefixes>>,
 }
 
 impl IssuesServer {
@@ -94,6 +101,7 @@ impl IssuesServer {
             repo_dir: repo_dir.map(Arc::new),
             domains: Arc::new(DomainRouter::new()),
             authenticator: None,
+            rig_prefixes: None,
         }
     }
 
@@ -122,6 +130,15 @@ impl IssuesServer {
     /// default-workspace [`store`](Self::store), so the change is additive.
     pub fn with_workspaces(mut self, workspaces: Arc<WorkspaceStores>) -> Self {
         self.workspaces = Some(workspaces);
+        self
+    }
+
+    /// Wire the per-workspace rig-prefix policy (hq-mt-rigs.6). With it, an
+    /// `issues.create` whose bead-id prefix is not a registered rig prefix in the
+    /// caller's workspace (nor a reserved prefix) is rejected. Additive — without it
+    /// the server accepts any prefix, exactly as before.
+    pub fn with_rig_prefixes(mut self, rig_prefixes: Arc<dyn WorkspaceRigPrefixes>) -> Self {
+        self.rig_prefixes = Some(rig_prefixes);
         self
     }
 
@@ -339,7 +356,16 @@ impl ServerHandler for IssuesServer {
             "meta" => dispatch_meta(&store, &tool, args.clone(), &scope.actor, &self.tools).await,
             "issues" => {
                 let repo_dir = self.repo_dir.as_deref().map(|p| p.as_path());
-                dispatch(&store, &tool, args.clone(), &scope.actor, repo_dir).await
+                dispatch(
+                    &store,
+                    &tool,
+                    args.clone(),
+                    &scope.actor,
+                    repo_dir,
+                    workspace.as_deref(),
+                    self.rig_prefixes.as_deref(),
+                )
+                .await
             }
             _ => {
                 let ctx = DomainCtx {

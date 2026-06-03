@@ -23,12 +23,38 @@ use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::git_tree::{commit_inspector, surface_tree};
+use crate::prefixes::{bead_prefix, WorkspaceRigPrefixes};
 
 /// Map a serde deserialization error onto the domain error so a malformed tool
 /// payload surfaces as a validation failure (not a 500).
 fn parse_args<T: serde::de::DeserializeOwned>(args: Value) -> Result<T, AppError> {
     serde_json::from_value(args)
         .map_err(|e| AppError::Validation(format!("invalid arguments: {e}")))
+}
+
+/// Reject an `issues.create` whose bead-id prefix is not routable in the caller's
+/// workspace (hq-mt-rigs.6): the `<prefix>` of `<prefix>-<slug>` must be a
+/// registered rig prefix in `ws` or a reserved/infra prefix. A prefix registered
+/// only in another tenant does not satisfy the check (no global prefix
+/// uniqueness). No-op when no rig-prefix policy is wired or the request resolved no
+/// workspace, so single-tenant / no-Postgres builds keep accept-all create.
+async fn enforce_rig_prefix(
+    prefixes: Option<&dyn WorkspaceRigPrefixes>,
+    ws: Option<&str>,
+    id: &str,
+) -> Result<(), AppError> {
+    let (Some(prefixes), Some(ws)) = (prefixes, ws) else {
+        return Ok(());
+    };
+    let prefix = bead_prefix(id);
+    if !prefixes.is_allowed(ws, prefix).await? {
+        return Err(AppError::Validation(format!(
+            "bead id `{id}`: prefix `{prefix}` is not a registered rig prefix in workspace `{ws}` \
+             — register a rig with this prefix in this workspace first (prefixes are per-workspace; \
+             one registered only in another workspace does not count)"
+        )));
+    }
+    Ok(())
 }
 
 /// Inject the S5 claim echo (`description`, `acceptance_criteria`, `phase`) into a
@@ -56,15 +82,19 @@ pub async fn dispatch(
     args: Value,
     actor: &str,
     repo_dir: Option<&Path>,
+    ws: Option<&str>,
+    prefixes: Option<&dyn WorkspaceRigPrefixes>,
 ) -> Result<Value, AppError> {
     match tool {
         "issues.create.validate" => {
             let a: CreateIssue = parse_args(args)?;
+            enforce_rig_prefix(prefixes, ws, &a.id).await?;
             run_create_issue(store, &a, surface_tree(repo_dir).as_ref(), true).await?;
             Ok(json!({ "ok": true }))
         }
         "issues.create.execute" => {
             let a: CreateIssue = parse_args(args)?;
+            enforce_rig_prefix(prefixes, ws, &a.id).await?;
             run_create_issue(store, &a, surface_tree(repo_dir).as_ref(), false).await?;
             Ok(json!({ "ok": true }))
         }
@@ -339,7 +369,59 @@ pub fn parse_issue_filter(qs: &str) -> Result<IssueFilter, AppError> {
 
 #[cfg(test)]
 mod tests {
-    use super::{json_array, parse_issue_filter, slugify, GAP_CATALOG_EPIC};
+    use super::{enforce_rig_prefix, json_array, parse_issue_filter, slugify, GAP_CATALOG_EPIC};
+    use crate::prefixes::WorkspaceRigPrefixes;
+    use async_trait::async_trait;
+    use gt_store_dolt::AppError;
+
+    /// Stub policy: a fixed set of allowed prefixes for workspace `acme`, mimicking
+    /// the rig catalog + reserved-set the real PG adapter unions. Anything else is
+    /// rejected; a different workspace has no allowed prefixes (per-workspace).
+    struct StubPrefixes;
+    #[async_trait]
+    impl WorkspaceRigPrefixes for StubPrefixes {
+        async fn is_allowed(&self, ws: &str, prefix: &str) -> Result<bool, AppError> {
+            Ok(ws == "acme" && matches!(prefix, "pl" | "hq"))
+        }
+    }
+
+    #[tokio::test]
+    async fn enforce_accepts_registered_prefix_in_workspace() {
+        let p = StubPrefixes;
+        assert!(enforce_rig_prefix(Some(&p), Some("acme"), "pl-new-bead").await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn enforce_accepts_reserved_prefix() {
+        // The adapter reports the reserved `hq` as allowed, so tracker beads survive.
+        let p = StubPrefixes;
+        assert!(enforce_rig_prefix(Some(&p), Some("acme"), "hq-mod-x.1").await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn enforce_rejects_unknown_prefix() {
+        let p = StubPrefixes;
+        let err = enforce_rig_prefix(Some(&p), Some("acme"), "zz-stranger")
+            .await
+            .unwrap_err();
+        assert!(matches!(err, AppError::Validation(_)), "got {err:?}");
+    }
+
+    #[tokio::test]
+    async fn enforce_rejects_prefix_registered_only_in_another_workspace() {
+        // `pl` is allowed in `acme` but not in `other` — no global uniqueness.
+        let p = StubPrefixes;
+        assert!(enforce_rig_prefix(Some(&p), Some("other"), "pl-foo").await.is_err());
+    }
+
+    #[tokio::test]
+    async fn enforce_is_noop_without_policy_or_workspace() {
+        // No policy wired (single-tenant / no-PG) ⇒ accept any prefix.
+        assert!(enforce_rig_prefix(None, Some("acme"), "zz-foo").await.is_ok());
+        // Policy wired but request resolved no workspace ⇒ accept (legacy default).
+        let p = StubPrefixes;
+        assert!(enforce_rig_prefix(Some(&p), None, "zz-foo").await.is_ok());
+    }
 
     #[test]
     fn json_array_seeds_columns_or_empties() {

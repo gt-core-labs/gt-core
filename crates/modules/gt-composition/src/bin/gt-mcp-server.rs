@@ -31,12 +31,15 @@ use rmcp::transport::{StreamableHttpServerConfig, StreamableHttpService};
 
 use gt_audit::{AuditSink, InMemoryAudit};
 use gt_composition::mcp::{
-    AgentHandler, ConvoyHandler, EventLog, MergeHandler, QuotaHandler, RigHandler, WorkspaceHandler,
-    WsPools,
+    AgentHandler, ConvoyHandler, EventLog, MergeHandler, PgRigPrefixes, QuotaHandler, RigHandler,
+    WorkspaceHandler, WsPools,
 };
 use gt_composition::stream::{feed_router, FeedState};
 use gt_issues::IssuesModule;
-use gt_mcp_server::{health, DomainRouter, HealthState, IssuesServer, PgAuditSink, WorkspaceStores};
+use gt_mcp_server::{
+    health, DomainRouter, HealthState, IssuesServer, PgAuditSink, WorkspaceRigPrefixes,
+    WorkspaceStores,
+};
 use gt_meta::MetaModule;
 use gt_module::RootBuilder;
 use gt_rbac::{RbacConfig, Scope};
@@ -131,8 +134,14 @@ async fn main() -> anyhow::Result<()> {
     // (workspace.*, rig.*, …) route to PG-backed handlers. Wired only when
     // GT_PG_URL is set; unset ⇒ an empty router, so the server serves issues +
     // meta exactly as before.
-    let domains = build_domain_router(event_log.clone()).await?;
+    let (domains, rig_prefixes) = build_domain_router(event_log.clone()).await?;
     service = service.with_domains(Arc::new(domains));
+    // Wire issues.create rig-prefix routing (hq-mt-rigs.6) when the PG rig catalog
+    // is present; without it the server accepts any bead-id prefix as before.
+    if let Some(prefixes) = rig_prefixes {
+        service = service.with_rig_prefixes(prefixes);
+        eprintln!("[gt-mcp-server] issues.create rig-prefix routing on (per-workspace)");
+    }
 
     // Multi-tenant routing (hq-mt-routing.5): when GT_DOLT_BASE_URL is set, a
     // request's X-Workspace header resolves that tenant's own `hq_<ws>` store per
@@ -191,12 +200,14 @@ async fn main() -> anyhow::Result<()> {
 /// are registered here as they land. `event_log` (the shared, path-partitioned
 /// per-workspace log) backs the event-sourced domains — it is the same handle the
 /// SSE feed streams from.
-async fn build_domain_router(event_log: Arc<EventLog>) -> anyhow::Result<DomainRouter> {
+async fn build_domain_router(
+    event_log: Arc<EventLog>,
+) -> anyhow::Result<(DomainRouter, Option<Arc<dyn WorkspaceRigPrefixes>>)> {
     let Ok(pg_url) = std::env::var("GT_PG_URL") else {
         eprintln!(
             "[gt-mcp-server] GT_PG_URL unset; domain dispatch disabled (issues + meta only)"
         );
-        return Ok(DomainRouter::new());
+        return Ok((DomainRouter::new(), None));
     };
     // The workspace catalog lives in the shared `public` schema, so it uses a
     // plain pool; the per-workspace domains (rig, …) resolve their `ws_<slug>`
@@ -217,5 +228,9 @@ async fn build_domain_router(event_log: Arc<EventLog>) -> anyhow::Result<DomainR
         "[gt-mcp-server] domain namespaces: {:?}",
         router.namespaces()
     );
-    Ok(router)
+    // The same per-workspace rig catalog backs issues.create prefix routing
+    // (hq-mt-rigs.6): a new bead's id prefix must be a registered rig prefix in the
+    // caller's workspace (or a reserved prefix).
+    let rig_prefixes: Arc<dyn WorkspaceRigPrefixes> = Arc::new(PgRigPrefixes::new(ws_pools));
+    Ok((router, Some(rig_prefixes)))
 }

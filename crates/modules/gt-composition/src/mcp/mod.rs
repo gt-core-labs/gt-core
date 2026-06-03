@@ -34,5 +34,5 @@ pub use eventlog::EventLog;
 pub use merge::MergeHandler;
 pub use pools::WsPools;
 pub use quota::QuotaHandler;
-pub use rig::RigHandler;
+pub use rig::{PgRigPrefixes, RigHandler};
 pub use workspace::WorkspaceHandler;
