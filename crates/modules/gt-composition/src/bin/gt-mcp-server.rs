@@ -1,26 +1,25 @@
-//! `gt-mcp-server` — the gt-core MCP server binary (hq-core-host.3).
+//! `gt-mcp-server` — the gt-core MCP server binary (hq-core-host.3, relocated
+//! here by `hq-mcp-dispatch`).
 //!
-//! The transport pillar of the MVP to host the issues tracker inside gt-core and
-//! retire the gastown `gt-mcp` bin. It composes the issues module's tool
-//! descriptors (through the kernel [`RootBuilder`]) + the lifted Dolt store, and
-//! serves them over the rmcp streamable-HTTP transport — pointed at the SAME
-//! Dolt the gastown gt-mcp uses, so cutover is a transport swap on shared data.
+//! The binary lives in `gt-composition` (the `modules` tier) because it wires the
+//! per-domain [`DomainHandler`](gt_mcp_server::DomainHandler)s into the server's
+//! [`DomainRouter`](gt_mcp_server::DomainRouter), and only the `modules` tier may
+//! depend on every `domain/*` crate (docs/03 Rule 4). The orchestration-tier
+//! `gt-mcp-server` library owns the transport + the issues/meta dispatch + the
+//! router contract; this crate composes it with the domain handlers.
 //!
 //! Env:
 //! - `GT_DOLT_URL` (required) — e.g. `mysql://gastown@127.0.0.1:3307/hq`.
+//! - `GT_PG_URL` — Postgres backing the domain handlers (workspace.*, …). Unset ⇒
+//!   the domain router is empty, so the server serves issues + meta only.
 //! - `GT_MCP_HTTP_BIND` — listen address, default `127.0.0.1:8765`.
 //! - `GT_MCP_ACTOR` — scope actor, default `mcp-local`.
 //! - `GT_MCP_SCOPE_CONFIG` — RBAC TOML/JSON path; unset ⇒ deny-by-default.
 //! - `GT_REPO_DIR` — gt-core checkout whose `main` tree backs surface validation
 //!   (S3, hq-core-mcp.9); unset ⇒ surface existence checks are skipped.
-
-mod dispatch;
-mod domain;
-mod git_tree;
-mod health;
-mod pg_audit;
-mod server;
-mod workspace;
+//! - `GT_DOLT_BASE_URL` — multi-tenant routing (hq-mt-routing.5); unset ⇒
+//!   single-tenant on `GT_DOLT_URL`.
+//! - `GT_PG_AUDIT_URL` — durable Postgres audit sink; unset ⇒ in-memory.
 
 use std::sync::Arc;
 
@@ -31,15 +30,13 @@ use rmcp::transport::streamable_http_server::session::local::LocalSessionManager
 use rmcp::transport::{StreamableHttpServerConfig, StreamableHttpService};
 
 use gt_audit::{AuditSink, InMemoryAudit};
+use gt_composition::mcp::WorkspaceHandler;
 use gt_issues::IssuesModule;
+use gt_mcp_server::{health, DomainRouter, HealthState, IssuesServer, PgAuditSink, WorkspaceStores};
 use gt_meta::MetaModule;
 use gt_module::RootBuilder;
 use gt_rbac::{RbacConfig, Scope};
 use gt_store_dolt::DoltIssues;
-
-use health::HealthState;
-use server::IssuesServer;
-use workspace::WorkspaceStores;
 
 /// Path the MCP endpoint mounts at (mirrors the gastown gt-mcp).
 const MCP_PATH: &str = "/mcp";
@@ -93,7 +90,7 @@ async fn main() -> anyhow::Result<()> {
     // in-memory otherwise. A PG connect failure degrades to in-memory rather than
     // taking the server down.
     let audit: Arc<dyn AuditSink + Send + Sync> = match std::env::var("GT_PG_AUDIT_URL") {
-        Ok(url) => match pg_audit::PgAuditSink::connect(&url).await {
+        Ok(url) => match PgAuditSink::connect(&url).await {
             Ok(sink) => {
                 eprintln!("[gt-mcp-server] audit: Postgres @ {url}");
                 Arc::new(sink)
@@ -119,16 +116,22 @@ async fn main() -> anyhow::Result<()> {
     }
     let mut service = IssuesServer::new(store, default_scope, rbac, audit, tools, repo_dir);
 
+    // Domain dispatch (hq-mcp-dispatch): tool namespaces beyond issues.*/meta.*
+    // (workspace.*, rig.*, …) route to PG-backed handlers. Wired only when
+    // GT_PG_URL is set; unset ⇒ an empty router, so the server serves issues +
+    // meta exactly as before.
+    let domains = build_domain_router().await?;
+    service = service.with_domains(Arc::new(domains));
+
     // Multi-tenant routing (hq-mt-routing.5): when GT_DOLT_BASE_URL is set, a
     // request's X-Workspace header resolves that tenant's own `hq_<ws>` store per
     // call. Unset ⇒ single-tenant on GT_DOLT_URL exactly as before (the live
     // server's default), so enabling tenancy is an opt-in env, not a behaviour
-    // change. The base URL carries server coordinates only; the per-workspace
-    // database is selected per tenant.
+    // change.
     match std::env::var("GT_DOLT_BASE_URL") {
         Ok(base) => {
-            let stores = WorkspaceStores::from_base_url(&base)
-                .context("GT_DOLT_BASE_URL is malformed")?;
+            let stores =
+                WorkspaceStores::from_base_url(&base).context("GT_DOLT_BASE_URL is malformed")?;
             service = service.with_workspaces(Arc::new(stores));
             eprintln!(
                 "[gt-mcp-server] multi-tenant routing on; X-Workspace selects hq_<ws> via {base}"
@@ -162,4 +165,26 @@ async fn main() -> anyhow::Result<()> {
     );
     axum::serve(listener, app).await?;
     Ok(())
+}
+
+/// Build the domain dispatch router from `GT_PG_URL`. Unset ⇒ an empty router
+/// (issues + meta only). The per-domain `DomainHandler`s (`hq-mcp-dispatch.2..7`)
+/// are registered here as they land.
+async fn build_domain_router() -> anyhow::Result<DomainRouter> {
+    let Ok(pg_url) = std::env::var("GT_PG_URL") else {
+        eprintln!(
+            "[gt-mcp-server] GT_PG_URL unset; domain dispatch disabled (issues + meta only)"
+        );
+        return Ok(DomainRouter::new());
+    };
+    let pool = sqlx::PgPool::connect(&pg_url)
+        .await
+        .context("GT_PG_URL must point at a reachable Postgres")?;
+    eprintln!("[gt-mcp-server] domain dispatch: Postgres @ {pg_url}");
+    let router = DomainRouter::new().register(Arc::new(WorkspaceHandler::new(pool.clone())));
+    eprintln!(
+        "[gt-mcp-server] domain namespaces: {:?}",
+        router.namespaces()
+    );
+    Ok(router)
 }

@@ -147,6 +147,7 @@ gt-dog           = { path = "crates/domain/orchestration/gt-dog" }
 gt-runtime       = { path = "crates/domain/orchestration/gt-runtime" }
 gt-memory        = { path = "crates/domain/orchestration/gt-memory" }
 gt-planner       = { path = "crates/domain/orchestration/gt-planner" }
+gt-mcp-server    = { path = "crates/domain/orchestration/gt-mcp-server" }
 
 gt-store-pg      = { path = "crates/kernel/gt-store-pg" }
 gt-store-dolt    = { path = "crates/kernel/gt-store-dolt" }

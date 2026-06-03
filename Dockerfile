@@ -1,13 +1,15 @@
 # gt-mcp-server — the gt-core MCP server (hq-core-host.3/.5).
 #
 # Multi-stage: build the single bin from the workspace, then ship it on a slim
-# runtime. Only gt-mcp-server + its deps are compiled (`-p`), so the Postgres /
-# sqlx stack of unrelated crates never enters the image. Connects to Dolt over
-# the MySQL wire (no TLS) — the runtime needs nothing beyond glibc + CA certs.
+# runtime. The `gt-mcp-server` binary now lives in gt-composition (the modules
+# tier — the only Rule-4-legal home for the per-domain dispatch handlers,
+# hq-mcp-dispatch), so the package is `gt-composition` while the binary name is
+# unchanged. Connects to Dolt over the MySQL wire (no TLS) and, when GT_PG_URL is
+# set, to Postgres for the domain dispatch handlers.
 FROM rust:1-slim-bookworm AS build
 WORKDIR /build
 COPY . .
-RUN cargo build --release -p gt-mcp-server
+RUN cargo build --release -p gt-composition --bin gt-mcp-server
 
 FROM debian:bookworm-slim
 # `git` backs the S3 readiness clause (docs/10 §S4): GitSurfaceTree shells out to

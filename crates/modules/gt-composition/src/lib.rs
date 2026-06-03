@@ -28,6 +28,8 @@
 //! `RootRegistry::get_or_hydrate_async`, owns its actors via `Supervisor::anchor`, and drains
 //! their events onto the hub via `RootHandle::drain_events_from`.
 
+pub mod mcp;
+
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;

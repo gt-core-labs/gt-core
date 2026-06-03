@@ -8,10 +8,10 @@ version.workspace = true
 # store, and serves them over the rmcp streamable-HTTP transport. The executable
 # handlers come from gt-issues (transport-free run_*_issue free fns); this crate
 # adds the rmcp ServerHandler wrapping (scope check + audit + dispatch).
-[[bin]]
-name = "gt-mcp-server"
-path = "src/main.rs"
-
+#
+# Library-only (hq-mcp-dispatch): the composing `gt-mcp-server` binary lives in
+# `crates/modules/gt-composition`, the one tier that may depend on every
+# `domain/*` crate to register the per-domain `DomainHandler`s (docs/03 Rule 4).
 [dependencies]
 gt-module = { workspace = true }
 gt-module-mcp = { workspace = true }

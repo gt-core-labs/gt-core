@@ -22,10 +22,33 @@ gt-runtime = { workspace = true }
 gt-roles = { workspace = true }
 gt-beads = { workspace = true }
 gt-module = { workspace = true }
-gt-workspace = { workspace = true }
+# PG-backed domain dispatch (hq-mcp-dispatch.2): the workspace handler drives the
+# `pg` adapter (PgWorkspaces) of the gt-workspace port over a shared PgPool.
+gt-workspace = { workspace = true, features = ["pg"] }
 async-trait = { workspace = true }
-tokio = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "net", "signal", "sync", "time"] }
+
+# The gt-mcp-server binary lives here (hq-mcp-dispatch): the modules tier is the
+# one Rule-4-legal home for the per-domain DomainHandler wiring. It composes the
+# gt-mcp-server library + the issues/meta modules + the domain handlers.
+gt-mcp-server = { workspace = true }
+gt-issues = { workspace = true }
+gt-meta = { workspace = true }
+gt-rbac = { workspace = true }
+gt-audit = { workspace = true }
+gt-store-dolt = { workspace = true }
+rmcp = { workspace = true, features = ["server", "transport-streamable-http-server"] }
+axum = { workspace = true }
+anyhow = { workspace = true }
+serde_json = { workspace = true }
+sqlx = { workspace = true }
+
+[[bin]]
+name = "gt-mcp-server"
+path = "src/bin/gt-mcp-server.rs"
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "sync", "time"] }
 serde_json = { workspace = true }
+# Schema for the PG-backed domain dispatch contract tests (GT_PG_URL-gated).
+gt-store-pg = { workspace = true }
