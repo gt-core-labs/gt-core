@@ -1,0 +1,4 @@
+# Built-in scope profile: closed (GT_MCP_SCOPE_PROFILE=closed).
+# Deny-by-default: no actor grants. Force the operator to supply a real policy via
+# GT_MCP_SCOPE_CONFIG. Equivalent to leaving scope unconfigured, but explicit.
+

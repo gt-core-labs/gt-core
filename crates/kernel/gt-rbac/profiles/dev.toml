@@ -1,0 +1,4 @@
+# Built-in scope profile: dev (GT_MCP_SCOPE_PROFILE=dev).
+# Full MCP access for the default local actor. NOT for shared/production exposure.
+[actors.mcp-local]
+allow = ["*"]

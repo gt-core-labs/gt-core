@@ -87,20 +87,23 @@ async fn main() -> anyhow::Result<()> {
     let tools: Vec<_> = root.mcp_tools().cloned().collect();
     eprintln!("[gt-mcp-server] {} tools registered", tools.len());
 
-    // Scope: the boot actor's scope is the default; when an RBAC config is wired
-    // the server also resolves per-connection scopes from the X-Actor header
-    // (hq-core-mcp.6), so several actors share one server with distinct allow-lists.
-    let (default_scope, rbac) = match std::env::var("GT_MCP_SCOPE_CONFIG") {
-        Ok(path) => {
-            let cfg = Arc::new(RbacConfig::load(&path)?);
+    // Scope: the boot actor's scope is the default; when an RBAC config is wired the server
+    // also resolves per-connection scopes from the X-Actor header (hq-core-mcp.6). Resolution
+    // precedence: an explicit GT_MCP_SCOPE_CONFIG file (operator's bespoke policy) wins; else a
+    // built-in named profile via GT_MCP_SCOPE_PROFILE (dev/readonly/closed — policy ships in
+    // core, the deploy just picks one); else deny-by-default.
+    let rbac_config = resolve_rbac_config()?;
+    let (default_scope, rbac) = match rbac_config {
+        Some(cfg) => {
+            let cfg = Arc::new(cfg);
             eprintln!(
-                "[gt-mcp-server] RBAC config loaded; per-connection X-Actor scope resolution on (default actor '{actor}')"
+                "[gt-mcp-server] RBAC active; per-connection X-Actor scope resolution on (default actor '{actor}')"
             );
             (Scope::from_rbac(&cfg, &actor), Some(cfg))
         }
-        Err(_) => {
+        None => {
             eprintln!(
-                "[gt-mcp-server] GT_MCP_SCOPE_CONFIG unset; actor '{actor}' gets a closed scope (deny all), no per-connection resolution"
+                "[gt-mcp-server] no RBAC config/profile; actor '{actor}' gets a closed scope (deny all)"
             );
             (Scope::denied(&actor), None)
         }
@@ -377,6 +380,32 @@ async fn build_domain_router(
     // gt://doc/{id} + the documents inline on gt://issue/{id}.
     let documents: Arc<dyn DocumentsResource> = Arc::new(PgDocumentsResource::new(ws_pools));
     Ok((router, Some(rig_prefixes), Some(ws_status), Some(documents)))
+}
+
+/// Resolve the RBAC config from the environment (scope-profiles feature). Precedence:
+/// `GT_MCP_SCOPE_CONFIG` (an operator's file — bespoke policy) over `GT_MCP_SCOPE_PROFILE`
+/// (a built-in named policy shipped in core) over `None` (deny-by-default). An unknown
+/// profile name fails closed with the valid set, rather than silently denying.
+fn resolve_rbac_config() -> anyhow::Result<Option<RbacConfig>> {
+    if let Ok(path) = std::env::var("GT_MCP_SCOPE_CONFIG") {
+        eprintln!("[gt-mcp-server] RBAC from file: {path}");
+        return Ok(Some(RbacConfig::load(&path)?));
+    }
+    if let Ok(profile) = std::env::var("GT_MCP_SCOPE_PROFILE") {
+        match RbacConfig::from_profile(&profile)? {
+            Some(cfg) => {
+                eprintln!("[gt-mcp-server] RBAC from built-in profile: {profile}");
+                return Ok(Some(cfg));
+            }
+            None => {
+                anyhow::bail!(
+                    "unknown GT_MCP_SCOPE_PROFILE `{profile}`; valid: {:?}",
+                    RbacConfig::available_profiles()
+                );
+            }
+        }
+    }
+    Ok(None)
 }
 
 /// Build the semantic-search embedder (hq-docs-search.2). Only the `embeddings-fastembed`
