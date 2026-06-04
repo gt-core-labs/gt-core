@@ -15,3 +15,30 @@ semver = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
 schemars = { workspace = true }
+# Off-by-default `axum` REST adapter (hq-fe-api-platform.4): maps `meta.*` to REST
+# routes the builder mounts at `/api/v1/meta` behind the meta.read/meta.write scope
+# guard, with a utoipa OpenAPI spec. The report-gap handler mints a hq-gap bead via
+# the Dolt issues store, so gt-store-dolt is pulled only with this feature — the
+# MCP-only / descriptor build stays dependency-light (docs/03 Rule 4), exactly as
+# gt-issues gates its adapter.
+axum = { workspace = true, optional = true }
+utoipa = { workspace = true, optional = true }
+gt-store-dolt = { workspace = true, optional = true }
+
+[features]
+# Compile the axum REST adapter + OpenAPI spec (`http.rs`), the transport-free
+# gap-minting handler (`handlers.rs`), and the route/spec-bearing `MetaHttpModule`.
+# Off by default — the descriptor-only build pulls no HTTP stack and no store; the
+# composition bin enables it to expose the REST surface.
+axum = ["dep:axum", "dep:utoipa", "dep:gt-store-dolt"]
+
+[dev-dependencies]
+# Exercise the REST router in-process (hq-fe-api-platform.4): `oneshot` a request
+# and read the response without a live socket. Run with `--features axum` so the
+# adapter + these helpers compile. The Dolt-gated report-gap roundtrip needs an
+# async runtime + a raw client to seed/read the throwaway test database.
+axum = { workspace = true }
+tower = { workspace = true, features = ["util"] }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+gt-store-dolt = { workspace = true }
+mysql_async = { workspace = true }

@@ -16,7 +16,20 @@
 #![warn(missing_docs)]
 
 pub mod commands;
+/// The off-by-default `axum` REST adapter (`hq-fe-api-platform.4`): maps `meta.*` to
+/// REST routes that reuse the same gap-minting logic as the MCP tools.
+#[cfg(feature = "axum")]
+pub mod http;
+/// Transport-free handlers shared by the MCP path and the REST adapter
+/// (`hq-fe-api-platform.4`). Gated with the adapter — the descriptor-only build
+/// needs neither the handler nor its store.
+#[cfg(feature = "axum")]
+pub mod handlers;
 mod module;
 
 pub use commands::ReportGap;
+#[cfg(feature = "axum")]
+pub use http::{meta_router, ApiDoc, MetaApiState};
+#[cfg(feature = "axum")]
+pub use module::MetaHttpModule;
 pub use module::MetaModule;

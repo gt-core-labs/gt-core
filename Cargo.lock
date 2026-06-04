@@ -1806,12 +1806,18 @@ dependencies = [
 name = "gt-meta"
 version = "0.1.0"
 dependencies = [
+ "axum",
  "gt-module",
  "gt-module-mcp",
+ "gt-store-dolt",
+ "mysql_async",
  "schemars 0.8.22",
  "semver",
  "serde",
  "serde_json",
+ "tokio",
+ "tower",
+ "utoipa",
 ]
 
 [[package]]
