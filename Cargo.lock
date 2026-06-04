@@ -1486,6 +1486,7 @@ dependencies = [
  "futures-core",
  "gt-agent",
  "gt-audit",
+ "gt-auth",
  "gt-beads",
  "gt-channel",
  "gt-docs-embed",
