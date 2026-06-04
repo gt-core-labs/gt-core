@@ -43,26 +43,29 @@ jobs:
           sudo apt-get install -y -qq \
             tesseract-ocr libtesseract-dev libleptonica-dev tesseract-ocr-eng \
             clang pkg-config
+      # --locked: build against the committed Cargo.lock. Without it CI re-resolves and can pull
+      # a newer transitive (e.g. pgvector → sqlx 0.9 vs the workspace's 0.8), which fails to
+      # compile; the lock pins one sqlx for every crate.
       - name: build
-        run: cargo build --workspace --all-targets
+        run: cargo build --workspace --all-targets --locked
       - name: test
-        run: cargo test --workspace
+        run: cargo test --workspace --locked
       # The feature-gated tesseract OcrEngine impl — built/tested only here where its
       # system libs exist, so a default local build stays free of the OCR dependency.
       - name: ocr feature (tesseract)
-        run: cargo test -p gt-docs-extract --features ocr-tesseract
+        run: cargo test -p gt-docs-extract --features ocr-tesseract --locked
       # The feature-gated fastembed Embedder impl (hq-docs-search.2). Build-only + report-only:
       # the ML stack (onnxruntime via `ort`) and model download are heavy/network-dependent, so
       # this proves the impl compiles without gating CI on the toolchain being present.
       - name: embeddings feature (fastembed)
-        run: cargo build -p gt-docs-embed --features embeddings-fastembed
+        run: cargo build -p gt-docs-embed --features embeddings-fastembed --locked
         continue-on-error: true
       # Report-only until the standing debt is cleared (see header).
       - name: fmt (report-only)
         run: cargo fmt --all --check
         continue-on-error: true
       - name: clippy (report-only)
-        run: cargo clippy --workspace --all-targets
+        run: cargo clippy --workspace --all-targets --locked
         continue-on-error: true
 
   contract:
@@ -115,14 +118,14 @@ jobs:
       - name: dolt contract
         env:
           GT_DOLT_URL: mysql://root@127.0.0.1:3306
-        run: cargo test -p gt-store-dolt --test issues_contract -- --test-threads=1
+        run: cargo test -p gt-store-dolt --test issues_contract --locked -- --test-threads=1
       # The issues MCP resource reads (gt://issues page envelope + gt://issue/{id}
       # NotFound, hq-mcp-test.3). Own throwaway DB (gt_rs_resources_test), so it
       # neither touches live hq nor races the store fixture above.
       - name: issues resources contract
         env:
           GT_DOLT_URL: mysql://root@127.0.0.1:3306
-        run: cargo test -p gt-issues --test resources_contract
+        run: cargo test -p gt-issues --test resources_contract --locked
       # Postgres-backed schema migration + workspace-scoped feature flags.
       - name: pg contract
         env:
@@ -130,9 +133,9 @@ jobs:
         run: |
           # --features pg activates the WorkspacePool + DocumentsRepository (hq-docs-store.3)
           # contract tests, which are #[cfg(feature = "pg")] and otherwise compile out.
-          cargo test -p gt-store-pg --features pg
-          cargo test -p gt-feature-flags
+          cargo test -p gt-store-pg --features pg --locked
+          cargo test -p gt-feature-flags --locked
           # The durable Postgres audit sink (hq-mcp-test.6): per-tenant isolation +
           # the restart-durability proof (write, drop the pool, reconnect, the trail
           # is still there). SERIAL — both gated tests reseed the one mcp_audit table.
-          cargo test -p gt-mcp-server -- --test-threads=1
+          cargo test -p gt-mcp-server --locked -- --test-threads=1
