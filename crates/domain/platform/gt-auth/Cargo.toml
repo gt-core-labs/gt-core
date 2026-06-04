@@ -46,6 +46,9 @@ getrandom = { workspace = true }
 # sqlx-free; the heavy stack is pulled only when a binary wires the DB-backed login path. Same
 # gating as gt-rig/gt-quota's `pg` adapters (docs/03 Rule 4 — adapter beside the port).
 sqlx = { workspace = true, optional = true }
+# SHA-256 for the durable refresh store (`refresh_pg.rs`, hq-auth-session.1): the opaque token
+# is stored only as its hash, never in clear. Off-by-default, pulled in only with `pg`.
+sha2 = { workspace = true, optional = true }
 # Axum auth-endpoint router (`http.rs`, hq-auth-routes.1): POST /auth/login|refresh|logout,
 # GET /auth/me. Off-by-default driving adapter (Rule 4) — the HTTP surface of the verify/mint/
 # refresh/identity ports this crate owns; pulled only when a binary serves the endpoints.
@@ -59,7 +62,7 @@ password-hash = ["dep:argon2"]
 jsonwebtoken = ["dep:jsonwebtoken", "dep:pem", "dep:simple_asn1", "dep:base64"]
 # Postgres-backed login store (`PgUsers`, hq-auth-mint.2). Pulls in `sqlx` and the
 # `password-hash` adapter it reuses for argon2 verification — never duplicates that logic.
-pg = ["dep:sqlx", "password-hash"]
+pg = ["dep:sqlx", "dep:sha2", "password-hash"]
 # Axum auth-endpoint router (`http.rs`, hq-auth-routes.1). Needs the minter, so it implies
 # `jsonwebtoken`; the login port is abstract, so the DB-backed adapter is opted in separately
 # via `pg`.

@@ -83,6 +83,9 @@ pub mod password;
 #[cfg(feature = "pg")]
 mod pg;
 
+#[cfg(feature = "pg")]
+mod refresh_pg;
+
 #[cfg(feature = "jsonwebtoken")]
 mod jwt;
 
@@ -102,6 +105,9 @@ pub use verify::{Authenticator, InMemoryAuthenticator};
 
 #[cfg(feature = "pg")]
 pub use pg::PgUsers;
+
+#[cfg(feature = "pg")]
+pub use refresh_pg::PgRefreshStore;
 
 #[cfg(feature = "jsonwebtoken")]
 pub use jwt::{Jwk, JwkSet, JwtAuthenticator};

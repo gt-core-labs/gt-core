@@ -106,8 +106,20 @@ pub struct RefreshId(String);
 
 impl RefreshId {
     /// Mint a fresh random id (128 bits — ample for a non-secret key).
-    fn generate() -> Self {
+    ///
+    /// `pub(crate)` rather than private so the Postgres adapter
+    /// ([`PgRefreshStore`](crate::PgRefreshStore)) can mint record/family ids the same way the
+    /// in-memory store does — without re-exposing the random-bytes primitive outside the crate.
+    pub(crate) fn generate() -> Self {
         Self(RefreshToken::from_bytes(&random_bytes::<16>()).0)
+    }
+
+    /// Rebuild an id from an already-formed string (e.g. the `id`/`family` columns read back by
+    /// the Postgres adapter). Crate-internal: ids are minted with [`generate`](Self::generate),
+    /// never parsed from untrusted input. Only the `pg` adapter rehydrates ids from storage.
+    #[cfg(feature = "pg")]
+    pub(crate) fn new(value: impl Into<String>) -> Self {
+        Self(value.into())
     }
 
     /// The id as a string.
@@ -194,6 +206,12 @@ pub enum RefreshError {
     /// The token's family was revoked (an explicit logout, or a prior reuse on a sibling).
     #[error("refresh token revoked")]
     Revoked,
+    /// The durable store ([`PgRefreshStore`](crate::PgRefreshStore)) could not reach or query its
+    /// Postgres backend. Distinct from the lifecycle verdicts above: this is an outage, not a
+    /// denied rotate — the caller should retry or fail the request, not treat the token as bad.
+    /// The dependency-free [`InMemoryRefreshStore`] never produces it (its map work cannot fault).
+    #[error("refresh store backend error: {0}")]
+    Backend(String),
 }
 
 /// The inverted **port**: issue, rotate, and revoke refresh tokens.
