@@ -32,8 +32,8 @@ use rmcp::transport::{StreamableHttpServerConfig, StreamableHttpService};
 use gt_audit::{AuditSink, InMemoryAudit};
 use gt_composition::mcp::{
     AgentHandler, AuditHandler, ConvoyHandler, DocumentsHandler, EventLog, GraphHandler,
-    MergeHandler, PgRigPrefixes, PgWorkspaceStatus, QuotaHandler, RigHandler, WorkspaceHandler,
-    WsPools,
+    MergeHandler, PgDocumentsResource, PgRigPrefixes, PgWorkspaceStatus, QuotaHandler, RigHandler,
+    WorkspaceHandler, WsPools,
 };
 use gt_docs_extract::Extractor;
 use gt_store_blob::BlobStore;
@@ -41,8 +41,8 @@ use gt_graphindex::GraphifyIndexer;
 use gt_composition::stream::{feed_router, FeedState};
 use gt_issues::IssuesModule;
 use gt_mcp_server::{
-    health, DomainRouter, HealthState, IssuesServer, PgAuditSink, WorkspaceRigPrefixes,
-    WorkspaceStatusGate, WorkspaceStores,
+    health, DocumentsResource, DomainRouter, HealthState, IssuesServer, PgAuditSink,
+    WorkspaceRigPrefixes, WorkspaceStatusGate, WorkspaceStores,
 };
 use gt_meta::MetaModule;
 use gt_module::RootBuilder;
@@ -144,7 +144,8 @@ async fn main() -> anyhow::Result<()> {
     // (workspace.*, rig.*, …) route to PG-backed handlers. Wired only when
     // GT_PG_URL is set; unset ⇒ an empty router, so the server serves issues +
     // meta exactly as before.
-    let (domains, rig_prefixes, ws_status) = build_domain_router(event_log.clone()).await?;
+    let (domains, rig_prefixes, ws_status, documents) =
+        build_domain_router(event_log.clone()).await?;
     // audit.* tails the same audit sink the server records into (hq-mt-ops.3).
     // Registered unconditionally — it reads the in-memory or Postgres sink, so it
     // works even when GT_PG_URL is unset and the rest of the router is empty.
@@ -163,6 +164,12 @@ async fn main() -> anyhow::Result<()> {
     if let Some(gate) = ws_status {
         service = service.with_workspace_status(gate);
         eprintln!("[gt-mcp-server] suspend/archive enforcement on (mutations gated by ws status)");
+    }
+    // Wire the document resource reads (hq-docs-api.3): gt://doc/{id} + the `documents`
+    // inline on gt://issue/{id}. Present whenever the PG document store is (GT_PG_URL set).
+    if let Some(docs) = documents {
+        service = service.with_documents(docs);
+        eprintln!("[gt-mcp-server] document resources on (gt://doc/{{id}} + gt://issue docs inline)");
     }
 
     // Multi-tenant routing (hq-mt-routing.5): when GT_DOLT_BASE_URL is set, a
@@ -298,12 +305,13 @@ async fn build_domain_router(
     DomainRouter,
     Option<Arc<dyn WorkspaceRigPrefixes>>,
     Option<Arc<dyn WorkspaceStatusGate>>,
+    Option<Arc<dyn DocumentsResource>>,
 )> {
     let Ok(pg_url) = std::env::var("GT_PG_URL") else {
         eprintln!(
             "[gt-mcp-server] GT_PG_URL unset; domain dispatch disabled (issues + meta only)"
         );
-        return Ok((DomainRouter::new(), None, None));
+        return Ok((DomainRouter::new(), None, None, None));
     };
     // The workspace catalog lives in the shared `public` schema, so it uses a
     // plain pool; the per-workspace domains (rig, …) resolve their `ws_<slug>`
@@ -356,11 +364,14 @@ async fn build_domain_router(
     // The same per-workspace rig catalog backs issues.create prefix routing
     // (hq-mt-rigs.6): a new bead's id prefix must be a registered rig prefix in the
     // caller's workspace (or a reserved prefix).
-    let rig_prefixes: Arc<dyn WorkspaceRigPrefixes> = Arc::new(PgRigPrefixes::new(ws_pools));
+    let rig_prefixes: Arc<dyn WorkspaceRigPrefixes> = Arc::new(PgRigPrefixes::new(ws_pools.clone()));
     // The suspend/archive gate reads the same `public`-schema workspace catalog the
     // `workspace.*` handler mutates (hq-mt-bootstrap.8), behind a short TTL cache.
     let ws_status: Arc<dyn WorkspaceStatusGate> = Arc::new(PgWorkspaceStatus::new(pool));
-    Ok((router, Some(rig_prefixes), Some(ws_status)))
+    // The same per-workspace pool cache backs the document resource reads (hq-docs-api.3):
+    // gt://doc/{id} + the documents inline on gt://issue/{id}.
+    let documents: Arc<dyn DocumentsResource> = Arc::new(PgDocumentsResource::new(ws_pools));
+    Ok((router, Some(rig_prefixes), Some(ws_status), Some(documents)))
 }
 
 /// Build the document blob store from `GT_BLOB_*` (hq-docs-api.2 / hq-docs-deploy.1). Returns

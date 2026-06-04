@@ -138,6 +138,10 @@ pub trait DocumentsRepository: Send + Sync {
         owner_type: &str,
         owner_id: &str,
     ) -> Result<Vec<Document>, DocError>;
+    /// List the live documents attached to an owner id, regardless of `owner_type`,
+    /// newest first. Backs the `gt://issue/{id}` resource inline (hq-docs-api.3): an
+    /// issue's documents are those carrying its id, whatever class the attacher chose.
+    async fn list_by_owner_id(&self, owner_id: &str) -> Result<Vec<Document>, DocError>;
     /// Dedup probe: the first live document whose content hash matches, or `None`.
     async fn find_by_sha(&self, sha256: &str) -> Result<Option<Document>, DocError>;
     /// Phase-1 full-text search (hq-docs-search.1) over `body_md`/`extracted_text` via the
@@ -232,6 +236,18 @@ impl DocumentsRepository for PgDocuments {
              ORDER BY uploaded_at DESC"
         ))
         .bind(owner_type)
+        .bind(owner_id)
+        .fetch_all(self.pool.pool())
+        .await?;
+        Ok(rows)
+    }
+
+    async fn list_by_owner_id(&self, owner_id: &str) -> Result<Vec<Document>, DocError> {
+        let rows = sqlx::query_as(&format!(
+            "SELECT {COLS} FROM documents \
+             WHERE owner_id = $1 AND deleted_at IS NULL \
+             ORDER BY uploaded_at DESC"
+        ))
         .bind(owner_id)
         .fetch_all(self.pool.pool())
         .await?;

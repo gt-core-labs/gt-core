@@ -19,7 +19,7 @@ use serde_json::{json, Value};
 
 use gt_documents::{AttachDoc, DocumentsModule, ListDocs, RemoveDoc, SearchDocs, UpdateDoc};
 use gt_docs_extract::Extractor;
-use gt_mcp_server::{DomainCtx, DomainHandler};
+use gt_mcp_server::{DocumentsResource, DomainCtx, DomainHandler};
 use gt_module::{GtModule, McpRegistry, McpTool};
 use gt_store_blob::{sha256_hex, BlobStore};
 use gt_store_dolt::AppError;
@@ -215,6 +215,38 @@ impl DocumentsHandler {
 
         let doc = repo.create(new).await.map_err(doc_err)?;
         Ok(doc_json(&doc))
+    }
+}
+
+/// Per-workspace document reader for the `gt://doc/{id}` + `gt://issue/{id}` resource reads
+/// (hq-docs-api.3). Implements the orchestration-tier [`DocumentsResource`] seam over the
+/// same per-workspace pool cache the dispatch handler uses.
+pub struct PgDocumentsResource {
+    pools: Arc<WsPools>,
+}
+
+impl PgDocumentsResource {
+    /// Wire the per-workspace pool cache.
+    pub fn new(pools: Arc<WsPools>) -> Self {
+        Self { pools }
+    }
+}
+
+#[async_trait]
+impl DocumentsResource for PgDocumentsResource {
+    async fn get(&self, workspace: Option<&str>, id: &str) -> Result<Option<Value>, AppError> {
+        let repo = PgDocuments::new(self.pools.get(workspace).await?);
+        Ok(repo.get(id).await.map_err(doc_err)?.as_ref().map(doc_json))
+    }
+
+    async fn list_for_owner(
+        &self,
+        workspace: Option<&str>,
+        owner_id: &str,
+    ) -> Result<Vec<Value>, AppError> {
+        let repo = PgDocuments::new(self.pools.get(workspace).await?);
+        let docs = repo.list_by_owner_id(owner_id).await.map_err(doc_err)?;
+        Ok(docs.iter().map(doc_json).collect())
     }
 }
 

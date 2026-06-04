@@ -18,6 +18,7 @@
 #![forbid(unsafe_code)]
 
 pub mod dispatch;
+pub mod documents;
 pub mod domain;
 pub mod git_tree;
 pub mod health;
@@ -27,6 +28,7 @@ pub mod server;
 pub mod workspace;
 pub mod ws_status;
 
+pub use documents::DocumentsResource;
 pub use domain::{DomainCtx, DomainHandler, DomainRouter};
 pub use health::HealthState;
 pub use pg_audit::PgAuditSink;

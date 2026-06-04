@@ -28,6 +28,7 @@ use rmcp::{ErrorData as McpError, ServerHandler};
 use tracing::Instrument;
 
 use crate::dispatch::{dispatch, dispatch_meta, parse_issue_filter};
+use crate::documents::DocumentsResource;
 use crate::domain::{DomainCtx, DomainRouter};
 use crate::prefixes::WorkspaceRigPrefixes;
 use crate::workspace::{workspace_from_ext, WorkspaceStores};
@@ -94,6 +95,11 @@ pub struct IssuesServer {
     /// is rejected (reads + `workspace.resume` still pass). `None` keeps the legacy
     /// accept-all behaviour, so single-tenant / no-Postgres builds are unaffected.
     workspace_status: Option<Arc<dyn WorkspaceStatusGate>>,
+    /// Per-workspace document reader for the `gt://doc/{id}` + `gt://issue/{id}` resource
+    /// reads (hq-docs-api.3). `Some` when the composition root wires the document store:
+    /// `gt://issue/{id}` then inlines a `documents` array, and `gt://doc/{id}` resolves a
+    /// single document. `None` keeps the issues-only resource surface unchanged.
+    documents: Option<Arc<dyn DocumentsResource>>,
 }
 
 impl IssuesServer {
@@ -127,7 +133,16 @@ impl IssuesServer {
             authenticator: None,
             rig_prefixes: None,
             workspace_status: None,
+            documents: None,
         }
+    }
+
+    /// Wire the per-workspace document reader (hq-docs-api.3): `gt://issue/{id}` then inlines
+    /// the bead's `documents` array and `gt://doc/{id}` resolves one document. Additive —
+    /// without it the resource surface is issues-only.
+    pub fn with_documents(mut self, documents: Arc<dyn DocumentsResource>) -> Self {
+        self.documents = Some(documents);
+        self
     }
 
     /// Enable per-workspace JWT auth (`hq-mcp-dispatch.9`). With a verifier wired,
@@ -593,9 +608,21 @@ impl ServerHandler for IssuesServer {
                 "gt://issue/{id}",
                 "issue.detail",
                 "Single bead WITH full text bodies + taxonomy columns + version. Read \
-                 after claiming a bead to see the actual spec.",
+                 after claiming a bead to see the actual spec. When the document store is \
+                 wired, also carries a `documents` array — the bead's attached .md / \
+                 extracted-text supporting material (docs/11).",
             ),
         ];
+        // gt://doc/{id} is discoverable only when a document reader is wired (hq-docs-api.3).
+        let mut resources = resources;
+        if self.documents.is_some() {
+            resources.push(mk(
+                "gt://doc/{id}",
+                "document.detail",
+                "Single document by id: .md body or a binary's extracted text + metadata \
+                 (the supporting material a model reads when resolving a bead, docs/11).",
+            ));
+        }
         Ok(ListResourcesResult::with_all_items(resources))
     }
 
@@ -616,7 +643,7 @@ impl ServerHandler for IssuesServer {
             .resolve_store(workspace.as_deref())
             .map_err(|e| Self::to_mcp_error(&e))?;
         let value = self
-            .read_resource_json(&store, uri)
+            .read_resource_json(&store, workspace.as_deref(), uri)
             .await
             .map_err(|e| Self::to_mcp_error(&e))?;
         let text = serde_json::to_string_pretty(&value).unwrap_or_else(|_| value.to_string());
@@ -632,8 +659,25 @@ impl IssuesServer {
     async fn read_resource_json(
         &self,
         store: &DoltIssues,
+        workspace: Option<&str>,
         uri: &str,
     ) -> Result<serde_json::Value, AppError> {
+        // gt://doc/{id} — one document by id (hq-docs-api.3). Only when a document reader is
+        // wired; otherwise it falls through to the not-found at the end.
+        if let Some(id) = uri.strip_prefix("gt://doc/") {
+            if id.is_empty() || id.contains('/') {
+                return Err(AppError::Validation(
+                    "gt://doc/<id> expects a single non-empty path segment".into(),
+                ));
+            }
+            if let Some(docs) = &self.documents {
+                return match docs.get(workspace, id).await? {
+                    Some(doc) => Ok(doc),
+                    None => Err(AppError::NotFound(format!("document {id}"))),
+                };
+            }
+        }
+
         // gt://issues[?filter] — the snapshot (optionally ?full=1).
         let issues_qs = match uri.strip_prefix("gt://issues") {
             Some("") => Some(""),
@@ -675,8 +719,17 @@ impl IssuesServer {
                 ));
             }
             return match gt_issues::resources::read_issue(store, id).await? {
-                Some(detail) => serde_json::to_value(&detail)
-                    .map_err(|e| AppError::Other(format!("encode issue: {e}"))),
+                Some(detail) => {
+                    let mut value = serde_json::to_value(&detail)
+                        .map_err(|e| AppError::Other(format!("encode issue: {e}")))?;
+                    // hq-docs-api.3: inline the bead's attached documents so a model reading
+                    // the issue gets its supporting .md / extracted text in the same call.
+                    if let (Some(docs), Some(obj)) = (&self.documents, value.as_object_mut()) {
+                        let attached = docs.list_for_owner(workspace, id).await?;
+                        obj.insert("documents".into(), serde_json::Value::Array(attached));
+                    }
+                    Ok(value)
+                }
                 None => Err(AppError::NotFound(format!("issue {id}"))),
             };
         }

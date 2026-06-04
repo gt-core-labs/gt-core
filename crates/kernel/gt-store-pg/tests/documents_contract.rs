@@ -68,6 +68,9 @@ async fn documents_crud_version_dedup_softdelete() {
     assert!(repo.get(&id).await.unwrap().is_some());
     let listed = repo.list_by_owner("epic", &owner).await.unwrap();
     assert!(listed.iter().any(|d| d.id == id), "owner listing includes the doc");
+    // hq-docs-api.3: list-by-owner-id (any owner_type) backs the gt://issue/{id} inline.
+    let by_id = repo.list_by_owner_id(&owner).await.unwrap();
+    assert!(by_id.iter().any(|d| d.id == id), "owner-id listing includes the doc");
 
     // dedup probe by content hash.
     let found = repo.find_by_sha(&sha).await.unwrap();
