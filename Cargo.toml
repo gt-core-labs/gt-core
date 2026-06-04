@@ -91,6 +91,9 @@ hex = "0.4"
 # Password hashing for the gt-auth email+password provider (off-by-default `password-hash`).
 # `std` pulls getrandom so `OsRng` is available for per-password salts.
 argon2 = { version = "0.5", features = ["std"] }
+# JWT signature verification + minting for the gt-auth RS256 adapter (off-by-default
+# `jsonwebtoken`, hq-auth-verify.1). Pulled only when a binary verifies or mints tokens.
+jsonwebtoken = "9"
 # base64 decode of document attach payloads (hq-docs-api.2).
 base64 = "0.22"
 # pgvector binding for the phase-2 semantic search column (hq-docs-search.2). `sqlx`

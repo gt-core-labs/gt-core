@@ -20,6 +20,8 @@
 //!   work, not I/O, so no `async` ceremony.
 //! - [`InMemoryAuthenticator`] — the dependency-free test double (a `token -> claims` map,
 //!   standing in for a real signature check), so the domain slice tests run without crypto.
+//! - [`JwtAuthenticator`] — the production RS256 verifier (jsonwebtoken), behind the
+//!   off-by-default `jsonwebtoken` feature.
 //! - [`AuthError`] — the rejection vocabulary.
 //!
 //! ## Login providers (the step before token verification)
@@ -33,9 +35,11 @@
 //! email+password adapter ([`password::PasswordProvider`], argon2 PHC hashing) lives behind
 //! the off-by-default `password-hash` feature; tests use the in-memory double.
 //!
-//! A real signature-verifying adapter (jsonwebtoken HS256/RS256) folds into this same crate
-//! behind an off-by-default `jsonwebtoken` feature in a follow-up — the way gt-rig/gt-quota
-//! gate their `pg`/`axum` adapters — never a sibling adapter crate (Rule 4).
+//! The real signature-verifying adapter ([`JwtAuthenticator`], RS256 via jsonwebtoken) folds
+//! into this same crate behind the off-by-default `jsonwebtoken` feature (`hq-auth-verify.1`) —
+//! the way gt-rig/gt-quota gate their `pg`/`axum` adapters — never a sibling adapter crate
+//! (Rule 4). It verifies the signature only; the `exp`/`workspace` gates stay
+//! [`JwtClaims::validate`]. Public-key loading by `kid` and rotation is `hq-auth-verify.2`.
 //!
 //! This crate intentionally does **not** depend on `gt-workspace`: platform → platform deps
 //! are forbidden (Rule 4). The `workspace` claim is a plain `String`; the consumer (the
@@ -51,9 +55,15 @@ mod verify;
 #[cfg(feature = "password-hash")]
 pub mod password;
 
+#[cfg(feature = "jsonwebtoken")]
+mod jwt;
+
 pub use error::AuthError;
 pub use provider::{Credentials, IdentityProvider, ProviderKind, VerifiedIdentity};
 pub use verify::{Authenticator, InMemoryAuthenticator};
+
+#[cfg(feature = "jsonwebtoken")]
+pub use jwt::JwtAuthenticator;
 
 #[cfg(test)]
 pub use provider::InMemoryIdentityProvider;

@@ -27,10 +27,16 @@ thiserror = { workspace = true }
 # core build stays dependency-light — the crypto stack is pulled only when a binary mints or
 # verifies passwords. Same gating as gt-rig/gt-quota's `pg` adapters (docs/03).
 argon2 = { workspace = true, optional = true }
+# Real RS256 signature-verifying adapter (`jwt.rs`): jsonwebtoken decode + verify. Off-by-default
+# so the core build stays crypto-free — pulled only when a binary verifies tokens. Same gating
+# as the `password-hash` adapter above (docs/03 Rule 4).
+jsonwebtoken = { workspace = true, optional = true }
 
 [features]
 # Production email+password provider — argon2 hash + verify.
 password-hash = ["dep:argon2"]
+# Production RS256 JWT verifier — jsonwebtoken decode + signature check (hq-auth-verify.1).
+jsonwebtoken = ["dep:jsonwebtoken"]
 
 [dev-dependencies]
 serde_json = { workspace = true }
