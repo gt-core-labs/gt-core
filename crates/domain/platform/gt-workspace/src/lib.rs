@@ -49,4 +49,4 @@ pub use workspace_id::{WorkspaceId, WorkspaceIdError, MAX_WORKSPACE_ID_LEN};
 #[cfg(feature = "pg")]
 pub use pg::PgWorkspaces;
 #[cfg(feature = "axum")]
-pub use web::{WorkspaceContext, WorkspaceContextRejection, WORKSPACE_HEADER};
+pub use web::{WorkspaceClaim, WorkspaceContext, WorkspaceContextRejection, WORKSPACE_HEADER};
