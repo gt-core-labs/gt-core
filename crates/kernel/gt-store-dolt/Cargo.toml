@@ -14,6 +14,8 @@ thiserror = { workspace = true }
 dashmap = { workspace = true }
 # Per-workspace flock guard against Dolt data-dir split-brain (hq-mt-data.12).
 libc = { workspace = true }
+# Async sleep for the ensure_database connection retry (cold-start race with the Dolt server).
+tokio = { workspace = true, features = ["time"] }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt", "rt-multi-thread", "macros"] }
