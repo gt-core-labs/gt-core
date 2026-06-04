@@ -28,6 +28,7 @@
 //! `RootRegistry::get_or_hydrate_async`, owns its actors via `Supervisor::anchor`, and drains
 //! their events onto the hub via `RootHandle::drain_events_from`.
 
+pub mod auth;
 pub mod mcp;
 pub mod polecat;
 pub mod stream;
