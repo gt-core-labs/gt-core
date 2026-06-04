@@ -1441,6 +1441,8 @@ name = "gt-auth"
 version = "0.1.0"
 dependencies = [
  "argon2",
+ "async-trait",
+ "axum",
  "getrandom 0.2.17",
  "jsonwebtoken",
  "serde",
@@ -1448,6 +1450,7 @@ dependencies = [
  "sqlx",
  "thiserror 2.0.18",
  "tokio",
+ "tower",
 ]
 
 [[package]]
