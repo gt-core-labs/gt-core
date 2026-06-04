@@ -1,8 +1,17 @@
-# Build + push the gt-mcp-server image to DockerHub on every push to main.
+# Build + push the gt-mcp-server image to DockerHub — GATED on CI passing.
+#
+# Triggered by the CI workflow completing (workflow_run), not directly by the
+# push. The job only runs when that CI run both succeeded AND was the push to
+# main, so a red `cargo build`/`cargo test`/contract gate blocks the image: a
+# broken commit never reaches DockerHub even though it compiles in isolation.
 #
 # Publishes codecsrayo/gt-core-mcp-server:
 #   - :latest         moving tag, what compose pulls (pull_policy: always)
 #   - :sha-<7>        immutable per-commit tag for rollback / pinning
+#
+# Trade-off vs the old direct-push trigger: workflow_run carries no paths-ignore,
+# so the docs-only / md-only skip is gone. CI runs on every push regardless, so
+# the only cost is an extra (cached) image build on doc-only commits to main.
 #
 # Requires two repo secrets (Settings -> Secrets and variables -> Actions):
 #   DOCKERHUB_USERNAME  e.g. codecsrayo
@@ -10,19 +19,34 @@
 name: docker-publish
 
 on:
-  push:
-    branches: [main]
-    # Skip image rebuilds for doc-only / CI-only changes.
-    paths-ignore:
-      - 'docs/**'
-      - '**/*.md'
+  workflow_run:
+    workflows: [CI]
+    types: [completed]
   workflow_dispatch: {}
 
 jobs:
   publish:
     runs-on: ubuntu-latest
+    # Gate: CI must have succeeded, on a push to main. workflow_dispatch (manual)
+    # carries no workflow_run payload, so the branch/event clauses are skipped for
+    # it and it publishes whatever main points at.
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (github.event.workflow_run.conclusion == 'success' &&
+       github.event.workflow_run.event == 'push' &&
+       github.event.workflow_run.head_branch == 'main')
     steps:
+      # Check out the exact commit CI validated, not the current tip of main
+      # (which may have advanced past the SHA that passed the gate).
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.workflow_run.head_sha || github.sha }}
+
+      - name: Resolve commit SHA
+        id: vars
+        run: |
+          SHA="${{ github.event.workflow_run.head_sha || github.sha }}"
+          echo "sha7=${SHA:0:7}" >> "$GITHUB_OUTPUT"
 
       - uses: docker/setup-buildx-action@v3
 
@@ -37,9 +61,11 @@ jobs:
         uses: docker/metadata-action@v5
         with:
           images: codecsrayo/gt-core-mcp-server
+          # sha tag is built from the CI-validated commit, not github.sha (which
+          # in the workflow_run context resolves to the default-branch tip).
           tags: |
             type=raw,value=latest
-            type=sha,prefix=sha-,format=short
+            type=raw,value=sha-${{ steps.vars.outputs.sha7 }}
 
       - name: Build and push
         uses: docker/build-push-action@v6
