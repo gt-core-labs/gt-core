@@ -1,6 +1,8 @@
 /target/
 **/*.rs.bk
-Cargo.lock
+# Cargo.lock IS committed: this workspace ships binaries (gt-mcp-server), so the lock
+# must pin transitive versions for reproducible CI — without it CI re-resolves and can
+# pull an incompatible newer transitive (e.g. pgvector → sqlx 0.9 vs the workspace 0.8).
 .DS_Store
 *.swp
 .idea/
