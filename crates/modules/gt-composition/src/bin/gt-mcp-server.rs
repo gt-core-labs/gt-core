@@ -31,9 +31,9 @@ use rmcp::transport::{StreamableHttpServerConfig, StreamableHttpService};
 
 use gt_audit::{AuditSink, InMemoryAudit};
 use gt_composition::mcp::{
-    AgentHandler, AuditHandler, ConvoyHandler, DocumentsHandler, EventLog, EventLogQuota,
-    GraphHandler, MergeHandler, PgDocumentsResource, PgRigPrefixes, PgWorkspaceStatus,
-    QuotaHandler, RigHandler, WorkspaceHandler, WsPoolRigs, WsPools,
+    AgentHandler, AuditHandler, ConvoyHandler, DocumentsHandler, EventLog, EventLogMerges,
+    EventLogQuota, GraphHandler, MergeHandler, PgDocumentsResource, PgRigPrefixes,
+    PgWorkspaceStatus, QuotaHandler, RigHandler, WorkspaceHandler, WsPoolRigs, WsPools,
 };
 use gt_docs_embed::Embedder;
 use gt_docs_extract::Extractor;
@@ -50,6 +50,7 @@ use gt_agent::{AgentApiState, AgentModule};
 use gt_documents::{DocumentsApiState, DocumentsModule};
 use gt_eventlog::DEFAULT_EVENTLOG_ROOT;
 use gt_issues::{IssuesApiState, IssuesModule};
+use gt_merge::{MergeApiState, MergeModule};
 use gt_mcp_server::{
     health, DocumentsResource, DomainRouter, HealthState, IssuesServer, PgAuditSink,
     WorkspaceRigPrefixes, WorkspaceStatusGate, WorkspaceStores,
@@ -297,6 +298,12 @@ async fn main() -> anyhow::Result<()> {
         .module(AgentModule::with_http(AgentApiState::new(agent_root)))
         .module(QuotaModule::with_http(QuotaApiState::new(Arc::new(EventLogQuota::new(
             event_log.clone(),
+        )))))
+        // merge.* (hq-fe-api-mount.3): the durable backing replays + appends the caller's
+        // `merge.*` stream — the same event-sourced board the MCP MergeHandler folds into, so the
+        // board survives restart (the actor's in-memory projection does not).
+        .module(MergeModule::with_http(MergeApiState::new(Arc::new(EventLogMerges::new(
+            event_log.clone(),
         )))));
     if let Ok(pg_url) = std::env::var("GT_PG_URL") {
         let pool = sqlx::PgPool::connect(&pg_url)
@@ -318,11 +325,11 @@ async fn main() -> anyhow::Result<()> {
             build_embedder(),
         )));
         eprintln!(
-            "[gt-mcp-server] REST domain modules: workspace + rig + documents + agent + quota"
+            "[gt-mcp-server] REST domain modules: workspace + rig + documents + agent + quota + merge"
         );
     } else {
         eprintln!(
-            "[gt-mcp-server] REST domain modules: agent + quota (GT_PG_URL unset → no workspace/rig/documents)"
+            "[gt-mcp-server] REST domain modules: agent + quota + merge (GT_PG_URL unset → no workspace/rig/documents)"
         );
     }
     let rest_root = rest

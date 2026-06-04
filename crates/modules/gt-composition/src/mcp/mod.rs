@@ -41,6 +41,6 @@ pub use graph::GraphHandler;
 pub use merge::MergeHandler;
 pub use pools::WsPools;
 pub use quota::QuotaHandler;
-pub use rest_backings::{EventLogQuota, WsPoolRigs};
+pub use rest_backings::{EventLogMerges, EventLogQuota, WsPoolRigs};
 pub use rig::{PgRigPrefixes, RigHandler};
 pub use workspace::{PgWorkspaceStatus, WorkspaceHandler};

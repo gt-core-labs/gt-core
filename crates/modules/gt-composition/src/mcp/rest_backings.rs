@@ -19,11 +19,16 @@
 //! [`gt_store_dolt::AppError`] the [`WsPools`]/[`EventLog`] edges return — so [`lift`]
 //! maps one to the other at the boundary.
 
+use std::future::Future;
 use std::sync::Arc;
 
 use async_trait::async_trait;
 use gt_events::AppError;
 
+use gt_merge::{
+    DynMergeRepository, MergeBoard, MergeEvent, MergeRepository, MergeSlot, MergeSlotState,
+    MergeState, WorkspaceMerges,
+};
 use gt_quota::{AccountRegistry, QuotaEvent, QuotaState, WorkspaceQuota};
 use gt_rig::{DynRigRepository, PgRigs, WorkspaceRigs};
 
@@ -34,6 +39,11 @@ use super::pools::WsPools;
 /// [`QuotaHandler`](super::quota::QuotaHandler)'s replay filter so both edges fold
 /// the identical stream.
 const QUOTA_NS: &str = "quota.";
+
+/// The event-log kind prefix every merge event carries (`merge.*.v1`); matches
+/// [`MergeHandler`](super::merge::MergeHandler)'s replay filter so the REST surface and the
+/// MCP handler fold the identical per-workspace stream.
+const MERGE_NS: &str = "merge.";
 
 /// Map the edge error ([`gt_store_dolt::AppError`]) onto the domain-core error
 /// ([`gt_events::AppError`]) the REST ports return. The two enums are variant-for-variant
@@ -99,5 +109,176 @@ impl WorkspaceQuota for EventLogQuota {
 
     async fn append(&self, workspace: &str, event: QuotaEvent) -> Result<(), AppError> {
         self.log.append(Some(workspace), event).map_err(lift)
+    }
+}
+
+/// REST backing for `merge.*` (`gt_merge::WorkspaceMerges`): the durable mirror of
+/// [`MergeHandler`](super::merge::MergeHandler). The merge board is event-sourced — the
+/// in-memory [`MergeRepository`](gt_merge::MergeRepository) the actor holds is a rebuilt-on-boot
+/// projection, never durable — so this backing resolves a per-request repository that rehydrates
+/// the board by replaying the caller's `merge.*` stream and appends transitions back to that same
+/// authoritative log. A `merge.submit` over MCP and a `POST /api/v1/merge` therefore land in one
+/// per-workspace board that survives restart.
+pub struct EventLogMerges {
+    log: Arc<EventLog>,
+}
+
+impl EventLogMerges {
+    /// Wrap the per-workspace event log (the binary's single shared instance).
+    pub fn new(log: Arc<EventLog>) -> Self {
+        Self { log }
+    }
+}
+
+#[async_trait]
+impl WorkspaceMerges for EventLogMerges {
+    async fn repo(&self, workspace: &str) -> Result<Box<dyn DynMergeRepository>, AppError> {
+        // The repo is a thin per-workspace handle over the shared log; building it cannot fail
+        // (the first replay/append is where an I/O error would surface), so no store touch here.
+        Ok(Box::new(EventLogMergeRepo {
+            log: self.log.clone(),
+            workspace: workspace.to_string(),
+        }))
+    }
+}
+
+/// A `merge.*` repository scoped to one workspace, over the shared event log.
+///
+/// Reads ([`list_slots`](MergeRepository::list_slots) / [`get_slot`](MergeRepository::get_slot))
+/// replay the stream; a write ([`upsert_slot`](MergeRepository::upsert_slot)) appends the
+/// [`MergeEvent`] the slot's resulting state implies. The board state machine derives a slot's
+/// state from its event *variant*, so the slot's lifecycle round-trips faithfully. The event's
+/// audit fields (`channel_msg_id` / `sha` / `reason`) are not part of the projection
+/// [`MergeSlot`] (`{bead, branch, state}`) the REST adapter persists, so a REST-written event
+/// carries them empty — the authoritative audit values are those the actor / refinery edge
+/// append. Implementing [`MergeRepository`] (not the boxed [`DynMergeRepository`] directly) reuses
+/// the crate's blanket adapter, so `Box<dyn DynMergeRepository>` falls out for free.
+struct EventLogMergeRepo {
+    log: Arc<EventLog>,
+    workspace: String,
+}
+
+impl EventLogMergeRepo {
+    /// Rehydrate the tenant's board from its `merge.*` events — the same replay the MCP
+    /// [`MergeHandler`](super::merge::MergeHandler) runs.
+    fn board(&self) -> Result<MergeBoard, AppError> {
+        let state = self
+            .log
+            .replay_domain(Some(&self.workspace), MERGE_NS, MergeState::default(), MergeState::apply)
+            .map_err(lift)?;
+        Ok(MergeBoard::from_state(&state))
+    }
+
+    /// The `merge.*` event a slot's current state implies, for the projection write the REST
+    /// adapter performs after a validated transition. Audit fields absent from the slot default
+    /// to empty (see the type docs).
+    fn slot_event(slot: &MergeSlot) -> MergeEvent {
+        match slot.state {
+            MergeSlotState::Ready => MergeEvent::Ready {
+                bead: slot.bead.clone(),
+                branch: slot.branch.clone(),
+                channel_msg_id: String::new(),
+            },
+            MergeSlotState::Merging => MergeEvent::Started { bead: slot.bead.clone() },
+            MergeSlotState::Merged => {
+                MergeEvent::Merged { bead: slot.bead.clone(), sha: String::new() }
+            }
+            MergeSlotState::Failed => {
+                MergeEvent::Failed { bead: slot.bead.clone(), reason: String::new() }
+            }
+        }
+    }
+}
+
+// The log's replay/append are synchronous, so each method resolves its `Result` eagerly and
+// moves it into a trivially-ready (and `Send`) future — no borrow of `self` crosses the await.
+impl MergeRepository for EventLogMergeRepo {
+    fn upsert_slot(&self, slot: &MergeSlot) -> impl Future<Output = Result<(), AppError>> + Send {
+        let res = self.log.append(Some(&self.workspace), Self::slot_event(slot)).map_err(lift);
+        async move { res }
+    }
+
+    fn get_slot(
+        &self,
+        bead: &str,
+    ) -> impl Future<Output = Result<Option<MergeSlot>, AppError>> + Send {
+        let res = self.board().map(|b| b.get(bead).cloned());
+        async move { res }
+    }
+
+    fn list_slots(&self) -> impl Future<Output = Result<Vec<MergeSlot>, AppError>> + Send {
+        let res = self.board().map(|b| b.snapshot());
+        async move { res }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    fn slot(bead: &str, branch: &str, state: MergeSlotState) -> MergeSlot {
+        MergeSlot { bead: bead.into(), branch: branch.into(), state }
+    }
+
+    /// A slot upserted through the backing survives a fresh provider over the same on-disk log —
+    /// the board is event-sourced, so a restart rehydrates it (the in-memory projection would not).
+    #[tokio::test]
+    async fn upsert_is_durable_across_provider_instances() {
+        let dir = TempDir::new().unwrap();
+        let log = || Arc::new(EventLog::new(Some(dir.path().to_path_buf())));
+
+        // Write a Ready slot through one provider instance.
+        EventLogMerges::new(log())
+            .repo("ws")
+            .await
+            .unwrap()
+            .upsert_slot(&slot("b1", "feat/b1", MergeSlotState::Ready))
+            .await
+            .unwrap();
+
+        // A brand-new provider (simulating a restart) still sees it by replaying the log.
+        let repo = EventLogMerges::new(log()).repo("ws").await.unwrap();
+        let slots = repo.list_slots().await.unwrap();
+        assert_eq!(slots.len(), 1);
+        assert_eq!(slots[0].bead, "b1");
+        assert_eq!(slots[0].state, MergeSlotState::Ready);
+        assert_eq!(repo.get_slot("b1").await.unwrap().unwrap().state, MergeSlotState::Ready);
+    }
+
+    /// The full lifecycle round-trips through the event stream: each upsert appends the event its
+    /// state implies, and a later read derives the current state from the replayed variants.
+    #[tokio::test]
+    async fn lifecycle_round_trips_through_the_stream() {
+        let dir = TempDir::new().unwrap();
+        let merges = EventLogMerges::new(Arc::new(EventLog::new(Some(dir.path().to_path_buf()))));
+        let repo = merges.repo("ws").await.unwrap();
+
+        for state in [MergeSlotState::Ready, MergeSlotState::Merging, MergeSlotState::Merged] {
+            repo.upsert_slot(&slot("b1", "feat/b1", state)).await.unwrap();
+        }
+        assert_eq!(repo.get_slot("b1").await.unwrap().unwrap().state, MergeSlotState::Merged);
+
+        // An unknown bead is absent, not an error.
+        assert!(repo.get_slot("nope").await.unwrap().is_none());
+    }
+
+    /// Per-workspace isolation is structural: a slot written under one tenant is invisible to
+    /// another (the log is path-partitioned per workspace).
+    #[tokio::test]
+    async fn workspaces_are_isolated() {
+        let dir = TempDir::new().unwrap();
+        let merges = EventLogMerges::new(Arc::new(EventLog::new(Some(dir.path().to_path_buf()))));
+
+        merges
+            .repo("alpha")
+            .await
+            .unwrap()
+            .upsert_slot(&slot("b1", "x", MergeSlotState::Ready))
+            .await
+            .unwrap();
+
+        assert!(merges.repo("beta").await.unwrap().list_slots().await.unwrap().is_empty());
+        assert_eq!(merges.repo("alpha").await.unwrap().list_slots().await.unwrap().len(), 1);
     }
 }
