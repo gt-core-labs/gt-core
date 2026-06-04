@@ -39,7 +39,9 @@
 //! into this same crate behind the off-by-default `jsonwebtoken` feature (`hq-auth-verify.1`) —
 //! the way gt-rig/gt-quota gate their `pg`/`axum` adapters — never a sibling adapter crate
 //! (Rule 4). It verifies the signature only; the `exp`/`workspace` gates stay
-//! [`JwtClaims::validate`]. Public-key loading by `kid` and rotation is `hq-auth-verify.2`.
+//! [`JwtClaims::validate`]. It holds one or more public keys indexed by the token's `kid` for
+//! rotation (`hq-auth-verify.2`), loaded from the environment via
+//! [`JwtAuthenticator::from_env`].
 //!
 //! This crate intentionally does **not** depend on `gt-workspace`: platform → platform deps
 //! are forbidden (Rule 4). The `workspace` claim is a plain `String`; the consumer (the

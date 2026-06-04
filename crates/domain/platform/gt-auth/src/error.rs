@@ -20,6 +20,13 @@ pub enum AuthError {
     /// The signature did not verify against the configured key.
     #[error("token signature is invalid")]
     InvalidSignature,
+    /// The token names a signing key (`kid`) the verifier does not hold — or carries no `kid`
+    /// and the verifier has no unambiguous key to fall back on. Distinct from
+    /// [`InvalidSignature`](Self::InvalidSignature): the token may be perfectly valid, but this
+    /// verifier cannot establish that without the matching public key. Carries the requested
+    /// `kid` (empty when the token had none). Raised by the RS256 keyset adapter.
+    #[error("no verification key for kid {0:?}")]
+    UnknownKey(String),
     /// The token could not be decoded into [`JwtClaims`](crate::JwtClaims) — wrong shape,
     /// not three dot-separated segments, bad base64, etc. Carries a human-readable reason.
     #[error("malformed token: {0}")]
