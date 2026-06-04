@@ -8,9 +8,16 @@
 //! caller's directory and no other.
 //!
 //! Per docs/02 (the SSE pattern):
-//! - **Per-workspace keying** — the tenant comes from the server-injected
-//!   `X-Workspace` header, never a URL/body field. `?channel=<namespace>` narrows
-//!   the feed to one domain (`merge`, `convoy`, …).
+//! - **Cookie auth, not header** (`hq-fe-api-stream.1`) — a browser `EventSource`
+//!   cannot set `Authorization`/`X-Workspace` headers, so when a JWT verifier is
+//!   configured the tenant comes from the **`gt_web_token` cookie**: the handler
+//!   verifies the JWT and keys the feed by its `workspace` claim, never a URL/body
+//!   field and never a client-supplied header. A missing/invalid/expired cookie is a
+//!   `401` *before* the SSE upgrade. With no verifier configured the endpoint keeps
+//!   its prior behaviour — tenant from the server-injected `X-Workspace` header — so
+//!   enabling cookie auth is an opt-in env, not a behaviour change.
+//! - **Per-workspace keying** — `?channel=<namespace>` narrows the feed to one
+//!   domain (`merge`, `convoy`, …).
 //! - **Last-Event-ID** — a reconnecting `EventSource` sends the last event's id (its
 //!   record `ts`); the handler replays only newer records, then resumes live.
 //! - **KeepAlive** — a comment line every 15s so proxies don't drop the idle stream.
@@ -25,21 +32,32 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use axum::extract::{Query, State};
-use axum::http::HeaderMap;
+use axum::http::{HeaderMap, StatusCode};
 use axum::response::sse::{Event, KeepAlive, Sse};
+use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use axum::Router;
-use futures_core::Stream;
 use serde::Deserialize;
+use time::OffsetDateTime;
 
+use gt_auth::JwtClaims;
 use gt_eventlog::EventRecord;
 
+use crate::auth::SharedAuthenticator;
+use crate::denial_audit::{record_denial, SharedAudit, ANONYMOUS};
 use crate::mcp::EventLog;
 
-/// The server-injected tenant header the stream is keyed by (mirrors the MCP
-/// dispatch `X-Workspace` convention). The workspace is never read from the URL or
-/// body — only this header — so a caller cannot stream another tenant's feed.
+/// The server-injected tenant header the stream is keyed by when no cookie auth is
+/// configured (mirrors the MCP dispatch `X-Workspace` convention). The workspace is
+/// never read from the URL or body — only this header — so a caller cannot stream
+/// another tenant's feed.
 const WORKSPACE_HEADER: &str = "x-workspace";
+
+/// The browser-nav JWT cookie the stream authenticates by (docs/02): an `EventSource`
+/// cannot set an `Authorization` header, so it carries the same bearer token in this
+/// cookie (`withCredentials: true`). The token is **never** read from the query string
+/// — that would leak it into proxy/access logs.
+const TOKEN_COOKIE: &str = "gt_web_token";
 
 /// Most records a connect/reconnect replays — a reconnect can't drain an unbounded
 /// backlog, and a fresh connect seeds with recent context only.
@@ -51,16 +69,43 @@ const POLL_INTERVAL: Duration = Duration::from_secs(1);
 /// Proxy keep-alive cadence — proxies drop idle SSE streams after ~60s (docs/02).
 const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(15);
 
-/// Shared state for the feed route: the per-workspace event log.
+/// The cookie-auth bundle: the verifier the `gt_web_token` JWT is checked with plus
+/// the audit sink rejections are recorded into (mirrors [`AuthState`](crate::auth::AuthState)
+/// for the REST chain). Present ⇒ the stream requires a valid cookie and keys the feed by
+/// the token's verified `workspace` claim; absent ⇒ the legacy `X-Workspace` header path.
+#[derive(Clone)]
+struct CookieAuth {
+    authenticator: SharedAuthenticator,
+    audit: SharedAudit,
+}
+
+/// Shared state for the feed route: the per-workspace event log, plus the optional
+/// cookie-auth bundle (`hq-fe-api-stream.1`). With auth `Some`, the tenant is the verified
+/// JWT `workspace` claim; with `None`, it is the `X-Workspace` header (prior behaviour).
 #[derive(Clone)]
 pub struct FeedState {
     event_log: Arc<EventLog>,
+    auth: Option<CookieAuth>,
 }
 
 impl FeedState {
-    /// Wrap the per-workspace event log the feed streams from.
+    /// Wrap the per-workspace event log the feed streams from, with **no** cookie auth: the
+    /// tenant is the server-injected `X-Workspace` header (the endpoint's prior behaviour,
+    /// for a deploy that configures no RS256 verifier).
     pub fn new(event_log: Arc<EventLog>) -> Self {
-        Self { event_log }
+        Self { event_log, auth: None }
+    }
+
+    /// Wrap the event log **with** `gt_web_token` cookie auth (`hq-fe-api-stream.1`): every
+    /// connect must present a JWT cookie the `authenticator` verifies, and the feed is keyed
+    /// by that token's `workspace` claim. Rejections (`401`) are recorded into `audit`, the
+    /// same sink the REST auth chain uses.
+    pub fn with_cookie_auth(
+        event_log: Arc<EventLog>,
+        authenticator: SharedAuthenticator,
+        audit: SharedAudit,
+    ) -> Self {
+        Self { event_log, auth: Some(CookieAuth { authenticator, audit }) }
     }
 }
 
@@ -77,16 +122,26 @@ pub fn feed_router(state: FeedState) -> Router {
     Router::new().route("/stream", get(feed_stream)).with_state(state)
 }
 
-/// Stream a workspace's event feed as SSE. The tenant is the `X-Workspace` header;
-/// `?channel=` narrows to one domain; `Last-Event-ID` resumes from a prior record.
+/// Stream a workspace's event feed as SSE. The tenant is the verified `gt_web_token`
+/// cookie's `workspace` claim when cookie auth is configured, else the `X-Workspace`
+/// header; `?channel=` narrows to one domain; `Last-Event-ID` resumes from a prior record.
+///
+/// Authentication (when configured) happens **before** the SSE upgrade — a missing,
+/// malformed, unverifiable, or expired cookie is a `401`, audited like the REST chain's
+/// token rejections (`hq-auth-guard.3`).
 async fn feed_stream(
     State(state): State<FeedState>,
     headers: HeaderMap,
     Query(params): Query<FeedParams>,
-) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
-    // Tenant + channel keying. The workspace is server-injected (header), never the
-    // query — the query carries only the channel filter.
-    let workspace = header(&headers, WORKSPACE_HEADER);
+) -> Response {
+    // Tenant keying. With cookie auth on, the workspace is the verified JWT claim (a
+    // browser EventSource can't send X-Workspace); off, it is the server-injected header.
+    // Never the query/body either way (docs/04 rule 15).
+    let workspace = match resolve_tenant(&state, &headers) {
+        Ok(ws) => ws,
+        // `resolve_tenant` already audited the denial; the message is the 401 body.
+        Err(msg) => return (StatusCode::UNAUTHORIZED, msg).into_response(),
+    };
     let channel = params.channel.filter(|c| !c.is_empty());
     // EventSource resends the last event's id on reconnect; our id is the record ts.
     let resume_from = header(&headers, "last-event-id");
@@ -103,17 +158,87 @@ async fn feed_stream(
                 .unwrap_or_default();
             for record in batch {
                 last_ts = Some(record.ts.clone());
-                yield Ok(record_event(&record));
+                // Annotate the error type: the handler now returns `Response`, so the stream's
+                // `Infallible` error is no longer inferred from a `Sse<…>` return type.
+                yield Ok::<Event, Infallible>(record_event(&record));
             }
             tokio::time::sleep(POLL_INTERVAL).await;
         }
     };
 
-    Sse::new(stream).keep_alive(
-        KeepAlive::new()
-            .interval(KEEPALIVE_INTERVAL)
-            .text("keep-alive"),
-    )
+    Sse::new(stream)
+        .keep_alive(
+            KeepAlive::new()
+                .interval(KEEPALIVE_INTERVAL)
+                .text("keep-alive"),
+        )
+        .into_response()
+}
+
+/// Resolve the tenant the feed is keyed by, enforcing cookie auth when configured.
+///
+/// - **Cookie auth on** (`state.auth` is `Some`): read the `gt_web_token` cookie, verify it
+///   through the authenticator, and gate its time/workspace invariants
+///   ([`JwtClaims::validate`] — the verifier checks the signature only). The tenant is the
+///   verified `workspace` claim. Any failure is a `401`, audited as an *unauthenticated*
+///   denial (the actor is [`ANONYMOUS`]: a credential we couldn't trust names no one).
+/// - **Cookie auth off** (`None`): the tenant is the `X-Workspace` header, or `None` (the
+///   whole-server-feed legacy shape) when absent.
+///
+/// On failure returns the `401` body message; the denial is recorded into the audit sink as
+/// a side effect (so the caller only has to turn the message into a response).
+fn resolve_tenant(state: &FeedState, headers: &HeaderMap) -> Result<Option<String>, &'static str> {
+    let Some(auth) = &state.auth else {
+        // Legacy path: server-injected header, no authentication.
+        return Ok(header(headers, WORKSPACE_HEADER));
+    };
+
+    // Audit an *unauthenticated* denial (`hq-auth-guard.3`) and return the body message. The
+    // actor is ANONYMOUS: a credential we couldn't verify names no one.
+    let reject = |msg: &'static str| -> &'static str {
+        record_denial(
+            auth.audit.as_ref(),
+            ANONYMOUS,
+            None,
+            &axum::http::Method::GET,
+            &"/stream".parse().expect("static uri"),
+            None,
+            StatusCode::UNAUTHORIZED,
+        );
+        msg
+    };
+
+    let token = match cookie(headers, TOKEN_COOKIE) {
+        Some(t) => t,
+        None => return Err(reject("missing gt_web_token cookie")),
+    };
+    let claims = match auth.authenticator.authenticate(&token) {
+        Ok(claims) => claims,
+        Err(_) => return Err(reject("invalid gt_web_token cookie")),
+    };
+    // Signature verified; now the clock + workspace-presence gate the verifier defers to us.
+    let now = OffsetDateTime::now_utc().unix_timestamp().max(0) as u64;
+    if claims
+        .validate(now, JwtClaims::workspace_optional_from_env())
+        .is_err()
+    {
+        return Err(reject("expired or incomplete gt_web_token cookie"));
+    }
+    Ok(Some(claims.workspace))
+}
+
+/// Value of a named cookie from the `Cookie` request header, trimmed and non-empty, or
+/// `None`. Parses the `name=value; name2=value2` list without pulling in a cookie-jar
+/// dependency (the token is the only cookie this endpoint reads).
+fn cookie(headers: &HeaderMap, name: &str) -> Option<String> {
+    headers
+        .get(axum::http::header::COOKIE)
+        .and_then(|v| v.to_str().ok())?
+        .split(';')
+        .filter_map(|pair| pair.split_once('='))
+        .find(|(k, _)| k.trim() == name)
+        .map(|(_, v)| v.trim().to_string())
+        .filter(|v| !v.is_empty())
 }
 
 /// Trimmed, non-empty value of a request header, or `None`.
@@ -139,7 +264,7 @@ fn record_event(record: &EventRecord) -> Event {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use gt_events::{Envelope, EventKind};
+    use gt_events::EventKind;
     use serde::Serialize;
     use tempfile::TempDir;
 
@@ -218,5 +343,191 @@ mod tests {
         assert_eq!(capped.len(), 3, "only the newest 3 are returned");
         // Newest end: the last appended (n=9) is included.
         assert_eq!(capped.last().unwrap().payload["n"], 9);
+    }
+}
+
+/// Cookie auth gate (`hq-fe-api-stream.1`): with a verifier wired, `/stream` requires the
+/// `gt_web_token` cookie, keys the feed by its verified `workspace` claim (never a header),
+/// and rejects a missing/invalid/expired cookie with a `401` audited like the REST chain.
+///
+/// Drives the real `feed_router` in-process (`tower` `oneshot`), reading the streaming
+/// Server-Sent-Events body for the happy path. Pure (tempdir log + in-memory doubles).
+#[cfg(test)]
+mod cookie_auth_tests {
+    use super::*;
+    use axum::body::Body;
+    use axum::http::{header, Request, StatusCode};
+    use gt_audit::{InMemoryAudit, Outcome};
+    use gt_auth::{InMemoryAuthenticator, JwtClaims};
+    use gt_events::EventKind;
+    use http_body_util::BodyExt;
+    use serde::Serialize;
+    use serde_json::Value;
+    use std::time::Duration;
+    use tempfile::TempDir;
+    use tower::ServiceExt; // oneshot
+
+    #[derive(Serialize)]
+    struct TestEvent {
+        #[serde(skip)]
+        kind: &'static str,
+        n: u64,
+    }
+    impl EventKind for TestEvent {
+        fn kind(&self) -> &'static str {
+            self.kind
+        }
+    }
+
+    /// Claims for `sub`/`workspace`, far-future expiry (a live token) unless `exp` overridden.
+    fn claims(workspace: &str, exp: u64) -> JwtClaims {
+        JwtClaims {
+            sub: "alice".into(),
+            workspace: workspace.into(),
+            scopes: vec![],
+            exp,
+            nbf: None,
+            iat: 0,
+        }
+    }
+
+    /// A `FeedState` with cookie auth over `token -> claims`, plus the audit sink so a test can
+    /// inspect recorded denials. The log lives in `dir`.
+    fn cookie_state(
+        dir: &TempDir,
+        token: &str,
+        claims: JwtClaims,
+    ) -> (FeedState, SharedAudit) {
+        let log = Arc::new(EventLog::new(Some(dir.path().to_path_buf())));
+        let audit: SharedAudit = Arc::new(InMemoryAudit::new());
+        let verifier: SharedAuthenticator =
+            Arc::new(InMemoryAuthenticator::new().with_token(token, claims));
+        (FeedState::with_cookie_auth(log, verifier, audit.clone()), audit)
+    }
+
+    /// Issue a `GET /stream` against the feed router, optionally with a `Cookie` and an
+    /// `X-Workspace` header, returning the whole response.
+    async fn get_stream(
+        state: FeedState,
+        cookie: Option<&str>,
+        x_workspace: Option<&str>,
+    ) -> axum::response::Response {
+        let mut b = Request::builder().uri("/stream");
+        if let Some(c) = cookie {
+            b = b.header(header::COOKIE, c);
+        }
+        if let Some(ws) = x_workspace {
+            b = b.header("x-workspace", ws);
+        }
+        feed_router(state).oneshot(b.body(Body::empty()).unwrap()).await.unwrap()
+    }
+
+    /// Read the SSE body until one `data:` frame is parsed or a bounded wait elapses (the
+    /// stream stays open for keep-alive, so we never read to EOF).
+    async fn first_event(body: Body) -> Option<Value> {
+        let mut buf = String::new();
+        let mut body = body;
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+        while tokio::time::Instant::now() < deadline {
+            let frame = match tokio::time::timeout(Duration::from_millis(200), body.frame()).await {
+                Ok(Some(Ok(f))) => f,
+                Ok(Some(Err(_))) | Ok(None) => break,
+                Err(_) => continue,
+            };
+            if let Some(chunk) = frame.data_ref() {
+                buf.push_str(&String::from_utf8_lossy(chunk));
+            }
+            for line in buf.lines() {
+                if let Some(v) = line.strip_prefix("data:") {
+                    if let Ok(val) = serde_json::from_str::<Value>(v.trim()) {
+                        return Some(val);
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    #[tokio::test]
+    async fn a_valid_cookie_streams_the_claim_workspace() {
+        let dir = TempDir::new().unwrap();
+        // Two tenants in distinct partitions; the cookie's claim is `acme`.
+        let log = EventLog::new(Some(dir.path().to_path_buf()));
+        log.append(Some("acme"), TestEvent { kind: "merge.merged.v1", n: 1 }).unwrap();
+        log.append(Some("beta"), TestEvent { kind: "merge.merged.v1", n: 2 }).unwrap();
+
+        let (state, audit) = cookie_state(&dir, "good", claims("acme", 9_999_999_999));
+        // An `X-Workspace: beta` header is present but must be ignored — the claim wins.
+        let resp = get_stream(state, Some("gt_web_token=good"), Some("beta")).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let event = first_event(resp.into_body()).await.expect("an SSE data frame");
+        assert_eq!(event["n"], 1, "streamed acme's event (the claim), not beta's header");
+        assert!(audit.read_all().unwrap().is_empty(), "a valid cookie is not a denial");
+    }
+
+    #[tokio::test]
+    async fn a_missing_cookie_is_unauthorized_and_audited() {
+        let dir = TempDir::new().unwrap();
+        let (state, audit) = cookie_state(&dir, "good", claims("acme", 9_999_999_999));
+        let resp = get_stream(state, None, Some("acme")).await;
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+        let rows = audit.read_all().unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].outcome, Outcome::Unauthorized);
+        assert_eq!(rows[0].actor, ANONYMOUS);
+        assert_eq!(rows[0].args["verdict"], "unauthenticated");
+    }
+
+    #[tokio::test]
+    async fn an_invalid_cookie_token_is_unauthorized_and_audited() {
+        let dir = TempDir::new().unwrap();
+        let (state, audit) = cookie_state(&dir, "good", claims("acme", 9_999_999_999));
+        // A different token value than the verifier knows → rejected.
+        let resp = get_stream(state, Some("gt_web_token=nope"), None).await;
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(audit.read_all().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn an_expired_cookie_is_unauthorized() {
+        let dir = TempDir::new().unwrap();
+        // exp in the past → JwtClaims::validate rejects even though the signature "verifies".
+        let (state, audit) = cookie_state(&dir, "good", claims("acme", 1));
+        let resp = get_stream(state, Some("gt_web_token=good"), None).await;
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(audit.read_all().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn the_cookie_is_picked_out_of_a_multi_cookie_header() {
+        let dir = TempDir::new().unwrap();
+        let log = EventLog::new(Some(dir.path().to_path_buf()));
+        log.append(Some("acme"), TestEvent { kind: "merge.merged.v1", n: 7 }).unwrap();
+        let (state, _audit) = cookie_state(&dir, "good", claims("acme", 9_999_999_999));
+        // Surrounded by other cookies, with spacing — must still be parsed.
+        let resp = get_stream(
+            state,
+            Some("theme=dark; gt_web_token=good; sid=abc123"),
+            None,
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let event = first_event(resp.into_body()).await.expect("an SSE data frame");
+        assert_eq!(event["n"], 7);
+    }
+
+    /// Without cookie auth (`FeedState::new`) the endpoint keeps its prior behaviour: the
+    /// `X-Workspace` header keys the feed and no cookie is required.
+    #[tokio::test]
+    async fn without_auth_the_x_workspace_header_still_keys_the_feed() {
+        let dir = TempDir::new().unwrap();
+        let log = EventLog::new(Some(dir.path().to_path_buf()));
+        log.append(Some("acme"), TestEvent { kind: "merge.merged.v1", n: 3 }).unwrap();
+        let state = FeedState::new(Arc::new(EventLog::new(Some(dir.path().to_path_buf()))));
+        let resp = get_stream(state, None, Some("acme")).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let event = first_event(resp.into_body()).await.expect("an SSE data frame");
+        assert_eq!(event["n"], 3);
     }
 }

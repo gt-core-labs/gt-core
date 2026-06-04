@@ -224,12 +224,36 @@ async fn main() -> anyhow::Result<()> {
         Arc::new(LocalSessionManager::default()),
         StreamableHttpServerConfig::default(),
     );
+    // The RS256 verifier, built once and shared by the SSE feed's cookie auth and the REST
+    // auth chain below. Env-gated (GT_JWT_RS256_KEYS / GT_JWT_RS256_PUBLIC_KEY_FILE): a deploy
+    // that configures no public key gets neither surface (MCP + ops only), exactly as before —
+    // enabling auth is an opt-in env, not a behaviour change.
+    let verifier: Option<SharedAuthenticator> = match JwtAuthenticator::from_env() {
+        Ok(v) => Some(Arc::new(v)),
+        Err(e) => {
+            eprintln!("[gt-mcp-server] no RS256 verifier configured ({e}); REST + cookie auth off");
+            None
+        }
+    };
+
     // Per-workspace SSE event feed (hq-mcp-dispatch.10): GET /stream fans the
     // caller's workspace log out as Server-Sent Events, keyed per (workspace,
     // channel) with Last-Event-ID resume + KeepAlive (docs/02). Merged as its own
     // sub-router so it carries FeedState without disturbing the health state.
-    let feed = feed_router(FeedState::new(event_log.clone()));
-    eprintln!("[gt-mcp-server] SSE feed on GET /stream (per-workspace, X-Workspace keyed)");
+    //
+    // Cookie auth (hq-fe-api-stream.1): with a verifier, a browser EventSource authenticates
+    // via the `gt_web_token` cookie and the feed is keyed by the JWT `workspace` claim; without
+    // one, the legacy `X-Workspace` header keys it (no auth), exactly as before.
+    let feed = match &verifier {
+        Some(v) => {
+            eprintln!("[gt-mcp-server] SSE feed on GET /stream (gt_web_token cookie auth, claim-keyed)");
+            feed_router(FeedState::with_cookie_auth(event_log.clone(), v.clone(), audit.clone()))
+        }
+        None => {
+            eprintln!("[gt-mcp-server] SSE feed on GET /stream (no verifier; X-Workspace keyed)");
+            feed_router(FeedState::new(event_log.clone()))
+        }
+    };
 
     let app = Router::new()
         .route("/health", get(health::health))
@@ -248,7 +272,7 @@ async fn main() -> anyhow::Result<()> {
     // Capability; this only adds authentication (RS256 bearer → verified claims) and the
     // claims→CallerScopes bridge the guard consumes, with denials audited.
     //
-    // Env-gated on the RS256 verifier (GT_JWT_RS256_KEYS / GT_JWT_RS256_PUBLIC_KEY_FILE): a
+    // Env-gated on the same RS256 verifier built above (shared with the SSE cookie auth): a
     // deploy that configures no public key serves no REST surface (MCP + ops only), exactly as
     // before — enabling it is an opt-in env, not a behaviour change.
     //
@@ -321,9 +345,8 @@ async fn main() -> anyhow::Result<()> {
     eprintln!("[gt-mcp-server] fused OpenAPI on GET /openapi.json (public spec)");
 
     let module_routes = root.into_router().merge(rest_root.into_router());
-    let app = match JwtAuthenticator::from_env() {
-        Ok(verifier) => {
-            let verifier: SharedAuthenticator = Arc::new(verifier);
+    let app = match verifier {
+        Some(verifier) => {
             let guarded = module_routes
                 // Innermost-first: the kernel scope guard (inside `module_routes`) runs last;
                 // bridge_scopes feeds it CallerScopes; audit_denials observes the guard's verdict;
@@ -339,12 +362,8 @@ async fn main() -> anyhow::Result<()> {
             );
             app.merge(guarded)
         }
-        Err(e) => {
-            eprintln!(
-                "[gt-mcp-server] REST surface off — no RS256 verifier configured ({e}); MCP + ops only"
-            );
-            app
-        }
+        // No verifier (the reason was logged where it was built): MCP + ops only.
+        None => app,
     };
 
     let listener = tokio::net::TcpListener::bind(&bind).await?;
