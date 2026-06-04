@@ -179,7 +179,7 @@ the query string (it leaks into proxy logs), and the client reconnects with
 | `register_routes` pilot (issues) | `hq-auth-routes.2` | planned |
 | JWKS endpoint | `hq-auth-routes.3` | planned |
 | Logout / refresh revocation | `hq-auth-session.1` | planned |
-| RS256 key rotation runbook | `hq-auth-session.2` | planned |
+| RS256 key rotation runbook | `hq-auth-session.2` | ✅ |
 
 Exposing all module functions over HTTP (the `register_routes` surface for the
 67 MCP tools) is the sibling epic `hq-fe-api`, which depends on this one: auth
@@ -187,6 +187,8 @@ gates, routes expose.
 
 ## See also
 
+- [14-rs256-key-rotation.md](14-rs256-key-rotation.md) — step-by-step operator
+  runbook for rolling the RS256 signing key (`kid` rollover) with no flag day.
 - [02-sse-pattern.md](02-sse-pattern.md) — streaming endpoint conventions.
 - [03-architecture-guardrails.md](03-architecture-guardrails.md) — Rule 4 (adapters
   fold into their crate), Rule 6 (workspace boundary).
