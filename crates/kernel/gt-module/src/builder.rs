@@ -601,9 +601,12 @@ impl Root {
     /// A module that declares scopes in its
     /// [`capability`](crate::GtModule::capability) has every one of its routes
     /// guarded by [`guard_module_scopes`](crate::guard_module_scopes): the caller
-    /// must hold the `<module>.<read|write>` scope the request method implies
-    /// (`hq-mod-routes.3`). A module claiming no scope keeps public routes. Takes
-    /// `self` because an `axum::Router` is consumed by nesting.
+    /// must hold the module's claimed `<module>.read` / `<module>.write` scope for
+    /// the request's verb-class (`hq-mod-routes.3`, `hq-auth-guard.2`). The
+    /// requirement is resolved from the declared [`Capability`](crate::Capability)
+    /// scopes, so a verb-class the module claims no scope for stays public; a
+    /// module claiming no scope at all keeps public routes. Takes `self` because
+    /// an `axum::Router` is consumed by nesting.
     pub fn into_router(self) -> Router {
         // Pair each module's id + claimed scopes with its router. Borrowing
         // `entries` while moving `routers` is fine — they are disjoint fields.
@@ -614,7 +617,11 @@ impl Root {
                 let guarded = if entry.capability.scopes().is_empty() {
                     module_router
                 } else {
-                    crate::guard_module_scopes(module_router, &entry.meta.id)
+                    crate::guard_module_scopes(
+                        module_router,
+                        &entry.meta.id,
+                        entry.capability.scopes(),
+                    )
                 };
                 app.nest(&crate::module_prefix(&entry.meta.id), guarded)
             })

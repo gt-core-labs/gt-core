@@ -18,9 +18,28 @@
 //! a request whose caller does not hold the scope the route requires. A module
 //! that claims no scope stays public.
 //!
-//! The required scope is derived per request from the HTTP method —
-//! `GET`/`HEAD`/`OPTIONS` need `<module>.read`, every mutating method needs
-//! `<module>.write`. Deriving it *inside* one middleware (rather than attaching a
+//! ## The required scope comes from the Capability (`hq-auth-guard.2`)
+//!
+//! The HTTP method classifies a request as a read (`GET`/`HEAD`/`OPTIONS`,
+//! safe/idempotent) or a write (every mutating method). But the *scope* that
+//! class requires is not fabricated from the method — it is the module's own
+//! claimed `<module>.read` / `<module>.write`, drawn from the
+//! [`Capability`](crate::Capability) (the same declared scope vocabulary the
+//! module's MCP tools name). Resolving the requirement from what the module
+//! *declares* — instead of assuming a `read`/`write` scope exists — has two
+//! consequences:
+//!
+//! - A verb-class the module claims **no** scope for stays **public** for that
+//!   class. This is the additive generalization of the "no scopes → public"
+//!   rule: a module that claims only `beads.read` gates reads and leaves writes
+//!   open; a module whose only scope is domain-specific (e.g. `merge.submit`,
+//!   never reached by a method class) keeps its whole HTTP surface public rather
+//!   than being bricked behind a `read`/`write` scope it never declared.
+//! - When the module *does* claim the matching scope, behavior is identical to
+//!   deriving it from the method — so a module claiming both `read` and `write`
+//!   is guarded exactly as before.
+//!
+//! Resolving the requirement *inside* one middleware (rather than attaching a
 //! static guard per method) is deliberate: a single `Router::layer` then guards
 //! all methods correctly, sidestepping the trap that `route_layer` applies one
 //! guard to every method on a router regardless of intent.
@@ -92,29 +111,74 @@ fn verb_for(method: &Method) -> &'static str {
     }
 }
 
-/// Wrap a module's router so every route enforces the caller holds the scope the
-/// request requires: `<module>.<read|write>` derived from the HTTP method
-/// (`hq-mod-routes.3`).
+/// The scope each verb-class of request requires, resolved once from a module's
+/// declared [`Capability`](crate::Capability) scopes (`hq-auth-guard.2`).
 ///
-/// The builder calls this only for modules that declare scopes in their
-/// [`Capability`](crate::Capability); a module that claims none keeps public
-/// routes. The returned router has the same `()` state, so it composes exactly
-/// like an unguarded one.
-pub fn guard_module_scopes(router: Router, module: &ModuleId) -> Router {
-    router.layer(from_fn_with_state(module.clone(), enforce_module_scope))
+/// `read`/`write` is `Some` only when the module actually claims
+/// `<module>.read` / `<module>.write`; a verb-class the module claims no scope
+/// for is left `None` and stays public — the additive generalization of the
+/// "no scopes → public" rule. Resolved at wiring time so the per-request guard
+/// is a cheap lookup carrying no parsing.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct RequiredScopes {
+    read: Option<Scope>,
+    write: Option<Scope>,
 }
 
-/// Per-request scope check. `module` is the owning module's id (the scope
-/// resource); the verb comes from the method, so one layer guards every method
-/// with the right scope.
-async fn enforce_module_scope(State(module): State<ModuleId>, req: Request, next: Next) -> Response {
-    // `<module>.<verb>` is always a valid scope: `module` is a validated slug and
-    // `verb_for` returns a fixed kebab word.
-    let required = Scope::new(format!("{}.{}", module.as_str(), verb_for(req.method())))
-        .expect("module id + fixed verb is a valid scope");
+impl RequiredScopes {
+    /// Resolve from the owning module id and the scopes it claims: keep the
+    /// claimed `<module>.read` / `<module>.write`, drop anything not declared.
+    fn resolve(module: &ModuleId, claimed: &[Scope]) -> Self {
+        // `<module>.<verb>` is always a valid scope (validated slug + fixed kebab
+        // verb); pick it only when the module's Capability declares it.
+        let pick = |verb: &str| {
+            let candidate = Scope::new(format!("{}.{}", module.as_str(), verb))
+                .expect("module id + fixed verb is a valid scope");
+            claimed.contains(&candidate).then_some(candidate)
+        };
+        RequiredScopes { read: pick("read"), write: pick("write") }
+    }
+
+    /// The scope a request with `method` requires, or `None` when the module
+    /// claims no scope for that verb-class (route is public for that class).
+    fn for_method(&self, method: &Method) -> Option<&Scope> {
+        match verb_for(method) {
+            "read" => self.read.as_ref(),
+            _ => self.write.as_ref(),
+        }
+    }
+}
+
+/// Wrap a module's router so every route enforces the caller holds the scope the
+/// request requires — the module's claimed `<module>.read` / `<module>.write`
+/// for the request's verb-class (`hq-auth-guard.2`).
+///
+/// The required scope is resolved from `claimed` (the module's
+/// [`Capability`](crate::Capability) scopes), not fabricated from the method: a
+/// verb-class the module declares no scope for stays public. The builder calls
+/// this only for modules that declare at least one scope; a module that claims
+/// none keeps public routes. The returned router has the same `()` state, so it
+/// composes exactly like an unguarded one.
+pub fn guard_module_scopes(router: Router, module: &ModuleId, claimed: &[Scope]) -> Router {
+    let required = RequiredScopes::resolve(module, claimed);
+    router.layer(from_fn_with_state(required, enforce_module_scope))
+}
+
+/// Per-request scope check. The request's verb-class selects the required scope
+/// resolved from the module's Capability; a class with no claimed scope passes
+/// through (public), otherwise the caller must hold that scope.
+async fn enforce_module_scope(
+    State(required): State<RequiredScopes>,
+    req: Request,
+    next: Next,
+) -> Response {
+    let Some(needed) = required.for_method(req.method()) else {
+        // The module claims no scope for this verb-class → route is public.
+        return next.run(req).await;
+    };
     match req.extensions().get::<CallerScopes>() {
         None => StatusCode::UNAUTHORIZED.into_response(),
-        Some(scopes) if scopes.holds(&required) => next.run(req).await,
+        Some(scopes) if scopes.holds(needed) => next.run(req).await,
         Some(_) => StatusCode::FORBIDDEN.into_response(),
     }
 }
@@ -171,10 +235,17 @@ mod tests {
         assert!(CallerScopes::default().0.is_empty());
     }
 
-    /// A `beads` router with a read (GET) and a write (POST) route, guarded.
-    fn guarded_beads() -> Router {
+    /// A `beads` router with a read (GET) and a write (POST) route, guarded by
+    /// the given claimed scopes.
+    fn guarded_beads_claiming(claimed: &[&str]) -> Router {
         let inner = Router::new().route("/list", get(|| async { "ok" }).post(|| async { "ok" }));
-        guard_module_scopes(inner, &ModuleId::new("beads").unwrap())
+        let scopes: Vec<Scope> = claimed.iter().map(|s| scope(s)).collect();
+        guard_module_scopes(inner, &ModuleId::new("beads").unwrap(), &scopes)
+    }
+
+    /// The common case: a `beads` module claiming both read and write.
+    fn guarded_beads() -> Router {
+        guarded_beads_claiming(&["beads.read", "beads.write"])
     }
 
     /// Send `method /list` with the optional caller scopes; return the status.
@@ -224,5 +295,65 @@ mod tests {
         // `beads.read` — a scope for the wrong module never passes.
         let cs = CallerScopes::new([scope("rigs.read")]);
         assert_eq!(status(guarded_beads(), Method::GET, Some(cs)).await, StatusCode::FORBIDDEN);
+    }
+
+    // --- Capability-derived requirement (hq-auth-guard.2) -------------------
+
+    #[test]
+    fn required_scopes_keep_only_declared_verbs() {
+        let beads = ModuleId::new("beads").unwrap();
+        // Both claimed → both required.
+        let both = RequiredScopes::resolve(&beads, &[scope("beads.read"), scope("beads.write")]);
+        assert_eq!(both.read, Some(scope("beads.read")));
+        assert_eq!(both.write, Some(scope("beads.write")));
+        // Only read claimed → write verb-class is unguarded.
+        let read_only = RequiredScopes::resolve(&beads, &[scope("beads.read")]);
+        assert_eq!(read_only.read, Some(scope("beads.read")));
+        assert_eq!(read_only.write, None);
+        // A domain-specific scope maps to neither read nor write.
+        let domain = RequiredScopes::resolve(&beads, &[scope("beads.submit")]);
+        assert_eq!(domain, RequiredScopes::default());
+    }
+
+    #[test]
+    fn for_method_picks_the_verb_class_scope() {
+        let beads = ModuleId::new("beads").unwrap();
+        let req = RequiredScopes::resolve(&beads, &[scope("beads.read"), scope("beads.write")]);
+        assert_eq!(req.for_method(&Method::GET), Some(&scope("beads.read")));
+        assert_eq!(req.for_method(&Method::HEAD), Some(&scope("beads.read")));
+        assert_eq!(req.for_method(&Method::POST), Some(&scope("beads.write")));
+        assert_eq!(req.for_method(&Method::DELETE), Some(&scope("beads.write")));
+    }
+
+    #[tokio::test]
+    async fn unclaimed_write_verb_leaves_writes_public() {
+        // A module that claims only `beads.read` gates reads but leaves the write
+        // verb-class public — the additive generalization of "no scopes → public".
+        let app = || guarded_beads_claiming(&["beads.read"]);
+        // Write needs no scope at all: even an unauthenticated POST passes.
+        assert_eq!(status(app(), Method::POST, None).await, StatusCode::OK);
+        // Reads are still gated.
+        assert_eq!(status(app(), Method::GET, None).await, StatusCode::UNAUTHORIZED);
+        let cs = CallerScopes::new([scope("beads.read")]);
+        assert_eq!(status(app(), Method::GET, Some(cs)).await, StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn unclaimed_read_verb_leaves_reads_public() {
+        let app = || guarded_beads_claiming(&["beads.write"]);
+        assert_eq!(status(app(), Method::GET, None).await, StatusCode::OK);
+        // Writes are still gated.
+        assert_eq!(status(app(), Method::POST, None).await, StatusCode::UNAUTHORIZED);
+        let cs = CallerScopes::new([scope("beads.write")]);
+        assert_eq!(status(app(), Method::POST, Some(cs)).await, StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn domain_only_scope_leaves_whole_surface_public() {
+        // The module's only claimed scope is neither read nor write, so no HTTP
+        // verb-class is gated: the surface stays public rather than bricked.
+        let app = || guarded_beads_claiming(&["beads.submit"]);
+        assert_eq!(status(app(), Method::GET, None).await, StatusCode::OK);
+        assert_eq!(status(app(), Method::POST, None).await, StatusCode::OK);
     }
 }
