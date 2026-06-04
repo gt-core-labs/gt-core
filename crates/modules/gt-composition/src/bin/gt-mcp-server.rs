@@ -301,11 +301,26 @@ async fn main() -> anyhow::Result<()> {
             "[gt-mcp-server] REST domain modules: agent + quota (GT_PG_URL unset → no workspace/rig/documents)"
         );
     }
-    let domain_rest_router = rest
+    let rest_root = rest
         .build()
-        .map_err(|e| anyhow::anyhow!("REST module build failed: {e:?}"))?
-        .into_router();
-    let module_routes = root.into_router().merge(domain_rest_router);
+        .map_err(|e| anyhow::anyhow!("REST module build failed: {e:?}"))?;
+
+    // Fused OpenAPI (hq-fe-api-spec.1): the kernel mounts each loaded module's route spec under
+    // its `/api/v1/<module>` prefix and merges them per builder; combine the two builders' docs —
+    // `root` (issues + meta) and `rest` (the domain crates) — into one and serve it at the public
+    // `/openapi.json`, so a frontend / codegen reads the whole REST surface from a single URL.
+    // Rendered once at boot, before `into_router` consumes either Root. Public by design: it
+    // describes the contract (a `401` without a token is part of it) and carries no tenant data,
+    // so it mounts on the ops router, never behind the RS256 auth chain the `/api/v1/*` routes do.
+    let mut openapi_doc = root.openapi();
+    openapi_doc.merge(rest_root.openapi());
+    let openapi_json: Arc<str> = Arc::from(
+        serde_json::to_string(&openapi_doc).context("serialize the merged OpenAPI document")?,
+    );
+    let app = app.merge(openapi_router(openapi_json));
+    eprintln!("[gt-mcp-server] fused OpenAPI on GET /openapi.json (public spec)");
+
+    let module_routes = root.into_router().merge(rest_root.into_router());
     let app = match JwtAuthenticator::from_env() {
         Ok(verifier) => {
             let verifier: SharedAuthenticator = Arc::new(verifier);
@@ -339,6 +354,23 @@ async fn main() -> anyhow::Result<()> {
     );
     axum::serve(listener, app).await?;
     Ok(())
+}
+
+/// Serve the kernel-merged OpenAPI document as the public `GET /openapi.json`
+/// (hq-fe-api-spec.1). `spec` is the JSON pre-rendered once at boot and shared across
+/// requests, so each call is a cheap clone, not a re-serialize. Public by design — it
+/// describes the REST contract and holds no tenant data — so it mounts on the ops router
+/// beside `/health`, never behind the RS256 auth chain the `/api/v1/*` surface carries.
+fn openapi_router(spec: Arc<str>) -> Router {
+    Router::new().route(
+        "/openapi.json",
+        get(move || {
+            let spec = spec.clone();
+            async move {
+                ([(axum::http::header::CONTENT_TYPE, "application/json")], spec.to_string())
+            }
+        }),
+    )
 }
 
 /// Prometheus scrape endpoint (hq-mt-deploy.8): render the process-global registry
@@ -559,5 +591,30 @@ fn build_blob_store() -> (Option<Arc<BlobStore>>, String) {
             eprintln!("[gt-mcp-server] blob store init failed — {e}; documents are .md-only");
             (None, bucket)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::body::Body;
+    use axum::http::{header, Request, StatusCode};
+    use tower::ServiceExt; // `oneshot`
+
+    /// `GET /openapi.json` serves the pre-rendered spec verbatim, as `application/json`,
+    /// with no auth — it is the public REST contract a frontend / codegen consumes.
+    #[tokio::test]
+    async fn openapi_json_served_public_as_json() {
+        let spec: Arc<str> = Arc::from(r#"{"openapi":"3.1.0","paths":{}}"#);
+        let resp = openapi_router(spec.clone())
+            .oneshot(Request::builder().uri("/openapi.json").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(resp.headers().get(header::CONTENT_TYPE).unwrap(), "application/json");
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        // Served byte-for-byte, and still valid JSON.
+        assert_eq!(&bytes[..], spec.as_bytes());
+        assert!(serde_json::from_slice::<serde_json::Value>(&bytes).is_ok());
     }
 }
