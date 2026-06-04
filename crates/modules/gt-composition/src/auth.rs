@@ -31,8 +31,29 @@ use axum::response::{IntoResponse, Response};
 use gt_auth::Authenticator;
 use gt_workspace::WorkspaceClaim;
 
+use crate::denial_audit::{record_denial, SharedAudit, ANONYMOUS};
+
 /// A shareable, object-safe authenticator handle the middleware verifies tokens with.
 pub type SharedAuthenticator = Arc<dyn Authenticator + Send + Sync>;
+
+/// State for [`authenticate`]: the verifier it checks tokens with plus the audit sink it
+/// records token rejections (`401`) into. Bundled because the middleware that both
+/// authenticates and audits its own denials needs a single `State` (`hq-auth-guard.3`).
+#[derive(Clone)]
+pub struct AuthState {
+    /// The object-safe authenticator handle.
+    pub authenticator: SharedAuthenticator,
+    /// The sink token-rejection denials are recorded into (the same `Arc` the
+    /// [`audit_denials`](crate::denial_audit::audit_denials) layer holds).
+    pub audit: SharedAudit,
+}
+
+impl AuthState {
+    /// Bundle a verifier and an audit sink for the auth middleware.
+    pub fn new(authenticator: SharedAuthenticator, audit: SharedAudit) -> Self {
+        Self { authenticator, audit }
+    }
+}
 
 /// Pull the bearer token out of an `Authorization` header value (`Bearer <token>`),
 /// case-insensitively on the scheme. Returns `None` when the header is absent.
@@ -50,20 +71,23 @@ fn bearer(req: &Request) -> Option<Result<&str, ()>> {
 
 /// Authenticate the request and inject the verified claim, or pass it through anonymously.
 ///
-/// Wire it with [`axum::middleware::from_fn_with_state`] passing a [`SharedAuthenticator`] as
-/// the state. See the module docs for the contract.
+/// Wire it with [`axum::middleware::from_fn_with_state`] passing an [`AuthState`] as the
+/// state. See the module docs for the contract. A token rejection (`401`) is the one denial
+/// this layer produces itself — it short-circuits before any downstream layer — so it audits
+/// that denial inline (`hq-auth-guard.3`); the scope-guard denials are audited downstream by
+/// [`audit_denials`](crate::denial_audit::audit_denials).
 pub async fn authenticate(
-    State(auth): State<SharedAuthenticator>,
+    State(state): State<AuthState>,
     mut req: Request,
     next: Next,
 ) -> Response {
     match bearer(&req) {
         // No Authorization header — anonymous. The per-route guard rejects protected routes;
-        // public ones (login) proceed.
+        // public ones (login) proceed. Not a denial here, so nothing to audit.
         None => next.run(req).await,
         // Present but not a well-formed bearer token.
-        Some(Err(())) => unauthorized("malformed Authorization header").into_response(),
-        Some(Ok(token)) => match auth.authenticate(token) {
+        Some(Err(())) => reject(&state, &req, "malformed Authorization header"),
+        Some(Ok(token)) => match state.authenticator.authenticate(token) {
             Ok(claims) => {
                 // WorkspaceClaim first (the slug the tenant extractor falls back to), then the
                 // full claims for the scope guard.
@@ -72,9 +96,25 @@ pub async fn authenticate(
                 req.extensions_mut().insert(claims);
                 next.run(req).await
             }
-            Err(_) => unauthorized("invalid bearer token").into_response(),
+            Err(_) => reject(&state, &req, "invalid bearer token"),
         },
     }
+}
+
+/// Audit a token-rejection denial (`401`, *unauthenticated* — no verified identity yet) and
+/// return the `401` response. The actor is [`ANONYMOUS`]: a credential we could not verify
+/// names no one, and no scope was ever resolved.
+fn reject(state: &AuthState, req: &Request, msg: &str) -> Response {
+    record_denial(
+        state.audit.as_ref(),
+        ANONYMOUS,
+        None,
+        req.method(),
+        req.uri(),
+        None,
+        StatusCode::UNAUTHORIZED,
+    );
+    unauthorized(msg).into_response()
 }
 
 fn unauthorized(msg: &str) -> impl IntoResponse + '_ {
@@ -87,6 +127,7 @@ mod tests {
     use axum::body::Body;
     use axum::routing::get;
     use axum::Router;
+    use gt_audit::{InMemoryAudit, Outcome};
     use gt_auth::{InMemoryAuthenticator, JwtClaims};
     use tower::ServiceExt; // oneshot
 
@@ -108,18 +149,18 @@ mod tests {
         format!("claims={claims:?} ws={ws:?}")
     }
 
-    fn app(auth: SharedAuthenticator) -> Router {
+    fn app(state: AuthState) -> Router {
         Router::new()
             .route("/", get(probe))
-            .layer(axum::middleware::from_fn_with_state(auth, authenticate))
+            .layer(axum::middleware::from_fn_with_state(state, authenticate))
     }
 
-    async fn call(auth: SharedAuthenticator, header: Option<&str>) -> (StatusCode, String) {
+    async fn call(state: AuthState, header: Option<&str>) -> (StatusCode, String) {
         let mut builder = Request::builder().uri("/");
         if let Some(h) = header {
             builder = builder.header(AUTHORIZATION, h);
         }
-        let resp = app(auth)
+        let resp = app(state)
             .oneshot(builder.body(Body::empty()).unwrap())
             .await
             .unwrap();
@@ -128,47 +169,67 @@ mod tests {
         (status, String::from_utf8(bytes.to_vec()).unwrap())
     }
 
-    fn verifier() -> SharedAuthenticator {
-        Arc::new(InMemoryAuthenticator::new().with_token("good", claims()))
+    /// An [`AuthState`] over the `good` token plus a fresh in-memory sink, returned so the
+    /// test can inspect what denials the auth layer recorded.
+    fn state() -> (AuthState, SharedAudit) {
+        let audit: SharedAudit = Arc::new(InMemoryAudit::new());
+        let verifier: SharedAuthenticator =
+            Arc::new(InMemoryAuthenticator::new().with_token("good", claims()));
+        (AuthState::new(verifier, audit.clone()), audit)
     }
 
     #[tokio::test]
     async fn a_valid_token_injects_claims_and_workspace() {
-        let (status, body) = call(verifier(), Some("Bearer good")).await;
+        let (st, audit) = state();
+        let (status, body) = call(st, Some("Bearer good")).await;
         assert_eq!(status, StatusCode::OK);
         assert!(body.contains(r#"claims=Some("alice")"#), "{body}");
         assert!(body.contains(r#"ws=Some("acme")"#), "{body}");
+        assert!(audit.read_all().unwrap().is_empty(), "a valid token is not a denial");
     }
 
     #[tokio::test]
     async fn the_bearer_scheme_is_case_insensitive() {
-        let (status, body) = call(verifier(), Some("bearer good")).await;
+        let (st, _audit) = state();
+        let (status, body) = call(st, Some("bearer good")).await;
         assert_eq!(status, StatusCode::OK);
         assert!(body.contains(r#"claims=Some("alice")"#), "{body}");
     }
 
     #[tokio::test]
     async fn no_header_passes_through_anonymously() {
-        let (status, body) = call(verifier(), None).await;
+        let (st, audit) = state();
+        let (status, body) = call(st, None).await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(body, "claims=None ws=None");
+        assert!(audit.read_all().unwrap().is_empty(), "anonymous pass-through is not a denial");
     }
 
     #[tokio::test]
-    async fn an_invalid_token_is_unauthorized() {
-        let (status, _) = call(verifier(), Some("Bearer nope")).await;
+    async fn an_invalid_token_is_unauthorized_and_audited() {
+        let (st, audit) = state();
+        let (status, _) = call(st, Some("Bearer nope")).await;
         assert_eq!(status, StatusCode::UNAUTHORIZED);
+        let rows = audit.read_all().unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].outcome, Outcome::Unauthorized);
+        assert_eq!(rows[0].actor, ANONYMOUS);
+        assert_eq!(rows[0].args["verdict"], "unauthenticated");
     }
 
     #[tokio::test]
-    async fn a_non_bearer_authorization_is_unauthorized() {
-        let (status, _) = call(verifier(), Some("Basic abc123")).await;
+    async fn a_non_bearer_authorization_is_unauthorized_and_audited() {
+        let (st, audit) = state();
+        let (status, _) = call(st, Some("Basic abc123")).await;
         assert_eq!(status, StatusCode::UNAUTHORIZED);
+        assert_eq!(audit.read_all().unwrap().len(), 1);
     }
 
     #[tokio::test]
-    async fn an_empty_bearer_token_is_unauthorized() {
-        let (status, _) = call(verifier(), Some("Bearer ")).await;
+    async fn an_empty_bearer_token_is_unauthorized_and_audited() {
+        let (st, audit) = state();
+        let (status, _) = call(st, Some("Bearer ")).await;
         assert_eq!(status, StatusCode::UNAUTHORIZED);
+        assert_eq!(audit.read_all().unwrap().len(), 1);
     }
 }

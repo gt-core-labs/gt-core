@@ -81,5 +81,5 @@ pub use mcp::{McpRegistry, McpTool, McpToolNameError};
 pub use meta::{ModuleId, ModuleIdError, ModuleMeta};
 pub use migrate::Migration;
 pub use module_trait::GtModule;
-pub use routes::{guard_module_scopes, module_prefix, CallerScopes, API_BASE};
+pub use routes::{guard_module_scopes, module_prefix, CallerScopes, ScopeDenied, API_BASE};
 pub use scope::{Scope, ScopeError};

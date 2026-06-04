@@ -101,6 +101,22 @@ impl CallerScopes {
     }
 }
 
+/// Stamped into a denied response's extensions by [`guard_module_scopes`] so an
+/// outer audit layer can record the denial — the scope the route required and the
+/// verdict — without re-deriving either (`hq-auth-guard.3`).
+///
+/// Additive and behaviour-preserving: the status the guard returns is unchanged; only
+/// this marker rides along for observability. Its presence is the precise signal that a
+/// `401`/`403` came from THIS scope guard, never from a route handler's own response.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ScopeDenied {
+    /// The scope the route required (`<module>.<verb>`).
+    pub required: Scope,
+    /// The verdict: `401 UNAUTHORIZED` (no caller scopes ⇒ unauthenticated) or
+    /// `403 FORBIDDEN` (authenticated but missing the required scope).
+    pub status: StatusCode,
+}
+
 /// The scope verb a request method requires: read for safe/idempotent reads,
 /// write for anything that mutates. `OPTIONS` (CORS preflight, idempotent) maps
 /// to read so it is never gated behind write.
@@ -177,10 +193,19 @@ async fn enforce_module_scope(
         return next.run(req).await;
     };
     match req.extensions().get::<CallerScopes>() {
-        None => StatusCode::UNAUTHORIZED.into_response(),
+        None => deny(needed.clone(), StatusCode::UNAUTHORIZED),
         Some(scopes) if scopes.holds(needed) => next.run(req).await,
-        Some(_) => StatusCode::FORBIDDEN.into_response(),
+        Some(_) => deny(needed.clone(), StatusCode::FORBIDDEN),
     }
+}
+
+/// Build a guard denial response, tagging it with the [`ScopeDenied`] marker so an
+/// outer audit layer can observe what was refused. The response body stays the bare
+/// status — only the extension is added, so behaviour is unchanged.
+fn deny(required: Scope, status: StatusCode) -> Response {
+    let mut resp = status.into_response();
+    resp.extensions_mut().insert(ScopeDenied { required, status });
+    resp
 }
 
 #[cfg(test)]
@@ -295,6 +320,49 @@ mod tests {
         // `beads.read` — a scope for the wrong module never passes.
         let cs = CallerScopes::new([scope("rigs.read")]);
         assert_eq!(status(guarded_beads(), Method::GET, Some(cs)).await, StatusCode::FORBIDDEN);
+    }
+
+    /// Send `method /list` with the optional caller scopes; return the whole response
+    /// so a test can inspect its [`ScopeDenied`] marker.
+    async fn respond(app: Router, method: Method, caller: Option<CallerScopes>) -> Response {
+        let mut req = Request::builder()
+            .method(method)
+            .uri("/list")
+            .body(Body::empty())
+            .unwrap();
+        if let Some(cs) = caller {
+            req.extensions_mut().insert(cs);
+        }
+        app.oneshot(req).await.unwrap()
+    }
+
+    #[tokio::test]
+    async fn denials_carry_the_scope_denied_marker() {
+        // 401 (no caller scopes) marks the required scope + status for an audit layer.
+        let resp = respond(guarded_beads(), Method::GET, None).await;
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(
+            resp.extensions().get::<ScopeDenied>(),
+            Some(&ScopeDenied { required: scope("beads.read"), status: StatusCode::UNAUTHORIZED })
+        );
+
+        // 403 (present but lacking the scope) marks the required scope + status too.
+        let cs = CallerScopes::new([scope("beads.read")]);
+        let resp = respond(guarded_beads(), Method::POST, Some(cs)).await;
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        assert_eq!(
+            resp.extensions().get::<ScopeDenied>(),
+            Some(&ScopeDenied { required: scope("beads.write"), status: StatusCode::FORBIDDEN })
+        );
+    }
+
+    #[tokio::test]
+    async fn allowed_and_public_responses_carry_no_marker() {
+        // A passing request never stamps the marker, so an audit layer records nothing.
+        let cs = CallerScopes::new([scope("beads.read")]);
+        let resp = respond(guarded_beads(), Method::GET, Some(cs)).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert!(resp.extensions().get::<ScopeDenied>().is_none());
     }
 
     // --- Capability-derived requirement (hq-auth-guard.2) -------------------

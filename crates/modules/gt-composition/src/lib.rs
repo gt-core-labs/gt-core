@@ -29,6 +29,7 @@
 //! their events onto the hub via `RootHandle::drain_events_from`.
 
 pub mod auth;
+pub mod denial_audit;
 pub mod mcp;
 pub mod polecat;
 pub mod scope_bridge;
