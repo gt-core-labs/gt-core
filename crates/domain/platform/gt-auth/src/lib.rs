@@ -24,6 +24,16 @@
 //!   off-by-default `jsonwebtoken` feature.
 //! - [`AuthError`] — the rejection vocabulary.
 //!
+//! ## Refresh tokens (the long-lived counterpart, `hq-auth-mint.3`)
+//!
+//! Access tokens are short-lived JWTs; [`RefreshToken`] is the long-lived **opaque** credential
+//! a client trades in for a fresh access token without re-login. [`RefreshStore`] is the port
+//! for issuing, **rotating** (single-use: each rotate mints a successor and spends the old
+//! token), and revoking them, with **reuse detection** — presenting an already-rotated token is
+//! the theft signal and revokes the whole [family](RefreshRecord::family). The dependency-free
+//! [`InMemoryRefreshStore`] is the reference adapter (a Postgres-backed one is a follow-up). See
+//! the `refresh` module docs for the security model and the `std`-only entropy rationale.
+//!
 //! ## Login providers (the step before token verification)
 //!
 //! [`Authenticator`] verifies an already-minted token. One step earlier, a principal logs in
@@ -60,6 +70,7 @@
 
 mod error;
 mod provider;
+mod refresh;
 mod verify;
 
 #[cfg(feature = "password-hash")]
@@ -73,6 +84,10 @@ mod mint;
 
 pub use error::AuthError;
 pub use provider::{Credentials, IdentityProvider, ProviderKind, VerifiedIdentity};
+pub use refresh::{
+    InMemoryRefreshStore, RefreshError, RefreshId, RefreshRecord, RefreshStatus, RefreshStore,
+    RefreshToken,
+};
 pub use verify::{Authenticator, InMemoryAuthenticator};
 
 #[cfg(feature = "jsonwebtoken")]

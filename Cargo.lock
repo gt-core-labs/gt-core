@@ -1441,6 +1441,7 @@ name = "gt-auth"
 version = "0.1.0"
 dependencies = [
  "argon2",
+ "getrandom 0.2.17",
  "jsonwebtoken",
  "serde",
  "serde_json",

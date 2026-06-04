@@ -31,6 +31,9 @@ argon2 = { workspace = true, optional = true }
 # so the core build stays crypto-free — pulled only when a binary verifies tokens. Same gating
 # as the `password-hash` adapter above (docs/03 Rule 4).
 jsonwebtoken = { workspace = true, optional = true }
+# OS CSPRNG for the always-on refresh-token module (`refresh.rs`, hq-auth-mint.3): bearer
+# credentials need unpredictable bytes, so this is a normal dep, not feature-gated.
+getrandom = { workspace = true }
 
 [features]
 # Production email+password provider — argon2 hash + verify.
