@@ -271,4 +271,87 @@ mod tests {
             .await;
         assert_eq!(err, Err(AuthError::InvalidCredentials));
     }
+
+    // --- mint.4: the full login flow against the REAL stack -------------------------------------
+    //
+    // Where the tests above stop at `PgUsers -> VerifiedIdentity`, this drives the whole login
+    // pipeline end to end with the production adapters: credentials -> `PgUsers` (argon2 against
+    // PG) -> `VerifiedIdentity` -> `into_claims` -> `JwtMinter` (access JWT) -> `JwtAuthenticator`
+    // verifies that very token back into the same claims, plus a `RefreshStore` issuing the
+    // long-lived counterpart. It is gated on the `jsonwebtoken` feature *as well* (the mint/verify
+    // adapters live behind it): with only `pg` on it compiles out, so the contract tests above
+    // still run on a pg-only build. Like them, it is a no-op without `GT_PG_URL`.
+    #[cfg(feature = "jsonwebtoken")]
+    #[tokio::test]
+    async fn login_e2e_mints_an_access_token_the_verifier_accepts_and_issues_a_refresh() {
+        use crate::{
+            Authenticator, InMemoryRefreshStore, JwtAuthenticator, JwtMinter, RefreshStore,
+        };
+
+        // The same throwaway 2048-bit RSA keypair the mint/verify slices use: sign with the
+        // private half, verify against its public half — a real RS256 round-trip, no shared secret.
+        const PRIV_PEM: &[u8] = include_bytes!("../tests/fixtures/rs256_priv.pem");
+        const PUB_PEM: &[u8] = include_bytes!("../tests/fixtures/rs256_pub.pem");
+
+        let Some(pool) = pool_or_skip().await else {
+            eprintln!("GT_PG_URL unset; skipping login e2e test");
+            return;
+        };
+        ensure_users_table(&pool).await;
+        let hash = hash_password("hunter2").unwrap();
+        seed_user(&pool, "u-carol", "carol@acme.test", &hash, &["rig.read", "rig.write"]).await;
+
+        let users = PgUsers::new(pool, "acme");
+
+        // 1. credentials -> PgUsers (argon2 verified against PG) -> VerifiedIdentity.
+        let identity = users
+            .authenticate(&Credentials::EmailPassword {
+                email: "carol@acme.test".into(),
+                password: "hunter2".into(),
+            })
+            .await
+            .expect("correct password authenticates");
+        assert_eq!(identity.sub, "u-carol");
+        // Workspace is the server-injected slug, never anything from the payload (docs/04 §15).
+        assert_eq!(identity.workspace, "acme");
+        assert_eq!(identity.scopes, vec!["rig.read".to_string(), "rig.write".to_string()]);
+
+        // 2. VerifiedIdentity.into_claims(exp, iat) -> JwtMinter.mint -> the access JWT.
+        let (iat, exp) = (1_000u64, 1_900u64);
+        let claims = identity.clone().into_claims(exp, iat);
+        let minter = JwtMinter::from_rsa_pem(PRIV_PEM).unwrap().with_kid("k1");
+        let access = minter.mint(&claims).expect("mint access token");
+
+        // 3. JwtAuthenticator (the public half of the pair) verifies the access token back into
+        //    the SAME claims — proving the mint -> verify round-trip end to end.
+        let verifier = JwtAuthenticator::from_kid_pems([("k1", PUB_PEM)]).unwrap();
+        let verified = verifier.authenticate(&access).expect("verify access token");
+        assert_eq!(verified, claims);
+        assert_eq!(verified.sub, "u-carol");
+        assert_eq!(verified.workspace, "acme");
+        assert_eq!(verified.scopes, vec!["rig.read".to_string(), "rig.write".to_string()]);
+        // The signature-verified token still passes the semantic clock/workspace gate in-window.
+        assert_eq!(verified.validate(iat + 1, false), Ok(()));
+
+        // 4. RefreshStore issues the long-lived counterpart for the same session, carrying the
+        //    identity's sub/workspace/scopes.
+        let store = InMemoryRefreshStore::new();
+        let (refresh, record) =
+            store.issue(&identity.sub, &identity.workspace, &identity.scopes, iat, exp);
+        assert!(!refresh.as_str().is_empty());
+        assert_eq!(record.sub, "u-carol");
+        assert_eq!(record.workspace, "acme");
+        assert_eq!(record.scopes, identity.scopes);
+        assert_eq!(record.status, crate::RefreshStatus::Active);
+
+        // Negative: a wrong password is rejected at the login step, so the flow never reaches the
+        // minter — there is no token to mint for a denied login.
+        let denied = users
+            .authenticate(&Credentials::EmailPassword {
+                email: "carol@acme.test".into(),
+                password: "wrong".into(),
+            })
+            .await;
+        assert_eq!(denied, Err(AuthError::InvalidCredentials));
+    }
 }
