@@ -61,11 +61,20 @@ pub mod fastembed {
 
     impl FastEmbedder {
         /// Load the default model (downloaded + cached on first use).
+        ///
+        /// Honours `FASTEMBED_CACHE_PATH`: when set, the model cache lands there — mount it on
+        /// a volume so the ~80MB model downloads once and persists across restarts. Unset ⇒
+        /// fastembed's default (`./.fastembed_cache`, ephemeral in a container).
         pub fn new() -> Result<Self, EmbedError> {
-            let model = TextEmbedding::try_new(
-                InitOptions::new(EmbeddingModel::AllMiniLML6V2).with_show_download_progress(false),
-            )
-            .map_err(|e| EmbedError::Init(e.to_string()))?;
+            let mut opts =
+                InitOptions::new(EmbeddingModel::AllMiniLML6V2).with_show_download_progress(false);
+            match std::env::var("FASTEMBED_CACHE_PATH") {
+                Ok(dir) if !dir.is_empty() => {
+                    opts = opts.with_cache_dir(std::path::PathBuf::from(dir));
+                }
+                _ => {}
+            }
+            let model = TextEmbedding::try_new(opts).map_err(|e| EmbedError::Init(e.to_string()))?;
             Ok(Self { model: Arc::new(model) })
         }
     }
