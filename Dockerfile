@@ -8,13 +8,11 @@
 # set, to Postgres for the domain dispatch handlers.
 FROM rust:1-slim-bookworm AS build
 WORKDIR /build
-# Build deps for the document extraction OCR path (hq-docs-store.4, docs/11):
-# leptonica/tesseract headers + clang for the bindgen bindings, pkg-config to find
-# them. PDF/Office extraction use pure-Rust crates and need nothing here.
-RUN apt-get update \
-    && apt-get install -y --no-install-recommends \
-       libtesseract-dev libleptonica-dev clang pkg-config \
-    && rm -rf /var/lib/apt/lists/*
+# This image builds the DEFAULT binary (no `ocr-tesseract` / `embeddings-fastembed`
+# features), so it needs none of those system libraries — the OCR/embedding engines are
+# decoupled, opt-in builds (docs/11). PDF/Office extraction + the blob store (opendal) +
+# pgvector binding are all pure-Rust. A future OCR/embeddings image adds the relevant libs
+# (libtesseract-dev/libleptonica-dev/clang, or the onnxruntime stack) alongside the feature.
 COPY . .
 RUN cargo build --release -p gt-composition --bin gt-mcp-server
 
@@ -25,12 +23,8 @@ FROM debian:bookworm-slim
 # check degrades to accept-all and the frontier surfaces beads whose surfaces live
 # only in a source repo (gastown) — the gap hq-gap-ready-set-has-no-unblocked-gt-core-work.
 # The operator wires GT_REPO_DIR + a read-only checkout via compose (out of this repo).
-# Runtime libs the OCR path links against (libtesseract/libleptonica) plus the
-# English trained data tesseract loads at runtime. PDF/Office extraction need none.
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends \
-       ca-certificates git \
-       libtesseract5 libleptonica6 tesseract-ocr-eng \
+    && apt-get install -y --no-install-recommends ca-certificates git \
     && rm -rf /var/lib/apt/lists/*
 COPY --from=build /build/target/release/gt-mcp-server /usr/local/bin/gt-mcp-server
 # Env (GT_DOLT_URL, GT_MCP_HTTP_BIND, GT_MCP_ACTOR, GT_MCP_SCOPE_CONFIG, and
