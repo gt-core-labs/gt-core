@@ -89,6 +89,9 @@ mod jwt;
 #[cfg(feature = "jsonwebtoken")]
 mod mint;
 
+#[cfg(feature = "axum")]
+mod http;
+
 pub use error::AuthError;
 pub use provider::{Credentials, IdentityProvider, ProviderKind, VerifiedIdentity};
 pub use refresh::{
@@ -105,6 +108,12 @@ pub use jwt::JwtAuthenticator;
 
 #[cfg(feature = "jsonwebtoken")]
 pub use mint::JwtMinter;
+
+#[cfg(feature = "axum")]
+pub use http::{
+    auth_router, AuthState, Clock, LoginProvider, LoginRequest, MeResponse, RefreshRequest,
+    TokenResponse,
+};
 
 #[cfg(test)]
 pub use provider::InMemoryIdentityProvider;

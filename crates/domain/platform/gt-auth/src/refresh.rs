@@ -154,6 +154,10 @@ pub struct RefreshRecord {
     pub sub: String,
     /// Tenant the session is scoped to (mirrors the `workspace` access-token claim).
     pub workspace: String,
+    /// Authorization scopes granted to the session, carried so a rotation can re-mint a
+    /// faithful access token without re-querying the user store. Inherited unchanged across a
+    /// rotation chain.
+    pub scopes: Vec<String>,
     /// Issued-at, seconds since the Unix epoch (injected, never read from the wall clock).
     pub issued_at: u64,
     /// Expiry, seconds since the Unix epoch. Rotation past this instant is
@@ -201,13 +205,14 @@ pub enum RefreshError {
 /// expose that behind a thin sync wrapper (block-on at its own edge) or grow an `async`
 /// sibling trait there without disturbing this clean, runtime-free core.
 pub trait RefreshStore {
-    /// Mint a new token in a **new** family for `sub`/`workspace`, valid until `exp` and issued
-    /// at `issued_at` (both injected — the store reads no clock). Returns the secret to hand to
-    /// the client plus its server-side [`RefreshRecord`].
+    /// Mint a new token in a **new** family for `sub`/`workspace` carrying `scopes`, valid until
+    /// `exp` and issued at `issued_at` (both injected — the store reads no clock). Returns the
+    /// secret to hand to the client plus its server-side [`RefreshRecord`].
     fn issue(
         &self,
         sub: &str,
         workspace: &str,
+        scopes: &[String],
         issued_at: u64,
         exp: u64,
     ) -> (RefreshToken, RefreshRecord);
@@ -230,6 +235,11 @@ pub trait RefreshStore {
     /// Kill every token in `family` (logout). Idempotent — revoking an already-dead or unknown
     /// family is a no-op.
     fn revoke_family(&self, family: &RefreshId);
+
+    /// Revoke the family the presented `token` belongs to (logout by refresh token). Resolves the
+    /// token to its family and kills it. Idempotent: an unknown token is a no-op, so logout never
+    /// errors and cannot be used to probe which tokens exist.
+    fn revoke_by_token(&self, token: &RefreshToken);
 }
 
 /// A [`Mutex`]-guarded in-memory [`RefreshStore`] for tests and the no-database path.
@@ -294,6 +304,7 @@ impl RefreshStore for InMemoryRefreshStore {
         &self,
         sub: &str,
         workspace: &str,
+        scopes: &[String],
         issued_at: u64,
         exp: u64,
     ) -> (RefreshToken, RefreshRecord) {
@@ -304,6 +315,7 @@ impl RefreshStore for InMemoryRefreshStore {
             family: RefreshId::generate(),
             sub: sub.to_owned(),
             workspace: workspace.to_owned(),
+            scopes: scopes.to_vec(),
             issued_at,
             expires_at: exp,
             status: RefreshStatus::Active,
@@ -322,13 +334,14 @@ impl RefreshStore for InMemoryRefreshStore {
         let id = inner.tokens.get(token).cloned().ok_or(RefreshError::Unknown)?;
         // The id was in `tokens`, so the record exists; clone the fields we need before we let
         // go of the immutable borrow.
-        let (status, family, sub, workspace, expires_at) = {
+        let (status, family, sub, workspace, scopes, expires_at) = {
             let record = inner.records.get(&id).expect("token id without a record");
             (
                 record.status,
                 record.family.clone(),
                 record.sub.clone(),
                 record.workspace.clone(),
+                record.scopes.clone(),
                 record.expires_at,
             )
         };
@@ -357,6 +370,7 @@ impl RefreshStore for InMemoryRefreshStore {
                     family,
                     sub,
                     workspace,
+                    scopes,
                     issued_at: now,
                     expires_at,
                     status: RefreshStatus::Active,
@@ -371,6 +385,16 @@ impl RefreshStore for InMemoryRefreshStore {
         let mut inner = self.inner.lock().expect("refresh store mutex poisoned");
         inner.revoke_family(family);
     }
+
+    fn revoke_by_token(&self, token: &RefreshToken) {
+        let mut inner = self.inner.lock().expect("refresh store mutex poisoned");
+        // Resolve token -> id -> family, then sweep the family. Unknown token: nothing to do.
+        if let Some(id) = inner.tokens.get(token).cloned() {
+            if let Some(family) = inner.records.get(&id).map(|r| r.family.clone()) {
+                inner.revoke_family(&family);
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -380,9 +404,30 @@ mod tests {
     const HOUR: u64 = 3600;
 
     #[test]
+    fn scopes_are_carried_and_inherited_across_rotation() {
+        let store = InMemoryRefreshStore::new();
+        let scopes = vec!["rig.read".to_string(), "rig.write".to_string()];
+        let (tok, rec) = store.issue("alice", "acme", &scopes, 0, HOUR);
+        assert_eq!(rec.scopes, scopes);
+        // The successor inherits the granted scopes so a refresh can re-mint a faithful access.
+        let (_next, next_rec) = store.rotate(&tok, 10).unwrap();
+        assert_eq!(next_rec.scopes, scopes);
+    }
+
+    #[test]
+    fn revoke_by_token_kills_the_family_and_is_idempotent_for_unknown_tokens() {
+        let store = InMemoryRefreshStore::new();
+        let (tok, _) = store.issue("alice", "acme", &[], 0, HOUR);
+        store.revoke_by_token(&tok);
+        assert_eq!(store.rotate(&tok, 10), Err(RefreshError::Revoked));
+        // Unknown token: no-op, no panic.
+        store.revoke_by_token(&RefreshToken::new("never-issued"));
+    }
+
+    #[test]
     fn issue_then_rotate_swaps_the_token_and_invalidates_the_old_one() {
         let store = InMemoryRefreshStore::new();
-        let (tok, rec) = store.issue("alice", "acme", 0, HOUR);
+        let (tok, rec) = store.issue("alice", "acme", &[],0, HOUR);
         assert_eq!(rec.sub, "alice");
         assert_eq!(rec.workspace, "acme");
         assert_eq!(rec.status, RefreshStatus::Active);
@@ -403,7 +448,7 @@ mod tests {
     #[test]
     fn rotating_the_same_token_twice_is_reuse_and_revokes_the_family() {
         let store = InMemoryRefreshStore::new();
-        let (tok, _) = store.issue("alice", "acme", 0, HOUR);
+        let (tok, _) = store.issue("alice", "acme", &[],0, HOUR);
 
         let (successor, _) = store.rotate(&tok, 10).unwrap();
         // Presenting the spent token again → reuse detected.
@@ -415,7 +460,7 @@ mod tests {
     #[test]
     fn an_expired_token_cannot_be_rotated() {
         let store = InMemoryRefreshStore::new();
-        let (tok, _) = store.issue("alice", "acme", 0, 100);
+        let (tok, _) = store.issue("alice", "acme", &[],0, 100);
         // exp is exclusive: now == exp is already expired.
         assert_eq!(store.rotate(&tok, 100), Err(RefreshError::Expired));
         assert_eq!(store.rotate(&tok, 101), Err(RefreshError::Expired));
@@ -434,7 +479,7 @@ mod tests {
     #[test]
     fn revoke_family_then_rotate_is_revoked() {
         let store = InMemoryRefreshStore::new();
-        let (tok, rec) = store.issue("alice", "acme", 0, HOUR);
+        let (tok, rec) = store.issue("alice", "acme", &[],0, HOUR);
         store.revoke_family(&rec.family);
         assert_eq!(store.rotate(&tok, 10), Err(RefreshError::Revoked));
     }
@@ -442,7 +487,7 @@ mod tests {
     #[test]
     fn revoke_family_is_idempotent_and_safe_for_unknown_families() {
         let store = InMemoryRefreshStore::new();
-        let (tok, rec) = store.issue("alice", "acme", 0, HOUR);
+        let (tok, rec) = store.issue("alice", "acme", &[],0, HOUR);
         store.revoke_family(&rec.family);
         // Second revoke is a no-op, not a panic.
         store.revoke_family(&rec.family);
@@ -457,7 +502,7 @@ mod tests {
         let store = InMemoryRefreshStore::new();
         let mut seen = HashSet::new();
         for _ in 0..10_000 {
-            let (tok, _) = store.issue("alice", "acme", 0, HOUR);
+            let (tok, _) = store.issue("alice", "acme", &[],0, HOUR);
             assert!(seen.insert(tok), "duplicate refresh token generated");
         }
     }
@@ -481,8 +526,8 @@ mod tests {
     fn a_fresh_issue_opens_an_independent_family() {
         // Reuse on one session must not touch another.
         let store = InMemoryRefreshStore::new();
-        let (tok_a, _) = store.issue("alice", "acme", 0, HOUR);
-        let (tok_b, rec_b) = store.issue("alice", "acme", 0, HOUR);
+        let (tok_a, _) = store.issue("alice", "acme", &[],0, HOUR);
+        let (tok_b, rec_b) = store.issue("alice", "acme", &[],0, HOUR);
 
         // Trip reuse detection on session A.
         let _ = store.rotate(&tok_a, 10).unwrap();
