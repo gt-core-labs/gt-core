@@ -1,0 +1,32 @@
+# gt-mcp-server — embeddings variant (hq-docs-search.2, docs/11).
+#
+# Same server as the default Dockerfile, but built WITH `--features embeddings-fastembed`
+# so the local fastembed Embedder (ONNX, AllMiniLM-L6-v2) is compiled in. Heavier than the
+# lean default image (onnxruntime + openssl); use it only when semantic/hybrid document
+# search is wanted, with `GT_EMBEDDINGS=1` set at runtime.
+FROM rust:1-slim-bookworm AS build
+WORKDIR /build
+# fastembed/ort + their build chain: clang (bindgen), pkg-config + libssl-dev (openssl-sys),
+# cmake for the onnxruntime bindings.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+       clang pkg-config libssl-dev cmake \
+    && rm -rf /var/lib/apt/lists/*
+COPY . .
+RUN cargo build --release --locked -p gt-composition --bin gt-mcp-server \
+       --features embeddings-fastembed
+
+FROM debian:bookworm-slim
+# git: S3 readiness clause (docs/10 §S4). libssl3: openssl runtime for the embedding stack's
+# HTTPS model download. ca-certificates: TLS roots for that download.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates git libssl3 \
+    && rm -rf /var/lib/apt/lists/*
+COPY --from=build /build/target/release/gt-mcp-server /usr/local/bin/gt-mcp-server
+# ort downloads the onnxruntime shared lib at build; carry it into the runtime image and
+# point ort at it (ORT_DYLIB_PATH), so no runtime download/link is needed.
+COPY --from=build /build/target/release/libonnxruntime.so* /usr/local/lib/
+ENV ORT_DYLIB_PATH=/usr/local/lib/libonnxruntime.so
+# fastembed caches the model under this dir (mount a volume to persist across restarts).
+ENV FASTEMBED_CACHE_PATH=/var/lib/gt-core/fastembed
+ENTRYPOINT ["gt-mcp-server"]
