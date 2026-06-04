@@ -23,7 +23,7 @@ use rmcp::model::{
     ReadResourceRequestParams, ReadResourceResult, ResourceContents, ServerCapabilities,
     ServerInfo, Tool,
 };
-use rmcp::service::{RequestContext, RoleServer};
+use rmcp::service::{NotificationContext, RequestContext, RoleServer};
 use rmcp::{ErrorData as McpError, ServerHandler};
 use tracing::Instrument;
 
@@ -398,10 +398,28 @@ impl ServerHandler for IssuesServer {
         ServerInfo::new(
             ServerCapabilities::builder()
                 .enable_tools()
+                // Declare the tools `listChanged` capability so a connected client
+                // refetches `tools/list` when we emit the notification, rather than
+                // requiring a manual reconnect (hq-mcp-native.4). Paired with the
+                // `on_initialized` emit below.
+                .enable_tool_list_changed()
                 .enable_resources()
                 .build(),
         )
         .with_server_info(Implementation::from_build_env())
+    }
+
+    /// Fires once the client completes the initialize handshake (sends
+    /// `notifications/initialized`). The served tool set is fixed for the process
+    /// lifetime, but a client can connect and cache `tools/list` before the PG
+    /// catalog finishes seeding on boot (gt-composition self-seeds the catalog),
+    /// harvesting an incomplete set. Emitting `tools/list_changed` here nudges every
+    /// client to refetch the full, sanitized tool list deterministically on
+    /// (re)connect (hq-mcp-native.4).
+    async fn on_initialized(&self, context: NotificationContext<RoleServer>) {
+        if let Err(err) = context.peer.notify_tool_list_changed().await {
+            tracing::warn!(%err, "failed to emit tools/list_changed after initialize");
+        }
     }
 
     async fn list_tools(
@@ -844,6 +862,32 @@ mod tests {
         assert_eq!(sanitize_tool_name("meta.report-gap.execute"), "meta_report-gap_execute");
         // No dots ⇒ unchanged (a domain tool already underscore-free stays put).
         assert_eq!(sanitize_tool_name("workspace_list"), "workspace_list");
+    }
+
+    /// `get_info` advertises the tools `listChanged` capability (hq-mcp-native.4) so a
+    /// client refetches `tools/list` when `on_initialized` emits the notification,
+    /// instead of being stuck with a stale set until a manual reconnect.
+    #[test]
+    fn get_info_advertises_tool_list_changed_capability() {
+        let srv = IssuesServer::new(
+            Arc::new(
+                DoltIssues::connect("mysql://gt@127.0.0.1:1/none").expect("lazy pool url parses"),
+            ),
+            Scope::admin("boot"),
+            None,
+            Arc::new(InMemoryAudit::new()),
+            vec![],
+            None,
+        );
+        let tools = rmcp::ServerHandler::get_info(&srv)
+            .capabilities
+            .tools
+            .expect("tools capability is enabled");
+        assert_eq!(
+            tools.list_changed,
+            Some(true),
+            "listChanged must be advertised for the on_initialized emit to take effect"
+        );
     }
 
     /// `new` builds the alias map keyed on the sanitized name, valued by the canonical
