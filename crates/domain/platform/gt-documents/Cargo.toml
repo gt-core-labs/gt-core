@@ -1,0 +1,25 @@
+[package]
+name = "gt-documents"
+edition.workspace = true
+version.workspace = true
+
+# hq-docs-api.1 (docs/11) — the document subsystem as a GtModule.
+#
+# Wraps the per-workspace document store (DocumentsRepository, hq-docs-store.3) + the blob
+# store (gt-store-blob) + extraction (gt-docs-extract) behind the kernel module seam, so the
+# composition root harvests the `documents.*` MCP tools instead of hand-listing them. This
+# crate owns the tool-arg shapes + their shape-only `validate()`; the transport-free execute
+# handlers (hq-docs-api.2) and the resource reads (hq-docs-api.3) build on top.
+#
+# Same faithful-wrap discipline as RigsModule / SkillsModule: the module facade is the unit
+# struct the root registers; the live work happens in the injected repository/stores.
+[dependencies]
+gt-module = { workspace = true }
+# `schema_for::<T>()` — JSON Schema for the tool-arg structs surfaced by MCP.
+gt-module-mcp = { workspace = true }
+schemars = { workspace = true }
+serde = { workspace = true }
+semver = { workspace = true }
+
+[dev-dependencies]
+serde_json = { workspace = true }

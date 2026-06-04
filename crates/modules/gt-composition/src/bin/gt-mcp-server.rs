@@ -31,15 +31,19 @@ use rmcp::transport::{StreamableHttpServerConfig, StreamableHttpService};
 
 use gt_audit::{AuditSink, InMemoryAudit};
 use gt_composition::mcp::{
-    AgentHandler, AuditHandler, ConvoyHandler, EventLog, GraphHandler, MergeHandler, PgRigPrefixes,
-    PgWorkspaceStatus, QuotaHandler, RigHandler, WorkspaceHandler, WsPools,
+    AgentHandler, AuditHandler, ConvoyHandler, DocumentsHandler, EventLog, GraphHandler,
+    MergeHandler, PgDocumentsResource, PgRigPrefixes, PgWorkspaceStatus, QuotaHandler, RigHandler,
+    WorkspaceHandler, WsPools,
 };
+use gt_docs_embed::Embedder;
+use gt_docs_extract::Extractor;
+use gt_store_blob::BlobStore;
 use gt_graphindex::GraphifyIndexer;
 use gt_composition::stream::{feed_router, FeedState};
 use gt_issues::IssuesModule;
 use gt_mcp_server::{
-    health, DomainRouter, HealthState, IssuesServer, PgAuditSink, WorkspaceRigPrefixes,
-    WorkspaceStatusGate, WorkspaceStores,
+    health, DocumentsResource, DomainRouter, HealthState, IssuesServer, PgAuditSink,
+    WorkspaceRigPrefixes, WorkspaceStatusGate, WorkspaceStores,
 };
 use gt_meta::MetaModule;
 use gt_module::RootBuilder;
@@ -141,7 +145,8 @@ async fn main() -> anyhow::Result<()> {
     // (workspace.*, rig.*, …) route to PG-backed handlers. Wired only when
     // GT_PG_URL is set; unset ⇒ an empty router, so the server serves issues +
     // meta exactly as before.
-    let (domains, rig_prefixes, ws_status) = build_domain_router(event_log.clone()).await?;
+    let (domains, rig_prefixes, ws_status, documents) =
+        build_domain_router(event_log.clone()).await?;
     // audit.* tails the same audit sink the server records into (hq-mt-ops.3).
     // Registered unconditionally — it reads the in-memory or Postgres sink, so it
     // works even when GT_PG_URL is unset and the rest of the router is empty.
@@ -160,6 +165,12 @@ async fn main() -> anyhow::Result<()> {
     if let Some(gate) = ws_status {
         service = service.with_workspace_status(gate);
         eprintln!("[gt-mcp-server] suspend/archive enforcement on (mutations gated by ws status)");
+    }
+    // Wire the document resource reads (hq-docs-api.3): gt://doc/{id} + the `documents`
+    // inline on gt://issue/{id}. Present whenever the PG document store is (GT_PG_URL set).
+    if let Some(docs) = documents {
+        service = service.with_documents(docs);
+        eprintln!("[gt-mcp-server] document resources on (gt://doc/{{id}} + gt://issue docs inline)");
     }
 
     // Multi-tenant routing (hq-mt-routing.5): when GT_DOLT_BASE_URL is set, a
@@ -257,15 +268,20 @@ async fn apply_pg_catalog(pool: &sqlx::PgPool) -> anyhow::Result<()> {
     let workspace_id = ModuleId::new("workspace").expect("`workspace` is a valid module id");
     let feature_id = ModuleId::new("feature").expect("`feature` is a valid module id");
     let rig_id = ModuleId::new("rig").expect("`rig` is a valid module id");
+    let docs_id = ModuleId::new("docs").expect("`docs` is a valid module id");
     let workspace_migs = gt_store_pg::workspace_migrations();
     let feature_migs = gt_store_pg::feature_flags_migrations();
     let rig_migs = RigsModule.migrations();
+    // hq-docs-store.1: the per-workspace `documents` template tables (docs/11). Like `rig`,
+    // they seed the `ws_default` template so `gt_create_workspace_schema` clones them per tenant.
+    let docs_migs = gt_store_pg::docs_migrations();
 
     let plan: Vec<_> = workspace_migs
         .iter()
         .map(|m| (&workspace_id, m))
         .chain(feature_migs.iter().map(|m| (&feature_id, m)))
         .chain(rig_migs.iter().map(|m| (&rig_id, m)))
+        .chain(docs_migs.iter().map(|m| (&docs_id, m)))
         .collect();
 
     let report = gt_module_migrate::apply(pool, &plan)
@@ -290,12 +306,13 @@ async fn build_domain_router(
     DomainRouter,
     Option<Arc<dyn WorkspaceRigPrefixes>>,
     Option<Arc<dyn WorkspaceStatusGate>>,
+    Option<Arc<dyn DocumentsResource>>,
 )> {
     let Ok(pg_url) = std::env::var("GT_PG_URL") else {
         eprintln!(
             "[gt-mcp-server] GT_PG_URL unset; domain dispatch disabled (issues + meta only)"
         );
-        return Ok((DomainRouter::new(), None, None));
+        return Ok((DomainRouter::new(), None, None, None));
     };
     // The workspace catalog lives in the shared `public` schema, so it uses a
     // plain pool; the per-workspace domains (rig, …) resolve their `ws_<slug>`
@@ -329,6 +346,19 @@ async fn build_domain_router(
             event_log.clone(),
             Arc::new(GraphifyIndexer::new()),
         )));
+
+    // documents.* dispatch (hq-docs-api.2, docs/11): .md content + binary attachments a model
+    // reads as context. The blob store is wired from GT_BLOB_* when set; unset ⇒ md-only
+    // (blob attach errors, .md still works). Extraction runs without OCR in the default build
+    // (the tesseract OcrEngine is behind the `ocr-tesseract` feature, docs/11).
+    let (blob, bucket) = build_blob_store();
+    let router = router.register(Arc::new(DocumentsHandler::new(
+        ws_pools.clone(),
+        blob,
+        bucket,
+        Extractor::without_ocr(),
+        build_embedder(),
+    )));
     eprintln!(
         "[gt-mcp-server] domain namespaces: {:?}",
         router.namespaces()
@@ -336,9 +366,60 @@ async fn build_domain_router(
     // The same per-workspace rig catalog backs issues.create prefix routing
     // (hq-mt-rigs.6): a new bead's id prefix must be a registered rig prefix in the
     // caller's workspace (or a reserved prefix).
-    let rig_prefixes: Arc<dyn WorkspaceRigPrefixes> = Arc::new(PgRigPrefixes::new(ws_pools));
+    let rig_prefixes: Arc<dyn WorkspaceRigPrefixes> = Arc::new(PgRigPrefixes::new(ws_pools.clone()));
     // The suspend/archive gate reads the same `public`-schema workspace catalog the
     // `workspace.*` handler mutates (hq-mt-bootstrap.8), behind a short TTL cache.
     let ws_status: Arc<dyn WorkspaceStatusGate> = Arc::new(PgWorkspaceStatus::new(pool));
-    Ok((router, Some(rig_prefixes), Some(ws_status)))
+    // The same per-workspace pool cache backs the document resource reads (hq-docs-api.3):
+    // gt://doc/{id} + the documents inline on gt://issue/{id}.
+    let documents: Arc<dyn DocumentsResource> = Arc::new(PgDocumentsResource::new(ws_pools));
+    Ok((router, Some(rig_prefixes), Some(ws_status), Some(documents)))
+}
+
+/// Build the semantic-search embedder (hq-docs-search.2). Only the `embeddings-fastembed`
+/// build can produce one, and only when `GT_EMBEDDINGS` is set truthy (model load/download is
+/// heavy, so it is opt-in). `None` ⇒ `documents.search` stays phase-1 full-text only.
+fn build_embedder() -> Option<Arc<dyn Embedder>> {
+    #[cfg(feature = "embeddings-fastembed")]
+    {
+        let on = std::env::var("GT_EMBEDDINGS").map(|v| v != "0" && !v.is_empty()).unwrap_or(false);
+        if on {
+            match gt_docs_embed::fastembed::FastEmbedder::new() {
+                Ok(e) => {
+                    eprintln!("[gt-mcp-server] documents semantic search on (fastembed local)");
+                    return Some(Arc::new(e));
+                }
+                Err(err) => {
+                    eprintln!("[gt-mcp-server] embedder init failed — {err}; search is full-text only");
+                }
+            }
+        }
+    }
+    eprintln!("[gt-mcp-server] embeddings off; documents.search is full-text only");
+    None
+}
+
+/// Build the document blob store from `GT_BLOB_*` (hq-docs-api.2 / hq-docs-deploy.1). Returns
+/// `(None, bucket)` when `GT_BLOB_ENDPOINT` is unset — the server then serves `.md` documents
+/// but rejects `kind="blob"` attachments. The bucket name is always returned (recorded on a
+/// blob row's pointer); it defaults to `gt-documents`.
+fn build_blob_store() -> (Option<Arc<BlobStore>>, String) {
+    let bucket = std::env::var("GT_BLOB_BUCKET").unwrap_or_else(|_| "gt-documents".into());
+    let Ok(endpoint) = std::env::var("GT_BLOB_ENDPOINT") else {
+        eprintln!("[gt-mcp-server] GT_BLOB_ENDPOINT unset; documents are .md-only (no blob store)");
+        return (None, bucket);
+    };
+    let region = std::env::var("GT_BLOB_REGION").unwrap_or_else(|_| "us-east-1".into());
+    let access = std::env::var("GT_BLOB_ACCESS_KEY").unwrap_or_default();
+    let secret = std::env::var("GT_BLOB_SECRET_KEY").unwrap_or_default();
+    match BlobStore::from_s3(&endpoint, &bucket, &region, &access, &secret) {
+        Ok(store) => {
+            eprintln!("[gt-mcp-server] documents blob store: S3 @ {endpoint} (bucket {bucket})");
+            (Some(Arc::new(store)), bucket)
+        }
+        Err(e) => {
+            eprintln!("[gt-mcp-server] blob store init failed — {e}; documents are .md-only");
+            (None, bucket)
+        }
+    }
 }

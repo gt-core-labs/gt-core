@@ -20,6 +20,13 @@ pub use schema::{schema_for, MAX_WORKSPACE_SLUG_LEN, SCHEMA_PREFIX, SHARED_SCHEM
 #[cfg(feature = "pg")]
 pub use schema::WorkspacePool;
 
+#[cfg(feature = "pg")]
+pub mod documents;
+#[cfg(feature = "pg")]
+pub use documents::{
+    DocError, Document, DocumentPatch, DocumentsRepository, NewDocument, PgDocuments,
+};
+
 /// Canonical id of the bootstrap default workspace.
 ///
 /// A single workspace is seeded by the initial migration so the platform is
@@ -66,6 +73,32 @@ const FEATURE_FLAGS_0001_SQL: &str =
 /// `workspaces` (the FK target) alongside every other module's schema.
 pub fn feature_flags_migrations() -> Vec<Migration> {
     vec![Migration::new(1, "0001_flag_overrides", FEATURE_FLAGS_0001_SQL)]
+}
+
+/// Migration #1: per-workspace `documents` table in the `ws_default` template.
+const DOCS_0001_SQL: &str = include_str!("../migrations/gt-docs/0001_documents.sql");
+
+/// Migration #2: per-workspace `document_versions` history in the `ws_default` template.
+const DOCS_0002_SQL: &str = include_str!("../migrations/gt-docs/0002_document_versions.sql");
+
+/// Migration #3: pgvector `embedding` column + HNSW index (phase-2 semantic search).
+const DOCS_0003_SQL: &str = include_str!("../migrations/gt-docs/0003_embedding.sql");
+
+/// Migrations for the `gt-docs` per-workspace document store (hq-docs-store.1), in
+/// ascending apply order.
+///
+/// Like `gt-rig`'s `rigs`, the `documents`/`document_versions` tables are per-workspace
+/// projection data defined ONCE in the `ws_default` template schema; the catalog runner
+/// applies them on boot and `gt_create_workspace_schema` clones them into every tenant
+/// (docs/11, docs/04 §15). The owning `gt-documents` domain crate (hq-docs-api.1) will
+/// surface these through `GtModule::migrations`; until it lands they live here beside the
+/// other port-only schemas (`gt-workspace`, `gt-feature-flags`).
+pub fn docs_migrations() -> Vec<Migration> {
+    vec![
+        Migration::new(1, "0001_documents", DOCS_0001_SQL),
+        Migration::new(2, "0002_document_versions", DOCS_0002_SQL),
+        Migration::new(3, "0003_embedding", DOCS_0003_SQL),
+    ]
 }
 
 #[cfg(test)]
@@ -115,6 +148,44 @@ mod tests {
             sql.to_uppercase().contains("ON CONFLICT"),
             "seed must be idempotent on manual re-apply",
         );
+    }
+
+    #[test]
+    fn docs_migrations_define_template_tables_in_order() {
+        let migs = docs_migrations();
+        assert_eq!(migs.len(), 3);
+        assert_eq!(migs[0].version, 1);
+        assert_eq!(migs[0].name, "0001_documents");
+        assert_eq!(migs[1].version, 2);
+        assert_eq!(migs[1].name, "0002_document_versions");
+        assert_eq!(migs[2].version, 3);
+        assert_eq!(migs[2].name, "0003_embedding");
+        // Phase-2 embedding migration: pgvector extension + vector column + ANN index.
+        let emb = &migs[2].sql;
+        assert!(emb.contains("CREATE EXTENSION IF NOT EXISTS vector"), "enables pgvector");
+        assert!(emb.contains("embedding vector(384)"), "384-dim embedding column");
+        assert!(emb.to_lowercase().contains("hnsw"), "ANN index");
+
+        // Per-workspace projection: defined in the ws_default template, structural
+        // isolation (no workspace_id / FK), idempotent like the other template migrations.
+        let create = &migs[0].sql;
+        assert!(create.contains("CREATE SCHEMA IF NOT EXISTS ws_default"), "bootstraps template");
+        assert!(create.contains("ws_default.documents"), "table in template schema");
+        assert!(create.to_uppercase().contains("CREATE TABLE IF NOT EXISTS"), "idempotent");
+        // Structural isolation: no `workspace_id` *column* (the prose comment may name it).
+        assert!(!create.contains("workspace_id TEXT"), "no workspace_id column");
+        assert!(!create.to_uppercase().contains("REFERENCES WORKSPACES"), "no FK to workspaces");
+        // Phase-1 shape: full-text column present.
+        assert!(create.contains("tsv"), "phase-1 full-text column present");
+        // The locked design decisions are realized in the schema.
+        assert!(create.contains("version"), "optimistic-concurrency token");
+        assert!(create.contains("deleted_at"), "soft-delete column");
+        assert!(create.contains("sha256"), "dedup key");
+        assert!(create.contains("kind IN ('md', 'blob')"), "two content classes");
+
+        let versions = &migs[1].sql;
+        assert!(versions.contains("ws_default.document_versions"), "history table in template");
+        assert!(versions.contains("REFERENCES ws_default.documents"), "FKs the live row");
     }
 
     #[test]

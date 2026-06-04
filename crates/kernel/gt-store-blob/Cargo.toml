@@ -1,0 +1,26 @@
+[package]
+name = "gt-store-blob"
+edition.workspace = true
+version.workspace = true
+
+# hq-docs-store.2 (docs/11) — S3-compatible object store for the document subsystem.
+#
+# Holds the BYTES of binary attachments (PDF / image / Office) the document store
+# (gt-documents) tracks; the Postgres `documents` row keeps only the bucket/key pointer
+# + extracted text. `.md` content never comes here — it lives in `documents.body_md`.
+#
+# Backend-agnostic via `opendal`: `services-s3` targets MinIO/S3 in prod, `services-fs`
+# backs local dev + tests with no running object store, so callers (the DocumentsRepository
+# adapter, hq-docs-store.3) never branch on backend. Key layout is per-tenant:
+# `<ws>/<owner_type>/<owner_id>/<sha256>-<filename>` so a workspace's blobs are namespaced.
+[dependencies]
+opendal = { workspace = true }
+tokio = { workspace = true }
+thiserror = { workspace = true }
+# Content-hash key + dedup (hq-docs decision 3).
+sha2 = { workspace = true }
+hex = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+tempfile = { workspace = true }
