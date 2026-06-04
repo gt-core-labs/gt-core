@@ -11,7 +11,32 @@ version.workspace = true
 [lib]
 path = "src/lib.rs"
 
+[features]
+# Off-by-default `axum` REST adapter (hq-fe-api-kernel.2): `register_routes` maps the
+# read-only `audit.tail` to a REST route the builder mounts at `/api/v1/audit` behind the
+# auth+scope guard, with a utoipa OpenAPI spec. Folds into this crate behind the `axum`
+# feature (docs/03 Rule 4), exactly as gt-quota/gt-graphindex gate theirs. Kernel-pure: the
+# per-tenant workspace is read straight off the `X-Workspace` header (no gt-workspace dep,
+# which would be a forbidden kernel->domain edge).
+axum = ["dep:axum", "dep:utoipa"]
+
 [dependencies]
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
+# The kernel module seam — `AuditModule` declares the audit subsystem's identity + capability
+# + the `audit.tail` descriptor so the `RootBuilder` harvests them, and carries the REST route
+# under `axum`.
+gt-module = { workspace = true }
+# `semver::Version` for the module's `ModuleMeta`.
+semver = { workspace = true }
+# The `axum` REST adapter + its OpenAPI spec (hq-fe-api-kernel.2), off by default.
+axum = { workspace = true, optional = true }
+utoipa = { workspace = true, optional = true }
+
+[dev-dependencies]
+# Exercise the REST router in-process (hq-fe-api-kernel.2): `oneshot` a request and read the
+# response without a live socket. Run with `--features axum` so the adapter compiles.
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+axum = { workspace = true }
+tower = { workspace = true, features = ["util"] }

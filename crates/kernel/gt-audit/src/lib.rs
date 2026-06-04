@@ -18,6 +18,20 @@ use std::sync::Mutex;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+/// The `audit.*` module seam (`hq-fe-api-kernel.2`): identity, capability, the `audit.tail`
+/// descriptor, and — under `axum` — the read-only REST route.
+pub mod module;
+/// The off-by-default `axum` REST adapter (`hq-fe-api-kernel.2`): the `audit.tail` HTTP route the
+/// builder mounts at `/api/v1/audit`, tailing the same [`AuditSink`] the MCP tool reads.
+#[cfg(feature = "axum")]
+pub mod http;
+
+#[cfg(feature = "axum")]
+pub use http::{audit_router, ApiDoc, AuditApiState};
+#[cfg(feature = "axum")]
+pub use module::AuditHttpModule;
+pub use module::AuditModule;
+
 /// Local error for the audit sink. In-memory recording does not fail; the `Result`
 /// exists for the Postgres sink to surface I/O errors without changing the trait.
 #[derive(Debug, Clone, Error, PartialEq, Eq)]
