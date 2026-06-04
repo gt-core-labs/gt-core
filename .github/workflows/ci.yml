@@ -96,18 +96,6 @@ jobs:
           --health-interval 5s
           --health-timeout 5s
           --health-retries 10
-      # Object store for the document blob path (hq-docs-test-blob.2 / -e2e.2). The bitnami
-      # image starts the MinIO server on its own (no command override — GitHub service
-      # containers can't set one) and auto-creates the bucket via MINIO_DEFAULT_BUCKETS, so
-      # the gated S3/e2e steps have a ready bucket without an extra `mc` provisioning step.
-      minio:
-        image: bitnami/minio:latest
-        env:
-          MINIO_ROOT_USER: minioadmin
-          MINIO_ROOT_PASSWORD: minioadmin
-          MINIO_DEFAULT_BUCKETS: gt-documents
-        ports:
-          - 9000:9000
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -159,10 +147,12 @@ jobs:
           # is still there). SERIAL — both gated tests reseed the one mcp_audit table.
           cargo test -p gt-mcp-server --locked -- --test-threads=1
       # The object-store beads (hq-docs-test-blob.2, hq-docs-test-e2e.*): the S3 backend
-      # roundtrip/presign and the full-stack attach→inline→search→presign flow against the
-      # live MinIO + Postgres. Report-only: a flaky object-store service must not break the
-      # hard contract gate (the schema/dispatch beads above already cover the document store
-      # without an object store). Runs the same suites the compose stack runs.
+      # roundtrip/presign and the full-stack attach→inline→search→presign flow against a
+      # live MinIO + Postgres. Report-only, and MinIO is started here with `docker run`
+      # rather than as a job `services:` container ON PURPOSE: a service-container init
+      # failure fails the whole job (skipping the hard-gated pg steps above), whereas a
+      # failure inside this step is contained by continue-on-error. The schema/dispatch
+      # beads already cover the document store without an object store.
       - name: documents object-store e2e (report-only)
         continue-on-error: true
         env:
@@ -173,12 +163,17 @@ jobs:
           GT_BLOB_ACCESS_KEY: minioadmin
           GT_BLOB_SECRET_KEY: minioadmin
         run: |
-          # Wait for MinIO to answer before exercising the object store.
+          docker run -d --name gt-minio -p 9000:9000 \
+            -e MINIO_ROOT_USER=minioadmin -e MINIO_ROOT_PASSWORD=minioadmin \
+            minio/minio server /data
           for _ in $(seq 1 30); do
             if curl -sf http://127.0.0.1:9000/minio/health/live >/dev/null 2>&1; then
               echo "minio ready"; break
             fi
             sleep 2
           done
+          # Provision the bucket the blob store writes to.
+          docker run --rm --network host --entrypoint sh minio/mc -c \
+            'mc alias set loc http://127.0.0.1:9000 minioadmin minioadmin && mc mb -p loc/gt-documents'
           cargo test -p gt-store-blob --locked s3_backend_roundtrips_and_presigns
           cargo test -p gt-composition --test documents_e2e --locked
