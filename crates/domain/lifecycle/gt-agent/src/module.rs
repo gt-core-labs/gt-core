@@ -48,17 +48,36 @@
 use gt_module::{Capability, EventKind, GtModule, McpRegistry, ModuleId, ModuleMeta, Scope};
 use semver::Version;
 
-/// The [`GtModule`] facade over the agent/session lifecycle. Zero-sized: the live session
-/// registry lives in the actor spawned by [`crate::actor::spawn`], so the unit struct is all
-/// the composition root registers.
-#[derive(Clone, Copy, Debug, Default)]
-pub struct AgentModule;
+/// The [`GtModule`] facade over the agent/session lifecycle. Field-less on the MCP harvest path
+/// (the live session registry is replayed from the event log per call, not held here), so the
+/// default-constructed module is all the MCP harvest path registers.
+///
+/// To also serve the REST surface, the binary constructs it with [`with_http`](Self::with_http),
+/// which bakes the event-log root into the router the trait's
+/// [`register_routes`](GtModule::register_routes) returns (the trait takes `&self`, so an
+/// implementor that needs runtime handles need not be zero-sized). Without the `axum` feature the
+/// module is field-less and routes default to empty.
+#[derive(Clone, Debug, Default)]
+pub struct AgentModule {
+    /// The REST state, present only when the binary opts the module into its HTTP surface via
+    /// [`with_http`](Self::with_http). `None` (the default) keeps the empty-router default.
+    #[cfg(feature = "axum")]
+    http: Option<crate::http::AgentApiState>,
+}
 
 impl AgentModule {
     /// The module's stable id (`agent`). Singular, to match the existing `agent.*`
     /// event-kind, MCP-tool, and scope namespaces. The literal is a known-valid slug.
     pub fn id() -> ModuleId {
         ModuleId::new("agent").expect("`agent` is a valid module id")
+    }
+
+    /// Build a module that also serves the REST surface (`hq-fe-api-orch.1`), baking `state` (the
+    /// event-log root) into the router [`register_routes`](GtModule::register_routes) returns. The
+    /// binary calls this; the MCP harvest path uses [`default`](Self::default).
+    #[cfg(feature = "axum")]
+    pub fn with_http(state: crate::http::AgentApiState) -> Self {
+        Self { http: Some(state) }
     }
 }
 
@@ -124,6 +143,26 @@ impl GtModule for AgentModule {
                  rejected by the state machine.",
             );
     }
+
+    /// The agent REST routes (`hq-fe-api-orch.1`), relative — the builder nests them under
+    /// `/api/v1/agent` and applies the `agent.read`/`agent.write` scope guard. Present only when
+    /// the module was built with [`with_http`](AgentModule::with_http); otherwise the empty
+    /// default (MCP-only registration), so the MCP harvest path mounts no HTTP surface.
+    #[cfg(feature = "axum")]
+    fn register_routes(&self) -> axum::Router {
+        match &self.http {
+            Some(state) => crate::http::agent_router(state.clone()),
+            None => axum::Router::new(),
+        }
+    }
+
+    /// The OpenAPI spec for the agent REST routes, contributed only when the module carries the
+    /// HTTP state (so the combined document documents exactly the routes actually mounted).
+    #[cfg(feature = "axum")]
+    fn openapi(&self) -> Option<utoipa::openapi::OpenApi> {
+        use utoipa::OpenApi;
+        self.http.as_ref().map(|_| crate::http::ApiDoc::openapi())
+    }
 }
 
 #[cfg(test)]
@@ -132,14 +171,14 @@ mod tests {
 
     #[test]
     fn meta_identity_is_singular_agent() {
-        let m = AgentModule.meta();
+        let m = AgentModule::default().meta();
         assert_eq!(m.id.as_str(), "agent");
         assert_eq!(m.version, Version::new(1, 0, 0));
     }
 
     #[test]
     fn capability_owns_agent_scopes_and_four_versioned_kinds() {
-        let cap = AgentModule.capability();
+        let cap = AgentModule::default().capability();
 
         let scopes: Vec<&str> = cap.scopes().iter().map(Scope::as_str).collect();
         assert_eq!(scopes, ["agent.read", "agent.write"]);
@@ -163,7 +202,7 @@ mod tests {
     #[test]
     fn registers_the_six_existing_agent_tools() {
         let mut reg = McpRegistry::new();
-        AgentModule.register_mcp_tools(&mut reg);
+        AgentModule::default().register_mcp_tools(&mut reg);
         let names: Vec<&str> = reg.tools().iter().map(|t| t.name.as_str()).collect();
         assert_eq!(
             names,
@@ -182,13 +221,24 @@ mod tests {
     fn owns_no_migration_sessions_are_dolt_native() {
         // The sessions table lives in Dolt (`gt-store-dolt` implements the write/query ports),
         // not a PG projection — so the wrap declares no migration, like `BeadsModule`.
-        assert!(AgentModule.migrations().is_empty());
+        assert!(AgentModule::default().migrations().is_empty());
     }
 
     #[test]
-    fn contributes_no_openapi_surface() {
-        // Sessions are managed over MCP (+ a `gt-web` read route lifted in refactor.13); the
-        // default (no OpenAPI, empty router) stands.
-        assert!(AgentModule.openapi().is_none());
+    fn default_module_contributes_no_routes_or_openapi() {
+        // The MCP harvest path uses the default module: no HTTP state ⇒ the empty-router /
+        // no-OpenAPI defaults stand. The REST surface is opt-in via `with_http` (hq-fe-api-orch.1).
+        assert!(AgentModule::default().openapi().is_none());
+        assert!(AgentModule::default().migrations().is_empty());
+    }
+
+    #[cfg(feature = "axum")]
+    #[test]
+    fn with_http_contributes_routes_and_openapi() {
+        // Built with HTTP state, the module documents its REST routes and returns a non-empty
+        // OpenAPI spec the builder mounts under `/api/v1/agent`. (The router itself is exercised
+        // by the http module's own tests + the contract test; here we assert the wiring flips on.)
+        let m = AgentModule::with_http(crate::http::AgentApiState::new("/tmp/gt-agent-rest-test"));
+        assert!(m.openapi().is_some());
     }
 }

@@ -10,11 +10,18 @@ mod state;
 
 pub mod actor;
 pub mod commands;
+/// The off-by-default `axum` REST adapter (`hq-fe-api-orch.1`): maps the `agent.*`
+/// session-lifecycle surface to REST routes that dispatch to the same event-log replay+append
+/// as the MCP tools.
+#[cfg(feature = "axum")]
+pub mod http;
 pub mod module;
 pub mod supervisor;
 
 pub use commands::{AddSession, AgentCommand, RemoveSession, TransitionSession};
 pub use events::AgentEvent;
+#[cfg(feature = "axum")]
+pub use http::{agent_router, AgentApiState, ApiDoc};
 pub use module::AgentModule;
 pub use repo::{InMemorySessions, SessionQueries, SessionWriter};
 pub use state::{DogKind, Session, SessionRegistry, SessionRole, SessionState};
