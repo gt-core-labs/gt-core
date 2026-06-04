@@ -1,0 +1,6 @@
+# Built-in scope profile: readonly (GT_MCP_SCOPE_PROFILE=readonly).
+# The default actor may call only *.validate tools — no execute/mutation path.
+# Safe for an observer/inspection client.
+[actors.mcp-local]
+allow = ["*"]
+validate_only = true
