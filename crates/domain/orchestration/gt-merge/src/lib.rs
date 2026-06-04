@@ -13,6 +13,8 @@
 
 pub mod actor;
 pub mod commands;
+#[cfg(feature = "axum")]
+pub mod http;
 pub mod module;
 pub mod refinery;
 mod events;
@@ -24,3 +26,11 @@ pub use events::{MergeEvent, MergeReadyPayload};
 pub use module::MergeModule;
 pub use repo::{InMemoryMergeRepo, MergeRepository};
 pub use state::{BoardSnapshot, MergeBoard, MergeSlot, MergeSlotState, MergeState};
+
+// The off-by-default `axum` REST adapter (`hq-fe-api-orch.2`): re-export the surface the
+// composition root wires (the per-workspace provider, its object-safe repo mirror, and the REST
+// state) so the binary can build the HTTP-enabled module without naming the `http` module path.
+#[cfg(feature = "axum")]
+pub use http::{merge_router, DynMergeRepository, MergeApiState, WorkspaceMerges};
+#[cfg(feature = "axum")]
+pub use module::MergeHttpModule;

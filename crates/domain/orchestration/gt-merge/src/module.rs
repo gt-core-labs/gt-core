@@ -48,6 +48,66 @@ impl MergeModule {
     pub fn id() -> ModuleId {
         ModuleId::new("merge").expect("`merge` is a valid module id")
     }
+
+    /// Build the HTTP-enabled merge module (`hq-fe-api-orch.2`), baking `state` (the
+    /// per-workspace repository provider) into the router its
+    /// [`register_routes`](GtModule::register_routes) returns. The binary calls this to opt the
+    /// module into its REST surface; the MCP harvest path keeps the plain unit [`MergeModule`].
+    /// Returns a [`MergeHttpModule`] rather than mutating `MergeModule` so the unit struct (and
+    /// its `MergeModule.migrations()` call sites) is left untouched — the same shape
+    /// `RigsModule::with_http` follows.
+    #[cfg(feature = "axum")]
+    pub fn with_http(state: crate::http::MergeApiState) -> MergeHttpModule {
+        MergeHttpModule { http: state }
+    }
+}
+
+/// The HTTP-enabled merge module (`hq-fe-api-orch.2`): the same `GtModule` contract as
+/// [`MergeModule`] plus the `merge.*` REST routes + OpenAPI spec.
+///
+/// Built by [`MergeModule::with_http`]. Identity, capability, and MCP tools are delegated verbatim
+/// to [`MergeModule`] (one source of truth for the board's contract); only
+/// [`register_routes`](GtModule::register_routes) and [`openapi`](GtModule::openapi) are
+/// overridden, carrying the per-workspace [`WorkspaceMerges`](crate::WorkspaceMerges) provider the
+/// handlers dispatch through. Like the unit module it owns no migration (the board is
+/// event-sourced), so the empty-`migrations` default stands.
+#[cfg(feature = "axum")]
+#[derive(Clone)]
+pub struct MergeHttpModule {
+    /// The per-workspace REST state the routes dispatch through.
+    http: crate::http::MergeApiState,
+}
+
+#[cfg(feature = "axum")]
+impl GtModule for MergeHttpModule {
+    fn meta(&self) -> ModuleMeta {
+        MergeModule.meta()
+    }
+
+    fn capability(&self) -> Capability {
+        MergeModule.capability()
+    }
+
+    fn register_mcp_tools(&self, registry: &mut McpRegistry) {
+        MergeModule.register_mcp_tools(registry);
+    }
+
+    fn migrations(&self) -> Vec<Migration> {
+        MergeModule.migrations()
+    }
+
+    /// The merge REST routes (`hq-fe-api-orch.2`), relative — the builder nests them under
+    /// `/api/v1/merge` and applies the `merge.read`/`merge.write` scope guard.
+    fn register_routes(&self) -> axum::Router {
+        crate::http::merge_router(self.http.clone())
+    }
+
+    /// The OpenAPI spec for the merge REST routes, so the combined document documents exactly the
+    /// routes mounted under the HTTP-enabled module.
+    fn openapi(&self) -> Option<utoipa::openapi::OpenApi> {
+        use utoipa::OpenApi;
+        Some(crate::http::ApiDoc::openapi())
+    }
 }
 
 impl GtModule for MergeModule {
@@ -172,5 +232,43 @@ mod tests {
         // The board is event-sourced (no table) and MCP-only: empty defaults stand.
         assert!(MergeModule.migrations().is_empty());
         assert!(MergeModule.openapi().is_none());
+    }
+
+    /// The HTTP-enabled variant (`hq-fe-api-orch.2`) documents its REST routes and returns a
+    /// non-empty OpenAPI spec the builder mounts under `/api/v1/merge`, while delegating the
+    /// board contract (id, scopes, MCP tools, no migration) verbatim to [`MergeModule`]. The
+    /// router itself is exercised by the http module's own tests + the contract test; here we
+    /// assert the trait wiring flips on and the delegation holds.
+    #[cfg(feature = "axum")]
+    #[test]
+    fn with_http_contributes_routes_and_delegates_contract() {
+        use crate::http::{DynMergeRepository, MergeApiState, WorkspaceMerges};
+        use gt_events::AppError;
+        use std::sync::Arc;
+
+        // A never-used provider is fine: `openapi()`/`meta()` read no state, and
+        // `register_routes` only clones the state into the router without dispatching.
+        struct NoopMerges;
+        #[async_trait::async_trait]
+        impl WorkspaceMerges for NoopMerges {
+            async fn repo(&self, _ws: &str) -> Result<Box<dyn DynMergeRepository>, AppError> {
+                Err(AppError::Other("unused".into()))
+            }
+        }
+
+        let m = MergeModule::with_http(MergeApiState::new(Arc::new(NoopMerges)));
+        assert!(m.openapi().is_some(), "HTTP variant ships an OpenAPI spec");
+
+        // Delegation: the HTTP variant carries the SAME contract as the unit module.
+        assert_eq!(m.meta().id.as_str(), MergeModule.meta().id.as_str());
+        assert_eq!(
+            m.capability().scopes(),
+            MergeModule.capability().scopes(),
+            "scopes delegate to MergeModule"
+        );
+        assert!(m.migrations().is_empty(), "no migration, delegated to MergeModule");
+        let mut reg = McpRegistry::new();
+        m.register_mcp_tools(&mut reg);
+        assert_eq!(reg.tools().len(), 6, "the six merge tools still register");
     }
 }

@@ -129,6 +129,20 @@ impl MergeBoard {
         }
         board
     }
+
+    /// Rebuild a live board from a [`MergeRepository`](crate::MergeRepository) projection
+    /// (the REST / dashboard read path, `hq-fe-api-orch.2`). Each persisted [`MergeSlot`]
+    /// already carries its current state, so the board is reconstituted directly — the same
+    /// decide-against-live-state hydration `from_state` does for replay, but seeded from the
+    /// repo's `list_slots` instead of the event log. A `Command` can then validate its
+    /// transition against the rehydrated board before the touched slot is upserted back.
+    pub fn from_slots(slots: impl IntoIterator<Item = MergeSlot>) -> Self {
+        let mut board = MergeBoard::default();
+        for slot in slots {
+            board.slots.insert(slot.bead.clone(), slot);
+        }
+        board
+    }
 }
 
 /// Replay reducer: re-corre el log y reconstruye el board + listas de terminados. Puro y
@@ -234,6 +248,22 @@ mod tests {
         b.start("b1").unwrap();
         b.fail("b1").unwrap();
         assert_eq!(b.get("b1").unwrap().state, MergeSlotState::Failed);
+    }
+
+    #[test]
+    fn from_slots_rehydrates_states_for_command_validation() {
+        // A repo projection carries each slot's *current* state, not just `Ready`. The board
+        // must come back with those states so a follow-up command validates correctly.
+        let board = MergeBoard::from_slots([
+            MergeSlot { bead: "b1".into(), branch: "feat/x".into(), state: MergeSlotState::Merging },
+            MergeSlot { bead: "b2".into(), branch: "feat/y".into(), state: MergeSlotState::Ready },
+        ]);
+        assert_eq!(board.get("b1").unwrap().state, MergeSlotState::Merging);
+        assert_eq!(board.get("b2").unwrap().state, MergeSlotState::Ready);
+        // `complete` is legal on the rehydrated Merging slot, illegal on the Ready one.
+        let mut b = MergeBoard::from_slots(board.snapshot());
+        b.complete("b1").unwrap();
+        assert!(b.complete("b2").is_err(), "Ready → Merged stays illegal after hydration");
     }
 
     #[test]

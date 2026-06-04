@@ -15,8 +15,30 @@ serde.workspace = true
 serde_json.workspace = true
 # JSON Schema derives for Command arguments — surfaced by gt-mcp.
 schemars.workspace = true
+# Off-by-default `axum` REST adapter (hq-fe-api-orch.2): the orchestration sibling of the
+# issues/rig HTTP surfaces — `register_routes` maps `merge.*` to REST routes the builder mounts
+# at `/api/v1/merge` behind the auth+scope guard, with a utoipa OpenAPI spec. Folds into this
+# crate behind the `axum` feature (docs/03 Rule 4), exactly as gt-issues/gt-rig/gt-workspace gate
+# their axum adapters — never a sibling crate. `gt-workspace` brings the `WorkspaceContext`
+# extractor (the per-tenant board is resolved from the auth context, never the path).
+axum = { workspace = true, optional = true }
+utoipa = { workspace = true, optional = true }
+async-trait = { workspace = true, optional = true }
+gt-workspace = { workspace = true, optional = true, features = ["axum"] }
+
+[features]
+# Compile the axum REST adapter + OpenAPI spec (`http.rs`) and the `MergeHttpModule` route/spec
+# overrides. Off by default — the MCP-only build pulls no HTTP stack; the composition bin enables
+# it to expose the REST surface.
+axum = ["dep:axum", "dep:utoipa", "dep:async-trait", "dep:gt-workspace"]
 
 [dev-dependencies]
 # El gate test cablea el flujo entero (refinery+actor+channel) y reconstruye con replay.
 gt-eventlog = { workspace = true }
 ulid.workspace = true
+# Exercise the REST router in-process (hq-fe-api-orch.2): `oneshot` a request and read the
+# response without a live socket. Run with `--features axum` so the adapter + these helpers
+# compile for the contract test.
+axum = { workspace = true }
+tower = { workspace = true, features = ["util"] }
+async-trait = { workspace = true }
