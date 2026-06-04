@@ -69,7 +69,10 @@ async fn main() -> anyhow::Result<()> {
     // no checkout (e.g. the live container), so surface validation is skipped.
     let repo_dir = std::env::var("GT_REPO_DIR").ok().map(std::path::PathBuf::from);
 
-    // Store: the lifted Dolt issues adapter (hq-core-host.1), on the shared Dolt.
+    // Store: the lifted Dolt issues adapter (hq-core-host.1), on the shared Dolt. gt-core owns
+    // the bootstrap (hq-docs follow-up): ensure the target database exists before the pool
+    // binds to it (a fresh Dolt volume ships none), so the deploy needs no dolt-init.sql.
+    DoltIssues::ensure_database(&dolt_url).await?;
     let store = Arc::new(DoltIssues::connect(&dolt_url)?);
     store.ensure_schema().await?;
     eprintln!("[gt-mcp-server] issues: Dolt @ {dolt_url}");
