@@ -39,11 +39,23 @@
 pub mod artifacts;
 #[cfg(feature = "graphify")]
 mod graphify;
+/// The off-by-default `axum` REST adapter (`hq-fe-api-kernel.1`): the read-only `graph.*` HTTP
+/// routes the builder mounts at `/api/v1/graph`, dispatching to the same indexer the MCP tools use.
+#[cfg(feature = "axum")]
+pub mod http;
 mod memory;
+/// The `graph.*` module seam (`hq-fe-api-kernel.1`): identity, capability, MCP-tool descriptors,
+/// and — under `axum` — the read-only REST routes.
+pub mod module;
 mod port;
 
 pub use artifacts::{ensure_ignored, patterns_for, NEUTRAL_UMBRELLA};
 #[cfg(feature = "graphify")]
 pub use graphify::GraphifyIndexer;
+#[cfg(feature = "axum")]
+pub use http::{graph_router, ApiDoc, GraphApiState, RigCustody, WorkspaceGraph};
 pub use memory::InMemoryGraphIndexer;
+#[cfg(feature = "axum")]
+pub use module::GraphHttpModule;
+pub use module::GraphModule;
 pub use port::{GraphAnswer, GraphError, GraphIndexer, IndexDiff, IndexStats, IndexStatus};

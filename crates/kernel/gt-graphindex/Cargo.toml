@@ -16,15 +16,34 @@ default = []
 # process machinery nor serde_json — only consumers that wire the real adapter
 # (the composition edge) turn it on.
 graphify = ["dep:tokio", "dep:serde_json"]
+# Off-by-default `axum` REST adapter (hq-fe-api-kernel.1): `register_routes` maps the
+# read-only `graph.*` queries to REST routes the builder mounts at `/api/v1/graph`
+# behind the auth+scope guard, with a utoipa OpenAPI spec. Folds into this crate behind
+# the `axum` feature (docs/03 Rule 4), exactly as gt-quota/gt-orchestration gate theirs.
+# Kernel-pure: the per-tenant workspace is read straight off the `X-Workspace` header
+# (no gt-workspace dep, which would be a forbidden kernel->domain edge).
+axum = ["dep:axum", "dep:utoipa", "dep:serde_json"]
 
 [dependencies]
 async-trait = { workspace = true }
 serde = { workspace = true }
 thiserror = { workspace = true }
+# The kernel module seam — `GraphModule` declares the graph domain's identity + capability
+# + MCP tools so the `RootBuilder` harvests them, and carries the REST routes under `axum`.
+gt-module = { workspace = true }
+# `semver::Version` for the module's `ModuleMeta`.
+semver = { workspace = true }
 # Edge-only deps for the `graphify` adapter (spawn the venv python, parse its JSON).
 tokio = { workspace = true, optional = true, features = ["process", "io-util"] }
 serde_json = { workspace = true, optional = true }
+# The `axum` REST adapter + its OpenAPI spec (hq-fe-api-kernel.1), off by default.
+axum = { workspace = true, optional = true }
+utoipa = { workspace = true, optional = true }
 
 [dev-dependencies]
 tokio = { workspace = true }
 serde_json = { workspace = true }
+# Exercise the REST router in-process (hq-fe-api-kernel.1): `oneshot` a request and read
+# the response without a live socket. Run with `--features axum` so the adapter compiles.
+axum = { workspace = true }
+tower = { workspace = true, features = ["util"] }
