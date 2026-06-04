@@ -90,7 +90,9 @@ gt-mcp-server = { workspace = true }
 # The `axum` feature compiles the issues REST adapter (hq-auth-routes.2): IssuesModule's
 # register_routes/openapi + the http.rs router the bin mounts at /api/v1/issues.
 gt-issues = { workspace = true, features = ["axum"] }
-gt-meta = { workspace = true }
+# The `axum` feature compiles the meta REST adapter (hq-fe-api-mount.2): MetaHttpModule's
+# register_routes mounts GET /help + POST /report-gap under /api/v1/meta.
+gt-meta = { workspace = true, features = ["axum"] }
 gt-rbac = { workspace = true }
 gt-audit = { workspace = true }
 gt-store-dolt = { workspace = true }

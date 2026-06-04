@@ -23,10 +23,10 @@
 //! ## Scope: the REST-surfaced namespaces only
 //!
 //! The bin (`src/bin/gt-mcp-server.rs`) mounts REST modules for [`NAMESPACES`]: `issues` (the
-//! `root` builder) plus `agent` / `quota` / `workspace` / `rig` / `documents` (the `rest_root`
-//! builder). The other MCP namespaces — `meta`, `merge`, `convoy`, `graph`, `audit` — dispatch
-//! over MCP only (no `with_http` module is mounted for them), so they are out of scope here: this
-//! test asserts parity exactly for the namespaces the server serves on both transports.
+//! `root` builder) plus `meta` / `agent` / `quota` / `workspace` / `rig` / `documents` (the
+//! `rest_root` builder). The other MCP namespaces — `merge`, `convoy`, `graph`, `audit` —
+//! dispatch over MCP only (no `with_http` module is mounted for them), so they are out of scope
+//! here: this test asserts parity exactly for the namespaces the server serves on both transports.
 //!
 //! ## How it harvests the two surfaces
 //!
@@ -51,9 +51,11 @@ use utoipa::OpenApi;
 use gt_composition::mcp::{AgentHandler, EventLog, QuotaHandler, RigHandler, WorkspaceHandler, WsPools};
 use gt_documents::DocumentsModule;
 use gt_issues::IssuesModule;
+use gt_meta::MetaModule;
 
 /// The namespaces the server exposes over both MCP and HTTP — the parity scope.
-const NAMESPACES: &[&str] = &["issues", "workspace", "rig", "documents", "agent", "quota"];
+const NAMESPACES: &[&str] =
+    &["issues", "meta", "workspace", "rig", "documents", "agent", "quota"];
 
 /// A never-connected Postgres URL: the PG-backed handlers store the pool/url but `descriptors()`
 /// never touches it, so a lazy pool that never dials is enough to harvest the tool set offline.
@@ -84,6 +86,10 @@ fn parity_map(ns: &str) -> Vec<Route> {
             rt("POST", "/{id}/transition", Some("issues.transition.execute")),
             rt("POST", "/{id}/close", Some("issues.close.execute")),
             rt("POST", "/{id}/claim", Some("issues.claim.execute")),
+        ],
+        "meta" => vec![
+            rt("GET", "/help", Some("meta.help.execute")),
+            rt("POST", "/report-gap", Some("meta.report-gap.execute")),
         ],
         "workspace" => vec![
             rt("GET", "/", Some("workspace.list")),
@@ -135,6 +141,7 @@ fn parity_map(ns: &str) -> Vec<Route> {
 fn served_openapi(ns: &str) -> utoipa::openapi::OpenApi {
     match ns {
         "issues" => gt_issues::ApiDoc::openapi(),
+        "meta" => gt_meta::ApiDoc::openapi(),
         "workspace" => gt_workspace::ApiDoc::openapi(),
         "rig" => gt_rig::ApiDoc::openapi(),
         "documents" => gt_documents::ApiDoc::openapi(),
@@ -159,6 +166,7 @@ fn served_mcp_tools(ns: &str) -> Vec<String> {
     let event_log = || Arc::new(EventLog::new(None));
     match ns {
         "issues" => from_registry(|r| IssuesModule::default().register_mcp_tools(r)),
+        "meta" => from_registry(|r| MetaModule.register_mcp_tools(r)),
         "documents" => from_registry(|r| DocumentsModule::default().register_mcp_tools(r)),
         "workspace" => {
             let pool = sqlx::PgPool::connect_lazy(DUMMY_PG).expect("lazy pool never dials");

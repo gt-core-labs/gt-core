@@ -55,7 +55,7 @@ use gt_mcp_server::{
     health, DocumentsResource, DomainRouter, HealthState, IssuesServer, PgAuditSink,
     WorkspaceRigPrefixes, WorkspaceStatusGate, WorkspaceStores,
 };
-use gt_meta::MetaModule;
+use gt_meta::{MetaApiState, MetaModule};
 use gt_module::RootBuilder;
 use gt_quota::{QuotaApiState, QuotaModule};
 use gt_rig::{RigApiState, RigsModule};
@@ -154,6 +154,12 @@ async fn main() -> anyhow::Result<()> {
             "[gt-mcp-server] GT_REPO_DIR unset; surface existence checks skipped (accept-all)"
         ),
     }
+    // Clones for the meta REST surface (hq-fe-api-mount.2), captured before `store`/`tools`
+    // move into the server: `meta.report-gap` mints into the same Dolt store, and `meta.help`
+    // serves the full tools/list — the issues+meta descriptors here, extended below with the
+    // domain handlers' descriptors so the REST `/help` matches the MCP `meta.help` exactly.
+    let meta_store = store.clone();
+    let meta_base_tools = tools.clone();
     let mut service =
         IssuesServer::new(store, default_scope, rbac, audit.clone(), tools, repo_dir);
 
@@ -175,6 +181,15 @@ async fn main() -> anyhow::Result<()> {
     // works even when GT_PG_URL is unset and the rest of the router is empty.
     let domains = domains.register(Arc::new(AuditHandler::new(audit.clone())));
     eprintln!("[gt-mcp-server] audit.tail dispatch on (per-workspace audit trail)");
+    // The full served tools/list for meta.help (hq-fe-api-mount.2): issues+meta descriptors
+    // plus every domain handler's, the same set `with_domains` folds into the MCP `tools/list`
+    // just below — captured here, before `domains` moves into the server, so REST `/help` and
+    // MCP `meta.help` return the identical payload.
+    let meta_tools: Vec<_> = {
+        let mut t = meta_base_tools;
+        t.extend(domains.descriptors());
+        t
+    };
     service = service.with_domains(Arc::new(domains));
     // Wire issues.create rig-prefix routing (hq-mt-rigs.6) when the PG rig catalog
     // is present; without it the server accepts any bead-id prefix as before.
@@ -277,16 +292,16 @@ async fn main() -> anyhow::Result<()> {
     // deploy that configures no public key serves no REST surface (MCP + ops only), exactly as
     // before — enabling it is an opt-in env, not a behaviour change.
     //
-    // Domain REST surface (hq-fe-api-mount.1): mount the domain crates' `register_routes`
-    // (workspace/rig/documents/agent/quota) so the frontend reaches those namespaces over the
-    // same authenticated HTTP path as issues — dispatching the identical domain commands the MCP
-    // `DomainRouter` serves. Built from a SEPARATE `RootBuilder` than `root`: each domain module
-    // re-registers its MCP tools (RigsHttpModule delegates to RigsModule, &c.), and the server's
-    // `with_domains` already folded those namespaces into `tools/list`; harvesting this builder's
-    // tools too would double-list every domain tool. So this builder feeds ONLY `into_router()` —
-    // its `mcp_tools()` is never read.
+    // Domain REST surface (hq-fe-api-mount.1, .2): mount the modules' `register_routes`
+    // (meta/workspace/rig/documents/agent/quota) so the frontend reaches those namespaces over
+    // the same authenticated HTTP path as issues — dispatching the identical domain commands the
+    // MCP `DomainRouter` serves. Built from a SEPARATE `RootBuilder` than `root`: each module
+    // re-registers its MCP tools (RigsHttpModule delegates to RigsModule, MetaHttpModule to
+    // MetaModule, &c.), and the server's `with_domains` (+ `root`'s MetaModule) already folded
+    // those namespaces into `tools/list`; harvesting this builder's tools too would double-list
+    // them. So this builder feeds ONLY `into_router()`/`openapi()` — its `mcp_tools()` is never read.
     //
-    // The event-log-backed modules (agent, quota) mount whenever the REST surface is on; the
+    // The store-/event-log-backed modules (meta, agent, quota) mount whenever the REST surface is on; the
     // PG-backed ones (workspace, rig, documents) mount only with GT_PG_URL, mirroring
     // `build_domain_router`'s gating — without Postgres they have no backing. The REST backings
     // are independent handles (their own pool / pool-cache / event-log provider) over the same
@@ -295,6 +310,14 @@ async fn main() -> anyhow::Result<()> {
         .map(std::path::PathBuf::from)
         .unwrap_or_else(|_| std::path::PathBuf::from(DEFAULT_EVENTLOG_ROOT));
     let mut rest = RootBuilder::new()
+        // meta REST (hq-fe-api-mount.2): GET /help (full tools/list) + POST /report-gap, both
+        // backed by the Dolt store + server actor — always on, like agent/quota, since they need
+        // no Postgres. Mounted under /api/v1/meta behind the meta.read/meta.write guard.
+        .module(MetaModule::with_http(MetaApiState::new(
+            meta_store,
+            actor.clone(),
+            meta_tools,
+        )))
         .module(AgentModule::with_http(AgentApiState::new(agent_root)))
         .module(QuotaModule::with_http(QuotaApiState::new(Arc::new(EventLogQuota::new(
             event_log.clone(),
@@ -325,11 +348,11 @@ async fn main() -> anyhow::Result<()> {
             build_embedder(),
         )));
         eprintln!(
-            "[gt-mcp-server] REST domain modules: workspace + rig + documents + agent + quota + merge"
+            "[gt-mcp-server] REST domain modules: meta + workspace + rig + documents + agent + quota + merge"
         );
     } else {
         eprintln!(
-            "[gt-mcp-server] REST domain modules: agent + quota + merge (GT_PG_URL unset → no workspace/rig/documents)"
+            "[gt-mcp-server] REST domain modules: meta + agent + quota + merge (GT_PG_URL unset → no workspace/rig/documents)"
         );
     }
     let rest_root = rest
@@ -338,7 +361,8 @@ async fn main() -> anyhow::Result<()> {
 
     // Fused OpenAPI (hq-fe-api-spec.1): the kernel mounts each loaded module's route spec under
     // its `/api/v1/<module>` prefix and merges them per builder; combine the two builders' docs —
-    // `root` (issues + meta) and `rest` (the domain crates) — into one and serve it at the public
+    // `root` (issues; meta is descriptor-only here so it adds no spec) and `rest` (meta + the
+    // domain crates) — into one and serve it at the public
     // `/openapi.json`, so a frontend / codegen reads the whole REST surface from a single URL.
     // Rendered once at boot, before `into_router` consumes either Root. Public by design: it
     // describes the contract (a `401` without a token is part of it) and carries no tenant data,
