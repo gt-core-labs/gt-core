@@ -534,7 +534,25 @@ impl DoltIssues {
         let Some(db) = db else { return Ok(()) };
         let pool = Pool::from_url(&server_url)
             .map_err(|e| AppError::Other(format!("dolt connect (server): {e}")))?;
-        let mut conn = pool.get_conn().await.map_err(map_err)?;
+
+        // Retry the first connection: on a cold `docker compose up` the Dolt server is often
+        // still starting when this runs, so a bare attempt races to "connection refused". The
+        // bootstrap owns the wait rather than leaning on the orchestrator's restart policy —
+        // ~30s (15 × 2s) covers a normal server start; past that the error is real.
+        let mut conn = {
+            let mut attempt = 0u32;
+            loop {
+                match pool.get_conn().await {
+                    Ok(c) => break c,
+                    Err(e) if attempt < 15 => {
+                        attempt += 1;
+                        eprintln!("[gt-store-dolt] waiting for Dolt (attempt {attempt}): {e}");
+                        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                    }
+                    Err(e) => return Err(map_err(e)),
+                }
+            }
+        };
         // `db` is the path segment of an operator-supplied URL; backtick-quote it. Dolt accepts
         // CREATE DATABASE over the MySQL wire.
         conn.query_drop(format!("CREATE DATABASE IF NOT EXISTS `{db}`"))
