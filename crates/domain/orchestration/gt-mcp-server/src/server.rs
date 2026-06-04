@@ -892,6 +892,7 @@ mod tests {
             workspace: workspace.into(),
             scopes: vec![scope.into()],
             exp: 9_999_999_999,
+            nbf: None,
             iat: 0,
         }
     }
@@ -1252,6 +1253,7 @@ validate_only = true
             workspace: "acme".into(),
             scopes: vec![WORKSPACE_ADMIN.into()],
             exp: 1, // 1970 — well past
+            nbf: None,
             iat: 0,
         };
         let auth = InMemoryAuthenticator::new().with_token("old", expired);
