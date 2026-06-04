@@ -15,14 +15,25 @@ async-trait = { workspace = true }
 # stays dependency-light (see lib.rs "Adapters").
 sqlx = { workspace = true, optional = true }
 axum = { workspace = true, optional = true }
+# The kernel module seam + OpenAPI, pulled only by the `axum` feature: `WorkspaceModule`
+# (the GtModule facade) and the `workspace.*` REST adapter (`hq-fe-api-platform.1`). The
+# default dependency-light build (and the `pg`-only build) links neither.
+gt-module = { workspace = true, optional = true }
+utoipa = { workspace = true, optional = true }
+# Module semver for `WorkspaceModule::meta`, pulled only with the `axum` module surface.
+semver = { workspace = true, optional = true }
 
 [features]
 # Postgres `WorkspaceRepository` adapter (`PgWorkspaces`).
 pg = ["dep:sqlx"]
-# Axum `WorkspaceContext` request extractor.
-axum = ["dep:axum"]
+# Axum `WorkspaceContext` request extractor + the `WorkspaceModule` REST surface
+# (`http.rs` / `module.rs`, `hq-fe-api-platform.1`) and its OpenAPI spec.
+axum = ["dep:axum", "dep:gt-module", "dep:utoipa", "dep:semver"]
 
 [dev-dependencies]
 tokio = { workspace = true }
 # Source of the workspaces migration SQL for the `pg` contract test.
 gt-store-pg = { workspace = true }
+# Exercise the REST router in-process (`hq-fe-api-platform.1`): `oneshot` a request and
+# read the response without a live socket. Needs `--features axum` so the adapter compiles.
+tower = { workspace = true, features = ["util"] }

@@ -2172,12 +2172,16 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "axum",
+ "gt-module",
  "gt-store-pg",
  "schemars 0.8.22",
+ "semver",
  "serde",
  "serde_json",
  "sqlx",
  "tokio",
+ "tower",
+ "utoipa",
 ]
 
 [[package]]

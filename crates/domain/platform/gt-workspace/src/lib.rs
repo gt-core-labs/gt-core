@@ -31,6 +31,12 @@
 mod actor;
 mod commands;
 mod events;
+/// The off-by-default `axum` REST adapter (`hq-fe-api-platform.1`): maps `workspace.*`
+/// to REST routes dispatching to the same command layer the MCP handler wraps.
+#[cfg(feature = "axum")]
+pub mod http;
+#[cfg(feature = "axum")]
+mod module;
 #[cfg(feature = "pg")]
 mod pg;
 mod repo;
@@ -48,5 +54,9 @@ pub use workspace_id::{WorkspaceId, WorkspaceIdError, MAX_WORKSPACE_ID_LEN};
 
 #[cfg(feature = "pg")]
 pub use pg::PgWorkspaces;
+#[cfg(feature = "axum")]
+pub use http::{workspace_router, ApiDoc, WorkspaceApiState};
+#[cfg(feature = "axum")]
+pub use module::WorkspaceModule;
 #[cfg(feature = "axum")]
 pub use web::{WorkspaceClaim, WorkspaceContext, WorkspaceContextRejection, WORKSPACE_HEADER};

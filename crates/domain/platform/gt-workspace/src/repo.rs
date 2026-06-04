@@ -15,7 +15,7 @@
 //! persistence in one call.
 
 use std::collections::BTreeMap;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 
@@ -86,6 +86,26 @@ pub trait WorkspaceRepository: Send + Sync {
             }
         }
         Ok(catalog)
+    }
+}
+
+/// Forward the port through a shared trait object so a caller can hold one
+/// `Arc<dyn WorkspaceRepository>` (the REST adapter's state, `hq-fe-api-platform.1`)
+/// and still drive a [`WorkspaceActor`](crate::WorkspaceActor), which takes its
+/// repository by value. The `Arc` is cheap to clone per request, exactly as the
+/// MCP `WorkspaceHandler` clones a `PgPool` per call.
+#[async_trait]
+impl WorkspaceRepository for Arc<dyn WorkspaceRepository> {
+    async fn save(&self, entry: &WorkspaceEntry) -> Result<(), RepoError> {
+        (**self).save(entry).await
+    }
+
+    async fn load(&self, id: &WorkspaceId) -> Result<Option<WorkspaceEntry>, RepoError> {
+        (**self).load(id).await
+    }
+
+    async fn list(&self) -> Result<Vec<WorkspaceEntry>, RepoError> {
+        (**self).list().await
     }
 }
 

@@ -1,0 +1,439 @@
+//! The `axum` REST adapter for the `workspace.*` surface (`hq-fe-api-platform.1`).
+//!
+//! Exposes the workspace catalog as REST routes that dispatch to the **same**
+//! [`WorkspaceCommand`] decide/apply layer the MCP `WorkspaceHandler` (in
+//! `gt-composition`) wraps — no lifecycle logic is duplicated, only the wire shape
+//! differs. It folds into `gt-workspace` behind the off-by-default `axum` feature
+//! (docs/03 Rule 4), beside the [`WorkspaceContext`](crate::WorkspaceContext)
+//! extractor, rather than living in a sibling crate.
+//!
+//! ## Admin-level, cross-workspace — *not* per-tenant
+//!
+//! Every other module's REST surface resolves a per-request tenant boundary through
+//! [`WorkspaceContext`](crate::WorkspaceContext) (docs/04 §15: the workspace is read
+//! from the verified auth context, never the path/body). **These routes deliberately
+//! do not.** `workspace.*` is the single cross-workspace consumer (docs/03 Rule 6):
+//! it administers the *catalog of workspaces itself*, the lifecycle of tenants, not
+//! data inside one tenant. So:
+//!
+//! - The `:id` path segment names the **catalog resource** being administered (the
+//!   workspace whose lifecycle the request changes), not a tenant context. This is
+//!   the one legitimate place an id rides the path, because the catalog *is* the
+//!   resource — there is no enclosing tenant to resolve.
+//! - The guard scopes the module claims — `workspace.read` / `workspace.write` (see
+//!   [`WorkspaceModule::capability`](crate::WorkspaceModule)) — are **operator/admin**
+//!   authorities: they govern who may list and mutate the tenant catalog, and should
+//!   be granted only to platform operators, never to an ordinary tenant user. The
+//!   builder's capability-derived guard maps `GET` → `workspace.read` and the
+//!   mutating verbs → `workspace.write`; `admin`-style enforcement is *who holds
+//!   `workspace.write`*, not a separate verb the guard would leave ungated.
+//!
+//! ## What it does *not* do
+//!
+//! - **It does not authenticate or authorize.** The builder mounts this router under
+//!   `/api/v1/workspace` and wraps it with the scope guard
+//!   ([`guard_module_scopes`](gt_module::guard_module_scopes)); the composition root
+//!   layers the auth middleware in front.
+//! - **It does not provision the tenant's PG schema.** The MCP `workspace.create`
+//!   path additionally calls `gt_create_workspace_schema` to clone `ws_default`; that
+//!   is a composition-tier concern (raw SQL over the shared pool the domain tier does
+//!   not own), layered by the binary, not this catalog-only adapter. A REST `create`
+//!   records the catalog entry through the replayable [`WorkspaceActor`] cycle exactly
+//!   as the MCP path's catalog step does.
+
+use std::sync::Arc;
+
+use axum::extract::{Path, State};
+use axum::http::StatusCode;
+use axum::response::{IntoResponse, Response};
+use axum::routing::{get, post};
+use axum::{Json, Router};
+use serde::Deserialize;
+use serde_json::{json, Value};
+
+use crate::actor::{ActorError, WorkspaceActor};
+use crate::commands::{WorkspaceCommand, WorkspaceError};
+use crate::repo::{RepoError, WorkspaceRepository};
+use crate::state::{WorkspaceEntry, WorkspaceStatus};
+use crate::workspace_id::{WorkspaceId, WorkspaceIdError};
+
+/// Everything the workspace REST handlers need, baked into the router with
+/// [`Router::with_state`] before it leaves [`workspace_router`] so the merged
+/// application router carries no outstanding state type (the kernel's state-erased
+/// `Router<()>` contract).
+///
+/// Holds the [`WorkspaceRepository`] as a shared trait object so the adapter stays
+/// independent of which backend the binary supplies (the durable [`PgWorkspaces`]
+/// under the `pg` feature, or an in-memory store in a test). Each mutating handler
+/// clones the `Arc` into a fresh [`WorkspaceActor`] per request — the same
+/// hydrate-per-call shape the MCP `WorkspaceHandler` uses.
+///
+/// [`PgWorkspaces`]: crate::PgWorkspaces
+#[derive(Clone)]
+pub struct WorkspaceApiState {
+    /// The live catalog repository the binary supplies — the module owns no store of
+    /// its own.
+    repo: Arc<dyn WorkspaceRepository>,
+}
+
+impl WorkspaceApiState {
+    /// Build the REST state over a live catalog repository.
+    pub fn new(repo: Arc<dyn WorkspaceRepository>) -> Self {
+        Self { repo }
+    }
+
+    /// Hydrate a fresh actor from the repository for one mutating command.
+    async fn actor(&self) -> Result<WorkspaceActor<Arc<dyn WorkspaceRepository>>, ApiError> {
+        Ok(WorkspaceActor::hydrate(self.repo.clone()).await?)
+    }
+}
+
+/// Build the workspace REST router with `state` baked in (`hq-fe-api-platform.1`).
+///
+/// The paths are **relative**: the builder nests them under `/api/v1/workspace` and
+/// applies the scope guard. [`register_routes`](crate::WorkspaceModule) on
+/// [`WorkspaceModule`](crate::WorkspaceModule) returns exactly this router when the
+/// module carries HTTP state.
+///
+/// | Method + path           | Maps to MCP tool      |
+/// |-------------------------|-----------------------|
+/// | `GET /`                 | `workspace.list`      |
+/// | `POST /`                | `workspace.create`    |
+/// | `GET /:id`              | `workspace.info`      |
+/// | `POST /:id/suspend`     | `workspace.suspend`   |
+/// | `POST /:id/resume`      | `workspace.resume`    |
+/// | `POST /:id/archive`     | `workspace.archive`   |
+pub fn workspace_router(state: WorkspaceApiState) -> Router {
+    Router::new()
+        .route("/", get(list_workspaces).post(create_workspace))
+        .route("/:id", get(get_workspace))
+        .route("/:id/suspend", post(suspend_workspace))
+        .route("/:id/resume", post(resume_workspace))
+        .route("/:id/archive", post(archive_workspace))
+        .with_state(state)
+}
+
+/// Request body for `POST /` — the catalog id + display name for the new workspace.
+/// Mirrors the `workspace.create` MCP arguments (`{id, name}`).
+#[derive(Debug, Deserialize)]
+struct CreateBody {
+    /// The workspace slug to create (validated as a [`WorkspaceId`]).
+    id: String,
+    /// Its display name.
+    name: String,
+}
+
+/// `GET /` — every workspace in the catalog (`workspace.list`). A pure read straight
+/// off the repository; the envelope matches the MCP tool's `{ "workspaces": [...] }`.
+#[cfg_attr(feature = "axum", utoipa::path(
+    get, path = "/",
+    responses((status = 200, description = "Every workspace in the catalog")),
+))]
+async fn list_workspaces(State(st): State<WorkspaceApiState>) -> Result<Json<Value>, ApiError> {
+    let entries = st.repo.list().await?;
+    Ok(Json(json!({
+        "workspaces": entries.iter().map(entry_json).collect::<Vec<_>>(),
+    })))
+}
+
+/// `GET /:id` — one workspace's id, name + status (`workspace.info`); `404` when the
+/// catalog holds no such id.
+#[cfg_attr(feature = "axum", utoipa::path(
+    get, path = "/{id}",
+    params(("id" = String, Path, description = "Workspace slug")),
+    responses(
+        (status = 200, description = "The workspace's id, name + status"),
+        (status = 404, description = "No workspace with that id"),
+    ),
+))]
+async fn get_workspace(
+    State(st): State<WorkspaceApiState>,
+    Path(id): Path<String>,
+) -> Result<Json<Value>, ApiError> {
+    let id = parse_id(&id)?;
+    match st.repo.load(&id).await? {
+        Some(entry) => Ok(Json(entry_json(&entry))),
+        None => Err(ApiError::NotFound(format!("workspace {id}"))),
+    }
+}
+
+/// `POST /` — provision a new active workspace in the catalog (`workspace.create`).
+/// The id lives in the body (it names the new resource), uniqueness is enforced by
+/// the decide layer (`409` on a duplicate). Runs the full [`WorkspaceActor`] cycle so
+/// the change is a replayable event. `201` on success.
+#[cfg_attr(feature = "axum", utoipa::path(
+    post, path = "/",
+    responses(
+        (status = 201, description = "Workspace created"),
+        (status = 409, description = "A workspace with that id already exists"),
+        (status = 422, description = "Invalid id or blank name"),
+    ),
+))]
+async fn create_workspace(
+    State(st): State<WorkspaceApiState>,
+    Json(body): Json<CreateBody>,
+) -> Result<Response, ApiError> {
+    let id = parse_id(&body.id)?;
+    let mut actor = st.actor().await?;
+    actor
+        .handle(WorkspaceCommand::Create { id: id.clone(), name: body.name.clone() })
+        .await?;
+    Ok((
+        StatusCode::CREATED,
+        Json(json!({
+            "ok": true,
+            "id": id.as_str(),
+            "name": body.name,
+            "status": status_str(WorkspaceStatus::Active),
+        })),
+    )
+        .into_response())
+}
+
+/// `POST /:id/suspend` — reversibly disable an active workspace (`workspace.suspend`).
+/// The decide layer rejects a non-active source as an illegal transition (`409`).
+#[cfg_attr(feature = "axum", utoipa::path(
+    post, path = "/{id}/suspend",
+    params(("id" = String, Path, description = "Workspace slug")),
+    responses(
+        (status = 200, description = "Workspace suspended"),
+        (status = 404, description = "No workspace with that id"),
+        (status = 409, description = "Not active (illegal transition)"),
+    ),
+))]
+async fn suspend_workspace(
+    State(st): State<WorkspaceApiState>,
+    Path(id): Path<String>,
+) -> Result<Json<Value>, ApiError> {
+    transition(st, &id, WorkspaceStatus::Suspended, |id| WorkspaceCommand::Suspend { id }).await
+}
+
+/// `POST /:id/resume` — restore a suspended workspace to active (`workspace.resume`).
+/// The decide layer rejects a non-suspended source as an illegal transition (`409`).
+#[cfg_attr(feature = "axum", utoipa::path(
+    post, path = "/{id}/resume",
+    params(("id" = String, Path, description = "Workspace slug")),
+    responses(
+        (status = 200, description = "Workspace resumed"),
+        (status = 404, description = "No workspace with that id"),
+        (status = 409, description = "Not suspended (illegal transition)"),
+    ),
+))]
+async fn resume_workspace(
+    State(st): State<WorkspaceApiState>,
+    Path(id): Path<String>,
+) -> Result<Json<Value>, ApiError> {
+    transition(st, &id, WorkspaceStatus::Active, |id| WorkspaceCommand::Resume { id }).await
+}
+
+/// `POST /:id/archive` — archive a workspace (`workspace.archive`, terminal). The
+/// decide layer rejects an already-archived workspace as an illegal transition (`409`).
+#[cfg_attr(feature = "axum", utoipa::path(
+    post, path = "/{id}/archive",
+    params(("id" = String, Path, description = "Workspace slug")),
+    responses(
+        (status = 200, description = "Workspace archived"),
+        (status = 404, description = "No workspace with that id"),
+        (status = 409, description = "Already archived (illegal transition)"),
+    ),
+))]
+async fn archive_workspace(
+    State(st): State<WorkspaceApiState>,
+    Path(id): Path<String>,
+) -> Result<Json<Value>, ApiError> {
+    transition(st, &id, WorkspaceStatus::Archived, |id| WorkspaceCommand::Archive { id }).await
+}
+
+/// Run one lifecycle transition: parse the path id, hydrate an actor, decide+apply
+/// the command, and echo the resulting status. Shared by suspend/resume/archive,
+/// which differ only in the command they build and the status they land on.
+async fn transition(
+    st: WorkspaceApiState,
+    id: &str,
+    landed: WorkspaceStatus,
+    build: impl FnOnce(WorkspaceId) -> WorkspaceCommand,
+) -> Result<Json<Value>, ApiError> {
+    let id = parse_id(id)?;
+    let mut actor = st.actor().await?;
+    actor.handle(build(id.clone())).await?;
+    Ok(Json(json!({
+        "ok": true,
+        "id": id.as_str(),
+        "status": status_str(landed),
+    })))
+}
+
+/// The combined OpenAPI document for the workspace REST surface
+/// (`hq-fe-api-platform.1`). The builder mounts it under the module prefix and
+/// rewrites its relative paths to `/api/v1/workspace/...`, so the `#[utoipa::path]`
+/// annotations stay prefix-free.
+#[derive(utoipa::OpenApi)]
+#[openapi(paths(
+    list_workspaces,
+    create_workspace,
+    get_workspace,
+    suspend_workspace,
+    resume_workspace,
+    archive_workspace,
+))]
+pub struct ApiDoc;
+
+/// Parse a path/body slug into a [`WorkspaceId`], surfacing a malformed id as a `422`.
+fn parse_id(raw: &str) -> Result<WorkspaceId, ApiError> {
+    WorkspaceId::new(raw).map_err(ApiError::from)
+}
+
+/// The snake_case spelling of a status, matching the serde representation the MCP
+/// path emits.
+fn status_str(status: WorkspaceStatus) -> &'static str {
+    match status {
+        WorkspaceStatus::Active => "active",
+        WorkspaceStatus::Suspended => "suspended",
+        WorkspaceStatus::Archived => "archived",
+    }
+}
+
+/// Shape one catalog entry as the REST payload — identical to the MCP tool's
+/// `{ id, name, status }`.
+fn entry_json(entry: &WorkspaceEntry) -> Value {
+    json!({
+        "id": entry.id.as_str(),
+        "name": entry.name,
+        "status": status_str(entry.status),
+    })
+}
+
+/// HTTP error space for the workspace REST handlers, mapping the domain failures
+/// onto statuses so a handler can `?`-propagate them. The body is the bare message,
+/// matching the reason the MCP path surfaces so a client sees identical text across
+/// transports.
+enum ApiError {
+    /// A targeted workspace is absent (`404`).
+    NotFound(String),
+    /// A request conflicts with the catalog's current state — a duplicate id or an
+    /// illegal lifecycle transition (`409`).
+    Conflict(String),
+    /// The request was malformed — a bad slug or a blank name (`422`).
+    Unprocessable(String),
+    /// A persistence/apply fault behind the catalog (`500`).
+    Internal(String),
+}
+
+impl From<WorkspaceIdError> for ApiError {
+    fn from(e: WorkspaceIdError) -> Self {
+        ApiError::Unprocessable(e.to_string())
+    }
+}
+
+impl From<RepoError> for ApiError {
+    fn from(e: RepoError) -> Self {
+        // A backend or consistency fault is internal, never a caller fault.
+        ApiError::Internal(e.to_string())
+    }
+}
+
+impl From<ActorError> for ApiError {
+    fn from(e: ActorError) -> Self {
+        match e {
+            // A missing target is a not-found; a duplicate or illegal transition is a
+            // conflict with current state; a blank name is unprocessable.
+            ActorError::Rejected(WorkspaceError::NotFound(id)) => {
+                ApiError::NotFound(format!("workspace {id}"))
+            }
+            ActorError::Rejected(rejected @ WorkspaceError::AlreadyExists(_)) => {
+                ApiError::Conflict(rejected.to_string())
+            }
+            ActorError::Rejected(rejected @ WorkspaceError::IllegalTransition { .. }) => {
+                ApiError::Conflict(rejected.to_string())
+            }
+            ActorError::Rejected(rejected @ WorkspaceError::EmptyName(_)) => {
+                ApiError::Unprocessable(rejected.to_string())
+            }
+            // Apply/persist faults are internal — they should not occur after a
+            // successful decide.
+            other => ApiError::Internal(other.to_string()),
+        }
+    }
+}
+
+impl IntoResponse for ApiError {
+    fn into_response(self) -> Response {
+        let (status, msg) = match self {
+            ApiError::NotFound(m) => (StatusCode::NOT_FOUND, m),
+            ApiError::Conflict(m) => (StatusCode::CONFLICT, m),
+            ApiError::Unprocessable(m) => (StatusCode::UNPROCESSABLE_ENTITY, m),
+            ApiError::Internal(m) => (StatusCode::INTERNAL_SERVER_ERROR, m),
+        };
+        (status, msg).into_response()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use utoipa::OpenApi;
+
+    #[test]
+    fn openapi_lists_every_relative_route_prefix_free() {
+        // The spec the builder mounts: paths are relative (no `/api/v1/workspace`), so
+        // nesting can rewrite them. Every declared route must be present.
+        let doc = ApiDoc::openapi();
+        let paths: Vec<&str> = doc.paths.paths.keys().map(String::as_str).collect();
+        for expected in ["/", "/{id}", "/{id}/suspend", "/{id}/resume", "/{id}/archive"] {
+            assert!(paths.contains(&expected), "missing {expected} in {paths:?}");
+        }
+        // Prefix-free: the module builder, not the annotation, owns `/api/v1/workspace`.
+        assert!(paths.iter().all(|p| !p.contains("/api/v1")), "{paths:?}");
+    }
+
+    #[test]
+    fn error_status_mapping_matches_domain_failures() {
+        let id = WorkspaceId::new("acme").unwrap();
+        let cases = [
+            (
+                ApiError::from(ActorError::Rejected(WorkspaceError::NotFound(id.clone()))),
+                StatusCode::NOT_FOUND,
+            ),
+            (
+                ApiError::from(ActorError::Rejected(WorkspaceError::AlreadyExists(id.clone()))),
+                StatusCode::CONFLICT,
+            ),
+            (
+                ApiError::from(ActorError::Rejected(WorkspaceError::IllegalTransition {
+                    id: id.clone(),
+                    from: WorkspaceStatus::Archived,
+                    action: "resume",
+                })),
+                StatusCode::CONFLICT,
+            ),
+            (
+                ApiError::from(ActorError::Rejected(WorkspaceError::EmptyName(id))),
+                StatusCode::UNPROCESSABLE_ENTITY,
+            ),
+            (
+                ApiError::from(RepoError::Backend("boom".into())),
+                StatusCode::INTERNAL_SERVER_ERROR,
+            ),
+            (
+                ApiError::from(WorkspaceIdError::Empty),
+                StatusCode::UNPROCESSABLE_ENTITY,
+            ),
+        ];
+        for (err, want) in cases {
+            assert_eq!(err.into_response().status(), want);
+        }
+    }
+
+    #[test]
+    fn entry_json_matches_the_mcp_shape() {
+        let entry = WorkspaceEntry {
+            id: WorkspaceId::new("acme").unwrap(),
+            name: "Acme".into(),
+            status: WorkspaceStatus::Suspended,
+        };
+        assert_eq!(
+            entry_json(&entry),
+            json!({ "id": "acme", "name": "Acme", "status": "suspended" })
+        );
+    }
+}
