@@ -104,7 +104,7 @@ pub use verify::{Authenticator, InMemoryAuthenticator};
 pub use pg::PgUsers;
 
 #[cfg(feature = "jsonwebtoken")]
-pub use jwt::JwtAuthenticator;
+pub use jwt::{Jwk, JwkSet, JwtAuthenticator};
 
 #[cfg(feature = "jsonwebtoken")]
 pub use mint::JwtMinter;

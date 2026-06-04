@@ -24,7 +24,10 @@
 
 use std::collections::HashMap;
 
+use base64::Engine as _;
 use jsonwebtoken::{decode, decode_header, Algorithm, DecodingKey, Validation};
+use serde::Serialize;
+use simple_asn1::ASN1Block;
 
 use crate::{AuthError, Authenticator, JwtClaims};
 
@@ -43,7 +46,47 @@ pub struct JwtAuthenticator {
     by_kid: HashMap<String, DecodingKey>,
     /// The key used for a token that carries no `kid` (single-key deploys).
     default_key: Option<DecodingKey>,
+    /// The public JWK params of every PEM/DER-loaded key, in load order, for `GET /auth/jwks`.
+    /// Keys registered from a bare [`DecodingKey`] carry no raw material and so are absent here.
+    jwks: Vec<Jwk>,
     validation: Validation,
+}
+
+/// One RSA public key in [JWK](https://www.rfc-editor.org/rfc/rfc7517) form, signature use.
+///
+/// This is the *public* half only — never the signing secret. `n`/`e` are the base64url (no pad)
+/// big-endian modulus and exponent a client feeds to e.g.
+/// [`DecodingKey::from_rsa_components`] to verify a token offline.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct Jwk {
+    /// Key type — always `"RSA"`.
+    pub kty: &'static str,
+    /// Public-key use — always `"sig"` (signature verification).
+    #[serde(rename = "use")]
+    pub r#use: &'static str,
+    /// Algorithm — always `"RS256"`.
+    pub alg: &'static str,
+    /// Key id matching the JWT header `kid`; absent for the un-keyed default key.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub kid: Option<String>,
+    /// Base64url (no pad) big-endian RSA modulus.
+    pub n: String,
+    /// Base64url (no pad) big-endian RSA public exponent.
+    pub e: String,
+}
+
+impl Jwk {
+    fn rsa_sig(kid: Option<String>, n: String, e: String) -> Self {
+        Self { kty: "RSA", r#use: "sig", alg: "RS256", kid, n, e }
+    }
+}
+
+/// A [JWK Set](https://www.rfc-editor.org/rfc/rfc7517#section-5) — the public half of a
+/// verifier's keyset, as served by `GET /auth/jwks`. An empty `keys` is valid (no keys loaded).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct JwkSet {
+    /// One entry per published public key.
+    pub keys: Vec<Jwk>,
 }
 
 fn rs256_validation() -> Validation {
@@ -64,12 +107,58 @@ fn decoding_key_from_pem(pem: &[u8]) -> Result<DecodingKey, AuthError> {
         .map_err(|e| AuthError::Malformed(format!("invalid RS256 public key: {e}")))
 }
 
+/// The base64url-encoded JWK `(n, e)` of an RSA public key in PEM form.
+///
+/// `jsonwebtoken`'s [`DecodingKey`] keeps the parsed key opaque, so to publish a JWKS we re-parse
+/// the same PEM ourselves: PEM → DER ([`pem`]) → ASN.1 ([`simple_asn1`]) → the modulus/exponent
+/// integers, base64url-encoded (no pad) as RFC 7517 wants.
+fn jwk_params_from_pem(pem: &[u8]) -> Result<(String, String), AuthError> {
+    let doc = pem::parse(pem)
+        .map_err(|e| AuthError::Malformed(format!("invalid RS256 public key PEM: {e}")))?;
+    jwk_params_from_der(doc.contents())
+}
+
+/// As [`jwk_params_from_pem`], from the DER bytes directly.
+fn jwk_params_from_der(der: &[u8]) -> Result<(String, String), AuthError> {
+    let blocks = simple_asn1::from_der(der)
+        .map_err(|e| AuthError::Malformed(format!("invalid RS256 public key DER: {e}")))?;
+    let (n, e) = rsa_modulus_exponent(&blocks)?;
+    let enc = base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    Ok((enc.encode(n), enc.encode(e)))
+}
+
+/// Pull the modulus and exponent (big-endian, sign byte stripped) out of a parsed RSA public key,
+/// accepting both the SPKI (`BEGIN PUBLIC KEY`) and the bare PKCS#1 (`BEGIN RSA PUBLIC KEY`)
+/// shapes — the same two `DecodingKey::from_rsa_pem` accepts.
+fn rsa_modulus_exponent(blocks: &[ASN1Block]) -> Result<(Vec<u8>, Vec<u8>), AuthError> {
+    let bad = || AuthError::Malformed("unexpected RSA public key structure".to_string());
+    let Some(ASN1Block::Sequence(_, top)) = blocks.first() else {
+        return Err(bad());
+    };
+    // PKCS#1 RSAPublicKey: SEQUENCE { INTEGER n, INTEGER e }.
+    if let [ASN1Block::Integer(_, n), ASN1Block::Integer(_, e)] = top.as_slice() {
+        return Ok((n.to_bytes_be().1, e.to_bytes_be().1));
+    }
+    // SPKI: SEQUENCE { AlgorithmIdentifier, BIT STRING { <PKCS#1 RSAPublicKey> } }.
+    if let [_, ASN1Block::BitString(_, _, key_bytes)] = top.as_slice() {
+        let inner = simple_asn1::from_der(key_bytes)
+            .map_err(|e| AuthError::Malformed(format!("invalid SPKI key bits: {e}")))?;
+        if let Some(ASN1Block::Sequence(_, rsa)) = inner.first() {
+            if let [ASN1Block::Integer(_, n), ASN1Block::Integer(_, e)] = rsa.as_slice() {
+                return Ok((n.to_bytes_be().1, e.to_bytes_be().1));
+            }
+        }
+    }
+    Err(bad())
+}
+
 impl JwtAuthenticator {
     /// Build the verifier from a single, un-keyed RS256 [`DecodingKey`] (the default key).
     pub fn new(key: DecodingKey) -> Self {
         Self {
             by_kid: HashMap::new(),
             default_key: Some(key),
+            jwks: Vec::new(),
             validation: rs256_validation(),
         }
     }
@@ -79,6 +168,7 @@ impl JwtAuthenticator {
         Self {
             by_kid: HashMap::new(),
             default_key: None,
+            jwks: Vec::new(),
             validation: rs256_validation(),
         }
     }
@@ -86,12 +176,20 @@ impl JwtAuthenticator {
     /// Build the verifier from a single RSA public key in PEM form
     /// (`-----BEGIN PUBLIC KEY-----`), registered as the un-keyed default.
     pub fn from_rsa_pem(pem: &[u8]) -> Result<Self, AuthError> {
-        Ok(Self::new(decoding_key_from_pem(pem)?))
+        let (n, e) = jwk_params_from_pem(pem)?;
+        let mut auth = Self::new(decoding_key_from_pem(pem)?);
+        auth.jwks.push(Jwk::rsa_sig(None, n, e));
+        Ok(auth)
     }
 
     /// Build the verifier from a single RSA public key in DER form.
     pub fn from_rsa_der(der: &[u8]) -> Self {
-        Self::new(DecodingKey::from_rsa_der(der))
+        let mut auth = Self::new(DecodingKey::from_rsa_der(der));
+        // Best-effort JWK: a key that does not parse simply isn't published (it still verifies).
+        if let Ok((n, e)) = jwk_params_from_der(der) {
+            auth.jwks.push(Jwk::rsa_sig(None, n, e));
+        }
+        auth
     }
 
     /// Register `key` under `kid`. Chainable. A token whose header `kid` matches verifies
@@ -101,10 +199,24 @@ impl JwtAuthenticator {
         self
     }
 
-    /// Register an RSA PEM public key under `kid`. Chainable.
-    pub fn with_rsa_pem_kid(self, kid: impl Into<String>, pem: &[u8]) -> Result<Self, AuthError> {
+    /// Register an RSA PEM public key under `kid`. Chainable. Also publishes the key's public
+    /// params under that `kid` in [`jwk_set`](Self::jwk_set).
+    pub fn with_rsa_pem_kid(
+        mut self,
+        kid: impl Into<String>,
+        pem: &[u8],
+    ) -> Result<Self, AuthError> {
+        let kid = kid.into();
+        let (n, e) = jwk_params_from_pem(pem)?;
         let key = decoding_key_from_pem(pem)?;
+        self.jwks.push(Jwk::rsa_sig(Some(kid.clone()), n, e));
         Ok(self.with_key_kid(kid, key))
+    }
+
+    /// The public [`JwkSet`] for every PEM/DER-loaded key — the body of `GET /auth/jwks`. Holds
+    /// only public material; the signing secret never appears here.
+    pub fn jwk_set(&self) -> JwkSet {
+        JwkSet { keys: self.jwks.clone() }
     }
 
     /// Build a `kid`-indexed keyset from `(kid, pem)` pairs.
@@ -142,7 +254,9 @@ impl JwtAuthenticator {
         if let Ok(path) = std::env::var(ENV_KEY_FILE) {
             let pem = std::fs::read(&path)
                 .map_err(|e| AuthError::Malformed(format!("cannot read key file {path}: {e}")))?;
+            let (n, e) = jwk_params_from_pem(&pem)?;
             auth.default_key = Some(decoding_key_from_pem(&pem)?);
+            auth.jwks.push(Jwk::rsa_sig(None, n, e));
         }
         if auth.by_kid.is_empty() && auth.default_key.is_none() {
             return Err(AuthError::Malformed(format!(
@@ -346,6 +460,52 @@ mod tests {
             auth.authenticate(&token),
             Err(AuthError::UnknownKey(String::new()))
         );
+    }
+
+    // --- JWKS publication (hq-auth-routes.3) -----------------------------------------------
+
+    #[test]
+    fn jwk_set_publishes_each_kid_with_base64url_params() {
+        let auth = keyset(); // k1 + k2, both from PEM
+        let set = auth.jwk_set();
+        assert_eq!(set.keys.len(), 2);
+        let kids: Vec<_> = set.keys.iter().map(|k| k.kid.clone()).collect();
+        assert_eq!(kids, vec![Some("k1".to_string()), Some("k2".to_string())]);
+        for k in &set.keys {
+            assert_eq!((k.kty, k.r#use, k.alg), ("RSA", "sig", "RS256"));
+            assert!(!k.n.is_empty());
+            assert_eq!(k.e, "AQAB"); // 65537, the standard public exponent
+            // base64url, no pad, no standard-alphabet chars.
+            assert!(!k.n.contains('+') && !k.n.contains('/') && !k.n.contains('='));
+        }
+    }
+
+    #[test]
+    fn an_unkeyed_pem_key_publishes_a_kidless_jwk() {
+        let set = JwtAuthenticator::from_rsa_pem(TEST_PUB_PEM).unwrap().jwk_set();
+        assert_eq!(set.keys.len(), 1);
+        assert_eq!(set.keys[0].kid, None);
+    }
+
+    #[test]
+    fn a_bare_decoding_key_is_not_published() {
+        // `new`/`with_key_kid` carry no raw PEM, so there is nothing to publish.
+        let auth = JwtAuthenticator::from_rsa_der(&[]); // unparseable → no JWK, still constructs
+        assert!(auth.jwk_set().keys.is_empty());
+    }
+
+    #[test]
+    fn published_params_reconstruct_a_working_verifier() {
+        // The whole point: a client rebuilds a verifier from the JWKS `n`/`e` and validates a
+        // token minted by the matching private key — no shared secret.
+        let jwk = &JwtAuthenticator::from_kid_pems([("k1", TEST_PUB_PEM)])
+            .unwrap()
+            .jwk_set()
+            .keys[0];
+        let key = DecodingKey::from_rsa_components(&jwk.n, &jwk.e).unwrap();
+        let rebuilt = JwtAuthenticator::empty().with_key_kid("k1", key);
+        let token = sign(TEST_PRIV_PEM, Some("k1"), &claims());
+        assert_eq!(rebuilt.authenticate(&token).unwrap().sub, "alice");
     }
 
     // --- env spec parsing ------------------------------------------------------------------

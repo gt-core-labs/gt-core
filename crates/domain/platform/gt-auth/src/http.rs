@@ -21,6 +21,8 @@
 //!   re-mint an access token from the record's `sub`/`workspace`/`scopes`.
 //! - **logout** — `{refresh_token}` → [`RefreshStore::revoke_by_token`] (idempotent).
 //! - **me** — echo the verified [`JwtClaims`] the auth middleware injected; no claims ⇒ `401`.
+//! - **jwks** — publish the verifier's public RS256 keys (RFC 7517 JWK Set) so a frontend or
+//!   sibling service verifies access tokens offline; never exposes the signing secret.
 
 use std::sync::Arc;
 
@@ -33,7 +35,7 @@ use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    AuthError, Credentials, JwtClaims, JwtMinter, RefreshError, RefreshStore, RefreshToken,
+    AuthError, Credentials, JwkSet, JwtClaims, JwtMinter, RefreshError, RefreshStore, RefreshToken,
     VerifiedIdentity,
 };
 
@@ -75,6 +77,11 @@ pub struct AuthState {
     pub refresh_ttl: u64,
     /// Injected clock.
     pub now: Clock,
+    /// The verifier's public JWKS, served at `GET /auth/jwks` so clients verify access tokens
+    /// offline. Built from the verifier's public keys at the composition root
+    /// ([`JwtAuthenticator::jwk_set`](crate::JwtAuthenticator::jwk_set)) — never the signing
+    /// secret. `Arc` so cloning the state per request stays cheap.
+    pub jwks: Arc<JwkSet>,
 }
 
 /// Build the auth router. Mount it under the API base at the composition root.
@@ -84,6 +91,7 @@ pub fn auth_router(state: AuthState) -> Router {
         .route("/auth/refresh", post(refresh))
         .route("/auth/logout", post(logout))
         .route("/auth/me", get(me))
+        .route("/auth/jwks", get(jwks))
         .with_state(state)
 }
 
@@ -186,6 +194,13 @@ async fn me(claims: Option<Extension<JwtClaims>>) -> Result<Json<MeResponse>, Ap
     }))
 }
 
+/// `GET /auth/jwks` — the verifier's public RS256 keys as an RFC 7517 JWK Set. A client matches a
+/// token's header `kid` to a key here and verifies the signature offline. Returns `200` with
+/// `{"keys":[]}` when no keys are configured (a valid, empty set — simpler for clients than a 404).
+async fn jwks(State(state): State<AuthState>) -> Json<JwkSet> {
+    Json(state.jwks.as_ref().clone())
+}
+
 /// Mint an access + refresh token pair for a freshly verified identity.
 fn issue_tokens(
     state: &AuthState,
@@ -276,13 +291,16 @@ impl IntoResponse for ApiError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::InMemoryRefreshStore;
+    use crate::{Authenticator, InMemoryRefreshStore, JwtAuthenticator};
     use axum::body::Body;
     use axum::http::Request;
+    use jsonwebtoken::DecodingKey;
     use tower::ServiceExt; // oneshot
 
     // A throwaway RS256 keypair for minting + (in the middleware tests upstream) verifying.
     const PRIV_PEM: &[u8] = include_bytes!("../tests/fixtures/rs256_priv.pem");
+    // Its public half — the JWKS the verifier publishes.
+    const PUB_PEM: &[u8] = include_bytes!("../tests/fixtures/rs256_pub.pem");
 
     /// In-memory login double: one known user, everything else is invalid credentials.
     struct OneUser;
@@ -312,7 +330,22 @@ mod tests {
             access_ttl: 900,
             refresh_ttl: 1_209_600,
             now: Arc::new(|| 1_000_000_000),
+            // Publish the public half of the same "k1" key the minter signs with.
+            jwks: Arc::new(
+                JwtAuthenticator::from_kid_pems([("k1", PUB_PEM)]).unwrap().jwk_set(),
+            ),
         }
+    }
+
+    async fn get(app: &Router, path: &str) -> (StatusCode, String) {
+        let resp = app
+            .clone()
+            .oneshot(Request::builder().uri(path).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        let status = resp.status();
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        (status, String::from_utf8(bytes.to_vec()).unwrap())
     }
 
     async fn post(app: &Router, path: &str, json: &str) -> (StatusCode, String) {
@@ -435,5 +468,45 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn jwks_publishes_the_public_key_under_its_kid() {
+        let app = auth_router(state());
+        let (status, body) = get(&app, "/auth/jwks").await;
+        assert_eq!(status, StatusCode::OK);
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+        let keys = v["keys"].as_array().unwrap();
+        assert_eq!(keys.len(), 1);
+        let k = &keys[0];
+        assert_eq!(k["kid"], "k1"); // matches the minter's signing kid
+        assert_eq!(k["kty"], "RSA");
+        assert_eq!(k["alg"], "RS256");
+        assert_eq!(k["use"], "sig");
+        assert_eq!(k["e"], "AQAB");
+        assert!(!k["n"].as_str().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_token_verifies_against_the_published_jwks() {
+        // End-to-end: log in for a real access token, fetch the JWKS, rebuild a verifier from the
+        // advertised `n`/`e`, and confirm it accepts the token — no shared secret.
+        let app = auth_router(state());
+        let (_, login_body) = post(
+            &app,
+            "/auth/login",
+            r#"{"email":"alice@acme.test","password":"hunter2"}"#,
+        )
+        .await;
+        let (access, _) = token_pair(&login_body);
+
+        let (_, jwks_body) = get(&app, "/auth/jwks").await;
+        let v: serde_json::Value = serde_json::from_str(&jwks_body).unwrap();
+        let k = &v["keys"][0];
+        let key =
+            DecodingKey::from_rsa_components(k["n"].as_str().unwrap(), k["e"].as_str().unwrap())
+                .unwrap();
+        let rebuilt = JwtAuthenticator::empty().with_key_kid("k1", key);
+        assert_eq!(rebuilt.authenticate(&access).unwrap().sub, "alice");
     }
 }

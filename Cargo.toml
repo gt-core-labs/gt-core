@@ -97,8 +97,14 @@ jsonwebtoken = "9"
 # OS cryptographically-secure RNG for minting opaque refresh-token bytes (hq-auth-mint.3).
 # Tiny, no-tier utility — the same OS entropy source `rand` builds on.
 getrandom = "0.2"
-# base64 decode of document attach payloads (hq-docs-api.2).
+# base64 decode of document attach payloads (hq-docs-api.2); also base64url of the JWKS
+# modulus/exponent in the gt-auth RS256 adapter (hq-auth-routes.3).
 base64 = "0.22"
+# PEM/ASN.1 decode of an RSA public key into its raw (n, e) for the gt-auth JWKS endpoint
+# (`GET /auth/jwks`, hq-auth-routes.3). Both already build under `jsonwebtoken`'s own tree, so
+# no new crate enters the graph — only an explicit edge from `gt-auth` behind its feature gate.
+pem = "3"
+simple_asn1 = "0.6"
 # pgvector binding for the phase-2 semantic search column (hq-docs-search.2). `sqlx`
 # feature wires encode/decode of the `vector` type over the PG wire.
 pgvector = { version = "0.4", default-features = false, features = ["sqlx"] }

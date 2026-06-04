@@ -31,6 +31,13 @@ argon2 = { workspace = true, optional = true }
 # so the core build stays crypto-free — pulled only when a binary verifies tokens. Same gating
 # as the `password-hash` adapter above (docs/03 Rule 4).
 jsonwebtoken = { workspace = true, optional = true }
+# JWKS publication for the RS256 verifier (`GET /auth/jwks`, hq-auth-routes.3): `jsonwebtoken`'s
+# `DecodingKey` hides the raw `n`/`e`, so we parse the public PEM (`pem`) → DER (`simple_asn1`)
+# and base64url-encode the modulus/exponent (`base64`). All three already compile inside
+# `jsonwebtoken`'s own tree, so they add no new crate to the graph — only edges, gated with it.
+pem = { workspace = true, optional = true }
+simple_asn1 = { workspace = true, optional = true }
+base64 = { workspace = true, optional = true }
 # OS CSPRNG for the always-on refresh-token module (`refresh.rs`, hq-auth-mint.3): bearer
 # credentials need unpredictable bytes, so this is a normal dep, not feature-gated.
 getrandom = { workspace = true }
@@ -49,7 +56,7 @@ async-trait = { workspace = true, optional = true }
 # Production email+password provider — argon2 hash + verify.
 password-hash = ["dep:argon2"]
 # Production RS256 JWT verifier — jsonwebtoken decode + signature check (hq-auth-verify.1).
-jsonwebtoken = ["dep:jsonwebtoken"]
+jsonwebtoken = ["dep:jsonwebtoken", "dep:pem", "dep:simple_asn1", "dep:base64"]
 # Postgres-backed login store (`PgUsers`, hq-auth-mint.2). Pulls in `sqlx` and the
 # `password-hash` adapter it reuses for argon2 verification — never duplicates that logic.
 pg = ["dep:sqlx", "password-hash"]
