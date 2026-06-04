@@ -30,10 +30,31 @@ semver = { workspace = true }
 # the core build stays dependency-light; the heavy sqlx stack is pulled only when
 # the PG-backed dispatch handler wires it (docs/03 — adapter lives beside the port).
 sqlx = { workspace = true, optional = true }
+# Off-by-default `axum` REST adapter (hq-fe-api-platform.2): the platform sibling of the
+# issues HTTP surface — `register_routes` maps `rig.*` to REST routes the builder mounts at
+# `/api/v1/rig` behind the auth+scope guard, with a utoipa OpenAPI spec. Folds into this crate
+# behind the `axum` feature (docs/03 Rule 4), exactly as gt-issues/gt-workspace/gt-auth gate
+# their axum adapters — never a sibling crate. `gt-workspace` brings the `WorkspaceContext`
+# extractor (the per-tenant catalog is resolved from the auth context, never the path).
+axum = { workspace = true, optional = true }
+utoipa = { workspace = true, optional = true }
+async-trait = { workspace = true, optional = true }
+serde_json = { workspace = true, optional = true }
+gt-workspace = { workspace = true, optional = true, features = ["axum"] }
 
 [features]
 # Postgres adapter for the RigRepository port.
 pg = ["dep:sqlx"]
+# Compile the axum REST adapter + OpenAPI spec (`http.rs`) and the route/spec overrides on
+# `RigsModule`. Off by default — the MCP-only build pulls no HTTP stack; the composition bin
+# enables it to expose the REST surface.
+axum = ["dep:axum", "dep:utoipa", "dep:async-trait", "dep:serde_json", "dep:gt-workspace"]
 
 [dev-dependencies]
 serde_json.workspace = true
+# Exercise the REST router in-process (hq-fe-api-platform.2): `oneshot` a request and read the
+# response without a live socket. Run with `--features axum` so the adapter + these helpers
+# compile for the contract test.
+axum = { workspace = true }
+tower = { workspace = true, features = ["util"] }
+async-trait = { workspace = true }

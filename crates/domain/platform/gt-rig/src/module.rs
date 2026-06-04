@@ -18,9 +18,16 @@
 //! - **Migrations** ([`GtModule::migrations`]) — the `rigs` table + its `worktree_root`
 //!   column, owned by the module.
 //!
-//! It does **not** override `register_routes`/`openapi`: a rig is managed over MCP only
-//! (the orchestrator-state facet has no HTTP surface of its own — `gt-web` exposes only a
-//! `rig` *filter* field on session DTOs, not rig CRUD), so the empty-router default stands.
+//! - **HTTP routes + OpenAPI** (on the sibling [`RigsHttpModule`]) — under the off-by-default
+//!   `axum` feature (`hq-fe-api-platform.2`), the platform sibling of the issues HTTP surface:
+//!   the `rig.*` REST routes ([`crate::http`]) the builder mounts at `/api/v1/rig` behind the
+//!   capability-derived scope guard, plus their utoipa spec. [`RigsModule::with_http`] builds the
+//!   HTTP-enabled variant (carrying the per-workspace provider); the plain [`RigsModule`] keeps
+//!   the empty-router / no-spec defaults (MCP-only). The catalog is per-tenant, so unlike the
+//!   single-store issues surface the state is a [`WorkspaceRigs`](crate::WorkspaceRigs) provider
+//!   that yields a workspace-scoped repo per request, resolving the tenant from the auth context,
+//!   never the path. `RigsModule` stays a unit struct so existing `RigsModule.migrations()` call
+//!   sites are untouched.
 //!
 //! ## Two faithful-wrap notes (no logic change)
 //!
@@ -46,7 +53,14 @@ use semver::Version;
 
 /// The [`GtModule`] facade over the rig catalog. Zero-sized: the module owns no runtime
 /// state of its own (the live catalog lives in the actor spawned by [`crate::spawn`]), so the
-/// unit struct is all the composition root registers.
+/// unit struct is all the MCP harvest path registers.
+///
+/// To also serve the REST surface, the binary constructs it with [`with_http`](Self::with_http),
+/// which returns a [`RigsHttpModule`] carrying the per-workspace
+/// [`WorkspaceRigs`](crate::WorkspaceRigs) provider. That sibling delegates identity, capability,
+/// MCP tools, and migrations back to this unit struct and *adds* the REST routes + OpenAPI spec —
+/// so `RigsModule` stays a unit struct (existing `RigsModule.migrations()` call sites keep
+/// working) while the HTTP-enabled variant carries the runtime handle the routes need.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct RigsModule;
 
@@ -56,6 +70,64 @@ impl RigsModule {
     /// known-valid slug.
     pub fn id() -> ModuleId {
         ModuleId::new("rig").expect("`rig` is a valid module id")
+    }
+
+    /// Build the HTTP-enabled rig module (`hq-fe-api-platform.2`), baking `state` (the
+    /// per-workspace repository provider) into the router its
+    /// [`register_routes`](GtModule::register_routes) returns. The binary calls this to opt the
+    /// module into its REST surface; the MCP harvest path keeps the plain unit
+    /// [`RigsModule`]. Returns a [`RigsHttpModule`] rather than mutating `RigsModule` so the
+    /// unit struct (and its `RigsModule.migrations()` call sites) is left untouched.
+    #[cfg(feature = "axum")]
+    pub fn with_http(state: crate::http::RigApiState) -> RigsHttpModule {
+        RigsHttpModule { http: state }
+    }
+}
+
+/// The HTTP-enabled rig module (`hq-fe-api-platform.2`): the same `GtModule` contract as
+/// [`RigsModule`] plus the `rig.*` REST routes + OpenAPI spec.
+///
+/// Built by [`RigsModule::with_http`]. Identity, capability, MCP tools, and migrations are
+/// delegated verbatim to [`RigsModule`] (one source of truth for the catalog's contract); only
+/// [`register_routes`](GtModule::register_routes) and [`openapi`](GtModule::openapi) are
+/// overridden, carrying the per-workspace [`WorkspaceRigs`](crate::WorkspaceRigs) provider the
+/// handlers dispatch through.
+#[cfg(feature = "axum")]
+#[derive(Clone)]
+pub struct RigsHttpModule {
+    /// The per-workspace REST state the routes dispatch through.
+    http: crate::http::RigApiState,
+}
+
+#[cfg(feature = "axum")]
+impl GtModule for RigsHttpModule {
+    fn meta(&self) -> ModuleMeta {
+        RigsModule.meta()
+    }
+
+    fn capability(&self) -> Capability {
+        RigsModule.capability()
+    }
+
+    fn register_mcp_tools(&self, registry: &mut McpRegistry) {
+        RigsModule.register_mcp_tools(registry);
+    }
+
+    fn migrations(&self) -> Vec<Migration> {
+        RigsModule.migrations()
+    }
+
+    /// The rig REST routes (`hq-fe-api-platform.2`), relative — the builder nests them under
+    /// `/api/v1/rig` and applies the `rig.read`/`rig.write` scope guard.
+    fn register_routes(&self) -> axum::Router {
+        crate::http::rig_router(self.http.clone())
+    }
+
+    /// The OpenAPI spec for the rig REST routes, so the combined document documents exactly the
+    /// routes mounted under the HTTP-enabled module.
+    fn openapi(&self) -> Option<utoipa::openapi::OpenApi> {
+        use utoipa::OpenApi;
+        Some(crate::http::ApiDoc::openapi())
     }
 }
 
@@ -263,7 +335,49 @@ mod tests {
 
     #[test]
     fn contributes_no_openapi_surface() {
-        // Rigs are MCP-only; the default (no OpenAPI, empty router) stands.
+        // The plain unit module is MCP-only; the default (no OpenAPI, empty router) stands.
         assert!(RigsModule.openapi().is_none());
+    }
+
+    /// The HTTP-enabled variant (`hq-fe-api-platform.2`) documents its REST routes and returns a
+    /// non-empty OpenAPI spec the builder mounts under `/api/v1/rig`, while delegating the
+    /// catalog contract (id, scopes, MCP tools, migrations) verbatim to [`RigsModule`]. The
+    /// router itself is exercised by the http module's own tests + the contract test; here we
+    /// assert the trait wiring flips on and the delegation holds.
+    #[cfg(feature = "axum")]
+    #[test]
+    fn with_http_contributes_routes_and_delegates_contract() {
+        use crate::http::{DynRigRepository, RigApiState, WorkspaceRigs};
+        use gt_events::AppError;
+        use std::sync::Arc;
+
+        // A never-used provider is fine: `openapi()`/`meta()` read no state, and
+        // `register_routes` only clones the state into the router without dispatching.
+        struct NoopRigs;
+        #[async_trait::async_trait]
+        impl WorkspaceRigs for NoopRigs {
+            async fn repo(&self, _ws: &str) -> Result<Box<dyn DynRigRepository>, AppError> {
+                Err(AppError::Other("unused".into()))
+            }
+        }
+
+        let m = RigsModule::with_http(RigApiState::new(Arc::new(NoopRigs)));
+        assert!(m.openapi().is_some(), "HTTP variant ships an OpenAPI spec");
+
+        // Delegation: the HTTP variant carries the SAME contract as the unit module.
+        assert_eq!(m.meta().id.as_str(), RigsModule.meta().id.as_str());
+        assert_eq!(
+            m.capability().scopes(),
+            RigsModule.capability().scopes(),
+            "scopes delegate to RigsModule"
+        );
+        assert_eq!(
+            m.migrations().len(),
+            RigsModule.migrations().len(),
+            "migrations delegate to RigsModule"
+        );
+        let mut reg = McpRegistry::new();
+        m.register_mcp_tools(&mut reg);
+        assert_eq!(reg.tools().len(), 12, "the twelve rig tools still register");
     }
 }

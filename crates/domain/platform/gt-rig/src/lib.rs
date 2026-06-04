@@ -22,6 +22,8 @@
 
 pub mod actor;
 pub mod commands;
+#[cfg(feature = "axum")]
+pub mod http;
 pub mod module;
 #[cfg(feature = "pg")]
 mod pg;
@@ -38,6 +40,10 @@ pub use commands::{
     AddRig, AdoptRig, RemoveRig, RigCommand, SetRigDefaultBranch, SetRigPrefix, SetRigWorktreeRoot,
 };
 pub use events::RigEvent;
+#[cfg(feature = "axum")]
+pub use http::{rig_router, ApiDoc, DynRigRepository, RigApiState, WorkspaceRigs};
+#[cfg(feature = "axum")]
+pub use module::RigsHttpModule;
 pub use module::RigsModule;
 pub use repo::{InMemoryRigs, RigRepository};
 pub use state::{
