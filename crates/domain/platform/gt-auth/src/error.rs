@@ -28,4 +28,18 @@ pub enum AuthError {
     /// adapter would surface this as [`InvalidSignature`](Self::InvalidSignature)).
     #[error("unknown token")]
     UnknownToken,
+    /// Login was rejected: the email is unknown **or** the password did not match. Kept
+    /// deliberately indistinguishable so callers cannot enumerate users. Raised by an
+    /// [`IdentityProvider`](crate::IdentityProvider).
+    #[error("invalid email or password")]
+    InvalidCredentials,
+    /// The requested authentication provider is not implemented yet (OAuth/OIDC are
+    /// shape-reserved; only [`ProviderKind::EmailPassword`](crate::ProviderKind::EmailPassword)
+    /// is served today). Carries the kind that was asked for.
+    #[error("authentication provider not supported: {0:?}")]
+    UnsupportedProvider(crate::ProviderKind),
+    /// Password hashing or PHC-hash parsing failed — a crypto/stored-data error, not a wrong
+    /// password. Carries a human-readable reason. Only raised by the `password-hash` adapter.
+    #[error("password hashing failure: {0}")]
+    HashFailure(String),
 }

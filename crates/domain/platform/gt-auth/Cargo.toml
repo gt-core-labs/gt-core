@@ -23,6 +23,14 @@ version.workspace = true
 [dependencies]
 serde = { workspace = true }
 thiserror = { workspace = true }
+# Real email+password adapter (`password.rs`): argon2 PHC hashing. Off-by-default so the
+# core build stays dependency-light — the crypto stack is pulled only when a binary mints or
+# verifies passwords. Same gating as gt-rig/gt-quota's `pg` adapters (docs/03).
+argon2 = { workspace = true, optional = true }
+
+[features]
+# Production email+password provider — argon2 hash + verify.
+password-hash = ["dep:argon2"]
 
 [dev-dependencies]
 serde_json = { workspace = true }

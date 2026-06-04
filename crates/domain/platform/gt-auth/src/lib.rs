@@ -22,6 +22,17 @@
 //!   standing in for a real signature check), so the domain slice tests run without crypto.
 //! - [`AuthError`] — the rejection vocabulary.
 //!
+//! ## Login providers (the step before token verification)
+//!
+//! [`Authenticator`] verifies an already-minted token. One step earlier, a principal logs in
+//! by presenting [`Credentials`] to an [`IdentityProvider`], which authenticates them into a
+//! [`VerifiedIdentity`] — the facts the token-minting tier folds into a fresh [`JwtClaims`]
+//! ([`VerifiedIdentity::into_claims`]). [`ProviderKind`] enumerates the methods; **email +
+//! password is the default** ([`ProviderKind::default`]), with `OAuth`/`Oidc` shape-reserved
+//! (their adapters return [`AuthError::UnsupportedProvider`] until implemented). The real
+//! email+password adapter ([`password::PasswordProvider`], argon2 PHC hashing) lives behind
+//! the off-by-default `password-hash` feature; tests use the in-memory double.
+//!
 //! A real signature-verifying adapter (jsonwebtoken HS256/RS256) folds into this same crate
 //! behind an off-by-default `jsonwebtoken` feature in a follow-up — the way gt-rig/gt-quota
 //! gate their `pg`/`axum` adapters — never a sibling adapter crate (Rule 4).
@@ -34,10 +45,18 @@
 //! [workspace]: JwtClaims::workspace
 
 mod error;
+mod provider;
 mod verify;
 
+#[cfg(feature = "password-hash")]
+pub mod password;
+
 pub use error::AuthError;
+pub use provider::{Credentials, IdentityProvider, ProviderKind, VerifiedIdentity};
 pub use verify::{Authenticator, InMemoryAuthenticator};
+
+#[cfg(test)]
+pub use provider::InMemoryIdentityProvider;
 
 use serde::{Deserialize, Serialize};
 

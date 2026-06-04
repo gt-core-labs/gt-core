@@ -88,6 +88,9 @@ tower-http = { version = "0.6", features = ["trace"] }
 hmac = "0.12"
 sha2 = "0.10"
 hex = "0.4"
+# Password hashing for the gt-auth email+password provider (off-by-default `password-hash`).
+# `std` pulls getrandom so `OsRng` is available for per-password salts.
+argon2 = { version = "0.5", features = ["std"] }
 # base64 decode of document attach payloads (hq-docs-api.2).
 base64 = "0.22"
 # pgvector binding for the phase-2 semantic search column (hq-docs-search.2). `sqlx`

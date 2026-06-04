@@ -92,6 +92,7 @@ across the sub-epic boundary).
 | 1 | `hq-mt-data` | core | PG schema-per-ws + Dolt DB-per-ws + event log split |
 | 2 | `hq-mt-auth` | core, **data** `+add` | JWT workspace claim + WorkspaceGuard + scope matrix (auth.5→routing.5 lives at bead level only† — would cycle) |
 | 2 | `hq-mt-routing` | core, data, auth† | RootRegistry per workspace + lazy hydrate + idle teardown |
+| 3 | `hq-mt-authprov` | core, **auth** `+add` | Login providers: `gt-auth::IdentityProvider` port, default email+password (argon2, `password-hash` feature) + OAuth/OIDC shape-reserved stubs |
 | 3 | `hq-mt-rigs` | core, data, **auth** `+add` | Rigs scoped per workspace (absorbs worktree_root) |
 | 3 | `hq-mt-bootstrap` | core, data, routing, **`hq-mod-migrate`** `+add` | workspace.create/suspend/archive/restore |
 | 4 | `hq-mt-runtime` | core, data, auth, rigs, routing `+add ×3` | Polecat/tmux/sling/sessions/quota per workspace |
