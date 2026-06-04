@@ -32,10 +32,25 @@ jobs:
         with:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
+      # System deps for the OCR path (hq-docs-store.4, docs/11): tesseract + leptonica
+      # back the swappable `OcrEngine` tesseract impl; clang/pkg-config build its
+      # bindgen bindings. The default workspace build does NOT use them (OCR is behind
+      # the non-default `ocr-tesseract` feature — it stays decoupled); they are present
+      # so the dedicated OCR feature step below compiles + tests that impl.
+      - name: system deps (OCR)
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq \
+            tesseract-ocr libtesseract-dev libleptonica-dev tesseract-ocr-eng \
+            clang pkg-config
       - name: build
         run: cargo build --workspace --all-targets
       - name: test
         run: cargo test --workspace
+      # The feature-gated tesseract OcrEngine impl — built/tested only here where its
+      # system libs exist, so a default local build stays free of the OCR dependency.
+      - name: ocr feature (tesseract)
+        run: cargo test -p gt-docs-extract --features ocr-tesseract
       # Report-only until the standing debt is cleared (see header).
       - name: fmt (report-only)
         run: cargo fmt --all --check
@@ -104,7 +119,9 @@ jobs:
         env:
           GT_PG_URL: postgres://gastown:test@127.0.0.1:5432/gastown
         run: |
-          cargo test -p gt-store-pg
+          # --features pg activates the WorkspacePool + DocumentsRepository (hq-docs-store.3)
+          # contract tests, which are #[cfg(feature = "pg")] and otherwise compile out.
+          cargo test -p gt-store-pg --features pg
           cargo test -p gt-feature-flags
           # The durable Postgres audit sink (hq-mcp-test.6): per-tenant isolation +
           # the restart-durability proof (write, drop the pool, reconnect, the trail

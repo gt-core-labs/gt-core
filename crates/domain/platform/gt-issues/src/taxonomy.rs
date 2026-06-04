@@ -75,6 +75,11 @@ pub enum Domain {
     /// port wave (hq-gap-domain-taxonomy-…-doc-14); gt-terminal sits in the platform tier.
     #[serde(rename = "platform.terminal")]
     PlatformTerminal,
+    /// The per-workspace document store (gt-documents) — supporting material (.md
+    /// content + binary attachments) a model reads as context when resolving a bead
+    /// (docs/11, hq-docs). Added by hq-docs-api.4.
+    #[serde(rename = "platform.documents")]
+    PlatformDocuments,
     #[serde(rename = "role.sheriff")]
     RoleSheriff,
     #[serde(rename = "role.deacon")]
@@ -107,6 +112,11 @@ pub enum Domain {
     StorePg,
     #[serde(rename = "store.beads")]
     StoreBeads,
+    /// The S3-compatible object store (gt-store-blob, MinIO) holding binary
+    /// attachment bytes for the document store (docs/11, hq-docs-store.2). Added by
+    /// hq-docs-api.4.
+    #[serde(rename = "store.blob")]
+    StoreBlob,
     #[serde(rename = "fe.web")]
     FeWeb,
     #[serde(rename = "fe.docs")]
@@ -141,6 +151,14 @@ mod tests {
     fn skills_variant_present() {
         let d: Domain = serde_json::from_str("\"platform.skills\"").unwrap();
         assert_eq!(d, Domain::PlatformSkills);
+    }
+
+    #[test]
+    fn documents_variants_present() {
+        let docs: Domain = serde_json::from_str("\"platform.documents\"").unwrap();
+        assert_eq!(docs, Domain::PlatformDocuments);
+        let blob: Domain = serde_json::from_str("\"store.blob\"").unwrap();
+        assert_eq!(blob, Domain::StoreBlob);
     }
 
     #[test]

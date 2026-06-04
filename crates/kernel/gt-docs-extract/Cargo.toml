@@ -1,0 +1,34 @@
+[package]
+name = "gt-docs-extract"
+edition.workspace = true
+version.workspace = true
+
+# hq-docs-store.4 (docs/11) — text extraction for binary document attachments.
+#
+# Turns a `kind='blob'` upload (PDF / Office / image) into the `extracted_text` a model
+# reads and full-text/semantic search indexes. PDF + Office extractors are pure-Rust and
+# always compiled. OCR is DECOUPLED behind the `OcrEngine` trait: tesseract is one impl
+# behind the non-default `ocr-tesseract` feature; a future engine is a new impl with no
+# change to callers. The default build pulls no OCR system library.
+[dependencies]
+thiserror = { workspace = true }
+async-trait = { workspace = true }
+tokio = { workspace = true }
+# PDF text extraction, pure Rust.
+pdf-extract = "0.7"
+# OOXML (docx/xlsx/pptx) are zip-of-xml; unzip + pull text nodes.
+zip = { version = "2", default-features = false, features = ["deflate"] }
+quick-xml = "0.36"
+
+# Tesseract OcrEngine impl — opt-in, links libtesseract/libleptonica (system libs present
+# in CI + the Docker build, not in a default local build). Swap for another engine by
+# adding a sibling feature + impl; callers depend only on the `OcrEngine` trait.
+leptess = { version = "0.14", optional = true }
+
+[features]
+# The tesseract-backed OcrEngine. Off by default to keep OCR decoupled and the core build
+# free of the tesseract system dependency.
+ocr-tesseract = ["dep:leptess"]
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }

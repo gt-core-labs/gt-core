@@ -25,6 +25,7 @@ members = [
     "crates/domain/platform/gt-terminal",
     "crates/domain/platform/gt-feed",
     "crates/domain/platform/gt-skills",
+    "crates/domain/platform/gt-documents",
     "crates/domain/lifecycle/gt-agent",
     "crates/domain/lifecycle/gt-polecat",
     "crates/domain/roles/gt-sheriff",
@@ -51,6 +52,8 @@ members = [
     "crates/modules/gt-composition",
     "crates/kernel/gt-store-pg",
     "crates/kernel/gt-store-dolt",
+    "crates/kernel/gt-store-blob",
+    "crates/kernel/gt-docs-extract",
     "crates/kernel/gt-rbac",
     "crates/kernel/gt-audit",
     "examples/mod-hello",
@@ -90,6 +93,10 @@ sqlx = { version = "0.8", default-features = false, features = ["postgres", "mac
 # MySQL-wire client for Dolt (:3307); lifted issues store (hq-core-host.1). No
 # TLS (local Dolt), minimal deps.
 mysql_async = { version = "0.34", default-features = false, features = ["minimal"] }
+# S3-compatible object store client for the document blob store (hq-docs-store.2,
+# docs/11). `services-s3` targets MinIO/S3 in prod; `services-fs` backs local dev
+# and tests with no running object store. Backend swaps without touching callers.
+opendal = { version = "0.51", default-features = false, features = ["services-s3", "services-fs"] }
 thiserror = "2"
 # Event kernel (hq-core-port.10) — ulid for Envelope event ids, time for RFC3339 stamps.
 ulid = "1"
@@ -139,6 +146,7 @@ gt-issues        = { path = "crates/domain/platform/gt-issues" }
 gt-rig           = { path = "crates/domain/platform/gt-rig" }
 gt-feed          = { path = "crates/domain/platform/gt-feed" }
 gt-skills        = { path = "crates/domain/platform/gt-skills" }
+gt-documents     = { path = "crates/domain/platform/gt-documents" }
 gt-agent         = { path = "crates/domain/lifecycle/gt-agent" }
 gt-polecat       = { path = "crates/domain/lifecycle/gt-polecat" }
 gt-sheriff       = { path = "crates/domain/roles/gt-sheriff" }
@@ -162,6 +170,8 @@ gt-mcp-server    = { path = "crates/domain/orchestration/gt-mcp-server" }
 
 gt-store-pg      = { path = "crates/kernel/gt-store-pg" }
 gt-store-dolt    = { path = "crates/kernel/gt-store-dolt" }
+gt-store-blob    = { path = "crates/kernel/gt-store-blob" }
+gt-docs-extract  = { path = "crates/kernel/gt-docs-extract" }
 gt-rbac          = { path = "crates/kernel/gt-rbac" }
 gt-audit         = { path = "crates/kernel/gt-audit" }
 

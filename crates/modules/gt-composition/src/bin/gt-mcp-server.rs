@@ -257,15 +257,20 @@ async fn apply_pg_catalog(pool: &sqlx::PgPool) -> anyhow::Result<()> {
     let workspace_id = ModuleId::new("workspace").expect("`workspace` is a valid module id");
     let feature_id = ModuleId::new("feature").expect("`feature` is a valid module id");
     let rig_id = ModuleId::new("rig").expect("`rig` is a valid module id");
+    let docs_id = ModuleId::new("docs").expect("`docs` is a valid module id");
     let workspace_migs = gt_store_pg::workspace_migrations();
     let feature_migs = gt_store_pg::feature_flags_migrations();
     let rig_migs = RigsModule.migrations();
+    // hq-docs-store.1: the per-workspace `documents` template tables (docs/11). Like `rig`,
+    // they seed the `ws_default` template so `gt_create_workspace_schema` clones them per tenant.
+    let docs_migs = gt_store_pg::docs_migrations();
 
     let plan: Vec<_> = workspace_migs
         .iter()
         .map(|m| (&workspace_id, m))
         .chain(feature_migs.iter().map(|m| (&feature_id, m)))
         .chain(rig_migs.iter().map(|m| (&rig_id, m)))
+        .chain(docs_migs.iter().map(|m| (&docs_id, m)))
         .collect();
 
     let report = gt_module_migrate::apply(pool, &plan)
