@@ -21,6 +21,7 @@
 pub mod agent;
 pub mod audit;
 pub mod convoy;
+pub mod documents;
 pub mod eventlog;
 pub mod graph;
 pub mod merge;
@@ -33,6 +34,7 @@ pub mod workspace;
 pub use agent::AgentHandler;
 pub use audit::AuditHandler;
 pub use convoy::ConvoyHandler;
+pub use documents::DocumentsHandler;
 pub use eventlog::EventLog;
 pub use graph::GraphHandler;
 pub use merge::MergeHandler;

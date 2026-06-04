@@ -31,9 +31,12 @@ use rmcp::transport::{StreamableHttpServerConfig, StreamableHttpService};
 
 use gt_audit::{AuditSink, InMemoryAudit};
 use gt_composition::mcp::{
-    AgentHandler, AuditHandler, ConvoyHandler, EventLog, GraphHandler, MergeHandler, PgRigPrefixes,
-    PgWorkspaceStatus, QuotaHandler, RigHandler, WorkspaceHandler, WsPools,
+    AgentHandler, AuditHandler, ConvoyHandler, DocumentsHandler, EventLog, GraphHandler,
+    MergeHandler, PgRigPrefixes, PgWorkspaceStatus, QuotaHandler, RigHandler, WorkspaceHandler,
+    WsPools,
 };
+use gt_docs_extract::Extractor;
+use gt_store_blob::BlobStore;
 use gt_graphindex::GraphifyIndexer;
 use gt_composition::stream::{feed_router, FeedState};
 use gt_issues::IssuesModule;
@@ -334,6 +337,18 @@ async fn build_domain_router(
             event_log.clone(),
             Arc::new(GraphifyIndexer::new()),
         )));
+
+    // documents.* dispatch (hq-docs-api.2, docs/11): .md content + binary attachments a model
+    // reads as context. The blob store is wired from GT_BLOB_* when set; unset ⇒ md-only
+    // (blob attach errors, .md still works). Extraction runs without OCR in the default build
+    // (the tesseract OcrEngine is behind the `ocr-tesseract` feature, docs/11).
+    let (blob, bucket) = build_blob_store();
+    let router = router.register(Arc::new(DocumentsHandler::new(
+        ws_pools.clone(),
+        blob,
+        bucket,
+        Extractor::without_ocr(),
+    )));
     eprintln!(
         "[gt-mcp-server] domain namespaces: {:?}",
         router.namespaces()
@@ -346,4 +361,29 @@ async fn build_domain_router(
     // `workspace.*` handler mutates (hq-mt-bootstrap.8), behind a short TTL cache.
     let ws_status: Arc<dyn WorkspaceStatusGate> = Arc::new(PgWorkspaceStatus::new(pool));
     Ok((router, Some(rig_prefixes), Some(ws_status)))
+}
+
+/// Build the document blob store from `GT_BLOB_*` (hq-docs-api.2 / hq-docs-deploy.1). Returns
+/// `(None, bucket)` when `GT_BLOB_ENDPOINT` is unset — the server then serves `.md` documents
+/// but rejects `kind="blob"` attachments. The bucket name is always returned (recorded on a
+/// blob row's pointer); it defaults to `gt-documents`.
+fn build_blob_store() -> (Option<Arc<BlobStore>>, String) {
+    let bucket = std::env::var("GT_BLOB_BUCKET").unwrap_or_else(|_| "gt-documents".into());
+    let Ok(endpoint) = std::env::var("GT_BLOB_ENDPOINT") else {
+        eprintln!("[gt-mcp-server] GT_BLOB_ENDPOINT unset; documents are .md-only (no blob store)");
+        return (None, bucket);
+    };
+    let region = std::env::var("GT_BLOB_REGION").unwrap_or_else(|_| "us-east-1".into());
+    let access = std::env::var("GT_BLOB_ACCESS_KEY").unwrap_or_default();
+    let secret = std::env::var("GT_BLOB_SECRET_KEY").unwrap_or_default();
+    match BlobStore::from_s3(&endpoint, &bucket, &region, &access, &secret) {
+        Ok(store) => {
+            eprintln!("[gt-mcp-server] documents blob store: S3 @ {endpoint} (bucket {bucket})");
+            (Some(Arc::new(store)), bucket)
+        }
+        Err(e) => {
+            eprintln!("[gt-mcp-server] blob store init failed — {e}; documents are .md-only");
+            (None, bucket)
+        }
+    }
 }

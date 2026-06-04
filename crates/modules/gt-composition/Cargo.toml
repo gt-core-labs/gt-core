@@ -47,6 +47,15 @@ gt-graphindex = { workspace = true, features = ["graphify"] }
 gt-graphwarden = { workspace = true }
 # Per-workspace schema isolation: WorkspacePool sets search_path per connection.
 gt-store-pg = { workspace = true, features = ["pg"] }
+# Document subsystem dispatch (hq-docs-api.2): the GtModule contract (gt-documents),
+# the per-workspace DocumentsRepository (gt-store-pg `pg`), the blob store, and the
+# text extractor. base64 decodes attach payloads; ulid mints doc ids; sha2 dedups.
+gt-documents = { workspace = true }
+gt-store-blob = { workspace = true }
+gt-docs-extract = { workspace = true }
+base64 = { workspace = true }
+ulid = { workspace = true }
+sha2 = { workspace = true }
 # Boot-time PG migration apply: gt-mcp-server self-seeds the public catalog
 # (workspaces + feature flags) so a fresh deploy needs no operator migration step.
 gt-module-migrate = { workspace = true }
