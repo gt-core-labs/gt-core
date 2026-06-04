@@ -42,10 +42,10 @@ gt-module = { workspace = true }
 # (hq-auth-context.3).
 gt-workspace = { workspace = true, features = ["pg", "axum"] }
 # Authentication port (Authenticator/JwtClaims) for the HTTP auth middleware
-# (hq-auth-context.3): verify a bearer token, inject the verified claim. The trait
-# object stays generic, so no `jsonwebtoken` feature is needed here — the binary
-# supplies the concrete verifier.
-gt-auth = { workspace = true }
+# (hq-auth-context.3): verify a bearer token, inject the verified claim. The
+# `jsonwebtoken` feature pulls the concrete RS256 verifier (JwtAuthenticator::from_env)
+# the gt-mcp-server bin mounts in front of the REST surface (hq-auth-routes.2).
+gt-auth = { workspace = true, features = ["jsonwebtoken"] }
 # rig.* dispatch (hq-mcp-dispatch.3): PgRigs over a per-workspace schema pool.
 gt-rig = { workspace = true, features = ["pg"] }
 # graph.* read-only dispatch (hq-graphrig.10): GraphIndexer port (+ graphify adapter for
@@ -79,7 +79,9 @@ tokio = { workspace = true, features = ["macros", "rt-multi-thread", "net", "sig
 # one Rule-4-legal home for the per-domain DomainHandler wiring. It composes the
 # gt-mcp-server library + the issues/meta modules + the domain handlers.
 gt-mcp-server = { workspace = true }
-gt-issues = { workspace = true }
+# The `axum` feature compiles the issues REST adapter (hq-auth-routes.2): IssuesModule's
+# register_routes/openapi + the http.rs router the bin mounts at /api/v1/issues.
+gt-issues = { workspace = true, features = ["axum"] }
 gt-meta = { workspace = true }
 gt-rbac = { workspace = true }
 gt-audit = { workspace = true }

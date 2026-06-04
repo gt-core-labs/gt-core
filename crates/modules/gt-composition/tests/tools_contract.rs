@@ -22,7 +22,7 @@ use serde_json::Value;
 /// Build the issues server's published tool set the way the composition root does.
 fn served_tools() -> Vec<gt_module::McpTool> {
     let mut reg = McpRegistry::new();
-    IssuesModule.register_mcp_tools(&mut reg);
+    IssuesModule::default().register_mcp_tools(&mut reg);
     reg.tools().to_vec()
 }
 

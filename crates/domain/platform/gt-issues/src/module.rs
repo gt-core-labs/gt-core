@@ -19,10 +19,15 @@
 //!   + descriptions verbatim from the gastown `gt-mcp` service, each carrying the
 //!   JSON input schema generated from its arg struct.
 //!
-//! It does **not** override `register_routes`/`openapi`/`migrations`: issues are
-//! managed over MCP only, and the `issues` table is owned by `bd` (the store's
-//! `ensure_schema` adds the taxonomy columns idempotently), so the empty defaults
-//! stand.
+//! - **HTTP routes + OpenAPI** ([`GtModule::register_routes`] / [`GtModule::openapi`]) — under
+//!   the off-by-default `axum` feature (`hq-auth-routes.2`), the first GtModule HTTP surface:
+//!   the `issues.*` REST routes ([`crate::http`]) the builder mounts at `/api/v1/issues` behind
+//!   the capability-derived scope guard, plus their utoipa spec. A module instance carries the
+//!   live store only when the binary constructs it with [`IssuesModule::with_http`]; the
+//!   MCP-only registration path keeps the empty-router / no-spec defaults.
+//!
+//! It does **not** override `migrations`: the `issues` table is owned by `bd` (the store's
+//! `ensure_schema` adds the taxonomy columns idempotently), so the empty default stands.
 
 use gt_module::{Capability, GtModule, McpRegistry, ModuleId, ModuleMeta, Scope};
 use gt_module_mcp::schema_for;
@@ -32,20 +37,40 @@ use crate::commands::{
     AdvancePhase, ClaimIssue, CloseIssue, CreateIssue, TransitionIssue, UpdateIssue,
 };
 
-/// The [`GtModule`] facade over the issues store. Zero-sized: the module owns no
-/// runtime state of its own (the live store is the [`DoltIssues`] the binary
-/// supplies to the handlers), so the unit struct is all the composition root
-/// registers.
+/// The [`GtModule`] facade over the issues store.
+///
+/// Identity, capability, and the MCP tools need no runtime state, so the default-constructed
+/// module ([`IssuesModule::default`]) is all the MCP harvest path registers — the live store is
+/// the [`DoltIssues`] the binary supplies to the handlers per call.
+///
+/// To also serve the REST surface, the binary constructs it with [`with_http`](Self::with_http),
+/// which bakes the live store + attribution actor into the router the trait's
+/// [`register_routes`](GtModule::register_routes) returns (the trait takes `&self`, so an
+/// implementor that needs runtime handles need not be zero-sized). Without the `axum` feature
+/// the module is field-less and routes default to empty.
 ///
 /// [`DoltIssues`]: gt_store_dolt::DoltIssues
-#[derive(Clone, Copy, Debug, Default)]
-pub struct IssuesModule;
+#[derive(Clone, Default)]
+pub struct IssuesModule {
+    /// The REST state, present only when the binary opts the module into its HTTP surface via
+    /// [`with_http`](Self::with_http). `None` (the default) keeps the empty-router default.
+    #[cfg(feature = "axum")]
+    http: Option<crate::http::IssuesApiState>,
+}
 
 impl IssuesModule {
     /// The module's stable id (`issues`). Matches the `issues.*` MCP-tool and
     /// `issues.<verb>` scope namespaces. The literal is a known-valid slug.
     pub fn id() -> ModuleId {
         ModuleId::new("issues").expect("`issues` is a valid module id")
+    }
+
+    /// Build a module that also serves the REST surface (`hq-auth-routes.2`), baking `state`
+    /// (the live store + attribution actor) into the router [`register_routes`](GtModule::register_routes)
+    /// returns. The binary calls this; the MCP harvest path uses [`default`](Self::default).
+    #[cfg(feature = "axum")]
+    pub fn with_http(state: crate::http::IssuesApiState) -> Self {
+        Self { http: Some(state) }
     }
 }
 
@@ -167,6 +192,26 @@ impl GtModule for IssuesModule {
                 schema_for::<AdvancePhase>(),
             );
     }
+
+    /// The issues REST routes (`hq-auth-routes.2`), relative — the builder nests them under
+    /// `/api/v1/issues` and applies the `issues.read`/`issues.write` scope guard. Present only
+    /// when the module was built with [`with_http`](Self::with_http); otherwise the empty
+    /// default (MCP-only registration), so the MCP harvest path mounts no HTTP surface.
+    #[cfg(feature = "axum")]
+    fn register_routes(&self) -> axum::Router {
+        match &self.http {
+            Some(state) => crate::http::issues_router(state.clone()),
+            None => axum::Router::new(),
+        }
+    }
+
+    /// The OpenAPI spec for the issues REST routes, contributed only when the module carries the
+    /// HTTP state (so the combined document documents exactly the routes actually mounted).
+    #[cfg(feature = "axum")]
+    fn openapi(&self) -> Option<utoipa::openapi::OpenApi> {
+        use utoipa::OpenApi;
+        self.http.as_ref().map(|_| crate::http::ApiDoc::openapi())
+    }
 }
 
 #[cfg(test)]
@@ -175,14 +220,14 @@ mod tests {
 
     #[test]
     fn meta_identity_is_issues() {
-        let m = IssuesModule.meta();
+        let m = IssuesModule::default().meta();
         assert_eq!(m.id.as_str(), "issues");
         assert_eq!(m.version, Version::new(1, 0, 0));
     }
 
     #[test]
     fn capability_owns_issues_scopes_and_emits_nothing() {
-        let cap = IssuesModule.capability();
+        let cap = IssuesModule::default().capability();
         let scopes: Vec<&str> = cap.scopes().iter().map(Scope::as_str).collect();
         assert_eq!(scopes, ["issues.read", "issues.write"]);
         assert!(cap.emits().is_empty());
@@ -191,7 +236,7 @@ mod tests {
     #[test]
     fn registers_the_issues_tools() {
         let mut reg = McpRegistry::new();
-        IssuesModule.register_mcp_tools(&mut reg);
+        IssuesModule::default().register_mcp_tools(&mut reg);
         let names: Vec<&str> = reg.tools().iter().map(|t| t.name.as_str()).collect();
         assert_eq!(
             names,
@@ -218,7 +263,7 @@ mod tests {
         // The verb is `validate`/`execute` for the command pairs, plus `advance`
         // for the operator-only `issues.phase.advance` (hq-core-mcp.7).
         let mut reg = McpRegistry::new();
-        IssuesModule.register_mcp_tools(&mut reg);
+        IssuesModule::default().register_mcp_tools(&mut reg);
         for tool in reg.tools() {
             let (module, _action, verb) = tool.parse_name().expect("well-formed tool name");
             assert_eq!(module, "issues", "tool {} not namespaced to issues", tool.name);
@@ -233,7 +278,7 @@ mod tests {
     #[test]
     fn execute_tools_carry_an_object_input_schema() {
         let mut reg = McpRegistry::new();
-        IssuesModule.register_mcp_tools(&mut reg);
+        IssuesModule::default().register_mcp_tools(&mut reg);
         let create = reg
             .tools()
             .iter()
@@ -244,10 +289,24 @@ mod tests {
     }
 
     #[test]
-    fn contributes_no_routes_or_openapi() {
-        // Issues are MCP-only; the empty-router / no-OpenAPI / no-migration
-        // defaults stand.
-        assert!(IssuesModule.openapi().is_none());
-        assert!(IssuesModule.migrations().is_empty());
+    fn default_module_contributes_no_routes_or_openapi() {
+        // The MCP harvest path uses the default module: no HTTP state ⇒ the empty-router /
+        // no-OpenAPI defaults stand. The REST surface is opt-in via `with_http` (hq-auth-routes.2).
+        assert!(IssuesModule::default().openapi().is_none());
+        assert!(IssuesModule::default().migrations().is_empty());
+    }
+
+    #[cfg(feature = "axum")]
+    #[test]
+    fn with_http_contributes_routes_and_openapi() {
+        // Built with HTTP state, the module documents its REST routes and returns a non-empty
+        // OpenAPI spec the builder mounts under `/api/v1/issues`. (The router itself is exercised
+        // by the http module's own tests; here we assert the trait wiring flips on.)
+        use gt_store_dolt::DoltIssues;
+        // A never-connected store is fine: `openapi()` reads no store, and `register_routes`
+        // only clones the state into the router without dispatching.
+        let store = std::sync::Arc::new(DoltIssues::connect("mysql://x@127.0.0.1:1/none").unwrap());
+        let m = IssuesModule::with_http(crate::http::IssuesApiState::new(store, "test"));
+        assert!(m.openapi().is_some());
     }
 }

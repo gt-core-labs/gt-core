@@ -1696,6 +1696,7 @@ dependencies = [
 name = "gt-issues"
 version = "0.1.0"
 dependencies = [
+ "axum",
  "gt-module",
  "gt-module-mcp",
  "gt-store-dolt",
@@ -1705,6 +1706,8 @@ dependencies = [
  "serde",
  "serde_json",
  "tokio",
+ "tower",
+ "utoipa",
 ]
 
 [[package]]

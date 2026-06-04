@@ -18,6 +18,19 @@ serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
 schemars = { workspace = true }
 semver = { workspace = true }
+# Off-by-default `axum` REST adapter (hq-auth-routes.2): the first GtModule HTTP
+# surface — `register_routes` maps `issues.*` to REST routes the builder mounts at
+# `/api/v1/issues` behind the auth+scope guard, with a utoipa OpenAPI spec. Folds
+# into this crate behind the `axum` feature (docs/03 Rule 4), exactly as
+# gt-workspace/gt-auth gate their axum adapters — never a sibling crate.
+axum = { workspace = true, optional = true }
+utoipa = { workspace = true, optional = true }
+
+[features]
+# Compile the axum REST adapter + OpenAPI spec (`http.rs`) and the route/spec
+# overrides on `IssuesModule`. Off by default — the MCP-only build pulls no HTTP
+# stack; the composition bin enables it to expose the REST surface.
+axum = ["dep:axum", "dep:utoipa"]
 
 [dev-dependencies]
 gt-module-mcp = { workspace = true }
@@ -25,3 +38,8 @@ gt-module-mcp = { workspace = true }
 # seed the throwaway test database the resource passthroughs read back.
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 mysql_async = { workspace = true }
+# Exercise the REST router in-process (hq-auth-routes.2): `oneshot` a request and
+# read the response without a live socket. Run with `--features axum` so the
+# adapter + these helpers compile for the contract test.
+axum = { workspace = true }
+tower = { workspace = true, features = ["util"] }

@@ -35,6 +35,10 @@
 pub mod commands;
 pub mod delivery;
 pub mod handlers;
+/// The off-by-default `axum` REST adapter (`hq-auth-routes.2`): the first GtModule HTTP surface,
+/// mapping `issues.*` to REST routes that reuse the same handlers as the MCP tools.
+#[cfg(feature = "axum")]
+pub mod http;
 pub mod park;
 pub mod policy;
 pub mod readiness;
@@ -47,6 +51,8 @@ pub use commands::{
     AdvancePhase, ClaimIssue, CloseIssue, CreateIssue, TransitionIssue, UpdateIssue,
 };
 pub use delivery::{CommitInfo, CommitInspector};
+#[cfg(feature = "axum")]
+pub use http::{issues_router, ApiDoc, IssuesApiState};
 pub use module::IssuesModule;
 pub use park::{
     decide as park_decide, HumanPresence, IrreversibleKind, Operation, ParkDecision, ParkQueue,

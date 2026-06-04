@@ -28,7 +28,7 @@ use serde_json::{json, Value};
 /// kernel `RootBuilder`, descriptors collected via `root.mcp_tools()`.
 fn harvest_tools() -> Vec<McpTool> {
     let root = RootBuilder::new()
-        .module(IssuesModule)
+        .module(IssuesModule::default())
         .module(MetaModule)
         .build()
         .expect("module build");

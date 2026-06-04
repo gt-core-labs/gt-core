@@ -39,8 +39,12 @@ use gt_docs_embed::Embedder;
 use gt_docs_extract::Extractor;
 use gt_store_blob::BlobStore;
 use gt_graphindex::GraphifyIndexer;
+use gt_composition::auth::{authenticate, AuthState, SharedAuthenticator};
+use gt_composition::denial_audit::audit_denials;
+use gt_composition::scope_bridge::bridge_scopes;
 use gt_composition::stream::{feed_router, FeedState};
-use gt_issues::IssuesModule;
+use gt_auth::JwtAuthenticator;
+use gt_issues::{IssuesApiState, IssuesModule};
 use gt_mcp_server::{
     health, DocumentsResource, DomainRouter, HealthState, IssuesServer, PgAuditSink,
     WorkspaceRigPrefixes, WorkspaceStatusGate, WorkspaceStores,
@@ -77,10 +81,14 @@ async fn main() -> anyhow::Result<()> {
     store.ensure_schema().await?;
     eprintln!("[gt-mcp-server] issues: Dolt @ {dolt_url}");
 
-    // Tools: harvest the issues module's descriptors through the kernel builder —
-    // the composition root never hand-lists tools (docs/03 rule 3).
+    // Tools + routes: harvest the issues module's descriptors AND its REST router through the
+    // kernel builder — the composition root never hand-lists tools or hand-wires a module's
+    // routes (docs/03 rule 3). The module carries the live store + attribution actor so its
+    // `register_routes` (hq-auth-routes.2) can dispatch to the same handlers as the MCP tools;
+    // the builder mounts them at `/api/v1/issues` behind the issues.read/issues.write guard.
+    let issues_api = IssuesApiState::new(store.clone(), actor.clone());
     let root = RootBuilder::new()
-        .module(IssuesModule)
+        .module(IssuesModule::with_http(issues_api))
         .module(MetaModule)
         .build()
         .map_err(|e| anyhow::anyhow!("module build failed: {e:?}"))?;
@@ -225,6 +233,42 @@ async fn main() -> anyhow::Result<()> {
         .with_state(health_state)
         .merge(feed)
         .nest_service(MCP_PATH, http);
+
+    // REST surface (hq-auth-routes.2): the module routers the kernel builder mounted
+    // (`/api/v1/<module>/...`, currently issues) behind the auth + scope-bridge + audit chain.
+    // The per-route scope guard is already baked in by `into_router` from each module's
+    // Capability; this only adds authentication (RS256 bearer → verified claims) and the
+    // claims→CallerScopes bridge the guard consumes, with denials audited.
+    //
+    // Env-gated on the RS256 verifier (GT_JWT_RS256_KEYS / GT_JWT_RS256_PUBLIC_KEY_FILE): a
+    // deploy that configures no public key serves no REST surface (MCP + ops only), exactly as
+    // before — enabling it is an opt-in env, not a behaviour change.
+    let module_routes = root.into_router();
+    let app = match JwtAuthenticator::from_env() {
+        Ok(verifier) => {
+            let verifier: SharedAuthenticator = Arc::new(verifier);
+            let guarded = module_routes
+                // Innermost-first: the kernel scope guard (inside `module_routes`) runs last;
+                // bridge_scopes feeds it CallerScopes; audit_denials observes the guard's verdict;
+                // authenticate (outermost) verifies the bearer token and injects the claims.
+                .layer(axum::middleware::from_fn(bridge_scopes))
+                .layer(axum::middleware::from_fn_with_state(audit.clone(), audit_denials))
+                .layer(axum::middleware::from_fn_with_state(
+                    AuthState::new(verifier, audit.clone()),
+                    authenticate,
+                ));
+            eprintln!(
+                "[gt-mcp-server] REST surface on /api/v1/* behind RS256 auth + RBAC scope guard"
+            );
+            app.merge(guarded)
+        }
+        Err(e) => {
+            eprintln!(
+                "[gt-mcp-server] REST surface off — no RS256 verifier configured ({e}); MCP + ops only"
+            );
+            app
+        }
+    };
 
     let listener = tokio::net::TcpListener::bind(&bind).await?;
     eprintln!(

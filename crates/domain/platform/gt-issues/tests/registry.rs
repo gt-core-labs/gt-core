@@ -23,14 +23,14 @@ const EXPECTED: [&str; 11] = [
 
 #[test]
 fn root_exposes_the_issues_tools() {
-    let root = RootBuilder::new().module(IssuesModule).build().unwrap();
+    let root = RootBuilder::new().module(IssuesModule::default()).build().unwrap();
     let names: Vec<&str> = root.mcp_tools().map(|t| t.name.as_str()).collect();
     assert_eq!(names, EXPECTED);
 }
 
 #[test]
 fn meta_help_lists_the_issues_tools_in_mcp_shape() {
-    let root = RootBuilder::new().module(IssuesModule).build().unwrap();
+    let root = RootBuilder::new().module(IssuesModule::default()).build().unwrap();
     let help = meta_help(&root);
     let tools = help["tools"].as_array().expect("tools array");
     assert_eq!(tools.len(), EXPECTED.len());
