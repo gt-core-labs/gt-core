@@ -13,6 +13,11 @@ pub enum AuthError {
     /// The token is well-formed and correctly signed but past its `exp`.
     #[error("token expired")]
     Expired,
+    /// The token is correctly signed but presented before its `nbf` not-before instant (or
+    /// stamped with an `iat` in the future beyond the allowed clock skew). See
+    /// [`JwtClaims::validate_with_leeway`](crate::JwtClaims::validate_with_leeway).
+    #[error("token is not yet valid")]
+    NotYetValid,
     /// The token carries no `workspace` claim and the grace window is closed
     /// (`GT_JWT_WS_OPTIONAL` unset). See [`JwtClaims::validate`](crate::JwtClaims::validate).
     #[error("token is missing the required workspace claim")]

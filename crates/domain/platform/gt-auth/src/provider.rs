@@ -114,6 +114,7 @@ impl VerifiedIdentity {
             workspace: self.workspace,
             scopes: self.scopes,
             exp,
+            nbf: None,
             iat,
         }
     }

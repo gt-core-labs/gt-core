@@ -238,6 +238,7 @@ mod tests {
             workspace: "acme".into(),
             scopes: vec!["rig.read".into()],
             exp: 100,
+            nbf: None,
             iat: 0,
         }
     }

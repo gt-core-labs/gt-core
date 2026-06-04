@@ -92,31 +92,78 @@ pub struct JwtClaims {
     pub scopes: Vec<String>,
     /// Expiry, seconds since the Unix epoch (JWT `exp`).
     pub exp: u64,
+    /// Not-before, seconds since the Unix epoch (JWT `nbf`). When set, the token is rejected
+    /// before this instant. Absent (`None`) ⇒ valid from issue. Omitted from the wire when
+    /// `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub nbf: Option<u64>,
     /// Issued-at, seconds since the Unix epoch (JWT `iat`).
     #[serde(default)]
     pub iat: u64,
 }
 
+/// The `GT_JWT_WS_OPTIONAL` env var: when truthy, a token may omit the `workspace` claim
+/// during the rolling rollout (`hq-mt-auth.1`).
+pub const ENV_WS_OPTIONAL: &str = "GT_JWT_WS_OPTIONAL";
+
 impl JwtClaims {
     /// Validate the *semantic* invariants of an already-signature-verified token against the
-    /// current wall clock `now_secs`.
-    ///
-    /// - Expired when `now_secs >= exp` ([`AuthError::Expired`]).
-    /// - A blank `workspace` claim is [`AuthError::MissingWorkspace`] **unless**
-    ///   `workspace_optional` is set — the `GT_JWT_WS_OPTIONAL` grace flag for the rolling
-    ///   rollout described in `hq-mt-auth.1`. Drop the flag (and this branch) once every
-    ///   issuer stamps the claim.
+    /// current wall clock `now_secs`, with **zero** clock-skew tolerance. See
+    /// [`validate_with_leeway`](Self::validate_with_leeway) for the full contract.
     ///
     /// Signature verification is the [`Authenticator`]'s job and has already happened by the
     /// time you hold a `JwtClaims`; this is the cheap, crypto-free second gate.
     pub fn validate(&self, now_secs: u64, workspace_optional: bool) -> Result<(), AuthError> {
-        if now_secs >= self.exp {
+        self.validate_with_leeway(now_secs, 0, workspace_optional)
+    }
+
+    /// Validate the token's time bounds and workspace claim against `now_secs`, tolerating up to
+    /// `leeway_secs` of clock skew between the issuer and this verifier.
+    ///
+    /// - **Expired** when `now_secs >= exp + leeway` ([`AuthError::Expired`]).
+    /// - **Not yet valid** when a `nbf` is set and `now_secs + leeway < nbf`
+    ///   ([`AuthError::NotYetValid`]); likewise when `iat` is stamped and lies more than
+    ///   `leeway` in the future (a token minted "ahead" of this clock — skew or a forged
+    ///   timestamp).
+    /// - A blank `workspace` claim is [`AuthError::MissingWorkspace`] **unless**
+    ///   `workspace_optional` is set — the [`GT_JWT_WS_OPTIONAL`](ENV_WS_OPTIONAL) grace flag
+    ///   for the rolling rollout (`hq-mt-auth.1`). Drop the flag (and this branch) once every
+    ///   issuer stamps the claim.
+    ///
+    /// The leeway widens the *exp* window and narrows the *nbf*/*iat* one symmetrically, the
+    /// standard JWT skew allowance (RFC 7519 §4.1.4/§4.1.5).
+    pub fn validate_with_leeway(
+        &self,
+        now_secs: u64,
+        leeway_secs: u64,
+        workspace_optional: bool,
+    ) -> Result<(), AuthError> {
+        if now_secs >= self.exp.saturating_add(leeway_secs) {
             return Err(AuthError::Expired);
+        }
+        if let Some(nbf) = self.nbf {
+            if now_secs.saturating_add(leeway_secs) < nbf {
+                return Err(AuthError::NotYetValid);
+            }
+        }
+        // iat 0 ⇒ absent (the wire default); a non-zero iat in the future beyond leeway is a
+        // token claiming to be minted later than now — reject it like an unmet nbf.
+        if self.iat != 0 && self.iat > now_secs.saturating_add(leeway_secs) {
+            return Err(AuthError::NotYetValid);
         }
         if self.workspace.trim().is_empty() && !workspace_optional {
             return Err(AuthError::MissingWorkspace);
         }
         Ok(())
+    }
+
+    /// Read the [`GT_JWT_WS_OPTIONAL`](ENV_WS_OPTIONAL) grace flag from the environment.
+    /// Truthy values are `1`, `true`, `yes`, `on` (case-insensitive); anything else (or unset)
+    /// is `false`, so the workspace claim is required by default.
+    pub fn workspace_optional_from_env() -> bool {
+        std::env::var(ENV_WS_OPTIONAL)
+            .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"))
+            .unwrap_or(false)
     }
 
     /// True when `scope` is among the granted [`scopes`](Self::scopes).
