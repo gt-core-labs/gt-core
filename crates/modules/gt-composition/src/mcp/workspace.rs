@@ -96,6 +96,20 @@ impl DomainHandler for WorkspaceHandler {
                     })
                     .await
                     .map_err(actor_err)?;
+                // Provision the tenant's PG schema (`ws_<slug>`) by cloning the
+                // `ws_default` template (hq-mt-data.2). Without this the catalog row
+                // exists but the tenant has no `rigs`/quota/… tables, and every
+                // `rig.*` dispatch in that workspace fails with
+                // `relation "rigs" does not exist`. `gt_create_workspace_schema` is
+                // idempotent, so a retry against an already-provisioned tenant is a
+                // no-op — and re-running it repairs a tenant created before this fix.
+                sqlx::query("SELECT gt_create_workspace_schema($1)")
+                    .bind(id.as_str())
+                    .execute(&self.pool)
+                    .await
+                    .map_err(|e| {
+                        AppError::Other(format!("provision schema for {}: {e}", id.as_str()))
+                    })?;
                 Ok(json!({
                     "ok": true,
                     "id": id.as_str(),
@@ -362,6 +376,23 @@ mod tests {
         Some(PgPool::connect(&url).await.expect("GT_PG_URL must point at a reachable Postgres"))
     }
 
+    /// Seed the public-schema catalog the way the server's `apply_pg_catalog` does:
+    /// the `workspaces` table (migration 0), the `gt_create_workspace_schema`
+    /// provisioning function (migration 1), and the `ws_default` template the
+    /// function clones from. `workspace.create` now calls that function, so a
+    /// contract test that only created the table would fail at the clone step.
+    /// All idempotent (`raw_sql` simple-query protocol for the multi-statement
+    /// migrations), so every test can call this on entry.
+    async fn apply_workspace_migrations(pool: &PgPool) {
+        for m in gt_store_pg::workspace_migrations() {
+            sqlx::raw_sql(&m.sql).execute(pool).await.expect("apply workspaces migration");
+        }
+        sqlx::raw_sql("CREATE SCHEMA IF NOT EXISTS ws_default")
+            .execute(pool)
+            .await
+            .expect("ensure ws_default template");
+    }
+
     /// PG-backed round trip: `workspace.create` persists through the actor, then
     /// `workspace.info` and `workspace.list` read it back from Postgres — proving
     /// the handler shares durable state across calls (the bead's whole point).
@@ -374,8 +405,7 @@ mod tests {
         // The `workspaces` table is the one the gt-store-pg migration creates.
         // `raw_sql` uses the simple-query protocol so the multi-statement migration
         // (CREATE TABLE + seed INSERT) runs in one call.
-        let sql = &gt_store_pg::workspace_migrations()[0].sql;
-        sqlx::raw_sql(sql).execute(&pool).await.expect("apply workspaces migration");
+        apply_workspace_migrations(&pool).await;
         sqlx::query("DELETE FROM workspaces WHERE id = $1")
             .bind("dispatch-test")
             .execute(&pool)
@@ -391,6 +421,18 @@ mod tests {
             .unwrap();
         assert_eq!(created["status"], "active");
         assert_eq!(created["id"], "dispatch-test");
+
+        // create must also provision the tenant's PG schema (`ws_dispatch_test`),
+        // not just the catalog row — the gap that left `rig.*` failing with
+        // `relation "rigs" does not exist` for freshly-created workspaces.
+        let schema_exists: bool = sqlx::query_scalar(
+            "SELECT EXISTS (SELECT 1 FROM information_schema.schemata WHERE schema_name = $1)",
+        )
+        .bind("ws_dispatch_test")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert!(schema_exists, "workspace.create must clone ws_default into ws_dispatch_test");
 
         // Re-create is rejected (the actor decides AlreadyExists) as a validation fault.
         let dup = handler
@@ -428,6 +470,10 @@ mod tests {
             .execute(&pool)
             .await
             .unwrap();
+        sqlx::raw_sql("DROP SCHEMA IF EXISTS ws_dispatch_test CASCADE")
+            .execute(&pool)
+            .await
+            .unwrap();
     }
 
     /// PG-backed: `workspace.suspend` transitions Active → Suspended and persists it;
@@ -438,8 +484,7 @@ mod tests {
             eprintln!("GT_PG_URL unset; skipping WorkspaceHandler suspend test");
             return;
         };
-        let sql = &gt_store_pg::workspace_migrations()[0].sql;
-        sqlx::raw_sql(sql).execute(&pool).await.expect("apply workspaces migration");
+        apply_workspace_migrations(&pool).await;
         sqlx::query("DELETE FROM workspaces WHERE id = $1")
             .bind("suspend-test")
             .execute(&pool)
@@ -489,8 +534,7 @@ mod tests {
             eprintln!("GT_PG_URL unset; skipping WorkspaceHandler resume test");
             return;
         };
-        let sql = &gt_store_pg::workspace_migrations()[0].sql;
-        sqlx::raw_sql(sql).execute(&pool).await.expect("apply workspaces migration");
+        apply_workspace_migrations(&pool).await;
         sqlx::query("DELETE FROM workspaces WHERE id = $1")
             .bind("resume-test")
             .execute(&pool)
@@ -537,8 +581,7 @@ mod tests {
             eprintln!("GT_PG_URL unset; skipping WorkspaceHandler archive test");
             return;
         };
-        let sql = &gt_store_pg::workspace_migrations()[0].sql;
-        sqlx::raw_sql(sql).execute(&pool).await.expect("apply workspaces migration");
+        apply_workspace_migrations(&pool).await;
         sqlx::query("DELETE FROM workspaces WHERE id = $1")
             .bind("archive-test")
             .execute(&pool)
@@ -618,8 +661,7 @@ mod tests {
             eprintln!("GT_PG_URL unset; skipping PgWorkspaceStatus contract test");
             return;
         };
-        let sql = &gt_store_pg::workspace_migrations()[0].sql;
-        sqlx::raw_sql(sql).execute(&pool).await.expect("apply workspaces migration");
+        apply_workspace_migrations(&pool).await;
         sqlx::query("DELETE FROM workspaces WHERE id = $1")
             .bind("gate-test")
             .execute(&pool)
