@@ -1,0 +1,29 @@
+[package]
+name = "gt-docs-embed"
+edition.workspace = true
+version.workspace = true
+
+# hq-docs-search.2 (docs/11 phase 2) — text embeddings for semantic document search.
+#
+# Like the OCR seam (gt-docs-extract), the embedding ENGINE is decoupled behind the
+# `Embedder` trait: callers depend on the trait, never a concrete model. The local
+# fastembed engine is one impl behind the non-default `embeddings-fastembed` feature (it
+# pulls the onnxruntime ML stack + downloads a model at first use); a future engine (a
+# hosted API, candle, …) is a new impl with no change to callers. The default build pulls
+# no ML dependency.
+[dependencies]
+thiserror = { workspace = true }
+async-trait = { workspace = true }
+tokio = { workspace = true }
+
+# Local ONNX embedding engine — opt-in. AllMiniLM-L6-v2 (384-dim) is the default model,
+# matching the `vector(384)` column in migration 0003.
+fastembed = { version = "4", optional = true }
+
+[features]
+# The fastembed-backed local Embedder. Off by default to keep embeddings decoupled and the
+# core build free of the onnxruntime dependency.
+embeddings-fastembed = ["dep:fastembed"]
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }

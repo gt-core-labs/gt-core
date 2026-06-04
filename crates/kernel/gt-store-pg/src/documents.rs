@@ -15,6 +15,7 @@
 #![cfg(feature = "pg")]
 
 use async_trait::async_trait;
+use pgvector::Vector;
 use sqlx::types::chrono::{DateTime, Utc};
 use sqlx::{FromRow, Row};
 
@@ -154,6 +155,21 @@ pub trait DocumentsRepository: Send + Sync {
         owner: Option<(&str, &str)>,
         limit: i64,
     ) -> Result<Vec<Document>, DocError>;
+    /// Store (or replace) the semantic-search embedding of a live document (hq-docs-search.2).
+    /// `embedding.len()` must match the column dimension (384). A no-op count is fine — a
+    /// soft-deleted/absent row simply isn't updated.
+    async fn set_embedding(&self, id: &str, embedding: Vec<f32>) -> Result<(), DocError>;
+    /// Phase-2 hybrid search (hq-docs-search.2): fuse the phase-1 full-text rank with vector
+    /// cosine similarity against `query_embedding`, ranked by their weighted sum. Live rows
+    /// only, capped at `limit`, optionally narrowed to one owner. Rows lacking an embedding
+    /// still surface on the text side (the vector term coalesces to 0).
+    async fn search_hybrid(
+        &self,
+        query: &str,
+        query_embedding: &[f32],
+        owner: Option<(&str, &str)>,
+        limit: i64,
+    ) -> Result<Vec<Document>, DocError>;
     /// Apply `patch` under an optimistic `expected_version` guard; bumps `version` and
     /// appends a version snapshot. [`DocError::VersionConflict`] on a stale guard.
     async fn update(
@@ -285,6 +301,52 @@ impl DocumentsRepository for PgDocuments {
              LIMIT $2"
         );
         let mut q = sqlx::query_as(&sql).bind(query).bind(limit);
+        if let Some((ot, oid)) = owner {
+            q = q.bind(ot).bind(oid);
+        }
+        let rows = q.fetch_all(self.pool.pool()).await?;
+        Ok(rows)
+    }
+
+    async fn set_embedding(&self, id: &str, embedding: Vec<f32>) -> Result<(), DocError> {
+        sqlx::query("UPDATE documents SET embedding = $2 WHERE id = $1 AND deleted_at IS NULL")
+            .bind(id)
+            .bind(Vector::from(embedding))
+            .execute(self.pool.pool())
+            .await?;
+        Ok(())
+    }
+
+    async fn search_hybrid(
+        &self,
+        query: &str,
+        query_embedding: &[f32],
+        owner: Option<(&str, &str)>,
+        limit: i64,
+    ) -> Result<Vec<Document>, DocError> {
+        // $1 query text, $2 query vector, $3 limit; optional owner binds $4/$5. Score fuses
+        // text rank and (1 - cosine distance), each coalesced to 0 so a row matching on only
+        // one side still ranks. Candidates: text match OR an embedding present.
+        let owner_clause = if owner.is_some() {
+            "AND owner_type = $4 AND owner_id = $5"
+        } else {
+            ""
+        };
+        let sql = format!(
+            "SELECT {COLS} FROM documents \
+             WHERE deleted_at IS NULL \
+               AND (tsv @@ websearch_to_tsquery('english', $1) OR embedding IS NOT NULL) \
+               {owner_clause} \
+             ORDER BY ( \
+                 COALESCE(ts_rank(tsv, websearch_to_tsquery('english', $1)), 0) \
+                 + COALESCE(1 - (embedding <=> $2), 0) \
+             ) DESC \
+             LIMIT $3"
+        );
+        let mut q = sqlx::query_as(&sql)
+            .bind(query)
+            .bind(Vector::from(query_embedding.to_vec()))
+            .bind(limit);
         if let Some((ot, oid)) = owner {
             q = q.bind(ot).bind(oid);
         }

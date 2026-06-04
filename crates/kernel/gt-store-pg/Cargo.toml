@@ -13,11 +13,15 @@ sqlx = { workspace = true, optional = true }
 # errors. Pulled only with the `pg` adapter.
 async-trait = { workspace = true, optional = true }
 thiserror = { workspace = true, optional = true }
+# pgvector `Vector` type + its sqlx encode/decode, for the phase-2 semantic search
+# column (hq-docs-search.2). Pure-Rust binding; the DB-side extension is installed by
+# migration 0003.
+pgvector = { workspace = true, optional = true }
 
 [features]
 # `WorkspacePool` + the `DocumentsRepository` PG adapter: per-workspace
 # search_path-scoped Postgres access.
-pg = ["dep:sqlx", "dep:async-trait", "dep:thiserror"]
+pg = ["dep:sqlx", "dep:async-trait", "dep:thiserror", "dep:pgvector"]
 
 [dev-dependencies]
 # Drives the `pg`-gated WorkspacePool contract test (GT_PG_URL).

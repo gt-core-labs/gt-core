@@ -81,6 +81,9 @@ const DOCS_0001_SQL: &str = include_str!("../migrations/gt-docs/0001_documents.s
 /// Migration #2: per-workspace `document_versions` history in the `ws_default` template.
 const DOCS_0002_SQL: &str = include_str!("../migrations/gt-docs/0002_document_versions.sql");
 
+/// Migration #3: pgvector `embedding` column + HNSW index (phase-2 semantic search).
+const DOCS_0003_SQL: &str = include_str!("../migrations/gt-docs/0003_embedding.sql");
+
 /// Migrations for the `gt-docs` per-workspace document store (hq-docs-store.1), in
 /// ascending apply order.
 ///
@@ -94,6 +97,7 @@ pub fn docs_migrations() -> Vec<Migration> {
     vec![
         Migration::new(1, "0001_documents", DOCS_0001_SQL),
         Migration::new(2, "0002_document_versions", DOCS_0002_SQL),
+        Migration::new(3, "0003_embedding", DOCS_0003_SQL),
     ]
 }
 
@@ -149,11 +153,18 @@ mod tests {
     #[test]
     fn docs_migrations_define_template_tables_in_order() {
         let migs = docs_migrations();
-        assert_eq!(migs.len(), 2);
+        assert_eq!(migs.len(), 3);
         assert_eq!(migs[0].version, 1);
         assert_eq!(migs[0].name, "0001_documents");
         assert_eq!(migs[1].version, 2);
         assert_eq!(migs[1].name, "0002_document_versions");
+        assert_eq!(migs[2].version, 3);
+        assert_eq!(migs[2].name, "0003_embedding");
+        // Phase-2 embedding migration: pgvector extension + vector column + ANN index.
+        let emb = &migs[2].sql;
+        assert!(emb.contains("CREATE EXTENSION IF NOT EXISTS vector"), "enables pgvector");
+        assert!(emb.contains("embedding vector(384)"), "384-dim embedding column");
+        assert!(emb.to_lowercase().contains("hnsw"), "ANN index");
 
         // Per-workspace projection: defined in the ws_default template, structural
         // isolation (no workspace_id / FK), idempotent like the other template migrations.

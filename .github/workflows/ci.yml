@@ -51,6 +51,12 @@ jobs:
       # system libs exist, so a default local build stays free of the OCR dependency.
       - name: ocr feature (tesseract)
         run: cargo test -p gt-docs-extract --features ocr-tesseract
+      # The feature-gated fastembed Embedder impl (hq-docs-search.2). Build-only + report-only:
+      # the ML stack (onnxruntime via `ort`) and model download are heavy/network-dependent, so
+      # this proves the impl compiles without gating CI on the toolchain being present.
+      - name: embeddings feature (fastembed)
+        run: cargo build -p gt-docs-embed --features embeddings-fastembed
+        continue-on-error: true
       # Report-only until the standing debt is cleared (see header).
       - name: fmt (report-only)
         run: cargo fmt --all --check
@@ -72,15 +78,18 @@ jobs:
         ports:
           - 3306:3306
       postgres:
-        image: postgres:16-alpine
+        # pgvector image (not stock postgres): migration 0003 runs `CREATE EXTENSION vector`
+        # for the phase-2 semantic search column (hq-docs-search.2). The stock image lacks it,
+        # so the gt-store-pg `--features pg` contract would fail applying the docs migrations.
+        image: pgvector/pgvector:pg16
         env:
-          POSTGRES_USER: gastown
+          POSTGRES_USER: gtapp
           POSTGRES_PASSWORD: test
-          POSTGRES_DB: gastown
+          POSTGRES_DB: gtapp
         ports:
           - 5432:5432
         options: >-
-          --health-cmd "pg_isready -U gastown"
+          --health-cmd "pg_isready -U gtapp"
           --health-interval 5s
           --health-timeout 5s
           --health-retries 10
@@ -117,7 +126,7 @@ jobs:
       # Postgres-backed schema migration + workspace-scoped feature flags.
       - name: pg contract
         env:
-          GT_PG_URL: postgres://gastown:test@127.0.0.1:5432/gastown
+          GT_PG_URL: postgres://gtapp:test@127.0.0.1:5432/gtapp
         run: |
           # --features pg activates the WorkspacePool + DocumentsRepository (hq-docs-store.3)
           # contract tests, which are #[cfg(feature = "pg")] and otherwise compile out.

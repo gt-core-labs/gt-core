@@ -163,7 +163,14 @@ domain `platform.documents` is required (a conscious taxonomy add — see
 | bead | title | phase | depends_on |
 |------|-------|-------|------------|
 | `hq-docs-search.1` | **Phase 1** full-text: `tsv` populate trigger + `gin` index + query path over `body_md`/`extracted_text` | 1 | `hq-docs-store.3` |
-| `hq-docs-search.2` | **Phase 2** semantic: `pgvector` column + embedding generation (Voyage AI or local `fastembed`) + hybrid (full-text ∪ vector) rank | 2 | `.1` |
+| `hq-docs-search.2` | **Phase 2** semantic: `pgvector` `vector(384)` column (migration 0003) + decoupled `Embedder` port (local `fastembed`, feature `embeddings-fastembed`) + `search_hybrid` (text-rank + cosine) | 2 | `.1` |
+
+> **Embedding is decoupled** (`hq-docs-search.2`, mirrors the OCR seam): the handler depends on
+> the `Embedder` *trait* (gt-docs-embed), never a concrete model. fastembed (local ONNX,
+> AllMiniLM-L6-v2, 384-dim) is one impl behind the non-default `embeddings-fastembed` feature; a
+> future engine (hosted API, candle) is a new impl with no caller change. Enabled at runtime via
+> `GT_EMBEDDINGS` on a build carrying the feature; otherwise `documents.search` is phase-1
+> full-text only. Requires a pgvector Postgres image (CI + gt-app compose use `pgvector/pgvector`).
 
 ### `hq-docs-deploy` — infra (in `gt-app`, not core)
 

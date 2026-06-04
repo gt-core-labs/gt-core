@@ -53,6 +53,7 @@ gt-store-pg = { workspace = true, features = ["pg"] }
 gt-documents = { workspace = true }
 gt-store-blob = { workspace = true }
 gt-docs-extract = { workspace = true }
+gt-docs-embed = { workspace = true }
 base64 = { workspace = true }
 ulid = { workspace = true }
 sha2 = { workspace = true }
@@ -82,6 +83,11 @@ anyhow = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 sqlx = { workspace = true }
+
+[features]
+# Compile the local fastembed embedding engine into the server (hq-docs-search.2). Off by
+# default — pulls the onnxruntime ML stack; enable for semantic/hybrid document search.
+embeddings-fastembed = ["gt-docs-embed/embeddings-fastembed"]
 
 [[bin]]
 name = "gt-mcp-server"

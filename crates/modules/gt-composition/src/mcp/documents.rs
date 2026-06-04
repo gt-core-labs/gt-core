@@ -18,6 +18,7 @@ use base64::Engine as _;
 use serde_json::{json, Value};
 
 use gt_documents::{AttachDoc, DocumentsModule, ListDocs, RemoveDoc, SearchDocs, UpdateDoc};
+use gt_docs_embed::Embedder;
 use gt_docs_extract::Extractor;
 use gt_mcp_server::{DocumentsResource, DomainCtx, DomainHandler};
 use gt_module::{GtModule, McpRegistry, McpTool};
@@ -39,18 +40,23 @@ pub struct DocumentsHandler {
     /// already targets it; the row stores it for resolution).
     bucket: String,
     extractor: Extractor,
+    /// Optional semantic-search engine (hq-docs-search.2). `Some` ⇒ documents are embedded on
+    /// attach and `documents.search` uses the hybrid (text + vector) path; `None` ⇒ phase-1
+    /// full-text only.
+    embedder: Option<Arc<dyn Embedder>>,
 }
 
 impl DocumentsHandler {
-    /// Wire the per-workspace pool cache, the optional blob store + its bucket, and the
-    /// extraction pipeline.
+    /// Wire the per-workspace pool cache, the optional blob store + its bucket, the extraction
+    /// pipeline, and the optional embedding engine.
     pub fn new(
         pools: Arc<WsPools>,
         blob: Option<Arc<BlobStore>>,
         bucket: impl Into<String>,
         extractor: Extractor,
+        embedder: Option<Arc<dyn Embedder>>,
     ) -> Self {
-        Self { pools, blob, bucket: bucket.into(), extractor }
+        Self { pools, blob, bucket: bucket.into(), extractor, embedder }
     }
 
     async fn repo(&self, ws: Option<&str>) -> Result<PgDocuments, AppError> {
@@ -106,6 +112,8 @@ impl DomainHandler for DocumentsHandler {
                     )
                     .await
                     .map_err(doc_err)?;
+                // Re-embed: the body may have changed (hq-docs-search.2). Best-effort.
+                self.embed_doc(&repo, &doc).await;
                 Ok(doc_json(&doc))
             }
             "documents.remove.validate" => {
@@ -142,7 +150,17 @@ impl DomainHandler for DocumentsHandler {
                     (Some(t), Some(i)) => Some((t.as_str(), i.as_str())),
                     _ => None,
                 };
-                let docs = repo.search(&cmd.query, owner, cmd.limit).await.map_err(doc_err)?;
+                // Hybrid (text + vector) when an embedder is wired (hq-docs-search.2); else
+                // phase-1 full-text. An embed failure degrades to full-text rather than erroring.
+                let docs = match &self.embedder {
+                    Some(emb) => match emb.embed(&cmd.query).await {
+                        Ok(vec) => {
+                            repo.search_hybrid(&cmd.query, &vec, owner, cmd.limit).await.map_err(doc_err)?
+                        }
+                        Err(_) => repo.search(&cmd.query, owner, cmd.limit).await.map_err(doc_err)?,
+                    },
+                    None => repo.search(&cmd.query, owner, cmd.limit).await.map_err(doc_err)?,
+                };
                 Ok(json!({ "documents": docs.iter().map(doc_json).collect::<Vec<_>>() }))
             }
             other => Err(AppError::Validation(format!("unknown documents tool `{other}`"))),
@@ -214,7 +232,22 @@ impl DocumentsHandler {
         };
 
         let doc = repo.create(new).await.map_err(doc_err)?;
+        self.embed_doc(&repo, &doc).await;
         Ok(doc_json(&doc))
+    }
+
+    /// Best-effort: embed a document's text and store the vector (hq-docs-search.2). A missing
+    /// embedder, empty text, or an embed/store failure is silently skipped — semantic search
+    /// then just misses this row; attach/update never fail on it.
+    async fn embed_doc(&self, repo: &PgDocuments, doc: &Document) {
+        let Some(emb) = &self.embedder else { return };
+        let text = doc.body_md.as_deref().or(doc.extracted_text.as_deref()).unwrap_or("");
+        if text.trim().is_empty() {
+            return;
+        }
+        if let Ok(vec) = emb.embed(text).await {
+            let _ = repo.set_embedding(&doc.id, vec).await;
+        }
     }
 }
 

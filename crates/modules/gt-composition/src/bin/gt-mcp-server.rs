@@ -35,6 +35,7 @@ use gt_composition::mcp::{
     MergeHandler, PgDocumentsResource, PgRigPrefixes, PgWorkspaceStatus, QuotaHandler, RigHandler,
     WorkspaceHandler, WsPools,
 };
+use gt_docs_embed::Embedder;
 use gt_docs_extract::Extractor;
 use gt_store_blob::BlobStore;
 use gt_graphindex::GraphifyIndexer;
@@ -356,6 +357,7 @@ async fn build_domain_router(
         blob,
         bucket,
         Extractor::without_ocr(),
+        build_embedder(),
     )));
     eprintln!(
         "[gt-mcp-server] domain namespaces: {:?}",
@@ -372,6 +374,29 @@ async fn build_domain_router(
     // gt://doc/{id} + the documents inline on gt://issue/{id}.
     let documents: Arc<dyn DocumentsResource> = Arc::new(PgDocumentsResource::new(ws_pools));
     Ok((router, Some(rig_prefixes), Some(ws_status), Some(documents)))
+}
+
+/// Build the semantic-search embedder (hq-docs-search.2). Only the `embeddings-fastembed`
+/// build can produce one, and only when `GT_EMBEDDINGS` is set truthy (model load/download is
+/// heavy, so it is opt-in). `None` ⇒ `documents.search` stays phase-1 full-text only.
+fn build_embedder() -> Option<Arc<dyn Embedder>> {
+    #[cfg(feature = "embeddings-fastembed")]
+    {
+        let on = std::env::var("GT_EMBEDDINGS").map(|v| v != "0" && !v.is_empty()).unwrap_or(false);
+        if on {
+            match gt_docs_embed::fastembed::FastEmbedder::new() {
+                Ok(e) => {
+                    eprintln!("[gt-mcp-server] documents semantic search on (fastembed local)");
+                    return Some(Arc::new(e));
+                }
+                Err(err) => {
+                    eprintln!("[gt-mcp-server] embedder init failed — {err}; search is full-text only");
+                }
+            }
+        }
+    }
+    eprintln!("[gt-mcp-server] embeddings off; documents.search is full-text only");
+    None
 }
 
 /// Build the document blob store from `GT_BLOB_*` (hq-docs-api.2 / hq-docs-deploy.1). Returns

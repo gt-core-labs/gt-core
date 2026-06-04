@@ -54,6 +54,7 @@ members = [
     "crates/kernel/gt-store-dolt",
     "crates/kernel/gt-store-blob",
     "crates/kernel/gt-docs-extract",
+    "crates/kernel/gt-docs-embed",
     "crates/kernel/gt-rbac",
     "crates/kernel/gt-audit",
     "examples/mod-hello",
@@ -89,6 +90,9 @@ sha2 = "0.10"
 hex = "0.4"
 # base64 decode of document attach payloads (hq-docs-api.2).
 base64 = "0.22"
+# pgvector binding for the phase-2 semantic search column (hq-docs-search.2). `sqlx`
+# feature wires encode/decode of the `vector` type over the PG wire.
+pgvector = { version = "0.4", default-features = false, features = ["sqlx"] }
 
 # Storage
 sqlx = { version = "0.8", default-features = false, features = ["postgres", "macros", "runtime-tokio-rustls", "uuid", "chrono"] }
@@ -174,6 +178,7 @@ gt-store-pg      = { path = "crates/kernel/gt-store-pg" }
 gt-store-dolt    = { path = "crates/kernel/gt-store-dolt" }
 gt-store-blob    = { path = "crates/kernel/gt-store-blob" }
 gt-docs-extract  = { path = "crates/kernel/gt-docs-extract" }
+gt-docs-embed    = { path = "crates/kernel/gt-docs-embed" }
 gt-rbac          = { path = "crates/kernel/gt-rbac" }
 gt-audit         = { path = "crates/kernel/gt-audit" }
 
