@@ -130,3 +130,6 @@ zip = { version = "2", default-features = false, features = ["deflate"] }
 # Build a real PDF blob for the full-stack e2e (hq-docs-test-e2e.2) — same lopdf the reader
 # is built on, so the extractor reads it without a committed binary fixture.
 lopdf = "0.34"
+# Read each module's utoipa ApiDoc (the served REST spec) in the MCP↔HTTP parity
+# contract (hq-fe-api-spec.2): harvest its declared (method, path) set offline.
+utoipa = { workspace = true }
