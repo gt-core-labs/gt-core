@@ -76,7 +76,11 @@ impl DomainHandler for DocumentsHandler {
         // validate/execute pairs) exactly aligned with what `dispatch` below matches —
         // no drift between the schema clients see and the verbs the handler runs.
         let mut reg = McpRegistry::new();
-        DocumentsModule.register_mcp_tools(&mut reg);
+        // `DocumentsModule::default()` (not the bare value): under the `axum` feature the
+        // composition crate now enables (hq-fe-api-mount.1), the module carries an optional
+        // HTTP-state field, so it is no longer a unit struct. The default-constructed module
+        // (no HTTP state) registers the same `documents.*` tool contract.
+        DocumentsModule::default().register_mcp_tools(&mut reg);
         reg.tools().to_vec()
     }
 

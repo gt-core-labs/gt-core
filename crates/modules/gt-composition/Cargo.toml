@@ -19,10 +19,14 @@ gt-scheduling = { workspace = true }
 gt-merge = { workspace = true }
 # convoy.* dispatch (hq-mcp-dispatch.6): event-sourced ConvoyBoard.
 gt-orchestration = { workspace = true }
-# agent.* dispatch (hq-mcp-dispatch.7): event-sourced SessionRegistry.
-gt-agent = { workspace = true }
-# quota.* dispatch (hq-mcp-dispatch.4): event-sourced AccountRegistry.
-gt-quota = { workspace = true }
+# agent.* dispatch (hq-mcp-dispatch.7): event-sourced SessionRegistry. `axum` adds the
+# REST surface (AgentApiState over the event-log root) the bin mounts at /api/v1/agent
+# (hq-fe-api-mount.1).
+gt-agent = { workspace = true, features = ["axum"] }
+# quota.* dispatch (hq-mcp-dispatch.4): event-sourced AccountRegistry. `axum` adds the
+# REST surface + the WorkspaceQuota port the composition EventLog provider backs
+# (hq-fe-api-mount.1).
+gt-quota = { workspace = true, features = ["axum"] }
 # Per-workspace consumed-token counter (hq-mt-deploy.8): bump
 # gt_workspace_quota_consumed on each quota.sample.
 gt-telemetry = { workspace = true }
@@ -46,8 +50,10 @@ gt-workspace = { workspace = true, features = ["pg", "axum"] }
 # `jsonwebtoken` feature pulls the concrete RS256 verifier (JwtAuthenticator::from_env)
 # the gt-mcp-server bin mounts in front of the REST surface (hq-auth-routes.2).
 gt-auth = { workspace = true, features = ["jsonwebtoken"] }
-# rig.* dispatch (hq-mcp-dispatch.3): PgRigs over a per-workspace schema pool.
-gt-rig = { workspace = true, features = ["pg"] }
+# rig.* dispatch (hq-mcp-dispatch.3): PgRigs over a per-workspace schema pool. `axum`
+# adds the REST surface + the WorkspaceRigs port the composition WsPools provider backs
+# (hq-fe-api-mount.1).
+gt-rig = { workspace = true, features = ["pg", "axum"] }
 # graph.* read-only dispatch (hq-graphrig.10): GraphIndexer port (+ graphify adapter for
 # the live server) and the warden state replayed to resolve rig -> repo_dir.
 gt-graphindex = { workspace = true, features = ["graphify"] }
@@ -57,7 +63,7 @@ gt-store-pg = { workspace = true, features = ["pg"] }
 # Document subsystem dispatch (hq-docs-api.2): the GtModule contract (gt-documents),
 # the per-workspace DocumentsRepository (gt-store-pg `pg`), the blob store, and the
 # text extractor. base64 decodes attach payloads; ulid mints doc ids; sha2 dedups.
-gt-documents = { workspace = true }
+gt-documents = { workspace = true, features = ["axum"] }
 gt-store-blob = { workspace = true }
 gt-docs-extract = { workspace = true }
 gt-docs-embed = { workspace = true }

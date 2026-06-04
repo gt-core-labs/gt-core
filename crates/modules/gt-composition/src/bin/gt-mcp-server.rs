@@ -31,9 +31,9 @@ use rmcp::transport::{StreamableHttpServerConfig, StreamableHttpService};
 
 use gt_audit::{AuditSink, InMemoryAudit};
 use gt_composition::mcp::{
-    AgentHandler, AuditHandler, ConvoyHandler, DocumentsHandler, EventLog, GraphHandler,
-    MergeHandler, PgDocumentsResource, PgRigPrefixes, PgWorkspaceStatus, QuotaHandler, RigHandler,
-    WorkspaceHandler, WsPools,
+    AgentHandler, AuditHandler, ConvoyHandler, DocumentsHandler, EventLog, EventLogQuota,
+    GraphHandler, MergeHandler, PgDocumentsResource, PgRigPrefixes, PgWorkspaceStatus,
+    QuotaHandler, RigHandler, WorkspaceHandler, WsPoolRigs, WsPools,
 };
 use gt_docs_embed::Embedder;
 use gt_docs_extract::Extractor;
@@ -44,6 +44,11 @@ use gt_composition::denial_audit::audit_denials;
 use gt_composition::scope_bridge::bridge_scopes;
 use gt_composition::stream::{feed_router, FeedState};
 use gt_auth::JwtAuthenticator;
+// Domain REST modules + their `with_http` state (hq-fe-api-mount.1): the bin mounts each
+// crate's `register_routes` so the FE reaches every namespace over authenticated HTTP.
+use gt_agent::{AgentApiState, AgentModule};
+use gt_documents::{DocumentsApiState, DocumentsModule};
+use gt_eventlog::DEFAULT_EVENTLOG_ROOT;
 use gt_issues::{IssuesApiState, IssuesModule};
 use gt_mcp_server::{
     health, DocumentsResource, DomainRouter, HealthState, IssuesServer, PgAuditSink,
@@ -51,6 +56,9 @@ use gt_mcp_server::{
 };
 use gt_meta::MetaModule;
 use gt_module::RootBuilder;
+use gt_quota::{QuotaApiState, QuotaModule};
+use gt_rig::{RigApiState, RigsModule};
+use gt_workspace::{PgWorkspaces, WorkspaceApiState, WorkspaceModule};
 use gt_rbac::{RbacConfig, Scope};
 use gt_store_dolt::DoltIssues;
 
@@ -243,7 +251,61 @@ async fn main() -> anyhow::Result<()> {
     // Env-gated on the RS256 verifier (GT_JWT_RS256_KEYS / GT_JWT_RS256_PUBLIC_KEY_FILE): a
     // deploy that configures no public key serves no REST surface (MCP + ops only), exactly as
     // before — enabling it is an opt-in env, not a behaviour change.
-    let module_routes = root.into_router();
+    //
+    // Domain REST surface (hq-fe-api-mount.1): mount the domain crates' `register_routes`
+    // (workspace/rig/documents/agent/quota) so the frontend reaches those namespaces over the
+    // same authenticated HTTP path as issues — dispatching the identical domain commands the MCP
+    // `DomainRouter` serves. Built from a SEPARATE `RootBuilder` than `root`: each domain module
+    // re-registers its MCP tools (RigsHttpModule delegates to RigsModule, &c.), and the server's
+    // `with_domains` already folded those namespaces into `tools/list`; harvesting this builder's
+    // tools too would double-list every domain tool. So this builder feeds ONLY `into_router()` —
+    // its `mcp_tools()` is never read.
+    //
+    // The event-log-backed modules (agent, quota) mount whenever the REST surface is on; the
+    // PG-backed ones (workspace, rig, documents) mount only with GT_PG_URL, mirroring
+    // `build_domain_router`'s gating — without Postgres they have no backing. The REST backings
+    // are independent handles (their own pool / pool-cache / event-log provider) over the same
+    // stores, so the MCP dispatch wired above is untouched.
+    let agent_root = std::env::var("GT_EVENTLOG_ROOT")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|_| std::path::PathBuf::from(DEFAULT_EVENTLOG_ROOT));
+    let mut rest = RootBuilder::new()
+        .module(AgentModule::with_http(AgentApiState::new(agent_root)))
+        .module(QuotaModule::with_http(QuotaApiState::new(Arc::new(EventLogQuota::new(
+            event_log.clone(),
+        )))));
+    if let Ok(pg_url) = std::env::var("GT_PG_URL") {
+        let pool = sqlx::PgPool::connect(&pg_url)
+            .await
+            .context("GT_PG_URL must point at a reachable Postgres (REST backings)")?;
+        rest = rest
+            .module(WorkspaceModule::with_http(WorkspaceApiState::new(Arc::new(
+                PgWorkspaces::new(pool),
+            ))))
+            .module(RigsModule::with_http(RigApiState::new(Arc::new(WsPoolRigs::new(Arc::new(
+                WsPools::new(pg_url.clone()),
+            ))))));
+        let (blob, bucket) = build_blob_store();
+        rest = rest.module(DocumentsModule::with_http(DocumentsApiState::new(
+            pg_url,
+            blob,
+            bucket,
+            Extractor::without_ocr(),
+            build_embedder(),
+        )));
+        eprintln!(
+            "[gt-mcp-server] REST domain modules: workspace + rig + documents + agent + quota"
+        );
+    } else {
+        eprintln!(
+            "[gt-mcp-server] REST domain modules: agent + quota (GT_PG_URL unset → no workspace/rig/documents)"
+        );
+    }
+    let domain_rest_router = rest
+        .build()
+        .map_err(|e| anyhow::anyhow!("REST module build failed: {e:?}"))?
+        .into_router();
+    let module_routes = root.into_router().merge(domain_rest_router);
     let app = match JwtAuthenticator::from_env() {
         Ok(verifier) => {
             let verifier: SharedAuthenticator = Arc::new(verifier);
