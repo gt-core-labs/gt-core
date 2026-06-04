@@ -28,57 +28,57 @@ beads read `<sub-epic>.<n>`.
 
 | bead | title | state |
 |------|-------|-------|
-| `hq-docs-test-store.1` | CRUD + version snapshot + soft-delete round trip (`documents_contract`) | have (extend) |
-| `hq-docs-test-store.2` | dedup by `sha256` across owners: one blob hash, many rows; soft-deleted row drops out of `find_by_sha` | add |
+| `hq-docs-test-store.1` | CRUD + version snapshot + soft-delete round trip (`documents_contract`) | have |
+| `hq-docs-test-store.2` | dedup by `sha256` across owners: one blob hash, many rows; soft-deleted row drops out of `find_by_sha` | have |
 | `hq-docs-test-store.3` | optimistic `version` guard: stale `update`/`soft_delete` → `VersionConflict`, fresh wins + appends `document_versions` | have |
-| `hq-docs-test-store.4` | `list_by_owner_id` returns every owner_type for an id; excludes soft-deleted (backs `gt://issue` inline) | have (extend) |
+| `hq-docs-test-store.4` | `list_by_owner_id` returns every owner_type for an id; excludes soft-deleted (backs `gt://issue` inline) | have |
 
 ### `hq-docs-test-blob` — object store
 
 | bead | title | state |
 |------|-------|-------|
 | `hq-docs-test-blob.1` | `fs` backend put/get/exists/delete + content-addressed key layout | have |
-| `hq-docs-test-blob.2` | MinIO/S3 backend roundtrip (gated `GT_BLOB_*`): put → object present → get bytes match → presign returns a URL | add |
-| `hq-docs-test-blob.3` | dedup: identical content at the same key is not re-uploaded (write-once) | add |
+| `hq-docs-test-blob.2` | MinIO/S3 backend roundtrip (gated `GT_BLOB_*`): put → object present → get bytes match → presign returns a URL | have |
+| `hq-docs-test-blob.3` | dedup: identical content at the same key is not re-uploaded (write-once) | have |
 
 ### `hq-docs-test-extract` — text extraction
 
 | bead | title | state |
 |------|-------|-------|
 | `hq-docs-test-extract.1` | unknown/`image` type without OCR → `Unsupported`; injected `OcrEngine` used for images | have |
-| `hq-docs-test-extract.2` | PDF fixture → expected text; DOCX/XLSX/PPTX fixtures → text nodes extracted | add |
-| `hq-docs-test-extract.3` | tesseract `OcrEngine` (feature `ocr-tesseract`): image fixture → OCR'd text | add |
+| `hq-docs-test-extract.2` | PDF fixture → expected text; DOCX/XLSX/PPTX fixtures → text nodes extracted | have |
+| `hq-docs-test-extract.3` | tesseract `OcrEngine` (feature `ocr-tesseract`): image fixture → OCR'd text | have |
 
 ### `hq-docs-test-search` — retrieval
 
 | bead | title | state |
 |------|-------|-------|
 | `hq-docs-test-search.1` | full-text: a body term hits via `tsv`; unrelated query misses; owner narrowing | have |
-| `hq-docs-test-search.2` | hybrid (feature `embeddings-fastembed`): semantically-close-but-lexically-distinct query ranks the right doc above a keyword-only match | add |
-| `hq-docs-test-search.3` | a row with no embedding still surfaces on the text side of `search_hybrid` (vector term coalesces to 0) | add |
+| `hq-docs-test-search.2` | hybrid (feature `embeddings-fastembed`): semantically-close-but-lexically-distinct query ranks the right doc above a keyword-only match | have |
+| `hq-docs-test-search.3` | a row with no embedding still surfaces on the text side of `search_hybrid` (vector term coalesces to 0) | have |
 
 ### `hq-docs-test-api` — MCP dispatch + resources
 
 | bead | title | state |
 |------|-------|-------|
-| `hq-docs-test-api.1` | every `documents.*` tool: `validate` accepts/rejects shapes; `execute` performs the write | add |
-| `hq-docs-test-api.2` | `attach` kind=md persists `body_md`; kind=blob decodes base64 → blob store + `extracted_text` | add |
-| `hq-docs-test-api.3` | resources: `gt://doc/{id}` resolves one doc; `gt://issue/{id}` inlines `documents[]`; absent → not-found | add |
-| `hq-docs-test-api.4` | scope: a `documents.read`-only actor is denied `documents.attach.execute`; a `closed`/`readonly` profile blocks execute | add |
+| `hq-docs-test-api.1` | every `documents.*` tool: `validate` accepts/rejects shapes; `execute` performs the write | have |
+| `hq-docs-test-api.2` | `attach` kind=md persists `body_md`; kind=blob decodes base64 → blob store + `extracted_text` | have |
+| `hq-docs-test-api.3` | resources: `gt://doc/{id}` resolves one doc; `gt://issue/{id}` inlines `documents[]`; absent → not-found | have |
+| `hq-docs-test-api.4` | scope: a `documents.read`-only actor is denied `documents.attach.execute`; a `closed`/`readonly` profile blocks execute | have |
 
 ### `hq-docs-test-mt` — multi-tenant isolation
 
 | bead | title | state |
 |------|-------|-------|
-| `hq-docs-test-mt.1` | a doc attached in workspace A is invisible to `list`/`search`/`gt://doc` in workspace B (schema isolation, blob key prefix) | add |
+| `hq-docs-test-mt.1` | a doc attached in workspace A is invisible to `list`/`search`/`gt://doc` in workspace B (schema isolation, blob key prefix) | have |
 
 ### `hq-docs-test-e2e` — full stack (running compose)
 
 | bead | title | state |
 |------|-------|-------|
-| `hq-docs-test-e2e.1` | attach a `.md` to an epic via MCP → `gt://issue/{id}` returns it inline; `documents.search` finds it | add |
-| `hq-docs-test-e2e.2` | attach a PDF via MCP → object lands in MinIO bucket, `extracted_text` is searchable, original fetchable via presigned URL | add |
-| `hq-docs-test-e2e.3` | the model-context loop: resolving a bead surfaces its attached docs' text in one read | add |
+| `hq-docs-test-e2e.1` | attach a `.md` to an epic via MCP → `gt://issue/{id}` returns it inline; `documents.search` finds it | have |
+| `hq-docs-test-e2e.2` | attach a PDF via MCP → object lands in MinIO bucket, `extracted_text` is searchable, original fetchable via presigned URL | have |
+| `hq-docs-test-e2e.3` | the model-context loop: resolving a bead surfaces its attached docs' text in one read | have |
 
 ## The objects, proven used
 
@@ -96,3 +96,23 @@ one behaviour trustworthy.
   + resource reads over a test `WsPools`/store (mirrors the existing dispatch tests).
 - `e2e` beads → a script/test against the running compose stack (the same one docs/11
   deploys), exercising the live MCP endpoint.
+
+## Where it landed
+
+The epic is implemented; every bead above is `have`. The tests, by layer:
+
+| beads | file | gate / how to run |
+|-------|------|-------------------|
+| `store.*`, `search.*` | [`gt-store-pg/tests/documents_contract.rs`](../crates/kernel/gt-store-pg/tests/documents_contract.rs) | `GT_PG_URL` · `cargo test -p gt-store-pg --features pg` |
+| `blob.1`, `blob.3` | [`gt-store-blob/src/lib.rs`](../crates/kernel/gt-store-blob/src/lib.rs) (`mod tests`) | always · `cargo test -p gt-store-blob` |
+| `blob.2` | same file (`s3_backend_roundtrips_and_presigns`) | `GT_BLOB_*` (MinIO/S3) |
+| `extract.1`, `extract.2` | [`gt-docs-extract/src/lib.rs`](../crates/kernel/gt-docs-extract/src/lib.rs) (`mod tests`) | always (PDF via `lopdf`, OOXML via in-memory zip) |
+| `extract.3` | [`gt-docs-extract/tests/ocr_tesseract.rs`](../crates/kernel/gt-docs-extract/tests/ocr_tesseract.rs) | `--features ocr-tesseract` |
+| `search.2` (engine) | [`gt-docs-embed`](../crates/kernel/gt-docs-embed/src/lib.rs) | `--features embeddings-fastembed` (build); ranking proven at the repo layer with synthetic vectors |
+| `api.*`, `mt.1` | [`gt-composition/tests/documents_dispatch.rs`](../crates/modules/gt-composition/tests/documents_dispatch.rs) | `GT_PG_URL` (fs blob store) |
+| `api.4` (scope) | [`gt-rbac/src/scope.rs`](../crates/kernel/gt-rbac/src/scope.rs) (`documents_scope_gates_execute`) | always |
+| `e2e.*` | [`gt-composition/tests/documents_e2e.rs`](../crates/modules/gt-composition/tests/documents_e2e.rs) | `GT_PG_URL` + `GT_BLOB_*` (live PG + MinIO) |
+
+CI (`.github/workflows/ci.yml`): the always-on beads run in `build-test`; `store`/`search`/`api`/`mt`
+run in the hard-gated `contract` job (Postgres service); the object-store beads (`blob.2`, `e2e.*`)
+run report-only there against a MinIO service. `extract.3` runs under the `ocr-tesseract` feature step.

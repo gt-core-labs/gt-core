@@ -291,6 +291,45 @@ validate_only = true
         assert!(cfg.resolve("anyone").check("agent.add.validate").is_err());
     }
 
+    /// hq-docs-test-api.4 — a read-only documents actor (allowed only the read verbs) may
+    /// list/search but is denied `documents.attach.execute`; the bundled `readonly` and
+    /// `closed` profiles block every documents execute.
+    #[test]
+    fn documents_scope_gates_execute() {
+        // Allow-list read-only: the list/search verbs only, no attach/update/remove.
+        let reader = Scope {
+            actor: "doc-reader".into(),
+            allow: allow(&["documents.list.*", "documents.search.*"]),
+            validate_only: false,
+        };
+        reader.check("documents.list.execute").unwrap();
+        reader.check("documents.search.execute").unwrap();
+        assert!(
+            reader.check("documents.attach.execute").is_err(),
+            "a read-only documents actor cannot attach"
+        );
+        assert!(reader.check("documents.remove.execute").is_err(), "nor remove");
+
+        // The `readonly` profile (validate_only) blocks every execute, including documents.
+        let ro = RbacConfig::from_profile("readonly").unwrap().expect("readonly profile");
+        let ro_scope = ro.resolve("mcp-local");
+        ro_scope.check("documents.attach.validate").unwrap();
+        assert!(
+            ro_scope.check("documents.attach.execute").is_err(),
+            "readonly profile is validate_only — execute denied"
+        );
+
+        // The `closed` profile grants nothing, so even validate is denied.
+        let closed = RbacConfig::from_profile("closed").unwrap().expect("closed profile");
+        let closed_scope = closed.resolve("mcp-local");
+        assert!(closed_scope.check("documents.attach.validate").is_err(), "closed denies all");
+        assert!(closed_scope.check("documents.list.execute").is_err(), "closed denies reads too");
+
+        // The `dev` profile (full local access) permits the documents execute path.
+        let dev = RbacConfig::from_profile("dev").unwrap().expect("dev profile");
+        dev.resolve("mcp-local").check("documents.attach.execute").unwrap();
+    }
+
     #[test]
     fn unified_config_with_roles_block_still_resolves_mcp_scope() {
         let cfg = RbacConfig::from_toml(

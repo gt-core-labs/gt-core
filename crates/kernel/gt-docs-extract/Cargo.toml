@@ -32,3 +32,8 @@ ocr-tesseract = ["dep:leptess"]
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+# Build a real PDF fixture in-test (hq-docs-test-extract.2) so the extractor runs against a
+# genuine PDF, not a committed binary. Same lopdf the pdf-extract reader uses, so no version skew.
+lopdf = "0.34"
+# Encode a real PNG fixture for the gated tesseract OCR test (hq-docs-test-extract.3).
+image = { version = "0.25", default-features = false, features = ["png"] }

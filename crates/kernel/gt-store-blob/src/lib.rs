@@ -182,4 +182,78 @@ mod tests {
         let err = store.presign_read("k", Duration::from_secs(60)).await.unwrap_err();
         assert!(matches!(err, BlobError::PresignUnsupported));
     }
+
+    /// hq-docs-test-blob.3 — content-addressed dedup: at a content-addressed key the
+    /// `exists` probe gates the upload, so identical content is written once (write-once),
+    /// and a second attempt is a no-op that leaves the stored bytes intact.
+    #[tokio::test]
+    async fn identical_content_is_not_re_uploaded() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = BlobStore::from_fs(dir.path().to_str().unwrap()).unwrap();
+
+        let bytes = b"the exact same blob bytes".to_vec();
+        let sha = sha256_hex(&bytes);
+        // The key carries the content hash — identical content resolves to the same key.
+        let key = BlobStore::key_for("acme", "epic", "hq-docs", &sha, "design.pdf");
+
+        // The dedup guard the document handler runs: upload only when the object is absent.
+        async fn put_if_absent(store: &BlobStore, key: &str, bytes: Vec<u8>) -> bool {
+            if store.exists(key).await.unwrap() {
+                return false; // already present — skip the upload
+            }
+            store.put(key, bytes, Some("application/pdf")).await.unwrap();
+            true
+        }
+
+        assert!(put_if_absent(&store, &key, bytes.clone()).await, "first put uploads");
+        assert!(
+            !put_if_absent(&store, &key, bytes.clone()).await,
+            "identical content at the same key is not re-uploaded (write-once)"
+        );
+        assert_eq!(store.get(&key).await.unwrap(), bytes, "stored bytes unchanged after the no-op");
+    }
+
+    /// hq-docs-test-blob.2 — MinIO/S3 backend roundtrip. Gated on `GT_BLOB_*` (a running
+    /// object store): put → object present → get bytes match → presign returns a URL.
+    /// No-op without the env, mirroring the `GT_PG_URL` contract gating.
+    #[tokio::test]
+    async fn s3_backend_roundtrips_and_presigns() {
+        let (Ok(endpoint), Ok(bucket)) =
+            (std::env::var("GT_BLOB_ENDPOINT"), std::env::var("GT_BLOB_BUCKET"))
+        else {
+            eprintln!("GT_BLOB_ENDPOINT/GT_BLOB_BUCKET unset; skipping S3 roundtrip test");
+            return;
+        };
+        let region = std::env::var("GT_BLOB_REGION").unwrap_or_else(|_| "us-east-1".into());
+        let access = std::env::var("GT_BLOB_ACCESS_KEY").unwrap_or_default();
+        let secret = std::env::var("GT_BLOB_SECRET_KEY").unwrap_or_default();
+
+        let store = BlobStore::from_s3(&endpoint, &bucket, &region, &access, &secret)
+            .expect("build S3 store");
+
+        let bytes = format!("blob-{}", nonce_secs()).into_bytes();
+        let sha = sha256_hex(&bytes);
+        let key = BlobStore::key_for("default", "epic", "hq-docs", &sha, "roundtrip.bin");
+
+        store.put(&key, bytes.clone(), Some("application/octet-stream")).await.expect("put");
+        assert!(store.exists(&key).await.expect("exists"), "object present after put");
+        assert_eq!(store.get(&key).await.expect("get"), bytes, "fetched bytes match");
+
+        let url = store
+            .presign_read(&key, Duration::from_secs(60))
+            .await
+            .expect("S3 backend mints a presigned URL");
+        assert!(url.starts_with("http"), "presign returns an http(s) URL, got {url:?}");
+
+        store.delete(&key).await.expect("cleanup");
+    }
+
+    /// A coarse unique suffix for S3 object keys (seconds-since-epoch); avoids pulling a
+    /// time/uuid dependency just for the gated roundtrip key.
+    fn nonce_secs() -> u64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+    }
 }

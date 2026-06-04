@@ -109,3 +109,9 @@ http-body-util = "0.1"
 # Per-run throwaway Dolt database creation for the resources contract test
 # (hq-mcp-test.3) — CREATE DATABASE before DoltIssues::connect.
 mysql_async = { workspace = true }
+# Build a real OOXML (docx) blob in-test so the documents.attach blob path exercises
+# genuine text extraction (hq-docs-test-api.2), no committed binary fixture.
+zip = { version = "2", default-features = false, features = ["deflate"] }
+# Build a real PDF blob for the full-stack e2e (hq-docs-test-e2e.2) — same lopdf the reader
+# is built on, so the extractor reads it without a committed binary fixture.
+lopdf = "0.34"
