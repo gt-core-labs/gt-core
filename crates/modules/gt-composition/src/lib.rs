@@ -31,6 +31,7 @@
 pub mod auth;
 pub mod mcp;
 pub mod polecat;
+pub mod scope_bridge;
 pub mod stream;
 
 use std::collections::HashMap;
