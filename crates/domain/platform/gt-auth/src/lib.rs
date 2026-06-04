@@ -60,12 +60,18 @@ pub mod password;
 #[cfg(feature = "jsonwebtoken")]
 mod jwt;
 
+#[cfg(feature = "jsonwebtoken")]
+mod mint;
+
 pub use error::AuthError;
 pub use provider::{Credentials, IdentityProvider, ProviderKind, VerifiedIdentity};
 pub use verify::{Authenticator, InMemoryAuthenticator};
 
 #[cfg(feature = "jsonwebtoken")]
 pub use jwt::JwtAuthenticator;
+
+#[cfg(feature = "jsonwebtoken")]
+pub use mint::JwtMinter;
 
 #[cfg(test)]
 pub use provider::InMemoryIdentityProvider;
