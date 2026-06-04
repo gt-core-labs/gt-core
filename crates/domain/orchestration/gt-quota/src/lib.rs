@@ -17,6 +17,11 @@
 pub mod actor;
 pub mod commands;
 pub mod expectations;
+/// The off-by-default `axum` REST adapter (`hq-fe-api-orch.4`): the orchestration sibling of the
+/// issues/rig HTTP surfaces, mapping `quota.*` to REST routes that reuse the same commands as the
+/// MCP tools.
+#[cfg(feature = "axum")]
+pub mod http;
 pub mod keychain;
 pub mod module;
 pub mod probe;
@@ -31,7 +36,11 @@ pub use commands::{ProbeWindow, QuotaCommand, RotateAccount, SampleTokens};
 pub use cost::{cost_units, Cost, ModelWeights};
 pub use events::QuotaEvent;
 pub use expectations::{predict, Prediction};
+#[cfg(feature = "axum")]
+pub use http::{quota_router, ApiDoc, QuotaApiState, WorkspaceQuota};
 pub use keychain::{CredentialRecord, InMemoryKeychain, Keychain};
+#[cfg(feature = "axum")]
+pub use module::QuotaHttpModule;
 pub use module::QuotaModule;
 pub use probe::{parse_anthropic_ratelimit, RatelimitHeaders};
 pub use repo::{InMemoryQuota, QuotaRepository, UsageSample};

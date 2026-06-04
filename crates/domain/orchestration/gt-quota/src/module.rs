@@ -17,8 +17,16 @@
 //! - **Migrations** ([`GtModule::migrations`]) — the `accounts` + `token_usage` tables backing
 //!   [`QuotaRepository`](crate::QuotaRepository).
 //!
-//! It does **not** override `register_routes`/`openapi`: quota is managed over MCP only, so
-//! the empty-router default stands.
+//! - **HTTP routes + OpenAPI** (on the sibling [`QuotaHttpModule`]) — under the off-by-default
+//!   `axum` feature (`hq-fe-api-orch.4`), the orchestration sibling of the issues/rig HTTP
+//!   surfaces: the `quota.*` REST routes ([`crate::http`]) the builder mounts at `/api/v1/quota`
+//!   behind the capability-derived scope guard, plus their utoipa spec. [`QuotaModule::with_http`]
+//!   builds the HTTP-enabled variant (carrying the per-workspace event-log provider); the plain
+//!   [`QuotaModule`] keeps the empty-router / no-spec defaults (MCP-only). Quota is event-sourced
+//!   and per-tenant, so unlike a single-store surface the state is a
+//!   [`WorkspaceQuota`](crate::WorkspaceQuota) provider that replays the caller's own log per
+//!   request, resolving the tenant from the auth context, never the path. `QuotaModule` stays a
+//!   unit struct so existing `QuotaModule.migrations()` call sites are untouched.
 //!
 //! ## Faithful-wrap notes (no logic change)
 //!
@@ -54,6 +62,64 @@ impl QuotaModule {
     /// and scope namespaces. The literal is a known-valid slug.
     pub fn id() -> ModuleId {
         ModuleId::new("quota").expect("`quota` is a valid module id")
+    }
+
+    /// Build the HTTP-enabled quota module (`hq-fe-api-orch.4`), baking `state` (the per-workspace
+    /// event-log provider) into the router its [`register_routes`](GtModule::register_routes)
+    /// returns. The binary calls this to opt the module into its REST surface; the MCP harvest
+    /// path keeps the plain unit [`QuotaModule`]. Returns a [`QuotaHttpModule`] rather than
+    /// mutating `QuotaModule` so the unit struct (and its `QuotaModule.migrations()` call sites)
+    /// is left untouched.
+    #[cfg(feature = "axum")]
+    pub fn with_http(state: crate::http::QuotaApiState) -> QuotaHttpModule {
+        QuotaHttpModule { http: state }
+    }
+}
+
+/// The HTTP-enabled quota module (`hq-fe-api-orch.4`): the same `GtModule` contract as
+/// [`QuotaModule`] plus the `quota.*` REST routes + OpenAPI spec.
+///
+/// Built by [`QuotaModule::with_http`]. Identity, capability, MCP tools, and migrations are
+/// delegated verbatim to [`QuotaModule`] (one source of truth for the quota contract); only
+/// [`register_routes`](GtModule::register_routes) and [`openapi`](GtModule::openapi) are
+/// overridden, carrying the per-workspace [`WorkspaceQuota`](crate::WorkspaceQuota) provider the
+/// handlers dispatch through.
+#[cfg(feature = "axum")]
+#[derive(Clone)]
+pub struct QuotaHttpModule {
+    /// The per-workspace REST state the routes dispatch through.
+    http: crate::http::QuotaApiState,
+}
+
+#[cfg(feature = "axum")]
+impl GtModule for QuotaHttpModule {
+    fn meta(&self) -> ModuleMeta {
+        QuotaModule.meta()
+    }
+
+    fn capability(&self) -> Capability {
+        QuotaModule.capability()
+    }
+
+    fn register_mcp_tools(&self, registry: &mut McpRegistry) {
+        QuotaModule.register_mcp_tools(registry);
+    }
+
+    fn migrations(&self) -> Vec<Migration> {
+        QuotaModule.migrations()
+    }
+
+    /// The quota REST routes (`hq-fe-api-orch.4`), relative — the builder nests them under
+    /// `/api/v1/quota` and applies the `quota.read`/`quota.write` scope guard.
+    fn register_routes(&self) -> axum::Router {
+        crate::http::quota_router(self.http.clone())
+    }
+
+    /// The OpenAPI spec for the quota REST routes, so the combined document documents exactly the
+    /// routes mounted under the HTTP-enabled module.
+    fn openapi(&self) -> Option<utoipa::openapi::OpenApi> {
+        use utoipa::OpenApi;
+        Some(crate::http::ApiDoc::openapi())
     }
 }
 
@@ -229,5 +295,40 @@ mod tests {
     #[test]
     fn contributes_no_openapi_surface() {
         assert!(QuotaModule.openapi().is_none());
+    }
+
+    /// The HTTP-enabled variant ships routes + an OpenAPI spec while delegating the rest of the
+    /// `GtModule` contract verbatim to the unit struct (the router itself is exercised by the
+    /// http module's own tests + the contract test; here we assert the trait wiring flips on and
+    /// the delegated identity/capability/tools/migrations are unchanged).
+    #[cfg(feature = "axum")]
+    #[test]
+    fn with_http_contributes_routes_and_delegates_contract() {
+        use crate::http::{QuotaApiState, WorkspaceQuota};
+        use crate::{AccountRegistry, QuotaEvent};
+        use std::sync::Arc;
+
+        // A never-used provider is fine: `openapi()`/`meta()` read no state, and
+        // `register_routes` only clones the state into the router without dispatching.
+        struct NoopLog;
+        #[async_trait::async_trait]
+        impl WorkspaceQuota for NoopLog {
+            async fn registry(&self, _ws: &str) -> Result<AccountRegistry, gt_events::AppError> {
+                Ok(AccountRegistry::default())
+            }
+            async fn append(&self, _ws: &str, _ev: QuotaEvent) -> Result<(), gt_events::AppError> {
+                Ok(())
+            }
+        }
+
+        let m = QuotaModule::with_http(QuotaApiState::new(Arc::new(NoopLog)));
+        assert!(m.openapi().is_some(), "HTTP variant ships an OpenAPI spec");
+        // Delegated verbatim to the unit struct.
+        assert_eq!(m.meta().id, QuotaModule.meta().id);
+        assert_eq!(
+            m.capability().scopes().len(),
+            QuotaModule.capability().scopes().len(),
+        );
+        assert_eq!(m.migrations().len(), QuotaModule.migrations().len());
     }
 }

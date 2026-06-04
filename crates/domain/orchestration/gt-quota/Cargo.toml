@@ -16,6 +16,23 @@ serde.workspace = true
 time = { workspace = true, features = ["parsing"] }
 # JSON Schema derives for Command arguments — surfaced by gt-mcp.
 schemars.workspace = true
+# Off-by-default `axum` REST adapter (hq-fe-api-orch.4): the orchestration sibling of the
+# issues/rig HTTP surfaces — `register_routes` maps `quota.*` to REST routes the builder mounts
+# at `/api/v1/quota` behind the auth+scope guard, with a utoipa OpenAPI spec. Folds into this
+# crate behind the `axum` feature (docs/03 Rule 4), exactly as gt-issues/gt-rig/gt-workspace gate
+# their axum adapters — never a sibling crate. `gt-workspace` brings the `WorkspaceContext`
+# extractor (the per-tenant event log is resolved from the auth context, never the path).
+axum = { workspace = true, optional = true }
+utoipa = { workspace = true, optional = true }
+async-trait = { workspace = true, optional = true }
+serde_json = { workspace = true, optional = true }
+gt-workspace = { workspace = true, optional = true, features = ["axum"] }
+
+[features]
+# Compile the axum REST adapter + OpenAPI spec (`http.rs`) and the route/spec overrides exposed
+# via `QuotaModule::with_http`. Off by default — the MCP-only build pulls no HTTP stack; the
+# composition bin enables it to expose the REST surface.
+axum = ["dep:axum", "dep:utoipa", "dep:async-trait", "dep:serde_json", "dep:gt-workspace"]
 
 # Linux-only: platform keychain via Secret Service / kwallet / fallback file. Pulled in
 # behind `cfg(target_os = "linux")` so non-Linux builds skip it. `linux-native` uses
@@ -27,3 +44,9 @@ keyring = { version = "3", default-features = false, features = ["linux-native"]
 # The event-log store (replay test harness), ported from gastown's gt-audit (port.8).
 gt-eventlog = { workspace = true }
 serde_json.workspace = true
+# Exercise the REST router in-process (hq-fe-api-orch.4): `oneshot` a request and read the
+# response without a live socket. Run with `--features axum` so the adapter + these helpers
+# compile for the contract test.
+axum = { workspace = true }
+tower = { workspace = true, features = ["util"] }
+async-trait = { workspace = true }

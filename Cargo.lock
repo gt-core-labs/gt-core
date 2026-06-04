@@ -1926,9 +1926,12 @@ dependencies = [
 name = "gt-quota"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
+ "axum",
  "gt-eventlog",
  "gt-events",
  "gt-module",
+ "gt-workspace",
  "keyring",
  "schemars 0.8.22",
  "semver",
@@ -1936,6 +1939,8 @@ dependencies = [
  "serde_json",
  "time",
  "tokio",
+ "tower",
+ "utoipa",
 ]
 
 [[package]]
