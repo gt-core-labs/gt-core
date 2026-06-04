@@ -1585,12 +1585,23 @@ dependencies = [
 name = "gt-documents"
 version = "0.1.0"
 dependencies = [
+ "axum",
+ "base64 0.22.1",
+ "gt-docs-embed",
+ "gt-docs-extract",
  "gt-module",
  "gt-module-mcp",
+ "gt-store-blob",
+ "gt-store-pg",
  "schemars 0.8.22",
  "semver",
  "serde",
  "serde_json",
+ "sqlx",
+ "tokio",
+ "tower",
+ "ulid",
+ "utoipa",
 ]
 
 [[package]]

@@ -13,7 +13,13 @@
 #![warn(missing_docs)]
 
 pub mod commands;
+/// The off-by-default `axum` REST adapter (`hq-fe-api-platform.3`): the `documents.*` HTTP
+/// surface, mapping the tools to REST routes that reuse the same stores as the MCP dispatch.
+#[cfg(feature = "axum")]
+pub mod http;
 mod module;
 
 pub use commands::{AttachDoc, ListDocs, RemoveDoc, SearchDocs, UpdateDoc, ValidationError};
+#[cfg(feature = "axum")]
+pub use http::{documents_router, ApiDoc, DocumentsApiState};
 pub use module::DocumentsModule;
