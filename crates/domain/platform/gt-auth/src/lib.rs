@@ -43,7 +43,11 @@
 //! password is the default** ([`ProviderKind::default`]), with `OAuth`/`Oidc` shape-reserved
 //! (their adapters return [`AuthError::UnsupportedProvider`] until implemented). The real
 //! email+password adapter ([`password::PasswordProvider`], argon2 PHC hashing) lives behind
-//! the off-by-default `password-hash` feature; tests use the in-memory double.
+//! the off-by-default `password-hash` feature; tests use the in-memory double. The
+//! store-backed counterpart, [`PgUsers`] (`hq-auth-mint.2`, off-by-default `pg` feature),
+//! looks the user up in the per-workspace `users` table and reuses that same argon2 check —
+//! its async I/O makes it an inherent `authenticate` rather than the sync trait impl, and it
+//! stamps the server-injected workspace onto the identity (docs/04 §15), never a payload one.
 //!
 //! The real signature-verifying adapter ([`JwtAuthenticator`], RS256 via jsonwebtoken) folds
 //! into this same crate behind the off-by-default `jsonwebtoken` feature (`hq-auth-verify.1`) —
@@ -76,6 +80,9 @@ mod verify;
 #[cfg(feature = "password-hash")]
 pub mod password;
 
+#[cfg(feature = "pg")]
+mod pg;
+
 #[cfg(feature = "jsonwebtoken")]
 mod jwt;
 
@@ -89,6 +96,9 @@ pub use refresh::{
     RefreshToken,
 };
 pub use verify::{Authenticator, InMemoryAuthenticator};
+
+#[cfg(feature = "pg")]
+pub use pg::PgUsers;
 
 #[cfg(feature = "jsonwebtoken")]
 pub use jwt::JwtAuthenticator;

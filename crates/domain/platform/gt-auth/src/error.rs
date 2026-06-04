@@ -60,4 +60,12 @@ pub enum AuthError {
     /// Only raised by the `jsonwebtoken` minter adapter.
     #[error("token signing failure: {0}")]
     SigningFailure(String),
+    /// A backing store / infrastructure fault while authenticating — e.g. the Postgres
+    /// connection dropped or a query failed. Deliberately distinct from
+    /// [`InvalidCredentials`](Self::InvalidCredentials): a DB outage is **not** a rejected
+    /// login (treating it as one would mask the outage as a wave of bad passwords) and must
+    /// not silently deny access. Carries a human-readable reason. Only raised by a store-backed
+    /// adapter such as the `pg` [`PgUsers`](crate::PgUsers) provider.
+    #[error("authentication backend failure: {0}")]
+    Backend(String),
 }
