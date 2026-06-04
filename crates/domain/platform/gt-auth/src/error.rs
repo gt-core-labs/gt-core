@@ -54,4 +54,10 @@ pub enum AuthError {
     /// password. Carries a human-readable reason. Only raised by the `password-hash` adapter.
     #[error("password hashing failure: {0}")]
     HashFailure(String),
+    /// RS256 token signing failed — a crypto/stored-data error (e.g. a serializer fault or an
+    /// encoding key that cannot produce a signature), not a rejected request. The mirror of
+    /// [`HashFailure`](Self::HashFailure) on the minting side. Carries a human-readable reason.
+    /// Only raised by the `jsonwebtoken` minter adapter.
+    #[error("token signing failure: {0}")]
+    SigningFailure(String),
 }

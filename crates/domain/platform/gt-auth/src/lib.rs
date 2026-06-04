@@ -43,6 +43,14 @@
 //! rotation (`hq-auth-verify.2`), loaded from the environment via
 //! [`JwtAuthenticator::from_env`].
 //!
+//! Its production counterpart — the final `[sign]` arrow of the pipeline above — is
+//! [`JwtMinter`] (RS256 via jsonwebtoken, `hq-auth-mint.1`), folded into this same crate behind
+//! the *same* `jsonwebtoken` feature (never a sibling crate, Rule 4). Asymmetric on purpose:
+//! the minter holds the **private** key and signs a [`JwtClaims`] into a bearer token, stamping
+//! the signing `kid` into the header so [`JwtAuthenticator`]'s keyset can select the matching
+//! public key; the verifier holds only the public side. It loads its key from the environment
+//! via [`JwtMinter::from_env`].
+//!
 //! This crate intentionally does **not** depend on `gt-workspace`: platform → platform deps
 //! are forbidden (Rule 4). The `workspace` claim is a plain `String`; the consumer (the
 //! `WorkspaceContext` extractor, wired one tier up at the composition root) parses it into a

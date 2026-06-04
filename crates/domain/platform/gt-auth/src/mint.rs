@@ -1,72 +1,124 @@
-//! The RS256 signature-**minting** [`JwtMinter`] — the signing counterpart to
-//! [`JwtAuthenticator`](crate::JwtAuthenticator).
+//! The RS256 token **minter** — the `jsonwebtoken` signing adapter.
 //!
-//! Where the verifier holds the **public** key and decodes a bearer token into [`JwtClaims`],
-//! this adapter holds the **private** key and encodes a fresh [`JwtClaims`] into a signed
-//! RS256 bearer token. Asymmetric on purpose (hq-auth, RS256): only the minting tier ever
-//! holds the secret; verifiers downstream authenticate with the matching public key alone.
+//! This is the production counterpart of [`JwtAuthenticator`](crate::JwtAuthenticator), and its
+//! mirror image: where the verifier *decodes* a bearer token and checks its **RS256** signature
+//! against a public key, the minter *encodes* a [`JwtClaims`] and **signs** it with a private
+//! key, producing the bearer token. It is the final `[sign]` arrow of the login pipeline
+//! ([`VerifiedIdentity::into_claims`](crate::VerifiedIdentity::into_claims) widens a verified
+//! login into [`JwtClaims`]; this adapter signs those claims into the token the verifier later
+//! authenticates).
 //!
-//! ## Key rotation by `kid` (hq-auth-verify.2)
+//! Asymmetric on purpose (hq-auth, RS256): the minter holds the **private** key — the signing
+//! secret — while the verifier holds only the matching **public** key. A frontend or sibling
+//! service can therefore authenticate tokens without ever being able to mint them; only the
+//! issuing tier holds the secret.
 //!
-//! Every minted token's header carries this minter's `kid` (key id), so a verifier holding a
-//! `kid`-indexed keyset (see [`JwtAuthenticator::from_kid_pems`](crate::JwtAuthenticator)) can
-//! select the matching public key. Rotating keys is then a no-flag-day affair: stand up a
-//! minter under a new `kid`, publish the new public key, retire the old `kid` after the
-//! deprecation window.
+//! ## Key rotation by `kid` (mirror of hq-auth-verify.2)
+//!
+//! The minter can stamp a signing `kid` (key id) into the JWT header. The verifier's keyset
+//! ([`JwtAuthenticator`](crate::JwtAuthenticator) loaded with `kid`-indexed public keys) selects
+//! the matching public key by that header `kid`, so the issuing side can rotate keys without a
+//! flag day: publish the new public key under a fresh `kid`, switch the minter to signing with
+//! that `kid`, retire the old key after the deprecation window. A minter configured without a
+//! `kid` emits a `kid`-less token (back-compat with single-key deploys, which the verifier still
+//! accepts). [`from_env`](JwtMinter::from_env) loads the signing key — and its optional `kid` —
+//! from the deployment's environment.
 //!
 //! Hexagonal (docs/03 Rule 4): this adapter lives inside `gt-auth` behind the off-by-default
-//! `jsonwebtoken` feature — never a sibling crate — exactly as `jwt.rs` gates the verifier.
+//! `jsonwebtoken` feature — never a sibling crate — exactly as `jwt.rs` gates the verifier and
+//! `password.rs` gates argon2.
 
 use jsonwebtoken::{encode, Algorithm, EncodingKey, Header};
 
-use crate::{AuthError, JwtClaims, VerifiedIdentity};
+use crate::{AuthError, JwtClaims};
 
-/// Mints RS256-signed JWTs from a single RSA **private** key, stamping a `kid` into every
-/// token header so the verifier can select the matching public key for rotation.
+/// Environment variable naming the PEM file holding the RS256 **private** signing key.
+pub const ENV_PRIVATE_KEY_FILE: &str = "GT_JWT_RS256_PRIVATE_KEY_FILE";
+/// Environment variable naming the optional signing `kid` stamped into every minted token's
+/// header, so the verifier's keyset can select the matching public key.
+pub const ENV_SIGNING_KID: &str = "GT_JWT_RS256_SIGNING_KID";
+
+/// A minter that signs a [`JwtClaims`] into an RS256-signed JWT bearer token.
 ///
-/// The signing counterpart of [`JwtAuthenticator`](crate::JwtAuthenticator): build it from a
-/// PEM private key ([`from_rsa_pem`](Self::from_rsa_pem)), then [`mint`](Self::mint) claims —
-/// or fold a [`VerifiedIdentity`] straight into a token with
-/// [`mint_identity`](Self::mint_identity).
+/// Build it from a single signing key ([`new`](Self::new) / [`from_rsa_pem`](Self::from_rsa_pem)),
+/// optionally tagging the signing `kid` for rotation ([`with_kid`](Self::with_kid)), or load the
+/// key (and its `kid`) from the environment ([`from_env`](Self::from_env)).
+///
+/// The asymmetric counterpart of [`JwtAuthenticator`](crate::JwtAuthenticator): this holds the
+/// **private** key and produces tokens; the verifier holds the **public** key and consumes them.
 pub struct JwtMinter {
-    /// The RS256 private signing key.
+    /// The RS256 private key the token is signed with.
     key: EncodingKey,
-    /// The key id stamped into every minted token's header (`kid`), so a rotating verifier can
-    /// pick the matching public key.
-    kid: String,
+    /// The signing `kid` stamped into the JWT header (`None` ⇒ a `kid`-less token).
+    kid: Option<String>,
+}
+
+fn encoding_key_from_pem(pem: &[u8]) -> Result<EncodingKey, AuthError> {
+    EncodingKey::from_rsa_pem(pem)
+        .map_err(|e| AuthError::Malformed(format!("invalid RS256 private key: {e}")))
 }
 
 impl JwtMinter {
-    /// Build the minter from an RSA private key in PEM form (`-----BEGIN PRIVATE KEY-----` /
-    /// `-----BEGIN RSA PRIVATE KEY-----`), stamping `kid` into every token it mints.
-    pub fn from_rsa_pem(kid: impl Into<String>, pem: &[u8]) -> Result<Self, AuthError> {
-        let key = EncodingKey::from_rsa_pem(pem)
-            .map_err(|e| AuthError::Malformed(format!("invalid RS256 private key: {e}")))?;
-        Ok(Self {
-            key,
-            kid: kid.into(),
-        })
+    /// Build the minter from an RS256 [`EncodingKey`], with no signing `kid`.
+    pub fn new(key: EncodingKey) -> Self {
+        Self { key, kid: None }
     }
 
-    /// Encode `claims` into an RS256-signed bearer token whose header carries this minter's
-    /// `kid`. A jsonwebtoken encode failure surfaces as [`AuthError::Malformed`].
-    pub fn mint(&self, claims: &JwtClaims) -> Result<String, AuthError> {
+    /// Build the minter from an RSA private key in PEM form
+    /// (`-----BEGIN PRIVATE KEY-----` / `-----BEGIN RSA PRIVATE KEY-----`). A key that fails to
+    /// parse is [`AuthError::Malformed`], symmetric to the verifier's
+    /// [`from_rsa_pem`](crate::JwtAuthenticator::from_rsa_pem).
+    pub fn from_rsa_pem(pem: &[u8]) -> Result<Self, AuthError> {
+        Ok(Self::new(encoding_key_from_pem(pem)?))
+    }
+
+    /// Stamp `kid` into the header of every token this minter produces. Chainable. The verifier's
+    /// keyset selects the matching public key by this `kid`.
+    pub fn with_kid(mut self, kid: impl Into<String>) -> Self {
+        self.kid = Some(kid.into());
+        self
+    }
+
+    /// Load the minter from the deployment environment.
+    ///
+    /// - [`GT_JWT_RS256_PRIVATE_KEY_FILE`](ENV_PRIVATE_KEY_FILE) — the PEM file holding the RS256
+    ///   private signing key. **Required**: missing or unreadable ⇒ [`AuthError::Malformed`] with
+    ///   a reason naming the env var, symmetric to the verifier's
+    ///   [`from_env`](crate::JwtAuthenticator::from_env).
+    /// - [`GT_JWT_RS256_SIGNING_KID`](ENV_SIGNING_KID) — optional. When set, it is stamped into
+    ///   the header of every minted token so the verifier's keyset can select the matching public
+    ///   key (rotation). Unset ⇒ a `kid`-less token (single-key deploys).
+    pub fn from_env() -> Result<Self, AuthError> {
+        let path = std::env::var(ENV_PRIVATE_KEY_FILE).map_err(|_| {
+            AuthError::Malformed(format!(
+                "no RS256 private key configured (set {ENV_PRIVATE_KEY_FILE})"
+            ))
+        })?;
+        let pem = std::fs::read(&path).map_err(|e| {
+            AuthError::Malformed(format!(
+                "cannot read {ENV_PRIVATE_KEY_FILE} key file {path}: {e}"
+            ))
+        })?;
+        let mut minter = Self::from_rsa_pem(&pem)?;
+        if let Ok(kid) = std::env::var(ENV_SIGNING_KID) {
+            minter.kid = Some(kid);
+        }
+        Ok(minter)
+    }
+
+    /// Build the `Header::new(Algorithm::RS256)` for a minted token, stamping the signing `kid`.
+    fn header(&self) -> Header {
         let mut header = Header::new(Algorithm::RS256);
-        header.kid = Some(self.kid.clone());
-        encode(&header, claims, &self.key)
-            .map_err(|e| AuthError::Malformed(format!("failed to mint RS256 token: {e}")))
+        header.kid = self.kid.clone();
+        header
     }
 
-    /// Fold a [`VerifiedIdentity`] into [`JwtClaims`] (stamping `exp`/`iat`) and mint a token
-    /// for it. The convenience path from the login tier ([`IdentityProvider`](crate::IdentityProvider))
-    /// straight to a signed bearer token.
-    pub fn mint_identity(
-        &self,
-        identity: VerifiedIdentity,
-        exp: u64,
-        iat: u64,
-    ) -> Result<String, AuthError> {
-        self.mint(&identity.into_claims(exp, iat))
+    /// Sign `claims` into an RS256-signed JWT bearer token. An encode failure (a serializer fault
+    /// or a key that cannot produce a signature) is [`AuthError::SigningFailure`] — the minting
+    /// mirror of the verifier collapsing a decode fault into its error vocabulary.
+    pub fn mint(&self, claims: &JwtClaims) -> Result<String, AuthError> {
+        encode(&self.header(), claims, &self.key)
+            .map_err(|e| AuthError::SigningFailure(e.to_string()))
     }
 }
 
@@ -74,19 +126,21 @@ impl JwtMinter {
 mod tests {
     use super::*;
     use crate::{Authenticator, JwtAuthenticator};
+    use jsonwebtoken::decode_header;
 
-    // The same throwaway 2048-bit RSA keypair the verifier's tests use: minting with the
-    // private half and verifying with the public half proves the sign+verify interop end to
-    // end. The second keypair stands in as an unrelated `kid` for the rotation tests.
+    // The same two throwaway 2048-bit RSA keypairs the verifier slice uses. Minting with the
+    // primary private key and verifying against its public key proves the signing path;
+    // minting with the unrelated key proves a real (rejectable) signature; the keys also stand
+    // in as `kid`-named keys for rotation.
     const TEST_PRIV_PEM: &[u8] = include_bytes!("../tests/fixtures/rs256_priv.pem");
     const TEST_PUB_PEM: &[u8] = include_bytes!("../tests/fixtures/rs256_pub.pem");
-    const OTHER_PUB_PEM: &[u8] = include_bytes!("../tests/fixtures/rs256_other_pub.pem");
+    const OTHER_PRIV_PEM: &[u8] = include_bytes!("../tests/fixtures/rs256_other_priv.pem");
 
     fn claims() -> JwtClaims {
         JwtClaims {
             sub: "alice".into(),
             workspace: "acme".into(),
-            scopes: vec!["rig.read".into(), "rig.write".into()],
+            scopes: vec!["rig.read".into()],
             exp: 100,
             nbf: None,
             iat: 0,
@@ -94,66 +148,72 @@ mod tests {
     }
 
     #[test]
-    fn minted_token_round_trips_through_the_verifier() {
-        let minter = JwtMinter::from_rsa_pem("k1", TEST_PRIV_PEM).unwrap();
+    fn mints_a_token_that_round_trips_through_the_verifier() {
+        let minter = JwtMinter::from_rsa_pem(TEST_PRIV_PEM).unwrap();
         let token = minter.mint(&claims()).unwrap();
-
-        let auth = JwtAuthenticator::from_kid_pems([("k1", TEST_PUB_PEM)]).unwrap();
+        let auth = JwtAuthenticator::from_rsa_pem(TEST_PUB_PEM).unwrap();
         let got = auth.authenticate(&token).unwrap();
-
+        assert_eq!(got, claims());
         assert_eq!(got.sub, "alice");
         assert_eq!(got.workspace, "acme");
-        assert_eq!(got.scopes, vec!["rig.read".to_string(), "rig.write".to_string()]);
         assert!(got.has_scope("rig.read"));
-        assert!(got.has_scope("rig.write"));
+        assert_eq!(got.exp, 100);
     }
 
     #[test]
-    fn minted_token_header_carries_the_kid() {
-        let minter = JwtMinter::from_rsa_pem("k1", TEST_PRIV_PEM).unwrap();
+    fn stamps_the_signing_kid_and_round_trips_through_a_keyset() {
+        let minter = JwtMinter::from_rsa_pem(TEST_PRIV_PEM).unwrap().with_kid("k1");
         let token = minter.mint(&claims()).unwrap();
 
-        // A verifier holding only kid "k1" accepts it — the token's header selects that key.
-        let k1 = JwtAuthenticator::from_kid_pems([("k1", TEST_PUB_PEM)]).unwrap();
-        assert_eq!(k1.authenticate(&token).unwrap().sub, "alice");
+        // The header carries the configured kid, so the verifier's keyset can select the key.
+        let header = decode_header(&token).unwrap();
+        assert_eq!(header.kid.as_deref(), Some("k1"));
 
-        // A verifier holding only kid "k2" rejects it as an unknown key — the header's kid does
-        // not resolve, so the signature is never even checked.
-        let k2 = JwtAuthenticator::from_kid_pems([("k2", OTHER_PUB_PEM)]).unwrap();
-        assert_eq!(
-            k2.authenticate(&token),
-            Err(AuthError::UnknownKey("k1".into()))
-        );
+        let auth = JwtAuthenticator::from_kid_pems([("k1", TEST_PUB_PEM)]).unwrap();
+        assert_eq!(auth.authenticate(&token).unwrap().sub, "alice");
     }
 
     #[test]
-    fn from_rsa_pem_rejects_garbage_as_malformed() {
+    fn a_token_minted_with_a_different_key_fails_signature_verification() {
+        // Real, rejectable signature: the OTHER private key does not match the primary public key.
+        let minter = JwtMinter::from_rsa_pem(OTHER_PRIV_PEM).unwrap();
+        let token = minter.mint(&claims()).unwrap();
+        let auth = JwtAuthenticator::from_rsa_pem(TEST_PUB_PEM).unwrap();
+        assert_eq!(auth.authenticate(&token), Err(AuthError::InvalidSignature));
+    }
+
+    #[test]
+    fn a_malformed_private_key_is_rejected_at_construction() {
         assert!(matches!(
-            JwtMinter::from_rsa_pem(
-                "k1",
-                b"-----BEGIN PRIVATE KEY-----\nnope\n-----END PRIVATE KEY-----"
-            ),
+            JwtMinter::from_rsa_pem(b"-----BEGIN PRIVATE KEY-----\nnope\n-----END PRIVATE KEY-----"),
             Err(AuthError::Malformed(_))
         ));
     }
 
+    // All env cases live in one test: process-global env vars are shared mutable state, so two
+    // env tests would race under cargo's parallel runner. One test owns the vars start-to-end.
     #[test]
-    fn mint_identity_folds_the_identity_and_clock_into_the_token() {
-        let minter = JwtMinter::from_rsa_pem("k1", TEST_PRIV_PEM).unwrap();
-        let identity = VerifiedIdentity {
-            sub: "bob".into(),
-            workspace: "globex".into(),
-            scopes: vec!["rig.read".into()],
-        };
-        let token = minter.mint_identity(identity, 200, 10).unwrap();
+    fn from_env_loads_the_signing_key_and_errors_when_unconfigured() {
+        let dir = std::env::temp_dir().join(format!("gt-auth-mint-env-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let priv_path = dir.join("priv.pem");
+        std::fs::write(&priv_path, TEST_PRIV_PEM).unwrap();
 
+        // Nothing configured → error naming the env var.
+        std::env::remove_var(ENV_PRIVATE_KEY_FILE);
+        std::env::remove_var(ENV_SIGNING_KID);
+        assert!(matches!(JwtMinter::from_env(), Err(AuthError::Malformed(_))));
+
+        // Key file + signing kid configured → mint, then verify through the matching keyset.
+        std::env::set_var(ENV_PRIVATE_KEY_FILE, &priv_path);
+        std::env::set_var(ENV_SIGNING_KID, "k1");
+        let minter = JwtMinter::from_env().unwrap();
+        let token = minter.mint(&claims()).unwrap();
+        assert_eq!(decode_header(&token).unwrap().kid.as_deref(), Some("k1"));
         let auth = JwtAuthenticator::from_kid_pems([("k1", TEST_PUB_PEM)]).unwrap();
-        let got = auth.authenticate(&token).unwrap();
+        assert_eq!(auth.authenticate(&token).unwrap().sub, "alice");
 
-        assert_eq!(got.sub, "bob");
-        assert_eq!(got.workspace, "globex");
-        assert!(got.has_scope("rig.read"));
-        assert_eq!(got.exp, 200);
-        assert_eq!(got.iat, 10);
+        std::env::remove_var(ENV_PRIVATE_KEY_FILE);
+        std::env::remove_var(ENV_SIGNING_KID);
     }
 }
