@@ -1879,14 +1879,20 @@ dependencies = [
 name = "gt-orchestration"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
+ "axum",
  "gt-eventlog",
  "gt-events",
  "gt-module",
+ "gt-workspace",
  "schemars 0.8.22",
  "semver",
  "serde",
+ "serde_json",
  "tokio",
+ "tower",
  "ulid",
+ "utoipa",
 ]
 
 [[package]]

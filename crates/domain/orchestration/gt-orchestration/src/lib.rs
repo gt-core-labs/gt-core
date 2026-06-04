@@ -25,12 +25,20 @@
 pub mod actor;
 pub mod commands;
 mod events;
+/// The off-by-default `axum` REST adapter (`hq-fe-api-orch.3`): the `convoy.*` HTTP routes the
+/// builder mounts at `/api/v1/convoy`, dispatching to the same command layer the MCP tools use.
+#[cfg(feature = "axum")]
+pub mod http;
 pub mod module;
 mod repo;
 mod state;
 
 pub use commands::{CompleteMember, FailMember, LaunchConvoy, OrchCommand};
 pub use events::OrchEvent;
+#[cfg(feature = "axum")]
+pub use http::{convoy_router, ApiDoc, ConvoyApiState, WorkspaceConvoy};
+#[cfg(feature = "axum")]
+pub use module::ConvoyHttpModule;
 pub use module::ConvoyModule;
 pub use repo::{InMemoryOrchRepo, OrchRepository};
 pub use state::{Convoy, ConvoyBoard, ConvoyState, Member, MemberState, OrchState};

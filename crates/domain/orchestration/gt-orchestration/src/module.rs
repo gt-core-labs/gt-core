@@ -61,6 +61,62 @@ impl ConvoyModule {
     pub fn id() -> ModuleId {
         ModuleId::new("convoy").expect("`convoy` is a valid module id")
     }
+
+    /// Build the HTTP-enabled convoy module (`hq-fe-api-orch.3`), baking `state` (the
+    /// per-workspace event-log provider) into the router its
+    /// [`register_routes`](GtModule::register_routes) returns. The binary calls this to opt the
+    /// module into its REST surface; the MCP harvest path keeps the plain unit [`ConvoyModule`].
+    /// Returns a [`ConvoyHttpModule`] rather than mutating [`ConvoyModule`] so the unit struct
+    /// (and its `ConvoyModule.migrations()` call sites) is left untouched — the same shape
+    /// `MergeModule::with_http` / `RigsModule::with_http` follow.
+    #[cfg(feature = "axum")]
+    pub fn with_http(state: crate::http::ConvoyApiState) -> ConvoyHttpModule {
+        ConvoyHttpModule { http: state }
+    }
+}
+
+/// The HTTP-enabled convoy module (`hq-fe-api-orch.3`): the same `GtModule` contract as
+/// [`ConvoyModule`] plus the `convoy.*` REST routes + OpenAPI spec.
+///
+/// Built by [`ConvoyModule::with_http`]. Identity, capability, and MCP tools are delegated
+/// verbatim to [`ConvoyModule`] (one source of truth for the board's contract); only
+/// [`register_routes`](GtModule::register_routes) and [`openapi`](GtModule::openapi) are
+/// overridden, carrying the per-workspace [`WorkspaceConvoy`](crate::WorkspaceConvoy) provider the
+/// handlers dispatch through. Like the unit module it owns no migration (the board is
+/// event-sourced), so the empty-`migrations` default stands.
+#[cfg(feature = "axum")]
+#[derive(Clone)]
+pub struct ConvoyHttpModule {
+    /// The per-workspace REST state the routes dispatch through.
+    http: crate::http::ConvoyApiState,
+}
+
+#[cfg(feature = "axum")]
+impl GtModule for ConvoyHttpModule {
+    fn meta(&self) -> ModuleMeta {
+        ConvoyModule.meta()
+    }
+
+    fn capability(&self) -> Capability {
+        ConvoyModule.capability()
+    }
+
+    fn register_mcp_tools(&self, registry: &mut McpRegistry) {
+        ConvoyModule.register_mcp_tools(registry);
+    }
+
+    /// The convoy REST routes (`hq-fe-api-orch.3`), relative — the builder nests them under
+    /// `/api/v1/convoy` and applies the `convoys.read`/`convoys.write` scope guard.
+    fn register_routes(&self) -> axum::Router {
+        crate::http::convoy_router(self.http.clone())
+    }
+
+    /// The OpenAPI spec for the convoy REST routes, so the combined document documents exactly the
+    /// routes mounted under the HTTP-enabled module.
+    fn openapi(&self) -> Option<utoipa::openapi::OpenApi> {
+        use utoipa::OpenApi;
+        Some(crate::http::ApiDoc::openapi())
+    }
 }
 
 impl GtModule for ConvoyModule {
@@ -202,5 +258,47 @@ mod tests {
         // convoys.* HTTP routes are still gt-web-coupled (harvested by hq-mod-routes.5).
         assert!(ConvoyModule.migrations().is_empty());
         assert!(ConvoyModule.openapi().is_none());
+    }
+
+    /// The HTTP-enabled variant (`hq-fe-api-orch.3`) documents its REST routes and returns a
+    /// non-empty OpenAPI spec the builder mounts under `/api/v1/convoy`, while delegating the
+    /// board contract (id, scopes, MCP tools, no migration) verbatim to [`ConvoyModule`]. The
+    /// router itself is exercised by the http module's own tests + the contract test; here we
+    /// assert the trait wiring flips on and the delegation holds.
+    #[cfg(feature = "axum")]
+    #[test]
+    fn with_http_contributes_routes_and_delegates_contract() {
+        use crate::events::OrchEvent;
+        use crate::http::{ConvoyApiState, WorkspaceConvoy};
+        use crate::state::ConvoyBoard;
+        use gt_events::AppError;
+        use std::sync::Arc;
+
+        // A never-used provider is fine: `openapi()`/`meta()` read no state, and
+        // `register_routes` only clones the state into the router without dispatching.
+        struct NoopConvoy;
+        #[async_trait::async_trait]
+        impl WorkspaceConvoy for NoopConvoy {
+            async fn board(&self, _ws: &str) -> Result<ConvoyBoard, AppError> {
+                Err(AppError::Other("unused".into()))
+            }
+            async fn append(&self, _ws: &str, _events: Vec<OrchEvent>) -> Result<(), AppError> {
+                Err(AppError::Other("unused".into()))
+            }
+        }
+
+        let m = ConvoyModule::with_http(ConvoyApiState::new(Arc::new(NoopConvoy)));
+        assert!(m.openapi().is_some(), "HTTP variant ships an OpenAPI spec");
+
+        // Delegation: the HTTP variant carries the SAME contract as the unit module.
+        assert_eq!(m.meta().id.as_str(), ConvoyModule.meta().id.as_str());
+        assert_eq!(
+            m.capability().scopes(),
+            ConvoyModule.capability().scopes(),
+            "scopes delegate to ConvoyModule"
+        );
+        let mut reg = McpRegistry::new();
+        m.register_mcp_tools(&mut reg);
+        assert_eq!(reg.tools().len(), 6, "the six convoy tools still register");
     }
 }
