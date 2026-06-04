@@ -84,6 +84,29 @@ impl RbacConfig {
             .map_err(|e| AppError::Validation(format!("rbac config (json): {e}")))
     }
 
+    /// Load a built-in scope profile by name (`GT_MCP_SCOPE_PROFILE`). Profiles are TOML
+    /// files embedded in the binary, so a deploy selects a policy with one env var instead
+    /// of shipping a config file. `Ok(None)` for an unknown name (the caller reports the
+    /// valid set). An operator who needs a bespoke policy still overrides with a file via
+    /// `GT_MCP_SCOPE_CONFIG`, which takes precedence.
+    ///
+    /// Bundled: `dev` (full access for the default local actor), `readonly` (default actor
+    /// may call only `*.validate`), `closed` (deny-by-default — bring your own file).
+    pub fn from_profile(name: &str) -> Result<Option<Self>, AppError> {
+        let raw = match name {
+            "dev" => include_str!("../profiles/dev.toml"),
+            "readonly" => include_str!("../profiles/readonly.toml"),
+            "closed" => include_str!("../profiles/closed.toml"),
+            _ => return Ok(None),
+        };
+        Self::from_toml(raw).map(Some)
+    }
+
+    /// The names [`from_profile`](Self::from_profile) accepts, for error messages.
+    pub fn available_profiles() -> &'static [&'static str] {
+        &["dev", "readonly", "closed"]
+    }
+
     /// Load from disk; the parser is selected by extension (`.json` → JSON, otherwise
     /// TOML). I/O errors surface as [`AppError::Other`] so the boot path can log a
     /// useful path string before failing closed.
@@ -148,6 +171,20 @@ scopes = ["beads.write", "merge.read", "merge.submit"]
 [roles.reader]
 scopes = ["beads.read", "merge.read"]
 "#;
+
+    #[test]
+    fn builtin_profiles_load_and_unknown_is_none() {
+        let dev = RbacConfig::from_profile("dev").unwrap().expect("dev profile");
+        assert!(dev.actor("mcp-local").unwrap().allow.contains("*"));
+        let ro = RbacConfig::from_profile("readonly").unwrap().expect("readonly profile");
+        assert!(ro.actor("mcp-local").unwrap().validate_only, "readonly is validate-only");
+        let closed = RbacConfig::from_profile("closed").unwrap().expect("closed profile");
+        assert!(closed.actors.is_empty(), "closed grants nothing");
+        assert!(RbacConfig::from_profile("bogus").unwrap().is_none(), "unknown ⇒ None");
+        for p in RbacConfig::available_profiles() {
+            assert!(RbacConfig::from_profile(p).unwrap().is_some(), "advertised profile {p} loads");
+        }
+    }
 
     #[test]
     fn parses_actors_and_roles() {
