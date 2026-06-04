@@ -96,6 +96,18 @@ jobs:
           --health-interval 5s
           --health-timeout 5s
           --health-retries 10
+      # Object store for the document blob path (hq-docs-test-blob.2 / -e2e.2). The bitnami
+      # image starts the MinIO server on its own (no command override — GitHub service
+      # containers can't set one) and auto-creates the bucket via MINIO_DEFAULT_BUCKETS, so
+      # the gated S3/e2e steps have a ready bucket without an extra `mc` provisioning step.
+      minio:
+        image: bitnami/minio:latest
+        env:
+          MINIO_ROOT_USER: minioadmin
+          MINIO_ROOT_PASSWORD: minioadmin
+          MINIO_DEFAULT_BUCKETS: gt-documents
+        ports:
+          - 9000:9000
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -132,10 +144,41 @@ jobs:
           GT_PG_URL: postgres://gtapp:test@127.0.0.1:5432/gtapp
         run: |
           # --features pg activates the WorkspacePool + DocumentsRepository (hq-docs-store.3)
-          # contract tests, which are #[cfg(feature = "pg")] and otherwise compile out.
+          # contract tests, which are #[cfg(feature = "pg")] and otherwise compile out. The
+          # documents_contract suite also covers the dedup / list-by-owner-id / hybrid-search
+          # beads (hq-docs-test-store.2/.4, hq-docs-test-search.2/.3).
           cargo test -p gt-store-pg --features pg --locked
           cargo test -p gt-feature-flags --locked
+          # The documents.* dispatch + resource-read + multi-tenant isolation integration
+          # (hq-docs-test-api.1/.2/.3, hq-docs-test-mt.1): drives the production DocumentsHandler
+          # + PgDocumentsResource over the per-workspace Postgres (fs blob store — no object
+          # store needed for these beads; the MinIO path is the report-only e2e step below).
+          cargo test -p gt-composition --test documents_dispatch --locked
           # The durable Postgres audit sink (hq-mcp-test.6): per-tenant isolation +
           # the restart-durability proof (write, drop the pool, reconnect, the trail
           # is still there). SERIAL — both gated tests reseed the one mcp_audit table.
           cargo test -p gt-mcp-server --locked -- --test-threads=1
+      # The object-store beads (hq-docs-test-blob.2, hq-docs-test-e2e.*): the S3 backend
+      # roundtrip/presign and the full-stack attach→inline→search→presign flow against the
+      # live MinIO + Postgres. Report-only: a flaky object-store service must not break the
+      # hard contract gate (the schema/dispatch beads above already cover the document store
+      # without an object store). Runs the same suites the compose stack runs.
+      - name: documents object-store e2e (report-only)
+        continue-on-error: true
+        env:
+          GT_PG_URL: postgres://gtapp:test@127.0.0.1:5432/gtapp
+          GT_BLOB_ENDPOINT: http://127.0.0.1:9000
+          GT_BLOB_BUCKET: gt-documents
+          GT_BLOB_REGION: us-east-1
+          GT_BLOB_ACCESS_KEY: minioadmin
+          GT_BLOB_SECRET_KEY: minioadmin
+        run: |
+          # Wait for MinIO to answer before exercising the object store.
+          for _ in $(seq 1 30); do
+            if curl -sf http://127.0.0.1:9000/minio/health/live >/dev/null 2>&1; then
+              echo "minio ready"; break
+            fi
+            sleep 2
+          done
+          cargo test -p gt-store-blob --locked s3_backend_roundtrips_and_presigns
+          cargo test -p gt-composition --test documents_e2e --locked
