@@ -464,6 +464,50 @@ pub struct DoltIssues {
     pool: Pool,
 }
 
+/// The base `issues` table DDL — the schema gt-core seeds on a fresh Dolt database. Moved
+/// from the gt-app deploy's `dolt-init.sql` so the schema lives with the code that owns it;
+/// `ensure_schema` runs it when the table is absent, then layers the taxonomy columns on top.
+const ISSUES_BASE_TABLE_SQL: &str = "CREATE TABLE IF NOT EXISTS issues (
+    id                  VARCHAR(255) PRIMARY KEY,
+    content_hash        VARCHAR(64),
+    title               VARCHAR(500) NOT NULL,
+    description         TEXT NOT NULL,
+    design              TEXT NOT NULL,
+    acceptance_criteria TEXT NOT NULL,
+    notes               TEXT NOT NULL,
+    status              VARCHAR(32) NOT NULL DEFAULT 'open',
+    priority            INT NOT NULL DEFAULT 2,
+    issue_type          VARCHAR(32) NOT NULL DEFAULT 'task',
+    assignee            VARCHAR(255),
+    estimated_minutes   INT,
+    created_at          DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    created_by          VARCHAR(255) DEFAULT '',
+    owner               VARCHAR(255) DEFAULT '',
+    updated_at          DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    closed_at           DATETIME,
+    closed_by_session   VARCHAR(255) DEFAULT '',
+    external_ref        VARCHAR(255),
+    spec_id             VARCHAR(1024)
+)";
+
+/// Split a MySQL-wire URL into `(server_url_without_db, Some(db))`, or `(url, None)` when it
+/// carries no database path segment. Used by [`DoltIssues::ensure_database`] to `CREATE
+/// DATABASE` over a database-less connection before the main pool binds to that database.
+fn split_database(url: &str) -> (String, Option<String>) {
+    let Some((scheme, rest)) = url.split_once("://") else {
+        return (url.to_string(), None);
+    };
+    match rest.split_once('/') {
+        // `path` is `<db>[?params]`; the db is the segment before any `?` or further `/`.
+        Some((authority, path)) => {
+            let db = path.split(['/', '?']).next().unwrap_or("");
+            let db = (!db.is_empty()).then(|| db.to_string());
+            (format!("{scheme}://{authority}"), db)
+        }
+        None => (url.to_string(), None),
+    }
+}
+
 impl DoltIssues {
     pub fn new(pool: Pool) -> Self {
         Self { pool }
@@ -475,6 +519,30 @@ impl DoltIssues {
 
     pub fn pool(&self) -> &Pool {
         &self.pool
+    }
+
+    /// Ensure the target database in `url` exists (idempotent), creating it via a
+    /// database-less connection to the same server.
+    ///
+    /// A fresh Dolt volume ships no databases, so a pool to `…/hq` would fail to connect
+    /// before [`ensure_schema`](Self::ensure_schema) could seed anything. gt-core owns this
+    /// bootstrap (it knows its own schema) rather than a deploy-side init script: the server
+    /// calls this once on startup, then connects normally. No-op when the database already
+    /// exists, or when `url` carries no database segment.
+    pub async fn ensure_database(url: &str) -> Result<(), AppError> {
+        let (server_url, db) = split_database(url);
+        let Some(db) = db else { return Ok(()) };
+        let pool = Pool::from_url(&server_url)
+            .map_err(|e| AppError::Other(format!("dolt connect (server): {e}")))?;
+        let mut conn = pool.get_conn().await.map_err(map_err)?;
+        // `db` is the path segment of an operator-supplied URL; backtick-quote it. Dolt accepts
+        // CREATE DATABASE over the MySQL wire.
+        conn.query_drop(format!("CREATE DATABASE IF NOT EXISTS `{db}`"))
+            .await
+            .map_err(map_err)?;
+        drop(conn);
+        pool.disconnect().await.map_err(map_err)?;
+        Ok(())
     }
 
     /// Confirm the `issues` table exists and adds the taxonomy columns the
@@ -496,9 +564,16 @@ impl DoltIssues {
             .await
             .map_err(map_err)?;
         if present.is_none() {
-            return Err(AppError::Other(
-                "issues table missing in current Dolt database".into(),
-            ));
+            // Seed the base `issues` table (gt-core owns this; upstream it was `bd`-created,
+            // but this deploy has no `bd`). Idempotent via IF NOT EXISTS; the taxonomy columns
+            // below then layer on top. Moved here from the gt-app deploy's dolt-init.sql.
+            conn.query_drop(ISSUES_BASE_TABLE_SQL).await.map_err(map_err)?;
+            conn.exec_drop(
+                "CALL DOLT_COMMIT('-A', '-m', :msg)",
+                mysql_async::params! { "msg" => "gt-core boot seed: hq.issues base table".to_string() },
+            )
+            .await
+            .map_err(map_err)?;
         }
 
         let taxonomy_columns: &[(&str, &str)] = &[
@@ -1602,4 +1677,25 @@ fn row_to_issue(row: mysql_async::Row, full: bool) -> Result<IssueRow, AppError>
         acceptance_criteria: full.then(|| take_opt(&mut row, 21).unwrap_or_default()),
         notes: full.then(|| take_opt(&mut row, 22).unwrap_or_default()),
     })
+}
+
+#[cfg(test)]
+mod bootstrap_tests {
+    use super::split_database;
+
+    #[test]
+    fn splits_db_from_url() {
+        let (server, db) = split_database("mysql://gtapp@dolt:3307/hq");
+        assert_eq!(server, "mysql://gtapp@dolt:3307");
+        assert_eq!(db.as_deref(), Some("hq"));
+    }
+
+    #[test]
+    fn handles_query_params_and_missing_db() {
+        let (_s, db) = split_database("mysql://root@127.0.0.1:3306/hq?ssl=false");
+        assert_eq!(db.as_deref(), Some("hq"));
+        let (server, none) = split_database("mysql://root@127.0.0.1:3306");
+        assert_eq!(server, "mysql://root@127.0.0.1:3306");
+        assert!(none.is_none(), "no path segment ⇒ no db to create");
+    }
 }
