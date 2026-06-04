@@ -90,6 +90,12 @@ pub enum WorkspaceContextRejection {
     InvalidHeaderEncoding,
     /// The header value was present but not a valid workspace slug.
     InvalidId(WorkspaceIdError),
+    /// Both an `X-GT-Workspace` header and a verified [`WorkspaceClaim`] were
+    /// present but named **different** workspaces (`hq-auth-context.2`). A request
+    /// may not assert one tenant in the header while its token authorizes another:
+    /// that is a tenant-spoofing attempt (docs/04 rule 15), rejected with `403`
+    /// rather than silently trusting either side.
+    Mismatch,
 }
 
 impl std::fmt::Display for WorkspaceContextRejection {
@@ -104,6 +110,9 @@ impl std::fmt::Display for WorkspaceContextRejection {
             WorkspaceContextRejection::InvalidId(e) => {
                 write!(f, "invalid workspace id: {e}")
             }
+            WorkspaceContextRejection::Mismatch => {
+                write!(f, "{WORKSPACE_HEADER} header disagrees with the token workspace claim")
+            }
         }
     }
 }
@@ -112,10 +121,14 @@ impl std::error::Error for WorkspaceContextRejection {}
 
 impl IntoResponse for WorkspaceContextRejection {
     fn into_response(self) -> Response {
-        // A missing or malformed workspace selector is a client error; a
-        // mismatch with auth scope (once JWT lands) will be the spoof-rejection
-        // path docs/04 rule 15 describes.
-        (StatusCode::BAD_REQUEST, self.to_string()).into_response()
+        // A missing or malformed workspace selector is a client error (400); a
+        // header that contradicts the verified token claim is a tenant-spoof
+        // attempt (403), the docs/04 rule 15 rejection path.
+        let status = match self {
+            WorkspaceContextRejection::Mismatch => StatusCode::FORBIDDEN,
+            _ => StatusCode::BAD_REQUEST,
+        };
+        (status, self.to_string()).into_response()
     }
 }
 
@@ -136,6 +149,16 @@ where
                 .map_err(|_| WorkspaceContextRejection::InvalidHeaderEncoding)?;
             let workspace =
                 WorkspaceId::new(slug).map_err(WorkspaceContextRejection::InvalidId)?;
+            // Reconcile against the verified claim when one is also present: a
+            // header that names a different tenant than the token authorizes is a
+            // spoof attempt, not a preference (`hq-auth-context.2`).
+            if let Some(claim) = parts.extensions.get::<WorkspaceClaim>() {
+                let claimed = WorkspaceId::new(claim.slug())
+                    .map_err(|_| WorkspaceContextRejection::Mismatch)?;
+                if claimed != workspace {
+                    return Err(WorkspaceContextRejection::Mismatch);
+                }
+            }
             return Ok(WorkspaceContext { workspace });
         }
         // Fallback: the verified JWT claim the upstream auth middleware injected.
@@ -196,11 +219,32 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn header_takes_precedence_over_claim() {
-        // hq-auth-context.2 will *reconcile* a disagreement; for now the header,
-        // an explicit selector, simply wins.
-        let ctx = extract_with(Some("acme"), Some("other")).await.unwrap();
+    async fn header_agreeing_with_claim_resolves() {
+        // Header and verified claim name the same tenant — no conflict.
+        let ctx = extract_with(Some("acme"), Some("acme")).await.unwrap();
         assert_eq!(ctx.workspace().as_str(), "acme");
+    }
+
+    #[tokio::test]
+    async fn header_disagreeing_with_claim_is_a_mismatch() {
+        // The header claims one tenant, the token authorizes another → spoof, 403
+        // (hq-auth-context.2).
+        let err = extract_with(Some("acme"), Some("other")).await.unwrap_err();
+        assert_eq!(err, WorkspaceContextRejection::Mismatch);
+    }
+
+    #[tokio::test]
+    async fn a_header_beside_an_unparseable_claim_is_a_mismatch() {
+        // A valid header next to a claim that does not parse cannot be reconciled —
+        // treat the disagreement as a mismatch rather than trusting the header.
+        let err = extract_with(Some("acme"), Some("Bad_Id")).await.unwrap_err();
+        assert_eq!(err, WorkspaceContextRejection::Mismatch);
+    }
+
+    #[test]
+    fn mismatch_maps_to_403() {
+        let resp = WorkspaceContextRejection::Mismatch.into_response();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
     }
 
     #[tokio::test]
