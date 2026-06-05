@@ -24,7 +24,8 @@ pub use schema::WorkspacePool;
 pub mod documents;
 #[cfg(feature = "pg")]
 pub use documents::{
-    DocError, Document, DocumentPatch, DocumentsRepository, NewDocument, PgDocuments,
+    DocError, Document, DocumentPatch, DocumentShare, DocumentsRepository, NewDocument,
+    PgDocuments, SharesRepository,
 };
 
 /// Canonical id of the bootstrap default workspace.
@@ -84,6 +85,10 @@ const DOCS_0002_SQL: &str = include_str!("../migrations/gt-docs/0002_document_ve
 /// Migration #3: pgvector `embedding` column + HNSW index (phase-2 semantic search).
 const DOCS_0003_SQL: &str = include_str!("../migrations/gt-docs/0003_embedding.sql");
 
+/// Migration #4: per-workspace `document_shares` table — public capability-URL share links
+/// (hq-web-extras.9).
+const DOCS_0004_SQL: &str = include_str!("../migrations/gt-docs/0004_document_shares.sql");
+
 /// Migrations for the `gt-docs` per-workspace document store (hq-docs-store.1), in
 /// ascending apply order.
 ///
@@ -98,6 +103,7 @@ pub fn docs_migrations() -> Vec<Migration> {
         Migration::new(1, "0001_documents", DOCS_0001_SQL),
         Migration::new(2, "0002_document_versions", DOCS_0002_SQL),
         Migration::new(3, "0003_embedding", DOCS_0003_SQL),
+        Migration::new(4, "0004_document_shares", DOCS_0004_SQL),
     ]
 }
 
@@ -153,13 +159,20 @@ mod tests {
     #[test]
     fn docs_migrations_define_template_tables_in_order() {
         let migs = docs_migrations();
-        assert_eq!(migs.len(), 3);
+        assert_eq!(migs.len(), 4);
         assert_eq!(migs[0].version, 1);
         assert_eq!(migs[0].name, "0001_documents");
         assert_eq!(migs[1].version, 2);
         assert_eq!(migs[1].name, "0002_document_versions");
         assert_eq!(migs[2].version, 3);
         assert_eq!(migs[2].name, "0003_embedding");
+        assert_eq!(migs[3].version, 4);
+        assert_eq!(migs[3].name, "0004_document_shares");
+        // Per-workspace share table: in the ws_default template, FKs the live doc, no workspace_id.
+        let shares = &migs[3].sql;
+        assert!(shares.contains("ws_default.document_shares"), "share table in template");
+        assert!(shares.contains("REFERENCES ws_default.documents"), "FKs the live doc");
+        assert!(!shares.contains("workspace_id TEXT"), "no workspace_id column");
         // Phase-2 embedding migration: pgvector extension + vector column + ANN index.
         let emb = &migs[2].sql;
         assert!(emb.contains("CREATE EXTENSION IF NOT EXISTS vector"), "enables pgvector");

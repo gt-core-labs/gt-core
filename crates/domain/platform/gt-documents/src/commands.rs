@@ -156,23 +156,57 @@ impl RemoveDoc {
     }
 }
 
-/// Input for `documents.list`: the live documents of one owner.
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+/// Default page size for a flat document browse when `limit` is omitted.
+fn default_browse_limit() -> i64 {
+    50
+}
+
+/// Input for `documents.list` / `GET /api/v1/documents` (hq-web-extras.11): browse the
+/// workspace's live documents.
+///
+/// Owner is now OPTIONAL (back-compat: with both `owner_type`+`owner_id` it filters exactly as
+/// before; with neither it browses the whole workspace, newest first). Adds `content_type`
+/// filtering and `offset`/`limit` pagination (same envelope shape as `gt://issues`).
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
 pub struct ListDocs {
-    /// Owning bead class.
-    pub owner_type: String,
-    /// Owning bead id.
-    pub owner_id: String,
+    /// Optional owner narrowing: paired with `owner_id`. Omit both for a flat workspace browse.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner_type: Option<String>,
+    /// Optional owner narrowing (paired with `owner_type`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner_id: Option<String>,
+    /// Optional MIME-type filter (e.g. `text/markdown`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub content_type: Option<String>,
+    /// Zero-based page offset. Defaults to 0.
+    #[serde(default)]
+    pub offset: i64,
+    /// Max rows per page. Defaults to 50.
+    #[serde(default = "default_browse_limit")]
+    pub limit: i64,
 }
 
 impl ListDocs {
-    /// Shape-only validation.
+    /// Shape-only validation: the owner pair is all-or-nothing; pagination bounds are sane.
     pub fn validate(&self) -> Result<(), ValidationError> {
-        if self.owner_type.is_empty() {
-            return Err(err("owner_type is empty"));
+        if self.owner_type.is_some() != self.owner_id.is_some() {
+            return Err(err("owner_type and owner_id must be set together (or both omitted)"));
         }
-        if self.owner_id.is_empty() {
-            return Err(err("owner_id is empty"));
+        if let Some(ot) = &self.owner_type {
+            if ot.is_empty() {
+                return Err(err("owner_type is empty"));
+            }
+        }
+        if let Some(oid) = &self.owner_id {
+            if oid.is_empty() {
+                return Err(err("owner_id is empty"));
+            }
+        }
+        if self.offset < 0 {
+            return Err(err("offset must be >= 0"));
+        }
+        if self.limit <= 0 {
+            return Err(err("limit must be > 0"));
         }
         Ok(())
     }
@@ -205,6 +239,56 @@ impl SearchDocs {
         }
         if self.owner_type.is_some() != self.owner_id.is_some() {
             return Err(err("owner_type and owner_id must be set together"));
+        }
+        Ok(())
+    }
+}
+
+/// Input for `POST /:id/share` (hq-web-extras.9): mint a public capability URL onto a document.
+/// The document id rides on the path; `created_by` is the minter's attribution.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
+pub struct CreateShare {
+    /// TTL in seconds from now. Omitted (or `null`) ⇒ the share never expires (until revoked).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expires_in: Option<i64>,
+    /// Who is minting the share (agent or operator). Optional; defaults to the empty attribution.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub created_by: Option<String>,
+}
+
+impl CreateShare {
+    /// Shape-only validation: a present TTL must be positive.
+    pub fn validate(&self) -> Result<(), ValidationError> {
+        if self.expires_in.is_some_and(|s| s <= 0) {
+            return Err(err("expires_in must be > 0 (omit it for no limit)"));
+        }
+        Ok(())
+    }
+}
+
+/// Input for `PATCH /shares/:hash` (hq-web-extras.9): dynamically reset a share's limit —
+/// extend, shorten, or lift it. Exactly one intent is expressed: `expires_in` (relative,
+/// seconds from now), `expires_at` (an absolute RFC3339 instant), or neither — where neither
+/// present field means "lift the limit" (no expiry). The hash rides on the path.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
+pub struct PatchShare {
+    /// New TTL in seconds from now (extend / shorten). Mutually exclusive with `expires_at`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expires_in: Option<i64>,
+    /// New absolute expiry as an RFC3339 timestamp. Mutually exclusive with `expires_in`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expires_at: Option<String>,
+}
+
+impl PatchShare {
+    /// Shape-only validation: the two limit forms are mutually exclusive; a present
+    /// `expires_in` must be positive.
+    pub fn validate(&self) -> Result<(), ValidationError> {
+        if self.expires_in.is_some() && self.expires_at.is_some() {
+            return Err(err("set at most one of expires_in / expires_at"));
+        }
+        if self.expires_in.is_some_and(|s| s <= 0) {
+            return Err(err("expires_in must be > 0 (omit both fields to lift the limit)"));
         }
         Ok(())
     }
@@ -273,6 +357,32 @@ mod tests {
             edited_by: "e".into(),
         };
         assert!(noop.validate().is_err());
+    }
+
+    #[test]
+    fn create_share_rejects_non_positive_ttl() {
+        assert!(CreateShare::default().validate().is_ok(), "no TTL = no limit");
+        assert!(CreateShare { expires_in: Some(3600), created_by: None }.validate().is_ok());
+        assert!(CreateShare { expires_in: Some(0), created_by: None }.validate().is_err());
+        assert!(CreateShare { expires_in: Some(-1), created_by: None }.validate().is_err());
+    }
+
+    #[test]
+    fn patch_share_forms_are_mutually_exclusive() {
+        assert!(PatchShare::default().validate().is_ok(), "neither field = lift the limit");
+        assert!(PatchShare { expires_in: Some(60), expires_at: None }.validate().is_ok());
+        assert!(
+            PatchShare { expires_in: None, expires_at: Some("2030-01-01T00:00:00Z".into()) }
+                .validate()
+                .is_ok()
+        );
+        assert!(
+            PatchShare { expires_in: Some(60), expires_at: Some("2030-01-01T00:00:00Z".into()) }
+                .validate()
+                .is_err(),
+            "both forms at once is rejected"
+        );
+        assert!(PatchShare { expires_in: Some(0), expires_at: None }.validate().is_err());
     }
 
     #[test]

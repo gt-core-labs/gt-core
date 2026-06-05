@@ -143,6 +143,17 @@ pub trait DocumentsRepository: Send + Sync {
     /// newest first. Backs the `gt://issue/{id}` resource inline (hq-docs-api.3): an
     /// issue's documents are those carrying its id, whatever class the attacher chose.
     async fn list_by_owner_id(&self, owner_id: &str) -> Result<Vec<Document>, DocError>;
+    /// Flat, paged browse of the workspace's live documents, newest first (hq-web-extras.11).
+    /// All filters are optional: `owner` narrows to one bead (back-compat with `list_by_owner`),
+    /// `content_type` narrows by MIME. Fetches `limit + 1` rows from `offset` so the caller can
+    /// derive `has_more` without a separate COUNT; the caller truncates to `limit`.
+    async fn browse(
+        &self,
+        owner: Option<(&str, &str)>,
+        content_type: Option<&str>,
+        offset: i64,
+        limit: i64,
+    ) -> Result<Vec<Document>, DocError>;
     /// Dedup probe: the first live document whose content hash matches, or `None`.
     async fn find_by_sha(&self, sha256: &str) -> Result<Option<Document>, DocError>;
     /// Phase-1 full-text search (hq-docs-search.1) over `body_md`/`extracted_text` via the
@@ -267,6 +278,41 @@ impl DocumentsRepository for PgDocuments {
         .bind(owner_id)
         .fetch_all(self.pool.pool())
         .await?;
+        Ok(rows)
+    }
+
+    async fn browse(
+        &self,
+        owner: Option<(&str, &str)>,
+        content_type: Option<&str>,
+        offset: i64,
+        limit: i64,
+    ) -> Result<Vec<Document>, DocError> {
+        // Build the optional predicates with stable bind positions: $1 offset, $2 limit (+1 for
+        // the has_more probe). Owner binds $3/$4; content_type binds the next free slot.
+        let mut clauses = String::new();
+        if owner.is_some() {
+            clauses.push_str(" AND owner_type = $3 AND owner_id = $4");
+        }
+        if content_type.is_some() {
+            // $5 when an owner is also bound, else $3.
+            let pos = if owner.is_some() { 5 } else { 3 };
+            clauses.push_str(&format!(" AND content_type = ${pos}"));
+        }
+        let sql = format!(
+            "SELECT {COLS} FROM documents \
+             WHERE deleted_at IS NULL{clauses} \
+             ORDER BY uploaded_at DESC, id DESC \
+             OFFSET $1 LIMIT $2"
+        );
+        let mut q = sqlx::query_as(&sql).bind(offset).bind(limit + 1);
+        if let Some((ot, oid)) = owner {
+            q = q.bind(ot).bind(oid);
+        }
+        if let Some(ct) = content_type {
+            q = q.bind(ct);
+        }
+        let rows = q.fetch_all(self.pool.pool()).await?;
         Ok(rows)
     }
 
@@ -408,6 +454,196 @@ impl DocumentsRepository for PgDocuments {
             return Err(conflict_or_not_found(self, id, expected_version).await);
         }
         Ok(())
+    }
+}
+
+/// A document share-link row (hq-web-extras.9): a public capability URL onto a LIVE document.
+/// The `hash` is the only credential a reader presents; `expires_at`/`revoked` gate access,
+/// evaluated lazily at read time so no GC job is required.
+#[derive(Debug, Clone, FromRow)]
+pub struct DocumentShare {
+    /// The capability token (128-bit url-safe), PK and public credential.
+    pub hash: String,
+    /// The document this share exposes (live content).
+    pub document_id: String,
+    /// Who minted the share.
+    pub created_by: String,
+    /// When it was minted.
+    pub created_at: DateTime<Utc>,
+    /// Expiry instant; `None` = no limit (until revoked).
+    pub expires_at: Option<DateTime<Utc>>,
+    /// Hard revocation: a revoked share is dead regardless of expiry.
+    pub revoked: bool,
+    /// Last public read (informational; never gates access).
+    pub last_accessed_at: Option<DateTime<Utc>>,
+}
+
+impl DocumentShare {
+    /// The derived lifecycle state at `now`: `revoked` wins, then a past `expires_at` is
+    /// `expired`, else `active`. The string matches the wire contract (active|expired|revoked).
+    pub fn state_at(&self, now: DateTime<Utc>) -> &'static str {
+        if self.revoked {
+            "revoked"
+        } else if self.expires_at.is_some_and(|e| now > e) {
+            "expired"
+        } else {
+            "active"
+        }
+    }
+}
+
+/// The per-workspace document-share store port (hq-web-extras.9). Backs the public capability-URL
+/// surface; the adapter resolves the tenant by the same `search_path` the documents port does.
+#[async_trait]
+pub trait SharesRepository: Send + Sync {
+    /// Mint a share for a live document. `hash` is the caller-minted capability token;
+    /// `expires_at` is the optional TTL deadline. [`DocError::NotFound`] if the document is
+    /// absent or soft-deleted (a share onto a dead doc is never created).
+    async fn create_share(
+        &self,
+        hash: &str,
+        document_id: &str,
+        created_by: &str,
+        expires_at: Option<DateTime<Utc>>,
+    ) -> Result<DocumentShare, DocError>;
+    /// List every share whose document is still live, newest first. Backs the owner's management
+    /// view (`GET /shares`); the derived state is computed by the caller from each row.
+    async fn list_shares(&self) -> Result<Vec<DocumentShare>, DocError>;
+    /// Fetch one share by its hash (any state), or `None`.
+    async fn get_share(&self, hash: &str) -> Result<Option<DocumentShare>, DocError>;
+    /// Reset a share's expiry deadline (extend / shorten / lift): `Some(t)` sets the deadline,
+    /// `None` lifts the limit. [`DocError::NotFound`] when no such share exists. Returns the
+    /// post-update row.
+    async fn set_share_expiry(
+        &self,
+        hash: &str,
+        expires_at: Option<DateTime<Utc>>,
+    ) -> Result<DocumentShare, DocError>;
+    /// Revoke a share (idempotent): a missing or already-revoked share is a no-op success, so a
+    /// double-DELETE still returns OK.
+    async fn revoke_share(&self, hash: &str) -> Result<(), DocError>;
+    /// Read the LIVE document behind an *active* share by hash, touching `last_accessed_at`.
+    /// Returns the share row paired with its document only when the share resolves to `active`
+    /// at `now`; otherwise the share's derived state (so the caller maps revoked→404,
+    /// expired→410). [`DocError::NotFound`] when the hash is unknown or the doc is gone.
+    async fn read_active_share(
+        &self,
+        hash: &str,
+        now: DateTime<Utc>,
+    ) -> Result<(DocumentShare, Option<Document>), DocError>;
+}
+
+#[async_trait]
+impl SharesRepository for PgDocuments {
+    async fn create_share(
+        &self,
+        hash: &str,
+        document_id: &str,
+        created_by: &str,
+        expires_at: Option<DateTime<Utc>>,
+    ) -> Result<DocumentShare, DocError> {
+        // Guard: only mint a share onto a live document.
+        let exists: Option<String> =
+            sqlx::query_scalar("SELECT id FROM documents WHERE id = $1 AND deleted_at IS NULL")
+                .bind(document_id)
+                .fetch_optional(self.pool.pool())
+                .await?;
+        if exists.is_none() {
+            return Err(DocError::NotFound(document_id.to_string()));
+        }
+        let row: DocumentShare = sqlx::query_as(
+            "INSERT INTO document_shares (hash, document_id, created_by, expires_at) \
+             VALUES ($1, $2, $3, $4) \
+             RETURNING hash, document_id, created_by, created_at, expires_at, revoked, \
+                       last_accessed_at",
+        )
+        .bind(hash)
+        .bind(document_id)
+        .bind(created_by)
+        .bind(expires_at)
+        .fetch_one(self.pool.pool())
+        .await?;
+        Ok(row)
+    }
+
+    async fn list_shares(&self) -> Result<Vec<DocumentShare>, DocError> {
+        let rows = sqlx::query_as(
+            "SELECT s.hash, s.document_id, s.created_by, s.created_at, s.expires_at, \
+                    s.revoked, s.last_accessed_at \
+             FROM document_shares s \
+             JOIN documents d ON d.id = s.document_id AND d.deleted_at IS NULL \
+             ORDER BY s.created_at DESC",
+        )
+        .fetch_all(self.pool.pool())
+        .await?;
+        Ok(rows)
+    }
+
+    async fn get_share(&self, hash: &str) -> Result<Option<DocumentShare>, DocError> {
+        let row = sqlx::query_as(
+            "SELECT hash, document_id, created_by, created_at, expires_at, revoked, \
+                    last_accessed_at FROM document_shares WHERE hash = $1",
+        )
+        .bind(hash)
+        .fetch_optional(self.pool.pool())
+        .await?;
+        Ok(row)
+    }
+
+    async fn set_share_expiry(
+        &self,
+        hash: &str,
+        expires_at: Option<DateTime<Utc>>,
+    ) -> Result<DocumentShare, DocError> {
+        // A NULL `expires_at` lifts the limit; a value resets it. The `$2 IS NULL` arm makes the
+        // "lift" explicit rather than a no-op COALESCE would-be.
+        let row: Option<DocumentShare> = sqlx::query_as(
+            "UPDATE document_shares SET expires_at = $2 WHERE hash = $1 \
+             RETURNING hash, document_id, created_by, created_at, expires_at, revoked, \
+                       last_accessed_at",
+        )
+        .bind(hash)
+        .bind(expires_at)
+        .fetch_optional(self.pool.pool())
+        .await?;
+        row.ok_or_else(|| DocError::NotFound(hash.to_string()))
+    }
+
+    async fn revoke_share(&self, hash: &str) -> Result<(), DocError> {
+        // Idempotent: a missing/already-revoked share is a successful no-op.
+        sqlx::query("UPDATE document_shares SET revoked = TRUE WHERE hash = $1")
+            .bind(hash)
+            .execute(self.pool.pool())
+            .await?;
+        Ok(())
+    }
+
+    async fn read_active_share(
+        &self,
+        hash: &str,
+        now: DateTime<Utc>,
+    ) -> Result<(DocumentShare, Option<Document>), DocError> {
+        let share = match self.get_share(hash).await? {
+            Some(s) => s,
+            None => return Err(DocError::NotFound(hash.to_string())),
+        };
+        // Only resolve the document when the share is active; the caller maps the derived state
+        // (revoked→404, expired→410) without ever leaking the content.
+        if share.state_at(now) != "active" {
+            return Ok((share, None));
+        }
+        let doc = self.get(&share.document_id).await?;
+        // A soft-deleted/absent doc behind an otherwise-active share reads as gone.
+        let doc = doc.filter(|d| d.deleted_at.is_none());
+        if doc.is_some() {
+            // Best-effort touch; a failure here never blocks the read.
+            let _ = sqlx::query("UPDATE document_shares SET last_accessed_at = $2 WHERE hash = $1")
+                .bind(hash)
+                .bind(now)
+                .execute(self.pool.pool())
+                .await;
+        }
+        Ok((share, doc))
     }
 }
 

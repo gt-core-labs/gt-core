@@ -120,6 +120,13 @@ fn parity_map(ns: &str) -> Vec<Route> {
             rt("GET", "/{id}", None), // gt://doc/{id}
             rt("PATCH", "/{id}", Some("documents.update.execute")),
             rt("DELETE", "/{id}", Some("documents.remove.execute")),
+            // Share lifecycle (hq-web-extras.9) — REST-only capability URLs, no MCP tool sibling.
+            // The public GET /share/{hash} read lives in a SEPARATE PublicApiDoc mounted outside
+            // /api/v1/documents, so it never enters this namespace's served OpenAPI (no row here).
+            rt("POST", "/{id}/share", None),
+            rt("GET", "/shares", None),
+            rt("PATCH", "/shares/{hash}", None),
+            rt("DELETE", "/shares/{hash}", None),
         ],
         "agent" => vec![
             rt("GET", "/", Some("agent.list")),

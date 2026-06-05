@@ -139,8 +139,28 @@ impl DomainHandler for DocumentsHandler {
                 let cmd = parse::<ListDocs>(ctx.args)?;
                 cmd.validate().map_err(val)?;
                 let repo = self.repo(ctx.workspace).await?;
-                let docs = repo.list_by_owner(&cmd.owner_type, &cmd.owner_id).await.map_err(doc_err)?;
-                Ok(json!({ "documents": docs.iter().map(doc_json).collect::<Vec<_>>() }))
+                // Flat, paged browse (hq-web-extras.11): owner is optional (back-compat when both
+                // owner_type+owner_id are set), plus content_type filter + offset/limit paging.
+                let owner = match (&cmd.owner_type, &cmd.owner_id) {
+                    (Some(t), Some(i)) => Some((t.as_str(), i.as_str())),
+                    _ => None,
+                };
+                let mut docs = repo
+                    .browse(owner, cmd.content_type.as_deref(), cmd.offset, cmd.limit)
+                    .await
+                    .map_err(doc_err)?;
+                let has_more = docs.len() as i64 > cmd.limit;
+                if has_more {
+                    docs.truncate(cmd.limit as usize);
+                }
+                let next_offset = has_more.then_some(cmd.offset + cmd.limit);
+                Ok(json!({
+                    "documents": docs.iter().map(doc_json).collect::<Vec<_>>(),
+                    "offset": cmd.offset,
+                    "limit": cmd.limit,
+                    "has_more": has_more,
+                    "next_offset": next_offset,
+                }))
             }
             "documents.search.validate" => {
                 parse::<SearchDocs>(ctx.args)?.validate().map_err(val)?;

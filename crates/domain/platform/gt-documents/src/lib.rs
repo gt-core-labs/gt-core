@@ -19,7 +19,13 @@ pub mod commands;
 pub mod http;
 mod module;
 
-pub use commands::{AttachDoc, ListDocs, RemoveDoc, SearchDocs, UpdateDoc, ValidationError};
+pub use commands::{
+    AttachDoc, CreateShare, ListDocs, PatchShare, RemoveDoc, SearchDocs, UpdateDoc,
+    ValidationError,
+};
 #[cfg(feature = "axum")]
-pub use http::{documents_router, ApiDoc, DocumentsApiState};
+pub use http::{
+    documents_router, public_openapi, public_share_router, ApiDoc, DocumentsApiState,
+    PublicApiDoc,
+};
 pub use module::DocumentsModule;

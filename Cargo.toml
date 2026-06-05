@@ -109,6 +109,11 @@ simple_asn1 = "0.6"
 # feature wires encode/decode of the `vector` type over the PG wire.
 pgvector = { version = "0.4", default-features = false, features = ["sqlx"] }
 
+# Date/time the document/share ports surface (`DateTime<Utc>`) + relative TTL arithmetic
+# (`Duration`) for share-link expiry (hq-web-extras.9). Same crate `sqlx` resolves via its
+# `chrono` feature, pinned here so the REST adapter constructs/compares those types directly.
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
+
 # Storage
 sqlx = { version = "0.8", default-features = false, features = ["postgres", "macros", "runtime-tokio-rustls", "uuid", "chrono"] }
 # MySQL-wire client for Dolt (:3307); lifted issues store (hq-core-host.1). No

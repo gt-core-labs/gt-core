@@ -38,11 +38,15 @@ use serde_json::{json, Value};
 use gt_docs_embed::Embedder;
 use gt_docs_extract::Extractor;
 use gt_store_blob::{sha256_hex, BlobStore};
+use chrono::{DateTime, Duration, Utc};
 use gt_store_pg::{
-    DocError, Document, DocumentPatch, DocumentsRepository, NewDocument, PgDocuments, WorkspacePool,
+    DocError, Document, DocumentPatch, DocumentShare, DocumentsRepository, NewDocument,
+    PgDocuments, SharesRepository, WorkspacePool,
 };
 
-use crate::commands::{AttachDoc, ListDocs, RemoveDoc, SearchDocs, UpdateDoc, ValidationError};
+use crate::commands::{
+    AttachDoc, CreateShare, ListDocs, PatchShare, RemoveDoc, SearchDocs, UpdateDoc, ValidationError,
+};
 
 /// The header carrying the request's tenant — server-injected by the auth/workspace middleware,
 /// never read from a URL or body field (the same `X-Workspace` convention the dispatch + SSE
@@ -215,18 +219,34 @@ impl DocumentsApiState {
 ///
 /// | Method + path           | Maps to MCP tool            |
 /// |-------------------------|-----------------------------|
-/// | `GET /?owner_type&owner_id` | `documents.list.execute`   |
+/// | `GET /?owner_type&owner_id&content_type&offset&limit` | `documents.list.execute` |
 /// | `POST /`                | `documents.attach.execute`  |
 /// | `GET /search?query`     | `documents.search.execute`  |
 /// | `GET /:id`              | `gt://doc/{id}` read        |
 /// | `PATCH /:id`            | `documents.update.execute`  |
 /// | `DELETE /:id?expected_version` | `documents.remove.execute` |
+/// | `POST /:id/share`       | REST-only (hq-web-extras.9)  |
+/// | `GET /shares`           | REST-only (hq-web-extras.9)  |
+/// | `PATCH /shares/:hash`   | REST-only (hq-web-extras.9)  |
+/// | `DELETE /shares/:hash`  | REST-only (hq-web-extras.9)  |
 pub fn documents_router(state: DocumentsApiState) -> Router {
     Router::new()
         .route("/", get(list_documents).post(attach_document))
         .route("/search", get(search_documents))
+        .route("/shares", get(list_shares))
+        .route("/shares/:hash", axum::routing::patch(patch_share).delete(revoke_share))
+        .route("/:id/share", axum::routing::post(create_share))
         .route("/:id", get(get_document).patch(update_document).delete(remove_document))
         .with_state(state)
+}
+
+/// Build the PUBLIC share-read router (hq-web-extras.9): `GET /share/:hash` served OUTSIDE the
+/// `/api/v1/<ns>` chain — unauthenticated, like `/openapi.json`. The composition bin mounts this
+/// on the ops/public router, never behind the RS256 auth + scope guard. It exposes the LIVE
+/// content of a document behind an *active* share; a revoked share is a `404`, an expired one a
+/// `410 Gone`.
+pub fn public_share_router(state: DocumentsApiState) -> Router {
+    Router::new().route("/share/:hash", get(read_public_share)).with_state(state)
 }
 
 /// `POST /` — attach a document to a bead (`documents.attach.execute`). The id is minted
@@ -250,15 +270,23 @@ async fn attach_document(
     Ok((StatusCode::CREATED, Json(doc_json(&doc))).into_response())
 }
 
-/// `GET /?owner_type&owner_id` — the live documents attached to an owner bead, newest first
-/// (`documents.list.execute`).
+/// `GET /?owner_type&owner_id&content_type&offset&limit` — a flat, paged browse of the
+/// workspace's live documents, newest first (`documents.list.execute`, hq-web-extras.11).
+///
+/// Owner is optional: with both `owner_type`+`owner_id` it filters to one bead (back-compat);
+/// with neither it browses the whole workspace. `content_type` narrows by MIME. The response is
+/// the paged envelope `{ documents, offset, limit, has_more, next_offset }` (the `gt://issues`
+/// shape) — `next_offset` is `null` on the last page.
 #[utoipa::path(
     get, path = "/",
     params(
-        ("owner_type" = String, Query, description = "Owning bead class (epic|skill|spec)"),
-        ("owner_id" = String, Query, description = "Owning bead id"),
+        ("owner_type" = Option<String>, Query, description = "Optional owner narrowing (paired with owner_id)"),
+        ("owner_id" = Option<String>, Query, description = "Optional owner narrowing (paired with owner_type)"),
+        ("content_type" = Option<String>, Query, description = "Optional MIME-type filter"),
+        ("offset" = Option<i64>, Query, description = "Zero-based page offset (default 0)"),
+        ("limit" = Option<i64>, Query, description = "Max rows per page (default 50)"),
     ),
-    responses((status = 200, description = "Documents for the owner")),
+    responses((status = 200, description = "A page of workspace documents (paged envelope)")),
 )]
 async fn list_documents(
     State(st): State<DocumentsApiState>,
@@ -267,8 +295,27 @@ async fn list_documents(
 ) -> Result<Json<Value>, ApiError> {
     cmd.validate()?;
     let repo = st.repo(workspace_of(&headers).as_deref()).await?;
-    let docs = repo.list_by_owner(&cmd.owner_type, &cmd.owner_id).await.map_err(doc_err)?;
-    Ok(Json(json!({ "documents": docs.iter().map(doc_json).collect::<Vec<_>>() })))
+    let owner = match (&cmd.owner_type, &cmd.owner_id) {
+        (Some(t), Some(i)) => Some((t.as_str(), i.as_str())),
+        _ => None,
+    };
+    // browse fetches limit+1 to derive has_more without a COUNT; truncate to the page.
+    let mut docs = repo
+        .browse(owner, cmd.content_type.as_deref(), cmd.offset, cmd.limit)
+        .await
+        .map_err(doc_err)?;
+    let has_more = docs.len() as i64 > cmd.limit;
+    if has_more {
+        docs.truncate(cmd.limit as usize);
+    }
+    let next_offset = has_more.then_some(cmd.offset + cmd.limit);
+    Ok(Json(json!({
+        "documents": docs.iter().map(doc_json).collect::<Vec<_>>(),
+        "offset": cmd.offset,
+        "limit": cmd.limit,
+        "has_more": has_more,
+        "next_offset": next_offset,
+    })))
 }
 
 /// `GET /search?query&owner_type&owner_id&limit` — hybrid (text + vector) search when an embedder
@@ -403,6 +450,181 @@ struct RemoveQuery {
     expected_version: i64,
 }
 
+// ---------------------------------------------------------------------------------------------
+// Share lifecycle (hq-web-extras.9): public capability URLs onto a live document.
+// ---------------------------------------------------------------------------------------------
+
+/// `POST /:id/share` — mint a public capability URL onto a document (`documents.write`). The doc
+/// id rides on the path. `expires_in` (seconds, optional) sets the TTL; omit it for no limit.
+/// `201` with the share `{ hash, url, state, expires_at, ... }`. Several shares per document are
+/// allowed, each with its own TTL.
+#[utoipa::path(
+    post, path = "/{id}/share",
+    params(("id" = String, Path, description = "Document id to share")),
+    responses(
+        (status = 201, description = "Share minted"),
+        (status = 404, description = "No live document with that id"),
+        (status = 422, description = "Validation failed (non-positive TTL)"),
+    ),
+)]
+async fn create_share(
+    State(st): State<DocumentsApiState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    body: Option<Json<CreateShare>>,
+) -> Result<Response, ApiError> {
+    let cmd = body.map(|Json(c)| c).unwrap_or_default();
+    cmd.validate()?;
+    let repo = st.repo(workspace_of(&headers).as_deref()).await?;
+    let hash = mint_hash();
+    let expires_at = cmd.expires_in.map(|secs| Utc::now() + Duration::seconds(secs));
+    let created_by = cmd.created_by.unwrap_or_default();
+    let share = repo
+        .create_share(&hash, &id, &created_by, expires_at)
+        .await
+        .map_err(doc_err)?;
+    Ok((StatusCode::CREATED, Json(share_json(&share, Utc::now()))).into_response())
+}
+
+/// `GET /shares` — list the workspace's shares whose document is still live, with each share's
+/// derived state (`active|expired|revoked`) computed now (`documents.read`).
+#[utoipa::path(
+    get, path = "/shares",
+    responses((status = 200, description = "The workspace's shares with derived state")),
+)]
+async fn list_shares(
+    State(st): State<DocumentsApiState>,
+    headers: HeaderMap,
+) -> Result<Json<Value>, ApiError> {
+    let repo = st.repo(workspace_of(&headers).as_deref()).await?;
+    let now = Utc::now();
+    let shares = SharesRepository::list_shares(&repo).await.map_err(doc_err)?;
+    Ok(Json(json!({
+        "shares": shares.iter().map(|s| share_json(s, now)).collect::<Vec<_>>(),
+    })))
+}
+
+/// `PATCH /shares/:hash` — dynamically reset a share's limit: extend/shorten via `expires_in`
+/// (seconds from now) or `expires_at` (RFC3339), or lift it entirely by sending neither
+/// (`documents.write`). Returns the post-update share. `404` when the hash is unknown.
+#[utoipa::path(
+    patch, path = "/shares/{hash}",
+    params(("hash" = String, Path, description = "Share capability hash")),
+    responses(
+        (status = 200, description = "Share limit reset; returns the share"),
+        (status = 404, description = "No share with that hash"),
+        (status = 422, description = "Validation failed (both forms set / bad timestamp)"),
+    ),
+)]
+async fn patch_share(
+    State(st): State<DocumentsApiState>,
+    headers: HeaderMap,
+    Path(hash): Path<String>,
+    body: Option<Json<PatchShare>>,
+) -> Result<Json<Value>, ApiError> {
+    let cmd = body.map(|Json(c)| c).unwrap_or_default();
+    cmd.validate()?;
+    // Resolve the new deadline: relative (expires_in) → absolute now+TTL; absolute (expires_at)
+    // → parse RFC3339; neither present → None (lift the limit).
+    let expires_at = if let Some(secs) = cmd.expires_in {
+        Some(Utc::now() + Duration::seconds(secs))
+    } else if let Some(ts) = &cmd.expires_at {
+        Some(
+            DateTime::parse_from_rfc3339(ts)
+                .map_err(|e| ApiError::Validation(format!("expires_at is not RFC3339: {e}")))?
+                .with_timezone(&Utc),
+        )
+    } else {
+        None
+    };
+    let repo = st.repo(workspace_of(&headers).as_deref()).await?;
+    let share = repo.set_share_expiry(&hash, expires_at).await.map_err(doc_err)?;
+    Ok(Json(share_json(&share, Utc::now())))
+}
+
+/// `DELETE /shares/:hash` — revoke a share (`documents.write`). Idempotent: a missing or
+/// already-revoked share is still a `200`, so a double-DELETE is safe.
+#[utoipa::path(
+    delete, path = "/shares/{hash}",
+    params(("hash" = String, Path, description = "Share capability hash")),
+    responses((status = 200, description = "Share revoked (idempotent)")),
+)]
+async fn revoke_share(
+    State(st): State<DocumentsApiState>,
+    headers: HeaderMap,
+    Path(hash): Path<String>,
+) -> Result<Json<Value>, ApiError> {
+    let repo = st.repo(workspace_of(&headers).as_deref()).await?;
+    SharesRepository::revoke_share(&repo, &hash).await.map_err(doc_err)?;
+    Ok(Json(json!({ "ok": true, "hash": hash, "revoked": true })))
+}
+
+/// `GET /share/:hash` — PUBLIC, unauthenticated read of the LIVE document behind an *active*
+/// share (hq-web-extras.9). Served outside the `/api/v1` auth chain. Lazy expiry: the state is
+/// computed at read time. `active` ⇒ `200` with the document (markdown + metadata); `revoked` ⇒
+/// `404`; `expired` ⇒ `410 Gone`; unknown hash / vanished doc ⇒ `404`. Never leaks session data.
+#[utoipa::path(
+    get, path = "/share/{hash}",
+    params(("hash" = String, Path, description = "Share capability hash (the public credential)")),
+    responses(
+        (status = 200, description = "The live document behind an active share"),
+        (status = 404, description = "Unknown / revoked share, or the document is gone"),
+        (status = 410, description = "The share has expired"),
+    ),
+)]
+async fn read_public_share(
+    State(st): State<DocumentsApiState>,
+    headers: HeaderMap,
+    Path(hash): Path<String>,
+) -> Result<Response, ApiError> {
+    let repo = st.repo(workspace_of(&headers).as_deref()).await?;
+    let now = Utc::now();
+    let (share, doc) = repo.read_active_share(&hash, now).await.map_err(doc_err)?;
+    match share.state_at(now) {
+        "active" => match doc {
+            // Public payload: the document content + meta, plus the share fields the renderer
+            // shows. No owner/session data beyond what the document row already carries.
+            Some(d) => Ok((StatusCode::OK, Json(json!({
+                "share": share_json(&share, now),
+                "document": doc_json(&d),
+            })))
+            .into_response()),
+            // Active share but the doc vanished (soft-deleted) ⇒ gone.
+            None => Err(ApiError::NotFound(format!("document behind share {hash} is gone"))),
+        },
+        // A revoked share is indistinguishable from an unknown one to the public (no oracle).
+        "revoked" => Err(ApiError::NotFound(format!("share not found: {hash}"))),
+        // Expired ⇒ 410 Gone (the capability existed but its window closed).
+        _ => Err(ApiError::Gone(format!("share expired: {hash}"))),
+    }
+}
+
+/// Mint a 128-bit url-safe capability token: 16 bytes of OS entropy, base64-url (no padding) →
+/// 22 chars. Brute-forcing the keyspace is computationally infeasible.
+fn mint_hash() -> String {
+    let mut bytes = [0u8; 16];
+    // `getrandom` reads the OS CSPRNG; a failure here is unrecoverable (no entropy source).
+    getrandom::getrandom(&mut bytes).expect("OS CSPRNG available for share hash");
+    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes)
+}
+
+/// Render a [`DocumentShare`] as the JSON the API returns: the hash + derived `state` at `now`,
+/// the absolute `expires_at`, and the relative public capability path (`/share/{hash}`) the FE
+/// resolves against its origin.
+fn share_json(s: &DocumentShare, now: DateTime<Utc>) -> Value {
+    json!({
+        "hash": s.hash,
+        "document_id": s.document_id,
+        "url": format!("/share/{}", s.hash),
+        "state": s.state_at(now),
+        "created_by": s.created_by,
+        "created_at": s.created_at.to_rfc3339(),
+        "expires_at": s.expires_at.map(|t| t.to_rfc3339()),
+        "revoked": s.revoked,
+        "last_accessed_at": s.last_accessed_at.map(|t| t.to_rfc3339()),
+    })
+}
+
 /// The combined OpenAPI document for the documents REST surface (`hq-fe-api-platform.3`). The
 /// builder mounts it under the module prefix and rewrites its relative paths to
 /// `/api/v1/documents/...`, so the `#[utoipa::path]` annotations stay prefix-free.
@@ -414,8 +636,27 @@ struct RemoveQuery {
     get_document,
     update_document,
     remove_document,
+    create_share,
+    list_shares,
+    patch_share,
+    revoke_share,
 ))]
 pub struct ApiDoc;
+
+/// The OpenAPI document for the PUBLIC share-read surface (`GET /share/{hash}`,
+/// hq-web-extras.9). Kept SEPARATE from [`ApiDoc`] because it is mounted outside the
+/// `/api/v1/documents` prefix — directly at the app root, unauthenticated, like `/openapi.json`.
+/// The composition bin merges this into the fused `/openapi.json` so codegen sees it.
+#[derive(utoipa::OpenApi)]
+#[openapi(paths(read_public_share))]
+pub struct PublicApiDoc;
+
+/// The rendered OpenAPI for the public share-read surface, as the concrete
+/// [`utoipa::openapi::OpenApi`] — so a consumer (the composition bin) can `merge` it into the
+/// fused `/openapi.json` without importing the `utoipa::OpenApi` derive trait itself.
+pub fn public_openapi() -> utoipa::openapi::OpenApi {
+    <PublicApiDoc as utoipa::OpenApi>::openapi()
+}
 
 /// The request's tenant from the server-injected `X-Workspace` header, or `None` (the default
 /// workspace) when absent/blank. Never read from the path or body (docs/04 §15).
@@ -453,6 +694,8 @@ enum ApiError {
     Validation(String),
     /// `409` — an optimistic-concurrency conflict (stale `expected_version`).
     Conflict(String),
+    /// `410` — the resource existed but its window has closed (an expired share).
+    Gone(String),
     /// `500` — a backend/store failure or missing object store.
     Internal(String),
 }
@@ -469,6 +712,7 @@ impl IntoResponse for ApiError {
             ApiError::NotFound(m) => (StatusCode::NOT_FOUND, m),
             ApiError::Validation(m) => (StatusCode::UNPROCESSABLE_ENTITY, m),
             ApiError::Conflict(m) => (StatusCode::CONFLICT, m),
+            ApiError::Gone(m) => (StatusCode::GONE, m),
             ApiError::Internal(m) => (StatusCode::INTERNAL_SERVER_ERROR, m),
         };
         (status, msg).into_response()
@@ -524,11 +768,54 @@ mod tests {
         // rewrite them. Every declared route must be present so the combined document is complete.
         let doc = ApiDoc::openapi();
         let paths: Vec<&str> = doc.paths.paths.keys().map(String::as_str).collect();
-        for expected in ["/", "/search", "/{id}"] {
+        for expected in
+            ["/", "/search", "/{id}", "/{id}/share", "/shares", "/shares/{hash}"]
+        {
             assert!(paths.contains(&expected), "missing {expected} in {paths:?}");
         }
         // Prefix-free: the module builder, not the annotation, owns `/api/v1/documents`.
         assert!(paths.iter().all(|p| !p.contains("/api/v1")), "{paths:?}");
+    }
+
+    #[test]
+    fn public_apidoc_carries_only_the_share_read_route() {
+        use utoipa::OpenApi;
+        let doc = PublicApiDoc::openapi();
+        let paths: Vec<&str> = doc.paths.paths.keys().map(String::as_str).collect();
+        assert_eq!(paths, ["/share/{hash}"], "public doc is just the share read: {paths:?}");
+    }
+
+    #[test]
+    fn mint_hash_is_22_char_urlsafe_and_unique() {
+        let a = mint_hash();
+        let b = mint_hash();
+        assert_eq!(a.len(), 22, "16 bytes base64url-no-pad = 22 chars: {a}");
+        assert_ne!(a, b, "two mints differ");
+        assert!(
+            a.bytes().all(|c| c.is_ascii_alphanumeric() || c == b'-' || c == b'_'),
+            "url-safe alphabet only: {a}",
+        );
+    }
+
+    #[test]
+    fn share_state_derivation_revoked_wins_then_expiry() {
+        let now = Utc::now();
+        let base = DocumentShare {
+            hash: "h".into(),
+            document_id: "d".into(),
+            created_by: "u".into(),
+            created_at: now,
+            expires_at: None,
+            revoked: false,
+            last_accessed_at: None,
+        };
+        assert_eq!(base.state_at(now), "active", "no expiry, not revoked");
+        let mut expired = base.clone();
+        expired.expires_at = Some(now - Duration::seconds(1));
+        assert_eq!(expired.state_at(now), "expired");
+        let mut revoked = expired.clone();
+        revoked.revoked = true;
+        assert_eq!(revoked.state_at(now), "revoked", "revoked beats expiry");
     }
 
     #[test]
@@ -537,6 +824,7 @@ mod tests {
             (ApiError::NotFound("x".into()), StatusCode::NOT_FOUND),
             (ApiError::Validation("x".into()), StatusCode::UNPROCESSABLE_ENTITY),
             (ApiError::Conflict("x".into()), StatusCode::CONFLICT),
+            (ApiError::Gone("x".into()), StatusCode::GONE),
             (ApiError::Internal("x".into()), StatusCode::INTERNAL_SERVER_ERROR),
         ];
         for (err, want) in cases {

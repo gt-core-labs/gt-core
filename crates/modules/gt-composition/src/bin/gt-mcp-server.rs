@@ -394,6 +394,9 @@ async fn main() -> anyhow::Result<()> {
         .module(ConvoyModule::with_http(ConvoyApiState::new(Arc::new(EventLogConvoy::new(
             event_log.clone(),
         )))));
+    // The public, unauthenticated share-read surface (hq-web-extras.9): set when documents mount,
+    // mounted OUTSIDE the /api/v1 auth chain (like /openapi.json). `None` without Postgres.
+    let mut public_share: Option<axum::Router> = None;
     if let Ok(pg_url) = std::env::var("GT_PG_URL") {
         let pool = sqlx::PgPool::connect(&pg_url)
             .await
@@ -406,13 +409,17 @@ async fn main() -> anyhow::Result<()> {
                 WsPools::new(pg_url.clone()),
             ))))));
         let (blob, bucket) = build_blob_store();
-        rest = rest.module(DocumentsModule::with_http(DocumentsApiState::new(
+        // Build the documents REST state once; the authenticated module router and the public
+        // share-read router (hq-web-extras.9) share the same store handles.
+        let docs_state = DocumentsApiState::new(
             pg_url,
             blob,
             bucket,
             Extractor::without_ocr(),
             build_embedder(),
-        )));
+        );
+        public_share = Some(gt_documents::public_share_router(docs_state.clone()));
+        rest = rest.module(DocumentsModule::with_http(docs_state));
         eprintln!(
             "[gt-mcp-server] REST domain modules: meta + workspace + rig + documents + agent + quota + merge + skills + feed + convoy"
         );
@@ -435,11 +442,28 @@ async fn main() -> anyhow::Result<()> {
     // so it mounts on the ops router, never behind the RS256 auth chain the `/api/v1/*` routes do.
     let mut openapi_doc = root.openapi();
     openapi_doc.merge(rest_root.openapi());
+    // Fold in the PUBLIC share-read route (hq-web-extras.9): it lives outside the /api/v1/<ns>
+    // module prefixes, so it is not in either builder's docs — merge its prefix-free spec
+    // directly (its `#[utoipa::path]` already names the absolute `/share/{hash}`).
+    if public_share.is_some() {
+        openapi_doc.merge(gt_documents::public_openapi());
+    }
     let openapi_json: Arc<str> = Arc::from(
         serde_json::to_string(&openapi_doc).context("serialize the merged OpenAPI document")?,
     );
     let app = app.merge(openapi_router(openapi_json));
     eprintln!("[gt-mcp-server] fused OpenAPI on GET /openapi.json (public spec)");
+
+    // Mount the public, unauthenticated share-read surface on the ops/public router — beside
+    // /openapi.json and /health, never behind the RS256 auth chain the /api/v1/* routes carry
+    // (hq-web-extras.9). A capability hash is the only credential; no session data leaks.
+    let app = match public_share {
+        Some(router) => {
+            eprintln!("[gt-mcp-server] public share read on GET /share/:hash (unauthenticated)");
+            app.merge(router)
+        }
+        None => app,
+    };
 
     // Public login surface (hq-web-extras.7): mount `/auth/*` UNGUARDED so login is reachable
     // without a bearer. Gated on a verifier (for the JWKS), a minter (the RS256 signing key),
