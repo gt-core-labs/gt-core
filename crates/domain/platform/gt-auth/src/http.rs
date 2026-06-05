@@ -595,9 +595,18 @@ pub fn auth_router(state: AuthState) -> Router {
         // button per enabled provider — secret-free projection. GET is public; the POST admin CRUD
         // (system-admin gated) shares the path.
         .route("/auth/providers", get(list_public_providers).post(create_provider))
+        // ADMIN list (hq-idp-ui.1): the FULL provider list incl `enabled=false`, secret-free
+        // ([`ProviderView`]), for the gt-web admin page. A STATIC segment, so matchit resolves it
+        // before the `/:id` capture below — `all` is never read as a provider id.
+        .route("/auth/providers/all", get(list_all_providers))
+        // ADMIN single-by-id (hq-idp-ui.1): pre-fill the edit form. GET joins the existing
+        // PATCH/DELETE on this path. `/:id/authorize` (public, below) is MORE specific, so matchit
+        // keeps it resolving to the authorize handler — this GET only matches a bare `/{id}`.
         .route(
             "/auth/providers/:id",
-            axum::routing::patch(patch_provider).delete(delete_provider),
+            get(get_provider)
+                .patch(patch_provider)
+                .delete(delete_provider),
         )
         // PUBLIC authorize redirect (hq-idp-db.3): 302 to the IdP with state + PKCE challenge.
         .route("/auth/providers/:id/authorize", get(authorize))
@@ -665,6 +674,8 @@ struct AdminApiDoc;
 #[openapi(
     paths(
         list_public_providers,
+        list_all_providers,
+        get_provider,
         authorize,
         callback,
         create_provider,
@@ -1597,6 +1608,72 @@ async fn list_public_providers(
         .map(PublicProvider::from)
         .collect();
     Ok(Json(providers))
+}
+
+/// `GET /auth/providers/all` (system admin only, hq-idp-ui.1) — the FULL provider list, INCLUDING
+/// `enabled = false`, projected secret-free as [`ProviderView`] (id / kind / display_name /
+/// client_id / issuer / endpoints / scopes / enabled — never the client secret). UNLIKE the PUBLIC
+/// `GET /auth/providers` (enabled-only, minimal [`PublicProvider`]), this is the surface the gt-web
+/// admin page (hq-idp-ui.2) lists + edits from. `401` without claims; `403` for a non-system-admin;
+/// `501` when no provider store is configured.
+#[cfg_attr(feature = "axum", utoipa::path(
+    get, path = "/auth/providers/all", tag = "auth",
+    responses(
+        (status = 200, description = "Every provider incl disabled (secret-free; for the admin page)", body = Vec<ProviderView>),
+        (status = 401, description = "No verified claims"),
+        (status = 403, description = "Caller is not a system admin"),
+        (status = 501, description = "No provider store configured"),
+    ),
+))]
+#[cfg(feature = "oauth")]
+async fn list_all_providers(
+    State(state): State<AuthState>,
+    claims: Option<Extension<JwtClaims>>,
+) -> Result<Json<Vec<ProviderView>>, ApiError> {
+    require_system_admin(claims.as_deref())?;
+    let store = state.providers.as_ref().ok_or(ApiError::NotConfigured)?;
+    let providers = store
+        .list_providers()
+        .await?
+        .into_iter()
+        .map(ProviderView::from)
+        .collect();
+    Ok(Json(providers))
+}
+
+/// `GET /auth/providers/{id}` (system admin only, hq-idp-ui.1) — ONE provider by id, secret-free
+/// ([`ProviderView`]), to pre-fill the edit form on the gt-web admin page (hq-idp-ui.2). Returns a
+/// disabled provider too (unlike the public discovery list). `401` without claims; `403` for a
+/// non-system-admin; `404` for an unknown id; `501` when no provider store is configured.
+#[cfg_attr(feature = "axum", utoipa::path(
+    get, path = "/auth/providers/{id}", tag = "auth",
+    params(("id" = String, Path, description = "The provider id to read")),
+    responses(
+        (status = 200, description = "The provider (secret-free, incl disabled)", body = ProviderView),
+        (status = 401, description = "No verified claims"),
+        (status = 403, description = "Caller is not a system admin"),
+        (status = 404, description = "No provider with that id"),
+        (status = 501, description = "No provider store configured"),
+    ),
+))]
+#[cfg(feature = "oauth")]
+async fn get_provider(
+    State(state): State<AuthState>,
+    claims: Option<Extension<JwtClaims>>,
+    Path(id): Path<String>,
+) -> Result<Json<ProviderView>, ApiError> {
+    require_system_admin(claims.as_deref())?;
+    let store = state.providers.as_ref().ok_or(ApiError::NotConfigured)?;
+    // No `get`-by-id on the [`ProviderStore`] port, so filter the full list (which already returns
+    // disabled rows). The catalog is tiny deploy-global infrastructure — a linear scan is fine and
+    // keeps the port (+ both test doubles) untouched.
+    store
+        .list_providers()
+        .await?
+        .into_iter()
+        .find(|p| p.id == id)
+        .map(|p| Json(ProviderView::from(p)))
+        .ok_or(ApiError::NotFound)
 }
 
 /// `GET /auth/providers/{id}/authorize` (PUBLIC, no auth) — begin the authorization-code login
@@ -3173,6 +3250,102 @@ mod tests {
             let paths: Vec<&str> = doc.paths.paths.keys().map(String::as_str).collect();
             assert!(paths.contains(&"/auth/providers"), "{paths:?}");
             assert!(paths.contains(&"/auth/providers/{id}"), "{paths:?}");
+            // The admin read endpoints (hq-idp-ui.1) are advertised too.
+            assert!(paths.contains(&"/auth/providers/all"), "{paths:?}");
+        }
+
+        /// The admin READ surface (hq-idp-ui.1): a system admin lists ALL providers (incl
+        /// `enabled=false`) with the full secret-free shape, and reads a single disabled one by id;
+        /// a non-admin is 403, an unauthenticated caller 401, and an unknown id 404. The PUBLIC
+        /// `GET /auth/providers` stays enabled-only + minimal.
+        #[tokio::test]
+        async fn admin_read_lists_all_incl_disabled_without_secret() {
+            std::env::set_var(
+                crate::ENV_SECRET_KEY,
+                "0000000000000000000000000000000000000000000000000000000000000000",
+            );
+            let store = Arc::new(MemProviders::default());
+            let app = auth_router(state_with_providers(store.clone()));
+
+            // Seed one ENABLED + one DISABLED provider via the system-admin CRUD.
+            for body in [
+                r#"{"id":"goog","kind":"google","client_id":"cid-on","client_secret":"sec-on","enabled":true}"#,
+                r#"{"id":"gh","kind":"github","client_id":"cid-off","client_secret":"sec-off","enabled":false}"#,
+            ] {
+                let created = app
+                    .clone()
+                    .oneshot(req("POST", "/auth/providers", Some(&["*"]), Some(body)))
+                    .await
+                    .unwrap();
+                assert_eq!(created.status(), StatusCode::CREATED);
+            }
+
+            // Admin LIST → BOTH providers, with client_id/endpoints/enabled and NO secret.
+            let listed = app
+                .clone()
+                .oneshot(req("GET", "/auth/providers/all", Some(&["*"]), None))
+                .await
+                .unwrap();
+            assert_eq!(listed.status(), StatusCode::OK);
+            let all = body_str(listed).await;
+            assert!(all.contains("\"id\":\"goog\""), "enabled present: {all}");
+            assert!(all.contains("\"id\":\"gh\""), "disabled present: {all}");
+            assert!(all.contains("\"client_id\":\"cid-off\""), "client_id present: {all}");
+            assert!(all.contains("github.com/login/oauth"), "endpoints present: {all}");
+            assert!(all.contains("\"enabled\":false"), "disabled flag present: {all}");
+            assert!(!all.contains("client_secret"), "list names no secret: {all}");
+            assert!(!all.contains("sec-on") && !all.contains("sec-off"), "no secret value: {all}");
+
+            // Admin SINGLE by id → the DISABLED provider, full secret-free shape.
+            let single = app
+                .clone()
+                .oneshot(req("GET", "/auth/providers/gh", Some(&["*"]), None))
+                .await
+                .unwrap();
+            assert_eq!(single.status(), StatusCode::OK);
+            let one = body_str(single).await;
+            assert!(one.contains("\"id\":\"gh\""), "single by id: {one}");
+            assert!(one.contains("\"enabled\":false"), "single is the disabled one: {one}");
+            assert!(one.contains("\"client_id\":\"cid-off\""), "single carries client_id: {one}");
+            assert!(!one.contains("client_secret"), "single names no secret: {one}");
+
+            // A non-admin is 403 on both admin reads; unauthenticated is 401; an unknown id 404.
+            let list_forbidden = app
+                .clone()
+                .oneshot(req("GET", "/auth/providers/all", Some(&["workspace.admin"]), None))
+                .await
+                .unwrap();
+            assert_eq!(list_forbidden.status(), StatusCode::FORBIDDEN);
+            let single_forbidden = app
+                .clone()
+                .oneshot(req("GET", "/auth/providers/gh", Some(&["workspace.admin"]), None))
+                .await
+                .unwrap();
+            assert_eq!(single_forbidden.status(), StatusCode::FORBIDDEN);
+            let unauth = app
+                .clone()
+                .oneshot(req("GET", "/auth/providers/all", None, None))
+                .await
+                .unwrap();
+            assert_eq!(unauth.status(), StatusCode::UNAUTHORIZED);
+            let unknown = app
+                .clone()
+                .oneshot(req("GET", "/auth/providers/nope", Some(&["*"]), None))
+                .await
+                .unwrap();
+            assert_eq!(unknown.status(), StatusCode::NOT_FOUND);
+
+            // The PUBLIC GET /auth/providers stays enabled-only + minimal (no client_id/endpoints).
+            let public = app
+                .clone()
+                .oneshot(req("GET", "/auth/providers", None, None))
+                .await
+                .unwrap();
+            assert_eq!(public.status(), StatusCode::OK);
+            let pub_body = body_str(public).await;
+            assert!(pub_body.contains("\"id\":\"goog\""), "public lists enabled: {pub_body}");
+            assert!(!pub_body.contains("\"id\":\"gh\""), "public hides disabled: {pub_body}");
+            assert!(!pub_body.contains("client_id"), "public is minimal (no client_id): {pub_body}");
         }
     }
 
