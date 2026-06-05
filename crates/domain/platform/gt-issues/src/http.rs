@@ -89,11 +89,15 @@ impl IssuesApiState {
 
     /// Resolve the Dolt store for one request from its verified workspace. In multi-tenant mode
     /// the tenant's own `hq_<ws>` pool is selected (the slug is already validated by the
-    /// `WorkspaceContext` extractor + `pool_for`); single-tenant falls back to the shared
+    /// `WorkspaceContext` extractor + `pool_for`) and its schema is ensured on first access (F2)
+    /// via [`WorkspacePools::ensured_pool`], so a REST-created tenant self-heals an empty
+    /// `hq_<ws>` exactly once per slug per process; single-tenant falls back to the shared
     /// `store`, ignoring the workspace exactly as the pre-routing behaviour did.
-    fn resolve(&self, ctx: &WorkspaceContext) -> Result<Arc<DoltIssues>, AppError> {
+    async fn resolve(&self, ctx: &WorkspaceContext) -> Result<Arc<DoltIssues>, AppError> {
         match &self.workspaces {
-            Some(pools) => Ok(Arc::new(DoltIssues::new(pools.pool_for(ctx.workspace().as_str())?))),
+            Some(pools) => {
+                Ok(Arc::new(DoltIssues::new(pools.ensured_pool(ctx.workspace().as_str()).await?)))
+            }
             None => Ok(self.store.clone()),
         }
     }
@@ -197,7 +201,7 @@ async fn list_issues(
     ctx: WorkspaceContext,
     Query(q): Query<ListQuery>,
 ) -> Result<Json<IssuePage>, ApiError> {
-    let store = st.resolve(&ctx)?;
+    let store = st.resolve(&ctx).await?;
     let page = read_issues_page(&store, &q.into_filter()).await?;
     Ok(Json(page))
 }
@@ -254,7 +258,7 @@ async fn issue_stats(
     ctx: WorkspaceContext,
     Query(q): Query<StatsQuery>,
 ) -> Result<Json<StatsResponse>, ApiError> {
-    let store = st.resolve(&ctx)?;
+    let store = st.resolve(&ctx).await?;
     let dims = GroupDim::parse_list(q.group_by.as_deref().unwrap_or_default())
         .map_err(|e| ApiError(AppError::Validation(e)))?;
     // Pull the whole workspace tracker (cheap snapshot rows; `full=false`). A `None` limit would
@@ -292,7 +296,7 @@ async fn get_issue(
     ctx: WorkspaceContext,
     Path(id): Path<String>,
 ) -> Result<Json<IssueDetail>, ApiError> {
-    let store = st.resolve(&ctx)?;
+    let store = st.resolve(&ctx).await?;
     match read_issue(&store, &id).await? {
         Some(detail) => Ok(Json(detail)),
         None => Err(ApiError(AppError::NotFound(format!("issue {id}")))),
@@ -313,7 +317,7 @@ async fn create_issue(
     ctx: WorkspaceContext,
     Json(args): Json<CreateIssue>,
 ) -> Result<Response, ApiError> {
-    let store = st.resolve(&ctx)?;
+    let store = st.resolve(&ctx).await?;
     run_create_issue(&store, &args, &AllowAllTree, false).await?;
     Ok((StatusCode::CREATED, Json(json!({ "ok": true, "id": args.id }))).into_response())
 }
@@ -335,7 +339,7 @@ async fn update_issue(
     Path(id): Path<String>,
     Json(body): Json<Value>,
 ) -> Result<Json<Value>, ApiError> {
-    let store = st.resolve(&ctx)?;
+    let store = st.resolve(&ctx).await?;
     let args: UpdateIssue = with_path_id(body, id)?;
     let version = run_update_issue(&store, &args, &AllowAllTree, false).await?;
     let mut body = json!({ "ok": true });
@@ -362,7 +366,7 @@ async fn transition_issue(
     Path(id): Path<String>,
     Json(body): Json<Value>,
 ) -> Result<Json<Value>, ApiError> {
-    let store = st.resolve(&ctx)?;
+    let store = st.resolve(&ctx).await?;
     let args: TransitionIssue = with_path_id(body, id)?;
     run_transition_issue(&store, &args, false).await?;
     Ok(Json(json!({ "ok": true })))
@@ -387,7 +391,7 @@ async fn close_issue(
     Path(id): Path<String>,
     Json(body): Json<Value>,
 ) -> Result<Json<Value>, ApiError> {
-    let store = st.resolve(&ctx)?;
+    let store = st.resolve(&ctx).await?;
     let args: CloseIssue = with_path_id(body, id)?;
     run_close_issue(&store, &args, &st.actor, None, false).await?;
     Ok(Json(json!({ "ok": true })))
@@ -412,7 +416,7 @@ async fn claim_issue(
     Path(id): Path<String>,
     Json(body): Json<Value>,
 ) -> Result<Json<Value>, ApiError> {
-    let store = st.resolve(&ctx)?;
+    let store = st.resolve(&ctx).await?;
     let args: ClaimIssue = with_path_id(body, id)?;
     let res = run_claim_issue(&store, &args, &st.actor, false).await?;
     match res.outcome {

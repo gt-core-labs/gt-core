@@ -57,11 +57,23 @@ impl WorkspaceStores {
     /// The [`DoltIssues`] store for workspace `ws`.
     ///
     /// Validates the slug (a malformed tenant id can never select a surprising
-    /// database), then wraps the tenant's lazily-created pool. Returns an owned
-    /// store — `DoltIssues::new` only stores the `Arc`-backed pool handle, so this
-    /// is allocation-light and opens no connection.
-    pub fn store_for(&self, ws: &str) -> Result<DoltIssues, AppError> {
-        Ok(DoltIssues::new(self.pools.pool_for(ws)?))
+    /// database), then wraps the tenant's lazily-created pool. On the first access
+    /// for a workspace this also ensures its `hq_<ws>` schema exists (F2) via
+    /// [`WorkspacePools::ensured_pool`] — a freshly-provisioned tenant DB has no
+    /// `issues` table, so this self-heals it once per slug per process and caches
+    /// the result, leaving steady-state a no-op set lookup. Returns an owned store
+    /// — `DoltIssues::new` only stores the `Arc`-backed pool handle.
+    pub async fn store_for(&self, ws: &str) -> Result<DoltIssues, AppError> {
+        Ok(DoltIssues::new(self.pools.ensured_pool(ws).await?))
+    }
+
+    /// The underlying per-workspace pool registry. Exposed for callers that only
+    /// need to lazily prime/route a pool without the schema-ensuring DB hit that
+    /// [`store_for`](Self::store_for) now performs on first access (e.g. the
+    /// offline health-gauge gauge and the pool-routing contract tests use
+    /// [`WorkspacePools::pool_for`] directly).
+    pub fn pools(&self) -> &WorkspacePools {
+        &self.pools
     }
 
     /// Number of workspaces with a live pool — the `workspaces_loaded` gauge the
@@ -140,15 +152,15 @@ mod tests {
         assert!(WorkspaceStores::from_base_url("not a url").is_err());
     }
 
-    #[test]
-    fn store_for_validates_slug_and_is_offline_safe() {
+    #[tokio::test]
+    async fn store_for_validates_slug_before_any_db_work() {
         let stores = WorkspaceStores::from_base_url("mysql://root@127.0.0.1:3307/").unwrap();
-        // A malformed slug is rejected before any database is selected.
-        assert!(stores.store_for("Bad_Slug").is_err());
-        assert!(stores.store_for("").is_err());
-        // A well-formed slug builds a store without opening a socket (pool lazy),
-        // and is idempotent across calls (the pool is cached, reused).
-        assert!(stores.store_for("acme").is_ok());
-        assert!(stores.store_for("acme").is_ok());
+        // A malformed slug is rejected by `pool_for` before `ensured_pool` opens a
+        // socket or selects a database, so this is offline-safe.
+        assert!(stores.store_for("Bad_Slug").await.is_err());
+        assert!(stores.store_for("").await.is_err());
+        // A well-formed slug now ensures the tenant schema on first access (F2),
+        // which requires a live Dolt server; that path is exercised by the gated
+        // `ensured_pool` self-heal test in gt-store-dolt, not here.
     }
 }

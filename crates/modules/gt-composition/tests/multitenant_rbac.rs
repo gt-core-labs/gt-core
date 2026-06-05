@@ -82,12 +82,14 @@ fn ext_with_header(name: &str, value: &str) -> Extensions {
 #[test]
 fn two_workspaces_resolve_to_distinct_isolated_stores() {
     let stores = WorkspaceStores::from_base_url("mysql://gtapp@127.0.0.1:3307/").unwrap();
-    // Distinct, well-formed tenants each build their own (lazy) store — no socket
-    // opened, but the slugs route to different `hq_<ws>` databases.
-    assert!(stores.store_for("acme").is_ok());
-    assert!(stores.store_for("beta").is_ok());
-    // A malformed slug can never select a surprising database.
-    assert!(stores.store_for("Bad Slug").is_err());
+    // Distinct, well-formed tenants each route to their own (lazy) pool — no socket
+    // opened, but the slugs map to different `hq_<ws>` databases. The offline
+    // routing seam is `pool_for`; `store_for` now also ensures the schema (a DB hit)
+    // on first access, which this offline test does not exercise.
+    assert!(stores.pools().pool_for("acme").is_ok());
+    assert!(stores.pools().pool_for("beta").is_ok());
+    // A malformed slug can never select a surprising database (rejected before any DB work).
+    assert!(stores.pools().pool_for("Bad Slug").is_err());
 }
 
 #[test]

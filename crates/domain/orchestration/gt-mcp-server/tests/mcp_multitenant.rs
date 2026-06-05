@@ -43,25 +43,30 @@ fn workspace_stores_route_each_slug_to_its_own_pool() {
     let stores = WorkspaceStores::from_base_url("mysql://gastown@127.0.0.1:3307/")
         .expect("base url parses");
 
-    // Two distinct tenants build cleanly and offline (the pool is lazy — no socket).
-    assert!(stores.store_for("acme").is_ok());
-    assert!(stores.store_for("globex").is_ok());
+    // Two distinct tenants route to their own pool cleanly and offline (the pool is
+    // lazy — no socket). `store_for` now ensures the schema on first access (a DB
+    // hit), so the offline routing seam is the lower-level `pool_for`.
+    assert!(stores.pools().pool_for("acme").is_ok());
+    assert!(stores.pools().pool_for("globex").is_ok());
 
     // Each got its own pool: the routing registry now holds exactly the two.
     assert_eq!(stores.live_pools(), 2, "one pool per distinct tenant");
     assert_eq!(stores.loaded_workspaces(), vec!["acme", "globex"]);
 
     // Re-resolving a tenant reuses its pool (idempotent — no leak).
-    assert!(stores.store_for("acme").is_ok());
+    assert!(stores.pools().pool_for("acme").is_ok());
     assert_eq!(stores.live_pools(), 2, "re-resolve reuses the cached pool");
 }
 
 #[test]
 fn malformed_tenant_slug_is_rejected_before_a_database_is_selected() {
     let stores = WorkspaceStores::from_base_url("mysql://gastown@127.0.0.1:3307/").unwrap();
-    assert!(stores.store_for("Bad_Slug").is_err(), "uppercase/underscore is invalid");
-    assert!(stores.store_for("").is_err(), "empty slug is invalid");
-    assert!(stores.store_for("a/b").is_err(), "a path separator can never select a db");
+    // Rejection is synchronous, before any database is selected: `pool_for` (which
+    // `store_for`/`ensured_pool` call first) validates the slug, so this stays
+    // offline-safe even though the happy path now ensures the schema.
+    assert!(stores.pools().pool_for("Bad_Slug").is_err(), "uppercase/underscore is invalid");
+    assert!(stores.pools().pool_for("").is_err(), "empty slug is invalid");
+    assert!(stores.pools().pool_for("a/b").is_err(), "a path separator can never select a db");
     // A rejected slug created no pool.
     assert_eq!(stores.live_pools(), 0);
 }

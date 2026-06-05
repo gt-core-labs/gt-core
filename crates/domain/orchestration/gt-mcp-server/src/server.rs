@@ -221,9 +221,9 @@ impl IssuesServer {
     /// store is built (cheap: a lazily-pooled `DoltIssues`); otherwise the
     /// default-workspace store is used. A malformed/unknown slug is rejected here,
     /// before any dispatch.
-    fn resolve_store(&self, workspace: Option<&str>) -> Result<Arc<DoltIssues>, AppError> {
+    async fn resolve_store(&self, workspace: Option<&str>) -> Result<Arc<DoltIssues>, AppError> {
         match (&self.workspaces, workspace) {
-            (Some(ws), Some(slug)) => Ok(Arc::new(ws.store_for(slug)?)),
+            (Some(ws), Some(slug)) => Ok(Arc::new(ws.store_for(slug).await?)),
             _ => Ok(self.store.clone()),
         }
     }
@@ -501,7 +501,7 @@ impl ServerHandler for IssuesServer {
         // tenant's store; absent it, the default-workspace store. Resolved after
         // the scope check so a malformed slug from an unauthorized caller is never
         // built.
-        let store = match self.resolve_store(workspace.as_deref()) {
+        let store = match self.resolve_store(workspace.as_deref()).await {
             Ok(store) => store,
             Err(e) => return Err(Self::to_mcp_error(&e)),
         };
@@ -648,6 +648,7 @@ impl ServerHandler for IssuesServer {
         };
         let store = self
             .resolve_store(workspace.as_deref())
+            .await
             .map_err(|e| Self::to_mcp_error(&e))?;
         let payload = self
             .read_resource_json(&store, workspace.as_deref(), &clean_uri, format)

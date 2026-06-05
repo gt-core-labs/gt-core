@@ -99,9 +99,11 @@ mod tests {
     #[tokio::test]
     async fn health_counts_loaded_pools_in_multi_tenant() {
         let stores = WorkspaceStores::from_base_url("mysql://root@127.0.0.1:3307/").unwrap();
-        // Building a store creates a (lazy, un-connected) pool — counted as loaded.
-        let _ = stores.store_for("acme").unwrap();
-        let _ = stores.store_for("beta").unwrap();
+        // Priming a pool creates a (lazy, un-connected) pool — counted as loaded.
+        // Use `pool_for` directly (not `store_for`, which now ensures the schema on
+        // first access and would touch the dead 3307 server in this offline test).
+        let _ = stores.pools().pool_for("acme").unwrap();
+        let _ = stores.pools().pool_for("beta").unwrap();
         let state = HealthState::new(Some(Arc::new(stores)));
         let Json(v) = health(State(state)).await;
         assert_eq!(v["workspaces_loaded"], 2);

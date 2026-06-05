@@ -13,11 +13,12 @@
 //! passes its validated slug down; the slug is re-validated here before it is
 //! used to build a database name, mirroring [`crate::create_workspace_dolt`].
 
-use dashmap::DashMap;
+use dashmap::{DashMap, DashSet};
 use mysql_async::{Opts, OptsBuilder, Pool, PoolConstraints, PoolOpts};
 
 use crate::conn::map_err;
 use crate::error::AppError;
+use crate::issues_repo::DoltIssues;
 use crate::workspace::{dolt_db_name, validate_slug};
 
 /// Default ceiling on simultaneously-open connections per workspace pool. Dolt
@@ -39,6 +40,11 @@ pub struct WorkspacePools {
     max_conns: usize,
     /// `slug -> Pool`, populated lazily.
     pools: DashMap<String, Pool>,
+    /// Slugs whose `hq_<ws>` schema has already been ensured this process. A
+    /// freshly-created tenant DB has no `issues` table, so [`ensured_pool`] runs
+    /// the idempotent [`DoltIssues::ensure_schema`] on first access and records
+    /// the slug here; steady-state is a lock-free set membership check, no DB hit.
+    ensured: DashSet<String>,
 }
 
 impl WorkspacePools {
@@ -59,6 +65,7 @@ impl WorkspacePools {
             base,
             max_conns: max_conns.max(1),
             pools: DashMap::new(),
+            ensured: DashSet::new(),
         })
     }
 
@@ -81,6 +88,26 @@ impl WorkspacePools {
             .entry(ws.to_owned())
             .or_insert(pool);
         Ok(entry.clone())
+    }
+
+    /// Like [`pool_for`](Self::pool_for) but self-healing: the first access for a
+    /// workspace also ensures its `hq_<ws>` schema exists (F2). Multi-tenant
+    /// routing creates the tenant DB but never runs `ensure_schema`, so a
+    /// freshly-provisioned `hq_<ws>` has no `issues` table and the first
+    /// read/write would fail. This builds a [`DoltIssues`] over the pool and runs
+    /// the idempotent [`DoltIssues::ensure_schema`] exactly once per slug per
+    /// process, caching the result in [`Self::ensured`]; steady-state is a single
+    /// set lookup with no DB round-trip. `ensure_schema` is itself idempotent
+    /// (information_schema checks + `CREATE TABLE IF NOT EXISTS` + idempotent
+    /// column adds), so an already-provisioned tenant pays only the one no-op
+    /// pass on first access.
+    pub async fn ensured_pool(&self, ws: &str) -> Result<Pool, AppError> {
+        let pool = self.pool_for(ws)?;
+        if !self.ensured.contains(ws) {
+            DoltIssues::new(pool.clone()).ensure_schema().await?;
+            self.ensured.insert(ws.to_owned());
+        }
+        Ok(pool)
     }
 
     /// Construct (but do not connect) a pool whose connections default to the

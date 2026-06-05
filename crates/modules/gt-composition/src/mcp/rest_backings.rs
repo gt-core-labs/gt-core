@@ -394,7 +394,7 @@ impl MeStatsSource for IdentityDoltMeStats {
         // The tenant's own `hq_<ws>` tracker. Request the whole snapshot (full=false, max limit) so
         // the aggregate covers the workspace in one pass — the same filter the per-workspace
         // `/issues/stats` uses.
-        let store = self.stores.store_for(workspace)?;
+        let store = self.stores.store_for(workspace).await?;
         let filter = IssueFilter {
             status: Vec::new(),
             priority_max: None,
