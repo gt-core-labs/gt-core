@@ -104,6 +104,7 @@ pub trait MembershipDirectory: Send + Sync {
 /// One membership row as returned by `GET /auth/workspaces`: the workspace slug and the role the
 /// user holds there (the gt-web shell consumes this to render + drive the workspace selector).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "axum", derive(utoipa::ToSchema))]
 pub struct WorkspaceMembership {
     /// The workspace slug the user can switch into.
     pub workspace: String,
@@ -273,10 +274,71 @@ pub fn auth_router(state: AuthState) -> Router {
     router.with_state(state)
 }
 
+/// The OpenAPI document for the public `/auth/*` surface (`hq-web-extras.10`). UNLIKE the
+/// `/api/v1/<ns>` module ApiDocs, the auth router mounts at the server ROOT (not under a module
+/// prefix), so these paths are ABSOLUTE (`/auth/login`, …) and the composition root merges this
+/// doc verbatim into the fused `GET /openapi.json` — the FE codegen then reads the auth contract
+/// from the spec instead of hand-maintaining `src/lib/api/auth.ts`.
+#[derive(utoipa::OpenApi)]
+#[openapi(
+    paths(login, refresh, logout, me, jwks),
+    components(schemas(
+        LoginRequest,
+        TokenResponse,
+        RefreshRequest,
+        MeResponse,
+        crate::jwt::Jwk,
+        crate::jwt::JwkSet,
+    )),
+)]
+pub struct ApiDoc;
+
+/// The admin / RBAC / cross-workspace half of `/auth/*`, present only with the `pg` adapter (the
+/// user + role + membership stores these routes need). Folded into [`auth_openapi`] when compiled,
+/// so a Postgres-backed deploy advertises the full surface and a login-only build advertises just
+/// [`ApiDoc`].
+#[cfg(feature = "pg")]
+#[derive(utoipa::OpenApi)]
+#[openapi(
+    paths(
+        create_user,
+        list_users,
+        create_role,
+        list_roles,
+        delete_role,
+        assign_roles,
+        workspaces,
+        switch,
+    ),
+    components(schemas(
+        CreateUserRequest,
+        UserSummary,
+        CreateRoleRequest,
+        RoleSummary,
+        AssignRolesRequest,
+        SwitchRequest,
+        WorkspaceMembership,
+    )),
+)]
+struct AdminApiDoc;
+
+/// The full `/auth/*` OpenAPI the composition root fuses into `GET /openapi.json`: the always-on
+/// login surface ([`ApiDoc`]) plus, when the `pg` adapter is compiled, the admin / RBAC /
+/// workspace routes ([`AdminApiDoc`]).
+pub fn auth_openapi() -> utoipa::openapi::OpenApi {
+    use utoipa::OpenApi as _;
+    #[allow(unused_mut)]
+    let mut doc = ApiDoc::openapi();
+    #[cfg(feature = "pg")]
+    doc.merge(AdminApiDoc::openapi());
+    doc
+}
+
 // --- request/response DTOs --------------------------------------------------------------------
 
 /// `POST /auth/login` body.
 #[derive(Debug, Deserialize)]
+#[cfg_attr(feature = "axum", derive(utoipa::ToSchema))]
 pub struct LoginRequest {
     /// The principal's email address.
     pub email: String,
@@ -286,12 +348,14 @@ pub struct LoginRequest {
 
 /// A minted token pair, returned by login and refresh.
 #[derive(Debug, Serialize)]
+#[cfg_attr(feature = "axum", derive(utoipa::ToSchema))]
 pub struct TokenResponse {
     /// The short-lived RS256 access JWT (sent as `Authorization: Bearer`).
     pub access_token: String,
     /// The long-lived opaque refresh token (exchanged at `/auth/refresh`).
     pub refresh_token: String,
     /// Always `"Bearer"`.
+    #[cfg_attr(feature = "axum", schema(value_type = String))]
     pub token_type: &'static str,
     /// Access-token lifetime in seconds.
     pub expires_in: u64,
@@ -300,6 +364,7 @@ pub struct TokenResponse {
 /// `POST /auth/refresh` / `POST /auth/logout` body. Optional: a browser supplies the refresh
 /// token through the `gt_refresh` httpOnly cookie instead, so the JSON body may be absent.
 #[derive(Debug, Default, Deserialize)]
+#[cfg_attr(feature = "axum", derive(utoipa::ToSchema))]
 pub struct RefreshRequest {
     /// The opaque refresh token previously issued. Absent ⇒ read from the cookie.
     pub refresh_token: Option<String>,
@@ -307,6 +372,7 @@ pub struct RefreshRequest {
 
 /// `GET /auth/me` body — the verified identity behind the bearer token.
 #[derive(Debug, Serialize)]
+#[cfg_attr(feature = "axum", derive(utoipa::ToSchema))]
 pub struct MeResponse {
     /// Authenticated principal.
     pub sub: String,
@@ -318,6 +384,7 @@ pub struct MeResponse {
 
 /// `POST /auth/switch` body — the workspace to make active (hq-identity.3).
 #[derive(Debug, Deserialize)]
+#[cfg_attr(feature = "axum", derive(utoipa::ToSchema))]
 pub struct SwitchRequest {
     /// The slug of a workspace the caller is a member of. Validated against their memberships
     /// server-side; an unheld workspace is a `403`, never an honoured switch.
@@ -326,6 +393,7 @@ pub struct SwitchRequest {
 
 /// `POST /auth/users` body — create a user (admin only, `hq-web-extras.5`).
 #[derive(Debug, Deserialize)]
+#[cfg_attr(feature = "axum", derive(utoipa::ToSchema))]
 pub struct CreateUserRequest {
     /// Login email (unique within the workspace).
     pub email: String,
@@ -338,6 +406,7 @@ pub struct CreateUserRequest {
 
 /// A user as returned by `GET /auth/users` / `POST /auth/users` — never any password material.
 #[derive(Debug, Serialize)]
+#[cfg_attr(feature = "axum", derive(utoipa::ToSchema))]
 pub struct UserSummary {
     /// The subject id (`sub`).
     pub sub: String,
@@ -351,6 +420,7 @@ pub struct UserSummary {
 
 /// `POST /auth/roles` body — create or replace a role (admin only, hq-rbac.4).
 #[derive(Debug, Deserialize)]
+#[cfg_attr(feature = "axum", derive(utoipa::ToSchema))]
 pub struct CreateRoleRequest {
     /// The role name (referenced by a user's assigned roles).
     pub name: String,
@@ -362,6 +432,7 @@ pub struct CreateRoleRequest {
 
 /// A role as returned by `GET`/`POST /auth/roles`.
 #[derive(Debug, Serialize)]
+#[cfg_attr(feature = "axum", derive(utoipa::ToSchema))]
 pub struct RoleSummary {
     /// The role name.
     pub name: String,
@@ -373,6 +444,7 @@ pub struct RoleSummary {
 
 /// `POST /auth/users/{email}/roles` body — set a user's assigned roles (admin only, hq-rbac.4).
 #[derive(Debug, Deserialize)]
+#[cfg_attr(feature = "axum", derive(utoipa::ToSchema))]
 pub struct AssignRolesRequest {
     /// The role names to assign, replacing the user's current set.
     #[serde(default)]
@@ -381,6 +453,14 @@ pub struct AssignRolesRequest {
 
 // --- handlers ---------------------------------------------------------------------------------
 
+#[cfg_attr(feature = "axum", utoipa::path(
+    post, path = "/auth/login", tag = "auth",
+    request_body = LoginRequest,
+    responses(
+        (status = 200, description = "Authenticated — access + refresh pair (also set as httpOnly cookies)", body = TokenResponse),
+        (status = 401, description = "Bad credentials"),
+    ),
+))]
 async fn login(
     State(state): State<AuthState>,
     Json(body): Json<LoginRequest>,
@@ -396,6 +476,14 @@ async fn login(
     Ok((set_token_cookies(&state, &tokens), Json(tokens)))
 }
 
+#[cfg_attr(feature = "axum", utoipa::path(
+    post, path = "/auth/refresh", tag = "auth",
+    request_body(content = RefreshRequest, description = "Optional — the refresh token may instead ride the gt_refresh httpOnly cookie"),
+    responses(
+        (status = 200, description = "Rotated — a fresh access + refresh pair", body = TokenResponse),
+        (status = 401, description = "Missing, unknown, or already-rotated refresh token"),
+    ),
+))]
 async fn refresh(
     State(state): State<AuthState>,
     headers: HeaderMap,
@@ -424,6 +512,13 @@ async fn refresh(
     Ok((set_token_cookies(&state, &tokens), Json(tokens)))
 }
 
+#[cfg_attr(feature = "axum", utoipa::path(
+    post, path = "/auth/logout", tag = "auth",
+    request_body(content = RefreshRequest, description = "Optional — token may instead ride the gt_refresh httpOnly cookie"),
+    responses(
+        (status = 204, description = "Logged out (idempotent — revoking an absent token is a no-op); cookies cleared"),
+    ),
+))]
 async fn logout(
     State(state): State<AuthState>,
     headers: HeaderMap,
@@ -438,6 +533,13 @@ async fn logout(
     (clear_token_cookies(&state), StatusCode::NO_CONTENT)
 }
 
+#[cfg_attr(feature = "axum", utoipa::path(
+    get, path = "/auth/me", tag = "auth",
+    responses(
+        (status = 200, description = "The verified identity behind the bearer token", body = MeResponse),
+        (status = 401, description = "No verified claims (absent or invalid bearer)"),
+    ),
+))]
 async fn me(claims: Option<Extension<JwtClaims>>) -> Result<Json<MeResponse>, ApiError> {
     let Extension(claims) = claims.ok_or(ApiError::Unauthenticated)?;
     Ok(Json(MeResponse {
@@ -451,6 +553,14 @@ async fn me(claims: Option<Extension<JwtClaims>>) -> Result<Json<MeResponse>, Ap
 /// gt-web workspace selector (hq-identity.3). `401` without verified claims; `501` when no
 /// membership directory is configured. The list is keyed by the token's `sub`, so a caller only
 /// ever sees their own memberships.
+#[cfg_attr(feature = "axum", utoipa::path(
+    get, path = "/auth/workspaces", tag = "auth",
+    responses(
+        (status = 200, description = "The caller's workspace memberships (slug + role)", body = Vec<WorkspaceMembership>),
+        (status = 401, description = "No verified claims"),
+        (status = 501, description = "No membership directory configured"),
+    ),
+))]
 #[cfg(feature = "pg")]
 async fn workspaces(
     State(state): State<AuthState>,
@@ -466,6 +576,16 @@ async fn workspaces(
 /// its role-expanded scopes. `403` when the user is not a member of the requested workspace —
 /// the active tenant is resolved server-side from membership, never granted on request. `401`
 /// without claims; `501` when no directory is configured.
+#[cfg_attr(feature = "axum", utoipa::path(
+    post, path = "/auth/switch", tag = "auth",
+    request_body = SwitchRequest,
+    responses(
+        (status = 200, description = "Re-targeted — a fresh access + refresh pair scoped to the new workspace", body = TokenResponse),
+        (status = 401, description = "No verified claims"),
+        (status = 403, description = "Caller is not a member of the requested workspace"),
+        (status = 501, description = "No membership directory configured"),
+    ),
+))]
 #[cfg(feature = "pg")]
 async fn switch(
     State(state): State<AuthState>,
@@ -485,12 +605,27 @@ async fn switch(
 /// `GET /auth/jwks` — the verifier's public RS256 keys as an RFC 7517 JWK Set. A client matches a
 /// token's header `kid` to a key here and verifies the signature offline. Returns `200` with
 /// `{"keys":[]}` when no keys are configured (a valid, empty set — simpler for clients than a 404).
+#[cfg_attr(feature = "axum", utoipa::path(
+    get, path = "/auth/jwks", tag = "auth",
+    responses(
+        (status = 200, description = "The verifier's public RS256 keys (RFC 7517 JWK Set; empty keys is valid)", body = JwkSet),
+    ),
+))]
 async fn jwks(State(state): State<AuthState>) -> Json<JwkSet> {
     Json(state.jwks.as_ref().clone())
 }
 
 /// `POST /auth/users` — create a user (admin only). Requires a `users.write` (or `*`) scope in
 /// the caller's verified claims; the password is argon2-hashed before storage.
+#[cfg_attr(feature = "axum", utoipa::path(
+    post, path = "/auth/users", tag = "auth",
+    request_body = CreateUserRequest,
+    responses(
+        (status = 201, description = "Created — the new user (never any password material)", body = UserSummary),
+        (status = 401, description = "No verified claims"),
+        (status = 403, description = "Caller lacks the users.write scope"),
+    ),
+))]
 #[cfg(feature = "pg")]
 async fn create_user(
     State(state): State<AuthState>,
@@ -518,6 +653,14 @@ async fn create_user(
 }
 
 /// `GET /auth/users` — list users (admin only). Requires a `users.read` (or `*`) scope.
+#[cfg_attr(feature = "axum", utoipa::path(
+    get, path = "/auth/users", tag = "auth",
+    responses(
+        (status = 200, description = "Every user (no password material)", body = Vec<UserSummary>),
+        (status = 401, description = "No verified claims"),
+        (status = 403, description = "Caller lacks the users.read scope"),
+    ),
+))]
 #[cfg(feature = "pg")]
 async fn list_users(
     State(state): State<AuthState>,
@@ -531,6 +674,16 @@ async fn list_users(
 /// `POST /auth/roles` — create or replace a role (admin only). Requires `roles.write` (or `*`).
 /// Every scope in the bundle is validated against the closed vocabulary first, so a typo is a
 /// `400` rather than a silently dead grant.
+#[cfg_attr(feature = "axum", utoipa::path(
+    post, path = "/auth/roles", tag = "auth",
+    request_body = CreateRoleRequest,
+    responses(
+        (status = 201, description = "Created or replaced — the role", body = RoleSummary),
+        (status = 400, description = "A scope is outside the closed vocabulary"),
+        (status = 401, description = "No verified claims"),
+        (status = 403, description = "Caller lacks the roles.write scope"),
+    ),
+))]
 #[cfg(feature = "pg")]
 async fn create_role(
     State(state): State<AuthState>,
@@ -549,6 +702,14 @@ async fn create_role(
 }
 
 /// `GET /auth/roles` — list roles (admin only). Requires `roles.read` (or `*`).
+#[cfg_attr(feature = "axum", utoipa::path(
+    get, path = "/auth/roles", tag = "auth",
+    responses(
+        (status = 200, description = "Every role + its scope bundle", body = Vec<RoleSummary>),
+        (status = 401, description = "No verified claims"),
+        (status = 403, description = "Caller lacks the roles.read scope"),
+    ),
+))]
 #[cfg(feature = "pg")]
 async fn list_roles(
     State(state): State<AuthState>,
@@ -561,6 +722,16 @@ async fn list_roles(
 
 /// `DELETE /auth/roles/{name}` — delete a role (admin only). Requires `roles.write` (or `*`).
 /// Idempotent: deleting an absent role is `404`, deleting a present one is `204`.
+#[cfg_attr(feature = "axum", utoipa::path(
+    delete, path = "/auth/roles/{name}", tag = "auth",
+    params(("name" = String, Path, description = "The role name to delete")),
+    responses(
+        (status = 204, description = "Deleted"),
+        (status = 401, description = "No verified claims"),
+        (status = 403, description = "Caller lacks the roles.write scope"),
+        (status = 404, description = "No role with that name"),
+    ),
+))]
 #[cfg(feature = "pg")]
 async fn delete_role(
     State(state): State<AuthState>,
@@ -577,6 +748,17 @@ async fn delete_role(
 
 /// `POST /auth/users/{email}/roles` — set a user's assigned roles (admin only). Requires
 /// `users.write` (or `*`): assignment is a write to the user record. `404` for an unknown email.
+#[cfg_attr(feature = "axum", utoipa::path(
+    post, path = "/auth/users/{email}/roles", tag = "auth",
+    params(("email" = String, Path, description = "The user whose roles are being set")),
+    request_body = AssignRolesRequest,
+    responses(
+        (status = 204, description = "Roles set (replaces the user's current set)"),
+        (status = 401, description = "No verified claims"),
+        (status = 403, description = "Caller lacks the users.write scope"),
+        (status = 404, description = "No user with that email"),
+    ),
+))]
 #[cfg(feature = "pg")]
 async fn assign_roles(
     State(state): State<AuthState>,
@@ -788,6 +970,28 @@ mod tests {
     use axum::http::Request;
     use jsonwebtoken::DecodingKey;
     use tower::ServiceExt; // oneshot
+
+    /// The fused `/auth/*` OpenAPI must carry the absolute auth paths so the FE codegen
+    /// (`hq-web-extras.10`) sees them — login surface always, admin/RBAC routes with `pg`.
+    #[test]
+    fn auth_openapi_lists_every_absolute_route() {
+        let doc = auth_openapi();
+        let paths: Vec<&str> = doc.paths.paths.keys().map(String::as_str).collect();
+        for expected in ["/auth/login", "/auth/refresh", "/auth/logout", "/auth/me", "/auth/jwks"] {
+            assert!(paths.contains(&expected), "missing {expected} in {paths:?}");
+        }
+        #[cfg(feature = "pg")]
+        for expected in [
+            "/auth/users",
+            "/auth/roles",
+            "/auth/roles/{name}",
+            "/auth/users/{email}/roles",
+            "/auth/workspaces",
+            "/auth/switch",
+        ] {
+            assert!(paths.contains(&expected), "missing {expected} in {paths:?}");
+        }
+    }
 
     // A throwaway RS256 keypair for minting + (in the middleware tests upstream) verifying.
     const PRIV_PEM: &[u8] = include_bytes!("../tests/fixtures/rs256_priv.pem");

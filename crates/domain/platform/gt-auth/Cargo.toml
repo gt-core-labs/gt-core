@@ -59,6 +59,11 @@ async-trait = { workspace = true, optional = true }
 # than a silent permission hole. Kernel dep (platform → kernel is allowed), pulled only with the
 # `axum` admin surface.
 gt-rbac = { workspace = true, optional = true }
+# OpenAPI annotations for the auth router (`http.rs`, hq-web-extras.10): `#[utoipa::path]` on the
+# handlers + the `ApiDoc` the composition root fuses into `/openapi.json`, so the FE codegen reads
+# /auth/* from the spec instead of hand-maintaining the types. Gated with the `axum` surface it
+# describes — same as gt-issues (docs/03 Rule 4).
+utoipa = { workspace = true, optional = true }
 
 [features]
 # Production email+password provider — argon2 hash + verify.
@@ -71,7 +76,7 @@ pg = ["dep:sqlx", "dep:sha2", "password-hash"]
 # Axum auth-endpoint router (`http.rs`, hq-auth-routes.1). Needs the minter, so it implies
 # `jsonwebtoken`; the login port is abstract, so the DB-backed adapter is opted in separately
 # via `pg`.
-axum = ["dep:axum", "dep:async-trait", "dep:gt-rbac", "jsonwebtoken"]
+axum = ["dep:axum", "dep:async-trait", "dep:gt-rbac", "dep:utoipa", "jsonwebtoken"]
 
 [dev-dependencies]
 serde_json = { workspace = true }

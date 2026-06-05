@@ -58,13 +58,17 @@ pub struct JwtAuthenticator {
 /// big-endian modulus and exponent a client feeds to e.g.
 /// [`DecodingKey::from_rsa_components`] to verify a token offline.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[cfg_attr(feature = "axum", derive(utoipa::ToSchema))]
 pub struct Jwk {
     /// Key type — always `"RSA"`.
+    #[cfg_attr(feature = "axum", schema(value_type = String))]
     pub kty: &'static str,
     /// Public-key use — always `"sig"` (signature verification).
     #[serde(rename = "use")]
+    #[cfg_attr(feature = "axum", schema(value_type = String))]
     pub r#use: &'static str,
     /// Algorithm — always `"RS256"`.
+    #[cfg_attr(feature = "axum", schema(value_type = String))]
     pub alg: &'static str,
     /// Key id matching the JWT header `kid`; absent for the un-keyed default key.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -84,6 +88,7 @@ impl Jwk {
 /// A [JWK Set](https://www.rfc-editor.org/rfc/rfc7517#section-5) — the public half of a
 /// verifier's keyset, as served by `GET /auth/jwks`. An empty `keys` is valid (no keys loaded).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[cfg_attr(feature = "axum", derive(utoipa::ToSchema))]
 pub struct JwkSet {
     /// One entry per published public key.
     pub keys: Vec<Jwk>,

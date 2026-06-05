@@ -476,6 +476,12 @@ async fn main() -> anyhow::Result<()> {
     if public_share.is_some() {
         openapi_doc.merge(gt_documents::public_openapi());
     }
+    // Fold in the public `/auth/*` login + RBAC surface (hq-web-extras.10): it mounts at the
+    // server ROOT (below, beside /openapi.json), not under an /api/v1/<ns> module prefix, so it is
+    // in neither builder's docs — its `#[utoipa::path]`s already name the absolute `/auth/...`
+    // paths. Merged unconditionally: it describes the platform's auth contract (the gt-web codegen
+    // consumes it), and the compiled feature set (`pg`) advertises the admin/RBAC routes too.
+    openapi_doc.merge(gt_auth::auth_openapi());
     let openapi_json: Arc<str> = Arc::from(
         serde_json::to_string(&openapi_doc).context("serialize the merged OpenAPI document")?,
     );
