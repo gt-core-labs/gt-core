@@ -18,6 +18,9 @@ serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
 schemars = { workspace = true }
 semver = { workspace = true }
+# RFC3339 parsing for the stats lead-time roll-up (hq-web-extras.12), mirroring
+# gt-feed's `time`-based timestamp parsing — parse-only, no clock.
+time = { workspace = true, features = ["parsing"] }
 # Off-by-default `axum` REST adapter (hq-auth-routes.2): the first GtModule HTTP
 # surface — `register_routes` maps `issues.*` to REST routes the builder mounts at
 # `/api/v1/issues` behind the auth+scope guard, with a utoipa OpenAPI spec. Folds

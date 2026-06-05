@@ -42,7 +42,8 @@ use crate::commands::{ClaimIssue, CloseIssue, CreateIssue, TransitionIssue, Upda
 use crate::handlers::{
     run_claim_issue, run_close_issue, run_create_issue, run_transition_issue, run_update_issue,
 };
-use crate::resources::{read_issue, read_issues_page};
+use crate::resources::{read_issue, read_issues, read_issues_page};
+use crate::stats::{aggregate, GroupDim, StatsResponse};
 use crate::surface::AllowAllTree;
 
 /// Everything the issues REST handlers need, baked into the router with
@@ -80,9 +81,14 @@ impl IssuesApiState {
 /// | `POST /:id/transition`    | `issues.transition.execute` |
 /// | `POST /:id/close`         | `issues.close.execute`  |
 /// | `POST /:id/claim`         | `issues.claim.execute`  |
+/// | `GET /stats`              | aggregation (`hq-web-extras.12`) |
 pub fn issues_router(state: IssuesApiState) -> Router {
     Router::new()
         .route("/", get(list_issues).post(create_issue))
+        // Concrete `/stats` is registered before the `/:id` wildcard so the GET never matches
+        // an issue literally named "stats"; axum routes the more specific path first regardless,
+        // but ordering it here keeps the intent obvious.
+        .route("/stats", get(issue_stats))
         .route("/:id", get(get_issue).patch(update_issue))
         .route("/:id/transition", post(transition_issue))
         .route("/:id/close", post(close_issue))
@@ -159,6 +165,79 @@ async fn list_issues(
 ) -> Result<Json<IssuePage>, ApiError> {
     let page = read_issues_page(&st.store, &q.into_filter()).await?;
     Ok(Json(page))
+}
+
+/// Querystring for `GET /stats` (`hq-web-extras.12`). `group_by` is the required, comma-separated
+/// list of dimensions (`epic|rig|status|domain|assignee|owner`, combinable); the optional filters
+/// mirror [`ListQuery`] so a caller can scope the aggregation to a sub-slice (e.g. one epic) before
+/// it is rolled up.
+#[derive(Debug, Default, Deserialize)]
+struct StatsQuery {
+    /// Required comma-separated grouping dimensions (e.g. `assignee,rig`).
+    group_by: Option<String>,
+    /// Optional comma-separated `status` pre-filter (e.g. `open,working`).
+    status: Option<String>,
+    /// Optional `priority <= priority_max` pre-filter.
+    priority_max: Option<u8>,
+    /// Optional exact `assignee` pre-filter (`""` = unassigned).
+    assignee: Option<String>,
+    /// Optional exact `external_ref` (epic) pre-filter.
+    external_ref: Option<String>,
+    /// Optional exact `issue_type` pre-filter.
+    issue_type: Option<String>,
+}
+
+/// `GET /stats` — per-workspace aggregation for the statistics view (`gt-web.5`, `hq-web-extras.12`).
+///
+/// Returns counts `{open,working,closed,other,total}` + `progress_pct` (`closed/total`) +
+/// `lead_time` (from `created_at`/`closed_at` on closed beads) for each bucket of the requested
+/// `group_by` dimensions, plus an ungrouped `totals` roll-up. The aggregation runs over the
+/// tracker rows of the active workspace (the same auth-scoped store the other handlers use —
+/// tenant resolution is upstream, never a route param); the math itself lives in transport-free
+/// [`crate::stats`]. Scope: `issues.read` (the GET verb-class the builder guards).
+///
+/// An unknown or empty `group_by` is a `422` (client error), matching the MCP parse path. The
+/// rows are pulled with a high page limit (clamped by `GT_ISSUES_MAX_LIMIT`) so the aggregate
+/// covers the whole workspace tracker in one pass.
+#[cfg_attr(feature = "axum", utoipa::path(
+    get, path = "/stats",
+    params(
+        ("group_by" = String, Query, description = "Comma-separated dimensions: epic|rig|status|domain|assignee|owner (combinable)"),
+        ("status" = Option<String>, Query, description = "Comma-separated status pre-filter"),
+        ("priority_max" = Option<u8>, Query, description = "Keep priority <= this"),
+        ("assignee" = Option<String>, Query, description = "Exact assignee pre-filter"),
+        ("external_ref" = Option<String>, Query, description = "Exact external_ref (epic) pre-filter"),
+        ("issue_type" = Option<String>, Query, description = "Exact issue_type pre-filter"),
+    ),
+    responses(
+        (status = 200, description = "Per-bucket counts + progress% + lead_time, plus ungrouped totals", body = StatsResponse),
+        (status = 422, description = "Missing/unknown group_by dimension"),
+    ),
+))]
+async fn issue_stats(
+    State(st): State<IssuesApiState>,
+    Query(q): Query<StatsQuery>,
+) -> Result<Json<StatsResponse>, ApiError> {
+    let dims = GroupDim::parse_list(q.group_by.as_deref().unwrap_or_default())
+        .map_err(|e| ApiError(AppError::Validation(e)))?;
+    // Pull the whole workspace tracker (cheap snapshot rows; `full=false`). A `None` limit would
+    // cap at GT_ISSUES_DEFAULT_LIMIT (~200) and silently undercount, so request the max ceiling.
+    let filter = IssueFilter {
+        status: q
+            .status
+            .map(|s| s.split(',').filter(|p| !p.is_empty()).map(str::to_string).collect())
+            .unwrap_or_default(),
+        priority_max: q.priority_max,
+        assignee: q.assignee,
+        external_ref: q.external_ref,
+        issue_type: q.issue_type,
+        limit: Some(gt_store_dolt::issues_max_limit()),
+        offset: None,
+        full: false,
+        ready: false,
+    };
+    let rows = read_issues(&st.store, &filter).await?;
+    Ok(Json(aggregate(&rows, &dims)))
 }
 
 /// `GET /:id` — one issue with its heavy bodies + `version` (`gt://issue/{id}`); `404` when no
@@ -315,15 +394,24 @@ async fn claim_issue(
 /// mounts it under the module prefix and rewrites its relative paths to `/api/v1/issues/...`,
 /// so the `#[utoipa::path]` annotations stay prefix-free.
 #[derive(utoipa::OpenApi)]
-#[openapi(paths(
-    list_issues,
-    get_issue,
-    create_issue,
-    update_issue,
-    transition_issue,
-    close_issue,
-    claim_issue,
-))]
+#[openapi(
+    paths(
+        list_issues,
+        issue_stats,
+        get_issue,
+        create_issue,
+        update_issue,
+        transition_issue,
+        close_issue,
+        claim_issue,
+    ),
+    components(schemas(
+        StatsResponse,
+        crate::stats::StatBucket,
+        crate::stats::LeadTime,
+        GroupDim,
+    )),
+)]
 pub struct ApiDoc;
 
 /// Deserialize a path-addressed command body, forcing the `id` to the path segment so it is
@@ -376,7 +464,7 @@ mod tests {
         // rewrite them. Every declared route must be present so the combined document is complete.
         let doc = ApiDoc::openapi();
         let paths: Vec<&str> = doc.paths.paths.keys().map(String::as_str).collect();
-        for expected in ["/", "/{id}", "/{id}/transition", "/{id}/close", "/{id}/claim"] {
+        for expected in ["/", "/stats", "/{id}", "/{id}/transition", "/{id}/close", "/{id}/claim"] {
             assert!(paths.contains(&expected), "missing {expected} in {paths:?}");
         }
         // Prefix-free: the module builder, not the annotation, owns `/api/v1/issues`.

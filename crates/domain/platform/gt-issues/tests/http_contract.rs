@@ -168,3 +168,53 @@ async fn claim_flips_status_to_working() {
     let (_, detail) = send(&app, get("/hq-claim")).await;
     assert_eq!(detail["status"], "working", "claim flips status to working");
 }
+
+#[tokio::test]
+async fn stats_groups_by_status_with_progress_and_totals() {
+    let Ok(base) = std::env::var("GT_DOLT_URL") else {
+        eprintln!("GT_DOLT_URL unset — skipping http contract");
+        return;
+    };
+    let base = base.trim_end_matches('/').to_string();
+    let db = "gt_http_stats";
+    fresh_db(&base, db).await.expect("db");
+    let app = router(&base, db).await;
+
+    // Two epics under the same id prefix (rig = "hq"); one is then claimed -> working.
+    for id in ["hq-stats-a", "hq-stats-b"] {
+        let (s, _) = send(
+            &app,
+            post_json("/", json!({ "id": id, "title": "s", "issue_type": "epic", "created_by": "test", "domain": ["platform.rig"] })),
+        )
+        .await;
+        assert_eq!(s, StatusCode::CREATED);
+    }
+    send(&app, post_json("/hq-stats-a/claim", json!({}))).await;
+
+    // group_by=status: one open + one working bucket, totals over both.
+    let (status, body) = send(&app, get("/stats?group_by=status")).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["group_by"], json!(["status"]));
+    assert_eq!(body["totals"]["total"], 2);
+    let buckets = body["buckets"].as_array().expect("buckets array");
+    let working = buckets
+        .iter()
+        .find(|b| b["key"]["status"] == "working")
+        .expect("working bucket");
+    assert_eq!(working["working"], 1);
+    assert_eq!(working["total"], 1);
+
+    // group_by=rig: both beads share the "hq" prefix => a single bucket of 2.
+    let (status, body) = send(&app, get("/stats?group_by=rig")).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let buckets = body["buckets"].as_array().expect("buckets");
+    assert_eq!(buckets.len(), 1);
+    assert_eq!(buckets[0]["key"]["rig"], "hq");
+    assert_eq!(buckets[0]["total"], 2);
+
+    // Unknown/missing group_by is a 422 (client error), not a 500.
+    let (status, _) = send(&app, get("/stats?group_by=bogus")).await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+    let (status, _) = send(&app, get("/stats")).await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+}

@@ -43,6 +43,11 @@ pub mod park;
 pub mod policy;
 pub mod readiness;
 pub mod resources;
+/// Transport-free statistics aggregation (`hq-web-extras.12`): counts + progress + lead-time
+/// roll-ups over the tracker rows, grouped by epic/rig/status/domain/assignee/owner. The cheap
+/// `gt://issues` snapshot feeds it; the `GET /api/v1/issues/stats` REST handler in [`http`] wires
+/// it to the wire.
+pub mod stats;
 pub mod surface;
 pub mod taxonomy;
 mod module;
