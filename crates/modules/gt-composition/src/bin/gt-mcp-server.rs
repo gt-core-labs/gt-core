@@ -48,10 +48,11 @@ use gt_composition::denial_audit::audit_denials;
 use gt_composition::scope_bridge::bridge_scopes;
 use gt_composition::stream::{feed_router, FeedState};
 use gt_auth::{
-    auth_router, AuthState as LoginState, InMemoryRefreshStore, JwtAuthenticator, JwtMinter, PgUsers,
-    SameSite,
+    auth_router, AuthState as LoginState, GlobalLogin, InMemoryRefreshStore, JwtAuthenticator,
+    JwtMinter, PgUsers, SameSite,
 };
-use gt_store_pg::WorkspacePool;
+use gt_store_pg::{schema_for, WorkspacePool};
+use sqlx::Row;
 // Domain REST modules + their `with_http` state (hq-fe-api-mount.1): the bin mounts each
 // crate's `register_routes` so the FE reaches every namespace over authenticated HTTP.
 use gt_agent::{AgentApiState, AgentModule};
@@ -448,12 +449,19 @@ async fn main() -> anyhow::Result<()> {
                 // expand roles → scopes from the first request.
                 gt_auth::migrations::CREATE_ROLES,
                 gt_auth::migrations::ADD_USER_ROLES,
+                // hq-identity.1: the global identity + N:N membership tables, so global login
+                // (hq-identity.2) and the migration below have somewhere to land.
+                gt_auth::migrations::CREATE_GLOBAL_IDENTITY,
             ] {
                 sqlx::raw_sql(sql)
                     .execute(&pool)
                     .await
                     .context("auth: apply gt-auth migration")?;
             }
+            // hq-identity.4: lift every existing per-workspace user into the global identity +
+            // membership tables, THEN (re)seed the global admin. Order matters — the seed is the
+            // authority for admin, so it runs last and wins. Both are idempotent.
+            migrate_users_to_global(&pool).await?;
             seed_admin(&pool).await?;
             let jwks = Arc::new(
                 JwtAuthenticator::from_env()
@@ -464,7 +472,11 @@ async fn main() -> anyhow::Result<()> {
             // role-admin store (hq-rbac.4) — one adapter over the ws_default pool.
             let pg_users = Arc::new(PgUsers::new(pool.clone(), "default"));
             let login_state = LoginState {
-                login: pg_users.clone(),
+                // hq-identity.4: login now authenticates against the GLOBAL identity and resolves
+                // the active workspace from membership (default = first), replacing the per-ws
+                // ws_default lookup. The migration + seed above guarantee admin@gt.local already
+                // has a global row + a default membership, so the live login survives the cutover.
+                login: Arc::new(GlobalLogin(pg_users.clone())),
                 users: Some(pg_users.clone() as Arc<dyn gt_auth::UserStore>),
                 roles: Some(pg_users.clone() as Arc<dyn gt_auth::RoleStore>),
                 // Cross-workspace surface (hq-identity.3): list memberships + switch active
@@ -786,11 +798,18 @@ fn build_blob_store() -> (Option<Arc<BlobStore>>, String) {
     }
 }
 
-/// Ensure the default admin user exists in `ws_default.users` (hq-web-extras.4). Idempotent:
-/// `ON CONFLICT (email) DO NOTHING`, and the password is argon2-hashed at boot — never stored
-/// plain. Skipped (with a log line) unless BOTH `GT_ADMIN_EMAIL` and `GT_ADMIN_PASSWORD` are
-/// set, so no insecure default credential is ever baked into a deploy. Scopes are `["*"]`: the
-/// RBAC scope guard treats the wildcard as allow-all, so the seeded admin reaches every route.
+/// Ensure the default admin exists as a GLOBAL identity (hq-identity.4, was hq-web-extras.4).
+///
+/// Seeds, all idempotently and all argon2-hashed at boot (never plaintext):
+/// - the legacy `ws_default.users` admin row (kept for back-compat during the transition);
+/// - the global `public.users` admin identity (id `admin`, the globally-unique email);
+/// - an `admin` role in `ws_default.roles` granting `["*"]` (the RBAC wildcard = allow-all);
+/// - a `public.user_workspaces` membership tying admin to the `default` workspace with that role.
+///
+/// So once login is global, `admin@gt.local` authenticates against `public.users`, resolves its
+/// `default` membership, and expands `admin` → `["*"]` — the live admin login survives the
+/// cutover. Skipped (with a log line) unless BOTH `GT_ADMIN_EMAIL` and `GT_ADMIN_PASSWORD` are
+/// set, so no insecure default credential is ever baked into a deploy.
 async fn seed_admin(pool: &sqlx::PgPool) -> anyhow::Result<()> {
     let (email, password) = match (
         std::env::var("GT_ADMIN_EMAIL"),
@@ -811,6 +830,7 @@ async fn seed_admin(pool: &sqlx::PgPool) -> anyhow::Result<()> {
         .expect("system clock before the Unix epoch")
         .as_secs() as i64;
     let scopes = vec!["*".to_string()];
+    // Legacy per-ws row (back-compat; harmless once global login is wired).
     sqlx::query(
         "INSERT INTO users (id, email, password_hash, scopes, created_at, updated_at) \
          VALUES ($1, $2, $3, $4, $5, $5) ON CONFLICT (email) DO NOTHING",
@@ -823,8 +843,195 @@ async fn seed_admin(pool: &sqlx::PgPool) -> anyhow::Result<()> {
     .execute(pool)
     .await
     .context("seed default admin user")?;
-    eprintln!("[gt-mcp-server] default admin ensured: {email}");
+
+    // Global identity: the admin reachable from any workspace pool.
+    sqlx::query(
+        "INSERT INTO public.users (id, email, password_hash, created_at, updated_at) \
+         VALUES ($1, $2, $3, $4, $4) ON CONFLICT (email) DO NOTHING",
+    )
+    .bind("admin")
+    .bind(&email)
+    .bind(&hash)
+    .bind(now)
+    .execute(pool)
+    .await
+    .context("seed global admin identity")?;
+    // The `admin` role granting the wildcard, in the default workspace's catalog.
+    sqlx::query(
+        "INSERT INTO ws_default.roles (name, scopes, created_at, updated_at) \
+         VALUES ('admin', $1, $2, $2) ON CONFLICT (name) DO UPDATE SET scopes = EXCLUDED.scopes",
+    )
+    .bind(&scopes)
+    .bind(now)
+    .execute(pool)
+    .await
+    .context("seed admin role")?;
+    // Membership: admin@default holds `admin`, so global login expands it to `["*"]`. Resolve the
+    // surviving global id by email in case a prior row already claimed it.
+    let admin_id: String = sqlx::query_scalar("SELECT id FROM public.users WHERE email = $1")
+        .bind(&email)
+        .fetch_one(pool)
+        .await
+        .context("resolve global admin id")?;
+    sqlx::query(
+        "INSERT INTO public.user_workspaces (user_id, workspace_slug, role, created_at) \
+         VALUES ($1, 'default', 'admin', $2) \
+         ON CONFLICT (user_id, workspace_slug) DO UPDATE SET role = EXCLUDED.role",
+    )
+    .bind(&admin_id)
+    .bind(now)
+    .execute(pool)
+    .await
+    .context("seed admin membership")?;
+    eprintln!("[gt-mcp-server] global admin ensured: {email} (default/admin → [*])");
     Ok(())
+}
+
+/// Lift every existing per-workspace user (`ws_<slug>.users`) into the global identity tables
+/// (hq-identity.4): one `public.users` row per email plus a `public.user_workspaces` membership
+/// for the workspace it came from, with the user's old direct scopes preserved through a role the
+/// membership names ([`migrated_role`]). Idempotent — every write is an upsert, so a restart
+/// against an already-migrated DB is a no-op. Best-effort per workspace: a tenant whose schema has
+/// no `users` table is skipped, never fatal. Runs BEFORE [`seed_admin`], which is the authority for
+/// the admin row.
+async fn migrate_users_to_global(pool: &sqlx::PgPool) -> anyhow::Result<()> {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system clock before the Unix epoch")
+        .as_secs() as i64;
+    // Drive off the workspace catalog: its slug is authoritative for both the schema name and the
+    // membership's `workspace_slug` (reverse-mapping a schema name back to a slug would be lossy).
+    // The catalog is self-seeded LATER in boot, so on a brand-new DB it may not exist yet — but a
+    // brand-new DB has no pre-existing users to migrate either, so its absence is a clean skip.
+    let has_catalog: bool = sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM information_schema.tables \
+         WHERE table_schema = 'public' AND table_name = 'workspaces')",
+    )
+    .fetch_one(pool)
+    .await
+    .context("migrate: probe workspace catalog")?;
+    if !has_catalog {
+        return Ok(());
+    }
+    let slugs: Vec<String> = sqlx::query_scalar("SELECT slug FROM public.workspaces ORDER BY slug")
+        .fetch_all(pool)
+        .await
+        .context("migrate: list workspaces")?;
+    let mut migrated = 0usize;
+    for slug in slugs {
+        let schema = schema_for(&slug);
+        // Catalog slugs are system-minted, but the schema name is interpolated below — prove it is
+        // a plain `ws_*` identifier before it ever reaches a SQL string.
+        if !is_safe_schema_ident(&schema) {
+            continue;
+        }
+        let has_users: bool = sqlx::query_scalar(
+            "SELECT EXISTS (SELECT 1 FROM information_schema.tables \
+             WHERE table_schema = $1 AND table_name = 'users')",
+        )
+        .bind(&schema)
+        .fetch_one(pool)
+        .await
+        .context("migrate: probe users table")?;
+        if !has_users {
+            continue;
+        }
+        // Ensure the per-ws role catalog exists (older tenants may predate it) so the migrated
+        // role has somewhere to land and login can expand it.
+        sqlx::query(&format!(
+            "CREATE TABLE IF NOT EXISTS {schema}.roles ( \
+                name TEXT PRIMARY KEY, \
+                scopes TEXT[] NOT NULL DEFAULT '{{}}', \
+                created_at BIGINT NOT NULL, \
+                updated_at BIGINT NOT NULL )"
+        ))
+        .execute(pool)
+        .await
+        .with_context(|| format!("migrate: ensure {schema}.roles"))?;
+
+        let rows = sqlx::query(&format!(
+            "SELECT id, email, password_hash, scopes FROM {schema}.users"
+        ))
+        .fetch_all(pool)
+        .await
+        .with_context(|| format!("migrate: read {schema}.users"))?;
+        for row in &rows {
+            let id: String = row.try_get("id").context("migrate: row id")?;
+            let email: String = row.try_get("email").context("migrate: row email")?;
+            let hash: String = row.try_get("password_hash").context("migrate: row hash")?;
+            let scopes: Vec<String> = row.try_get("scopes").context("migrate: row scopes")?;
+
+            sqlx::query(
+                "INSERT INTO public.users (id, email, password_hash, created_at, updated_at) \
+                 VALUES ($1, $2, $3, $4, $4) ON CONFLICT (email) DO NOTHING",
+            )
+            .bind(&id)
+            .bind(&email)
+            .bind(&hash)
+            .bind(now)
+            .execute(pool)
+            .await
+            .context("migrate: upsert global user")?;
+            // The surviving global id may differ if this email already had a global row.
+            let global_id: String =
+                sqlx::query_scalar("SELECT id FROM public.users WHERE email = $1")
+                    .bind(&email)
+                    .fetch_one(pool)
+                    .await
+                    .context("migrate: resolve global id")?;
+
+            let (role_name, role_scopes) = migrated_role(&global_id, &scopes);
+            sqlx::query(&format!(
+                "INSERT INTO {schema}.roles (name, scopes, created_at, updated_at) \
+                 VALUES ($1, $2, $3, $3) ON CONFLICT (name) DO UPDATE SET scopes = EXCLUDED.scopes"
+            ))
+            .bind(&role_name)
+            .bind(&role_scopes)
+            .bind(now)
+            .execute(pool)
+            .await
+            .context("migrate: upsert migrated role")?;
+
+            sqlx::query(
+                "INSERT INTO public.user_workspaces (user_id, workspace_slug, role, created_at) \
+                 VALUES ($1, $2, $3, $4) ON CONFLICT (user_id, workspace_slug) DO NOTHING",
+            )
+            .bind(&global_id)
+            .bind(&slug)
+            .bind(&role_name)
+            .bind(now)
+            .execute(pool)
+            .await
+            .context("migrate: upsert membership")?;
+            migrated += 1;
+        }
+    }
+    if migrated > 0 {
+        eprintln!("[gt-mcp-server] migrated {migrated} per-workspace user(s) into global identity");
+    }
+    Ok(())
+}
+
+/// The (role name, scopes) a migrated user's membership references (hq-identity.4), carrying their
+/// old direct scopes into the role→scopes model. A full-access user (`["*"]`) maps to the shared
+/// `admin` role; everyone else gets a per-user role keyed by their global id, granting exactly the
+/// scopes they had. Pure — unit-tested without a database.
+fn migrated_role(global_id: &str, scopes: &[String]) -> (String, Vec<String>) {
+    if scopes.len() == 1 && scopes[0] == "*" {
+        ("admin".to_string(), vec!["*".to_string()])
+    } else {
+        (format!("migrated-{global_id}"), scopes.to_vec())
+    }
+}
+
+/// Whether `s` is a plain `ws_*` Postgres schema identifier safe to interpolate (hq-identity.4):
+/// lowercase letters, digits, and underscores only, ≤ the 63-byte identifier limit. Guards the
+/// migration's interpolated schema names even though catalog slugs are system-minted.
+fn is_safe_schema_ident(s: &str) -> bool {
+    s.len() <= 63
+        && s.starts_with("ws_")
+        && s.chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_')
 }
 
 /// Parse a `u64` env var, falling back to `default` when it is unset or unparseable.
@@ -919,5 +1126,166 @@ mod tests {
         // Served byte-for-byte, and still valid JSON.
         assert_eq!(&bytes[..], spec.as_bytes());
         assert!(serde_json::from_slice::<serde_json::Value>(&bytes).is_ok());
+    }
+
+    /// hq-identity.4: a full-access user maps to the shared `admin` role; everyone else keeps their
+    /// exact scopes through a per-user role keyed by their global id.
+    #[test]
+    fn migrated_role_maps_wildcard_to_admin_else_per_user() {
+        assert_eq!(
+            migrated_role("admin", &["*".to_string()]),
+            ("admin".to_string(), vec!["*".to_string()])
+        );
+        assert_eq!(
+            migrated_role("user-bob@x.test", &["rig.read".to_string(), "beads.read".to_string()]),
+            (
+                "migrated-user-bob@x.test".to_string(),
+                vec!["rig.read".to_string(), "beads.read".to_string()]
+            )
+        );
+        // A user with no scopes still gets a (empty) per-user role, never the admin one.
+        assert_eq!(
+            migrated_role("u-empty", &[]),
+            ("migrated-u-empty".to_string(), vec![])
+        );
+        // `*` alongside other scopes is NOT the wildcard-only case → per-user role.
+        let (name, _) = migrated_role("u-mixed", &["*".to_string(), "rig.read".to_string()]);
+        assert_eq!(name, "migrated-u-mixed");
+    }
+
+    /// hq-identity.4: only plain `ws_*` identifiers are safe to interpolate as a schema name.
+    #[test]
+    fn is_safe_schema_ident_accepts_ws_and_rejects_the_rest() {
+        assert!(is_safe_schema_ident("ws_default"));
+        assert!(is_safe_schema_ident("ws_team_1"));
+        for bad in ["public", "ws-default", "ws_Default", "ws_a;b", "pg_catalog", "", &format!("ws_{}", "a".repeat(61))] {
+            assert!(!is_safe_schema_ident(bad), "{bad:?} must be rejected");
+        }
+    }
+
+    /// hq-identity.4 (GT_PG_URL-gated): the boot path end to end against a live Postgres — apply
+    /// the auth migrations, lift a pre-existing per-workspace user into the global identity, seed
+    /// the global admin, and prove BOTH log in globally with their scopes intact. A no-op without
+    /// GT_PG_URL (same gate as gt-auth's pg contract tests). Serialised: it sets admin env vars.
+    #[tokio::test]
+    async fn boot_migration_and_seed_make_users_log_in_globally() {
+        let Ok(url) = std::env::var("GT_PG_URL") else {
+            eprintln!("GT_PG_URL unset; skipping global migration+seed e2e");
+            return;
+        };
+        // The server hands seed_admin a ws_default-scoped pool (its legacy per-ws insert is
+        // unqualified `users`); mirror that search_path so the test is faithful to boot.
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .after_connect(|conn, _| {
+                Box::pin(async move {
+                    sqlx::query("SET search_path TO ws_default, public")
+                        .execute(conn)
+                        .await
+                        .map(|_| ())
+                })
+            })
+            .connect(&url)
+            .await
+            .expect("connect GT_PG_URL");
+        // The schema must exist before a connection sets search_path to it on checkout.
+        sqlx::raw_sql("CREATE SCHEMA IF NOT EXISTS ws_default")
+            .execute(&pool)
+            .await
+            .expect("ensure ws_default schema");
+
+        // The boot migration set the server applies before migrating.
+        for sql in [
+            gt_auth::migrations::CREATE_USERS,
+            gt_auth::migrations::CREATE_ROLES,
+            gt_auth::migrations::ADD_USER_ROLES,
+            gt_auth::migrations::CREATE_GLOBAL_IDENTITY,
+        ] {
+            sqlx::raw_sql(sql).execute(&pool).await.expect("apply migration");
+        }
+        // A workspace catalog with `default` (the migration drives off it).
+        sqlx::raw_sql(
+            "CREATE TABLE IF NOT EXISTS public.workspaces (slug TEXT PRIMARY KEY); \
+             INSERT INTO public.workspaces (slug) VALUES ('default') ON CONFLICT DO NOTHING;",
+        )
+        .execute(&pool)
+        .await
+        .expect("seed workspace catalog");
+
+        // Clean prior runs, then plant a pre-existing per-ws user (bob, rig.read) to be migrated.
+        for email in ["bob@id4.test", "admin@id4.test"] {
+            sqlx::query("DELETE FROM public.users WHERE email = $1")
+                .bind(email)
+                .execute(&pool)
+                .await
+                .unwrap();
+            sqlx::query("DELETE FROM ws_default.users WHERE email = $1")
+                .bind(email)
+                .execute(&pool)
+                .await
+                .unwrap();
+        }
+        let hash = gt_auth::password::hash_password("pw-bob").unwrap();
+        sqlx::query(
+            "INSERT INTO ws_default.users (id, email, password_hash, scopes, created_at, updated_at) \
+             VALUES ('u-bob', 'bob@id4.test', $1, ARRAY['rig.read'], 0, 0)",
+        )
+        .bind(&hash)
+        .execute(&pool)
+        .await
+        .expect("plant pre-existing user");
+
+        // Run the real boot steps.
+        migrate_users_to_global(&pool).await.expect("migrate");
+        std::env::set_var("GT_ADMIN_EMAIL", "admin@id4.test");
+        std::env::set_var("GT_ADMIN_PASSWORD", "pw-admin");
+        seed_admin(&pool).await.expect("seed admin");
+
+        let users = PgUsers::new(pool.clone(), "default");
+
+        // Migrated user: logs in globally, lands on its origin workspace, keeps its scopes.
+        let bob = users
+            .authenticate_global(
+                &gt_auth::Credentials::EmailPassword {
+                    email: "bob@id4.test".into(),
+                    password: "pw-bob".into(),
+                },
+                None,
+            )
+            .await
+            .expect("bob logs in globally");
+        assert_eq!(bob.workspace, "default");
+        assert_eq!(bob.scopes, vec!["rig.read".to_string()]);
+
+        // Seeded admin: global login, default workspace, wildcard scope.
+        let admin = users
+            .authenticate_global(
+                &gt_auth::Credentials::EmailPassword {
+                    email: "admin@id4.test".into(),
+                    password: "pw-admin".into(),
+                },
+                None,
+            )
+            .await
+            .expect("admin logs in globally");
+        assert_eq!(admin.workspace, "default");
+        assert_eq!(admin.scopes, vec!["*".to_string()]);
+
+        // Idempotent: a second migrate + seed changes nothing and still logs both in.
+        migrate_users_to_global(&pool).await.expect("re-migrate");
+        seed_admin(&pool).await.expect("re-seed");
+        assert_eq!(
+            users
+                .authenticate_global(
+                    &gt_auth::Credentials::EmailPassword {
+                        email: "bob@id4.test".into(),
+                        password: "pw-bob".into(),
+                    },
+                    None,
+                )
+                .await
+                .unwrap()
+                .scopes,
+            vec!["rig.read".to_string()]
+        );
     }
 }
