@@ -438,8 +438,11 @@ async fn main() -> anyhow::Result<()> {
                     .context("auth: build JWKS from the public verifier keys")?
                     .jwk_set(),
             );
+            // One PgUsers backs both the login port and the user-admin store (hq-web-extras.5).
+            let pg_users = Arc::new(PgUsers::new(pool.clone(), "default"));
             let login_state = LoginState {
-                login: Arc::new(PgUsers::new(pool.clone(), "default")),
+                login: pg_users.clone(),
+                users: Some(pg_users.clone() as Arc<dyn gt_auth::UserStore>),
                 minter: Arc::new(minter),
                 // MVP refresh store (hq-web-extras.7): in-memory, so refresh tokens do not
                 // survive a restart. Durable PgRefreshStore is async-only and does not implement

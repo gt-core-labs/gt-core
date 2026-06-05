@@ -128,6 +128,61 @@ fn row_to_identity(row: &PgRow, workspace: &str) -> Result<VerifiedIdentity, Aut
     })
 }
 
+/// User administration over the same `users` table (`hq-web-extras.5`). Available when the
+/// `axum` admin surface is also on; storage-only — the handler hashes the password first.
+#[cfg(feature = "axum")]
+#[async_trait::async_trait]
+impl crate::http::UserStore for PgUsers {
+    async fn create_user(
+        &self,
+        id: &str,
+        email: &str,
+        password_hash: &str,
+        scopes: &[String],
+        now: u64,
+    ) -> Result<(), AuthError> {
+        sqlx::query(
+            "INSERT INTO users (id, email, password_hash, scopes, created_at, updated_at) \
+             VALUES ($1, $2, $3, $4, $5, $5)",
+        )
+        .bind(id)
+        .bind(email)
+        .bind(password_hash)
+        .bind(scopes)
+        .bind(now as i64)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| AuthError::Backend(format!("users postgres: {e}")))?;
+        Ok(())
+    }
+
+    async fn list_users(&self) -> Result<Vec<crate::http::UserSummary>, AuthError> {
+        let rows =
+            sqlx::query("SELECT id, email, scopes, created_at FROM users ORDER BY created_at")
+                .fetch_all(&self.pool)
+                .await
+                .map_err(|e| AuthError::Backend(format!("users postgres: {e}")))?;
+        rows.iter()
+            .map(|row| {
+                Ok(crate::http::UserSummary {
+                    sub: row
+                        .try_get("id")
+                        .map_err(|e| AuthError::Backend(format!("users postgres: {e}")))?,
+                    email: row
+                        .try_get("email")
+                        .map_err(|e| AuthError::Backend(format!("users postgres: {e}")))?,
+                    scopes: row
+                        .try_get("scopes")
+                        .map_err(|e| AuthError::Backend(format!("users postgres: {e}")))?,
+                    created_at: row
+                        .try_get("created_at")
+                        .map_err(|e| AuthError::Backend(format!("users postgres: {e}")))?,
+                })
+            })
+            .collect()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

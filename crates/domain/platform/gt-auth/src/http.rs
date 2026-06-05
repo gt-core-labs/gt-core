@@ -59,6 +59,27 @@ impl LoginProvider for crate::PgUsers {
     }
 }
 
+/// The async user-administration port behind `POST`/`GET /auth/users` (`hq-web-extras.5`): the
+/// onboarding surface that creates and lists users without hand-written SQL. Separate from
+/// [`LoginProvider`] (which only authenticates) so a deploy can mount login without exposing
+/// administration. The production adapter is [`PgUsers`](crate::PgUsers).
+#[async_trait]
+pub trait UserStore: Send + Sync {
+    /// Insert a user with an already-hashed password. A duplicate email is
+    /// [`AuthError::Backend`] (the unique index rejects it); a fault is [`AuthError::Backend`].
+    async fn create_user(
+        &self,
+        id: &str,
+        email: &str,
+        password_hash: &str,
+        scopes: &[String],
+        now: u64,
+    ) -> Result<(), AuthError>;
+
+    /// List every user (no password material), oldest first.
+    async fn list_users(&self) -> Result<Vec<UserSummary>, AuthError>;
+}
+
 /// An injected wall clock: seconds since the Unix epoch. Kept abstract so tests pin time.
 pub type Clock = Arc<dyn Fn() -> u64 + Send + Sync>;
 
@@ -110,6 +131,9 @@ pub struct AuthState {
     pub cookie_secure: bool,
     /// `SameSite` attribute stamped on the auth cookies.
     pub cookie_same_site: SameSite,
+    /// The user-administration store behind `/auth/users` (`hq-web-extras.5`). `None` ⇒ the
+    /// admin endpoints are not configured and respond `501`; login still works without it.
+    pub users: Option<Arc<dyn UserStore>>,
     /// The verifier's public JWKS, served at `GET /auth/jwks` so clients verify access tokens
     /// offline. Built from the verifier's public keys at the composition root
     /// ([`JwtAuthenticator::jwk_set`](crate::JwtAuthenticator::jwk_set)) — never the signing
@@ -119,13 +143,17 @@ pub struct AuthState {
 
 /// Build the auth router. Mount it under the API base at the composition root.
 pub fn auth_router(state: AuthState) -> Router {
-    Router::new()
+    let router = Router::new()
         .route("/auth/login", post(login))
         .route("/auth/refresh", post(refresh))
         .route("/auth/logout", post(logout))
         .route("/auth/me", get(me))
-        .route("/auth/jwks", get(jwks))
-        .with_state(state)
+        .route("/auth/jwks", get(jwks));
+    // User administration (`hq-web-extras.5`) hashes passwords, so it rides the `pg`/argon2
+    // adapter — without it the surface is login-only.
+    #[cfg(feature = "pg")]
+    let router = router.route("/auth/users", post(create_user).get(list_users));
+    router.with_state(state)
 }
 
 // --- request/response DTOs --------------------------------------------------------------------
@@ -169,6 +197,31 @@ pub struct MeResponse {
     pub workspace: String,
     /// Granted authorization scopes.
     pub scopes: Vec<String>,
+}
+
+/// `POST /auth/users` body — create a user (admin only, `hq-web-extras.5`).
+#[derive(Debug, Deserialize)]
+pub struct CreateUserRequest {
+    /// Login email (unique within the workspace).
+    pub email: String,
+    /// Plaintext password — argon2-hashed server-side, never stored or echoed.
+    pub password: String,
+    /// Granted authorization scopes. Empty ⇒ a user that can authenticate but reach nothing.
+    #[serde(default)]
+    pub scopes: Vec<String>,
+}
+
+/// A user as returned by `GET /auth/users` / `POST /auth/users` — never any password material.
+#[derive(Debug, Serialize)]
+pub struct UserSummary {
+    /// The subject id (`sub`).
+    pub sub: String,
+    /// Login email.
+    pub email: String,
+    /// Granted authorization scopes.
+    pub scopes: Vec<String>,
+    /// Creation time (epoch seconds).
+    pub created_at: i64,
 }
 
 // --- handlers ---------------------------------------------------------------------------------
@@ -244,6 +297,57 @@ async fn me(claims: Option<Extension<JwtClaims>>) -> Result<Json<MeResponse>, Ap
 /// `{"keys":[]}` when no keys are configured (a valid, empty set — simpler for clients than a 404).
 async fn jwks(State(state): State<AuthState>) -> Json<JwkSet> {
     Json(state.jwks.as_ref().clone())
+}
+
+/// `POST /auth/users` — create a user (admin only). Requires a `users.write` (or `*`) scope in
+/// the caller's verified claims; the password is argon2-hashed before storage.
+#[cfg(feature = "pg")]
+async fn create_user(
+    State(state): State<AuthState>,
+    claims: Option<Extension<JwtClaims>>,
+    Json(body): Json<CreateUserRequest>,
+) -> Result<(StatusCode, Json<UserSummary>), ApiError> {
+    require_scope(claims.as_deref(), "users.write")?;
+    let store = state.users.as_ref().ok_or(ApiError::NotConfigured)?;
+    let hash = crate::password::hash_password(&body.password)?;
+    let now = (state.now)();
+    // The unique email doubles as the stable id source, so a re-create hits the unique index.
+    let id = format!("user-{}", body.email);
+    store
+        .create_user(&id, &body.email, &hash, &body.scopes, now)
+        .await?;
+    Ok((
+        StatusCode::CREATED,
+        Json(UserSummary {
+            sub: id,
+            email: body.email,
+            scopes: body.scopes,
+            created_at: now as i64,
+        }),
+    ))
+}
+
+/// `GET /auth/users` — list users (admin only). Requires a `users.read` (or `*`) scope.
+#[cfg(feature = "pg")]
+async fn list_users(
+    State(state): State<AuthState>,
+    claims: Option<Extension<JwtClaims>>,
+) -> Result<Json<Vec<UserSummary>>, ApiError> {
+    require_scope(claims.as_deref(), "users.read")?;
+    let store = state.users.as_ref().ok_or(ApiError::NotConfigured)?;
+    Ok(Json(store.list_users().await?))
+}
+
+/// Gate an admin endpoint: the caller must carry verified claims whose scopes include `needed`
+/// or the `*` wildcard. No claims ⇒ `401`; claims without the scope ⇒ `403`.
+#[cfg(feature = "pg")]
+fn require_scope(claims: Option<&JwtClaims>, needed: &str) -> Result<(), ApiError> {
+    let claims = claims.ok_or(ApiError::Unauthenticated)?;
+    let ok = claims
+        .scopes
+        .iter()
+        .any(|s| s == "*" || s == needed);
+    ok.then_some(()).ok_or(ApiError::Forbidden)
 }
 
 /// Mint an access + refresh token pair for a freshly verified identity.
@@ -369,6 +473,12 @@ enum ApiError {
     Auth(AuthError),
     /// `GET /auth/me` with no verified claims in the request — `401`.
     Unauthenticated,
+    /// Verified caller, but the claims lack the required scope — `403` (`hq-web-extras.5`).
+    #[cfg(feature = "pg")]
+    Forbidden,
+    /// The endpoint needs a backing store the deploy did not configure — `501` (`hq-web-extras.5`).
+    #[cfg(feature = "pg")]
+    NotConfigured,
 }
 
 impl From<RefreshError> for ApiError {
@@ -392,6 +502,14 @@ impl IntoResponse for ApiError {
             ApiError::Auth(e) => e.into_response(),
             ApiError::Unauthenticated => {
                 (StatusCode::UNAUTHORIZED, "missing or invalid bearer token").into_response()
+            }
+            #[cfg(feature = "pg")]
+            ApiError::Forbidden => {
+                (StatusCode::FORBIDDEN, "insufficient scope").into_response()
+            }
+            #[cfg(feature = "pg")]
+            ApiError::NotConfigured => {
+                (StatusCode::NOT_IMPLEMENTED, "user administration is not configured").into_response()
             }
         }
     }
@@ -441,6 +559,7 @@ mod tests {
             now: Arc::new(|| 1_000_000_000),
             cookie_secure: true,
             cookie_same_site: SameSite::Lax,
+            users: None,
             // Publish the public half of the same "k1" key the minter signs with.
             jwks: Arc::new(
                 JwtAuthenticator::from_kid_pems([("k1", PUB_PEM)]).unwrap().jwk_set(),
