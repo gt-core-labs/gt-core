@@ -140,10 +140,10 @@ pub use mint::JwtMinter;
 
 #[cfg(feature = "axum")]
 pub use http::{
-    auth_openapi, auth_router, AssignRolesRequest, AsyncRefreshStore, AuthState, Clock,
-    CreateRoleRequest, CreateUserRequest, LoginProvider, LoginRequest, MeResponse,
-    MembershipDirectory, RefreshRequest, RoleStore, RoleSummary, SameSite, SwitchRequest,
-    TokenResponse, UserStore, UserSummary, WorkspaceMembership,
+    auth_openapi, auth_router, AddMemberRequest, AssignRolesRequest, AsyncRefreshStore, AuthState,
+    Clock, CreateRoleRequest, CreateUserRequest, LoginProvider, LoginRequest, MeResponse,
+    MembershipAdmin, MembershipDirectory, RefreshRequest, RoleStore, RoleSummary, SameSite,
+    SwitchRequest, TokenResponse, UserStore, UserSummary, WorkspaceMembership,
 };
 
 /// The global-login port adapter (hq-identity.2) needs both the HTTP port (`axum`) and the

@@ -584,6 +584,9 @@ async fn main() -> anyhow::Result<()> {
                 // Cross-workspace surface (hq-identity.3): list memberships + switch active
                 // workspace, backed by the same global-identity adapter.
                 memberships: Some(pg_users.clone() as Arc<dyn gt_auth::MembershipDirectory>),
+                // Membership administration (hq-platform-hardening.2): a ws admin adds/removes
+                // another user, backed by the same global-identity adapter.
+                membership_admin: Some(pg_users.clone() as Arc<dyn gt_auth::MembershipAdmin>),
                 minter: Arc::new(minter),
                 // Durable refresh store (hq-platform-hardening.1): PgRefreshStore over the same
                 // ws_default pool, so a refresh token survives a gt-mcp-server redeploy instead of

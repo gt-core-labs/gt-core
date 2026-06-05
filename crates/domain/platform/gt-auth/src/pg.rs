@@ -335,6 +335,107 @@ impl PgUsers {
             scopes,
         }))
     }
+
+    /// Add a global user (looked up by `email`) as a member of `workspace`, holding `role`
+    /// (hq-platform-hardening.2). Mirrors the `seed_workspace_rbac` shape that provisions a
+    /// workspace's CREATOR, but for a SECOND user an admin attaches afterwards:
+    ///
+    /// 1. mirror the global identity into the tenant's per-ws login store
+    ///    (`ws_<slug>.users`), holding `role` — so the per-tenant `authenticate` agrees the user
+    ///    exists in that schema;
+    /// 2. insert the `public.user_workspaces` membership — what `/auth/switch` resolves before
+    ///    expanding `role` to scopes.
+    ///
+    /// Returns `Ok(true)` when the email named a known global user (membership written);
+    /// `Ok(false)` when no `public.users` row has that email — the caller maps that to `404`
+    /// rather than minting a dangling membership. Both writes are idempotent: re-adding updates
+    /// the role in place (mirror via `DO UPDATE`, membership via the unique-pair `DO UPDATE`).
+    /// The `ws_<slug>` schema must already exist (every provisioned workspace has it).
+    pub async fn add_workspace_member(
+        &self,
+        email: &str,
+        workspace: &str,
+        role: &str,
+        now: u64,
+    ) -> Result<bool, AuthError> {
+        let schema = workspace_schema(workspace)?;
+        // Resolve the global identity by email — only a known user may be granted a membership.
+        let global: Option<(String, String)> =
+            sqlx::query_as("SELECT id, password_hash FROM public.users WHERE email = $1")
+                .bind(email)
+                .fetch_optional(&self.pool)
+                .await
+                .map_err(|e| AuthError::Backend(format!("lookup global identity: {e}")))?;
+        let Some((user_id, password_hash)) = global else {
+            return Ok(false);
+        };
+
+        // Mirror into the tenant's per-ws login store, holding `role` (schema validated above,
+        // values bound). Re-add updates the role in place rather than failing the PK.
+        sqlx::query(&format!(
+            "INSERT INTO {schema}.users \
+                (id, email, password_hash, scopes, roles, created_at, updated_at) \
+             SELECT id, email, $2, ARRAY[]::text[], ARRAY[$3]::text[], $4, $4 \
+             FROM public.users WHERE id = $1 \
+             ON CONFLICT (id) DO UPDATE SET roles = EXCLUDED.roles, updated_at = EXCLUDED.updated_at"
+        ))
+        .bind(&user_id)
+        .bind(&password_hash)
+        .bind(role)
+        .bind(now as i64)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| AuthError::Backend(format!("mirror {schema}.users member: {e}")))?;
+
+        // The cross-tenant membership: FK-safe (user_id was just read from public.users).
+        self.add_membership(&user_id, workspace, role, now).await?;
+        Ok(true)
+    }
+
+    /// Remove a user (by `email`) from `workspace` (hq-platform-hardening.2): delete the
+    /// `public.user_workspaces` membership AND the `ws_<slug>.users` mirror, so the user can no
+    /// longer `/auth/switch` into the tenant nor authenticate against its per-ws store.
+    ///
+    /// Returns `Ok(true)` when a membership existed and was deleted; `Ok(false)` when the email
+    /// named no global user OR the user held no membership of `workspace` — the caller maps that
+    /// to `404` (idempotent remove). The mirror delete is best-effort to the same end: a user
+    /// without a membership cannot reach the tenant regardless of a leftover login row.
+    pub async fn remove_workspace_member(
+        &self,
+        email: &str,
+        workspace: &str,
+    ) -> Result<bool, AuthError> {
+        let schema = workspace_schema(workspace)?;
+        let user_id: Option<String> =
+            sqlx::query_scalar("SELECT id FROM public.users WHERE email = $1")
+                .bind(email)
+                .fetch_optional(&self.pool)
+                .await
+                .map_err(|e| AuthError::Backend(format!("lookup global identity: {e}")))?;
+        let Some(user_id) = user_id else {
+            return Ok(false);
+        };
+
+        let deleted = sqlx::query(
+            "DELETE FROM public.user_workspaces WHERE user_id = $1 AND workspace_slug = $2",
+        )
+        .bind(&user_id)
+        .bind(workspace)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| AuthError::Backend(format!("user_workspaces postgres: {e}")))?
+        .rows_affected()
+            > 0;
+
+        // Drop the per-ws login mirror too (schema validated above). Harmless if absent.
+        sqlx::query(&format!("DELETE FROM {schema}.users WHERE id = $1"))
+            .bind(&user_id)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| AuthError::Backend(format!("delete {schema}.users member: {e}")))?;
+
+        Ok(deleted)
+    }
 }
 
 /// Build a [`Membership`] from a `public.user_workspaces` row. A column-read fault is an
@@ -645,6 +746,29 @@ mod tests {
         .execute(pool)
         .await
         .expect("create ws roles table");
+    }
+
+    /// Provision a per-workspace `users` login mirror in the `ws_<slug>` schema
+    /// (hq-platform-hardening.2), the table `add_workspace_member` mirrors into. `schema` is the
+    /// already-mapped schema name (e.g. `ws_phm`). Idempotent.
+    async fn ensure_ws_users(pool: &PgPool, schema: &str) {
+        sqlx::query(&format!("CREATE SCHEMA IF NOT EXISTS {schema}"))
+            .execute(pool)
+            .await
+            .expect("create ws schema");
+        sqlx::query(&format!(
+            "CREATE TABLE IF NOT EXISTS {schema}.users ( \
+                id TEXT PRIMARY KEY, \
+                email TEXT NOT NULL UNIQUE, \
+                password_hash TEXT NOT NULL, \
+                scopes TEXT[] NOT NULL DEFAULT '{{}}', \
+                roles TEXT[] NOT NULL DEFAULT '{{}}', \
+                created_at BIGINT NOT NULL, \
+                updated_at BIGINT NOT NULL )"
+        ))
+        .execute(pool)
+        .await
+        .expect("create ws users table");
     }
 
     /// Upsert a role into a specific `ws_<slug>.roles` catalog (hq-identity.2 test helper).
@@ -1009,6 +1133,104 @@ mod tests {
             .unwrap();
         let placeless = users.authenticate_global(&creds, None).await;
         assert_eq!(placeless, Err(AuthError::InvalidCredentials));
+    }
+
+    /// hq-platform-hardening.2: a workspace admin adds a SECOND user, who can then switch into the
+    /// workspace; removing them revokes that reach. Proves the full membership-admin seam end to
+    /// end against a live PG — `add_workspace_member` mirrors into `ws_<slug>.users` AND inserts
+    /// the `public.user_workspaces` bridge `resolve_membership` (the switch path) reads, and
+    /// `remove_workspace_member` undoes both.
+    #[tokio::test]
+    async fn membership_admin_add_lets_a_second_user_switch_then_remove_revokes() {
+        let Some(pool) = pool_or_skip().await else {
+            eprintln!("GT_PG_URL unset; skipping membership-admin contract test");
+            return;
+        };
+        ensure_global_identity_tables(&pool).await;
+        // The target tenant's per-ws catalogs: a `member` role + the login-mirror table.
+        ensure_ws_roles(&pool, "ws_phm").await;
+        ensure_ws_users(&pool, "ws_phm").await;
+        seed_role_in(&pool, "ws_phm", "member", &["beads.read"]).await;
+        // Isolate from prior runs (cascade clears memberships); drop the mirror rows too.
+        for id in ["u-phm-admin", "u-phm-bob"] {
+            sqlx::query("DELETE FROM public.users WHERE id = $1")
+                .bind(id)
+                .execute(&pool)
+                .await
+                .expect("clear seed global user");
+            sqlx::query("DELETE FROM ws_phm.users WHERE id = $1")
+                .bind(id)
+                .execute(&pool)
+                .await
+                .expect("clear ws mirror");
+        }
+
+        let users = PgUsers::new(pool.clone(), "default");
+        let hash = hash_password("hunter2").unwrap();
+        // Two distinct global identities — the workspace admin and the user they will add.
+        users
+            .create_global_user("u-phm-admin", "admin@phm.test", &hash, 1)
+            .await
+            .unwrap();
+        users
+            .create_global_user("u-phm-bob", "bob@phm.test", &hash, 2)
+            .await
+            .unwrap();
+
+        // Before the add, Bob holds NO membership of `phm`, so a switch would resolve to None.
+        assert!(users.resolve_membership("u-phm-bob", "phm").await.unwrap().is_none());
+
+        // The admin adds Bob as a `member` of `phm`.
+        assert!(
+            users.add_workspace_member("bob@phm.test", "phm", "member", 3).await.unwrap(),
+            "adding a known global user writes the membership"
+        );
+
+        // Bob can now switch into `phm`: the membership resolves and `member` expands to its scopes.
+        let switched = users
+            .resolve_membership("u-phm-bob", "phm")
+            .await
+            .unwrap()
+            .expect("the added user can switch into the workspace");
+        assert_eq!(switched.sub, "u-phm-bob");
+        assert_eq!(switched.workspace, "phm");
+        assert_eq!(switched.scopes, vec!["beads.read".to_string()]);
+
+        // The mirror landed in the tenant's login store with the role, so the per-ws store agrees.
+        let (mid, mroles): (String, Vec<String>) =
+            sqlx::query_as("SELECT id, roles FROM ws_phm.users WHERE id = $1")
+                .bind("u-phm-bob")
+                .fetch_one(&pool)
+                .await
+                .expect("the added user is mirrored into ws_phm.users");
+        assert_eq!(mid, "u-phm-bob");
+        assert_eq!(mroles, vec!["member".to_string()]);
+
+        // Adding an UNKNOWN email is a no-op the handler maps to 404 — no dangling membership.
+        assert!(
+            !users.add_workspace_member("ghost@phm.test", "phm", "member", 4).await.unwrap(),
+            "an unknown email writes nothing"
+        );
+
+        // Removing Bob revokes the membership AND the mirror — he can no longer switch in.
+        assert!(
+            users.remove_workspace_member("bob@phm.test", "phm").await.unwrap(),
+            "removing a member returns true"
+        );
+        assert!(
+            users.resolve_membership("u-phm-bob", "phm").await.unwrap().is_none(),
+            "the removed user can no longer switch into the workspace"
+        );
+        let mirror_left: i64 = sqlx::query_scalar("SELECT count(*) FROM ws_phm.users WHERE id = $1")
+            .bind("u-phm-bob")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(mirror_left, 0, "the per-ws mirror is dropped on remove");
+
+        // Removing again (or an unknown user) is an idempotent 404 (no membership left).
+        assert!(!users.remove_workspace_member("bob@phm.test", "phm").await.unwrap());
+        assert!(!users.remove_workspace_member("ghost@phm.test", "phm").await.unwrap());
     }
 
     /// hq-rbac.3: a user's assigned roles expand to their scope bundles and union with the row's

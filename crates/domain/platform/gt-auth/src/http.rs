@@ -240,6 +240,49 @@ impl MembershipDirectory for crate::PgUsers {
     }
 }
 
+/// The workspace-membership ADMINISTRATION port behind `POST`/`DELETE
+/// `/auth/workspaces/{slug}/members` (hq-platform-hardening.2): a workspace admin attaches or
+/// detaches ANOTHER user. Distinct from [`MembershipDirectory`] (which only lists/switches the
+/// CALLER's own memberships): this one writes the N:N bridge for a third party, so it is gated on
+/// the caller being an admin OF THE TARGET workspace, never the system admin. The production
+/// adapter is [`PgUsers`](crate::PgUsers).
+#[async_trait]
+pub trait MembershipAdmin: Send + Sync {
+    /// Grant `email` membership of `workspace` holding `role`, mirroring the user into the
+    /// tenant's per-ws login store. `Ok(true)` ⇒ written; `Ok(false)` ⇒ no global user has that
+    /// email (the handler maps it to `404`). Idempotent — re-adding updates the role in place.
+    async fn add_member(
+        &self,
+        email: &str,
+        workspace: &str,
+        role: &str,
+        now: u64,
+    ) -> Result<bool, AuthError>;
+
+    /// Revoke `email`'s membership of `workspace` (and the per-ws mirror). `Ok(true)` ⇒ a
+    /// membership existed and was removed; `Ok(false)` ⇒ no such user/membership (`404`).
+    async fn remove_member(&self, email: &str, workspace: &str) -> Result<bool, AuthError>;
+}
+
+/// The production [`MembershipAdmin`]: add/remove over the global identity + per-ws mirror tables.
+#[cfg(feature = "pg")]
+#[async_trait]
+impl MembershipAdmin for crate::PgUsers {
+    async fn add_member(
+        &self,
+        email: &str,
+        workspace: &str,
+        role: &str,
+        now: u64,
+    ) -> Result<bool, AuthError> {
+        self.add_workspace_member(email, workspace, role, now).await
+    }
+
+    async fn remove_member(&self, email: &str, workspace: &str) -> Result<bool, AuthError> {
+        self.remove_workspace_member(email, workspace).await
+    }
+}
+
 /// The async user-administration port behind `POST`/`GET /auth/users` (`hq-web-extras.5`): the
 /// onboarding surface that creates and lists users without hand-written SQL. Separate from
 /// [`LoginProvider`] (which only authenticates) so a deploy can mount login without exposing
@@ -349,6 +392,10 @@ pub struct AuthState {
     /// The workspace-membership directory behind `GET /auth/workspaces` + `POST /auth/switch`
     /// (hq-identity.3). `None` ⇒ those endpoints respond `501`; login + admin are unaffected.
     pub memberships: Option<Arc<dyn MembershipDirectory>>,
+    /// The workspace-membership ADMIN surface behind `POST`/`DELETE
+    /// `/auth/workspaces/{slug}/members` (hq-platform-hardening.2): a ws admin attaches/detaches
+    /// another user. `None` ⇒ those endpoints respond `501`; everything else is unaffected.
+    pub membership_admin: Option<Arc<dyn MembershipAdmin>>,
     /// The verifier's public JWKS, served at `GET /auth/jwks` so clients verify access tokens
     /// offline. Built from the verifier's public keys at the composition root
     /// ([`JwtAuthenticator::jwk_set`](crate::JwtAuthenticator::jwk_set)) — never the signing
@@ -375,7 +422,14 @@ pub fn auth_router(state: AuthState) -> Router {
         .route("/auth/users/:email/roles", post(assign_roles))
         // Cross-workspace surface (hq-identity.3): list memberships + switch the active workspace.
         .route("/auth/workspaces", get(workspaces))
-        .route("/auth/switch", post(switch));
+        .route("/auth/switch", post(switch))
+        // Membership administration (hq-platform-hardening.2): a ws admin adds/removes another
+        // user. Gated on the caller being an admin OF the path workspace, not the system admin.
+        .route("/auth/workspaces/:slug/members", post(add_member))
+        .route(
+            "/auth/workspaces/:slug/members/:email",
+            axum::routing::delete(remove_member),
+        );
     router.with_state(state)
 }
 
@@ -414,6 +468,8 @@ pub struct ApiDoc;
         assign_roles,
         workspaces,
         switch,
+        add_member,
+        remove_member,
     ),
     components(schemas(
         CreateUserRequest,
@@ -423,6 +479,7 @@ pub struct ApiDoc;
         AssignRolesRequest,
         SwitchRequest,
         WorkspaceMembership,
+        AddMemberRequest,
     )),
 )]
 struct AdminApiDoc;
@@ -494,6 +551,19 @@ pub struct SwitchRequest {
     /// The slug of a workspace the caller is a member of. Validated against their memberships
     /// server-side; an unheld workspace is a `403`, never an honoured switch.
     pub workspace: String,
+}
+
+/// `POST /auth/workspaces/{slug}/members` body — add another user to the workspace
+/// (ws-admin only, hq-platform-hardening.2).
+#[derive(Debug, Deserialize)]
+#[cfg_attr(feature = "axum", derive(utoipa::ToSchema))]
+pub struct AddMemberRequest {
+    /// The login email of an existing global user to grant membership.
+    pub email: String,
+    /// The role the user holds in this workspace (expanded to scopes against `ws_<slug>.roles`
+    /// at login/switch). Empty ⇒ a member with no role-granted scopes.
+    #[serde(default)]
+    pub role: String,
 }
 
 /// `POST /auth/users` body — create a user (admin only, `hq-web-extras.5`).
@@ -710,6 +780,70 @@ async fn switch(
     Ok((set_token_cookies(&state, &tokens), Json(tokens)))
 }
 
+/// `POST /auth/workspaces/{slug}/members` `{email, role}` — add another user to `slug`
+/// (hq-platform-hardening.2). Gated on the caller being an ADMIN OF `slug` (their active
+/// workspace is `slug` and their scopes include `workspace.admin` or `*`) — a workspace's own
+/// admin, never the system admin, and never an admin of a DIFFERENT workspace. The added user can
+/// then `/auth/switch` into `slug`. `404` when no global user has that email.
+#[cfg_attr(feature = "axum", utoipa::path(
+    post, path = "/auth/workspaces/{slug}/members", tag = "auth",
+    params(("slug" = String, Path, description = "The workspace to add the member to")),
+    request_body = AddMemberRequest,
+    responses(
+        (status = 204, description = "Member added (idempotent — re-adding updates the role)"),
+        (status = 401, description = "No verified claims"),
+        (status = 403, description = "Caller is not an admin of this workspace"),
+        (status = 404, description = "No global user with that email"),
+        (status = 501, description = "No membership-admin surface configured"),
+    ),
+))]
+#[cfg(feature = "pg")]
+async fn add_member(
+    State(state): State<AuthState>,
+    claims: Option<Extension<JwtClaims>>,
+    Path(slug): Path<String>,
+    Json(body): Json<AddMemberRequest>,
+) -> Result<StatusCode, ApiError> {
+    require_workspace_admin(claims.as_deref(), &slug)?;
+    let admin = state.membership_admin.as_ref().ok_or(ApiError::NotConfigured)?;
+    let now = (state.now)();
+    match admin.add_member(&body.email, &slug, &body.role, now).await? {
+        true => Ok(StatusCode::NO_CONTENT),
+        false => Err(ApiError::NotFound),
+    }
+}
+
+/// `DELETE /auth/workspaces/{slug}/members/{email}` — remove a user from `slug`
+/// (hq-platform-hardening.2). Same ws-admin gate as [`add_member`]. `404` when the user holds no
+/// membership of `slug` (idempotent). After removal the user can no longer `/auth/switch` in.
+#[cfg_attr(feature = "axum", utoipa::path(
+    delete, path = "/auth/workspaces/{slug}/members/{email}", tag = "auth",
+    params(
+        ("slug" = String, Path, description = "The workspace to remove the member from"),
+        ("email" = String, Path, description = "The member's login email"),
+    ),
+    responses(
+        (status = 204, description = "Member removed"),
+        (status = 401, description = "No verified claims"),
+        (status = 403, description = "Caller is not an admin of this workspace"),
+        (status = 404, description = "No such member of this workspace"),
+        (status = 501, description = "No membership-admin surface configured"),
+    ),
+))]
+#[cfg(feature = "pg")]
+async fn remove_member(
+    State(state): State<AuthState>,
+    claims: Option<Extension<JwtClaims>>,
+    Path((slug, email)): Path<(String, String)>,
+) -> Result<StatusCode, ApiError> {
+    require_workspace_admin(claims.as_deref(), &slug)?;
+    let admin = state.membership_admin.as_ref().ok_or(ApiError::NotConfigured)?;
+    match admin.remove_member(&email, &slug).await? {
+        true => Ok(StatusCode::NO_CONTENT),
+        false => Err(ApiError::NotFound),
+    }
+}
+
 /// `GET /auth/jwks` — the verifier's public RS256 keys as an RFC 7517 JWK Set. A client matches a
 /// token's header `kid` to a key here and verifies the signature offline. Returns `200` with
 /// `{"keys":[]}` when no keys are configured (a valid, empty set — simpler for clients than a 404).
@@ -893,6 +1027,22 @@ fn require_scope(claims: Option<&JwtClaims>, needed: &str) -> Result<(), ApiErro
         .iter()
         .any(|s| s == "*" || s == needed);
     ok.then_some(()).ok_or(ApiError::Forbidden)
+}
+
+/// Gate a membership-admin endpoint on the caller being an ADMIN OF the target `workspace`
+/// (hq-platform-hardening.2). Unlike [`require_scope`], a scope alone is not enough: the caller's
+/// token must ALSO be active in `workspace`, so an admin of tenant A cannot manage tenant B. The
+/// admin grant is `workspace.admin` or the `*` wildcard (the role the workspace seeds its creator
+/// with). No claims ⇒ `401`; wrong workspace or missing grant ⇒ `403`.
+#[cfg(feature = "pg")]
+fn require_workspace_admin(claims: Option<&JwtClaims>, workspace: &str) -> Result<(), ApiError> {
+    let claims = claims.ok_or(ApiError::Unauthenticated)?;
+    let is_admin = claims.workspace == workspace
+        && claims
+            .scopes
+            .iter()
+            .any(|s| s == "*" || s == "workspace.admin");
+    is_admin.then_some(()).ok_or(ApiError::Forbidden)
 }
 
 /// Mint an access + refresh token pair for a freshly verified identity. Async: the refresh store
@@ -1097,6 +1247,8 @@ mod tests {
             "/auth/users/{email}/roles",
             "/auth/workspaces",
             "/auth/switch",
+            "/auth/workspaces/{slug}/members",
+            "/auth/workspaces/{slug}/members/{email}",
         ] {
             assert!(paths.contains(&expected), "missing {expected} in {paths:?}");
         }
@@ -1297,6 +1449,7 @@ mod tests {
             users: None,
             roles: None,
             memberships: None,
+            membership_admin: None,
             // Publish the public half of the same "k1" key the minter signs with.
             jwks: Arc::new(
                 JwtAuthenticator::from_kid_pems([("k1", PUB_PEM)]).unwrap().jwk_set(),
@@ -1603,6 +1756,190 @@ mod tests {
 
     fn state_with_memberships(dir: Arc<MemDirectory>) -> AuthState {
         AuthState { memberships: Some(dir), ..state() }
+    }
+
+    /// In-memory [`MembershipAdmin`] double: records add/remove calls, and "knows" a fixed set of
+    /// global emails so an add to anything else returns `false` (→ 404), mirroring the real adapter.
+    #[derive(Default)]
+    struct MemAdmin {
+        known_emails: Vec<String>,
+        added: std::sync::Mutex<Vec<(String, String, String)>>,
+        removed: std::sync::Mutex<Vec<(String, String)>>,
+    }
+
+    #[async_trait]
+    impl MembershipAdmin for MemAdmin {
+        async fn add_member(
+            &self,
+            email: &str,
+            workspace: &str,
+            role: &str,
+            _now: u64,
+        ) -> Result<bool, AuthError> {
+            if !self.known_emails.iter().any(|e| e == email) {
+                return Ok(false);
+            }
+            self.added
+                .lock()
+                .unwrap()
+                .push((email.into(), workspace.into(), role.into()));
+            Ok(true)
+        }
+        async fn remove_member(&self, email: &str, workspace: &str) -> Result<bool, AuthError> {
+            self.removed.lock().unwrap().push((email.into(), workspace.into()));
+            Ok(self.known_emails.iter().any(|e| e == email))
+        }
+    }
+
+    fn state_with_membership_admin(admin: Arc<MemAdmin>) -> AuthState {
+        AuthState { membership_admin: Some(admin), ..state() }
+    }
+
+    /// A request carrying verified claims whose active `workspace` + `scopes` are the caller's —
+    /// the membership-admin gate keys on BOTH, so the tests vary them.
+    fn claim_req(
+        method: &str,
+        path: &str,
+        workspace: Option<(&str, &[&str])>,
+        json: Option<&str>,
+    ) -> Request<Body> {
+        let mut builder = Request::builder().method(method).uri(path);
+        if json.is_some() {
+            builder = builder.header("content-type", "application/json");
+        }
+        let mut req = builder
+            .body(json.map(|j| Body::from(j.to_owned())).unwrap_or_else(Body::empty))
+            .unwrap();
+        if let Some((workspace, scopes)) = workspace {
+            req.extensions_mut().insert(JwtClaims {
+                sub: "admin".into(),
+                workspace: workspace.into(),
+                scopes: scopes.iter().map(|s| s.to_string()).collect(),
+                exp: 2_000_000_000,
+                nbf: None,
+                iat: 0,
+            });
+        }
+        req
+    }
+
+    #[tokio::test]
+    async fn ws_admin_can_add_a_member_but_a_non_admin_is_forbidden() {
+        let admin = Arc::new(MemAdmin { known_emails: vec!["bob@acme.test".into()], ..Default::default() });
+        let app = auth_router(state_with_membership_admin(admin.clone()));
+        let path = "/auth/workspaces/acme/members";
+        let body = r#"{"email":"bob@acme.test","role":"member"}"#;
+
+        // No claims → 401.
+        let resp = app.clone().oneshot(claim_req("POST", path, None, Some(body))).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+
+        // A member of acme WITHOUT the admin grant → 403 (a normal user cannot add).
+        let resp = app
+            .clone()
+            .oneshot(claim_req("POST", path, Some(("acme", &["beads.read"])), Some(body)))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+
+        // An admin of a DIFFERENT workspace → 403 (the gate keys on the active workspace too).
+        let resp = app
+            .clone()
+            .oneshot(claim_req("POST", path, Some(("other", &["*"])), Some(body)))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+
+        // The workspace's own admin (`workspace.admin` while active in acme) → 204, recorded.
+        let resp = app
+            .clone()
+            .oneshot(claim_req("POST", path, Some(("acme", &["workspace.admin"])), Some(body)))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+        // The `*` wildcard admin active in acme also passes.
+        let resp = app
+            .clone()
+            .oneshot(claim_req("POST", path, Some(("acme", &["*"])), Some(body)))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+        assert_eq!(admin.added.lock().unwrap().len(), 2);
+
+        // An unknown email → 404.
+        let resp = app
+            .clone()
+            .oneshot(claim_req(
+                "POST",
+                path,
+                Some(("acme", &["*"])),
+                Some(r#"{"email":"ghost@acme.test","role":"member"}"#),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn ws_admin_can_remove_a_member_and_non_member_is_404() {
+        let admin = Arc::new(MemAdmin { known_emails: vec!["bob@acme.test".into()], ..Default::default() });
+        let app = auth_router(state_with_membership_admin(admin.clone()));
+
+        // Non-admin remove → 403.
+        let resp = app
+            .clone()
+            .oneshot(claim_req(
+                "DELETE",
+                "/auth/workspaces/acme/members/bob@acme.test",
+                Some(("acme", &["beads.read"])),
+                None,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+
+        // Admin removes a known member → 204.
+        let resp = app
+            .clone()
+            .oneshot(claim_req(
+                "DELETE",
+                "/auth/workspaces/acme/members/bob@acme.test",
+                Some(("acme", &["workspace.admin"])),
+                None,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+
+        // Removing an unknown member → 404.
+        let resp = app
+            .clone()
+            .oneshot(claim_req(
+                "DELETE",
+                "/auth/workspaces/acme/members/ghost@acme.test",
+                Some(("acme", &["workspace.admin"])),
+                None,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn membership_admin_501_when_no_surface_configured() {
+        // Default state() has membership_admin: None → "not configured", but only AFTER the gate
+        // passes (an authorized admin call reaches the missing surface).
+        let app = auth_router(state());
+        let resp = app
+            .oneshot(claim_req(
+                "POST",
+                "/auth/workspaces/acme/members",
+                Some(("acme", &["*"])),
+                Some(r#"{"email":"x@y.z","role":"member"}"#),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_IMPLEMENTED);
     }
 
     /// Two-membership directory for "gwen": lead@ida (beads.read) and lead@idb (rig.read).

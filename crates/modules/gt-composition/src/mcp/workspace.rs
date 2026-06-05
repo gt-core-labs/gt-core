@@ -60,6 +60,13 @@ impl WorkspaceHandler {
     fn repo(&self) -> PgWorkspaces {
         PgWorkspaces::new(self.pool.clone())
     }
+
+    /// The global-identity adapter over the shared pool, backing the membership tools
+    /// (hq-platform-hardening.2). Its add/remove write fully-qualified `public.`/`ws_<slug>.`
+    /// tables, so the pool's default schema is irrelevant; the slug is passed per call.
+    fn users(&self) -> gt_auth::PgUsers {
+        gt_auth::PgUsers::new(self.pool.clone(), "default")
+    }
 }
 
 #[async_trait]
@@ -92,6 +99,19 @@ impl DomainHandler for WorkspaceHandler {
             ),
             descriptor("workspace.list", "List every workspace in the catalog.", &[]),
             descriptor("workspace.info", "Show one workspace's id, name + status.", &[req("id", "string")]),
+            // Membership management (hq-platform-hardening.2): a ws admin adds/removes ANOTHER
+            // user. Not in the `workspace_member` preset's allow-list, so the MCP scope gate
+            // reserves these for `workspace.admin` (the same ws-admin guard the REST surface uses).
+            descriptor(
+                "workspace.member-add",
+                "Add another user (by email) to a workspace, holding a role.",
+                &[req("id", "string"), req("email", "string"), req("role", "string")],
+            ),
+            descriptor(
+                "workspace.member-remove",
+                "Remove a user (by email) from a workspace.",
+                &[req("id", "string"), req("email", "string")],
+            ),
         ]
     }
 
@@ -189,6 +209,40 @@ impl DomainHandler for WorkspaceHandler {
                     Some(entry) => Ok(entry_json(&entry)),
                     None => Err(AppError::NotFound(format!("workspace {id}"))),
                 }
+            }
+            "workspace.member-add" => {
+                // Add another user to the workspace (hq-platform-hardening.2). The MCP scope gate
+                // already reserves this tool for `workspace.admin` (it is absent from the member
+                // preset), so this is the ws admin attaching a second user — mirroring them into
+                // `ws_<slug>.users` + inserting the `public.user_workspaces` membership the
+                // `/auth/switch` path resolves.
+                let id = workspace_id(str_arg(&ctx.args, "id")?)?;
+                let email = str_arg(&ctx.args, "email")?;
+                let role = str_arg(&ctx.args, "role")?;
+                let added = self
+                    .users()
+                    .add_workspace_member(email, id.as_str(), role, now_secs())
+                    .await
+                    .map_err(auth_err)?;
+                if !added {
+                    return Err(AppError::NotFound(format!("user {email}")));
+                }
+                Ok(json!({ "ok": true, "id": id.as_str(), "email": email, "role": role }))
+            }
+            "workspace.member-remove" => {
+                // Revoke another user's membership (hq-platform-hardening.2), the member-add
+                // counterpart — drops both the membership and the per-ws login mirror.
+                let id = workspace_id(str_arg(&ctx.args, "id")?)?;
+                let email = str_arg(&ctx.args, "email")?;
+                let removed = self
+                    .users()
+                    .remove_workspace_member(email, id.as_str())
+                    .await
+                    .map_err(auth_err)?;
+                if !removed {
+                    return Err(AppError::NotFound(format!("member {email} of {}", id.as_str())));
+                }
+                Ok(json!({ "ok": true, "id": id.as_str(), "email": email }))
             }
             other => Err(AppError::Validation(format!("unknown tool `{other}`"))),
         }
@@ -400,6 +454,25 @@ fn actor_err(e: ActorError) -> AppError {
 /// not a caller fault).
 fn repo_err(e: gt_workspace::RepoError) -> AppError {
     AppError::Other(e.to_string())
+}
+
+/// Map a `gt-auth` failure from the membership tools onto the MCP error space: an invalid slug is
+/// a caller-side validation fault, any other is an internal backend fault.
+fn auth_err(e: gt_auth::AuthError) -> AppError {
+    match e {
+        gt_auth::AuthError::Backend(msg) if msg.starts_with("invalid workspace slug") => {
+            AppError::Validation(msg)
+        }
+        other => AppError::Other(other.to_string()),
+    }
+}
+
+/// Now, in whole seconds since the Unix epoch — the timestamp the membership writes stamp.
+fn now_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
 }
 
 /// Map a `gt-workspace` lifecycle status onto the orchestration-tier

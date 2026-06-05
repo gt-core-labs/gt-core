@@ -199,10 +199,16 @@ fn served_mcp_tools(ns: &str) -> Vec<String> {
     }
 }
 
-/// A tool the server is expected to also serve over HTTP — i.e. not one of the documented
-/// MCP-only exemptions (`*.validate` dry-runs, the operator-only `issues.phase.advance`).
+/// A tool the server is expected to also serve over HTTP under ITS OWN namespace — i.e. not one of
+/// the documented exemptions: the `*.validate` dry-runs, the operator-only `issues.phase.advance`,
+/// and the workspace membership tools (`workspace.member-add`/`member-remove`, hq-platform-hardening.2)
+/// whose REST sibling lives on the `/auth/workspaces/{slug}/members` surface (the gt-auth router,
+/// covered by its own OpenAPI test), not the `workspace` module's `ApiDoc`.
 fn is_routable(tool: &str) -> bool {
-    !tool.ends_with(".validate") && tool != "issues.phase.advance"
+    !tool.ends_with(".validate")
+        && tool != "issues.phase.advance"
+        && tool != "workspace.member-add"
+        && tool != "workspace.member-remove"
 }
 
 /// The `(METHOD, path)` set a module's OpenAPI actually declares.
