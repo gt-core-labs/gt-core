@@ -50,6 +50,14 @@ pub enum AuthError {
     /// is served today). Carries the kind that was asked for.
     #[error("authentication provider not supported: {0:?}")]
     UnsupportedProvider(crate::ProviderKind),
+    /// An OAuth/OIDC login named a `provider_id` that is not registered in the provider store —
+    /// or names one that is `enabled = false`. A client error (the button/id is wrong or retired),
+    /// mapped to `404`, never `501`/`500`: the OAuth path IS wired, this specific provider is just
+    /// not a valid choice. Carries the requested id. Raised by the DB provider resolver
+    /// (hq-idp-db.2); kept indistinguishable between "absent" and "disabled" so a caller cannot
+    /// enumerate which provider ids exist.
+    #[error("unknown or disabled login provider: {0}")]
+    UnknownProvider(String),
     /// Password hashing or PHC-hash parsing failed — a crypto/stored-data error, not a wrong
     /// password. Carries a human-readable reason. Only raised by the `password-hash` adapter.
     #[error("password hashing failure: {0}")]

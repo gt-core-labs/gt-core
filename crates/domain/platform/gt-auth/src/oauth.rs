@@ -31,9 +31,12 @@
 //! - `GT_OIDC_WORKSPACE` — the tenant the resolved identity is scoped to (the `workspace` claim).
 //! - `GT_OIDC_SCOPES` (optional) — comma-separated scopes granted to a successful login.
 
+use std::sync::Arc;
+
 use async_trait::async_trait;
 use serde::Deserialize;
 
+use crate::provider_repo::ProviderRepo;
 use crate::{AuthError, Credentials, LoginProvider, VerifiedIdentity};
 
 /// Env var names for [`OidcConfig::from_env`] — public so the composition root can document the
@@ -255,6 +258,87 @@ impl LoginProvider for OidcProvider {
     }
 }
 
+/// The DB-backed OAuth/OIDC [`LoginProvider`] (hq-idp-db.2): instead of one provider baked from the
+/// environment ([`OidcConfig::from_env`]), it resolves the provider PER REQUEST from the
+/// [`ProviderRepo`] store by the login's `provider_id`, decrypts that row's client secret, builds an
+/// [`OidcConfig`], and runs the [`OidcProvider`] handshake — yielding the SAME
+/// [`VerifiedIdentity`] (and thus the same access/refresh pair) the password path does.
+///
+/// This is what the composition root wires into [`AuthState::oauth_login`](crate::AuthState) once a
+/// provider store exists, replacing the single `from_env` provider: an admin registers many
+/// providers (Google/GitHub/Microsoft presets or a generic OIDC IdP) and each is selectable by its
+/// `provider_id`, with no redeploy. The reqwest client is pooled across requests.
+///
+/// A `provider_id` that is absent or `enabled = false` is [`AuthError::UnknownProvider`] (a `404`),
+/// kept indistinguishable so a caller cannot enumerate the registered ids; a sealed secret that
+/// fails to unseal (wrong/rotated key) stays [`AuthError::Backend`] (a `500` — a misconfiguration,
+/// not a rejected login).
+pub struct DbOauthLogin {
+    repo: Arc<dyn ProviderRepo>,
+    http: reqwest::Client,
+    /// The redirect URI registered with every IdP, echoed back on the token exchange. Per-deploy
+    /// config (the `oauth_providers` row stores the authorize/token/userinfo endpoints, not the
+    /// app's own callback URL).
+    redirect_uri: String,
+    /// The tenant a resolved OAuth identity is scoped to (the `workspace` claim) — per-deploy, like
+    /// the old `GT_OIDC_WORKSPACE`. The row carries the provider's scopes, not the landing tenant.
+    workspace: String,
+}
+
+impl DbOauthLogin {
+    /// Build the resolver over a provider `repo`, scoping resolved identities to `workspace` and
+    /// echoing `redirect_uri` on every exchange. A fresh pooled reqwest client backs the handshakes.
+    pub fn new(
+        repo: Arc<dyn ProviderRepo>,
+        workspace: impl Into<String>,
+        redirect_uri: impl Into<String>,
+    ) -> Result<Self, AuthError> {
+        let http = reqwest::Client::builder()
+            .build()
+            .map_err(|e| AuthError::Backend(format!("oidc http client: {e}")))?;
+        Ok(Self {
+            repo,
+            http,
+            redirect_uri: redirect_uri.into(),
+            workspace: workspace.into(),
+        })
+    }
+
+    /// Resolve `provider_id` against the store into a handshake-ready [`OidcProvider`]: load the
+    /// row (absent/disabled ⇒ [`AuthError::UnknownProvider`]), unseal its secret, and assemble the
+    /// [`OidcConfig`] scoped to this resolver's workspace + redirect URI.
+    async fn provider_for(&self, provider_id: &str) -> Result<OidcProvider, AuthError> {
+        let record = self
+            .repo
+            .get(provider_id)
+            .await?
+            .filter(|r| r.enabled)
+            .ok_or_else(|| AuthError::UnknownProvider(provider_id.to_owned()))?;
+        let config = record.into_oidc_config(self.workspace.clone(), self.redirect_uri.clone())?;
+        Ok(OidcProvider::with_client(config, self.http.clone()))
+    }
+}
+
+#[async_trait]
+impl LoginProvider for DbOauthLogin {
+    async fn login(&self, creds: &Credentials) -> Result<VerifiedIdentity, AuthError> {
+        // The login's `provider_id` selects which stored provider runs the handshake. OAuth carries
+        // it as `provider`; OIDC has no id (the issuer self-identifies), so there is nothing to
+        // resolve from the store — that path stays env/issuer-driven and is not this resolver's job.
+        let provider_id = match creds {
+            Credentials::OAuth { provider, .. } => provider.as_str(),
+            Credentials::Oidc { .. } | Credentials::EmailPassword { .. } => {
+                return Err(AuthError::UnsupportedProvider(creds.kind()))
+            }
+        };
+        if provider_id.trim().is_empty() {
+            return Err(AuthError::UnknownProvider(String::new()));
+        }
+        let provider = self.provider_for(provider_id).await?;
+        provider.login(creds).await
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -434,5 +518,236 @@ mod tests {
         let err = OidcConfig::from_env();
         // In the test process these are unset, so it must error on the first required var.
         assert!(matches!(err, Err(AuthError::Backend(_))));
+    }
+
+    // --- DB-backed resolver (hq-idp-db.2) -----------------------------------------------------
+    //
+    // The resolver maps a login's `provider_id` to a stored provider and runs the handshake. The
+    // routing/4xx behaviour is proved here against an in-memory `ProviderRepo` (no PG needed); the
+    // full token-issuing handshake against a real `PgProviderRepo` + mock IdP is the `pg`-gated
+    // `db_pg` module below.
+    use crate::provider_repo::{NewProvider, ProviderKind as RepoKind, ProviderRecord, ProviderRepo};
+
+    /// A trivial in-memory [`ProviderRepo`] over a fixed set of records — enough to exercise the
+    /// resolver's id-lookup + enabled gate without standing up Postgres.
+    #[derive(Default)]
+    struct MapRepo {
+        rows: HashMap<String, ProviderRecord>,
+    }
+
+    #[async_trait]
+    impl ProviderRepo for MapRepo {
+        async fn list(&self) -> Result<Vec<ProviderRecord>, AuthError> {
+            Ok(self.rows.values().cloned().collect())
+        }
+        async fn get(&self, id: &str) -> Result<Option<ProviderRecord>, AuthError> {
+            Ok(self.rows.get(id).cloned())
+        }
+        async fn create(&self, _p: NewProvider) -> Result<ProviderRecord, AuthError> {
+            unreachable!("the resolver never writes")
+        }
+        async fn delete(&self, _id: &str) -> Result<bool, AuthError> {
+            unreachable!("the resolver never writes")
+        }
+    }
+
+    /// A generic-kind record pointing its endpoints at `base`, sealing `secret` with the test key.
+    fn record_for(base: &str, id: &str, enabled: bool, secret: &str) -> ProviderRecord {
+        std::env::set_var(
+            crate::ENV_SECRET_KEY,
+            "0000000000000000000000000000000000000000000000000000000000000000",
+        );
+        ProviderRecord {
+            id: id.into(),
+            kind: RepoKind::Generic,
+            display_name: "Corp SSO".into(),
+            client_id: "gt-client".into(),
+            client_secret_enc: crate::crypto::seal(secret.as_bytes()).unwrap(),
+            issuer: format!("{base}/"),
+            authorize_endpoint: format!("{base}/authorize"),
+            token_endpoint: format!("{base}/token"),
+            userinfo_endpoint: format!("{base}/userinfo"),
+            scopes: "rig.read".into(),
+            enabled,
+        }
+    }
+
+    #[tokio::test]
+    async fn db_resolver_issues_an_identity_for_a_registered_enabled_provider() {
+        let idp = MockIdp {
+            codes: Arc::new(HashMap::from([("good-code".into(), "tok-1".into())])),
+            tokens: Arc::new(HashMap::from([("tok-1".into(), "carol-sub".into())])),
+        };
+        let base = spawn_idp(idp).await;
+        let mut repo = MapRepo::default();
+        repo.rows
+            .insert("corp".into(), record_for(&base, "corp", true, "s3cret"));
+        let resolver =
+            DbOauthLogin::new(Arc::new(repo), "acme", "https://gt.test/cb").unwrap();
+
+        let identity = resolver
+            .login(&Credentials::OAuth { provider: "corp".into(), code: "good-code".into() })
+            .await
+            .unwrap();
+        // Same VerifiedIdentity shape the password path yields, scoped to the resolver's workspace.
+        assert_eq!(
+            identity,
+            VerifiedIdentity {
+                sub: "carol-sub".into(),
+                workspace: "acme".into(),
+                scopes: vec!["rig.read".into()],
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn db_resolver_rejects_an_unknown_provider_id_with_a_4xx() {
+        let resolver = DbOauthLogin::new(
+            Arc::new(MapRepo::default()),
+            "acme",
+            "https://gt.test/cb",
+        )
+        .unwrap();
+        let err = resolver
+            .login(&Credentials::OAuth { provider: "nope".into(), code: "x".into() })
+            .await;
+        // UnknownProvider maps to 404 in the HTTP layer — a clear 4xx, never 501/500.
+        assert_eq!(err, Err(AuthError::UnknownProvider("nope".into())));
+    }
+
+    #[tokio::test]
+    async fn db_resolver_rejects_a_disabled_provider_id_with_a_4xx() {
+        let base = spawn_idp(MockIdp::default()).await;
+        let mut repo = MapRepo::default();
+        repo.rows
+            .insert("off".into(), record_for(&base, "off", false, "s3cret"));
+        let resolver =
+            DbOauthLogin::new(Arc::new(repo), "acme", "https://gt.test/cb").unwrap();
+        let err = resolver
+            .login(&Credentials::OAuth { provider: "off".into(), code: "good".into() })
+            .await;
+        // Disabled is indistinguishable from absent — same UnknownProvider 4xx, no enumeration.
+        assert_eq!(err, Err(AuthError::UnknownProvider("off".into())));
+    }
+
+    #[tokio::test]
+    async fn db_resolver_rejects_a_blank_provider_id_with_a_4xx() {
+        let resolver = DbOauthLogin::new(
+            Arc::new(MapRepo::default()),
+            "acme",
+            "https://gt.test/cb",
+        )
+        .unwrap();
+        let err = resolver
+            .login(&Credentials::OAuth { provider: String::new(), code: "x".into() })
+            .await;
+        assert_eq!(err, Err(AuthError::UnknownProvider(String::new())));
+    }
+
+    // --- PG-gated: the full handshake against a real PgProviderRepo + mock IdP -----------------
+    //
+    // No-ops when `GT_PG_URL` is unset (same gate as provider_repo's contract tests). Run with
+    // `--test-threads=1` and a `GT_SECRET_KEY` set. Seeds a provider row, spins the mock IdP, and
+    // proves login with that `provider_id`+`code` resolves the VerifiedIdentity (the login tier then
+    // folds it into the SAME access/refresh pair as the password path); an unknown id is a 4xx.
+    #[cfg(feature = "pg")]
+    mod db_pg {
+        use super::*;
+        use crate::PgProviderRepo;
+        use sqlx::PgPool;
+
+        async fn pool_or_skip() -> Option<PgPool> {
+            let url = std::env::var("GT_PG_URL").ok()?;
+            Some(
+                PgPool::connect(&url)
+                    .await
+                    .expect("GT_PG_URL must point at a reachable Postgres"),
+            )
+        }
+
+        async fn ensure_table(pool: &PgPool) {
+            let mut tx = pool.begin().await.expect("begin ddl tx");
+            sqlx::query("SELECT pg_advisory_xact_lock(8422)")
+                .execute(&mut *tx)
+                .await
+                .expect("advisory lock");
+            sqlx::query(crate::migrations::CREATE_OAUTH_PROVIDERS)
+                .execute(&mut *tx)
+                .await
+                .expect("create oauth_providers table");
+            tx.commit().await.expect("commit ddl tx");
+        }
+
+        fn unique_id(tag: &str) -> String {
+            use std::time::{SystemTime, UNIX_EPOCH};
+            let n = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos();
+            format!("test-{tag}-{n}")
+        }
+
+        #[tokio::test]
+        async fn db_backed_login_issues_an_identity_and_unknown_is_rejected() {
+            std::env::set_var(
+                crate::ENV_SECRET_KEY,
+                "0000000000000000000000000000000000000000000000000000000000000000",
+            );
+            let Some(pool) = pool_or_skip().await else {
+                return;
+            };
+            ensure_table(&pool).await;
+            let repo = PgProviderRepo::new(pool.clone());
+
+            // Mock IdP: swap `good-code` → `tok-9`, resolve `tok-9` → `dave-sub`.
+            let idp = MockIdp {
+                codes: Arc::new(HashMap::from([("good-code".into(), "tok-9".into())])),
+                tokens: Arc::new(HashMap::from([("tok-9".into(), "dave-sub".into())])),
+            };
+            let base = spawn_idp(idp).await;
+
+            // Seed a generic provider whose endpoints point at the mock IdP. The secret is sealed
+            // on write and unsealed only inside the resolver.
+            let id = unique_id("dbresolve");
+            let new = NewProvider {
+                id: id.clone(),
+                kind: RepoKind::Generic,
+                display_name: "Mock IdP".into(),
+                client_id: "gt-client".into(),
+                client_secret: "the-secret".into(),
+                issuer: format!("{base}/"),
+                authorize_endpoint: format!("{base}/authorize"),
+                token_endpoint: format!("{base}/token"),
+                userinfo_endpoint: format!("{base}/userinfo"),
+                scopes: "rig.read,rig.write".into(),
+                enabled: true,
+            };
+            repo.create(new).await.unwrap();
+
+            let resolver =
+                DbOauthLogin::new(Arc::new(repo.clone()), "acme", "https://gt.test/cb").unwrap();
+
+            // The valid provider_id + code resolves a full VerifiedIdentity from DB config.
+            let identity = resolver
+                .login(&Credentials::OAuth { provider: id.clone(), code: "good-code".into() })
+                .await
+                .unwrap();
+            assert_eq!(identity.sub, "dave-sub");
+            assert_eq!(identity.workspace, "acme");
+            assert_eq!(identity.scopes, vec!["rig.read".to_string(), "rig.write".into()]);
+
+            // An unknown provider_id is a 4xx (UnknownProvider), never a backend fault.
+            let err = resolver
+                .login(&Credentials::OAuth { provider: unique_id("absent"), code: "x".into() })
+                .await;
+            assert!(matches!(err, Err(AuthError::UnknownProvider(_))));
+
+            // Disabling the provider makes it resolve as unknown too (no enumeration).
+            assert!(repo.delete(&id).await.unwrap());
+            let err = resolver
+                .login(&Credentials::OAuth { provider: id, code: "good-code".into() })
+                .await;
+            assert!(matches!(err, Err(AuthError::UnknownProvider(_))));
+        }
     }
 }

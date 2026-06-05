@@ -604,6 +604,10 @@ async fn main() -> anyhow::Result<()> {
                 // hq-identity.1: the global identity + N:N membership tables, so global login
                 // (hq-identity.2) and the migration below have somewhere to land.
                 gt_auth::migrations::CREATE_GLOBAL_IDENTITY,
+                // hq-idp-db.1/.2: the GLOBAL `public.oauth_providers` store, so the DB-backed
+                // OAuth/OIDC login resolver (`DbOauthLogin`) has rows to resolve a `provider_id`
+                // against. Idempotent CREATE ... IF NOT EXISTS like the rest.
+                gt_auth::migrations::CREATE_OAUTH_PROVIDERS,
             ] {
                 sqlx::raw_sql(sql)
                     .execute(&pool)
@@ -629,10 +633,13 @@ async fn main() -> anyhow::Result<()> {
                 // ws_default lookup. The migration + seed above guarantee admin@gt.local already
                 // has a global row + a default membership, so the live login survives the cutover.
                 login: Arc::new(GlobalLogin(pg_users.clone())),
-                // OAuth/OIDC login provider (hq-platform-hardening.3). Wired only when the
-                // `oauth` feature is built AND the GT_OIDC_* env contract is present, so a default
-                // deploy carries no HTTP client and an OAuth/OIDC login responds 501 until opted in.
-                oauth_login: oidc_login_from_env(),
+                // OAuth/OIDC login provider. hq-idp-db.2 moved provider config from env to the DB:
+                // when the `oauth` feature is built, this is the `DbOauthLogin` resolver over the
+                // GLOBAL `public.oauth_providers` store (just migrated above), so a login's
+                // `provider_id` selects the registered provider per request — no redeploy to add
+                // one. Without the `oauth` feature there is no HTTP client, so it stays `None` and
+                // an OAuth/OIDC login responds 501.
+                oauth_login: oidc_login_from_db(pool.clone()),
                 users: Some(pg_users.clone() as Arc<dyn gt_auth::UserStore>),
                 roles: Some(pg_users.clone() as Arc<dyn gt_auth::RoleStore>),
                 // Cross-workspace surface (hq-identity.3): list memberships + switch active
@@ -1230,23 +1237,35 @@ fn env_u64(key: &str, default: u64) -> u64 {
 /// The `Secure` flag for the auth cookies (hq-web-extras.1). Defaults to `true` (HTTPS deploy);
 /// `GT_AUTH_COOKIE_SECURE=false` opts a plain-http local dev out. `SameSite=None` forces it on
 /// regardless, since browsers drop a `None` cookie that is not also `Secure`.
-/// The OAuth/OIDC [`LoginProvider`](gt_auth::LoginProvider) for `AuthState::oauth_login`
-/// (hq-platform-hardening.3), built from the `GT_OIDC_*` env contract. Returns `None` (the
-/// email+password path only; an OAuth/OIDC login responds `501`) when:
-///   - the `oauth` feature is not built — a default deploy carries no HTTP client; or
-///   - `GT_OIDC_ISSUER` is unset — the deploy did not opt into a provider.
-/// A configured-but-malformed env (e.g. issuer set but client id missing) is fatal — a
-/// misconfiguration must not silently fall back to "OAuth off".
-fn oidc_login_from_env() -> Option<Arc<dyn gt_auth::LoginProvider>> {
+/// The DB-backed OAuth/OIDC [`LoginProvider`](gt_auth::LoginProvider) for `AuthState::oauth_login`
+/// (hq-idp-db.2). Unlike the retired env path (`OidcConfig::from_env`), provider config now lives in
+/// the GLOBAL `public.oauth_providers` store: this returns a `DbOauthLogin` resolver over a
+/// `PgProviderRepo` on `pool`, so a login's `provider_id` selects the registered provider per
+/// request — an admin adds Google/GitHub/Microsoft or a generic OIDC provider with no redeploy.
+///
+/// Returns `None` (the email+password path only; an OAuth/OIDC login responds `501`) when the
+/// `oauth` feature is not built — a default deploy carries no HTTP client. The per-deploy bits that
+/// are NOT provider rows still come from env: `GT_OIDC_REDIRECT_URI` (the app's own callback URL,
+/// echoed on every exchange; required) and `GT_OIDC_WORKSPACE` (the tenant a resolved OAuth identity
+/// lands in; defaults to `default`). A missing redirect URI is fatal — it must not silently resolve
+/// to a blank callback.
+#[allow(unused_variables)]
+fn oidc_login_from_db(pool: sqlx::PgPool) -> Option<Arc<dyn gt_auth::LoginProvider>> {
     #[cfg(feature = "oauth")]
     {
-        if std::env::var(gt_auth::ENV_ISSUER).ok().filter(|v| !v.trim().is_empty()).is_none() {
-            return None;
-        }
-        let config = gt_auth::OidcConfig::from_env().expect("GT_OIDC_* config is malformed");
-        let provider = gt_auth::OidcProvider::new(config).expect("build the OIDC login provider");
-        eprintln!("[gt-mcp-server] oauth/oidc login enabled (issuer {})", provider.issuer());
-        Some(Arc::new(provider) as Arc<dyn gt_auth::LoginProvider>)
+        let redirect_uri = std::env::var(gt_auth::ENV_REDIRECT_URI)
+            .ok()
+            .filter(|v| !v.trim().is_empty())
+            .expect("GT_OIDC_REDIRECT_URI must be set for the DB-backed OAuth login");
+        let workspace = std::env::var(gt_auth::ENV_WORKSPACE)
+            .ok()
+            .filter(|v| !v.trim().is_empty())
+            .unwrap_or_else(|| "default".to_owned());
+        let repo = Arc::new(gt_auth::PgProviderRepo::new(pool)) as Arc<dyn gt_auth::ProviderRepo>;
+        let resolver = gt_auth::DbOauthLogin::new(repo, workspace, redirect_uri)
+            .expect("build the DB-backed OAuth login resolver");
+        eprintln!("[gt-mcp-server] oauth/oidc login enabled (DB-backed provider store)");
+        Some(Arc::new(resolver) as Arc<dyn gt_auth::LoginProvider>)
     }
     #[cfg(not(feature = "oauth"))]
     {

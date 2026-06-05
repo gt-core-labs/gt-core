@@ -169,8 +169,8 @@ pub use http::GlobalLogin;
 /// password path yields. Behind the off-by-default `oauth` feature.
 #[cfg(feature = "oauth")]
 pub use oauth::{
-    OidcConfig, OidcProvider, ENV_CLIENT_ID, ENV_CLIENT_SECRET, ENV_ISSUER, ENV_REDIRECT_URI,
-    ENV_SCOPES, ENV_TOKEN_ENDPOINT, ENV_USERINFO_ENDPOINT, ENV_WORKSPACE,
+    DbOauthLogin, OidcConfig, OidcProvider, ENV_CLIENT_ID, ENV_CLIENT_SECRET, ENV_ISSUER,
+    ENV_REDIRECT_URI, ENV_SCOPES, ENV_TOKEN_ENDPOINT, ENV_USERINFO_ENDPOINT, ENV_WORKSPACE,
 };
 
 /// The DB-backed OAuth/OIDC provider store (hq-idp-db.1): the `ProviderRepo` CRUD port over the

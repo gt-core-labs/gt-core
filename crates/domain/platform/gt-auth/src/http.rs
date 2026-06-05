@@ -517,7 +517,14 @@ pub struct LoginRequest {
     /// The plaintext password presented this request (email+password path).
     #[serde(default)]
     pub password: Option<String>,
-    /// Upstream provider id for the OAuth authorization-code grant (e.g. `"github"`); pairs with
+    /// The registered provider's id in the `oauth_providers` store (hq-idp-db.2) — the primary key
+    /// the FE login button carries. Pairs with [`code`](Self::code); the server loads this row,
+    /// decrypts its client secret, and runs the handshake against it. An unknown/disabled id is a
+    /// `404`. Falls back to [`provider`](Self::provider) when absent (the pre-DB wire name).
+    #[serde(default)]
+    pub provider_id: Option<String>,
+    /// Upstream provider id for the OAuth authorization-code grant (e.g. `"github"`); the pre-DB
+    /// alias of [`provider_id`](Self::provider_id), kept for back-compat. Pairs with
     /// [`code`](Self::code).
     #[serde(default)]
     pub provider: Option<String>,
@@ -540,10 +547,13 @@ impl LoginRequest {
     /// silent default.
     fn into_credentials(self) -> Result<Credentials, AuthError> {
         match self {
-            LoginRequest { code: Some(code), provider, .. } => Ok(Credentials::OAuth {
-                provider: provider.unwrap_or_default(),
-                code,
-            }),
+            LoginRequest { code: Some(code), provider_id, provider, .. } => {
+                Ok(Credentials::OAuth {
+                    // `provider_id` (the `oauth_providers` PK) wins; `provider` is the pre-DB alias.
+                    provider: provider_id.or(provider).unwrap_or_default(),
+                    code,
+                })
+            }
             LoginRequest { id_token: Some(id_token), issuer: Some(issuer), .. } => {
                 Ok(Credentials::Oidc { issuer, id_token })
             }
@@ -1206,6 +1216,9 @@ impl IntoResponse for AuthError {
             | AuthError::UnknownKey(_)
             | AuthError::MissingWorkspace => StatusCode::UNAUTHORIZED,
             AuthError::UnsupportedProvider(_) => StatusCode::BAD_REQUEST,
+            // An unknown/disabled `provider_id` is a client error (wrong/retired login button),
+            // not a server fault: a clear `404`, distinct from the `501` "oauth not wired at all".
+            AuthError::UnknownProvider(_) => StatusCode::NOT_FOUND,
             AuthError::HashFailure(_)
             | AuthError::SigningFailure(_)
             | AuthError::Backend(_) => StatusCode::INTERNAL_SERVER_ERROR,
