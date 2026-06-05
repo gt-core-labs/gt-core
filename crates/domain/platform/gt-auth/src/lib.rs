@@ -98,6 +98,12 @@ mod http;
 #[cfg(feature = "oauth")]
 mod oauth;
 
+#[cfg(feature = "oauth")]
+mod crypto;
+
+#[cfg(feature = "oauth")]
+mod provider_repo;
+
 pub use error::AuthError;
 pub use provider::{Credentials, IdentityProvider, ProviderKind, VerifiedIdentity};
 pub use refresh::{
@@ -133,6 +139,10 @@ pub mod migrations {
     /// (`public.user_workspaces`), the foundation of cross-workspace login (hq-identity.1).
     pub const CREATE_GLOBAL_IDENTITY: &str =
         include_str!("../migrations/auth/0005__global_identity.sql");
+    /// `0006` — the GLOBAL DB-backed OAuth/OIDC provider store (`public.oauth_providers`,
+    /// hq-idp-db.1); the client secret column holds the AES-GCM-sealed blob, never cleartext.
+    pub const CREATE_OAUTH_PROVIDERS: &str =
+        include_str!("../migrations/auth/0006__create_oauth_providers.sql");
 }
 
 #[cfg(feature = "jsonwebtoken")]
@@ -162,6 +172,24 @@ pub use oauth::{
     OidcConfig, OidcProvider, ENV_CLIENT_ID, ENV_CLIENT_SECRET, ENV_ISSUER, ENV_REDIRECT_URI,
     ENV_SCOPES, ENV_TOKEN_ENDPOINT, ENV_USERINFO_ENDPOINT, ENV_WORKSPACE,
 };
+
+/// The DB-backed OAuth/OIDC provider store (hq-idp-db.1): the `ProviderRepo` CRUD port over the
+/// GLOBAL `public.oauth_providers` table, the `ProviderKind`/preset catalog, and the
+/// `NewProvider`/`ProviderRecord` row shapes. The Postgres adapter `PgProviderRepo` is additionally
+/// gated by `pg`. The AES-GCM master-key env var (`GT_SECRET_KEY`) is re-exported for the
+/// composition root to document the contract.
+#[cfg(feature = "oauth")]
+pub use provider_repo::{
+    preset_for, presets, NewProvider, ProviderKind as OauthProviderKind, ProviderPreset,
+    ProviderRecord, ProviderRepo,
+};
+
+/// The AES-GCM seal/unseal env contract for the provider-secret store (hq-idp-db.1).
+#[cfg(feature = "oauth")]
+pub use crypto::ENV_SECRET_KEY;
+
+#[cfg(all(feature = "oauth", feature = "pg"))]
+pub use provider_repo::PgProviderRepo;
 
 #[cfg(test)]
 pub use provider::InMemoryIdentityProvider;
