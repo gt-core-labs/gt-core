@@ -49,8 +49,8 @@ use gt_composition::denial_audit::audit_denials;
 use gt_composition::scope_bridge::bridge_scopes;
 use gt_composition::stream::{feed_router, FeedState};
 use gt_auth::{
-    auth_router, AuthState as LoginState, GlobalLogin, InMemoryRefreshStore, JwtAuthenticator,
-    JwtMinter, PgUsers, SameSite,
+    auth_router, AuthState as LoginState, GlobalLogin, JwtAuthenticator, JwtMinter, PgRefreshStore,
+    PgUsers, SameSite,
 };
 use gt_store_pg::{schema_for, WorkspacePool};
 use sqlx::Row;
@@ -585,10 +585,12 @@ async fn main() -> anyhow::Result<()> {
                 // workspace, backed by the same global-identity adapter.
                 memberships: Some(pg_users.clone() as Arc<dyn gt_auth::MembershipDirectory>),
                 minter: Arc::new(minter),
-                // MVP refresh store (hq-web-extras.7): in-memory, so refresh tokens do not
-                // survive a restart. Durable PgRefreshStore is async-only and does not implement
-                // the sync `RefreshStore` trait — wiring it is the follow-up (hq-web-extras.2).
-                refresh: Arc::new(InMemoryRefreshStore::new()),
+                // Durable refresh store (hq-platform-hardening.1): PgRefreshStore over the same
+                // ws_default pool, so a refresh token survives a gt-mcp-server redeploy instead of
+                // being wiped with the process (the in-memory MVP forced re-login on every deploy).
+                // It backs the async `AsyncRefreshStore` port directly, no block_on; the
+                // `refresh_tokens` table was provisioned by the CREATE_REFRESH_TOKENS migration above.
+                refresh: Arc::new(PgRefreshStore::new(pool.clone())),
                 access_ttl,
                 refresh_ttl,
                 now: Arc::new(|| {
@@ -608,7 +610,7 @@ async fn main() -> anyhow::Result<()> {
                 authenticate,
             ));
             eprintln!(
-                "[gt-mcp-server] login surface on /auth/* (public; access {access_ttl}s / refresh {refresh_ttl}s, in-memory refresh)"
+                "[gt-mcp-server] login surface on /auth/* (public; access {access_ttl}s / refresh {refresh_ttl}s, durable PG refresh)"
             );
             app.merge(auth_app)
         }

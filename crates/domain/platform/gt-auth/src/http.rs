@@ -37,9 +37,112 @@ use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    AuthError, Credentials, JwkSet, JwtClaims, JwtMinter, RefreshError, RefreshStore, RefreshToken,
-    VerifiedIdentity,
+    AuthError, Credentials, JwkSet, JwtClaims, JwtMinter, RefreshError, RefreshRecord, RefreshStore,
+    RefreshToken, VerifiedIdentity,
 };
+
+/// The async refresh-store port behind [`AuthState::refresh`] — the I/O-capable boundary the HTTP
+/// handlers actually call (`hq-platform-hardening.1`).
+///
+/// The core [`RefreshStore`](crate::RefreshStore) is **synchronous** (the in-memory adapter does
+/// only map work). A durable adapter is I/O, so — like [`LoginProvider`] is to the sync
+/// [`IdentityProvider`](crate::IdentityProvider) — the endpoints depend on this `async` sibling.
+/// Both adapters back it without a `block_on`:
+///
+/// - any sync [`RefreshStore`] (the dependency-free [`InMemoryRefreshStore`](crate::InMemoryRefreshStore)
+///   fallback) via the blanket impl below — its map work just returns immediately, wrapped `Ok`;
+/// - [`PgRefreshStore`](crate::PgRefreshStore) (the durable, restart-surviving store) via its
+///   inherent `async` methods directly, with no runtime parked on a DB round-trip.
+///
+/// Only the three methods the endpoints invoke are exposed (`issue` / `rotate` / `revoke_by_token`);
+/// every verdict is a [`RefreshError`], so the sync store's infallible calls surface as `Ok`.
+#[async_trait]
+pub trait AsyncRefreshStore: Send + Sync {
+    /// Mint a new token in a fresh family — the async counterpart of
+    /// [`RefreshStore::issue`](crate::RefreshStore::issue).
+    async fn issue(
+        &self,
+        sub: &str,
+        workspace: &str,
+        scopes: &[String],
+        issued_at: u64,
+        exp: u64,
+    ) -> Result<(RefreshToken, RefreshRecord), RefreshError>;
+
+    /// Exchange an active token for a successor — the async counterpart of
+    /// [`RefreshStore::rotate`](crate::RefreshStore::rotate).
+    async fn rotate(
+        &self,
+        token: &RefreshToken,
+        now: u64,
+    ) -> Result<(RefreshToken, RefreshRecord), RefreshError>;
+
+    /// Revoke the presented token's family (logout) — the async counterpart of
+    /// [`RefreshStore::revoke_by_token`](crate::RefreshStore::revoke_by_token).
+    async fn revoke_by_token(&self, token: &RefreshToken) -> Result<(), RefreshError>;
+}
+
+/// Every synchronous [`RefreshStore`] is an [`AsyncRefreshStore`]: its calls are in-memory map
+/// work, so the async wrapper just runs them inline and wraps the infallible ones in `Ok`. This is
+/// what keeps the dependency-free [`InMemoryRefreshStore`](crate::InMemoryRefreshStore) usable as
+/// the no-database fallback without changing the sync core.
+#[async_trait]
+impl<S: RefreshStore + Send + Sync> AsyncRefreshStore for S {
+    async fn issue(
+        &self,
+        sub: &str,
+        workspace: &str,
+        scopes: &[String],
+        issued_at: u64,
+        exp: u64,
+    ) -> Result<(RefreshToken, RefreshRecord), RefreshError> {
+        Ok(RefreshStore::issue(self, sub, workspace, scopes, issued_at, exp))
+    }
+
+    async fn rotate(
+        &self,
+        token: &RefreshToken,
+        now: u64,
+    ) -> Result<(RefreshToken, RefreshRecord), RefreshError> {
+        RefreshStore::rotate(self, token, now)
+    }
+
+    async fn revoke_by_token(&self, token: &RefreshToken) -> Result<(), RefreshError> {
+        RefreshStore::revoke_by_token(self, token);
+        Ok(())
+    }
+}
+
+/// The durable Postgres store is the production [`AsyncRefreshStore`]: it already exposes inherent
+/// `async` issue / rotate / revoke methods over the same [`RefreshError`] contract, so this just
+/// adapts them to the port. Available with the `pg` adapter; wiring it in place of the in-memory
+/// fallback is what makes a session survive a `gt-mcp-server` redeploy (`hq-platform-hardening.1`).
+#[cfg(feature = "pg")]
+#[async_trait]
+impl AsyncRefreshStore for crate::PgRefreshStore {
+    async fn issue(
+        &self,
+        sub: &str,
+        workspace: &str,
+        scopes: &[String],
+        issued_at: u64,
+        exp: u64,
+    ) -> Result<(RefreshToken, RefreshRecord), RefreshError> {
+        crate::PgRefreshStore::issue(self, sub, workspace, scopes, issued_at, exp).await
+    }
+
+    async fn rotate(
+        &self,
+        token: &RefreshToken,
+        now: u64,
+    ) -> Result<(RefreshToken, RefreshRecord), RefreshError> {
+        crate::PgRefreshStore::rotate(self, token, now).await
+    }
+
+    async fn revoke_by_token(&self, token: &RefreshToken) -> Result<(), RefreshError> {
+        crate::PgRefreshStore::revoke_by_token(self, token).await
+    }
+}
 
 /// The async login port — the I/O-bound sibling of the synchronous
 /// [`IdentityProvider`](crate::IdentityProvider). A real store (e.g. `PgUsers`) authenticates
@@ -222,8 +325,10 @@ pub struct AuthState {
     pub login: Arc<dyn LoginProvider>,
     /// The RS256 access-token minter.
     pub minter: Arc<JwtMinter>,
-    /// The refresh-token store (rotation, reuse detection, revocation).
-    pub refresh: Arc<dyn RefreshStore + Send + Sync>,
+    /// The refresh-token store (rotation, reuse detection, revocation). The async port, so the
+    /// durable [`PgRefreshStore`](crate::PgRefreshStore) (restart-surviving) backs it without a
+    /// `block_on`; the in-memory fallback satisfies it via the blanket impl (`hq-platform-hardening.1`).
+    pub refresh: Arc<dyn AsyncRefreshStore>,
     /// Access-token lifetime in seconds (short).
     pub access_ttl: u64,
     /// Refresh-token lifetime in seconds (long).
@@ -464,13 +569,13 @@ pub struct AssignRolesRequest {
 async fn login(
     State(state): State<AuthState>,
     Json(body): Json<LoginRequest>,
-) -> Result<(HeaderMap, Json<TokenResponse>), AuthError> {
+) -> Result<(HeaderMap, Json<TokenResponse>), ApiError> {
     let creds = Credentials::EmailPassword {
         email: body.email,
         password: body.password,
     };
     let identity = state.login.login(&creds).await?;
-    let tokens = issue_tokens(&state, identity.sub, identity.workspace, identity.scopes)?;
+    let tokens = issue_tokens(&state, identity.sub, identity.workspace, identity.scopes).await?;
     // Set httpOnly cookies for the browser (SSE + refresh) while still returning the JSON body
     // for non-browser clients (`hq-web-extras.1`).
     Ok((set_token_cookies(&state, &tokens), Json(tokens)))
@@ -492,7 +597,7 @@ async fn refresh(
     // Prefer the httpOnly cookie (browser); fall back to the JSON body (non-browser clients).
     let token = refresh_token_from(&headers, body).ok_or(ApiError::Unauthenticated)?;
     let now = (state.now)();
-    let (next, record) = state.refresh.rotate(&RefreshToken::new(token), now)?;
+    let (next, record) = state.refresh.rotate(&RefreshToken::new(token), now).await?;
     // Re-mint a faithful access token from the record's carried scopes.
     let claims = JwtClaims {
         sub: record.sub,
@@ -528,7 +633,10 @@ async fn logout(
     // cannot probe which tokens exist. Either source (cookie or body) is honoured, and the
     // cookies are cleared regardless.
     if let Some(token) = refresh_token_from(&headers, body) {
-        state.refresh.revoke_by_token(&RefreshToken::new(token));
+        // Best-effort: a backend fault on revoke must not fail logout (the client is leaving and
+        // the cookies are cleared regardless). The durable store's reuse/revoke verdicts are
+        // already terminal; an outage here is logged-and-dropped, not surfaced.
+        let _ = state.refresh.revoke_by_token(&RefreshToken::new(token)).await;
     }
     (clear_token_cookies(&state), StatusCode::NO_CONTENT)
 }
@@ -598,7 +706,7 @@ async fn switch(
         .resolve(&claims.sub, &body.workspace)
         .await?
         .ok_or(ApiError::Forbidden)?;
-    let tokens = issue_tokens(&state, identity.sub, identity.workspace, identity.scopes)?;
+    let tokens = issue_tokens(&state, identity.sub, identity.workspace, identity.scopes).await?;
     Ok((set_token_cookies(&state, &tokens), Json(tokens)))
 }
 
@@ -787,13 +895,14 @@ fn require_scope(claims: Option<&JwtClaims>, needed: &str) -> Result<(), ApiErro
     ok.then_some(()).ok_or(ApiError::Forbidden)
 }
 
-/// Mint an access + refresh token pair for a freshly verified identity.
-fn issue_tokens(
+/// Mint an access + refresh token pair for a freshly verified identity. Async: the refresh store
+/// is the I/O-capable [`AsyncRefreshStore`] port, so issuing the durable token is awaited.
+async fn issue_tokens(
     state: &AuthState,
     sub: String,
     workspace: String,
     scopes: Vec<String>,
-) -> Result<TokenResponse, AuthError> {
+) -> Result<TokenResponse, ApiError> {
     let now = (state.now)();
     let identity = VerifiedIdentity {
         sub: sub.clone(),
@@ -802,10 +911,10 @@ fn issue_tokens(
     };
     let claims = identity.into_claims(now + state.access_ttl, now);
     let access_token = state.minter.mint(&claims)?;
-    let (refresh_token, _record) =
-        state
-            .refresh
-            .issue(&sub, &workspace, &scopes, now, now + state.refresh_ttl);
+    let (refresh_token, _record) = state
+        .refresh
+        .issue(&sub, &workspace, &scopes, now, now + state.refresh_ttl)
+        .await?;
     Ok(TokenResponse {
         access_token,
         refresh_token: refresh_token.as_str().to_owned(),

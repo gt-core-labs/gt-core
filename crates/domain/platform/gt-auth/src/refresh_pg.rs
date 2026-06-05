@@ -459,6 +459,40 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_refresh_token_survives_a_simulated_restart_new_store_same_pg() {
+        // hq-platform-hardening.1: the whole point of the durable store — a refresh token issued
+        // before a gt-mcp-server redeploy is STILL redeemable after it. We model the redeploy by
+        // dropping the issuing store and building a brand-new `PgRefreshStore` over the same
+        // Postgres (a fresh process holds no in-memory session state), then rotating the token the
+        // "old" store handed out. The in-memory MVP would have lost it with the process.
+        let Some(pool) = pool_or_skip().await else {
+            eprintln!("GT_PG_URL unset; skipping PgRefreshStore restart-survival test");
+            return;
+        };
+        ensure_table(&pool).await;
+
+        // --- before the "restart": issue a token, then drop the store that minted it. ---
+        let token = {
+            let store = PgRefreshStore::new(pool.clone());
+            let (tok, _) = store.issue("alice", "acme", &[], 0, HOUR).await.unwrap();
+            tok
+            // `store` drops here — the issuing process is gone.
+        };
+
+        // --- after the "restart": a fresh store over the same PG, no shared in-memory state. ---
+        let restarted = PgRefreshStore::new(pool);
+        let (next, rec) = restarted
+            .rotate(&token, 10)
+            .await
+            .expect("a pre-restart refresh token must still be redeemable after a new store");
+        assert_eq!(rec.sub, "alice");
+        assert_eq!(rec.workspace, "acme");
+        assert_ne!(token, next, "the survived token rotates to a fresh successor");
+        // And reuse detection still holds across the restart: the now-spent token is reuse.
+        assert_eq!(restarted.rotate(&token, 20).await, Err(RefreshError::Reused));
+    }
+
+    #[tokio::test]
     async fn a_fresh_issue_opens_an_independent_family() {
         let Some(pool) = pool_or_skip().await else {
             eprintln!("GT_PG_URL unset; skipping PgRefreshStore contract test");
