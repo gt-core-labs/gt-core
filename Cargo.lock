@@ -1739,6 +1739,7 @@ dependencies = [
  "async-trait",
  "axum",
  "gt-auth",
+ "gt-events",
  "gt-module",
  "gt-module-mcp",
  "gt-store-dolt",

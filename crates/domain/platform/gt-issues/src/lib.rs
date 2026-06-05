@@ -34,6 +34,12 @@
 
 pub mod commands;
 pub mod delivery;
+/// Issue-mutation events for the per-workspace SSE feed (`hq-issues-sse`): the
+/// versioned [`events::IssueEvent`] every successful mutation emits, the
+/// [`events::IssueEventSink`] seam the composition root backs with the event log, and
+/// the shared [`events::emit_issue_event`] both the REST and MCP paths call so the two
+/// transports emit the identical event.
+pub mod events;
 pub mod handlers;
 /// The off-by-default `axum` REST adapter (`hq-auth-routes.2`): the first GtModule HTTP surface,
 /// mapping `issues.*` to REST routes that reuse the same handlers as the MCP tools.
@@ -47,6 +53,7 @@ pub mod me;
 /// The [`GtModule`](gt_module::GtModule) facade for the cross-workspace `me.*` surface
 /// (`hq-web-extras.15`), mounted at `/api/v1/me` behind the `me.read` guard.
 pub mod me_module;
+mod module;
 pub mod park;
 pub mod policy;
 pub mod readiness;
@@ -58,19 +65,18 @@ pub mod resources;
 pub mod stats;
 pub mod surface;
 pub mod taxonomy;
-mod module;
 
 pub use commands::{
     AdvancePhase, ClaimIssue, CloseIssue, CreateIssue, TransitionIssue, UpdateIssue,
 };
 pub use delivery::{CommitInfo, CommitInspector};
+pub use events::{emit_issue_event, IssueEvent, IssueEventSink, IssueVerb};
 #[cfg(feature = "axum")]
 pub use http::{issues_router, ApiDoc, IssuesApiState};
 #[cfg(feature = "axum")]
 pub use me::{me_router, MeApiState, MeMembership, MeStatsSource};
 pub use me_module::MeModule;
 pub use module::IssuesModule;
-pub use stats::{MeStatsResponse, WorkspaceStats};
 pub use park::{
     decide as park_decide, HumanPresence, IrreversibleKind, Operation, ParkDecision, ParkQueue,
     ParkedOp, Reversibility,
@@ -80,5 +86,6 @@ pub use policy::{
     Violation, INVARIANTS,
 };
 pub use readiness::is_ready;
+pub use stats::{MeStatsResponse, WorkspaceStats};
 pub use surface::{AllowAllTree, SurfaceEntry, SurfaceTree};
 pub use taxonomy::Domain;

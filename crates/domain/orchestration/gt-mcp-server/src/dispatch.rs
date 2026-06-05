@@ -12,8 +12,8 @@ use gt_issues::handlers::{
     run_update_issue, ClaimResult,
 };
 use gt_issues::{
-    AdvancePhase, ClaimIssue, CloseIssue, CommitInspector, CreateIssue, TransitionIssue,
-    UpdateIssue,
+    emit_issue_event, AdvancePhase, ClaimIssue, CloseIssue, CommitInspector, CreateIssue,
+    IssueEventSink, IssueVerb, TransitionIssue, UpdateIssue,
 };
 use gt_meta::ReportGap;
 use gt_module::McpTool;
@@ -74,8 +74,14 @@ fn inject_claim_echo(body: &mut Value, res: &ClaimResult) {
 }
 
 /// Dispatch one `issues.*` tool call. `actor` is the server-injected scope actor
-/// (used as the close/claim attribution). `Ok(value)` is the success payload the
-/// server wraps in a `CallToolResult`; `Err` maps to an MCP error.
+/// (used as the close/claim attribution). `sink` is the SSE-feed event sink
+/// (`hq-issues-sse`): every successful `*.execute` mutation publishes its
+/// [`IssueEvent`](gt_issues::IssueEvent) to it, keyed to `ws`, so an agent moving a
+/// bead over MCP shows up on `GET /stream?channel=issues` — the natural-movement
+/// source the REST surface alone would miss. `None` (no event log wired) emits
+/// nothing, exactly as before. `Ok(value)` is the success payload the server wraps in
+/// a `CallToolResult`; `Err` maps to an MCP error.
+#[allow(clippy::too_many_arguments)]
 pub async fn dispatch(
     store: &DoltIssues,
     tool: &str,
@@ -84,6 +90,7 @@ pub async fn dispatch(
     repo_dir: Option<&Path>,
     ws: Option<&str>,
     prefixes: Option<&dyn WorkspaceRigPrefixes>,
+    sink: Option<&dyn IssueEventSink>,
 ) -> Result<Value, AppError> {
     match tool {
         "issues.create.validate" => {
@@ -96,6 +103,7 @@ pub async fn dispatch(
             let a: CreateIssue = parse_args(args)?;
             enforce_rig_prefix(prefixes, ws, &a.id).await?;
             run_create_issue(store, &a, surface_tree(repo_dir).as_ref(), false).await?;
+            emit_issue_event(sink, store, ws, IssueVerb::Created, &a.id, actor).await;
             Ok(json!({ "ok": true }))
         }
         "issues.update.validate" => {
@@ -107,7 +115,9 @@ pub async fn dispatch(
         }
         "issues.update.execute" => {
             let a: UpdateIssue = parse_args(args)?;
-            let version = run_update_issue(store, &a, surface_tree(repo_dir).as_ref(), false).await?;
+            let version =
+                run_update_issue(store, &a, surface_tree(repo_dir).as_ref(), false).await?;
+            emit_issue_event(sink, store, ws, IssueVerb::Updated, &a.id, actor).await;
             let mut body = json!({ "ok": true });
             if let Some(v) = version {
                 body["version"] = json!(v);
@@ -122,6 +132,7 @@ pub async fn dispatch(
         "issues.transition.execute" => {
             let a: TransitionIssue = parse_args(args)?;
             run_transition_issue(store, &a, false).await?;
+            emit_issue_event(sink, store, ws, IssueVerb::Transitioned, &a.id, actor).await;
             Ok(json!({ "ok": true }))
         }
         "issues.close.validate" => {
@@ -137,9 +148,11 @@ pub async fn dispatch(
             // non-planned surface and yields the full sha to stamp. `None` (no
             // repo wired) skips verification and leaves delivered_sha NULL.
             let inspector = commit_inspector(repo_dir);
-            let inspector_ref =
-                inspector.as_ref().map(|i| i as &(dyn CommitInspector + Send + Sync));
+            let inspector_ref = inspector
+                .as_ref()
+                .map(|i| i as &(dyn CommitInspector + Send + Sync));
             run_close_issue(store, &a, actor, inspector_ref, false).await?;
+            emit_issue_event(sink, store, ws, IssueVerb::Closed, &a.id, actor).await;
             Ok(json!({ "ok": true }))
         }
         "issues.claim.validate" => {
@@ -154,6 +167,8 @@ pub async fn dispatch(
             let res = run_claim_issue(store, &a, actor, false).await?;
             match &res.outcome {
                 ClaimOutcome::Won => {
+                    // Only a won claim mutated the row; a lost claim emits nothing.
+                    emit_issue_event(sink, store, ws, IssueVerb::Claimed, &a.id, actor).await;
                     let mut body = json!({ "outcome": "won", "owner": actor });
                     if let Some(v) = res.version {
                         body["version"] = json!(v);
@@ -388,14 +403,18 @@ mod tests {
     #[tokio::test]
     async fn enforce_accepts_registered_prefix_in_workspace() {
         let p = StubPrefixes;
-        assert!(enforce_rig_prefix(Some(&p), Some("acme"), "pl-new-bead").await.is_ok());
+        assert!(enforce_rig_prefix(Some(&p), Some("acme"), "pl-new-bead")
+            .await
+            .is_ok());
     }
 
     #[tokio::test]
     async fn enforce_accepts_reserved_prefix() {
         // The adapter reports the reserved `hq` as allowed, so tracker beads survive.
         let p = StubPrefixes;
-        assert!(enforce_rig_prefix(Some(&p), Some("acme"), "hq-mod-x.1").await.is_ok());
+        assert!(enforce_rig_prefix(Some(&p), Some("acme"), "hq-mod-x.1")
+            .await
+            .is_ok());
     }
 
     #[tokio::test]
@@ -411,13 +430,17 @@ mod tests {
     async fn enforce_rejects_prefix_registered_only_in_another_workspace() {
         // `pl` is allowed in `acme` but not in `other` — no global uniqueness.
         let p = StubPrefixes;
-        assert!(enforce_rig_prefix(Some(&p), Some("other"), "pl-foo").await.is_err());
+        assert!(enforce_rig_prefix(Some(&p), Some("other"), "pl-foo")
+            .await
+            .is_err());
     }
 
     #[tokio::test]
     async fn enforce_is_noop_without_policy_or_workspace() {
         // No policy wired (single-tenant / no-PG) ⇒ accept any prefix.
-        assert!(enforce_rig_prefix(None, Some("acme"), "zz-foo").await.is_ok());
+        assert!(enforce_rig_prefix(None, Some("acme"), "zz-foo")
+            .await
+            .is_ok());
         // Policy wired but request resolved no workspace ⇒ accept (legacy default).
         let p = StubPrefixes;
         assert!(enforce_rig_prefix(Some(&p), None, "zz-foo").await.is_ok());
@@ -485,7 +508,13 @@ mod tests {
 
     #[test]
     fn rejects_unknown_key_and_malformed_pair() {
-        assert!(parse_issue_filter("bogus=1").unwrap_err().to_string().contains("bogus"));
-        assert!(parse_issue_filter("status").unwrap_err().to_string().contains('='));
+        assert!(parse_issue_filter("bogus=1")
+            .unwrap_err()
+            .to_string()
+            .contains("bogus"));
+        assert!(parse_issue_filter("status")
+            .unwrap_err()
+            .to_string()
+            .contains('='));
     }
 }

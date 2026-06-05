@@ -34,24 +34,25 @@ use rmcp::transport::streamable_http_server::session::local::LocalSessionManager
 use rmcp::transport::{StreamableHttpServerConfig, StreamableHttpService};
 
 use gt_audit::{AuditSink, InMemoryAudit};
-use gt_composition::mcp::{
-    AgentHandler, AuditHandler, ConvoyHandler, DocumentsHandler, EventLog, EventLogConvoy,
-    EventLogFeed, EventLogMerges, EventLogQuota, EventLogSkills, GraphHandler, IdentityDoltMeStats,
-    CompositionTenantProvisioner, MergeHandler, PgDocumentsResource, PgRigPrefixes,
-    PgWorkspaceStatus, QuotaHandler, RigHandler, WorkspaceHandler, WsPoolRigs, WsPools,
-};
-use gt_docs_embed::Embedder;
-use gt_docs_extract::Extractor;
-use gt_store_blob::BlobStore;
-use gt_graphindex::GraphifyIndexer;
-use gt_composition::auth::{authenticate, AuthState, SharedAuthenticator};
-use gt_composition::denial_audit::audit_denials;
-use gt_composition::scope_bridge::bridge_scopes;
-use gt_composition::stream::{feed_router, FeedState};
 use gt_auth::{
     auth_router, AuthState as LoginState, GlobalLogin, JwtAuthenticator, JwtMinter, PgRefreshStore,
     PgUsers, SameSite,
 };
+use gt_composition::auth::{authenticate, AuthState, SharedAuthenticator};
+use gt_composition::denial_audit::audit_denials;
+use gt_composition::mcp::{
+    AgentHandler, AuditHandler, CompositionTenantProvisioner, ConvoyHandler, DocumentsHandler,
+    EventLog, EventLogConvoy, EventLogFeed, EventLogIssueSink, EventLogMerges, EventLogQuota,
+    EventLogSkills, GraphHandler, IdentityDoltMeStats, MergeHandler, PgDocumentsResource,
+    PgRigPrefixes, PgWorkspaceStatus, QuotaHandler, RigHandler, WorkspaceHandler, WsPoolRigs,
+    WsPools,
+};
+use gt_composition::scope_bridge::bridge_scopes;
+use gt_composition::stream::{feed_router, FeedState};
+use gt_docs_embed::Embedder;
+use gt_docs_extract::Extractor;
+use gt_graphindex::GraphifyIndexer;
+use gt_store_blob::BlobStore;
 use gt_store_pg::{schema_for, WorkspacePool};
 use sqlx::Row;
 // Domain REST modules + their `with_http` state (hq-fe-api-mount.1): the bin mounts each
@@ -59,22 +60,22 @@ use sqlx::Row;
 use gt_agent::{AgentApiState, AgentModule};
 use gt_documents::{DocumentsApiState, DocumentsModule};
 use gt_eventlog::DEFAULT_EVENTLOG_ROOT;
+use gt_feed::{FeedApiState, FeedModule};
 use gt_issues::{IssuesApiState, IssuesModule, MeApiState, MeModule};
-use gt_merge::{MergeApiState, MergeModule};
 use gt_mcp_server::{
     health, DocumentsResource, DomainRouter, HealthState, IssuesServer, PgAuditSink,
     WorkspaceRigPrefixes, WorkspaceStatusGate, WorkspaceStores,
 };
+use gt_merge::{MergeApiState, MergeModule};
 use gt_meta::{MetaApiState, MetaModule};
-use gt_orchestration::{ConvoyApiState, ConvoyModule};
 use gt_module::RootBuilder;
-use gt_feed::{FeedApiState, FeedModule};
+use gt_orchestration::{ConvoyApiState, ConvoyModule};
 use gt_quota::{QuotaApiState, QuotaModule};
+use gt_rbac::{RbacConfig, Scope};
 use gt_rig::{RigApiState, RigsModule};
 use gt_skills::{SkillsApiState, SkillsModule};
-use gt_workspace::{PgWorkspaces, WorkspaceApiState, WorkspaceModule};
-use gt_rbac::{RbacConfig, Scope};
 use gt_store_dolt::{DoltIssues, WorkspacePools};
+use gt_workspace::{PgWorkspaces, WorkspaceApiState, WorkspaceModule};
 
 /// Path the MCP endpoint mounts at (mirrors the upstream gt-mcp).
 const MCP_PATH: &str = "/mcp";
@@ -93,7 +94,9 @@ async fn main() -> anyhow::Result<()> {
     // S3 surface validation (hq-core-mcp.9): the gt-core checkout whose `main`
     // tree create/update validate `planned:false` surface paths against. Unset ⇒
     // no checkout (e.g. the live container), so surface validation is skipped.
-    let repo_dir = std::env::var("GT_REPO_DIR").ok().map(std::path::PathBuf::from);
+    let repo_dir = std::env::var("GT_REPO_DIR")
+        .ok()
+        .map(std::path::PathBuf::from);
 
     // Store: the lifted Dolt issues adapter (hq-core-host.1), on the shared Dolt. gt-core owns
     // the bootstrap (hq-docs follow-up): ensure the target database exists before the pool
@@ -102,6 +105,22 @@ async fn main() -> anyhow::Result<()> {
     let store = Arc::new(DoltIssues::connect(&dolt_url)?);
     store.ensure_schema().await?;
     eprintln!("[gt-mcp-server] issues: Dolt @ {dolt_url}");
+
+    // The per-workspace event log (the event-sourced domains' durable store AND the SSE feed's
+    // source) is path-partitioned under GT_EVENTLOG_ROOT (default /var/lib/gt-core). Built here
+    // — before the issues REST state + the MCP service — so both can emit issue-mutation events
+    // into the same log the `GET /stream` feed fans out (hq-issues-sse). The event-sourced
+    // domain handlers + the feed route below share this one handle.
+    let event_root = std::env::var("GT_EVENTLOG_ROOT")
+        .ok()
+        .map(std::path::PathBuf::from);
+    let event_log = Arc::new(EventLog::new(event_root));
+    // The issues tracker is Dolt-backed, not event-sourced, so its mutations never reached the
+    // event log — the SSE feed never carried issue movement. This sink closes that gap: it
+    // appends every `issues.*` mutation (REST or MCP) to the workspace log, so the tracker moves
+    // on `GET /stream?channel=issues`. One sink, shared by both surfaces, so REST and MCP emit the
+    // identical event (parity).
+    let issue_sink = Arc::new(EventLogIssueSink::new(event_log.clone()));
 
     // Tools + routes: harvest the issues module's descriptors AND its REST router through the
     // kernel builder — the composition root never hand-lists tools or hand-wires a module's
@@ -126,7 +145,9 @@ async fn main() -> anyhow::Result<()> {
             IssuesApiState::new(store.clone(), actor.clone()).with_workspaces(pools.clone())
         }
         None => IssuesApiState::new(store.clone(), actor.clone()),
-    };
+    }
+    // SSE feed (hq-issues-sse): a REST mutation publishes its event into the per-workspace log.
+    .with_event_sink(issue_sink.clone());
     let root = RootBuilder::new()
         .module(IssuesModule::with_http(issues_api))
         .module(MetaModule)
@@ -172,7 +193,9 @@ async fn main() -> anyhow::Result<()> {
             }
         },
         Err(_) => {
-            eprintln!("[gt-mcp-server] GT_PG_AUDIT_URL unset; audit is in-memory (lost on restart)");
+            eprintln!(
+                "[gt-mcp-server] GT_PG_AUDIT_URL unset; audit is in-memory (lost on restart)"
+            );
             Arc::new(InMemoryAudit::new())
         }
     };
@@ -191,15 +214,11 @@ async fn main() -> anyhow::Result<()> {
     // domain handlers' descriptors so the REST `/help` matches the MCP `meta.help` exactly.
     let meta_store = store.clone();
     let meta_base_tools = tools.clone();
-    let mut service =
-        IssuesServer::new(store, default_scope, rbac, audit.clone(), tools, repo_dir);
-
-    // The per-workspace event log (the event-sourced domains' durable store +
-    // the SSE feed's source) is path-partitioned under GT_EVENTLOG_ROOT (default
-    // /var/lib/gt-core). Built once, shared by the domain dispatch handlers and the
-    // streaming feed route.
-    let event_root = std::env::var("GT_EVENTLOG_ROOT").ok().map(std::path::PathBuf::from);
-    let event_log = Arc::new(EventLog::new(event_root));
+    // `with_issue_sink` (hq-issues-sse): an `issues.*.execute` over MCP — the agent-driven
+    // movement the REST surface alone would miss — publishes its event into the same per-workspace
+    // log the SSE feed fans out, so the tracker moves on `GET /stream?channel=issues`.
+    let mut service = IssuesServer::new(store, default_scope, rbac, audit.clone(), tools, repo_dir)
+        .with_issue_sink(issue_sink.clone());
 
     // Domain dispatch (hq-mcp-dispatch): tool namespaces beyond issues.*/meta.*
     // (workspace.*, rig.*, …) route to PG-backed handlers. Wired only when
@@ -239,7 +258,9 @@ async fn main() -> anyhow::Result<()> {
     // inline on gt://issue/{id}. Present whenever the PG document store is (GT_PG_URL set).
     if let Some(docs) = documents {
         service = service.with_documents(docs);
-        eprintln!("[gt-mcp-server] document resources on (gt://doc/{{id}} + gt://issue docs inline)");
+        eprintln!(
+            "[gt-mcp-server] document resources on (gt://doc/{{id}} + gt://issue docs inline)"
+        );
     }
 
     // Multi-tenant routing (hq-mt-routing.5): when GT_DOLT_BASE_URL is set, a
@@ -279,7 +300,9 @@ async fn main() -> anyhow::Result<()> {
     let verifier: Option<SharedAuthenticator> = match JwtAuthenticator::from_env() {
         Ok(v) => Some(Arc::new(v)),
         Err(e) => {
-            eprintln!("[gt-mcp-server] no RS256 verifier configured ({e}); MCP/REST/cookie auth off");
+            eprintln!(
+                "[gt-mcp-server] no RS256 verifier configured ({e}); MCP/REST/cookie auth off"
+            );
             None
         }
     };
@@ -329,8 +352,14 @@ async fn main() -> anyhow::Result<()> {
     // one, the legacy `X-Workspace` header keys it (no auth), exactly as before.
     let feed = match &verifier {
         Some(v) => {
-            eprintln!("[gt-mcp-server] SSE feed on GET /stream (gt_web_token cookie auth, claim-keyed)");
-            feed_router(FeedState::with_cookie_auth(event_log.clone(), v.clone(), audit.clone()))
+            eprintln!(
+                "[gt-mcp-server] SSE feed on GET /stream (gt_web_token cookie auth, claim-keyed)"
+            );
+            feed_router(FeedState::with_cookie_auth(
+                event_log.clone(),
+                v.clone(),
+                audit.clone(),
+            ))
         }
         None => {
             eprintln!("[gt-mcp-server] SSE feed on GET /stream (no verifier; X-Workspace keyed)");
@@ -386,32 +415,32 @@ async fn main() -> anyhow::Result<()> {
             meta_tools,
         )))
         .module(AgentModule::with_http(AgentApiState::new(agent_root)))
-        .module(QuotaModule::with_http(QuotaApiState::new(Arc::new(EventLogQuota::new(
-            event_log.clone(),
-        )))))
+        .module(QuotaModule::with_http(QuotaApiState::new(Arc::new(
+            EventLogQuota::new(event_log.clone()),
+        ))))
         // merge.* (hq-fe-api-mount.3): the durable backing replays + appends the caller's
         // `merge.*` stream — the same event-sourced board the MCP MergeHandler folds into, so the
         // board survives restart (the actor's in-memory projection does not).
-        .module(MergeModule::with_http(MergeApiState::new(Arc::new(EventLogMerges::new(
-            event_log.clone(),
-        )))))
+        .module(MergeModule::with_http(MergeApiState::new(Arc::new(
+            EventLogMerges::new(event_log.clone()),
+        ))))
         // skills.read (hq-web-extras.13): read-only catalog the FE hydrates, replayed from the
         // caller's `skills.*` event stream. Mounted at /api/v1/skills behind the skills.read guard.
-        .module(SkillsModule::with_http(SkillsApiState::new(Arc::new(EventLogSkills::new(
-            event_log.clone(),
-        )))))
+        .module(SkillsModule::with_http(SkillsApiState::new(Arc::new(
+            EventLogSkills::new(event_log.clone()),
+        ))))
         // feed.read (hq-web-extras.14): read-only activity feed, folded from the caller's whole
         // workspace log. Mounted at /api/v1/feed behind the feed.read guard.
-        .module(FeedModule::with_http(FeedApiState::new(Arc::new(EventLogFeed::new(
-            event_log.clone(),
-        )))))
+        .module(FeedModule::with_http(FeedApiState::new(Arc::new(
+            EventLogFeed::new(event_log.clone()),
+        ))))
         // convoy.* (hq-web-extras.16): read + mutate REST surface — the durable backing replays +
         // appends the caller's `convoy.*` stream, the same event-sourced board the MCP
         // ConvoyHandler folds into. Mounted at /api/v1/convoy behind the convoys.read/convoys.write
         // guard (board read + complete-member/fail-member mutations).
-        .module(ConvoyModule::with_http(ConvoyApiState::new(Arc::new(EventLogConvoy::new(
-            event_log.clone(),
-        )))));
+        .module(ConvoyModule::with_http(ConvoyApiState::new(Arc::new(
+            EventLogConvoy::new(event_log.clone()),
+        ))));
     // The public, unauthenticated share-read surface (hq-web-extras.9): set when documents mount,
     // mounted OUTSIDE the /api/v1 auth chain (like /openapi.json). `None` without Postgres.
     let mut public_share: Option<axum::Router> = None;
@@ -425,12 +454,15 @@ async fn main() -> anyhow::Result<()> {
             // the same PG pool + per-workspace Dolt pools (hq-gap-workspace-rest-create-provision).
             .module(WorkspaceModule::with_http(
                 WorkspaceApiState::new(Arc::new(PgWorkspaces::new(pool.clone()))).with_provisioner(
-                    Arc::new(CompositionTenantProvisioner::new(pool, issues_workspaces.clone())),
+                    Arc::new(CompositionTenantProvisioner::new(
+                        pool,
+                        issues_workspaces.clone(),
+                    )),
                 ),
             ))
-            .module(RigsModule::with_http(RigApiState::new(Arc::new(WsPoolRigs::new(Arc::new(
-                WsPools::new(pg_url.clone()),
-            ))))));
+            .module(RigsModule::with_http(RigApiState::new(Arc::new(
+                WsPoolRigs::new(Arc::new(WsPools::new(pg_url.clone()))),
+            ))));
         let (blob, bucket) = build_blob_store();
         // Capture the PG url before it moves into the documents state — the cross-workspace
         // /me/stats surface (hq-web-extras.15) below opens its own ws_default pool for the
@@ -633,7 +665,10 @@ async fn main() -> anyhow::Result<()> {
                 // bridge_scopes feeds it CallerScopes; audit_denials observes the guard's verdict;
                 // authenticate (outermost) verifies the bearer token and injects the claims.
                 .layer(axum::middleware::from_fn(bridge_scopes))
-                .layer(axum::middleware::from_fn_with_state(audit.clone(), audit_denials))
+                .layer(axum::middleware::from_fn_with_state(
+                    audit.clone(),
+                    audit_denials,
+                ))
                 .layer(axum::middleware::from_fn_with_state(
                     AuthState::new(verifier, audit.clone()),
                     authenticate,
@@ -678,7 +713,10 @@ fn openapi_router(spec: Arc<str>) -> Router {
         get(move || {
             let spec = spec.clone();
             async move {
-                ([(axum::http::header::CONTENT_TYPE, "application/json")], spec.to_string())
+                (
+                    [(axum::http::header::CONTENT_TYPE, "application/json")],
+                    spec.to_string(),
+                )
             }
         }),
     )
@@ -764,9 +802,7 @@ async fn build_domain_router(
     Option<Arc<dyn DocumentsResource>>,
 )> {
     let Ok(pg_url) = std::env::var("GT_PG_URL") else {
-        eprintln!(
-            "[gt-mcp-server] GT_PG_URL unset; domain dispatch disabled (issues + meta only)"
-        );
+        eprintln!("[gt-mcp-server] GT_PG_URL unset; domain dispatch disabled (issues + meta only)");
         return Ok((DomainRouter::new(), None, None, None));
     };
     // The workspace catalog lives in the shared `public` schema, so it uses a
@@ -836,7 +872,8 @@ async fn build_domain_router(
     // The same per-workspace rig catalog backs issues.create prefix routing
     // (hq-mt-rigs.6): a new bead's id prefix must be a registered rig prefix in the
     // caller's workspace (or a reserved prefix).
-    let rig_prefixes: Arc<dyn WorkspaceRigPrefixes> = Arc::new(PgRigPrefixes::new(ws_pools.clone()));
+    let rig_prefixes: Arc<dyn WorkspaceRigPrefixes> =
+        Arc::new(PgRigPrefixes::new(ws_pools.clone()));
     // The suspend/archive gate reads the same `public`-schema workspace catalog the
     // `workspace.*` handler mutates (hq-mt-bootstrap.8), behind a short TTL cache.
     let ws_status: Arc<dyn WorkspaceStatusGate> = Arc::new(PgWorkspaceStatus::new(pool));
@@ -878,7 +915,9 @@ fn resolve_rbac_config() -> anyhow::Result<Option<RbacConfig>> {
 fn build_embedder() -> Option<Arc<dyn Embedder>> {
     #[cfg(feature = "embeddings-fastembed")]
     {
-        let on = std::env::var("GT_EMBEDDINGS").map(|v| v != "0" && !v.is_empty()).unwrap_or(false);
+        let on = std::env::var("GT_EMBEDDINGS")
+            .map(|v| v != "0" && !v.is_empty())
+            .unwrap_or(false);
         if on {
             match gt_docs_embed::fastembed::FastEmbedder::new() {
                 Ok(e) => {
@@ -886,7 +925,9 @@ fn build_embedder() -> Option<Arc<dyn Embedder>> {
                     return Some(Arc::new(e));
                 }
                 Err(err) => {
-                    eprintln!("[gt-mcp-server] embedder init failed — {err}; search is full-text only");
+                    eprintln!(
+                        "[gt-mcp-server] embedder init failed — {err}; search is full-text only"
+                    );
                 }
             }
         }
@@ -1239,12 +1280,22 @@ mod tests {
     async fn openapi_json_served_public_as_json() {
         let spec: Arc<str> = Arc::from(r#"{"openapi":"3.1.0","paths":{}}"#);
         let resp = openapi_router(spec.clone())
-            .oneshot(Request::builder().uri("/openapi.json").body(Body::empty()).unwrap())
+            .oneshot(
+                Request::builder()
+                    .uri("/openapi.json")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
-        assert_eq!(resp.headers().get(header::CONTENT_TYPE).unwrap(), "application/json");
-        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        assert_eq!(
+            resp.headers().get(header::CONTENT_TYPE).unwrap(),
+            "application/json"
+        );
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
         // Served byte-for-byte, and still valid JSON.
         assert_eq!(&bytes[..], spec.as_bytes());
         assert!(serde_json::from_slice::<serde_json::Value>(&bytes).is_ok());
@@ -1259,7 +1310,10 @@ mod tests {
             ("admin".to_string(), vec!["*".to_string()])
         );
         assert_eq!(
-            migrated_role("user-bob@x.test", &["rig.read".to_string(), "beads.read".to_string()]),
+            migrated_role(
+                "user-bob@x.test",
+                &["rig.read".to_string(), "beads.read".to_string()]
+            ),
             (
                 "migrated-user-bob@x.test".to_string(),
                 vec!["rig.read".to_string(), "beads.read".to_string()]
@@ -1280,7 +1334,15 @@ mod tests {
     fn is_safe_schema_ident_accepts_ws_and_rejects_the_rest() {
         assert!(is_safe_schema_ident("ws_default"));
         assert!(is_safe_schema_ident("ws_team_1"));
-        for bad in ["public", "ws-default", "ws_Default", "ws_a;b", "pg_catalog", "", &format!("ws_{}", "a".repeat(61))] {
+        for bad in [
+            "public",
+            "ws-default",
+            "ws_Default",
+            "ws_a;b",
+            "pg_catalog",
+            "",
+            &format!("ws_{}", "a".repeat(61)),
+        ] {
             assert!(!is_safe_schema_ident(bad), "{bad:?} must be rejected");
         }
     }
@@ -1322,7 +1384,10 @@ mod tests {
             gt_auth::migrations::ADD_USER_ROLES,
             gt_auth::migrations::CREATE_GLOBAL_IDENTITY,
         ] {
-            sqlx::raw_sql(sql).execute(&pool).await.expect("apply migration");
+            sqlx::raw_sql(sql)
+                .execute(&pool)
+                .await
+                .expect("apply migration");
         }
         // A workspace catalog with `default` (the migration drives off it).
         sqlx::raw_sql(

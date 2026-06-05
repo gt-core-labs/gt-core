@@ -14,6 +14,11 @@ version.workspace = true
 gt-module = { workspace = true }
 gt-module-mcp = { workspace = true }
 gt-store-dolt = { workspace = true }
+# Issue-mutation events for the SSE feed (hq-issues-sse): `IssueEvent` implements
+# `gt_events::EventKind` so the composition root's event-log-backed sink can append it
+# to the per-workspace log the `GET /stream` feed fans out. Always on — both the MCP
+# dispatch and the REST adapter emit, so it is not behind the `axum` feature.
+gt-events = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
 schemars = { workspace = true }

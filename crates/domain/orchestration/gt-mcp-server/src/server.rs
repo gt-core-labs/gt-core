@@ -13,6 +13,7 @@ use std::sync::Arc;
 
 use gt_audit::{AuditRecord, AuditSink};
 use gt_auth::Authenticator;
+use gt_issues::IssueEventSink;
 use gt_module::McpTool;
 use gt_rbac::{RbacConfig, Scope};
 use gt_store_dolt::{AppError, DoltIssues};
@@ -100,6 +101,12 @@ pub struct IssuesServer {
     /// `gt://issue/{id}` then inlines a `documents` array, and `gt://doc/{id}` resolves a
     /// single document. `None` keeps the issues-only resource surface unchanged.
     documents: Option<Arc<dyn DocumentsResource>>,
+    /// SSE-feed event sink for `issues.*` mutations (`hq-issues-sse`). `Some` when the
+    /// composition root wires the event-log-backed sink: a successful `issues.*.execute`
+    /// over MCP then appears on `GET /stream?channel=issues` — the agent-driven
+    /// natural-movement source the REST surface alone would miss. `None` emits nothing,
+    /// so the issues-only build is unchanged.
+    issue_sink: Option<Arc<dyn IssueEventSink>>,
 }
 
 impl IssuesServer {
@@ -134,7 +141,17 @@ impl IssuesServer {
             rig_prefixes: None,
             workspace_status: None,
             documents: None,
+            issue_sink: None,
         }
+    }
+
+    /// Wire the SSE-feed event sink (`hq-issues-sse`): every successful `issues.*.execute`
+    /// then publishes its [`IssueEvent`](gt_issues::IssueEvent) to `sink`, keyed to the
+    /// resolved tenant, so an agent moving a bead over MCP shows up on
+    /// `GET /stream?channel=issues`. Additive — without it the MCP path emits nothing.
+    pub fn with_issue_sink(mut self, sink: Arc<dyn IssueEventSink>) -> Self {
+        self.issue_sink = Some(sink);
+        self
     }
 
     /// Wire the per-workspace document reader (hq-docs-api.3): `gt://issue/{id}` then inlines
@@ -150,7 +167,10 @@ impl IssuesServer {
     /// claim is the authoritative tenant (an `X-Workspace` header naming a different
     /// tenant is rejected) and its workspace-role scopes drive the per-tool check.
     /// Additive — without it the server keeps the `X-Actor`/`X-Workspace` behaviour.
-    pub fn with_authenticator(mut self, authenticator: Arc<dyn Authenticator + Send + Sync>) -> Self {
+    pub fn with_authenticator(
+        mut self,
+        authenticator: Arc<dyn Authenticator + Send + Sync>,
+    ) -> Self {
         self.authenticator = Some(authenticator);
         self
     }
@@ -360,8 +380,14 @@ impl IssuesServer {
             return Ok(None);
         };
         // A credential is mandatory in JWT mode: Authorization: Bearer, or the gt_web_token cookie.
-        let token = token_from_ext(ext)
-            .ok_or_else(|| self.deny(op, args, "<anonymous>", "missing bearer token or gt_web_token cookie"))?;
+        let token = token_from_ext(ext).ok_or_else(|| {
+            self.deny(
+                op,
+                args,
+                "<anonymous>",
+                "missing bearer token or gt_web_token cookie",
+            )
+        })?;
         let claims = auth
             .authenticate(token)
             .map_err(|e| self.deny(op, args, "<unverified>", &e.to_string()))?;
@@ -446,11 +472,7 @@ impl ServerHandler for IssuesServer {
             .tools
             .iter()
             .map(|t| {
-                let schema = t
-                    .input_schema
-                    .as_object()
-                    .cloned()
-                    .unwrap_or_default();
+                let schema = t.input_schema.as_object().cloned().unwrap_or_default();
                 // Advertise the sanitized name (dots → underscores) so an Anthropic
                 // client surfaces the tool; `call_tool` maps it back (hq-mcp-native.1).
                 Tool::new(
@@ -538,6 +560,7 @@ impl ServerHandler for IssuesServer {
                         repo_dir,
                         workspace.as_deref(),
                         self.rig_prefixes.as_deref(),
+                        self.issue_sink.as_deref(),
                     )
                     .await
                 }
@@ -642,7 +665,11 @@ impl ServerHandler for IssuesServer {
         // Resources are tenant data too: run the same JWT/leak gate as a tool call
         // (a token for ws A must not read ws B's resources), then resolve that
         // tenant's store so a read reflects the caller's workspace.
-        let workspace = match self.authenticate_claims(&clean_uri, &serde_json::json!({}), &context.extensions)? {
+        let workspace = match self.authenticate_claims(
+            &clean_uri,
+            &serde_json::json!({}),
+            &context.extensions,
+        )? {
             Some(claims) => Some(claims.workspace),
             None => workspace_from_ext(&context.extensions).map(str::to_string),
         };
@@ -719,7 +746,9 @@ impl IssuesServer {
                     gt_issues::resources::filter_ready(rows, open_phase, &deps, tree.as_ref());
                 // hq-mcp-output-format: the frontier is list-heavy too — honour tsv.
                 if format == OutputFormat::Tsv {
-                    return Ok(ResourcePayload::Text(gt_issues::resources::rows_to_tsv(&rows)));
+                    return Ok(ResourcePayload::Text(gt_issues::resources::rows_to_tsv(
+                        &rows,
+                    )));
                 }
                 return serde_json::to_value(&rows)
                     .map(ResourcePayload::Json)
@@ -731,7 +760,9 @@ impl IssuesServer {
             let page = gt_issues::resources::read_issues_page(store, &filter).await?;
             // hq-mcp-output-format: the dense tabular shape for the largest read.
             if format == OutputFormat::Tsv {
-                return Ok(ResourcePayload::Text(gt_issues::resources::page_to_tsv(&page)));
+                return Ok(ResourcePayload::Text(gt_issues::resources::page_to_tsv(
+                    &page,
+                )));
             }
             return serde_json::to_value(&page)
                 .map(ResourcePayload::Json)
@@ -847,7 +878,9 @@ fn bearer_from_ext(ext: &Extensions) -> Option<&str> {
         .get::<axum::http::request::Parts>()
         .and_then(|p| p.headers.get(axum::http::header::AUTHORIZATION))
         .and_then(|v| v.to_str().ok())?;
-    let token = raw.strip_prefix("Bearer ").or_else(|| raw.strip_prefix("bearer "))?;
+    let token = raw
+        .strip_prefix("Bearer ")
+        .or_else(|| raw.strip_prefix("bearer "))?;
     let token = token.trim();
     (!token.is_empty()).then_some(token)
 }
@@ -935,8 +968,16 @@ fn is_mutation(tool: &str) -> bool {
     let verb = tool.rsplit('.').next().unwrap_or(tool);
     !matches!(
         verb,
-        "validate" | "list" | "info" | "get" | "status" | "query" | "explain" | "owner"
-            | "prefix" | "read"
+        "validate"
+            | "list"
+            | "info"
+            | "get"
+            | "status"
+            | "query"
+            | "explain"
+            | "owner"
+            | "prefix"
+            | "read"
     )
 }
 
@@ -1045,8 +1086,14 @@ mod tests {
         let ext = ext_with_header("cookie", "foo=bar; gt_web_token=jwt.abc.def ; baz=qux");
         assert_eq!(cookie_token_from_ext(&ext), Some("jwt.abc.def"));
         // Absent cookie ⇒ None; an empty value ⇒ None.
-        assert_eq!(cookie_token_from_ext(&ext_with_header("cookie", "foo=bar")), None);
-        assert_eq!(cookie_token_from_ext(&ext_with_header("cookie", "gt_web_token=")), None);
+        assert_eq!(
+            cookie_token_from_ext(&ext_with_header("cookie", "foo=bar")),
+            None
+        );
+        assert_eq!(
+            cookie_token_from_ext(&ext_with_header("cookie", "gt_web_token=")),
+            None
+        );
     }
 
     #[test]
@@ -1072,8 +1119,14 @@ mod tests {
     /// the Anthropic function-name charset `^[a-zA-Z0-9_-]+$`.
     #[test]
     fn sanitize_replaces_dots_keeps_dashes() {
-        assert_eq!(sanitize_tool_name("issues.create.execute"), "issues_create_execute");
-        assert_eq!(sanitize_tool_name("meta.report-gap.execute"), "meta_report-gap_execute");
+        assert_eq!(
+            sanitize_tool_name("issues.create.execute"),
+            "issues_create_execute"
+        );
+        assert_eq!(
+            sanitize_tool_name("meta.report-gap.execute"),
+            "meta_report-gap_execute"
+        );
         // No dots ⇒ unchanged (a domain tool already underscore-free stays put).
         assert_eq!(sanitize_tool_name("workspace_list"), "workspace_list");
     }
@@ -1117,16 +1170,23 @@ mod tests {
             Scope::admin("boot"),
             None,
             Arc::new(InMemoryAudit::new()),
-            vec![tool("issues.create.execute"), tool("meta.report-gap.execute")],
+            vec![
+                tool("issues.create.execute"),
+                tool("meta.report-gap.execute"),
+            ],
             None,
         );
         assert_eq!(
-            srv.tool_aliases.get("issues_create_execute").map(String::as_str),
+            srv.tool_aliases
+                .get("issues_create_execute")
+                .map(String::as_str),
             Some("issues.create.execute"),
             "sanitized name maps back to the canonical dotted name"
         );
         assert_eq!(
-            srv.tool_aliases.get("meta_report-gap_execute").map(String::as_str),
+            srv.tool_aliases
+                .get("meta_report-gap_execute")
+                .map(String::as_str),
             Some("meta.report-gap.execute")
         );
         // A name never advertised (canonical dotted, or a domain tool) is absent, so
@@ -1209,7 +1269,10 @@ mod tests {
 
     #[test]
     fn trims_and_rejects_blank() {
-        assert_eq!(actor_from_ext(&ext_with_header("x-actor", "  bob ")), Some("bob"));
+        assert_eq!(
+            actor_from_ext(&ext_with_header("x-actor", "  bob ")),
+            Some("bob")
+        );
         assert_eq!(actor_from_ext(&ext_with_header("x-actor", "   ")), None);
     }
 
@@ -1355,30 +1418,50 @@ validate_only = true
     #[test]
     fn jwt_token_bound_to_its_workspace_blocks_cross_tenant() {
         let audit = Arc::new(InMemoryAudit::new());
-        let auth = InMemoryAuthenticator::new().with_token("tokA", token("agent-a", "acme", WORKSPACE_ADMIN));
+        let auth = InMemoryAuthenticator::new()
+            .with_token("tokA", token("agent-a", "acme", WORKSPACE_ADMIN));
         let srv = auth_server(auth, audit.clone());
 
         // Operating its own workspace: authorized, scope from the claim, tenant = acme.
         let (scope, ws) = srv
-            .authorize("issues.close.execute", &json!({}), &ext_bearer("tokA", Some("acme")))
+            .authorize(
+                "issues.close.execute",
+                &json!({}),
+                &ext_bearer("tokA", Some("acme")),
+            )
             .expect("a token operating its own workspace is allowed");
         assert_eq!(scope.actor, "agent-a", "attribution is the token subject");
-        assert_eq!(ws.as_deref(), Some("acme"), "tenant resolved from the claim");
+        assert_eq!(
+            ws.as_deref(),
+            Some("acme"),
+            "tenant resolved from the claim"
+        );
 
         // Cross-workspace: X-Workspace=beta with an acme token — the leak gate fires.
         let err = srv
-            .authorize("issues.close.execute", &json!({}), &ext_bearer("tokA", Some("beta")))
+            .authorize(
+                "issues.close.execute",
+                &json!({}),
+                &ext_bearer("tokA", Some("beta")),
+            )
             .expect_err("a token for acme must not operate beta");
         assert_eq!(err.code, ErrorCode::INVALID_REQUEST);
 
         // No X-Workspace header: pinned to the claim's workspace, never a header.
         let (_s, ws) = srv
-            .authorize("issues.close.execute", &json!({}), &ext_bearer("tokA", None))
+            .authorize(
+                "issues.close.execute",
+                &json!({}),
+                &ext_bearer("tokA", None),
+            )
             .expect("an absent header pins to the claim");
         assert_eq!(ws.as_deref(), Some("acme"));
 
         let rows = audit.read_all().unwrap();
-        let denials = rows.iter().filter(|r| r.outcome == Outcome::Unauthorized).count();
+        let denials = rows
+            .iter()
+            .filter(|r| r.outcome == Outcome::Unauthorized)
+            .count();
         assert_eq!(denials, 1, "only the cross-tenant attempt is audited");
         assert_eq!(rows[0].actor, "agent-a");
     }
@@ -1388,7 +1471,8 @@ validate_only = true
     #[test]
     fn jwt_missing_or_unverifiable_token_is_denied() {
         let audit = Arc::new(InMemoryAudit::new());
-        let auth = InMemoryAuthenticator::new().with_token("good", token("a", "acme", WORKSPACE_ADMIN));
+        let auth =
+            InMemoryAuthenticator::new().with_token("good", token("a", "acme", WORKSPACE_ADMIN));
         let srv = auth_server(auth, audit.clone());
 
         let no_token = srv
@@ -1401,7 +1485,11 @@ validate_only = true
             .expect_err("an unverifiable token is denied");
         assert_eq!(bad_token.code, ErrorCode::INVALID_REQUEST);
 
-        assert_eq!(audit.read_all().unwrap().len(), 2, "both failures are audited");
+        assert_eq!(
+            audit.read_all().unwrap().len(),
+            2,
+            "both failures are audited"
+        );
     }
 
     /// An expired token is rejected by the claim's semantic gate.
@@ -1430,14 +1518,23 @@ validate_only = true
     #[test]
     fn jwt_member_role_cannot_create_a_workspace() {
         let audit = Arc::new(InMemoryAudit::new());
-        let auth = InMemoryAuthenticator::new().with_token("mem", token("m", "acme", WORKSPACE_MEMBER));
+        let auth =
+            InMemoryAuthenticator::new().with_token("mem", token("m", "acme", WORKSPACE_MEMBER));
         let srv = auth_server(auth, audit.clone());
 
-        srv.authorize("issues.close.execute", &json!({}), &ext_bearer("mem", Some("acme")))
-            .expect("a member operates the issue tools");
+        srv.authorize(
+            "issues.close.execute",
+            &json!({}),
+            &ext_bearer("mem", Some("acme")),
+        )
+        .expect("a member operates the issue tools");
 
         let err = srv
-            .authorize("workspace.create", &json!({}), &ext_bearer("mem", Some("acme")))
+            .authorize(
+                "workspace.create",
+                &json!({}),
+                &ext_bearer("mem", Some("acme")),
+            )
             .expect_err("a member cannot provision a tenant");
         assert_eq!(err.code, ErrorCode::INVALID_REQUEST);
 
@@ -1468,7 +1565,10 @@ validate_only = true
 
         let rows = audit.read_all().unwrap();
         assert_eq!(rows[0].workspace_id, "globex", "header tenant attributed");
-        assert_eq!(rows[1].workspace_id, "default", "no header falls back to default");
+        assert_eq!(
+            rows[1].workspace_id, "default",
+            "no header falls back to default"
+        );
     }
 
     // ----- hq-mt-bootstrap.8: the suspend/archive enforcement gate -------------
@@ -1511,7 +1611,10 @@ validate_only = true
         }
         // The two exceptions the verb rule alone would misclassify.
         assert!(!is_mutation("meta.help.execute"), "help is a pure read");
-        assert!(!is_mutation("workspace.resume"), "resume is the recovery exception");
+        assert!(
+            !is_mutation("workspace.resume"),
+            "resume is the recovery exception"
+        );
     }
 
     /// Stub gate: maps a fixed set of slugs to a status; anything else is unknown.
@@ -1542,19 +1645,32 @@ validate_only = true
         let srv = gated_server(audit.clone());
 
         let err = srv
-            .enforce_workspace_active("issues.create.execute", &json!({}), &Scope::admin("boot"), Some("paused"))
+            .enforce_workspace_active(
+                "issues.create.execute",
+                &json!({}),
+                &Scope::admin("boot"),
+                Some("paused"),
+            )
             .await
             .expect_err("a suspended tenant rejects mutations");
         assert_eq!(err.code, ErrorCode::INVALID_REQUEST);
 
-        srv.enforce_workspace_active("workspace.create", &json!({}), &Scope::admin("boot"), Some("dead"))
-            .await
-            .expect_err("an archived tenant rejects mutations");
+        srv.enforce_workspace_active(
+            "workspace.create",
+            &json!({}),
+            &Scope::admin("boot"),
+            Some("dead"),
+        )
+        .await
+        .expect_err("an archived tenant rejects mutations");
 
         let rows = audit.read_all().unwrap();
         assert_eq!(rows.len(), 2, "each block is one Unauthorized row");
         assert!(rows.iter().all(|r| r.outcome == Outcome::Unauthorized));
-        assert_eq!(rows[0].workspace_id, "paused", "attributed to the resolved tenant");
+        assert_eq!(
+            rows[0].workspace_id, "paused",
+            "attributed to the resolved tenant"
+        );
         assert_eq!(rows[1].workspace_id, "dead");
     }
 
@@ -1565,12 +1681,20 @@ validate_only = true
         let srv = gated_server(audit.clone());
         let boot = Scope::admin("boot");
 
-        for tool in ["issues.create.validate", "workspace.list", "workspace.info", "workspace.resume"] {
+        for tool in [
+            "issues.create.validate",
+            "workspace.list",
+            "workspace.info",
+            "workspace.resume",
+        ] {
             srv.enforce_workspace_active(tool, &json!({}), &boot, Some("paused"))
                 .await
                 .unwrap_or_else(|_| panic!("{tool} must pass on a suspended workspace"));
         }
-        assert!(audit.read_all().unwrap().is_empty(), "a pass audits nothing");
+        assert!(
+            audit.read_all().unwrap().is_empty(),
+            "a pass audits nothing"
+        );
     }
 
     /// A mutation on an active workspace passes; an unknown slug passes (the gate only
@@ -1597,14 +1721,24 @@ validate_only = true
         // No gate: even a mutation with a workspace passes.
         let ungated = server(Scope::admin("boot"), None, audit.clone());
         ungated
-            .enforce_workspace_active("issues.create.execute", &json!({}), &Scope::admin("boot"), Some("paused"))
+            .enforce_workspace_active(
+                "issues.create.execute",
+                &json!({}),
+                &Scope::admin("boot"),
+                Some("paused"),
+            )
             .await
             .expect("no gate wired ⇒ accept-all");
         // Gate wired but no resolved workspace (default tenant) ⇒ pass.
         let srv = gated_server(audit.clone());
-        srv.enforce_workspace_active("issues.create.execute", &json!({}), &Scope::admin("boot"), None)
-            .await
-            .expect("no resolved workspace ⇒ the default tenant, ungoverned");
+        srv.enforce_workspace_active(
+            "issues.create.execute",
+            &json!({}),
+            &Scope::admin("boot"),
+            None,
+        )
+        .await
+        .expect("no resolved workspace ⇒ the default tenant, ungoverned");
         assert!(audit.read_all().unwrap().is_empty());
     }
 
@@ -1625,10 +1759,18 @@ validate_only = true
     struct FieldVisitor<'a>(&'a Captured);
     impl Visit for FieldVisitor<'_> {
         fn record_str(&mut self, field: &Field, value: &str) {
-            self.0 .0.lock().unwrap().push((field.name().into(), value.into()));
+            self.0
+                 .0
+                .lock()
+                .unwrap()
+                .push((field.name().into(), value.into()));
         }
         fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
-            self.0 .0.lock().unwrap().push((field.name().into(), format!("{value:?}")));
+            self.0
+                 .0
+                .lock()
+                .unwrap()
+                .push((field.name().into(), format!("{value:?}")));
         }
     }
 
@@ -1657,11 +1799,15 @@ validate_only = true
     fn call_span_records_resolved_workspace_id() {
         let fields = fields_for("workspace.list", Some("acme"));
         assert!(
-            fields.iter().any(|(k, v)| k == "workspace.id" && v == "acme"),
+            fields
+                .iter()
+                .any(|(k, v)| k == "workspace.id" && v == "acme"),
             "span must carry workspace.id=acme, got {fields:?}"
         );
         assert!(
-            fields.iter().any(|(k, v)| k == "tool" && v.contains("workspace.list")),
+            fields
+                .iter()
+                .any(|(k, v)| k == "tool" && v.contains("workspace.list")),
             "span must carry the tool name, got {fields:?}"
         );
     }
@@ -1671,7 +1817,9 @@ validate_only = true
         let fields = fields_for("issues.list.execute", None);
         // No tenant resolved ⇒ workspace.id is never recorded with a value.
         assert!(
-            !fields.iter().any(|(k, v)| k == "workspace.id" && !v.is_empty()),
+            !fields
+                .iter()
+                .any(|(k, v)| k == "workspace.id" && !v.is_empty()),
             "workspace.id must stay empty without a resolved tenant, got {fields:?}"
         );
     }

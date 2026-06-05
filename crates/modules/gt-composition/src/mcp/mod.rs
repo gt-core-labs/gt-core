@@ -36,7 +36,7 @@ pub use agent::AgentHandler;
 pub use audit::AuditHandler;
 pub use convoy::ConvoyHandler;
 pub use documents::{DocumentsHandler, PgDocumentsResource};
-pub use eventlog::EventLog;
+pub use eventlog::{EventLog, EventLogIssueSink};
 pub use graph::GraphHandler;
 pub use merge::MergeHandler;
 pub use pools::WsPools;

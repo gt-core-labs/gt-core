@@ -18,12 +18,14 @@
 //! a stronger guarantee is a follow-up when multiple writers share a log.
 
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use serde::de::DeserializeOwned;
 use serde::Serialize;
 
 use gt_eventlog::{replay, EventRecord, EventStore, JsonlWriter, DEFAULT_EVENTLOG_ROOT};
 use gt_events::{Envelope, EventKind};
+use gt_issues::{IssueEvent, IssueEventSink};
 use gt_store_dolt::AppError;
 
 use super::util::ev_err;
@@ -122,5 +124,80 @@ impl EventLog {
         }
         let start = records.len().saturating_sub(limit);
         Ok(records[start..].to_vec())
+    }
+}
+
+/// The composition-root [`IssueEventSink`] for the issues tracker (`hq-issues-sse`).
+///
+/// The issues tracker is Dolt-backed, not event-sourced, so its mutations never
+/// reached the per-workspace event log the `GET /stream` SSE feed fans out — a
+/// frontend never saw the tracker move without polling. This sink closes that gap:
+/// it appends every issue mutation's [`IssueEvent`] to that same log (the exact handle
+/// the feed streams from), so a `create`/`update`/`transition`/`close`/`claim` — over
+/// REST **or** MCP — surfaces on `GET /stream?channel=issues`, keyed to the mutation's
+/// workspace.
+///
+/// Best-effort by the [`IssueEventSink`] contract: a mutation has already committed by
+/// the time this emits, so an append failure is swallowed (the log layer records its
+/// own diagnostics) and never surfaces to the caller.
+pub struct EventLogIssueSink {
+    log: Arc<EventLog>,
+}
+
+impl EventLogIssueSink {
+    /// Back the sink with the shared per-workspace event log — the same handle the SSE
+    /// feed reads, so an emitted event is immediately visible to a live subscriber.
+    pub fn new(log: Arc<EventLog>) -> Self {
+        Self { log }
+    }
+}
+
+impl IssueEventSink for EventLogIssueSink {
+    fn emit(&self, workspace: Option<&str>, event: &IssueEvent) {
+        // Best-effort: a feed append must never undo the mutation that already
+        // committed, so a failure is swallowed rather than propagated.
+        let _ = self.log.append(workspace, event.clone());
+    }
+}
+
+#[cfg(test)]
+mod issue_sink_tests {
+    use super::*;
+    use gt_issues::IssueVerb;
+    use tempfile::TempDir;
+
+    /// An emitted issue event lands in the workspace log under a channel-routable
+    /// `issues.*` kind — exactly what `read_since(ws, Some("issues"), …)` (the SSE feed)
+    /// reads — and stays isolated to the mutation's tenant.
+    #[test]
+    fn emit_appends_a_channel_routable_issues_event_per_workspace() {
+        let dir = TempDir::new().unwrap();
+        let log = Arc::new(EventLog::new(Some(dir.path().to_path_buf())));
+        let sink = EventLogIssueSink::new(log.clone());
+
+        sink.emit(
+            Some("acme"),
+            &IssueEvent {
+                verb: IssueVerb::Transitioned,
+                id: "hq-x.1".into(),
+                actor: "mcp-local".into(),
+                issue: Some(serde_json::json!({ "id": "hq-x.1", "status": "working" })),
+            },
+        );
+
+        // The feed reads it back through the `issues` channel filter.
+        let on_channel = log
+            .read_since(Some("acme"), Some("issues"), None, 256)
+            .unwrap();
+        assert_eq!(on_channel.len(), 1);
+        assert_eq!(on_channel[0].kind, "issues.transitioned.v1");
+        assert_eq!(on_channel[0].payload["id"], "hq-x.1");
+        assert_eq!(on_channel[0].payload["issue"]["status"], "working");
+
+        // Another tenant's feed never sees it (path-partitioned isolation).
+        let other = log
+            .read_since(Some("beta"), Some("issues"), None, 256)
+            .unwrap();
+        assert!(other.is_empty());
     }
 }

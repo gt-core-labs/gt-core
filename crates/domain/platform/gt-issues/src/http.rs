@@ -42,6 +42,7 @@ use gt_store_dolt::{
 use gt_workspace::WorkspaceContext;
 
 use crate::commands::{ClaimIssue, CloseIssue, CreateIssue, TransitionIssue, UpdateIssue};
+use crate::events::{emit_issue_event, IssueEventSink, IssueVerb};
 use crate::handlers::{
     run_claim_issue, run_close_issue, run_create_issue, run_transition_issue, run_update_issue,
 };
@@ -69,6 +70,12 @@ pub struct IssuesApiState {
     /// path uses `GT_MCP_ACTOR`. It is the server identity, not the per-request caller, so a
     /// request body can never spoof it.
     actor: Arc<str>,
+    /// The SSE-feed sink every successful mutation publishes its [`IssueEvent`](crate::events::IssueEvent)
+    /// to (`hq-issues-sse`). `Some` when the composition root wires the event-log-backed sink:
+    /// a create/update/transition/close/claim then appears on `GET /stream?channel=issues`
+    /// keyed to the request's workspace. `None` keeps the REST surface emit-free (no feed), so a
+    /// build that wires no event log behaves exactly as before.
+    event_sink: Option<Arc<dyn IssueEventSink>>,
 }
 
 impl IssuesApiState {
@@ -76,7 +83,12 @@ impl IssuesApiState {
     /// Single-tenant by default; call [`with_workspaces`](Self::with_workspaces) to enable
     /// per-request tenant routing.
     pub fn new(store: Arc<DoltIssues>, actor: impl Into<Arc<str>>) -> Self {
-        Self { store, workspaces: None, actor: actor.into() }
+        Self {
+            store,
+            workspaces: None,
+            actor: actor.into(),
+            event_sink: None,
+        }
     }
 
     /// Enable multi-tenant routing: each request resolves its tenant's `hq_<ws>` store from the
@@ -84,6 +96,15 @@ impl IssuesApiState {
     /// fallback `store` for every caller.
     pub fn with_workspaces(mut self, pools: Arc<WorkspacePools>) -> Self {
         self.workspaces = Some(pools);
+        self
+    }
+
+    /// Wire the SSE-feed event sink (`hq-issues-sse`): every successful mutation then publishes
+    /// its [`IssueEvent`](crate::events::IssueEvent) to `sink`, keyed to the request's workspace,
+    /// so a frontend sees the tracker move on `GET /stream?channel=issues` without polling.
+    /// Additive — without it the REST surface emits nothing, exactly as before.
+    pub fn with_event_sink(mut self, sink: Arc<dyn IssueEventSink>) -> Self {
+        self.event_sink = Some(sink);
         self
     }
 
@@ -95,9 +116,9 @@ impl IssuesApiState {
     /// `store`, ignoring the workspace exactly as the pre-routing behaviour did.
     async fn resolve(&self, ctx: &WorkspaceContext) -> Result<Arc<DoltIssues>, AppError> {
         match &self.workspaces {
-            Some(pools) => {
-                Ok(Arc::new(DoltIssues::new(pools.ensured_pool(ctx.workspace().as_str()).await?)))
-            }
+            Some(pools) => Ok(Arc::new(DoltIssues::new(
+                pools.ensured_pool(ctx.workspace().as_str()).await?,
+            ))),
             None => Ok(self.store.clone()),
         }
     }
@@ -165,7 +186,12 @@ impl ListQuery {
         IssueFilter {
             status: self
                 .status
-                .map(|s| s.split(',').filter(|p| !p.is_empty()).map(str::to_string).collect())
+                .map(|s| {
+                    s.split(',')
+                        .filter(|p| !p.is_empty())
+                        .map(str::to_string)
+                        .collect()
+                })
                 .unwrap_or_default(),
             priority_max: self.priority_max,
             assignee: self.assignee,
@@ -266,7 +292,12 @@ async fn issue_stats(
     let filter = IssueFilter {
         status: q
             .status
-            .map(|s| s.split(',').filter(|p| !p.is_empty()).map(str::to_string).collect())
+            .map(|s| {
+                s.split(',')
+                    .filter(|p| !p.is_empty())
+                    .map(str::to_string)
+                    .collect()
+            })
             .unwrap_or_default(),
         priority_max: q.priority_max,
         assignee: q.assignee,
@@ -319,7 +350,20 @@ async fn create_issue(
 ) -> Result<Response, ApiError> {
     let store = st.resolve(&ctx).await?;
     run_create_issue(&store, &args, &AllowAllTree, false).await?;
-    Ok((StatusCode::CREATED, Json(json!({ "ok": true, "id": args.id }))).into_response())
+    emit_issue_event(
+        st.event_sink.as_deref(),
+        &store,
+        Some(ctx.workspace().as_str()),
+        IssueVerb::Created,
+        &args.id,
+        st.actor.as_ref(),
+    )
+    .await;
+    Ok((
+        StatusCode::CREATED,
+        Json(json!({ "ok": true, "id": args.id })),
+    )
+        .into_response())
 }
 
 /// `PATCH /:id` — patch editable fields (`issues.update.execute`). The id always comes from the
@@ -342,6 +386,15 @@ async fn update_issue(
     let store = st.resolve(&ctx).await?;
     let args: UpdateIssue = with_path_id(body, id)?;
     let version = run_update_issue(&store, &args, &AllowAllTree, false).await?;
+    emit_issue_event(
+        st.event_sink.as_deref(),
+        &store,
+        Some(ctx.workspace().as_str()),
+        IssueVerb::Updated,
+        &args.id,
+        st.actor.as_ref(),
+    )
+    .await;
     let mut body = json!({ "ok": true });
     if let Some(v) = version {
         body["version"] = json!(v);
@@ -369,6 +422,15 @@ async fn transition_issue(
     let store = st.resolve(&ctx).await?;
     let args: TransitionIssue = with_path_id(body, id)?;
     run_transition_issue(&store, &args, false).await?;
+    emit_issue_event(
+        st.event_sink.as_deref(),
+        &store,
+        Some(ctx.workspace().as_str()),
+        IssueVerb::Transitioned,
+        &args.id,
+        st.actor.as_ref(),
+    )
+    .await;
     Ok(Json(json!({ "ok": true })))
 }
 
@@ -394,6 +456,15 @@ async fn close_issue(
     let store = st.resolve(&ctx).await?;
     let args: CloseIssue = with_path_id(body, id)?;
     run_close_issue(&store, &args, &st.actor, None, false).await?;
+    emit_issue_event(
+        st.event_sink.as_deref(),
+        &store,
+        Some(ctx.workspace().as_str()),
+        IssueVerb::Closed,
+        &args.id,
+        st.actor.as_ref(),
+    )
+    .await;
     Ok(Json(json!({ "ok": true })))
 }
 
@@ -421,6 +492,17 @@ async fn claim_issue(
     let res = run_claim_issue(&store, &args, &st.actor, false).await?;
     match res.outcome {
         ClaimOutcome::Won => {
+            // Only a won claim mutated the row — a lost claim left it untouched, so it
+            // emits no event.
+            emit_issue_event(
+                st.event_sink.as_deref(),
+                &store,
+                Some(ctx.workspace().as_str()),
+                IssueVerb::Claimed,
+                &args.id,
+                st.actor.as_ref(),
+            )
+            .await;
             let mut body = json!({ "outcome": "won", "owner": st.actor.as_ref() });
             if let Some(v) = res.version {
                 body["version"] = json!(v);
@@ -463,7 +545,7 @@ async fn claim_issue(
         crate::stats::StatBucket,
         crate::stats::LeadTime,
         GroupDim,
-    )),
+    ))
 )]
 pub struct ApiDoc;
 
@@ -471,7 +553,10 @@ pub struct ApiDoc;
 /// never trusted from the payload (docs/03 Rule 6). The path id overwrites any `id` in the body
 /// and supplies it when absent, so a REST client need not repeat the id it already named in the
 /// URL. A malformed body surfaces as a `422` (validation), matching the MCP `parse_args` path.
-fn with_path_id<T: serde::de::DeserializeOwned>(mut body: Value, id: String) -> Result<T, ApiError> {
+fn with_path_id<T: serde::de::DeserializeOwned>(
+    mut body: Value,
+    id: String,
+) -> Result<T, ApiError> {
     match &mut body {
         Value::Object(map) => {
             map.insert("id".to_string(), Value::String(id));
@@ -517,7 +602,14 @@ mod tests {
         // rewrite them. Every declared route must be present so the combined document is complete.
         let doc = ApiDoc::openapi();
         let paths: Vec<&str> = doc.paths.paths.keys().map(String::as_str).collect();
-        for expected in ["/", "/stats", "/{id}", "/{id}/transition", "/{id}/close", "/{id}/claim"] {
+        for expected in [
+            "/",
+            "/stats",
+            "/{id}",
+            "/{id}/transition",
+            "/{id}/close",
+            "/{id}/claim",
+        ] {
             assert!(paths.contains(&expected), "missing {expected} in {paths:?}");
         }
         // Prefix-free: the module builder, not the annotation, owns `/api/v1/issues`.
@@ -545,7 +637,11 @@ mod tests {
     #[test]
     fn empty_status_yields_no_status_filter() {
         // A bare `?status=` (or absent) must not become a `[""]` filter that matches nothing.
-        let f = ListQuery { status: Some(String::new()), ..Default::default() }.into_filter();
+        let f = ListQuery {
+            status: Some(String::new()),
+            ..Default::default()
+        }
+        .into_filter();
         assert!(f.status.is_empty());
         assert!(ListQuery::default().into_filter().status.is_empty());
     }
@@ -554,10 +650,22 @@ mod tests {
     fn error_status_mapping_matches_app_error_kinds() {
         let cases = [
             (AppError::NotFound("x".into()), StatusCode::NOT_FOUND),
-            (AppError::Validation("x".into()), StatusCode::UNPROCESSABLE_ENTITY),
-            (AppError::InvalidTransition("x".into()), StatusCode::CONFLICT),
-            (AppError::Handler("x".into()), StatusCode::INTERNAL_SERVER_ERROR),
-            (AppError::Other("x".into()), StatusCode::INTERNAL_SERVER_ERROR),
+            (
+                AppError::Validation("x".into()),
+                StatusCode::UNPROCESSABLE_ENTITY,
+            ),
+            (
+                AppError::InvalidTransition("x".into()),
+                StatusCode::CONFLICT,
+            ),
+            (
+                AppError::Handler("x".into()),
+                StatusCode::INTERNAL_SERVER_ERROR,
+            ),
+            (
+                AppError::Other("x".into()),
+                StatusCode::INTERNAL_SERVER_ERROR,
+            ),
         ];
         for (err, want) in cases {
             assert_eq!(ApiError(err).into_response().status(), want);
