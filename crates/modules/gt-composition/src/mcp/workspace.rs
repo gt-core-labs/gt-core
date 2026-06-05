@@ -67,6 +67,15 @@ impl WorkspaceHandler {
     fn users(&self) -> gt_auth::PgUsers {
         gt_auth::PgUsers::new(self.pool.clone(), "default")
     }
+
+    /// The GLOBAL OAuth/OIDC provider store over the shared pool, backing the system-admin
+    /// provider tools (hq-idp-db.4). CRUD writes the `public.oauth_providers` table, sealing the
+    /// client secret at rest; the slug is irrelevant (providers are deploy-global). Behind the
+    /// `oauth` feature (the provider store + secret crypto).
+    #[cfg(feature = "oauth")]
+    fn providers(&self) -> gt_auth::PgProviderRepo {
+        gt_auth::PgProviderRepo::new(self.pool.clone())
+    }
 }
 
 #[async_trait]
@@ -76,7 +85,8 @@ impl DomainHandler for WorkspaceHandler {
     }
 
     fn descriptors(&self) -> Vec<McpTool> {
-        vec![
+        #[allow(unused_mut)]
+        let mut tools = vec![
             descriptor(
                 "workspace.create",
                 "Provision a new workspace (tenant) in the catalog.",
@@ -112,7 +122,36 @@ impl DomainHandler for WorkspaceHandler {
                 "Remove a user (by email) from a workspace.",
                 &[req("id", "string"), req("email", "string")],
             ),
-        ]
+        ];
+        // OAuth/OIDC provider administration (hq-idp-db.4): a SYSTEM admin manages the GLOBAL login
+        // providers. Reserved for `*`/admin by the scope gate (absent from the member preset), the
+        // same shape as the membership tools. The REST sibling lives on `/auth/providers`, so the
+        // MCP↔HTTP parity test exempts these tools. The `client_secret` is write-only — accepted on
+        // create/update, sealed at rest, and never in any read/list output.
+        #[cfg(feature = "oauth")]
+        tools.extend([
+            descriptor(
+                "workspace.provider-list",
+                "List the GLOBAL OAuth/OIDC login providers (never the client secret).",
+                &[],
+            ),
+            descriptor(
+                "workspace.provider-create",
+                "Register a GLOBAL OAuth/OIDC login provider (secret write-only, sealed at rest).",
+                &[req("id", "string"), req("kind", "string"), req("client_id", "string"), req("client_secret", "string")],
+            ),
+            descriptor(
+                "workspace.provider-update",
+                "Update a GLOBAL OAuth/OIDC provider (toggle enabled, rotate secret, edit endpoints).",
+                &[req("id", "string")],
+            ),
+            descriptor(
+                "workspace.provider-delete",
+                "Delete a GLOBAL OAuth/OIDC login provider.",
+                &[req("id", "string")],
+            ),
+        ]);
+        tools
     }
 
     async fn dispatch(&self, tool: &str, ctx: DomainCtx<'_>) -> Result<Value, AppError> {
@@ -244,8 +283,133 @@ impl DomainHandler for WorkspaceHandler {
                 }
                 Ok(json!({ "ok": true, "id": id.as_str(), "email": email }))
             }
+            #[cfg(feature = "oauth")]
+            "workspace.provider-list" => {
+                // System-admin read of the GLOBAL providers. The scope gate already reserved this
+                // for `*`/admin. The projection drops every secret — only `provider_view` fields.
+                let records = gt_auth::ProviderRepo::list(&self.providers())
+                    .await
+                    .map_err(provider_err)?;
+                Ok(json!({
+                    "providers": records.iter().map(provider_view).collect::<Vec<_>>(),
+                }))
+            }
+            #[cfg(feature = "oauth")]
+            "workspace.provider-create" => {
+                let new = new_provider_from_args(&ctx.args)?;
+                let stored = gt_auth::ProviderRepo::create(&self.providers(), new)
+                    .await
+                    .map_err(provider_err)?;
+                Ok(provider_view(&stored))
+            }
+            #[cfg(feature = "oauth")]
+            "workspace.provider-update" => {
+                let id = str_arg(&ctx.args, "id")?.to_string();
+                let patch = patch_provider_from_args(&ctx.args);
+                match gt_auth::ProviderRepo::patch(&self.providers(), &id, patch)
+                    .await
+                    .map_err(provider_err)?
+                {
+                    Some(updated) => Ok(provider_view(&updated)),
+                    None => Err(AppError::NotFound(format!("provider {id}"))),
+                }
+            }
+            #[cfg(feature = "oauth")]
+            "workspace.provider-delete" => {
+                let id = str_arg(&ctx.args, "id")?.to_string();
+                let removed = gt_auth::ProviderRepo::delete(&self.providers(), &id)
+                    .await
+                    .map_err(provider_err)?;
+                if !removed {
+                    return Err(AppError::NotFound(format!("provider {id}")));
+                }
+                Ok(json!({ "ok": true, "id": id }))
+            }
             other => Err(AppError::Validation(format!("unknown tool `{other}`"))),
         }
+    }
+}
+
+/// Project a [`ProviderRecord`](gt_auth::ProviderRecord) onto the MCP dispatch payload, OMITTING
+/// the `client_secret` (sealed or plain) — the write-only secret never appears in any read/echo
+/// (hq-idp-db.4), mirroring the REST `ProviderView`.
+#[cfg(feature = "oauth")]
+fn provider_view(r: &gt_auth::ProviderRecord) -> Value {
+    json!({
+        "id": r.id,
+        "kind": r.kind.as_str(),
+        "display_name": r.display_name,
+        "client_id": r.client_id,
+        "issuer": r.issuer,
+        "authorize_endpoint": r.authorize_endpoint,
+        "token_endpoint": r.token_endpoint,
+        "userinfo_endpoint": r.userinfo_endpoint,
+        "scopes": r.scopes,
+        "enabled": r.enabled,
+    })
+}
+
+/// Build a [`NewProvider`](gt_auth::NewProvider) from the `workspace.provider-create` args, filling
+/// a preset kind's baked endpoints/scopes when absent and requiring every endpoint for `generic`.
+/// An unknown kind / a generic provider missing an endpoint is a validation fault.
+#[cfg(feature = "oauth")]
+fn new_provider_from_args(args: &Value) -> Result<gt_auth::NewProvider, AppError> {
+    let kind = gt_auth::OauthProviderKind::parse(str_arg(args, "kind")?)
+        .map_err(|e| AppError::Validation(e.to_string()))?;
+    let preset = gt_auth::preset_for(kind);
+    let opt = |key: &str| args.get(key).and_then(Value::as_str).map(str::to_owned);
+    let need = |key: &str, from_preset: Option<&str>| {
+        opt(key)
+            .or_else(|| from_preset.map(str::to_owned))
+            .ok_or_else(|| AppError::Validation(format!("missing `{key}` for a generic provider")))
+    };
+    let id = str_arg(args, "id")?.to_string();
+    let display_name = opt("display_name")
+        .or_else(|| preset.as_ref().map(|p| p.display_name.to_owned()))
+        .unwrap_or_else(|| id.clone());
+    Ok(gt_auth::NewProvider {
+        id,
+        kind,
+        display_name,
+        client_id: str_arg(args, "client_id")?.to_string(),
+        client_secret: str_arg(args, "client_secret")?.to_string(),
+        issuer: need("issuer", preset.as_ref().map(|p| p.issuer))?,
+        authorize_endpoint: need("authorize_endpoint", preset.as_ref().map(|p| p.authorize_endpoint))?,
+        token_endpoint: need("token_endpoint", preset.as_ref().map(|p| p.token_endpoint))?,
+        userinfo_endpoint: need("userinfo_endpoint", preset.as_ref().map(|p| p.userinfo_endpoint))?,
+        scopes: need("scopes", preset.as_ref().map(|p| p.default_scopes))?,
+        enabled: args.get("enabled").and_then(Value::as_bool).unwrap_or(true),
+    })
+}
+
+/// Build a [`PatchProvider`](gt_auth::PatchProvider) from the `workspace.provider-update` args —
+/// each present field overwrites, each absent one leaves the column. `client_secret` is write-only
+/// (supply to rotate, omit to keep).
+#[cfg(feature = "oauth")]
+fn patch_provider_from_args(args: &Value) -> gt_auth::PatchProvider {
+    let opt = |key: &str| args.get(key).and_then(Value::as_str).map(str::to_owned);
+    gt_auth::PatchProvider {
+        display_name: opt("display_name"),
+        client_id: opt("client_id"),
+        client_secret: opt("client_secret"),
+        issuer: opt("issuer"),
+        authorize_endpoint: opt("authorize_endpoint"),
+        token_endpoint: opt("token_endpoint"),
+        userinfo_endpoint: opt("userinfo_endpoint"),
+        scopes: opt("scopes"),
+        enabled: args.get("enabled").and_then(Value::as_bool),
+    }
+}
+
+/// Map a `gt-auth` provider-store failure onto the MCP error space (hq-idp-db.4): an invalid kind
+/// is a caller-side validation fault, any other (sealing/backend) is an internal fault.
+#[cfg(feature = "oauth")]
+fn provider_err(e: gt_auth::AuthError) -> AppError {
+    match e {
+        gt_auth::AuthError::Backend(msg) if msg.starts_with("unknown provider kind") => {
+            AppError::Validation(msg)
+        }
+        other => AppError::Other(other.to_string()),
     }
 }
 
@@ -1009,6 +1173,88 @@ mod tests {
         sqlx::query("DELETE FROM workspaces WHERE id = $1").bind("prov-test").execute(&pool).await.unwrap();
         sqlx::query("DELETE FROM public.users WHERE id = 'user-prov'").execute(&pool).await.unwrap();
         sqlx::raw_sql("DROP SCHEMA IF EXISTS ws_prov_test CASCADE").execute(&pool).await.unwrap();
+    }
+
+    /// PG-backed: the `workspace.provider-*` system-admin tools (hq-idp-db.4) round-trip through
+    /// `public.oauth_providers` — create (preset endpoints filled), list/get show NO secret, patch
+    /// `enabled`, delete. The scope gate (system admin only) is enforced one tier up at the MCP
+    /// server boundary; this proves the handler + projection. An unknown kind is a validation fault.
+    #[cfg(feature = "oauth")]
+    #[tokio::test]
+    async fn provider_tools_round_trip_without_leaking_the_secret() {
+        std::env::set_var(
+            "GT_SECRET_KEY",
+            "0000000000000000000000000000000000000000000000000000000000000000",
+        );
+        let Some(pool) = pool_or_skip().await else {
+            eprintln!("GT_PG_URL unset; skipping provider tools contract test");
+            return;
+        };
+        // Provision the GLOBAL provider table (the same DDL the boot migration applies).
+        sqlx::raw_sql(gt_auth::migrations::CREATE_OAUTH_PROVIDERS)
+            .execute(&pool)
+            .await
+            .expect("create public.oauth_providers");
+        let id = format!("prov-tool-{}", now_secs());
+        sqlx::query("DELETE FROM public.oauth_providers WHERE id = $1")
+            .bind(&id)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let handler = WorkspaceHandler::new(pool.clone());
+        let ctx = |args| DomainCtx { workspace: None, actor: "sysadmin", args };
+
+        // Create a Google preset: only client credentials supplied, endpoints baked.
+        let created = handler
+            .dispatch(
+                "workspace.provider-create",
+                ctx(json!({ "id": id, "kind": "google", "client_id": "cid", "client_secret": "top-secret-xyz" })),
+            )
+            .await
+            .unwrap();
+        assert_eq!(created["id"], id);
+        assert_eq!(created["token_endpoint"], "https://oauth2.googleapis.com/token");
+        let created_str = created.to_string();
+        assert!(!created_str.contains("client_secret"), "create echo names no secret: {created_str}");
+        assert!(!created_str.contains("top-secret-xyz"), "create echo carries no secret: {created_str}");
+
+        // List shows it, still no secret.
+        let list = handler.dispatch("workspace.provider-list", ctx(json!({}))).await.unwrap();
+        let list_str = list.to_string();
+        assert!(list_str.contains(&id), "list includes the provider: {list_str}");
+        assert!(!list_str.contains("client_secret"), "list names no secret");
+        assert!(!list_str.contains("top-secret-xyz"), "list carries no secret");
+
+        // Patch `enabled` (no secret re-supplied).
+        let patched = handler
+            .dispatch("workspace.provider-update", ctx(json!({ "id": id, "enabled": false })))
+            .await
+            .unwrap();
+        assert_eq!(patched["enabled"], false);
+        assert!(!patched.to_string().contains("top-secret-xyz"));
+
+        // Unknown kind is a validation fault, not a 500.
+        let bad = handler
+            .dispatch(
+                "workspace.provider-create",
+                ctx(json!({ "id": "x", "kind": "nope", "client_id": "c", "client_secret": "s" })),
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(bad, AppError::Validation(_)));
+
+        // Delete: present → ok; absent → not found.
+        let del = handler
+            .dispatch("workspace.provider-delete", ctx(json!({ "id": id })))
+            .await
+            .unwrap();
+        assert_eq!(del["ok"], true);
+        let gone = handler
+            .dispatch("workspace.provider-delete", ctx(json!({ "id": id })))
+            .await
+            .unwrap_err();
+        assert!(matches!(gone, AppError::NotFound(_)));
     }
 
     #[test]

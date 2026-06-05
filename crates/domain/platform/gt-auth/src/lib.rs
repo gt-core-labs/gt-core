@@ -180,13 +180,21 @@ pub use oauth::{
 /// composition root to document the contract.
 #[cfg(feature = "oauth")]
 pub use provider_repo::{
-    preset_for, presets, NewProvider, ProviderKind as OauthProviderKind, ProviderPreset,
-    ProviderRecord, ProviderRepo,
+    preset_for, presets, NewProvider, PatchProvider, ProviderKind as OauthProviderKind,
+    ProviderPreset, ProviderRecord, ProviderRepo,
 };
 
 /// The AES-GCM seal/unseal env contract for the provider-secret store (hq-idp-db.1).
 #[cfg(feature = "oauth")]
 pub use crypto::ENV_SECRET_KEY;
+
+/// The system-admin OAuth/OIDC provider-administration surface (hq-idp-db.4): the abstract
+/// [`ProviderStore`] port the `/auth/providers` CRUD handlers depend on, the request DTOs, and the
+/// secret-omitting [`ProviderView`] projection. Behind the `oauth` feature (with the HTTP router it
+/// rides). The composition root supplies the production adapter (`PgProviderRepo`) via
+/// [`AuthState::providers`].
+#[cfg(feature = "oauth")]
+pub use http::{CreateProviderRequest, PatchProviderRequest, ProviderStore, ProviderView};
 
 #[cfg(all(feature = "oauth", feature = "pg"))]
 pub use provider_repo::PgProviderRepo;

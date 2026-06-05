@@ -28,7 +28,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use axum::extract::{Extension, State};
-#[cfg(feature = "pg")]
+#[cfg(any(feature = "pg", feature = "oauth"))]
 use axum::extract::Path;
 use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
@@ -40,6 +40,8 @@ use crate::{
     AuthError, Credentials, JwkSet, JwtClaims, JwtMinter, ProviderKind, RefreshError, RefreshRecord,
     RefreshStore, RefreshToken, VerifiedIdentity,
 };
+#[cfg(feature = "oauth")]
+use crate::{NewProvider, OauthProviderKind, PatchProvider, ProviderRecord};
 
 /// The async refresh-store port behind [`AuthState::refresh`] — the I/O-capable boundary the HTTP
 /// handlers actually call (`hq-platform-hardening.1`).
@@ -330,6 +332,52 @@ pub trait RoleStore: Send + Sync {
     ) -> Result<bool, AuthError>;
 }
 
+/// The async OAuth/OIDC provider-administration port behind `POST`/`PATCH`/`DELETE
+/// `/auth/providers` (hq-idp-db.4): a SYSTEM admin manages the GLOBAL login providers (presets +
+/// generic OIDC). The `client_secret` is write-only — accepted on create/patch (sealed at rest by
+/// the adapter), but the [`ProviderView`] this returns never carries it back. Separate from the
+/// per-workspace admin ports because providers are deploy-global, not tenant data. The production
+/// adapter is [`PgProviderRepo`](crate::PgProviderRepo).
+#[cfg(feature = "oauth")]
+#[async_trait]
+pub trait ProviderStore: Send + Sync {
+    /// List every registered provider (no secret material).
+    async fn list_providers(&self) -> Result<Vec<ProviderRecord>, AuthError>;
+    /// Register a provider, sealing its cleartext secret at rest.
+    async fn create_provider(&self, provider: NewProvider) -> Result<ProviderRecord, AuthError>;
+    /// Apply a partial update; `None` ⇒ no provider with that id. A `Some` secret is re-sealed.
+    async fn patch_provider(
+        &self,
+        id: &str,
+        patch: PatchProvider,
+    ) -> Result<Option<ProviderRecord>, AuthError>;
+    /// Remove a provider; `false` ⇒ none matched (idempotent delete).
+    async fn delete_provider(&self, id: &str) -> Result<bool, AuthError>;
+}
+
+/// The production [`ProviderStore`]: CRUD over the GLOBAL `public.oauth_providers` table, sealing
+/// the client secret on write. Available when both `oauth` and `pg` are on.
+#[cfg(all(feature = "oauth", feature = "pg"))]
+#[async_trait]
+impl ProviderStore for crate::PgProviderRepo {
+    async fn list_providers(&self) -> Result<Vec<ProviderRecord>, AuthError> {
+        crate::ProviderRepo::list(self).await
+    }
+    async fn create_provider(&self, provider: NewProvider) -> Result<ProviderRecord, AuthError> {
+        crate::ProviderRepo::create(self, provider).await
+    }
+    async fn patch_provider(
+        &self,
+        id: &str,
+        patch: PatchProvider,
+    ) -> Result<Option<ProviderRecord>, AuthError> {
+        crate::ProviderRepo::patch(self, id, patch).await
+    }
+    async fn delete_provider(&self, id: &str) -> Result<bool, AuthError> {
+        crate::ProviderRepo::delete(self, id).await
+    }
+}
+
 /// An injected wall clock: seconds since the Unix epoch. Kept abstract so tests pin time.
 pub type Clock = Arc<dyn Fn() -> u64 + Send + Sync>;
 
@@ -402,6 +450,12 @@ pub struct AuthState {
     /// `/auth/workspaces/{slug}/members` (hq-platform-hardening.2): a ws admin attaches/detaches
     /// another user. `None` ⇒ those endpoints respond `501`; everything else is unaffected.
     pub membership_admin: Option<Arc<dyn MembershipAdmin>>,
+    /// The OAuth/OIDC provider-administration store behind `POST`/`PATCH`/`DELETE
+    /// `/auth/providers` (hq-idp-db.4): a SYSTEM admin manages the GLOBAL login providers. `None`
+    /// ⇒ those endpoints respond `501`; login + the per-ws admin surfaces are unaffected. Present
+    /// only with the `oauth` feature (the provider store + secret crypto ride it).
+    #[cfg(feature = "oauth")]
+    pub providers: Option<Arc<dyn ProviderStore>>,
     /// The verifier's public JWKS, served at `GET /auth/jwks` so clients verify access tokens
     /// offline. Built from the verifier's public keys at the composition root
     /// ([`JwtAuthenticator::jwk_set`](crate::JwtAuthenticator::jwk_set)) — never the signing
@@ -435,6 +489,16 @@ pub fn auth_router(state: AuthState) -> Router {
         .route(
             "/auth/workspaces/:slug/members/:email",
             axum::routing::delete(remove_member),
+        );
+    // OAuth/OIDC provider administration (hq-idp-db.4): a SYSTEM admin manages the GLOBAL login
+    // providers. Rides the `oauth` feature (the provider store + secret crypto), not `pg`, so a
+    // login-only build carries no provider surface.
+    #[cfg(feature = "oauth")]
+    let router = router
+        .route("/auth/providers", post(create_provider))
+        .route(
+            "/auth/providers/:id",
+            axum::routing::patch(patch_provider).delete(delete_provider),
         );
     router.with_state(state)
 }
@@ -490,15 +554,29 @@ pub struct ApiDoc;
 )]
 struct AdminApiDoc;
 
+/// The OAuth/OIDC provider-administration half of `/auth/*`, present only with the `oauth` feature
+/// (hq-idp-db.4): the system-admin CRUD over the GLOBAL login providers. Folded into [`auth_openapi`]
+/// when compiled, so an OAuth-enabled deploy advertises the provider surface.
+#[cfg(feature = "oauth")]
+#[derive(utoipa::OpenApi)]
+#[openapi(
+    paths(create_provider, patch_provider, delete_provider),
+    components(schemas(CreateProviderRequest, PatchProviderRequest, ProviderView)),
+)]
+struct ProviderApiDoc;
+
 /// The full `/auth/*` OpenAPI the composition root fuses into `GET /openapi.json`: the always-on
 /// login surface ([`ApiDoc`]) plus, when the `pg` adapter is compiled, the admin / RBAC /
-/// workspace routes ([`AdminApiDoc`]).
+/// workspace routes ([`AdminApiDoc`]), plus the OAuth provider CRUD ([`ProviderApiDoc`]) with the
+/// `oauth` feature.
 pub fn auth_openapi() -> utoipa::openapi::OpenApi {
     use utoipa::OpenApi as _;
     #[allow(unused_mut)]
     let mut doc = ApiDoc::openapi();
     #[cfg(feature = "pg")]
     doc.merge(AdminApiDoc::openapi());
+    #[cfg(feature = "oauth")]
+    doc.merge(ProviderApiDoc::openapi());
     doc
 }
 
@@ -681,6 +759,137 @@ pub struct AssignRolesRequest {
     /// The role names to assign, replacing the user's current set.
     #[serde(default)]
     pub roles: Vec<String>,
+}
+
+/// `POST /auth/providers` body — register a GLOBAL OAuth/OIDC login provider (system admin only,
+/// hq-idp-db.4). The `client_secret` is WRITE-ONLY: accepted here, sealed at rest, and NEVER echoed
+/// back (the response is a [`ProviderView`], which omits it). For a preset `kind`
+/// (`google`/`github`/`microsoft`) the endpoints + default scopes are baked, so only the client
+/// credentials are required; for the `generic` kind the admin supplies every endpoint.
+#[cfg(feature = "oauth")]
+#[derive(Debug, Deserialize)]
+#[cfg_attr(feature = "axum", derive(utoipa::ToSchema))]
+pub struct CreateProviderRequest {
+    /// The stable id / primary key (also the login-button token).
+    pub id: String,
+    /// The provider variant: `google` / `github` / `microsoft` / `generic`.
+    pub kind: String,
+    /// Human label for the login button. Omitted ⇒ the preset's label (required for `generic`).
+    #[serde(default)]
+    pub display_name: Option<String>,
+    /// The registered client id.
+    pub client_id: String,
+    /// The registered client secret (cleartext on the wire; sealed at rest, never returned).
+    pub client_secret: String,
+    /// Issuer URL. Omitted ⇒ the preset's (required for `generic`).
+    #[serde(default)]
+    pub issuer: Option<String>,
+    /// Authorization endpoint. Omitted ⇒ the preset's (required for `generic`).
+    #[serde(default)]
+    pub authorize_endpoint: Option<String>,
+    /// Token endpoint. Omitted ⇒ the preset's (required for `generic`).
+    #[serde(default)]
+    pub token_endpoint: Option<String>,
+    /// Userinfo endpoint. Omitted ⇒ the preset's (required for `generic`).
+    #[serde(default)]
+    pub userinfo_endpoint: Option<String>,
+    /// Comma-separated scopes. Omitted ⇒ the preset's defaults (required for `generic`).
+    #[serde(default)]
+    pub scopes: Option<String>,
+    /// Whether the provider shows as a login button. Omitted ⇒ `true`.
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+}
+
+/// The default for [`CreateProviderRequest::enabled`] — a freshly registered provider is live.
+#[cfg(feature = "oauth")]
+fn default_true() -> bool {
+    true
+}
+
+/// `PATCH /auth/providers/{id}` body — partial update of a provider (system admin only,
+/// hq-idp-db.4). Every field is optional: `None`/absent leaves the column, `Some` overwrites.
+/// `client_secret` is write-only — supply it to ROTATE the secret, omit it to leave the stored one.
+#[cfg(feature = "oauth")]
+#[derive(Debug, Default, Deserialize)]
+#[cfg_attr(feature = "axum", derive(utoipa::ToSchema))]
+pub struct PatchProviderRequest {
+    /// New human label, or absent to leave it.
+    #[serde(default)]
+    pub display_name: Option<String>,
+    /// New client id, or absent to leave it.
+    #[serde(default)]
+    pub client_id: Option<String>,
+    /// New client secret to rotate to (sealed at rest, never returned), or absent to keep it.
+    #[serde(default)]
+    pub client_secret: Option<String>,
+    /// New issuer URL, or absent to leave it.
+    #[serde(default)]
+    pub issuer: Option<String>,
+    /// New authorization endpoint, or absent to leave it.
+    #[serde(default)]
+    pub authorize_endpoint: Option<String>,
+    /// New token endpoint, or absent to leave it.
+    #[serde(default)]
+    pub token_endpoint: Option<String>,
+    /// New userinfo endpoint, or absent to leave it.
+    #[serde(default)]
+    pub userinfo_endpoint: Option<String>,
+    /// New comma-separated scopes, or absent to leave them.
+    #[serde(default)]
+    pub scopes: Option<String>,
+    /// Toggle whether the provider shows as a login button, or absent to leave it.
+    #[serde(default)]
+    pub enabled: Option<bool>,
+}
+
+/// A provider as returned by every read/echo on `/auth/providers` (hq-idp-db.4) — the projection
+/// that OMITS the `client_secret` (sealed or plain). The secret is write-only; no read surface ever
+/// carries it, so a compromised token cannot exfiltrate a configured provider's credentials.
+#[cfg(feature = "oauth")]
+#[derive(Debug, Serialize)]
+#[cfg_attr(feature = "axum", derive(utoipa::ToSchema))]
+pub struct ProviderView {
+    /// The id / primary key.
+    pub id: String,
+    /// The provider variant (`google` / `github` / `microsoft` / `generic`).
+    pub kind: String,
+    /// The human label for the login button.
+    pub display_name: String,
+    /// The registered client id (public; the secret is never included).
+    pub client_id: String,
+    /// The issuer URL.
+    pub issuer: String,
+    /// The authorization endpoint.
+    pub authorize_endpoint: String,
+    /// The token endpoint.
+    pub token_endpoint: String,
+    /// The userinfo endpoint.
+    pub userinfo_endpoint: String,
+    /// Comma-separated granted scopes.
+    pub scopes: String,
+    /// Whether the provider shows as a login button.
+    pub enabled: bool,
+}
+
+#[cfg(feature = "oauth")]
+impl From<ProviderRecord> for ProviderView {
+    fn from(r: ProviderRecord) -> Self {
+        // The sealed `client_secret_enc` is intentionally DROPPED here — this projection is the
+        // only shape any read/echo returns, so the secret can never leak through the HTTP surface.
+        ProviderView {
+            id: r.id,
+            kind: r.kind.as_str().to_owned(),
+            display_name: r.display_name,
+            client_id: r.client_id,
+            issuer: r.issuer,
+            authorize_endpoint: r.authorize_endpoint,
+            token_endpoint: r.token_endpoint,
+            userinfo_endpoint: r.userinfo_endpoint,
+            scopes: r.scopes,
+            enabled: r.enabled,
+        }
+    }
 }
 
 // --- handlers ---------------------------------------------------------------------------------
@@ -1109,6 +1318,178 @@ fn require_workspace_admin(claims: Option<&JwtClaims>, workspace: &str) -> Resul
     is_admin.then_some(()).ok_or(ApiError::Forbidden)
 }
 
+/// Gate a SYSTEM-admin endpoint (hq-idp-db.4): the caller must carry verified claims whose scopes
+/// include the `*` wildcard — the deploy-wide super-admin grant. UNLIKE [`require_workspace_admin`],
+/// this is NOT tied to the token's active workspace: OAuth providers are GLOBAL infrastructure, so
+/// only a system admin (never a mere workspace admin) may mutate them. No claims ⇒ `401`; a token
+/// without the `*` grant ⇒ `403`.
+#[cfg(feature = "oauth")]
+fn require_system_admin(claims: Option<&JwtClaims>) -> Result<(), ApiError> {
+    let claims = claims.ok_or(ApiError::Unauthenticated)?;
+    claims
+        .scopes
+        .iter()
+        .any(|s| s == "*")
+        .then_some(())
+        .ok_or(ApiError::Forbidden)
+}
+
+/// `POST /auth/providers` — register a GLOBAL OAuth/OIDC login provider (system admin only). The
+/// `client_secret` is accepted in the body, sealed at rest, and NEVER returned: the `201` echoes a
+/// [`ProviderView`], which omits it. A preset `kind` fills the endpoints/scopes from the baked
+/// catalog when they are absent; the `generic` kind requires every endpoint. `400` for an unknown
+/// kind or a `generic` provider missing an endpoint; `403` for a non-system-admin caller; `501`
+/// when no provider store is configured.
+#[cfg_attr(feature = "axum", utoipa::path(
+    post, path = "/auth/providers", tag = "auth",
+    request_body = CreateProviderRequest,
+    responses(
+        (status = 201, description = "Registered — the provider (never the client secret)", body = ProviderView),
+        (status = 400, description = "Unknown kind, or a generic provider missing an endpoint"),
+        (status = 401, description = "No verified claims"),
+        (status = 403, description = "Caller is not a system admin"),
+        (status = 501, description = "No provider store configured"),
+    ),
+))]
+#[cfg(feature = "oauth")]
+async fn create_provider(
+    State(state): State<AuthState>,
+    claims: Option<Extension<JwtClaims>>,
+    Json(body): Json<CreateProviderRequest>,
+) -> Result<(StatusCode, Json<ProviderView>), ApiError> {
+    require_system_admin(claims.as_deref())?;
+    let store = state.providers.as_ref().ok_or(ApiError::NotConfigured)?;
+    let new = body.into_new_provider()?;
+    let stored = store.create_provider(new).await?;
+    Ok((StatusCode::CREATED, Json(stored.into())))
+}
+
+/// `PATCH /auth/providers/{id}` — partially update a provider (system admin only). Toggles
+/// `enabled`, edits metadata/endpoints, and ROTATES the secret when `client_secret` is supplied
+/// (left untouched when omitted). The `200` echoes the updated [`ProviderView`] — never the secret.
+/// `403` for a non-system-admin caller; `404` for an unknown id; `501` with no store.
+#[cfg_attr(feature = "axum", utoipa::path(
+    patch, path = "/auth/providers/{id}", tag = "auth",
+    params(("id" = String, Path, description = "The provider id to update")),
+    request_body = PatchProviderRequest,
+    responses(
+        (status = 200, description = "Updated — the provider (never the client secret)", body = ProviderView),
+        (status = 401, description = "No verified claims"),
+        (status = 403, description = "Caller is not a system admin"),
+        (status = 404, description = "No provider with that id"),
+        (status = 501, description = "No provider store configured"),
+    ),
+))]
+#[cfg(feature = "oauth")]
+async fn patch_provider(
+    State(state): State<AuthState>,
+    claims: Option<Extension<JwtClaims>>,
+    Path(id): Path<String>,
+    Json(body): Json<PatchProviderRequest>,
+) -> Result<Json<ProviderView>, ApiError> {
+    require_system_admin(claims.as_deref())?;
+    let store = state.providers.as_ref().ok_or(ApiError::NotConfigured)?;
+    match store.patch_provider(&id, body.into_patch()).await? {
+        Some(updated) => Ok(Json(updated.into())),
+        None => Err(ApiError::NotFound),
+    }
+}
+
+/// `DELETE /auth/providers/{id}` — remove a provider (system admin only). Idempotent: a present
+/// provider is `204`, an absent one is `404`. `403` for a non-system-admin caller; `501` with no
+/// store.
+#[cfg_attr(feature = "axum", utoipa::path(
+    delete, path = "/auth/providers/{id}", tag = "auth",
+    params(("id" = String, Path, description = "The provider id to delete")),
+    responses(
+        (status = 204, description = "Deleted"),
+        (status = 401, description = "No verified claims"),
+        (status = 403, description = "Caller is not a system admin"),
+        (status = 404, description = "No provider with that id"),
+        (status = 501, description = "No provider store configured"),
+    ),
+))]
+#[cfg(feature = "oauth")]
+async fn delete_provider(
+    State(state): State<AuthState>,
+    claims: Option<Extension<JwtClaims>>,
+    Path(id): Path<String>,
+) -> Result<StatusCode, ApiError> {
+    require_system_admin(claims.as_deref())?;
+    let store = state.providers.as_ref().ok_or(ApiError::NotConfigured)?;
+    match store.delete_provider(&id).await? {
+        true => Ok(StatusCode::NO_CONTENT),
+        false => Err(ApiError::NotFound),
+    }
+}
+
+#[cfg(feature = "oauth")]
+impl CreateProviderRequest {
+    /// Turn the request into a [`NewProvider`], filling a preset kind's baked endpoints/scopes when
+    /// they are absent and requiring every endpoint for the `generic` kind. An unknown kind or a
+    /// `generic` provider missing an endpoint is [`ApiError::BadProvider`] (`400`).
+    fn into_new_provider(self) -> Result<NewProvider, ApiError> {
+        let kind = OauthProviderKind::parse(&self.kind)
+            .map_err(|e| ApiError::BadProvider(e.to_string()))?;
+        let preset = crate::preset_for(kind);
+        // Fill from the preset when the field is absent; the `generic` kind has no preset, so an
+        // absent endpoint there is a caller error rather than a silent empty string.
+        let need = |field: Option<String>, from_preset: Option<&str>, name: &str| {
+            field
+                .or_else(|| from_preset.map(str::to_owned))
+                .ok_or_else(|| ApiError::BadProvider(format!("missing `{name}` for a generic provider")))
+        };
+        let display_name = self
+            .display_name
+            .or_else(|| preset.as_ref().map(|p| p.display_name.to_owned()))
+            .unwrap_or_else(|| self.id.clone());
+        Ok(NewProvider {
+            id: self.id,
+            kind,
+            display_name,
+            client_id: self.client_id,
+            client_secret: self.client_secret,
+            issuer: need(self.issuer, preset.as_ref().map(|p| p.issuer), "issuer")?,
+            authorize_endpoint: need(
+                self.authorize_endpoint,
+                preset.as_ref().map(|p| p.authorize_endpoint),
+                "authorize_endpoint",
+            )?,
+            token_endpoint: need(
+                self.token_endpoint,
+                preset.as_ref().map(|p| p.token_endpoint),
+                "token_endpoint",
+            )?,
+            userinfo_endpoint: need(
+                self.userinfo_endpoint,
+                preset.as_ref().map(|p| p.userinfo_endpoint),
+                "userinfo_endpoint",
+            )?,
+            scopes: need(self.scopes, preset.as_ref().map(|p| p.default_scopes), "scopes")?,
+            enabled: self.enabled,
+        })
+    }
+}
+
+#[cfg(feature = "oauth")]
+impl PatchProviderRequest {
+    /// Project the request onto the repo's [`PatchProvider`] — a field-for-field move, the secret
+    /// carried through write-only.
+    fn into_patch(self) -> PatchProvider {
+        PatchProvider {
+            display_name: self.display_name,
+            client_id: self.client_id,
+            client_secret: self.client_secret,
+            issuer: self.issuer,
+            authorize_endpoint: self.authorize_endpoint,
+            token_endpoint: self.token_endpoint,
+            userinfo_endpoint: self.userinfo_endpoint,
+            scopes: self.scopes,
+            enabled: self.enabled,
+        }
+    }
+}
+
 /// Mint an access + refresh token pair for a freshly verified identity. Async: the refresh store
 /// is the I/O-capable [`AsyncRefreshStore`] port, so issuing the durable token is awaited.
 async fn issue_tokens(
@@ -1240,17 +1621,21 @@ enum ApiError {
     /// [`oauth_login`](AuthState::oauth_login) provider — `501` (hq-platform-hardening.3).
     OauthNotConfigured,
     /// Verified caller, but the claims lack the required scope — `403` (`hq-web-extras.5`).
-    #[cfg(feature = "pg")]
+    #[cfg(any(feature = "pg", feature = "oauth"))]
     Forbidden,
     /// The endpoint needs a backing store the deploy did not configure — `501` (`hq-web-extras.5`).
-    #[cfg(feature = "pg")]
+    #[cfg(any(feature = "pg", feature = "oauth"))]
     NotConfigured,
     /// A role's scope failed the closed-vocabulary check — `400` (hq-rbac.4).
     #[cfg(feature = "pg")]
     BadScope(String),
-    /// The addressed role/user does not exist — `404` (hq-rbac.4).
-    #[cfg(feature = "pg")]
+    /// The addressed role/user/provider does not exist — `404` (hq-rbac.4 / hq-idp-db.4).
+    #[cfg(any(feature = "pg", feature = "oauth"))]
     NotFound,
+    /// A provider registration was malformed — unknown kind, or a generic provider missing an
+    /// endpoint — `400` (hq-idp-db.4).
+    #[cfg(feature = "oauth")]
+    BadProvider(String),
 }
 
 impl From<RefreshError> for ApiError {
@@ -1278,18 +1663,20 @@ impl IntoResponse for ApiError {
             ApiError::OauthNotConfigured => {
                 (StatusCode::NOT_IMPLEMENTED, "oauth/oidc login is not configured").into_response()
             }
-            #[cfg(feature = "pg")]
+            #[cfg(any(feature = "pg", feature = "oauth"))]
             ApiError::Forbidden => {
                 (StatusCode::FORBIDDEN, "insufficient scope").into_response()
             }
-            #[cfg(feature = "pg")]
+            #[cfg(any(feature = "pg", feature = "oauth"))]
             ApiError::NotConfigured => {
                 (StatusCode::NOT_IMPLEMENTED, "user administration is not configured").into_response()
             }
             #[cfg(feature = "pg")]
             ApiError::BadScope(msg) => (StatusCode::BAD_REQUEST, msg).into_response(),
-            #[cfg(feature = "pg")]
+            #[cfg(any(feature = "pg", feature = "oauth"))]
             ApiError::NotFound => (StatusCode::NOT_FOUND, "not found").into_response(),
+            #[cfg(feature = "oauth")]
+            ApiError::BadProvider(msg) => (StatusCode::BAD_REQUEST, msg).into_response(),
         }
     }
 }
@@ -1524,6 +1911,8 @@ mod tests {
             roles: None,
             memberships: None,
             membership_admin: None,
+            #[cfg(feature = "oauth")]
+            providers: None,
             // Publish the public half of the same "k1" key the minter signs with.
             jwks: Arc::new(
                 JwtAuthenticator::from_kid_pems([("k1", PUB_PEM)]).unwrap().jwk_set(),
@@ -2208,5 +2597,243 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    // --- OAuth/OIDC provider CRUD (hq-idp-db.4): system-admin gate + secret write-only ----------
+    #[cfg(feature = "oauth")]
+    mod providers {
+        use super::*;
+        use std::sync::Mutex;
+
+        /// In-memory [`ProviderStore`] double recording the records as written — including the
+        /// SEALED secret, so the test can prove the HTTP projection drops it (the store keeps it,
+        /// the wire never shows it).
+        #[derive(Default)]
+        struct MemProviders {
+            rows: Mutex<Vec<ProviderRecord>>,
+        }
+
+        #[async_trait]
+        impl ProviderStore for MemProviders {
+            async fn list_providers(&self) -> Result<Vec<ProviderRecord>, AuthError> {
+                Ok(self.rows.lock().unwrap().clone())
+            }
+            async fn create_provider(
+                &self,
+                provider: NewProvider,
+            ) -> Result<ProviderRecord, AuthError> {
+                // Seal the secret exactly as the real adapter would, so the stored record carries a
+                // ciphertext blob the projection must omit.
+                let enc = crate::crypto::seal(provider.client_secret.as_bytes())?;
+                let rec = ProviderRecord {
+                    id: provider.id,
+                    kind: provider.kind,
+                    display_name: provider.display_name,
+                    client_id: provider.client_id,
+                    client_secret_enc: enc,
+                    issuer: provider.issuer,
+                    authorize_endpoint: provider.authorize_endpoint,
+                    token_endpoint: provider.token_endpoint,
+                    userinfo_endpoint: provider.userinfo_endpoint,
+                    scopes: provider.scopes,
+                    enabled: provider.enabled,
+                };
+                self.rows.lock().unwrap().push(rec.clone());
+                Ok(rec)
+            }
+            async fn patch_provider(
+                &self,
+                id: &str,
+                patch: PatchProvider,
+            ) -> Result<Option<ProviderRecord>, AuthError> {
+                let mut rows = self.rows.lock().unwrap();
+                let Some(rec) = rows.iter_mut().find(|r| r.id == id) else {
+                    return Ok(None);
+                };
+                if let Some(v) = patch.enabled {
+                    rec.enabled = v;
+                }
+                if let Some(v) = patch.client_secret {
+                    rec.client_secret_enc = crate::crypto::seal(v.as_bytes())?;
+                }
+                if let Some(v) = patch.display_name {
+                    rec.display_name = v;
+                }
+                Ok(Some(rec.clone()))
+            }
+            async fn delete_provider(&self, id: &str) -> Result<bool, AuthError> {
+                let mut rows = self.rows.lock().unwrap();
+                let before = rows.len();
+                rows.retain(|r| r.id != id);
+                Ok(rows.len() != before)
+            }
+        }
+
+        fn state_with_providers(p: Arc<MemProviders>) -> AuthState {
+            AuthState { providers: Some(p), ..state() }
+        }
+
+        /// A request with the caller's scopes injected as verified claims; `None` ⇒ no claims.
+        fn req(method: &str, path: &str, scopes: Option<&[&str]>, json: Option<&str>) -> Request<Body> {
+            let mut builder = Request::builder().method(method).uri(path);
+            if json.is_some() {
+                builder = builder.header("content-type", "application/json");
+            }
+            let mut r = builder
+                .body(json.map(|j| Body::from(j.to_owned())).unwrap_or_else(Body::empty))
+                .unwrap();
+            if let Some(scopes) = scopes {
+                r.extensions_mut().insert(JwtClaims {
+                    sub: "caller".into(),
+                    workspace: "acme".into(),
+                    scopes: scopes.iter().map(|s| s.to_string()).collect(),
+                    exp: 2_000_000_000,
+                    nbf: None,
+                    iat: 0,
+                });
+            }
+            r
+        }
+
+        async fn body_str(resp: axum::response::Response) -> String {
+            let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+            String::from_utf8(bytes.to_vec()).unwrap()
+        }
+
+        /// The full admin lifecycle: a system admin (`*`) creates → the create echo carries NO
+        /// secret; patches `enabled`; lists → still no secret; deletes. A non-admin caller is 403
+        /// on every mutation, and an unauthenticated one is 401.
+        #[tokio::test]
+        async fn system_admin_crud_and_secret_is_write_only() {
+            // The seal step needs a master key for the test process.
+            std::env::set_var(
+                crate::ENV_SECRET_KEY,
+                "0000000000000000000000000000000000000000000000000000000000000000",
+            );
+            let store = Arc::new(MemProviders::default());
+            let app = auth_router(state_with_providers(store.clone()));
+            let create_body = r#"{"id":"goog","kind":"google","client_id":"cid","client_secret":"top-secret-xyz"}"#;
+
+            // Non-admin (a mere workspace.admin, not the system `*`) → 403; unauthenticated → 401.
+            let forbidden = app
+                .clone()
+                .oneshot(req("POST", "/auth/providers", Some(&["workspace.admin"]), Some(create_body)))
+                .await
+                .unwrap();
+            assert_eq!(forbidden.status(), StatusCode::FORBIDDEN);
+            let unauth = app
+                .clone()
+                .oneshot(req("POST", "/auth/providers", None, Some(create_body)))
+                .await
+                .unwrap();
+            assert_eq!(unauth.status(), StatusCode::UNAUTHORIZED);
+
+            // System admin (`*`) → 201, and the echo omits the secret (sealed or plain).
+            let created = app
+                .clone()
+                .oneshot(req("POST", "/auth/providers", Some(&["*"]), Some(create_body)))
+                .await
+                .unwrap();
+            assert_eq!(created.status(), StatusCode::CREATED);
+            let echo = body_str(created).await;
+            assert!(echo.contains("\"id\":\"goog\""), "echo: {echo}");
+            assert!(echo.contains("\"client_id\":\"cid\""), "echo: {echo}");
+            assert!(echo.contains("oauth2.googleapis.com"), "preset endpoints filled: {echo}");
+            assert!(!echo.contains("client_secret"), "echo must not name the secret: {echo}");
+            assert!(!echo.contains("top-secret-xyz"), "echo must not carry the secret: {echo}");
+
+            // Patch `enabled` (no secret re-supplied) → 200, still no secret on the wire.
+            let patched = app
+                .clone()
+                .oneshot(req("PATCH", "/auth/providers/goog", Some(&["*"]), Some(r#"{"enabled":false}"#)))
+                .await
+                .unwrap();
+            assert_eq!(patched.status(), StatusCode::OK);
+            let pbody = body_str(patched).await;
+            assert!(pbody.contains("\"enabled\":false"), "patch toggled enabled: {pbody}");
+            assert!(!pbody.contains("top-secret-xyz"), "patch echo carries no secret: {pbody}");
+
+            // The store still holds the SEALED secret (write-only is about the wire, not at rest).
+            assert!(!store.rows.lock().unwrap()[0].client_secret_enc.is_empty());
+
+            // A delete by a non-admin is 403; by the system admin, 204; a second delete is 404.
+            let del_forbidden = app
+                .clone()
+                .oneshot(req("DELETE", "/auth/providers/goog", Some(&["issues.write"]), None))
+                .await
+                .unwrap();
+            assert_eq!(del_forbidden.status(), StatusCode::FORBIDDEN);
+            let deleted = app
+                .clone()
+                .oneshot(req("DELETE", "/auth/providers/goog", Some(&["*"]), None))
+                .await
+                .unwrap();
+            assert_eq!(deleted.status(), StatusCode::NO_CONTENT);
+            let gone = app
+                .clone()
+                .oneshot(req("DELETE", "/auth/providers/goog", Some(&["*"]), None))
+                .await
+                .unwrap();
+            assert_eq!(gone.status(), StatusCode::NOT_FOUND);
+        }
+
+        /// A `generic` provider missing an endpoint is a 400 (no preset to fill it), and an unknown
+        /// kind is a 400 — never a silent half-registered row.
+        #[tokio::test]
+        async fn generic_requires_endpoints_and_unknown_kind_is_400() {
+            std::env::set_var(
+                crate::ENV_SECRET_KEY,
+                "0000000000000000000000000000000000000000000000000000000000000000",
+            );
+            let app = auth_router(state_with_providers(Arc::new(MemProviders::default())));
+
+            let missing = app
+                .clone()
+                .oneshot(req(
+                    "POST",
+                    "/auth/providers",
+                    Some(&["*"]),
+                    Some(r#"{"id":"x","kind":"generic","client_id":"c","client_secret":"s"}"#),
+                ))
+                .await
+                .unwrap();
+            assert_eq!(missing.status(), StatusCode::BAD_REQUEST);
+
+            let unknown = app
+                .oneshot(req(
+                    "POST",
+                    "/auth/providers",
+                    Some(&["*"]),
+                    Some(r#"{"id":"x","kind":"nope","client_id":"c","client_secret":"s"}"#),
+                ))
+                .await
+                .unwrap();
+            assert_eq!(unknown.status(), StatusCode::BAD_REQUEST);
+        }
+
+        /// With no provider store configured the surface is 501 (login + admin unaffected).
+        #[tokio::test]
+        async fn not_configured_is_501() {
+            let app = auth_router(state()); // providers: None
+            let resp = app
+                .oneshot(req(
+                    "POST",
+                    "/auth/providers",
+                    Some(&["*"]),
+                    Some(r#"{"id":"x","kind":"google","client_id":"c","client_secret":"s"}"#),
+                ))
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::NOT_IMPLEMENTED);
+        }
+
+        /// The fused OpenAPI advertises the provider routes when `oauth` is built.
+        #[test]
+        fn openapi_lists_provider_routes() {
+            let doc = auth_openapi();
+            let paths: Vec<&str> = doc.paths.paths.keys().map(String::as_str).collect();
+            assert!(paths.contains(&"/auth/providers"), "{paths:?}");
+            assert!(paths.contains(&"/auth/providers/{id}"), "{paths:?}");
+        }
     }
 }

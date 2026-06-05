@@ -209,6 +209,10 @@ fn is_routable(tool: &str) -> bool {
         && tool != "issues.phase.advance"
         && tool != "workspace.member-add"
         && tool != "workspace.member-remove"
+        // OAuth/OIDC provider CRUD (hq-idp-db.4): the system-admin provider tools whose REST sibling
+        // lives on the `/auth/providers` surface (the gt-auth router, covered by its own OpenAPI
+        // test), not the `workspace` module's `ApiDoc`.
+        && !tool.starts_with("workspace.provider-")
 }
 
 /// The `(METHOD, path)` set a module's OpenAPI actually declares.

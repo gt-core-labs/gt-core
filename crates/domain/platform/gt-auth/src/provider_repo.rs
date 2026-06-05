@@ -187,6 +187,33 @@ impl NewProvider {
     }
 }
 
+/// A partial update to an existing provider (hq-idp-db.4). Every field is optional: `None` leaves
+/// the stored column untouched, `Some(_)` overwrites it. The `client_secret` is write-only — when
+/// `Some`, the repo RE-SEALS the new cleartext ([`crypto::seal`](crate::crypto::seal)); when `None`,
+/// the existing sealed blob is left in place (so a metadata edit, e.g. toggling `enabled`, does not
+/// require re-supplying the secret).
+#[derive(Clone, Debug, Default)]
+pub struct PatchProvider {
+    /// New human label, or `None` to leave it.
+    pub display_name: Option<String>,
+    /// New client id, or `None` to leave it.
+    pub client_id: Option<String>,
+    /// New client secret in cleartext (re-sealed by the repo), or `None` to keep the stored one.
+    pub client_secret: Option<String>,
+    /// New issuer URL, or `None` to leave it.
+    pub issuer: Option<String>,
+    /// New authorization endpoint, or `None` to leave it.
+    pub authorize_endpoint: Option<String>,
+    /// New token endpoint, or `None` to leave it.
+    pub token_endpoint: Option<String>,
+    /// New userinfo endpoint, or `None` to leave it.
+    pub userinfo_endpoint: Option<String>,
+    /// New comma-separated scopes, or `None` to leave them.
+    pub scopes: Option<String>,
+    /// Toggle whether the provider shows as a login button, or `None` to leave it.
+    pub enabled: Option<bool>,
+}
+
 /// A provider read back from the store. The `client_secret_enc` is the SEALED blob — the cleartext
 /// is recovered only in memory, only when building an [`OidcConfig`](crate::OidcConfig) for the
 /// handshake ([`into_oidc_config`](Self::into_oidc_config)).
@@ -264,6 +291,14 @@ pub trait ProviderRepo: Send + Sync {
     /// Register `provider`, sealing its client secret before it is stored. Returns the stored
     /// record (with the sealed blob).
     async fn create(&self, provider: NewProvider) -> Result<ProviderRecord, AuthError>;
+    /// Apply a partial update to the provider `id` (hq-idp-db.4): each `Some` field overwrites,
+    /// each `None` leaves the column. A `Some` client secret is RE-SEALED; a `None` secret leaves
+    /// the stored blob untouched. Returns the updated record, or `None` if no provider has that id.
+    async fn patch(
+        &self,
+        id: &str,
+        patch: PatchProvider,
+    ) -> Result<Option<ProviderRecord>, AuthError>;
     /// Remove a provider by id; `true` if a row was deleted, `false` if none matched.
     async fn delete(&self, id: &str) -> Result<bool, AuthError>;
 }
@@ -400,6 +435,56 @@ mod pg_impl {
                 scopes: provider.scopes,
                 enabled: provider.enabled,
             })
+        }
+
+        async fn patch(
+            &self,
+            id: &str,
+            patch: PatchProvider,
+        ) -> Result<Option<ProviderRecord>, AuthError> {
+            // Read-modify-write: load the current row, fold the `Some` fields over it, then write
+            // it back. The secret is re-sealed only when the patch carries a new one; otherwise the
+            // stored sealed blob rides through untouched (a metadata-only edit keeps the secret).
+            let Some(current) = self.get(id).await? else {
+                return Ok(None);
+            };
+            let enc = match patch.client_secret {
+                Some(secret) => crate::crypto::seal(secret.as_bytes())?,
+                None => current.client_secret_enc,
+            };
+            let next = ProviderRecord {
+                id: current.id,
+                kind: current.kind,
+                display_name: patch.display_name.unwrap_or(current.display_name),
+                client_id: patch.client_id.unwrap_or(current.client_id),
+                client_secret_enc: enc,
+                issuer: patch.issuer.unwrap_or(current.issuer),
+                authorize_endpoint: patch.authorize_endpoint.unwrap_or(current.authorize_endpoint),
+                token_endpoint: patch.token_endpoint.unwrap_or(current.token_endpoint),
+                userinfo_endpoint: patch.userinfo_endpoint.unwrap_or(current.userinfo_endpoint),
+                scopes: patch.scopes.unwrap_or(current.scopes),
+                enabled: patch.enabled.unwrap_or(current.enabled),
+            };
+            sqlx::query(
+                "UPDATE public.oauth_providers SET \
+                 display_name = $2, client_id = $3, client_secret_enc = $4, issuer = $5, \
+                 authorize_endpoint = $6, token_endpoint = $7, userinfo_endpoint = $8, \
+                 scopes = $9, enabled = $10 WHERE id = $1",
+            )
+            .bind(&next.id)
+            .bind(&next.display_name)
+            .bind(&next.client_id)
+            .bind(&next.client_secret_enc)
+            .bind(&next.issuer)
+            .bind(&next.authorize_endpoint)
+            .bind(&next.token_endpoint)
+            .bind(&next.userinfo_endpoint)
+            .bind(&next.scopes)
+            .bind(next.enabled)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| AuthError::Backend(format!("oauth_providers patch: {e}")))?;
+            Ok(Some(next))
         }
 
         async fn delete(&self, id: &str) -> Result<bool, AuthError> {
@@ -556,6 +641,69 @@ mod tests {
             assert!(repo.delete(&id).await.unwrap());
             assert!(repo.get(&id).await.unwrap().is_none());
             assert!(!repo.delete(&id).await.unwrap());
+        }
+
+        #[tokio::test]
+        async fn patch_overwrites_fields_and_secret_is_optional() {
+            std::env::set_var(
+                crate::ENV_SECRET_KEY,
+                "0000000000000000000000000000000000000000000000000000000000000000",
+            );
+            let Some(pool) = pool_or_skip().await else {
+                return;
+            };
+            ensure_table(&pool).await;
+            let repo = PgProviderRepo::new(pool.clone());
+
+            let id = unique_id("patch");
+            let new = NewProvider::from_preset(&id, ProviderKind::Google, "client-1", "secret-1")
+                .unwrap();
+            let original_enc = repo.create(new).await.unwrap().client_secret_enc;
+
+            // A metadata-only patch (no secret) toggles `enabled` + edits the label, and LEAVES the
+            // sealed secret untouched — a partial edit never requires re-supplying the credential.
+            let patched = repo
+                .patch(
+                    &id,
+                    PatchProvider {
+                        enabled: Some(false),
+                        display_name: Some("Renamed".into()),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .unwrap()
+                .expect("provider present");
+            assert!(!patched.enabled);
+            assert_eq!(patched.display_name, "Renamed");
+            assert_eq!(patched.client_secret_enc, original_enc, "secret left unchanged");
+            assert_eq!(patched.client_id, "client-1", "untouched field preserved");
+
+            // A patch WITH a secret re-seals it: the stored blob changes, and it decrypts to the new
+            // cleartext via into_oidc_config.
+            let rotated = repo
+                .patch(
+                    &id,
+                    PatchProvider { client_secret: Some("secret-2".into()), ..Default::default() },
+                )
+                .await
+                .unwrap()
+                .unwrap();
+            assert_ne!(rotated.client_secret_enc, original_enc, "secret re-sealed");
+            let cfg = rotated.into_oidc_config("acme", "https://gt.test/cb").unwrap();
+            assert_eq!(cfg.client_secret, "secret-2");
+
+            // Patching an absent id is None (the handler maps it to 404).
+            assert!(repo
+                .patch(
+                    "no-such-provider-xyz",
+                    PatchProvider { enabled: Some(true), ..Default::default() },
+                )
+                .await
+                .unwrap()
+                .is_none());
+
+            repo.delete(&id).await.unwrap();
         }
 
         #[tokio::test]

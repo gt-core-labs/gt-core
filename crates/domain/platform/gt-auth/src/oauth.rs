@@ -546,6 +546,13 @@ mod tests {
         async fn create(&self, _p: NewProvider) -> Result<ProviderRecord, AuthError> {
             unreachable!("the resolver never writes")
         }
+        async fn patch(
+            &self,
+            _id: &str,
+            _p: crate::provider_repo::PatchProvider,
+        ) -> Result<Option<ProviderRecord>, AuthError> {
+            unreachable!("the resolver never writes")
+        }
         async fn delete(&self, _id: &str) -> Result<bool, AuthError> {
             unreachable!("the resolver never writes")
         }

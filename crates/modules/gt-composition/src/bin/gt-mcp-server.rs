@@ -648,6 +648,15 @@ async fn main() -> anyhow::Result<()> {
                 // Membership administration (hq-platform-hardening.2): a ws admin adds/removes
                 // another user, backed by the same global-identity adapter.
                 membership_admin: Some(pg_users.clone() as Arc<dyn gt_auth::MembershipAdmin>),
+                // OAuth/OIDC provider administration (hq-idp-db.4): a SYSTEM admin manages the
+                // GLOBAL login providers via `/auth/providers`, backed by PgProviderRepo over the
+                // shared pool. The secret is AES-GCM-sealed at rest (GT_SECRET_KEY) and never
+                // returned. Wired only with the `oauth` feature (the provider store + crypto).
+                #[cfg(feature = "oauth")]
+                providers: Some(
+                    Arc::new(gt_auth::PgProviderRepo::new(pool.clone()))
+                        as Arc<dyn gt_auth::ProviderStore>,
+                ),
                 minter: Arc::new(minter),
                 // Durable refresh store (hq-platform-hardening.1): PgRefreshStore over the same
                 // ws_default pool, so a refresh token survives a gt-mcp-server redeploy instead of
