@@ -167,14 +167,26 @@ impl OidcProvider {
     }
 
     /// Exchange `code` at the token endpoint for an access token (authorization-code grant).
-    async fn exchange_code(&self, code: &str) -> Result<String, AuthError> {
-        let form = [
+    /// When the flow was started with PKCE (hq-idp-db.3), the matching `code_verifier` is replayed
+    /// here so the IdP can verify it against the `code_challenge` it bound the `code` to; a
+    /// `None`/blank verifier keeps the plain (non-PKCE) exchange working unchanged.
+    async fn exchange_code(
+        &self,
+        code: &str,
+        code_verifier: Option<&str>,
+    ) -> Result<String, AuthError> {
+        let mut form = vec![
             ("grant_type", "authorization_code"),
             ("code", code),
             ("redirect_uri", self.config.redirect_uri.as_str()),
             ("client_id", self.config.client_id.as_str()),
             ("client_secret", self.config.client_secret.as_str()),
         ];
+        // Only append the PKCE proof when one was carried — a provider/flow without PKCE must not
+        // see an empty `code_verifier` (some IdPs reject the parameter outright).
+        if let Some(verifier) = code_verifier.filter(|v| !v.is_empty()) {
+            form.push(("code_verifier", verifier));
+        }
         let resp = self
             .http
             .post(&self.config.token_endpoint)
@@ -232,14 +244,46 @@ impl OidcProvider {
             scopes: self.config.scopes.clone(),
         }
     }
+
+    /// Run the FULL authorization-code handshake for the PKCE redirect flow (hq-idp-db.3): exchange
+    /// `code` (replaying the `code_verifier`), read userinfo, and resolve the
+    /// [`VerifiedIdentity`] — the same value the `/login` path yields, so the callback folds it into
+    /// the identical access/refresh pair. This is the verifier-carrying counterpart of the plain
+    /// [`LoginProvider::login`] OAuth path.
+    pub async fn exchange_for_identity(
+        &self,
+        code: &str,
+        code_verifier: Option<&str>,
+    ) -> Result<VerifiedIdentity, AuthError> {
+        let access_token = self.exchange_code(code, code_verifier).await?;
+        let sub = self.userinfo(&access_token).await?;
+        Ok(self.identity_for(sub))
+    }
+
+    /// The configured client id (sent on the authorize URL).
+    pub fn client_id(&self) -> &str {
+        &self.config.client_id
+    }
+
+    /// The configured redirect URI echoed on the exchange (and sent on the authorize URL).
+    pub fn redirect_uri(&self) -> &str {
+        &self.config.redirect_uri
+    }
+
+    /// The configured granted scopes (sent space-joined on the authorize URL).
+    pub fn scopes(&self) -> &[String] {
+        &self.config.scopes
+    }
 }
 
 #[async_trait]
 impl LoginProvider for OidcProvider {
     async fn login(&self, creds: &Credentials) -> Result<VerifiedIdentity, AuthError> {
         let access_token = match creds {
-            // OAuth authorization-code grant: exchange the code, then read userinfo.
-            Credentials::OAuth { code, .. } => self.exchange_code(code).await?,
+            // OAuth authorization-code grant: exchange the code, then read userinfo. The plain
+            // login port carries no PKCE verifier (the `/login` JSON path); the PKCE flow goes
+            // through `exchange_for_identity` below instead.
+            Credentials::OAuth { code, .. } => self.exchange_code(code, None).await?,
             // OIDC: the issuer must match this provider; the id_token is the access token the
             // userinfo endpoint accepts (the IdP minted both for this client).
             Credentials::Oidc { issuer, id_token } => {
@@ -317,6 +361,83 @@ impl DbOauthLogin {
         let config = record.into_oidc_config(self.workspace.clone(), self.redirect_uri.clone())?;
         Ok(OidcProvider::with_client(config, self.http.clone()))
     }
+
+    /// The redirect URI every IdP echoes back (the app's own `/auth/callback`), per-deploy config.
+    /// The `/authorize` leg records it on the pending row so the callback rebuilds the same value.
+    pub fn redirect_uri(&self) -> &str {
+        &self.redirect_uri
+    }
+
+    /// Build the IdP authorization URL for `provider_id` (hq-idp-db.3): load the row
+    /// (absent/disabled ⇒ [`AuthError::UnknownProvider`], a `404`), then assemble the
+    /// authorization-code request — `response_type=code`, the client id, this resolver's
+    /// `redirect_uri`, the provider's scopes, the anti-CSRF `state`, and the PKCE `code_challenge`
+    /// (`S256`). The browser is 302-redirected here to begin the flow.
+    pub async fn authorize_url(
+        &self,
+        provider_id: &str,
+        state: &str,
+        code_challenge: &str,
+    ) -> Result<String, AuthError> {
+        let record = self
+            .repo
+            .get(provider_id)
+            .await?
+            .filter(|r| r.enabled)
+            .ok_or_else(|| AuthError::UnknownProvider(provider_id.to_owned()))?;
+        // OAuth scopes are space-delimited on the wire; the row stores them comma-separated.
+        let scopes = record
+            .scopes
+            .split(',')
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .collect::<Vec<_>>()
+            .join(" ");
+        let q = |s: &str| url_encode(s);
+        let mut url = format!(
+            "{}?response_type=code&client_id={}&redirect_uri={}&state={}&code_challenge={}&code_challenge_method=S256",
+            record.authorize_endpoint,
+            q(&record.client_id),
+            q(&self.redirect_uri),
+            q(state),
+            q(code_challenge),
+        );
+        if !scopes.is_empty() {
+            url.push_str("&scope=");
+            url.push_str(&url_encode(&scopes));
+        }
+        Ok(url)
+    }
+
+    /// Finish the PKCE redirect flow (hq-idp-db.3): resolve `provider_id`, exchange `code` replaying
+    /// `code_verifier`, and read userinfo into the [`VerifiedIdentity`] — the SAME value the
+    /// `/login` path yields, so the callback issues the identical access/refresh pair. An
+    /// absent/disabled provider is [`AuthError::UnknownProvider`].
+    pub async fn exchange(
+        &self,
+        provider_id: &str,
+        code: &str,
+        code_verifier: &str,
+    ) -> Result<VerifiedIdentity, AuthError> {
+        let provider = self.provider_for(provider_id).await?;
+        provider.exchange_for_identity(code, Some(code_verifier)).await
+    }
+}
+
+/// Percent-encode a query-parameter value (RFC 3986 unreserved kept, everything else `%XX`). A
+/// tiny dependency-free encoder — the values here are URLs / opaque tokens / scope lists, so a
+/// correct minimal escape is all the authorize URL needs (no `url`/`percent-encoding` crate pulled).
+fn url_encode(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for &b in s.as_bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(b as char)
+            }
+            _ => out.push_str(&format!("%{b:02X}")),
+        }
+    }
+    out
 }
 
 #[async_trait]

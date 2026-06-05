@@ -97,7 +97,7 @@ axum = ["dep:axum", "dep:async-trait", "dep:gt-rbac", "dep:utoipa", "jsonwebtoke
 # provider store (hq-idp-db.1) folds in here too: `aes-gcm` seals the client secret at rest, with
 # `base64`/`hex` decoding the `GT_SECRET_KEY` master key. The Postgres adapter (`PgProviderRepo`)
 # additionally needs `pg`, which a deploy opts into separately.
-oauth = ["dep:reqwest", "dep:aes-gcm", "dep:base64", "dep:hex", "axum"]
+oauth = ["dep:reqwest", "dep:aes-gcm", "dep:base64", "dep:hex", "dep:sha2", "axum"]
 
 [dev-dependencies]
 serde_json = { workspace = true }

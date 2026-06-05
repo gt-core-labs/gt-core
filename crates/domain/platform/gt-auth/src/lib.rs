@@ -104,6 +104,9 @@ mod crypto;
 #[cfg(feature = "oauth")]
 mod provider_repo;
 
+#[cfg(feature = "oauth")]
+mod authz_state;
+
 pub use error::AuthError;
 pub use provider::{Credentials, IdentityProvider, ProviderKind, VerifiedIdentity};
 pub use refresh::{
@@ -143,6 +146,12 @@ pub mod migrations {
     /// hq-idp-db.1); the client secret column holds the AES-GCM-sealed blob, never cleartext.
     pub const CREATE_OAUTH_PROVIDERS: &str =
         include_str!("../migrations/auth/0006__create_oauth_providers.sql");
+    /// `0007` — the ephemeral OAuth authorize state + PKCE verifier store
+    /// (`public.oauth_authz_state`, hq-idp-db.3): one short-lived, one-shot row per in-flight
+    /// `/authorize`→`/callback` handshake, so the callback can validate the anti-CSRF `state` and
+    /// recover the PKCE `code_verifier`. Durable so an in-flight login survives a redeploy.
+    pub const CREATE_OAUTH_AUTHZ_STATE: &str =
+        include_str!("../migrations/auth/0007__create_oauth_authz_state.sql");
 }
 
 #[cfg(feature = "jsonwebtoken")]
@@ -196,8 +205,26 @@ pub use crypto::ENV_SECRET_KEY;
 #[cfg(feature = "oauth")]
 pub use http::{CreateProviderRequest, PatchProviderRequest, ProviderStore, ProviderView};
 
+/// The PUBLIC OAuth discovery + redirect-login surface (hq-idp-db.3): the `AuthzStateStore` /
+/// `OauthAuthzFlow` ports the `/authorize`→`/callback` handlers depend on, and the secret-free
+/// [`PublicProvider`] projection the FE login page renders buttons from. Behind the `oauth` feature.
+/// The composition root supplies the production adapters (`PgAuthzStateRepo` / `DbOauthLogin`) via
+/// [`AuthState::authz_state`] / [`AuthState::authz_flow`].
+#[cfg(feature = "oauth")]
+pub use http::{AuthzStateStore, OauthAuthzFlow, PublicProvider};
+
 #[cfg(all(feature = "oauth", feature = "pg"))]
 pub use provider_repo::PgProviderRepo;
+
+/// The ephemeral OAuth authorize-state + PKCE store (hq-idp-db.3): the `AuthzStateRepo` CRUD port
+/// the public `/authorize`→`/callback` flow depends on, the `PendingAuthz`/`NewAuthz` row shapes,
+/// and the PKCE helper ([`new_pkce`]) that mints a verifier + its S256 challenge. The Postgres
+/// adapter `PgAuthzStateRepo` is additionally gated by `pg`.
+#[cfg(feature = "oauth")]
+pub use authz_state::{new_pkce, AuthzStateRepo, NewAuthz, PendingAuthz, Pkce};
+
+#[cfg(all(feature = "oauth", feature = "pg"))]
+pub use authz_state::PgAuthzStateRepo;
 
 #[cfg(test)]
 pub use provider::InMemoryIdentityProvider;

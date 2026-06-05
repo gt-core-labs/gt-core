@@ -41,7 +41,7 @@ use crate::{
     RefreshStore, RefreshToken, VerifiedIdentity,
 };
 #[cfg(feature = "oauth")]
-use crate::{NewProvider, OauthProviderKind, PatchProvider, ProviderRecord};
+use crate::{NewAuthz, NewProvider, OauthProviderKind, PatchProvider, PendingAuthz, ProviderRecord};
 
 /// The async refresh-store port behind [`AuthState::refresh`] — the I/O-capable boundary the HTTP
 /// handlers actually call (`hq-platform-hardening.1`).
@@ -378,6 +378,85 @@ impl ProviderStore for crate::PgProviderRepo {
     }
 }
 
+/// The ephemeral authorize-state port behind the public `/authorize`→`/callback` flow
+/// (hq-idp-db.3): persist a pending handshake on `/authorize`, then ONE-SHOT consume it on
+/// `/callback` (so a replayed `state` is rejected). Distinct from [`ProviderStore`] (the admin CRUD)
+/// — this holds the transient per-login state, not the provider catalog. The production adapter is
+/// [`PgAuthzStateRepo`](crate::PgAuthzStateRepo).
+#[cfg(feature = "oauth")]
+#[async_trait]
+pub trait AuthzStateStore: Send + Sync {
+    /// Persist a pending authorize handshake (the `/authorize` leg).
+    async fn insert(&self, authz: NewAuthz) -> Result<(), AuthError>;
+    /// Atomically delete + return the row for `state`, or `None` if absent/already-consumed.
+    async fn consume(&self, state: &str) -> Result<Option<PendingAuthz>, AuthError>;
+}
+
+/// The production [`AuthzStateStore`]: insert/consume over `public.oauth_authz_state`. Available
+/// when both `oauth` and `pg` are on.
+#[cfg(all(feature = "oauth", feature = "pg"))]
+#[async_trait]
+impl AuthzStateStore for crate::PgAuthzStateRepo {
+    async fn insert(&self, authz: NewAuthz) -> Result<(), AuthError> {
+        crate::AuthzStateRepo::insert(self, authz).await
+    }
+    async fn consume(&self, state: &str) -> Result<Option<PendingAuthz>, AuthError> {
+        crate::AuthzStateRepo::consume(self, state).await
+    }
+}
+
+/// The OAuth redirect-flow port behind `/authorize` + `/callback` (hq-idp-db.3): build the IdP
+/// authorization URL for a provider (with `state` + PKCE `code_challenge`), and finish the flow by
+/// exchanging the returned `code` (replaying the `code_verifier`) into a [`VerifiedIdentity`] — the
+/// SAME value the password path yields. The production adapter is [`DbOauthLogin`](crate::DbOauthLogin),
+/// the per-request DB-backed resolver; it owns the app's own callback URL ([`redirect_uri`](Self::redirect_uri)).
+#[cfg(feature = "oauth")]
+#[async_trait]
+pub trait OauthAuthzFlow: Send + Sync {
+    /// The app's own `/auth/callback` URL echoed on every exchange (recorded on the pending row).
+    fn redirect_uri(&self) -> &str;
+    /// Build the IdP authorization URL for `provider_id` (`404` for an absent/disabled id).
+    async fn authorize_url(
+        &self,
+        provider_id: &str,
+        state: &str,
+        code_challenge: &str,
+    ) -> Result<String, AuthError>;
+    /// Exchange `code` (replaying `code_verifier`) for `provider_id` into a [`VerifiedIdentity`].
+    async fn exchange(
+        &self,
+        provider_id: &str,
+        code: &str,
+        code_verifier: &str,
+    ) -> Result<VerifiedIdentity, AuthError>;
+}
+
+/// The production [`OauthAuthzFlow`]: the DB-backed resolver builds the authorize URL + runs the
+/// PKCE exchange against the provider selected by `provider_id`. Available with the `oauth` feature.
+#[cfg(feature = "oauth")]
+#[async_trait]
+impl OauthAuthzFlow for crate::DbOauthLogin {
+    fn redirect_uri(&self) -> &str {
+        crate::DbOauthLogin::redirect_uri(self)
+    }
+    async fn authorize_url(
+        &self,
+        provider_id: &str,
+        state: &str,
+        code_challenge: &str,
+    ) -> Result<String, AuthError> {
+        crate::DbOauthLogin::authorize_url(self, provider_id, state, code_challenge).await
+    }
+    async fn exchange(
+        &self,
+        provider_id: &str,
+        code: &str,
+        code_verifier: &str,
+    ) -> Result<VerifiedIdentity, AuthError> {
+        crate::DbOauthLogin::exchange(self, provider_id, code, code_verifier).await
+    }
+}
+
 /// An injected wall clock: seconds since the Unix epoch. Kept abstract so tests pin time.
 pub type Clock = Arc<dyn Fn() -> u64 + Send + Sync>;
 
@@ -456,6 +535,23 @@ pub struct AuthState {
     /// only with the `oauth` feature (the provider store + secret crypto ride it).
     #[cfg(feature = "oauth")]
     pub providers: Option<Arc<dyn ProviderStore>>,
+    /// The OAuth redirect-flow driver behind the PUBLIC `GET /auth/providers/{id}/authorize` +
+    /// `GET /auth/callback` (hq-idp-db.3): builds the IdP authorization URL and runs the PKCE
+    /// exchange. `None` ⇒ those endpoints respond `501`. The production adapter is
+    /// [`DbOauthLogin`](crate::DbOauthLogin) (the same resolver behind [`oauth_login`](Self::oauth_login)).
+    #[cfg(feature = "oauth")]
+    pub authz_flow: Option<Arc<dyn OauthAuthzFlow>>,
+    /// The ephemeral authorize-state store (hq-idp-db.3): holds the per-login `state`+PKCE
+    /// `code_verifier` between `/authorize` and `/callback`. `None` ⇒ those endpoints respond `501`.
+    /// The production adapter is [`PgAuthzStateRepo`](crate::PgAuthzStateRepo).
+    #[cfg(feature = "oauth")]
+    pub authz_state: Option<Arc<dyn AuthzStateStore>>,
+    /// Where `GET /auth/callback` sends the browser after a successful login (hq-idp-db.3): the FE
+    /// landing URL the freshly minted tokens are handed off to (via a short-lived URL fragment, plus
+    /// the httpOnly auth cookies). `None` ⇒ the callback returns the token JSON directly (useful for
+    /// a non-browser client / test). From `GT_OAUTH_FE_REDIRECT_URL`.
+    #[cfg(feature = "oauth")]
+    pub fe_redirect_url: Option<String>,
     /// The verifier's public JWKS, served at `GET /auth/jwks` so clients verify access tokens
     /// offline. Built from the verifier's public keys at the composition root
     /// ([`JwtAuthenticator::jwk_set`](crate::JwtAuthenticator::jwk_set)) — never the signing
@@ -495,11 +591,18 @@ pub fn auth_router(state: AuthState) -> Router {
     // login-only build carries no provider surface.
     #[cfg(feature = "oauth")]
     let router = router
-        .route("/auth/providers", post(create_provider))
+        // PUBLIC discovery (no auth): the FE login page (hq-idp-db.5) fetches this to render a
+        // button per enabled provider — secret-free projection. GET is public; the POST admin CRUD
+        // (system-admin gated) shares the path.
+        .route("/auth/providers", get(list_public_providers).post(create_provider))
         .route(
             "/auth/providers/:id",
             axum::routing::patch(patch_provider).delete(delete_provider),
-        );
+        )
+        // PUBLIC authorize redirect (hq-idp-db.3): 302 to the IdP with state + PKCE challenge.
+        .route("/auth/providers/:id/authorize", get(authorize))
+        // PUBLIC callback (hq-idp-db.3): validate+consume state, redeem the code, issue tokens.
+        .route("/auth/callback", get(callback));
     router.with_state(state)
 }
 
@@ -560,8 +663,20 @@ struct AdminApiDoc;
 #[cfg(feature = "oauth")]
 #[derive(utoipa::OpenApi)]
 #[openapi(
-    paths(create_provider, patch_provider, delete_provider),
-    components(schemas(CreateProviderRequest, PatchProviderRequest, ProviderView)),
+    paths(
+        list_public_providers,
+        authorize,
+        callback,
+        create_provider,
+        patch_provider,
+        delete_provider,
+    ),
+    components(schemas(
+        CreateProviderRequest,
+        PatchProviderRequest,
+        ProviderView,
+        PublicProvider,
+    )),
 )]
 struct ProviderApiDoc;
 
@@ -870,6 +985,41 @@ pub struct ProviderView {
     pub scopes: String,
     /// Whether the provider shows as a login button.
     pub enabled: bool,
+}
+
+/// A login provider as returned by the PUBLIC `GET /auth/providers` (hq-idp-db.3) — the projection
+/// the FE login page renders a button from. Carries ONLY what a login button needs: the id, the
+/// human label, the kind (so the FE can pick an icon), and the relative `authorize_url` to send the
+/// browser to. It NEVER carries the client secret OR the client id / endpoints — strictly less than
+/// even the admin [`ProviderView`], because this surface is unauthenticated.
+#[cfg(feature = "oauth")]
+#[derive(Debug, Serialize)]
+#[cfg_attr(feature = "axum", derive(utoipa::ToSchema))]
+pub struct PublicProvider {
+    /// The id / primary key (also the login-button token).
+    pub id: String,
+    /// The provider variant (`google` / `github` / `microsoft` / `generic`) — for the button icon.
+    pub kind: String,
+    /// The human label for the login button.
+    pub display_name: String,
+    /// The relative URL the FE points the browser at to begin login (the server builds the full IdP
+    /// authorize URL with state + PKCE there, so the FE never holds OAuth parameters).
+    pub authorize_url: String,
+}
+
+#[cfg(feature = "oauth")]
+impl From<ProviderRecord> for PublicProvider {
+    fn from(r: ProviderRecord) -> Self {
+        // The relative authorize link the FE follows; the full IdP URL (with state + PKCE) is built
+        // server-side at `/auth/providers/{id}/authorize`, so no OAuth params leak to the page.
+        let authorize_url = format!("/auth/providers/{}/authorize", r.id);
+        PublicProvider {
+            id: r.id,
+            kind: r.kind.as_str().to_owned(),
+            display_name: r.display_name,
+            authorize_url,
+        }
+    }
 }
 
 #[cfg(feature = "oauth")]
@@ -1423,6 +1573,189 @@ async fn delete_provider(
     }
 }
 
+/// `GET /auth/providers` (PUBLIC, no auth) — the enabled login providers the FE renders buttons for
+/// (hq-idp-db.3). Lists ONLY `enabled = true` providers and projects the secret-free
+/// [`PublicProvider`] (id / kind / display_name / relative authorize_url) — never the client secret
+/// OR the client id / endpoints. `501` when no provider store is configured.
+#[cfg_attr(feature = "axum", utoipa::path(
+    get, path = "/auth/providers", tag = "auth",
+    responses(
+        (status = 200, description = "The enabled login providers (secret-free; for the FE login buttons)", body = Vec<PublicProvider>),
+        (status = 501, description = "No provider store configured"),
+    ),
+))]
+#[cfg(feature = "oauth")]
+async fn list_public_providers(
+    State(state): State<AuthState>,
+) -> Result<Json<Vec<PublicProvider>>, ApiError> {
+    let store = state.providers.as_ref().ok_or(ApiError::NotConfigured)?;
+    let providers = store
+        .list_providers()
+        .await?
+        .into_iter()
+        .filter(|p| p.enabled)
+        .map(PublicProvider::from)
+        .collect();
+    Ok(Json(providers))
+}
+
+/// `GET /auth/providers/{id}/authorize` (PUBLIC, no auth) — begin the authorization-code login
+/// (hq-idp-db.3). Mints a fresh anti-CSRF `state` + PKCE pair, persists the pending handshake
+/// (`state` → `code_verifier`, ~10 min TTL), and 302-redirects the browser to the IdP authorize URL
+/// (`response_type=code`, client id, redirect_uri, scope, `state`, `code_challenge` S256). `404` for
+/// an unknown/disabled id; `501` when the flow/state store is not configured.
+#[cfg_attr(feature = "axum", utoipa::path(
+    get, path = "/auth/providers/{id}/authorize", tag = "auth",
+    params(("id" = String, Path, description = "The enabled provider to begin login with")),
+    responses(
+        (status = 302, description = "Redirect to the IdP authorize URL (carries state + PKCE challenge)"),
+        (status = 404, description = "No enabled provider with that id"),
+        (status = 501, description = "OAuth authorize flow not configured"),
+    ),
+))]
+#[cfg(feature = "oauth")]
+async fn authorize(
+    State(state): State<AuthState>,
+    Path(id): Path<String>,
+) -> Result<Response, ApiError> {
+    let flow = state.authz_flow.as_ref().ok_or(ApiError::NotConfigured)?;
+    let store = state.authz_state.as_ref().ok_or(ApiError::NotConfigured)?;
+    // Fresh anti-CSRF state + PKCE: the `state` is replayed by the IdP on the callback (binding the
+    // round-trip to this browser); the `code_verifier` proves possession at the token exchange.
+    let pkce = crate::new_pkce().map_err(ApiError::Auth)?;
+    let csrf_state = csrf_token().map_err(ApiError::Auth)?;
+    // Build the IdP URL BEFORE persisting, so an unknown/disabled id (404) leaves no orphan row.
+    let url = flow.authorize_url(&id, &csrf_state, &pkce.challenge).await?;
+    let now = (state.now)();
+    store
+        .insert(NewAuthz {
+            state: csrf_state,
+            code_verifier: pkce.verifier,
+            provider_id: id,
+            redirect_uri: flow.redirect_uri().to_owned(),
+            created_at: now,
+            expires_at: now + AUTHZ_STATE_TTL_SECS,
+        })
+        .await?;
+    // An explicit `302 Found` (not axum's `Redirect::to`, which is `303 See Other`) — the OAuth
+    // authorize redirect is conventionally a 302, and the acceptance pins it.
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        header::LOCATION,
+        HeaderValue::from_str(&url)
+            .map_err(|_| ApiError::Auth(AuthError::Backend("invalid authorize URL".into())))?,
+    );
+    Ok((StatusCode::FOUND, headers).into_response())
+}
+
+/// `GET /auth/callback?code&state` (PUBLIC, no auth) — finish the authorization-code login
+/// (hq-idp-db.3). Validates + ONE-SHOT consumes the `state` (a replayed/unknown/expired state is
+/// `401`), resolves the provider, redeems the `code` through the PKCE exchange (replaying the stored
+/// `code_verifier`), and issues the access/refresh pair. Hands the tokens to the FE: when a
+/// `fe_redirect_url` is configured, 302 there with the access token in a URL fragment (plus the
+/// httpOnly auth cookies); otherwise return the token JSON. `401` for a bad state or a rejected code.
+#[cfg_attr(feature = "axum", utoipa::path(
+    get, path = "/auth/callback", tag = "auth",
+    params(
+        ("code" = String, Query, description = "The authorization code returned by the IdP"),
+        ("state" = String, Query, description = "The anti-CSRF state echoed back by the IdP"),
+    ),
+    responses(
+        (status = 200, description = "Authenticated — token pair (when no FE redirect is configured)", body = TokenResponse),
+        (status = 302, description = "Redirect to the FE with the tokens (fragment + httpOnly cookies)"),
+        (status = 401, description = "Unknown/expired/replayed state, or a rejected code"),
+        (status = 501, description = "OAuth callback flow not configured"),
+    ),
+))]
+#[cfg(feature = "oauth")]
+async fn callback(
+    State(state): State<AuthState>,
+    axum::extract::Query(params): axum::extract::Query<CallbackParams>,
+) -> Result<Response, ApiError> {
+    let flow = state.authz_flow.as_ref().ok_or(ApiError::NotConfigured)?;
+    let store = state.authz_state.as_ref().ok_or(ApiError::NotConfigured)?;
+    // One-shot consume: an unknown / already-used `state` is gone, so this is the anti-CSRF +
+    // replay gate. A `401` (not `404`) — the caller must restart the flow.
+    let pending = store
+        .consume(&params.state)
+        .await?
+        .ok_or(ApiError::Unauthenticated)?;
+    // Reject an expired pending row (the TTL elapsed between authorize and callback).
+    if (state.now)() > pending.expires_at {
+        return Err(ApiError::Unauthenticated);
+    }
+    // Redeem the code through the PKCE exchange (replaying the stored verifier) → VerifiedIdentity,
+    // the same value the password path yields.
+    let identity = flow
+        .exchange(&pending.provider_id, &params.code, &pending.code_verifier)
+        .await?;
+    let tokens = issue_tokens(&state, identity.sub, identity.workspace, identity.scopes).await?;
+    let mut headers = set_token_cookies(&state, &tokens);
+    match state.fe_redirect_url.as_deref() {
+        // Browser handoff: 302 to the FE with the access token in a short-lived URL fragment (never
+        // a query string — fragments are not sent to the server / logged), alongside the httpOnly
+        // cookies the same-origin app reads. The FE strips the fragment after reading it.
+        Some(fe) => {
+            let location = format!(
+                "{fe}#access_token={}&token_type=Bearer&expires_in={}",
+                url_encode(&tokens.access_token),
+                tokens.expires_in
+            );
+            headers.insert(
+                header::LOCATION,
+                HeaderValue::from_str(&location)
+                    .map_err(|_| ApiError::Auth(AuthError::Backend("invalid FE redirect URL".into())))?,
+            );
+            Ok((StatusCode::FOUND, headers).into_response())
+        }
+        // No FE configured: return the token JSON directly (non-browser client / test).
+        None => Ok((headers, Json(tokens)).into_response()),
+    }
+}
+
+/// `GET /auth/callback` query parameters: the IdP-returned authorization `code` and the `state`
+/// echoed back from `/authorize`.
+#[cfg(feature = "oauth")]
+#[derive(Debug, Deserialize)]
+pub struct CallbackParams {
+    /// The authorization code the IdP returned to the redirect URI.
+    pub code: String,
+    /// The anti-CSRF state echoed back — validated + consumed against the pending store.
+    pub state: String,
+}
+
+/// The TTL of a pending `/authorize` handshake — 10 minutes is ample for a human IdP round-trip
+/// while keeping a leaked/abandoned `state` short-lived (hq-idp-db.3).
+#[cfg(feature = "oauth")]
+const AUTHZ_STATE_TTL_SECS: u64 = 600;
+
+/// A fresh anti-CSRF `state`: 32 CSPRNG bytes, base64url (no padding). High-entropy + opaque, so it
+/// is both unguessable (CSRF defence) and a safe primary key for the pending-state row.
+#[cfg(feature = "oauth")]
+fn csrf_token() -> Result<String, AuthError> {
+    use base64::Engine as _;
+    let mut raw = [0u8; 32];
+    getrandom::getrandom(&mut raw)
+        .map_err(|e| AuthError::Backend(format!("OS CSPRNG for CSRF state: {e}")))?;
+    Ok(base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(raw))
+}
+
+/// Percent-encode a value for a URL fragment/query (the auth callback's FE handoff). Same minimal
+/// RFC 3986 unreserved-keep encoder the `oauth` adapter uses for the authorize URL.
+#[cfg(feature = "oauth")]
+fn url_encode(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for &b in s.as_bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(b as char)
+            }
+            _ => out.push_str(&format!("%{b:02X}")),
+        }
+    }
+    out
+}
+
 #[cfg(feature = "oauth")]
 impl CreateProviderRequest {
     /// Turn the request into a [`NewProvider`], filling a preset kind's baked endpoints/scopes when
@@ -1913,6 +2246,12 @@ mod tests {
             membership_admin: None,
             #[cfg(feature = "oauth")]
             providers: None,
+            #[cfg(feature = "oauth")]
+            authz_flow: None,
+            #[cfg(feature = "oauth")]
+            authz_state: None,
+            #[cfg(feature = "oauth")]
+            fe_redirect_url: None,
             // Publish the public half of the same "k1" key the minter signs with.
             jwks: Arc::new(
                 JwtAuthenticator::from_kid_pems([("k1", PUB_PEM)]).unwrap().jwk_set(),
@@ -2834,6 +3173,394 @@ mod tests {
             let paths: Vec<&str> = doc.paths.paths.keys().map(String::as_str).collect();
             assert!(paths.contains(&"/auth/providers"), "{paths:?}");
             assert!(paths.contains(&"/auth/providers/{id}"), "{paths:?}");
+        }
+    }
+
+    // --- Public discovery + authorize/callback redirect flow (hq-idp-db.3) ----------------------
+    #[cfg(feature = "oauth")]
+    mod authz_flow {
+        use super::*;
+        use crate::provider_repo::{NewProvider, ProviderKind as RepoKind, ProviderRecord, ProviderRepo};
+        use crate::{NewAuthz, PendingAuthz};
+        use std::collections::HashMap;
+        use std::sync::Mutex;
+
+        /// An in-memory [`ProviderStore`] + [`ProviderRepo`] over a fixed record set — enough to
+        /// drive both the public discovery projection and the `DbOauthLogin` resolver.
+        #[derive(Default)]
+        struct MapProviders {
+            rows: Mutex<Vec<ProviderRecord>>,
+        }
+        #[async_trait]
+        impl ProviderStore for MapProviders {
+            async fn list_providers(&self) -> Result<Vec<ProviderRecord>, AuthError> {
+                Ok(self.rows.lock().unwrap().clone())
+            }
+            async fn create_provider(&self, _p: NewProvider) -> Result<ProviderRecord, AuthError> {
+                unreachable!()
+            }
+            async fn patch_provider(
+                &self,
+                _id: &str,
+                _p: PatchProvider,
+            ) -> Result<Option<ProviderRecord>, AuthError> {
+                unreachable!()
+            }
+            async fn delete_provider(&self, _id: &str) -> Result<bool, AuthError> {
+                unreachable!()
+            }
+        }
+        #[async_trait]
+        impl ProviderRepo for MapProviders {
+            async fn list(&self) -> Result<Vec<ProviderRecord>, AuthError> {
+                Ok(self.rows.lock().unwrap().clone())
+            }
+            async fn get(&self, id: &str) -> Result<Option<ProviderRecord>, AuthError> {
+                Ok(self.rows.lock().unwrap().iter().find(|r| r.id == id).cloned())
+            }
+            async fn create(&self, _p: NewProvider) -> Result<ProviderRecord, AuthError> {
+                unreachable!()
+            }
+            async fn patch(
+                &self,
+                _id: &str,
+                _p: PatchProvider,
+            ) -> Result<Option<ProviderRecord>, AuthError> {
+                unreachable!()
+            }
+            async fn delete(&self, _id: &str) -> Result<bool, AuthError> {
+                unreachable!()
+            }
+        }
+
+        /// An in-memory one-shot [`AuthzStateStore`]: insert + delete-on-read, exactly the durable
+        /// adapter's contract (so the replay rejection is exercised without Postgres).
+        #[derive(Default)]
+        struct MemAuthzState {
+            rows: Mutex<HashMap<String, PendingAuthz>>,
+        }
+        #[async_trait]
+        impl AuthzStateStore for MemAuthzState {
+            async fn insert(&self, authz: NewAuthz) -> Result<(), AuthError> {
+                self.rows.lock().unwrap().insert(
+                    authz.state.clone(),
+                    PendingAuthz {
+                        state: authz.state,
+                        code_verifier: authz.code_verifier,
+                        provider_id: authz.provider_id,
+                        redirect_uri: authz.redirect_uri,
+                        expires_at: authz.expires_at,
+                    },
+                );
+                Ok(())
+            }
+            async fn consume(&self, state: &str) -> Result<Option<PendingAuthz>, AuthError> {
+                Ok(self.rows.lock().unwrap().remove(state))
+            }
+        }
+
+        /// A generic-kind record whose endpoints point at `base`, sealing `secret` with the test key.
+        fn record(base: &str, id: &str, enabled: bool) -> ProviderRecord {
+            std::env::set_var(
+                crate::ENV_SECRET_KEY,
+                "0000000000000000000000000000000000000000000000000000000000000000",
+            );
+            ProviderRecord {
+                id: id.into(),
+                kind: RepoKind::Generic,
+                display_name: "Corp SSO".into(),
+                client_id: "gt-client".into(),
+                client_secret_enc: crate::crypto::seal(b"s3cret").unwrap(),
+                issuer: format!("{base}/"),
+                authorize_endpoint: format!("{base}/authorize"),
+                token_endpoint: format!("{base}/token"),
+                userinfo_endpoint: format!("{base}/userinfo"),
+                scopes: "rig.read".into(),
+                enabled,
+            }
+        }
+
+        /// Spin up a throwaway in-process IdP: `/token` swaps `good-code` (with the right
+        /// `code_verifier` present) for an access token; `/userinfo` resolves it to a `sub`.
+        async fn spawn_idp() -> String {
+            use axum::extract::Form;
+            use axum::routing::{get as axget, post as axpost};
+            async fn token(Form(form): Form<HashMap<String, String>>) -> Result<Json<serde_json::Value>, StatusCode> {
+                // The PKCE verifier MUST have reached the token endpoint (proves the exchange
+                // threaded it through).
+                if form.get("code").map(String::as_str) == Some("good-code")
+                    && form.get("code_verifier").map(|v| !v.is_empty()).unwrap_or(false)
+                {
+                    Ok(Json(serde_json::json!({ "access_token": "tok-1", "token_type": "Bearer" })))
+                } else {
+                    Err(StatusCode::BAD_REQUEST)
+                }
+            }
+            async fn userinfo(headers: HeaderMap) -> Result<Json<serde_json::Value>, StatusCode> {
+                let ok = headers
+                    .get("authorization")
+                    .and_then(|v| v.to_str().ok())
+                    .map(|v| v == "Bearer tok-1")
+                    .unwrap_or(false);
+                if ok {
+                    Ok(Json(serde_json::json!({ "sub": "carol-sub" })))
+                } else {
+                    Err(StatusCode::UNAUTHORIZED)
+                }
+            }
+            let app = Router::new()
+                .route("/token", axpost(token))
+                .route("/userinfo", axget(userinfo));
+            let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+            let base = format!("http://{}", listener.local_addr().unwrap());
+            tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+            base
+        }
+
+        /// Build an [`AuthState`] wired with the discovery store + the DB resolver as both
+        /// `authz_flow` and `oauth_login`, plus the in-memory state store. `fe` is the optional FE
+        /// redirect URL.
+        fn flow_state(base: &str, fe: Option<&str>) -> (AuthState, Arc<MemAuthzState>) {
+            let providers = Arc::new(MapProviders::default());
+            providers
+                .rows
+                .lock()
+                .unwrap()
+                .push(record(base, "corp", true));
+            // A disabled provider must NOT appear in discovery.
+            providers
+                .rows
+                .lock()
+                .unwrap()
+                .push(record(base, "off", false));
+            let resolver = Arc::new(
+                crate::DbOauthLogin::new(
+                    providers.clone() as Arc<dyn ProviderRepo>,
+                    "acme",
+                    "https://gt.test/auth/callback",
+                )
+                .unwrap(),
+            );
+            let authz_state = Arc::new(MemAuthzState::default());
+            let st = AuthState {
+                providers: Some(providers as Arc<dyn ProviderStore>),
+                authz_flow: Some(resolver as Arc<dyn OauthAuthzFlow>),
+                authz_state: Some(authz_state.clone() as Arc<dyn AuthzStateStore>),
+                fe_redirect_url: fe.map(str::to_owned),
+                ..state()
+            };
+            (st, authz_state)
+        }
+
+        /// Pull the single `Location` header off a response.
+        fn location(resp: &axum::response::Response) -> String {
+            resp.headers().get(header::LOCATION).unwrap().to_str().unwrap().to_owned()
+        }
+
+        /// `GET /auth/providers` lists ONLY the enabled provider and leaks NO secret (or client id).
+        #[tokio::test]
+        async fn public_discovery_lists_enabled_without_secret() {
+            let base = spawn_idp().await;
+            let (st, _) = flow_state(&base, None);
+            let app = auth_router(st);
+            let resp = app
+                .oneshot(Request::builder().uri("/auth/providers").body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::OK);
+            let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+            let body = String::from_utf8(bytes.to_vec()).unwrap();
+            let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+            let arr = v.as_array().unwrap();
+            assert_eq!(arr.len(), 1, "only the enabled provider: {body}");
+            assert_eq!(arr[0]["id"], "corp");
+            assert_eq!(arr[0]["authorize_url"], "/auth/providers/corp/authorize");
+            // No secret material — and not even the client id / endpoints — on the public surface.
+            assert!(!body.contains("s3cret") && !body.contains("client_secret"));
+            assert!(!body.contains("gt-client") && !body.contains("token"));
+        }
+
+        /// `/authorize` 302s to the IdP with `state` + the S256 `code_challenge` in the Location.
+        #[tokio::test]
+        async fn authorize_redirects_with_state_and_pkce_challenge() {
+            let base = spawn_idp().await;
+            let (st, store) = flow_state(&base, None);
+            let app = auth_router(st);
+            let resp = app
+                .oneshot(
+                    Request::builder()
+                        .uri("/auth/providers/corp/authorize")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::FOUND);
+            let loc = location(&resp);
+            assert!(loc.starts_with(&format!("{base}/authorize?")), "loc: {loc}");
+            assert!(loc.contains("response_type=code"));
+            assert!(loc.contains("code_challenge="));
+            assert!(loc.contains("code_challenge_method=S256"));
+            assert!(loc.contains("state="));
+            // The pending row was persisted under exactly the `state` sent to the IdP.
+            let state_param = loc
+                .split("state=")
+                .nth(1)
+                .unwrap()
+                .split('&')
+                .next()
+                .unwrap()
+                .to_owned();
+            assert!(store.rows.lock().unwrap().contains_key(&state_param));
+
+            // An unknown / disabled id is a 404, with no orphan state row left behind.
+            for id in ["nope", "off"] {
+                let r = auth_router(flow_state(&base, None).0)
+                    .oneshot(
+                        Request::builder()
+                            .uri(format!("/auth/providers/{id}/authorize"))
+                            .body(Body::empty())
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(r.status(), StatusCode::NOT_FOUND, "id {id}");
+            }
+        }
+
+        /// Full roundtrip: authorize → carry the state → callback with the mock code issues tokens;
+        /// the state is consumed once (a replay is rejected `401`).
+        #[tokio::test]
+        async fn authorize_then_callback_issues_tokens_and_state_is_one_shot() {
+            let base = spawn_idp().await;
+            let (st, _store) = flow_state(&base, None);
+            let app = auth_router(st);
+
+            // Authorize, capture the state the server minted.
+            let authz = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri("/auth/providers/corp/authorize")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            let loc = location(&authz);
+            let state_param = loc
+                .split("state=")
+                .nth(1)
+                .unwrap()
+                .split('&')
+                .next()
+                .unwrap()
+                .to_owned();
+
+            // Callback with the mock `code` + that `state`: no FE configured ⇒ token JSON back.
+            let cb = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri(format!("/auth/callback?code=good-code&state={state_param}"))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(cb.status(), StatusCode::OK);
+            let bytes = axum::body::to_bytes(cb.into_body(), usize::MAX).await.unwrap();
+            let body = String::from_utf8(bytes.to_vec()).unwrap();
+            let (access, refresh) = token_pair(&body);
+            assert!(!access.is_empty() && !refresh.is_empty());
+
+            // Replaying the same state is rejected (the row was consumed one-shot) → 401.
+            let replay = app
+                .oneshot(
+                    Request::builder()
+                        .uri(format!("/auth/callback?code=good-code&state={state_param}"))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(replay.status(), StatusCode::UNAUTHORIZED);
+        }
+
+        /// An unknown `state` at the callback is a 401 (anti-CSRF), never a token.
+        #[tokio::test]
+        async fn callback_with_unknown_state_is_401() {
+            let base = spawn_idp().await;
+            let (st, _) = flow_state(&base, None);
+            let app = auth_router(st);
+            let resp = app
+                .oneshot(
+                    Request::builder()
+                        .uri("/auth/callback?code=good-code&state=never-issued")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+        }
+
+        /// With a FE redirect configured, the callback 302s there with the access token in a
+        /// fragment (plus the auth cookies).
+        #[tokio::test]
+        async fn callback_hands_tokens_to_the_fe_via_fragment() {
+            let base = spawn_idp().await;
+            let (st, _) = flow_state(&base, Some("https://app.gt.test/auth/landed"));
+            let app = auth_router(st);
+            let authz = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri("/auth/providers/corp/authorize")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            let loc = location(&authz);
+            let state_param = loc.split("state=").nth(1).unwrap().split('&').next().unwrap().to_owned();
+            let cb = app
+                .oneshot(
+                    Request::builder()
+                        .uri(format!("/auth/callback?code=good-code&state={state_param}"))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(cb.status(), StatusCode::FOUND);
+            let dest = location(&cb);
+            assert!(dest.starts_with("https://app.gt.test/auth/landed#access_token="), "dest: {dest}");
+            assert!(dest.contains("token_type=Bearer"));
+            // The httpOnly auth cookies rode along.
+            assert!(cb
+                .headers()
+                .get_all(header::SET_COOKIE)
+                .iter()
+                .any(|c| c.to_str().unwrap().starts_with("gt_web_token=")));
+        }
+
+        /// Without a flow/state store the public redirect endpoints are 501 (login unaffected).
+        #[tokio::test]
+        async fn flow_endpoints_501_without_configuration() {
+            // Default state(): authz_flow + authz_state are None.
+            let app = auth_router(state());
+            let a = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri("/auth/providers/corp/authorize")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(a.status(), StatusCode::NOT_IMPLEMENTED);
         }
     }
 }

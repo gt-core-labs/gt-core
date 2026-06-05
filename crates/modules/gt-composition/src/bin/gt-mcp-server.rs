@@ -608,6 +608,10 @@ async fn main() -> anyhow::Result<()> {
                 // OAuth/OIDC login resolver (`DbOauthLogin`) has rows to resolve a `provider_id`
                 // against. Idempotent CREATE ... IF NOT EXISTS like the rest.
                 gt_auth::migrations::CREATE_OAUTH_PROVIDERS,
+                // hq-idp-db.3: the ephemeral authorize-state + PKCE store, so the public
+                // `/authorize`→`/callback` redirect flow has somewhere durable to park the
+                // per-login `state`+`code_verifier` (one-shot, ~10 min TTL).
+                gt_auth::migrations::CREATE_OAUTH_AUTHZ_STATE,
             ] {
                 sqlx::raw_sql(sql)
                     .execute(&pool)
@@ -627,6 +631,12 @@ async fn main() -> anyhow::Result<()> {
             // One PgUsers backs the login port, the user-admin store (hq-web-extras.5), and the
             // role-admin store (hq-rbac.4) — one adapter over the ws_default pool.
             let pg_users = Arc::new(PgUsers::new(pool.clone(), "default"));
+            // hq-idp-db.3: the public OAuth redirect-login flow. One DB-backed resolver
+            // (`DbOauthLogin`) drives BOTH `oauth_login` (the JSON `/login` code path) and
+            // `authz_flow` (the `/authorize`→`/callback` redirect), so they share the same provider
+            // store + redirect URI. Built once here; `None` without the `oauth` feature.
+            #[cfg(feature = "oauth")]
+            let db_oauth = db_oauth_resolver(pool.clone());
             let login_state = LoginState {
                 // hq-identity.4: login now authenticates against the GLOBAL identity and resolves
                 // the active workspace from membership (default = first), replacing the per-ws
@@ -639,7 +649,12 @@ async fn main() -> anyhow::Result<()> {
                 // `provider_id` selects the registered provider per request — no redeploy to add
                 // one. Without the `oauth` feature there is no HTTP client, so it stays `None` and
                 // an OAuth/OIDC login responds 501.
-                oauth_login: oidc_login_from_db(pool.clone()),
+                #[cfg(feature = "oauth")]
+                oauth_login: db_oauth
+                    .clone()
+                    .map(|r| r as Arc<dyn gt_auth::LoginProvider>),
+                #[cfg(not(feature = "oauth"))]
+                oauth_login: None,
                 users: Some(pg_users.clone() as Arc<dyn gt_auth::UserStore>),
                 roles: Some(pg_users.clone() as Arc<dyn gt_auth::RoleStore>),
                 // Cross-workspace surface (hq-identity.3): list memberships + switch active
@@ -657,6 +672,25 @@ async fn main() -> anyhow::Result<()> {
                     Arc::new(gt_auth::PgProviderRepo::new(pool.clone()))
                         as Arc<dyn gt_auth::ProviderStore>,
                 ),
+                // hq-idp-db.3: the PUBLIC OAuth redirect-login flow. `authz_flow` is the same
+                // `DbOauthLogin` resolver as `oauth_login` (it builds the IdP authorize URL +
+                // runs the PKCE exchange); `authz_state` is the durable, one-shot state+PKCE store
+                // (`public.oauth_authz_state`, migrated above), so an in-flight login survives a
+                // redeploy. `fe_redirect_url` is where `/auth/callback` hands the tokens off after a
+                // successful login (None ⇒ returns the token JSON, for a non-browser client).
+                #[cfg(feature = "oauth")]
+                authz_flow: db_oauth
+                    .clone()
+                    .map(|r| r as Arc<dyn gt_auth::OauthAuthzFlow>),
+                #[cfg(feature = "oauth")]
+                authz_state: db_oauth.as_ref().map(|_| {
+                    Arc::new(gt_auth::PgAuthzStateRepo::new(pool.clone()))
+                        as Arc<dyn gt_auth::AuthzStateStore>
+                }),
+                #[cfg(feature = "oauth")]
+                fe_redirect_url: std::env::var("GT_OAUTH_FE_REDIRECT_URL")
+                    .ok()
+                    .filter(|v| !v.trim().is_empty()),
                 minter: Arc::new(minter),
                 // Durable refresh store (hq-platform-hardening.1): PgRefreshStore over the same
                 // ws_default pool, so a refresh token survives a gt-mcp-server redeploy instead of
@@ -1258,28 +1292,30 @@ fn env_u64(key: &str, default: u64) -> u64 {
 /// echoed on every exchange; required) and `GT_OIDC_WORKSPACE` (the tenant a resolved OAuth identity
 /// lands in; defaults to `default`). A missing redirect URI is fatal — it must not silently resolve
 /// to a blank callback.
-#[allow(unused_variables)]
-fn oidc_login_from_db(pool: sqlx::PgPool) -> Option<Arc<dyn gt_auth::LoginProvider>> {
-    #[cfg(feature = "oauth")]
-    {
-        let redirect_uri = std::env::var(gt_auth::ENV_REDIRECT_URI)
-            .ok()
-            .filter(|v| !v.trim().is_empty())
-            .expect("GT_OIDC_REDIRECT_URI must be set for the DB-backed OAuth login");
-        let workspace = std::env::var(gt_auth::ENV_WORKSPACE)
-            .ok()
-            .filter(|v| !v.trim().is_empty())
-            .unwrap_or_else(|| "default".to_owned());
-        let repo = Arc::new(gt_auth::PgProviderRepo::new(pool)) as Arc<dyn gt_auth::ProviderRepo>;
-        let resolver = gt_auth::DbOauthLogin::new(repo, workspace, redirect_uri)
-            .expect("build the DB-backed OAuth login resolver");
-        eprintln!("[gt-mcp-server] oauth/oidc login enabled (DB-backed provider store)");
-        Some(Arc::new(resolver) as Arc<dyn gt_auth::LoginProvider>)
-    }
-    #[cfg(not(feature = "oauth"))]
-    {
-        None
-    }
+/// The concrete DB-backed OAuth resolver (`DbOauthLogin`) over `pool`, shared by `oauth_login` (the
+/// JSON `/login` code path) and `authz_flow` (the public `/authorize`→`/callback` redirect, with
+/// `state`+PKCE — hq-idp-db.3). Returning the CONCRETE type (not a trait object) lets the call site
+/// cast the single `Arc` to both ports, so they agree on the provider store + redirect URI. The
+/// per-deploy bits not in a provider row still come from env: `GT_OIDC_REDIRECT_URI` (the app's own
+/// `/auth/callback` URL, echoed + recorded on every flow; REQUIRED) and `GT_OIDC_WORKSPACE` (the
+/// tenant a resolved OAuth identity lands in; defaults to `default`).
+#[cfg(feature = "oauth")]
+fn db_oauth_resolver(pool: sqlx::PgPool) -> Option<Arc<gt_auth::DbOauthLogin>> {
+    let redirect_uri = std::env::var(gt_auth::ENV_REDIRECT_URI)
+        .ok()
+        .filter(|v| !v.trim().is_empty())
+        .expect("GT_OIDC_REDIRECT_URI must be set for the DB-backed OAuth login");
+    let workspace = std::env::var(gt_auth::ENV_WORKSPACE)
+        .ok()
+        .filter(|v| !v.trim().is_empty())
+        .unwrap_or_else(|| "default".to_owned());
+    let repo = Arc::new(gt_auth::PgProviderRepo::new(pool)) as Arc<dyn gt_auth::ProviderRepo>;
+    let resolver = gt_auth::DbOauthLogin::new(repo, workspace, redirect_uri)
+        .expect("build the DB-backed OAuth login resolver");
+    eprintln!(
+        "[gt-mcp-server] oauth/oidc login enabled (DB-backed provider store; public /authorize+/callback with state+PKCE)"
+    );
+    Some(Arc::new(resolver))
 }
 
 fn cookie_secure() -> bool {
