@@ -14,7 +14,7 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/*
 COPY . .
 RUN cargo build --release --locked -p gt-composition --bin gt-mcp-server \
-       --features embeddings-fastembed
+       --features embeddings-fastembed,oauth
 
 FROM debian:bookworm-slim
 # git: S3 readiness clause (docs/10 §S4). libssl3: openssl runtime for the embedding stack's
