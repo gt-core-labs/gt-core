@@ -5,7 +5,8 @@ keywords = ["mcp", "rmcp", "proxy", "gt-core"]
 categories = ["api-bindings", "command-line-utilities"]
 readme = "README.md"
 edition.workspace = true
-version.workspace = true
+# Own version cadence (published independently of the monorepo workspace version).
+version = "0.2.0"
 license.workspace = true
 authors.workspace = true
 # Published publicly under gt-core-labs; the CLI (`gt`) depends on this crate so the

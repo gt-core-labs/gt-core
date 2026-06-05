@@ -9,8 +9,11 @@
 //! - [`proxy::run`] — the stdio↔HTTP MCP bridge `gt mcp` runs: it serves a stdio MCP
 //!   server and forwards every request to the remote `/mcp` streamable-HTTP transport,
 //!   injecting a bearer token and an `X-Workspace` header.
+//! - [`invoke`] — one-shot MCP calls (`call_tool`/`list_tools`/`list_resources`/
+//!   `read_resource`) backing the `gt mcp call|list|resources|resource` shell surface.
 
 pub mod client;
+pub mod invoke;
 pub mod proxy;
 
 pub use client::{Client, Rig, Tokens, Workspace};
