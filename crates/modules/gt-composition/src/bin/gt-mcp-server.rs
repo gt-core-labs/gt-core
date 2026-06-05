@@ -13,6 +13,9 @@
 //! - `GT_PG_URL` — Postgres backing the domain handlers (workspace.*, …). Unset ⇒
 //!   the domain router is empty, so the server serves issues + meta only.
 //! - `GT_MCP_HTTP_BIND` — listen address, default `127.0.0.1:8765`.
+//! - `GT_MCP_ALLOWED_HOSTS` — extra `Host` authorities the /mcp transport accepts, appended to
+//!   the loopback defaults (comma-separated). Set the served domain here for a public deploy
+//!   behind a reverse proxy; unset ⇒ loopback-only.
 //! - `GT_MCP_ACTOR` — scope actor, default `mcp-local`.
 //! - `GT_MCP_SCOPE_CONFIG` — RBAC TOML/JSON path; unset ⇒ deny-by-default.
 //! - `GT_REPO_DIR` — gt-core checkout whose `main` tree backs surface validation
@@ -239,10 +242,28 @@ async fn main() -> anyhow::Result<()> {
     // `service` is moved into the transport factory below.
     let health_state = HealthState::new(service.workspaces());
 
+    // Streamable-HTTP Host allow-list (rmcp's DNS-rebinding guard). The default only
+    // accepts loopback authorities (localhost/127.0.0.1/::1), so a public deploy behind a
+    // reverse proxy — where the inbound `Host` is the served domain — would have every /mcp
+    // request rejected. GT_MCP_ALLOWED_HOSTS (comma-separated host or host:port authorities)
+    // is APPENDED to the loopback defaults, so local clients keep working and the deploy adds
+    // its own domain (e.g. `gt.codecsrayo.com`). Unset ⇒ loopback-only, exactly as before.
+    let mut http_config = StreamableHttpServerConfig::default();
+    if let Ok(raw) = std::env::var("GT_MCP_ALLOWED_HOSTS") {
+        let extra: Vec<String> = raw
+            .split(',')
+            .map(|h| h.trim().to_string())
+            .filter(|h| !h.is_empty())
+            .collect();
+        if !extra.is_empty() {
+            eprintln!("[gt-mcp-server] allowed_hosts += {extra:?} (public reverse-proxy deploy)");
+            http_config.allowed_hosts.extend(extra);
+        }
+    }
     let http = StreamableHttpService::new(
         move || Ok(service.clone()),
         Arc::new(LocalSessionManager::default()),
-        StreamableHttpServerConfig::default(),
+        http_config,
     );
     // The RS256 verifier, built once and shared by the SSE feed's cookie auth and the REST
     // auth chain below. Env-gated (GT_JWT_RS256_KEYS / GT_JWT_RS256_PUBLIC_KEY_FILE): a deploy
