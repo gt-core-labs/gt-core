@@ -15,10 +15,13 @@
 //! back to pre-refactor behaviour instead of blocking writes.
 
 use std::collections::HashSet;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::Arc;
 
-use gt_issues::{AllowAllTree, CommitInfo, CommitInspector, SurfaceTree};
+use gt_issues::{
+    AllowAllTree, CommitInfo, CommitInspector, InspectorProvider, SurfaceProvider, SurfaceTree,
+};
 
 /// A snapshot of the `main` git tree: the flat set of every blob path returned by
 /// `git ls-tree -r --name-only main`. [`SurfaceTree::contains`] treats a surface
@@ -85,17 +88,17 @@ pub fn surface_tree(repo_dir: Option<&Path>) -> Box<dyn SurfaceTree + Send + Syn
 /// [`CommitInspector`] over a real git checkout (hq-core-mcp.10, §S2). Resolves a
 /// closing `commit_sha` to its full form, verifies it is reachable from `main`,
 /// and lists the paths it changed.
-pub struct GitCommitInspector<'a> {
-    repo_dir: &'a Path,
+pub struct GitCommitInspector {
+    repo_dir: PathBuf,
 }
 
-impl<'a> GitCommitInspector<'a> {
+impl GitCommitInspector {
     fn run(&self, args: &[&str]) -> std::io::Result<std::process::Output> {
-        Command::new("git").arg("-C").arg(self.repo_dir).args(args).output()
+        Command::new("git").arg("-C").arg(&self.repo_dir).args(args).output()
     }
 }
 
-impl CommitInspector for GitCommitInspector<'_> {
+impl CommitInspector for GitCommitInspector {
     fn inspect(&self, sha: &str) -> Option<CommitInfo> {
         // Resolve to a canonical commit sha; rejects a non-commit / unknown ref.
         let rev = self.run(&["rev-parse", "--verify", &format!("{sha}^{{commit}}")]).ok()?;
@@ -133,8 +136,68 @@ impl CommitInspector for GitCommitInspector<'_> {
 /// else `None` (delivery verification skipped, `delivered_sha` left NULL). Unlike
 /// the surface tree, a missing repo yields `None` rather than a permissive
 /// adapter — verification is opt-in, and absent it the close must NOT be rejected.
-pub fn commit_inspector(repo_dir: Option<&Path>) -> Option<GitCommitInspector<'_>> {
-    repo_dir.map(|repo_dir| GitCommitInspector { repo_dir })
+pub fn commit_inspector(repo_dir: Option<&Path>) -> Option<GitCommitInspector> {
+    repo_dir.map(|repo_dir| GitCommitInspector { repo_dir: repo_dir.to_path_buf() })
+}
+
+/// REST-path [`SurfaceProvider`] (`hq-platform-hardening.4/.5`): snapshots the
+/// `main` tree per request via [`surface_tree`] so the `?ready` frontier (S4) and
+/// the create/update surface check (S3) see freshly-merged paths without a server
+/// restart, exactly as the MCP path rebuilds the tree per call. The composition bin
+/// wires one from `GT_REPO_DIR`; without it the REST state keeps its accept-all
+/// default. A git failure degrades to [`AllowAllTree`] inside `surface_tree`.
+pub struct GitSurfaceProvider {
+    repo_dir: PathBuf,
+}
+
+impl GitSurfaceProvider {
+    /// Build a provider over the gt-core checkout at `repo_dir`.
+    pub fn new(repo_dir: PathBuf) -> Self {
+        Self { repo_dir }
+    }
+}
+
+impl SurfaceProvider for GitSurfaceProvider {
+    fn surface_tree(&self) -> Box<dyn SurfaceTree + Send + Sync> {
+        surface_tree(Some(&self.repo_dir))
+    }
+}
+
+/// REST-path [`InspectorProvider`] (`hq-platform-hardening.5`): yields a fresh
+/// git-backed [`GitCommitInspector`] per close so the REST close verifies the
+/// delivering commit (S2) against `main` exactly as the MCP close path does.
+pub struct GitInspectorProvider {
+    repo_dir: PathBuf,
+}
+
+impl GitInspectorProvider {
+    /// Build a provider over the gt-core checkout at `repo_dir`.
+    pub fn new(repo_dir: PathBuf) -> Self {
+        Self { repo_dir }
+    }
+}
+
+impl InspectorProvider for GitInspectorProvider {
+    fn commit_inspector(&self) -> Option<Box<dyn CommitInspector + Send + Sync>> {
+        Some(Box::new(GitCommitInspector { repo_dir: self.repo_dir.clone() }))
+    }
+}
+
+/// Build the REST git-verification providers from `repo_dir` (`hq-platform-hardening.5`):
+/// `Some((surfaces, inspectors))` when a repo is configured so the bin wires them into
+/// [`IssuesApiState::with_git_verification`], `None` when no repo is set so the REST
+/// surface keeps its accept-all S3 + skipped-S2 defaults — the degraded mode the MCP
+/// path runs in when `GT_REPO_DIR` is unset.
+pub fn rest_verification_providers(
+    repo_dir: Option<&Path>,
+) -> Option<(Arc<dyn SurfaceProvider>, Arc<dyn InspectorProvider>)> {
+    repo_dir.map(|dir| {
+        let surfaces: Arc<dyn SurfaceProvider> =
+            Arc::new(GitSurfaceProvider::new(dir.to_path_buf()));
+        let inspectors: Arc<dyn InspectorProvider> =
+            Arc::new(GitInspectorProvider::new(dir.to_path_buf()));
+        (surfaces, inspectors)
+    })
 }
 
 #[cfg(test)]

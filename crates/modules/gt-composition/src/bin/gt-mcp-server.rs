@@ -139,7 +139,7 @@ async fn main() -> anyhow::Result<()> {
         .transpose()
         .context("GT_DOLT_BASE_URL is malformed")?
         .map(Arc::new);
-    let issues_api = match &issues_workspaces {
+    let mut issues_api = match &issues_workspaces {
         Some(pools) => {
             eprintln!("[gt-mcp-server] issues REST: per-workspace routing on (X-Workspace/claim selects hq_<ws>)");
             IssuesApiState::new(store.clone(), actor.clone()).with_workspaces(pools.clone())
@@ -148,6 +148,24 @@ async fn main() -> anyhow::Result<()> {
     }
     // SSE feed (hq-issues-sse): a REST mutation publishes its event into the per-workspace log.
     .with_event_sink(issue_sink.clone());
+    // S2/S3 git verification on the REST surface (hq-platform-hardening.5) + the
+    // `?ready` frontier's git tree (hq-platform-hardening.4): when GT_REPO_DIR is
+    // set, wire the same git-backed surface tree + commit inspector the MCP path
+    // uses so REST create/update reject a non-existent surface (S3) and REST close
+    // verifies the delivering commit (S2). Unset ⇒ the state keeps its accept-all
+    // S3 + skipped-S2 defaults, the degraded mode the MCP path runs in with no repo.
+    if let Some((surfaces, inspectors)) =
+        gt_mcp_server::git_tree::rest_verification_providers(repo_dir.as_deref())
+    {
+        issues_api = issues_api.with_git_verification(surfaces, inspectors);
+        eprintln!(
+            "[gt-mcp-server] issues REST: git S2/S3 verification on (surface existence + delivered-commit)"
+        );
+    } else {
+        eprintln!(
+            "[gt-mcp-server] issues REST: GT_REPO_DIR unset; S3 accept-all, S2 skipped (degraded)"
+        );
+    }
     let root = RootBuilder::new()
         .module(IssuesModule::with_http(issues_api))
         .module(MetaModule)

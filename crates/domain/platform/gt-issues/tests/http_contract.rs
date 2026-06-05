@@ -21,6 +21,9 @@ use tower::ServiceExt; // oneshot
 
 use gt_issues::http::{issues_router, IssuesApiState};
 use gt_issues::resources::{filter_ready, read_issues};
+use gt_issues::{
+    CommitInfo, CommitInspector, InspectorProvider, SurfaceProvider, SurfaceTree,
+};
 use gt_store_dolt::{DoltIssues, IssueFilter};
 
 /// Create a throwaway DB `db` + an empty `issues` table (full schema via `ensure_schema` on the
@@ -290,7 +293,7 @@ async fn multi_tenant_routes_each_request_to_its_own_workspace_store() {
 /// `GET /?ready=1` returns the SAME sound set as the MCP `gt://issues?ready=1`
 /// resource (`hq-platform-hardening.4`). Both gather the candidate rows then narrow
 /// with the SAME `filter_ready` over the same phase frontier + delivered index + the
-/// surface tree (accept-all here, no repo wired). The REST result must be a bare
+/// `main` git tree (accept-all here, no repo wired). The REST result must be a bare
 /// array of only the ready ids — no pager envelope — equalling `filter_ready` applied
 /// in-process, which is exactly what the resource serves.
 #[tokio::test]
@@ -348,4 +351,177 @@ async fn ready_filter_matches_the_mcp_resource_sound_set() {
     assert!(!rest_ids.iter().any(|i| i == "hq-claimed"), "working bead is not ready");
     assert!(rest_ids.iter().any(|i| i == "hq-ready-a"));
     assert!(rest_ids.iter().any(|i| i == "hq-ready-b"));
+}
+
+/// Run `git` in `dir` and assert success (test-repo setup helper).
+fn git(dir: &std::path::Path, args: &[&str]) {
+    let out = std::process::Command::new("git")
+        .arg("-C")
+        .arg(dir)
+        .args(args)
+        .output()
+        .expect("git runs");
+    assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+}
+
+/// A test-local git-backed [`SurfaceTree`]: the flat blob set of `main` via
+/// `git ls-tree`, mirroring the orchestration `GitSurfaceTree` so the contract test
+/// exercises the REST S3 path without depending on the orchestration crate.
+struct TestGitTree {
+    paths: std::collections::HashSet<String>,
+}
+
+impl TestGitTree {
+    fn snapshot(repo: &std::path::Path) -> Self {
+        let out = std::process::Command::new("git")
+            .arg("-C")
+            .arg(repo)
+            .args(["ls-tree", "-r", "--name-only", "main"])
+            .output()
+            .expect("ls-tree");
+        let paths = String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .map(|l| l.trim_end().to_string())
+            .filter(|l| !l.is_empty())
+            .collect();
+        Self { paths }
+    }
+}
+
+impl SurfaceTree for TestGitTree {
+    fn contains(&self, path: &str) -> bool {
+        let p = path.trim().trim_end_matches('/');
+        if p.is_empty() {
+            return false;
+        }
+        let prefix = format!("{p}/");
+        self.paths.iter().any(|t| t == p || t.starts_with(&prefix))
+    }
+}
+
+struct TestSurfaceProvider {
+    repo: std::path::PathBuf,
+}
+
+impl SurfaceProvider for TestSurfaceProvider {
+    fn surface_tree(&self) -> Box<dyn SurfaceTree + Send + Sync> {
+        Box::new(TestGitTree::snapshot(&self.repo))
+    }
+}
+
+/// Test-local git [`CommitInspector`]: resolves a sha on `main` + its changed paths,
+/// mirroring the orchestration `GitCommitInspector`.
+struct TestGitInspector {
+    repo: std::path::PathBuf,
+}
+
+impl CommitInspector for TestGitInspector {
+    fn inspect(&self, sha: &str) -> Option<CommitInfo> {
+        let run = |args: &[&str]| {
+            std::process::Command::new("git").arg("-C").arg(&self.repo).args(args).output().ok()
+        };
+        let rev = run(&["rev-parse", "--verify", &format!("{sha}^{{commit}}")])?;
+        if !rev.status.success() {
+            return None;
+        }
+        let full_sha = String::from_utf8_lossy(&rev.stdout).trim().to_string();
+        if full_sha.is_empty() {
+            return None;
+        }
+        let anc = run(&["merge-base", "--is-ancestor", &full_sha, "main"])?;
+        if !anc.status.success() {
+            return None;
+        }
+        let diff = run(&["diff-tree", "--no-commit-id", "--name-only", "-r", &full_sha])?;
+        let changed_paths = String::from_utf8_lossy(&diff.stdout)
+            .lines()
+            .map(|l| l.trim_end().to_string())
+            .filter(|l| !l.is_empty())
+            .collect();
+        Some(CommitInfo { full_sha, changed_paths })
+    }
+}
+
+struct TestInspectorProvider {
+    repo: std::path::PathBuf,
+}
+
+impl InspectorProvider for TestInspectorProvider {
+    fn commit_inspector(&self) -> Option<Box<dyn CommitInspector + Send + Sync>> {
+        Some(Box::new(TestGitInspector { repo: self.repo.clone() }))
+    }
+}
+
+/// With git verification wired (the REST mirror of `GT_REPO_DIR` set,
+/// `hq-platform-hardening.5`): create with a non-existent `planned:false` surface is
+/// REJECTED (S3), exactly as the MCP path rejects it; and a close whose `commit_sha`
+/// does not resolve on `main` / does not touch a non-planned surface is REJECTED (S2),
+/// not silently accepted as the permissive REST path did before.
+#[tokio::test]
+async fn git_verification_rejects_bad_surface_and_unverified_close() {
+    let Ok(base) = std::env::var("GT_DOLT_URL") else {
+        eprintln!("GT_DOLT_URL unset — skipping http contract");
+        return;
+    };
+    let base = base.trim_end_matches('/').to_string();
+    let db = "gt_http_gitverify";
+    fresh_db(&base, db).await.expect("db");
+    let repo_store = Arc::new(DoltIssues::connect(&format!("{base}/{db}")).expect("connect"));
+    repo_store.ensure_schema().await.expect("schema");
+
+    // A throwaway git repo whose `main` tree holds exactly one real file.
+    let tmp = std::env::temp_dir().join(format!("gt-http-gitverify-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&tmp);
+    std::fs::create_dir_all(tmp.join("src")).expect("mkdir");
+    std::fs::write(tmp.join("src/real.rs"), "// real surface\n").expect("write");
+    git(&tmp, &["init", "-q", "-b", "main"]);
+    git(&tmp, &["config", "user.email", "t@t"]);
+    git(&tmp, &["config", "user.name", "t"]);
+    git(&tmp, &["add", "."]);
+    git(&tmp, &["commit", "-q", "-m", "add real surface"]);
+
+    let app = issues_router(
+        IssuesApiState::new(repo_store.clone(), "test-actor").with_git_verification(
+            Arc::new(TestSurfaceProvider { repo: tmp.clone() }),
+            Arc::new(TestInspectorProvider { repo: tmp.clone() }),
+        ),
+    );
+
+    // The parent epic the NN-16 taxonomy requires the beads to hang off of.
+    let (s, _) = send(
+        &app,
+        post_json("/", json!({ "id": "hq-gv", "title": "epic", "issue_type": "epic", "created_by": "test", "domain": ["platform.rig"] })),
+    )
+    .await;
+    assert_eq!(s, StatusCode::CREATED);
+
+    // S3: a bead naming a non-planned surface that does NOT exist on `main` is rejected
+    // at create (422), exactly as the MCP create path rejects it.
+    let bad = json!({
+        "id": "hq-gv.1", "title": "bad surface", "issue_type": "bead",
+        "external_ref": "hq-gv", "created_by": "test", "domain": ["platform.rig"],
+        "surface": [{ "path": "src/does_not_exist.rs", "planned": false }],
+    });
+    let (status, body) = send(&app, post_json("/", bad)).await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "non-existent surface rejected: {body}");
+
+    // A bead with a REAL non-planned surface is accepted (the tree contains src/real.rs).
+    let good = json!({
+        "id": "hq-gv.2", "title": "real surface", "issue_type": "bead",
+        "external_ref": "hq-gv", "created_by": "test", "domain": ["platform.rig"],
+        "surface": [{ "path": "src/real.rs", "planned": false }],
+    });
+    let (status, body) = send(&app, post_json("/", good)).await;
+    assert_eq!(status, StatusCode::CREATED, "real surface accepted: {body}");
+
+    // S2: closing the code-surface bead with a bogus sha (not on `main`) is rejected —
+    // delivery verification denies the off-tree commit.
+    let (status, body) = send(
+        &app,
+        post_json("/hq-gv.2/close", json!({ "commit_sha": "0".repeat(40), "closed_by_session": "test" })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "unverified close rejected: {body}");
+
+    let _ = std::fs::remove_dir_all(&tmp);
 }

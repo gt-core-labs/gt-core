@@ -69,7 +69,7 @@ pub mod taxonomy;
 pub use commands::{
     AdvancePhase, ClaimIssue, CloseIssue, CreateIssue, TransitionIssue, UpdateIssue,
 };
-pub use delivery::{CommitInfo, CommitInspector};
+pub use delivery::{CommitInfo, CommitInspector, InspectorProvider};
 pub use events::{emit_issue_event, IssueEvent, IssueEventSink, IssueVerb};
 #[cfg(feature = "axum")]
 pub use http::{issues_router, ApiDoc, IssuesApiState};

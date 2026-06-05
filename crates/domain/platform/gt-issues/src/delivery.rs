@@ -32,6 +32,18 @@ pub trait CommitInspector {
     fn inspect(&self, sha: &str) -> Option<CommitInfo>;
 }
 
+/// Per-request factory for the [`CommitInspector`] on the REST close path
+/// (`hq-platform-hardening.5`). The MCP path resolves a fresh inspector over the
+/// configured repo per close (the bin's `git_tree::commit_inspector`); the REST
+/// path mirrors that through this port. `None` (no repo wired) skips S2 delivery
+/// verification, exactly as the MCP path does when `GT_REPO_DIR` is unset — a close
+/// is then NOT rejected for a missing/off-main sha. The git-backed implementation
+/// lives in the composition bin (orchestration tier).
+pub trait InspectorProvider: Send + Sync {
+    /// Resolve the commit inspector for one close, or `None` to skip verification.
+    fn commit_inspector(&self) -> Option<Box<dyn CommitInspector + Send + Sync>>;
+}
+
 /// True when changed-path `changed` falls at or under surface path `surface` — an
 /// exact match or a file beneath a surface directory. Both are de-slashed so a
 /// trailing `/` on a surface entry does not defeat the prefix test.

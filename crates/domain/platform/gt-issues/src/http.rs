@@ -17,18 +17,17 @@
 //! - **It never reads a workspace from the path or body** (docs/04 §15, docs/03 Rule 6). The
 //!   issue id is a plain resource identifier; the tenant a request belongs to is the auth
 //!   context's concern, resolved upstream, never a route parameter.
-//! - **It skips the git-backed S2/S3 checks on writes.** Surface existence (S3) and
-//!   delivered-commit verification (S2) shell out to `git`, which the domain tier may not do —
-//!   those adapters live in the orchestration `gt-mcp-server`. Create/update/close therefore
-//!   validate against the permissive [`AllowAllTree`] and pass no
-//!   [`CommitInspector`](crate::CommitInspector), exactly the degraded mode the MCP path runs in
-//!   when `GT_REPO_DIR` is unset. Every other domain rule — shape validation, NN-16 taxonomy,
-//!   optimistic concurrency, the status state machine, and the "code surface ⇒ commit_sha
-//!   required" close rule — still runs, because it lives in the shared handlers.
-//! - **The `?ready` frontier resolves the same sound set as the MCP resource** (`hq-platform-hardening.4`).
-//!   `GET /?ready=1` mirrors `gt://issues?ready=1`: it narrows the candidates with the phase
-//!   frontier + delivered index + the injected [`SurfaceProvider`](crate::SurfaceProvider)'s
-//!   surface tree (accept-all here, the §S3 degradation) via the shared `filter_ready`.
+//! - **The git-backed S2/S3 checks run when a repo is wired** (`hq-platform-hardening.5`).
+//!   Surface existence (S3) and delivered-commit verification (S2) shell out to `git`, which the
+//!   domain tier may not do — those adapters live in the orchestration `gt-mcp-server`. The REST
+//!   state therefore holds INJECTED ports ([`SurfaceProvider`](crate::SurfaceProvider) +
+//!   [`InspectorProvider`](crate::InspectorProvider)) the composition bin populates from
+//!   `GT_REPO_DIR`; create/update validate the surface against the `main` tree and close verifies
+//!   the delivering commit, exactly as the MCP path. Without a repo (e.g. the live container) the
+//!   defaults degrade to the permissive [`AllowAllTree`] and no [`CommitInspector`](crate::CommitInspector),
+//!   the same degraded mode the MCP path runs in when `GT_REPO_DIR` is unset. Every other domain
+//!   rule — shape validation, NN-16 taxonomy, optimistic concurrency, the status state machine,
+//!   and the "code surface ⇒ commit_sha required" close rule — still runs, in the shared handlers.
 
 use std::sync::Arc;
 
@@ -46,13 +45,14 @@ use gt_store_dolt::{
 use gt_workspace::WorkspaceContext;
 
 use crate::commands::{ClaimIssue, CloseIssue, CreateIssue, TransitionIssue, UpdateIssue};
+use crate::delivery::InspectorProvider;
 use crate::events::{emit_issue_event, IssueEventSink, IssueVerb};
 use crate::handlers::{
     run_claim_issue, run_close_issue, run_create_issue, run_transition_issue, run_update_issue,
 };
 use crate::resources::{filter_ready, read_issue, read_issues, read_issues_page};
 use crate::stats::{aggregate, GroupDim, StatsResponse};
-use crate::surface::{AllowAllProvider, AllowAllTree, SurfaceProvider};
+use crate::surface::{AllowAllProvider, SurfaceProvider};
 
 /// Everything the issues REST handlers need, baked into the router with
 /// [`Router::with_state`] before it leaves [`issues_router`] so the merged application router
@@ -80,11 +80,17 @@ pub struct IssuesApiState {
     /// keyed to the request's workspace. `None` keeps the REST surface emit-free (no feed), so a
     /// build that wires no event log behaves exactly as before.
     event_sink: Option<Arc<dyn IssueEventSink>>,
-    /// Surface-tree factory backing the `?ready` frontier (S4, `hq-platform-hardening.4`). The
-    /// composition bin wires a git-backed provider from `GT_REPO_DIR`; the default is the
-    /// permissive [`AllowAllProvider`], so without a repo the readiness surface clause degrades to
-    /// accept-all exactly as the MCP path does when `GT_REPO_DIR` is unset.
+    /// Surface-tree factory backing the `?ready` frontier (S4, `hq-platform-hardening.4`) and the
+    /// create/update surface existence check (S3, `hq-platform-hardening.5`). The composition bin
+    /// wires a git-backed provider from `GT_REPO_DIR`; the default is the permissive
+    /// [`AllowAllProvider`], so without a repo the REST surface degrades to accept-all exactly as
+    /// the MCP path does when `GT_REPO_DIR` is unset.
     surfaces: Arc<dyn SurfaceProvider>,
+    /// Commit-inspector factory backing the `close` delivery check (S2, `hq-platform-hardening.5`).
+    /// `Some` when the bin wires a git-backed provider from `GT_REPO_DIR`; `None` skips S2
+    /// verification, the MCP-path degraded mode (a close is then not rejected for a missing/off-main
+    /// sha — only the "code surface ⇒ commit_sha required" rule in the shared handler still applies).
+    inspectors: Option<Arc<dyn InspectorProvider>>,
 }
 
 impl IssuesApiState {
@@ -98,6 +104,7 @@ impl IssuesApiState {
             actor: actor.into(),
             event_sink: None,
             surfaces: Arc::new(AllowAllProvider),
+            inspectors: None,
         }
     }
 
@@ -115,6 +122,22 @@ impl IssuesApiState {
     /// Additive — without it the REST surface emits nothing, exactly as before.
     pub fn with_event_sink(mut self, sink: Arc<dyn IssueEventSink>) -> Self {
         self.event_sink = Some(sink);
+        self
+    }
+
+    /// Wire the git-backed S2/S3 verification ports (`hq-platform-hardening.5`): the
+    /// `surfaces` provider snapshots the `main` tree for the `?ready` frontier (S4) and the
+    /// create/update surface check (S3), and the `inspectors` provider resolves the delivering
+    /// commit for close (S2). The composition bin builds these from `GT_REPO_DIR`; without this
+    /// call the state keeps the permissive defaults (accept-all S3, no S2), the same degraded mode
+    /// the MCP path runs in when no repo is configured.
+    pub fn with_git_verification(
+        mut self,
+        surfaces: Arc<dyn SurfaceProvider>,
+        inspectors: Arc<dyn InspectorProvider>,
+    ) -> Self {
+        self.surfaces = surfaces;
+        self.inspectors = Some(inspectors);
         self
     }
 
@@ -394,7 +417,11 @@ async fn create_issue(
     Json(args): Json<CreateIssue>,
 ) -> Result<Response, ApiError> {
     let store = st.resolve(&ctx).await?;
-    run_create_issue(&store, &args, &AllowAllTree, false).await?;
+    // S3 surface existence (`hq-platform-hardening.5`): validate `planned:false`
+    // paths against the `main` tree the injected provider snapshots per call —
+    // git-backed when a repo is wired, accept-all otherwise — exactly the MCP path.
+    let tree = st.surfaces.surface_tree();
+    run_create_issue(&store, &args, tree.as_ref(), false).await?;
     emit_issue_event(
         st.event_sink.as_deref(),
         &store,
@@ -430,7 +457,11 @@ async fn update_issue(
 ) -> Result<Json<Value>, ApiError> {
     let store = st.resolve(&ctx).await?;
     let args: UpdateIssue = with_path_id(body, id)?;
-    let version = run_update_issue(&store, &args, &AllowAllTree, false).await?;
+    // S3 surface existence (`hq-platform-hardening.5`): a re-pointed `planned:false`
+    // path is checked against the `main` tree the injected provider snapshots,
+    // mirroring the MCP update path.
+    let tree = st.surfaces.surface_tree();
+    let version = run_update_issue(&store, &args, tree.as_ref(), false).await?;
     emit_issue_event(
         st.event_sink.as_deref(),
         &store,
@@ -482,7 +513,8 @@ async fn transition_issue(
 /// `POST /:id/close` — close the bead (`issues.close.execute`). The attribution actor is the
 /// server identity in [`IssuesApiState`], never the body. A bead with a non-planned code
 /// surface still requires `commit_sha` (delivered-code proof), enforced by the shared handler;
-/// the git delivery verification (S2) is skipped on the REST path (see the module docs).
+/// when a repo is wired (`GT_REPO_DIR`) the injected inspector also verifies that sha delivered
+/// the surface on `main` (S2, `hq-platform-hardening.5`), exactly as the MCP close path does.
 #[cfg_attr(feature = "axum", utoipa::path(
     post, path = "/{id}/close",
     params(("id" = String, Path, description = "Bead id")),
@@ -500,7 +532,14 @@ async fn close_issue(
 ) -> Result<Json<Value>, ApiError> {
     let store = st.resolve(&ctx).await?;
     let args: CloseIssue = with_path_id(body, id)?;
-    run_close_issue(&store, &args, &st.actor, None, false).await?;
+    // S2 delivery verification (`hq-platform-hardening.5`): when a repo is wired the
+    // injected provider yields a git-backed inspector so the closing sha must resolve
+    // on `main` AND touch a non-planned surface — exactly the MCP close path. `None`
+    // (no repo) skips S2, the degraded mode; the "code surface ⇒ commit_sha required"
+    // rule in the shared handler still applies.
+    let inspector = st.inspectors.as_ref().and_then(|p| p.commit_inspector());
+    let inspector_ref = inspector.as_deref();
+    run_close_issue(&store, &args, &st.actor, inspector_ref, false).await?;
     emit_issue_event(
         st.event_sink.as_deref(),
         &store,
