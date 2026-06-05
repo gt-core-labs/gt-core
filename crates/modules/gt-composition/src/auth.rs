@@ -24,7 +24,10 @@
 use std::sync::Arc;
 
 use axum::extract::{Request, State};
-use axum::http::{header::AUTHORIZATION, StatusCode};
+use axum::http::{
+    header::{AUTHORIZATION, COOKIE},
+    StatusCode,
+};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 
@@ -55,6 +58,28 @@ impl AuthState {
     }
 }
 
+/// The browser cookie carrying the access JWT (set by the login surface, `hq-web-extras.1`;
+/// also what the SSE `/stream` reads). A same-origin SSR frontend cannot put an httpOnly cookie
+/// into an `Authorization` header from JS, so this is the access-token fallback for `/api/v1/*`.
+const ACCESS_COOKIE: &str = "gt_web_token";
+
+/// Read the access token from the `gt_web_token` cookie (`hq-web-extras.8`). The `Cookie` header
+/// is `name=value` pairs split on `;`; the token is a JWT (no cookie-special chars), so a split
+/// is sufficient. `None` when the cookie is absent.
+fn cookie_token(req: &Request) -> Option<&str> {
+    req.headers()
+        .get(COOKIE)?
+        .to_str()
+        .ok()?
+        .split(';')
+        .find_map(|kv| {
+            let (k, v) = kv.split_once('=')?;
+            (k.trim() == ACCESS_COOKIE)
+                .then(|| v.trim())
+                .filter(|t| !t.is_empty())
+        })
+}
+
 /// Pull the bearer token out of an `Authorization` header value (`Bearer <token>`),
 /// case-insensitively on the scheme. Returns `None` when the header is absent.
 /// `Some(Err)` marks a present header whose scheme/shape is wrong — a client error.
@@ -82,9 +107,22 @@ pub async fn authenticate(
     next: Next,
 ) -> Response {
     match bearer(&req) {
-        // No Authorization header — anonymous. The per-route guard rejects protected routes;
-        // public ones (login) proceed. Not a denial here, so nothing to audit.
-        None => next.run(req).await,
+        // No Authorization header: fall back to the `gt_web_token` cookie so a same-origin browser
+        // authenticates `/api/v1/*` with its httpOnly access cookie (hq-web-extras.8) — the JS
+        // cannot set the header itself. A present-but-invalid cookie falls through as anonymous
+        // (NOT a 401): a stale cookie must never block a public route like `/auth/login`, and the
+        // per-route scope guard still rejects protected routes. Only an explicit bad `Authorization`
+        // header is a hard client error (below).
+        None => {
+            let claims =
+                cookie_token(&req).and_then(|t| state.authenticator.authenticate(t).ok());
+            if let Some(claims) = claims {
+                req.extensions_mut()
+                    .insert(WorkspaceClaim(claims.workspace.clone()));
+                req.extensions_mut().insert(claims);
+            }
+            next.run(req).await
+        }
         // Present but not a well-formed bearer token.
         Some(Err(())) => reject(&state, &req, "malformed Authorization header"),
         Some(Ok(token)) => match state.authenticator.authenticate(token) {
@@ -203,6 +241,44 @@ mod tests {
         assert_eq!(status, StatusCode::OK);
         assert_eq!(body, "claims=None ws=None");
         assert!(audit.read_all().unwrap().is_empty(), "anonymous pass-through is not a denial");
+    }
+
+    async fn call_cookie(state: AuthState, cookie: &str) -> (StatusCode, String) {
+        let resp = app(state)
+            .oneshot(
+                Request::builder()
+                    .uri("/")
+                    .header(COOKIE, cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = resp.status();
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        (status, String::from_utf8(bytes.to_vec()).unwrap())
+    }
+
+    #[tokio::test]
+    async fn a_valid_gt_web_token_cookie_injects_claims() {
+        // hq-web-extras.8: the browser authenticates /api/v1/* with its httpOnly access cookie.
+        let (st, audit) = state();
+        let (status, body) = call_cookie(st, "gt_web_token=good").await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(body.contains(r#"claims=Some("alice")"#), "{body}");
+        assert!(body.contains(r#"ws=Some("acme")"#), "{body}");
+        assert!(audit.read_all().unwrap().is_empty(), "cookie auth is not a denial");
+    }
+
+    #[tokio::test]
+    async fn an_invalid_cookie_passes_through_anonymously() {
+        // A stale/invalid cookie must NOT 401 — it falls through anonymous so a public route
+        // (e.g. /auth/login) still works; the per-route scope guard rejects protected ones.
+        let (st, audit) = state();
+        let (status, body) = call_cookie(st, "gt_web_token=stale").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body, "claims=None ws=None");
+        assert!(audit.read_all().unwrap().is_empty(), "an invalid cookie is not an audited denial");
     }
 
     #[tokio::test]
