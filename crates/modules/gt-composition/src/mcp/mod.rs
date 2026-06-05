@@ -46,4 +46,4 @@ pub use rest_backings::{
     IdentityDoltMeStats, WsPoolRigs,
 };
 pub use rig::{PgRigPrefixes, RigHandler};
-pub use workspace::{PgWorkspaceStatus, WorkspaceHandler};
+pub use workspace::{CompositionTenantProvisioner, PgWorkspaceStatus, WorkspaceHandler};

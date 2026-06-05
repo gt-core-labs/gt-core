@@ -55,7 +55,7 @@ pub use workspace_id::{WorkspaceId, WorkspaceIdError, MAX_WORKSPACE_ID_LEN};
 #[cfg(feature = "pg")]
 pub use pg::PgWorkspaces;
 #[cfg(feature = "axum")]
-pub use http::{workspace_router, ApiDoc, WorkspaceApiState};
+pub use http::{workspace_router, ApiDoc, TenantProvisioner, WorkspaceApiState};
 #[cfg(feature = "axum")]
 pub use module::WorkspaceModule;
 #[cfg(feature = "axum")]

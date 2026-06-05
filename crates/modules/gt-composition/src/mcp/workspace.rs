@@ -111,41 +111,11 @@ impl DomainHandler for WorkspaceHandler {
                     })
                     .await
                     .map_err(actor_err)?;
-                // Provision the tenant's PG schema (`ws_<slug>`) by cloning the
-                // `ws_default` template (hq-mt-data.2). Without this the catalog row
-                // exists but the tenant has no `rigs`/quota/… tables, and every
-                // `rig.*` dispatch in that workspace fails with
-                // `relation "rigs" does not exist`. `gt_create_workspace_schema` is
-                // idempotent, so a retry against an already-provisioned tenant is a
-                // no-op — and re-running it repairs a tenant created before this fix.
-                sqlx::query("SELECT gt_create_workspace_schema($1)")
-                    .bind(id.as_str())
-                    .execute(&self.pool)
-                    .await
-                    .map_err(|e| {
-                        AppError::Other(format!("provision schema for {}: {e}", id.as_str()))
-                    })?;
-                // `gt_create_workspace_schema` clones the `ws_default` STRUCTURE only
-                // (CREATE TABLE LIKE), so the new `ws_<slug>.roles`/`users` tables are
-                // EMPTY — `/auth/switch` into the tenant would then expand no scopes (or,
-                // for a tenant predating the template, hit a missing relation). Seed the
-                // creator's RBAC so the workspace is usable the moment it is created
-                // (hq-gap-workspace-provision-full). Idempotent (ON CONFLICT DO NOTHING).
-                seed_workspace_rbac(&self.pool, id.as_str(), ctx.actor).await?;
-                // Provision the Dolt side: `CREATE DATABASE hq_<slug>` + apply the issues
-                // schema, so the tenant's tracker works from creation. Only when
-                // multi-tenant Dolt routing is configured (`GT_DOLT_BASE_URL`); otherwise
-                // the deploy is single-tenant on the shared `hq` and there is nothing to
-                // provision here. Idempotent (CREATE DATABASE IF NOT EXISTS + ensure_schema).
-                if let Some(dolt) = &self.dolt {
-                    // CREATE DATABASE hq_<slug> over a server-scoped pool (a tenant
-                    // pool would fail to connect to a database that does not exist
-                    // yet), then `ensured_pool` applies the issues schema once per
-                    // slug — the same self-healing path the read/write routes take.
-                    let server = dolt.server_pool();
-                    gt_store_dolt::create_workspace_dolt(&server, id.as_str()).await?;
-                    dolt.ensured_pool(id.as_str()).await?;
-                }
+                // Provision the tenant's PG schema + RBAC and (when multi-tenant) its Dolt DB +
+                // issues schema, so the workspace is usable the moment it is created. Shared with
+                // the REST `POST /api/v1/workspace` path via `provision_tenant`
+                // (hq-gap-workspace-rest-create-provision).
+                provision_tenant(&self.pool, self.dolt.as_ref(), id.as_str(), ctx.actor).await?;
                 Ok(json!({
                     "ok": true,
                     "id": id.as_str(),
@@ -222,6 +192,67 @@ impl DomainHandler for WorkspaceHandler {
             }
             other => Err(AppError::Validation(format!("unknown tool `{other}`"))),
         }
+    }
+}
+
+/// Provision a freshly-created workspace's per-tenant backends: clone the `ws_<slug>` PG schema
+/// from `ws_default`, seed its RBAC (so `/auth/switch` yields a usable token), and — when
+/// multi-tenant Dolt routing is configured — `CREATE DATABASE hq_<slug>` + apply its issues
+/// schema. Shared by the MCP `workspace.create` tool and the REST `POST /api/v1/workspace`
+/// handler (`hq-gap-workspace-rest-create-provision`) so both transports provision identically.
+/// Idempotent throughout. `actor` is the creator's verified id (membership lands for them; `""`
+/// ⇒ schema/role only, no membership).
+pub(crate) async fn provision_tenant(
+    pool: &PgPool,
+    dolt: Option<&Arc<WorkspacePools>>,
+    slug: &str,
+    actor: &str,
+) -> Result<(), AppError> {
+    // Clone the `ws_default` template (CREATE TABLE LIKE) into `ws_<slug>` — idempotent, and
+    // re-running repairs a tenant created before this fix.
+    sqlx::query("SELECT gt_create_workspace_schema($1)")
+        .bind(slug)
+        .execute(pool)
+        .await
+        .map_err(|e| AppError::Other(format!("provision schema for {slug}: {e}")))?;
+    // The clone copies STRUCTURE only, so the new roles/users tables are empty; seed the RBAC.
+    seed_workspace_rbac(pool, slug, actor).await?;
+    // Dolt side, only under multi-tenant routing: CREATE DATABASE over a server-scoped pool (a
+    // tenant pool can't connect to a not-yet-existing DB), then `ensured_pool` applies the issues
+    // schema once per slug — the same self-healing path the read/write routes take.
+    if let Some(dolt) = dolt {
+        let server = dolt.server_pool();
+        gt_store_dolt::create_workspace_dolt(&server, slug).await?;
+        dolt.ensured_pool(slug).await?;
+    }
+    Ok(())
+}
+
+/// The composition-tier [`gt_workspace::TenantProvisioner`] backing `POST /api/v1/workspace`:
+/// provisions a new tenant's PG schema/RBAC + Dolt exactly as the MCP `workspace.create` tool
+/// does, over the same shared pools (`hq-gap-workspace-rest-create-provision`).
+pub struct CompositionTenantProvisioner {
+    pool: PgPool,
+    dolt: Option<Arc<WorkspacePools>>,
+}
+
+impl CompositionTenantProvisioner {
+    /// Wrap the shared PG pool + (optional) per-workspace Dolt pools.
+    pub fn new(pool: PgPool, dolt: Option<Arc<WorkspacePools>>) -> Self {
+        Self { pool, dolt }
+    }
+}
+
+#[async_trait]
+impl gt_workspace::TenantProvisioner for CompositionTenantProvisioner {
+    async fn provision(
+        &self,
+        slug: &str,
+        actor: &str,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        provision_tenant(&self.pool, self.dolt.as_ref(), slug, actor)
+            .await
+            .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { e.to_string().into() })
     }
 }
 

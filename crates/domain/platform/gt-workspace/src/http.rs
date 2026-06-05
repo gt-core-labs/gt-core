@@ -47,15 +47,37 @@ use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
-use axum::{Json, Router};
+use axum::{Extension, Json, Router};
 use serde::Deserialize;
 use serde_json::{json, Value};
+
+use gt_auth::JwtClaims;
 
 use crate::actor::{ActorError, WorkspaceActor};
 use crate::commands::{WorkspaceCommand, WorkspaceError};
 use crate::repo::{RepoError, WorkspaceRepository};
 use crate::state::{WorkspaceEntry, WorkspaceStatus};
 use crate::workspace_id::{WorkspaceId, WorkspaceIdError};
+
+/// Provision a freshly-created workspace's per-tenant backends (PG schema + RBAC seed,
+/// Dolt `hq_<slug>` + issues schema) so it is usable the moment it is created.
+///
+/// The composition root supplies the adapter (docs/03 Rule 4): only it knows both the PG
+/// pool that owns `gt_create_workspace_schema` + the `ws_<slug>` RBAC tables and the
+/// per-workspace Dolt pools. Keyed by the verified creator `sub` so membership is attributed
+/// to the caller, never a path/body value. Idempotent — `create_workspace` calls it after the
+/// catalog event so the REST path provisions exactly like the MCP `workspace.create` tool
+/// (`hq-gap-workspace-rest-create-provision`).
+#[async_trait::async_trait]
+pub trait TenantProvisioner: Send + Sync {
+    /// Provision the tenant `slug` on behalf of `actor` (the creator's verified `sub`, or `""`
+    /// for a system-created workspace — the adapter then seeds the schema/role but no membership).
+    async fn provision(
+        &self,
+        slug: &str,
+        actor: &str,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>>;
+}
 
 /// Everything the workspace REST handlers need, baked into the router with
 /// [`Router::with_state`] before it leaves [`workspace_router`] so the merged
@@ -74,12 +96,25 @@ pub struct WorkspaceApiState {
     /// The live catalog repository the binary supplies — the module owns no store of
     /// its own.
     repo: Arc<dyn WorkspaceRepository>,
+    /// Per-tenant backend provisioner, wired by the composition root when multi-tenant
+    /// backends exist. `Some` ⇒ `POST /` also seeds the new tenant's PG schema/RBAC + Dolt
+    /// (the REST mirror of the MCP `workspace.create` provisioning). `None` ⇒ catalog row only,
+    /// exactly as before.
+    provisioner: Option<Arc<dyn TenantProvisioner>>,
 }
 
 impl WorkspaceApiState {
-    /// Build the REST state over a live catalog repository.
+    /// Build the REST state over a live catalog repository. Catalog-only by default; call
+    /// [`with_provisioner`](Self::with_provisioner) to also provision per-tenant backends.
     pub fn new(repo: Arc<dyn WorkspaceRepository>) -> Self {
-        Self { repo }
+        Self { repo, provisioner: None }
+    }
+
+    /// Attach the per-tenant provisioner so `POST /` provisions a fully-usable workspace
+    /// (PG schema/RBAC + Dolt), matching the MCP `workspace.create` tool.
+    pub fn with_provisioner(mut self, provisioner: Arc<dyn TenantProvisioner>) -> Self {
+        self.provisioner = Some(provisioner);
+        self
     }
 
     /// Hydrate a fresh actor from the repository for one mutating command.
@@ -171,6 +206,7 @@ async fn get_workspace(
 ))]
 async fn create_workspace(
     State(st): State<WorkspaceApiState>,
+    claims: Option<Extension<JwtClaims>>,
     Json(body): Json<CreateBody>,
 ) -> Result<Response, ApiError> {
     let id = parse_id(&body.id)?;
@@ -178,6 +214,18 @@ async fn create_workspace(
     actor
         .handle(WorkspaceCommand::Create { id: id.clone(), name: body.name.clone() })
         .await?;
+    // Provision the tenant's backends so the workspace is usable on creation — the REST mirror
+    // of the MCP `workspace.create` provisioning (`hq-gap-workspace-rest-create-provision`).
+    // Attributed to the verified creator `sub` (membership lands for them); a request with no
+    // verified identity provisions the schema/role but no membership (actor `""`). `None`
+    // provisioner ⇒ catalog-only, exactly as before.
+    if let Some(provisioner) = &st.provisioner {
+        let creator = claims.as_ref().map(|Extension(c)| c.sub.as_str()).unwrap_or("");
+        provisioner
+            .provision(id.as_str(), creator)
+            .await
+            .map_err(|e| ApiError::Internal(format!("provision tenant {id}: {e}")))?;
+    }
     Ok((
         StatusCode::CREATED,
         Json(json!({
@@ -384,6 +432,79 @@ mod tests {
         }
         // Prefix-free: the module builder, not the annotation, owns `/api/v1/workspace`.
         assert!(paths.iter().all(|p| !p.contains("/api/v1")), "{paths:?}");
+    }
+
+    /// A recording [`TenantProvisioner`] so the create test asserts the wiring without a DB.
+    #[derive(Default)]
+    struct RecordingProvisioner {
+        calls: std::sync::Mutex<Vec<(String, String)>>,
+    }
+
+    #[async_trait::async_trait]
+    impl TenantProvisioner for RecordingProvisioner {
+        async fn provision(
+            &self,
+            slug: &str,
+            actor: &str,
+        ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+            self.calls.lock().unwrap().push((slug.to_string(), actor.to_string()));
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn rest_create_provisions_the_tenant_attributed_to_the_caller() {
+        use axum::body::Body;
+        use axum::http::Request;
+        use tower::ServiceExt;
+
+        let prov = Arc::new(RecordingProvisioner::default());
+        let state = WorkspaceApiState::new(Arc::new(crate::InMemoryWorkspaces::new()))
+            .with_provisioner(prov.clone());
+        let app = workspace_router(state);
+
+        // POST / carrying a verified JwtClaims (sub = alice): the catalog create succeeds AND the
+        // provisioner runs for the new slug, attributed to the caller's sub — the REST mirror of
+        // the MCP `workspace.create` provisioning.
+        let mut req = Request::builder()
+            .method("POST")
+            .uri("/")
+            .header("content-type", "application/json")
+            .body(Body::from(json!({ "id": "acme", "name": "Acme" }).to_string()))
+            .unwrap();
+        req.extensions_mut().insert(JwtClaims {
+            sub: "alice".to_string(),
+            workspace: "acme".to_string(),
+            scopes: vec![],
+            exp: 0,
+            nbf: None,
+            iat: 0,
+        });
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::CREATED);
+        assert_eq!(
+            prov.calls.lock().unwrap().as_slice(),
+            &[("acme".to_string(), "alice".to_string())],
+        );
+    }
+
+    #[tokio::test]
+    async fn rest_create_without_provisioner_is_catalog_only() {
+        use axum::body::Body;
+        use axum::http::Request;
+        use tower::ServiceExt;
+
+        // No provisioner wired ⇒ create still succeeds (catalog row only), exactly as before.
+        let app =
+            workspace_router(WorkspaceApiState::new(Arc::new(crate::InMemoryWorkspaces::new())));
+        let req = Request::builder()
+            .method("POST")
+            .uri("/")
+            .header("content-type", "application/json")
+            .body(Body::from(json!({ "id": "beta", "name": "Beta" }).to_string()))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::CREATED);
     }
 
     #[test]

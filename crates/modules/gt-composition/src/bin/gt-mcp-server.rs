@@ -37,8 +37,8 @@ use gt_audit::{AuditSink, InMemoryAudit};
 use gt_composition::mcp::{
     AgentHandler, AuditHandler, ConvoyHandler, DocumentsHandler, EventLog, EventLogConvoy,
     EventLogFeed, EventLogMerges, EventLogQuota, EventLogSkills, GraphHandler, IdentityDoltMeStats,
-    MergeHandler, PgDocumentsResource, PgRigPrefixes, PgWorkspaceStatus, QuotaHandler, RigHandler,
-    WorkspaceHandler, WsPoolRigs, WsPools,
+    CompositionTenantProvisioner, MergeHandler, PgDocumentsResource, PgRigPrefixes,
+    PgWorkspaceStatus, QuotaHandler, RigHandler, WorkspaceHandler, WsPoolRigs, WsPools,
 };
 use gt_docs_embed::Embedder;
 use gt_docs_extract::Extractor;
@@ -420,9 +420,14 @@ async fn main() -> anyhow::Result<()> {
             .await
             .context("GT_PG_URL must point at a reachable Postgres (REST backings)")?;
         rest = rest
-            .module(WorkspaceModule::with_http(WorkspaceApiState::new(Arc::new(
-                PgWorkspaces::new(pool),
-            ))))
+            // The REST `POST /api/v1/workspace` provisions a fully-usable tenant — PG schema/RBAC
+            // + Dolt — exactly as the MCP `workspace.create` tool, via the shared provisioner over
+            // the same PG pool + per-workspace Dolt pools (hq-gap-workspace-rest-create-provision).
+            .module(WorkspaceModule::with_http(
+                WorkspaceApiState::new(Arc::new(PgWorkspaces::new(pool.clone()))).with_provisioner(
+                    Arc::new(CompositionTenantProvisioner::new(pool, issues_workspaces.clone())),
+                ),
+            ))
             .module(RigsModule::with_http(RigApiState::new(Arc::new(WsPoolRigs::new(Arc::new(
                 WsPools::new(pg_url.clone()),
             ))))));

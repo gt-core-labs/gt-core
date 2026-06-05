@@ -22,13 +22,17 @@ gt-module = { workspace = true, optional = true }
 utoipa = { workspace = true, optional = true }
 # Module semver for `WorkspaceModule::meta`, pulled only with the `axum` module surface.
 semver = { workspace = true, optional = true }
+# Verified caller identity for the REST create path (hq-gap-workspace-rest-create-provision):
+# `create_workspace` reads the creator's `sub` from the injected `JwtClaims` to attribute the
+# tenant provisioning (membership), exactly as gt-issues' `/me/stats` does. Rides the `axum` adapter.
+gt-auth = { workspace = true, optional = true }
 
 [features]
 # Postgres `WorkspaceRepository` adapter (`PgWorkspaces`).
 pg = ["dep:sqlx"]
 # Axum `WorkspaceContext` request extractor + the `WorkspaceModule` REST surface
 # (`http.rs` / `module.rs`, `hq-fe-api-platform.1`) and its OpenAPI spec.
-axum = ["dep:axum", "dep:gt-module", "dep:utoipa", "dep:semver"]
+axum = ["dep:axum", "dep:gt-module", "dep:utoipa", "dep:semver", "dep:gt-auth"]
 
 [dev-dependencies]
 tokio = { workspace = true }
