@@ -83,24 +83,29 @@ pub(crate) fn validate_slug(ws: &str) -> Result<(), AppError> {
 }
 
 /// Provision a workspace's Dolt database: `CREATE DATABASE IF NOT EXISTS
-/// hq_<ws>` plus `GRANT ALL` to the shared `gastown@%` application user.
+/// hq_<ws>`.
 ///
 /// Idempotent — safe to call on every workspace boot. `CREATE DATABASE IF NOT
-/// EXISTS` is a no-op when the database already exists, and re-granting an
-/// existing privilege is likewise a no-op. The slug is validated before any
-/// string interpolation so this can never become a DDL-injection vector.
+/// EXISTS` is a no-op when the database already exists. The slug is validated
+/// before any string interpolation so this can never become a DDL-injection
+/// vector.
 ///
 /// Note Dolt/MySQL DDL does not bind identifiers as parameters, so the database
 /// name is interpolated; [`validate_slug`] guarantees it is `[a-z0-9-]` only and
-/// it is backticked in the emitted statements.
+/// it is backticked in the emitted statement.
+///
+/// No explicit `GRANT` is emitted: the connecting server user is the deploy's
+/// application account (`gtapp`, which holds `GRANT ALL ON *.* WITH GRANT
+/// OPTION`), so it already reaches a freshly-created `hq_<ws>`. The previous
+/// hardcoded `GRANT ... TO 'gastown'@'%'` was brittle — in the live deploy no
+/// `gastown` user exists, so that statement ERRORed and aborted the whole
+/// provision. Relying on the server user's existing wildcard privilege keeps
+/// provisioning grantee-agnostic and non-fatal.
 pub async fn create_workspace_dolt(pool: &Pool, ws: &str) -> Result<(), AppError> {
     validate_slug(ws)?;
     let db = dolt_db_name(ws);
     let mut conn = pool.get_conn().await.map_err(map_err)?;
     conn.query_drop(format!("CREATE DATABASE IF NOT EXISTS `{db}`"))
-        .await
-        .map_err(map_err)?;
-    conn.query_drop(format!("GRANT ALL ON `{db}`.* TO 'gastown'@'%'"))
         .await
         .map_err(map_err)?;
     Ok(())

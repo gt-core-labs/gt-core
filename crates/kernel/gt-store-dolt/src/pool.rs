@@ -124,6 +124,16 @@ impl WorkspacePools {
         Pool::new(opts)
     }
 
+    /// A pool bound to the Dolt SERVER (no specific database), for server-scoped
+    /// DDL like `CREATE DATABASE hq_<ws>` that cannot run over a connection
+    /// defaulting to a database that does not exist yet. Built fresh each call
+    /// (it is not cached — used only on the provision path, not the hot path);
+    /// `mysql_async` pools are lazy, so no socket opens until first use.
+    pub fn server_pool(&self) -> Pool {
+        let opts = OptsBuilder::from_opts(self.base.clone()).db_name(None::<String>);
+        Pool::new(opts)
+    }
+
     /// Health-probe a workspace's pool with a `SELECT 1`. Lazily creates the
     /// pool if absent, then forces a real connection round-trip, surfacing a
     /// dead/unreachable Dolt server or a missing `hq_<ws>` database as an error.

@@ -775,8 +775,23 @@ async fn build_domain_router(
     // migrations, so a restart against a seeded DB is a no-op.
     apply_pg_catalog(&pool).await?;
     let ws_pools = Arc::new(WsPools::new(pg_url));
+    // Per-workspace Dolt pools for `workspace.create`'s tenant provisioning
+    // (hq-gap-workspace-provision-full): when multi-tenant Dolt routing is on
+    // (GT_DOLT_BASE_URL), creating a workspace also `CREATE DATABASE hq_<slug>`s
+    // and seeds its issues schema so the tracker works from creation. Unset ⇒
+    // single-tenant Dolt on the shared `hq`, nothing per-tenant to provision.
+    let dolt_pools = std::env::var("GT_DOLT_BASE_URL")
+        .ok()
+        .map(|base| WorkspacePools::from_url(&base))
+        .transpose()
+        .context("GT_DOLT_BASE_URL is malformed")?
+        .map(Arc::new);
+    let workspace_handler = match &dolt_pools {
+        Some(dolt) => WorkspaceHandler::new(pool.clone()).with_dolt(dolt.clone()),
+        None => WorkspaceHandler::new(pool.clone()),
+    };
     let router = DomainRouter::new()
-        .register(Arc::new(WorkspaceHandler::new(pool.clone())))
+        .register(Arc::new(workspace_handler))
         .register(Arc::new(RigHandler::new(ws_pools.clone())))
         // A completed merge marks the owning rig's graph stale (hq-graphrig.7).
         .register(Arc::new(

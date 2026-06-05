@@ -8,7 +8,8 @@
 //! `list` / `info` are pure reads straight off the repository.
 
 use std::collections::HashMap;
-use std::time::{Duration, Instant};
+use std::sync::Arc;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
 use serde_json::{json, Value};
@@ -17,7 +18,8 @@ use tokio::sync::RwLock;
 
 use gt_mcp_server::{DomainCtx, DomainHandler, GateStatus, WorkspaceStatusGate};
 use gt_module::McpTool;
-use gt_store_dolt::AppError;
+use gt_store_dolt::{AppError, WorkspacePools};
+use gt_store_pg::schema_for;
 use gt_workspace::{
     ActorError, PgWorkspaces, WorkspaceActor, WorkspaceCommand, WorkspaceEntry, WorkspaceError,
     WorkspaceId, WorkspaceRepository, WorkspaceStatus,
@@ -32,13 +34,26 @@ use super::util::{descriptor, req};
 /// shared across requests.
 pub struct WorkspaceHandler {
     pool: PgPool,
+    /// Per-workspace Dolt pools, when multi-tenant Dolt routing is configured
+    /// (`GT_DOLT_BASE_URL`). `workspace.create` uses this to `CREATE DATABASE
+    /// hq_<slug>` and seed its `issues` schema so the new tenant's tracker works
+    /// end to end. `None` ⇒ single-tenant Dolt; create provisions only the PG
+    /// side (the Dolt DB is the shared `hq`).
+    dolt: Option<Arc<WorkspacePools>>,
 }
 
 impl WorkspaceHandler {
     /// Wrap a connection pool. The `workspaces` table is expected to already
     /// exist (applied via the `gt-store-pg` migration at boot).
     pub fn new(pool: PgPool) -> Self {
-        Self { pool }
+        Self { pool, dolt: None }
+    }
+
+    /// Attach the per-workspace Dolt pools so `workspace.create` also provisions
+    /// the tenant's `hq_<slug>` database + issues schema (hq-gap-workspace-provision-full).
+    pub fn with_dolt(mut self, dolt: Arc<WorkspacePools>) -> Self {
+        self.dolt = Some(dolt);
+        self
     }
 
     /// A repository over the shared pool.
@@ -110,6 +125,27 @@ impl DomainHandler for WorkspaceHandler {
                     .map_err(|e| {
                         AppError::Other(format!("provision schema for {}: {e}", id.as_str()))
                     })?;
+                // `gt_create_workspace_schema` clones the `ws_default` STRUCTURE only
+                // (CREATE TABLE LIKE), so the new `ws_<slug>.roles`/`users` tables are
+                // EMPTY — `/auth/switch` into the tenant would then expand no scopes (or,
+                // for a tenant predating the template, hit a missing relation). Seed the
+                // creator's RBAC so the workspace is usable the moment it is created
+                // (hq-gap-workspace-provision-full). Idempotent (ON CONFLICT DO NOTHING).
+                seed_workspace_rbac(&self.pool, id.as_str(), ctx.actor).await?;
+                // Provision the Dolt side: `CREATE DATABASE hq_<slug>` + apply the issues
+                // schema, so the tenant's tracker works from creation. Only when
+                // multi-tenant Dolt routing is configured (`GT_DOLT_BASE_URL`); otherwise
+                // the deploy is single-tenant on the shared `hq` and there is nothing to
+                // provision here. Idempotent (CREATE DATABASE IF NOT EXISTS + ensure_schema).
+                if let Some(dolt) = &self.dolt {
+                    // CREATE DATABASE hq_<slug> over a server-scoped pool (a tenant
+                    // pool would fail to connect to a database that does not exist
+                    // yet), then `ensured_pool` applies the issues schema once per
+                    // slug — the same self-healing path the read/write routes take.
+                    let server = dolt.server_pool();
+                    gt_store_dolt::create_workspace_dolt(&server, id.as_str()).await?;
+                    dolt.ensured_pool(id.as_str()).await?;
+                }
                 Ok(json!({
                     "ok": true,
                     "id": id.as_str(),
@@ -187,6 +223,102 @@ impl DomainHandler for WorkspaceHandler {
             other => Err(AppError::Validation(format!("unknown tool `{other}`"))),
         }
     }
+}
+
+/// Seed the freshly-cloned `ws_<slug>` schema's RBAC so the creator can use the
+/// workspace immediately (hq-gap-workspace-provision-full).
+///
+/// `gt_create_workspace_schema` clones the `ws_default` template STRUCTURE only,
+/// so the new `roles`/`users` tables are empty — `/auth/switch` into the tenant
+/// would expand no scopes (no usable token). This seeds the minimum that makes a
+/// switch succeed:
+/// - an `admin` role granting the `*` wildcard in `ws_<slug>.roles`;
+/// - the creating user (mirrored from `public.users`) into `ws_<slug>.users`,
+///   holding that `admin` role, so the per-tenant login store agrees with the
+///   global identity;
+/// - a `(user_id, slug, 'admin')` row in `public.user_workspaces` so the creator
+///   is a member — what `/auth/switch` resolves before expanding the role.
+///
+/// All writes are idempotent (`ON CONFLICT DO NOTHING`), so a re-create / retry
+/// is a no-op. The membership + the per-ws user mirror are skipped when the actor
+/// is not a known global identity (e.g. the boot/system actor): the role still
+/// lands so an operator can attach a membership later. The schema name is derived
+/// by [`schema_for`] (the same hyphen→underscore mapping the SQL function uses)
+/// and validated as a plain `ws_*` identifier before interpolation, since a
+/// schema name cannot be a bound parameter.
+async fn seed_workspace_rbac(pool: &PgPool, slug: &str, actor: &str) -> Result<(), AppError> {
+    let schema = schema_for(slug);
+    if !is_safe_ws_schema(&schema) {
+        return Err(AppError::Other(format!(
+            "refusing to seed unsafe schema ident {schema:?}"
+        )));
+    }
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+
+    // The `admin` role granting the wildcard, mirroring the boot admin-seed shape
+    // (ws_default.roles). Identifier interpolated (validated above); values bound.
+    sqlx::query(&format!(
+        "INSERT INTO {schema}.roles (name, scopes, created_at, updated_at) \
+         VALUES ('admin', ARRAY['*'], $1, $1) ON CONFLICT (name) DO NOTHING"
+    ))
+    .bind(now)
+    .execute(pool)
+    .await
+    .map_err(|e| AppError::Other(format!("seed {schema}.roles admin: {e}")))?;
+
+    // Mirror the creating user's global identity into the tenant's per-ws login
+    // store, holding the `admin` role. Only when the actor is a known global
+    // identity — the boot/system actor has no `public.users` row, and the empty
+    // role assignment / absent membership is harmless (operator attaches later).
+    let global: Option<(String, String)> = sqlx::query_as(
+        "SELECT id, password_hash FROM public.users WHERE id = $1",
+    )
+    .bind(actor)
+    .fetch_optional(pool)
+    .await
+    .map_err(|e| AppError::Other(format!("lookup global identity {actor}: {e}")))?;
+
+    if let Some((user_id, password_hash)) = global {
+        sqlx::query(&format!(
+            "INSERT INTO {schema}.users \
+                (id, email, password_hash, scopes, roles, created_at, updated_at) \
+             SELECT id, email, $2, ARRAY[]::text[], ARRAY['admin'], $3, $3 \
+             FROM public.users WHERE id = $1 \
+             ON CONFLICT (id) DO NOTHING"
+        ))
+        .bind(&user_id)
+        .bind(&password_hash)
+        .bind(now)
+        .execute(pool)
+        .await
+        .map_err(|e| AppError::Other(format!("seed {schema}.users creator: {e}")))?;
+
+        // Membership: the creator holds `admin` in this workspace, so `/auth/switch`
+        // resolves it and expands `admin` → `[*]`. FK-safe: user_id exists in
+        // public.users (we just read it).
+        sqlx::query(
+            "INSERT INTO public.user_workspaces (user_id, workspace_slug, role, created_at) \
+             VALUES ($1, $2, 'admin', $3) ON CONFLICT (user_id, workspace_slug) DO NOTHING",
+        )
+        .bind(&user_id)
+        .bind(slug)
+        .bind(now)
+        .execute(pool)
+        .await
+        .map_err(|e| AppError::Other(format!("seed membership {user_id}@{slug}: {e}")))?;
+    }
+    Ok(())
+}
+
+/// True when `s` is a plain `ws_<a-z0-9_>+` schema identifier — the only shape
+/// [`schema_for`] yields — so it is safe to interpolate into DDL (a schema name
+/// cannot be a bound parameter). Mirrors the server's boot-time guard.
+fn is_safe_ws_schema(s: &str) -> bool {
+    s.strip_prefix("ws_")
+        .is_some_and(|rest| !rest.is_empty() && rest.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_'))
 }
 
 /// Pull a required string argument, rejecting a missing/non-string value as a
@@ -391,6 +523,45 @@ mod tests {
             .execute(pool)
             .await
             .expect("ensure ws_default template");
+    }
+
+    /// Seed the `ws_default` template's RBAC tables (the `roles`/`users` shapes the
+    /// boot auth migrations define) plus the global-identity tables (`public.users`,
+    /// `public.user_workspaces`), so a `gt_create_workspace_schema` clone carries the
+    /// `roles`/`users` structure and `seed_workspace_rbac` has somewhere to land. All
+    /// idempotent — mirrors the gt-auth migrations without depending on that crate's
+    /// migration runner here.
+    async fn apply_rbac_template(pool: &PgPool) {
+        sqlx::raw_sql(
+            "CREATE TABLE IF NOT EXISTS ws_default.roles ( \
+                name TEXT PRIMARY KEY, \
+                scopes TEXT[] NOT NULL DEFAULT '{}', \
+                created_at BIGINT NOT NULL, \
+                updated_at BIGINT NOT NULL ); \
+             CREATE TABLE IF NOT EXISTS ws_default.users ( \
+                id TEXT PRIMARY KEY, \
+                email TEXT NOT NULL UNIQUE, \
+                password_hash TEXT NOT NULL, \
+                scopes TEXT[] NOT NULL DEFAULT '{}', \
+                roles TEXT[] NOT NULL DEFAULT '{}', \
+                created_at BIGINT NOT NULL, \
+                updated_at BIGINT NOT NULL ); \
+             CREATE TABLE IF NOT EXISTS public.users ( \
+                id TEXT PRIMARY KEY, \
+                email TEXT NOT NULL UNIQUE, \
+                password_hash TEXT NOT NULL, \
+                created_at BIGINT NOT NULL, \
+                updated_at BIGINT NOT NULL ); \
+             CREATE TABLE IF NOT EXISTS public.user_workspaces ( \
+                user_id TEXT NOT NULL REFERENCES public.users(id) ON DELETE CASCADE, \
+                workspace_slug TEXT NOT NULL, \
+                role TEXT NOT NULL DEFAULT '', \
+                created_at BIGINT NOT NULL, \
+                UNIQUE (user_id, workspace_slug) );",
+        )
+        .execute(pool)
+        .await
+        .expect("seed rbac template + global identity tables");
     }
 
     /// PG-backed round trip: `workspace.create` persists through the actor, then
@@ -632,6 +803,108 @@ mod tests {
             let serde = serde_json::to_value(s).unwrap();
             assert_eq!(serde, json!(status_str(s)));
         }
+    }
+
+    #[test]
+    fn safe_ws_schema_accepts_ws_idents_and_rejects_the_rest() {
+        assert!(is_safe_ws_schema("ws_acme"));
+        assert!(is_safe_ws_schema("ws_team_1"));
+        assert!(is_safe_ws_schema(&schema_for("team-1")));
+        // Rejected: missing prefix, empty tail, uppercase, separators, injection.
+        assert!(!is_safe_ws_schema("ws_"));
+        assert!(!is_safe_ws_schema("public"));
+        assert!(!is_safe_ws_schema("ws_Acme"));
+        assert!(!is_safe_ws_schema("ws_a-b"));
+        assert!(!is_safe_ws_schema("ws_a; DROP"));
+    }
+
+    /// PG-backed: `workspace.create` makes a freshly-created tenant usable end to
+    /// end (hq-gap-workspace-provision-full). After create, the new `ws_<slug>`
+    /// schema holds an `admin` role granting `[*]`, the creating user mirrored from
+    /// `public.users` with that role, and a `public.user_workspaces` membership —
+    /// exactly what `/auth/switch` resolves before expanding the role. Re-create is
+    /// a no-op (idempotent seed), not a duplicate-key error.
+    #[tokio::test]
+    async fn create_provisions_usable_tenant_rbac_and_membership() {
+        let Some(pool) = pool_or_skip().await else {
+            eprintln!("GT_PG_URL unset; skipping provision-full contract test");
+            return;
+        };
+        apply_workspace_migrations(&pool).await;
+        apply_rbac_template(&pool).await;
+
+        // A clean slate for this slug.
+        let now = 1_700_000_000i64;
+        sqlx::query("DELETE FROM workspaces WHERE id = $1").bind("prov-test").execute(&pool).await.unwrap();
+        sqlx::query("DELETE FROM public.user_workspaces WHERE workspace_slug = $1")
+            .bind("prov-test")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::raw_sql("DROP SCHEMA IF EXISTS ws_prov_test CASCADE").execute(&pool).await.unwrap();
+        // The creating user must be a known global identity (membership FK).
+        sqlx::query(
+            "INSERT INTO public.users (id, email, password_hash, created_at, updated_at) \
+             VALUES ('user-prov', 'prov@gt.local', 'argon2-hash', $1, $1) \
+             ON CONFLICT (id) DO NOTHING",
+        )
+        .bind(now)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let handler = WorkspaceHandler::new(pool.clone());
+        let ctx = |args| DomainCtx { workspace: None, actor: "user-prov", args };
+
+        let created = handler
+            .dispatch("workspace.create", ctx(json!({ "id": "prov-test", "name": "Prov" })))
+            .await
+            .unwrap();
+        assert_eq!(created["status"], "active");
+
+        // The admin role exists in the tenant schema, granting the wildcard.
+        let role_scopes: Vec<String> =
+            sqlx::query_scalar("SELECT scopes FROM ws_prov_test.roles WHERE name = 'admin'")
+                .fetch_one(&pool)
+                .await
+                .expect("admin role seeded into ws_prov_test.roles");
+        assert_eq!(role_scopes, vec!["*".to_string()]);
+
+        // The creator is mirrored into the tenant's users, holding `admin`.
+        let (uid, uroles): (String, Vec<String>) =
+            sqlx::query_as("SELECT id, roles FROM ws_prov_test.users WHERE id = 'user-prov'")
+                .fetch_one(&pool)
+                .await
+                .expect("creator seeded into ws_prov_test.users");
+        assert_eq!(uid, "user-prov");
+        assert_eq!(uroles, vec!["admin".to_string()]);
+
+        // The membership ties the creator to the workspace with the admin role.
+        let mrole: String = sqlx::query_scalar(
+            "SELECT role FROM public.user_workspaces WHERE user_id = 'user-prov' AND workspace_slug = 'prov-test'",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("membership row seeded");
+        assert_eq!(mrole, "admin");
+
+        // Idempotent: deleting the catalog row and re-creating re-runs the seed as a
+        // no-op (ON CONFLICT DO NOTHING), never a duplicate-key error.
+        sqlx::query("DELETE FROM workspaces WHERE id = $1").bind("prov-test").execute(&pool).await.unwrap();
+        handler
+            .dispatch("workspace.create", ctx(json!({ "id": "prov-test", "name": "Prov" })))
+            .await
+            .expect("re-create with already-seeded RBAC is idempotent");
+
+        // Cleanup.
+        sqlx::query("DELETE FROM public.user_workspaces WHERE workspace_slug = $1")
+            .bind("prov-test")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("DELETE FROM workspaces WHERE id = $1").bind("prov-test").execute(&pool).await.unwrap();
+        sqlx::query("DELETE FROM public.users WHERE id = 'user-prov'").execute(&pool).await.unwrap();
+        sqlx::raw_sql("DROP SCHEMA IF EXISTS ws_prov_test CASCADE").execute(&pool).await.unwrap();
     }
 
     #[test]

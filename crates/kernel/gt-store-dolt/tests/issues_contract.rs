@@ -822,3 +822,55 @@ async fn pager_walks_corpus_without_dup_or_skip() {
     assert!(capped.has_more);
     std::env::remove_var("GT_ISSUES_MAX_LIMIT");
 }
+
+/// hq-gap-workspace-provision-full: `create_workspace_dolt` provisions a tenant's
+/// `hq_<slug>` database and `WorkspacePools::pool_for(slug)` + `ensure_schema`
+/// seeds its `issues` table — the Dolt half of making a fresh workspace usable.
+///
+/// Proves the gastown-grant fix: the live Dolt user is `gtapp` and no `gastown`
+/// user exists, so the old hardcoded `GRANT ... TO 'gastown'@'%'` would ERROR and
+/// abort provisioning. With the grant dropped, provisioning relies on the server
+/// user's own privilege and succeeds. Idempotent: a second call is a no-op.
+#[tokio::test]
+async fn create_workspace_dolt_provisions_hq_db_and_issues_schema() {
+    let Ok(base) = std::env::var("GT_DOLT_URL") else {
+        eprintln!("GT_DOLT_URL unset — skipping create_workspace_dolt contract");
+        return;
+    };
+    let base = base.trim_end_matches('/').to_string();
+    // A throwaway tenant slug; `hq_f3-prov` must not collide with the live `hq`.
+    let slug = "f3-prov";
+
+    // Server-scoped pool (no DB) for CREATE DATABASE — what the handler builds via
+    // WorkspacePools::server_pool() in the real path.
+    let server = gt_store_dolt::connect(&base).expect("connect server");
+    {
+        // Clean slate so the idempotency check below starts from absent.
+        let mut conn = server.get_conn().await.expect("conn");
+        conn.query_drop("DROP DATABASE IF EXISTS `hq_f3-prov`").await.expect("drop");
+    }
+
+    // First provision: creates the DB (and does NOT fail on a missing gastown user).
+    gt_store_dolt::create_workspace_dolt(&server, slug).await.expect("provision dolt db");
+    // Second provision is a no-op (CREATE DATABASE IF NOT EXISTS).
+    gt_store_dolt::create_workspace_dolt(&server, slug).await.expect("re-provision idempotent");
+
+    // The per-workspace pool binds to `hq_<slug>`; ensure_schema seeds `issues`.
+    let pools = gt_store_dolt::WorkspacePools::from_url(&format!("{base}/")).expect("pools");
+    let ws_pool = pools.pool_for(slug).expect("pool_for slug");
+    DoltIssues::new(ws_pool.clone()).ensure_schema().await.expect("ensure issues schema");
+
+    // The issues table exists in the new tenant database.
+    let mut conn = ws_pool.get_conn().await.expect("ws conn");
+    let present: Option<i64> = conn
+        .query_first(
+            "SELECT 1 FROM information_schema.tables \
+             WHERE table_schema = 'hq_f3-prov' AND table_name = 'issues' LIMIT 1",
+        )
+        .await
+        .expect("probe issues table");
+    assert_eq!(present, Some(1), "hq_f3-prov.issues must exist after provision");
+
+    // Cleanup.
+    conn.query_drop("DROP DATABASE IF EXISTS `hq_f3-prov`").await.expect("cleanup");
+}
