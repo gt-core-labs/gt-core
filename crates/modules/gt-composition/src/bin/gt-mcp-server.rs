@@ -467,6 +467,9 @@ async fn main() -> anyhow::Result<()> {
                 login: pg_users.clone(),
                 users: Some(pg_users.clone() as Arc<dyn gt_auth::UserStore>),
                 roles: Some(pg_users.clone() as Arc<dyn gt_auth::RoleStore>),
+                // Cross-workspace surface (hq-identity.3): list memberships + switch active
+                // workspace, backed by the same global-identity adapter.
+                memberships: Some(pg_users.clone() as Arc<dyn gt_auth::MembershipDirectory>),
                 minter: Arc::new(minter),
                 // MVP refresh store (hq-web-extras.7): in-memory, so refresh tokens do not
                 // survive a restart. Durable PgRefreshStore is async-only and does not implement

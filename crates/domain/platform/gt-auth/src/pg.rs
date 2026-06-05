@@ -311,6 +311,30 @@ impl PgUsers {
         // De-dup while preserving first-seen order (two roles may share a scope).
         Ok(merge_scopes(out, Vec::new()))
     }
+
+    /// Resolve `{sub, workspace}` into the identity a switch should re-mint (hq-identity.3): the
+    /// user's role in `workspace`, expanded to scopes against that workspace's catalog. `None` when
+    /// the user holds NO membership of `workspace` — the switch endpoint maps that to `403`, so a
+    /// caller can never re-mint into a tenant they do not belong to. No password is checked here:
+    /// the caller already proved identity with a valid bearer; this only re-targets the workspace.
+    pub async fn resolve_membership(
+        &self,
+        sub: &str,
+        workspace: &str,
+    ) -> Result<Option<VerifiedIdentity>, AuthError> {
+        let memberships = self.memberships(sub).await?;
+        let Some(membership) = memberships.iter().find(|m| m.workspace == workspace) else {
+            return Ok(None);
+        };
+        let scopes = self
+            .expand_roles_in_workspace(workspace, std::slice::from_ref(&membership.role))
+            .await?;
+        Ok(Some(VerifiedIdentity {
+            sub: sub.to_string(),
+            workspace: workspace.to_string(),
+            scopes,
+        }))
+    }
 }
 
 /// Build a [`Membership`] from a `public.user_workspaces` row. A column-read fault is an

@@ -79,6 +79,63 @@ impl LoginProvider for GlobalLogin {
     }
 }
 
+/// The workspace-membership port behind `GET /auth/workspaces` and `POST /auth/switch`
+/// (hq-identity.3): list the workspaces an already-authenticated user can reach, and re-target a
+/// session to one of them. Keyed by the verified token's `sub` — no password re-check, the bearer
+/// already proved identity. Separate from [`LoginProvider`] (which authenticates from scratch) so
+/// a deploy can mount login without the cross-workspace surface. The production adapter is
+/// [`PgUsers`](crate::PgUsers).
+#[async_trait]
+pub trait MembershipDirectory: Send + Sync {
+    /// The user's workspace memberships (slug + role), for the workspace picker. Empty ⇒ a global
+    /// identity with no tenant yet (it could log in nowhere — see [`PgUsers::authenticate_global`]).
+    async fn list(&self, sub: &str) -> Result<Vec<WorkspaceMembership>, AuthError>;
+
+    /// The identity to re-mint when switching `sub` into `workspace`: that membership's role,
+    /// expanded to scopes in that tenant. `None` ⇒ the user is NOT a member, which the switch
+    /// endpoint maps to `403` — never a token for an unheld tenant.
+    async fn resolve(
+        &self,
+        sub: &str,
+        workspace: &str,
+    ) -> Result<Option<VerifiedIdentity>, AuthError>;
+}
+
+/// One membership row as returned by `GET /auth/workspaces`: the workspace slug and the role the
+/// user holds there (the gt-web shell consumes this to render + drive the workspace selector).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct WorkspaceMembership {
+    /// The workspace slug the user can switch into.
+    pub workspace: String,
+    /// The role the user holds in that workspace.
+    pub role: String,
+}
+
+/// The production [`MembershipDirectory`]: list + resolve over the global identity tables.
+#[cfg(feature = "pg")]
+#[async_trait]
+impl MembershipDirectory for crate::PgUsers {
+    async fn list(&self, sub: &str) -> Result<Vec<WorkspaceMembership>, AuthError> {
+        Ok(self
+            .memberships(sub)
+            .await?
+            .into_iter()
+            .map(|m| WorkspaceMembership {
+                workspace: m.workspace,
+                role: m.role,
+            })
+            .collect())
+    }
+
+    async fn resolve(
+        &self,
+        sub: &str,
+        workspace: &str,
+    ) -> Result<Option<VerifiedIdentity>, AuthError> {
+        self.resolve_membership(sub, workspace).await
+    }
+}
+
 /// The async user-administration port behind `POST`/`GET /auth/users` (`hq-web-extras.5`): the
 /// onboarding surface that creates and lists users without hand-written SQL. Separate from
 /// [`LoginProvider`] (which only authenticates) so a deploy can mount login without exposing
@@ -183,6 +240,9 @@ pub struct AuthState {
     /// The role-administration store behind `/auth/roles` + `/auth/users/{email}/roles`
     /// (hq-rbac.4). `None` ⇒ those endpoints respond `501`; login + user admin are unaffected.
     pub roles: Option<Arc<dyn RoleStore>>,
+    /// The workspace-membership directory behind `GET /auth/workspaces` + `POST /auth/switch`
+    /// (hq-identity.3). `None` ⇒ those endpoints respond `501`; login + admin are unaffected.
+    pub memberships: Option<Arc<dyn MembershipDirectory>>,
     /// The verifier's public JWKS, served at `GET /auth/jwks` so clients verify access tokens
     /// offline. Built from the verifier's public keys at the composition root
     /// ([`JwtAuthenticator::jwk_set`](crate::JwtAuthenticator::jwk_set)) — never the signing
@@ -206,7 +266,10 @@ pub fn auth_router(state: AuthState) -> Router {
         // Role administration + assignment (hq-rbac.4), scope-gated like the user surface.
         .route("/auth/roles", post(create_role).get(list_roles))
         .route("/auth/roles/:name", axum::routing::delete(delete_role))
-        .route("/auth/users/:email/roles", post(assign_roles));
+        .route("/auth/users/:email/roles", post(assign_roles))
+        // Cross-workspace surface (hq-identity.3): list memberships + switch the active workspace.
+        .route("/auth/workspaces", get(workspaces))
+        .route("/auth/switch", post(switch));
     router.with_state(state)
 }
 
@@ -251,6 +314,14 @@ pub struct MeResponse {
     pub workspace: String,
     /// Granted authorization scopes.
     pub scopes: Vec<String>,
+}
+
+/// `POST /auth/switch` body — the workspace to make active (hq-identity.3).
+#[derive(Debug, Deserialize)]
+pub struct SwitchRequest {
+    /// The slug of a workspace the caller is a member of. Validated against their memberships
+    /// server-side; an unheld workspace is a `403`, never an honoured switch.
+    pub workspace: String,
 }
 
 /// `POST /auth/users` body — create a user (admin only, `hq-web-extras.5`).
@@ -374,6 +445,41 @@ async fn me(claims: Option<Extension<JwtClaims>>) -> Result<Json<MeResponse>, Ap
         workspace: claims.workspace,
         scopes: claims.scopes,
     }))
+}
+
+/// `GET /auth/workspaces` — the authenticated user's workspace memberships (slug + role), for the
+/// gt-web workspace selector (hq-identity.3). `401` without verified claims; `501` when no
+/// membership directory is configured. The list is keyed by the token's `sub`, so a caller only
+/// ever sees their own memberships.
+#[cfg(feature = "pg")]
+async fn workspaces(
+    State(state): State<AuthState>,
+    claims: Option<Extension<JwtClaims>>,
+) -> Result<Json<Vec<WorkspaceMembership>>, ApiError> {
+    let Extension(claims) = claims.ok_or(ApiError::Unauthenticated)?;
+    let dir = state.memberships.as_ref().ok_or(ApiError::NotConfigured)?;
+    Ok(Json(dir.list(&claims.sub).await?))
+}
+
+/// `POST /auth/switch` `{workspace}` — re-target the session to another of the user's workspaces
+/// (hq-identity.3). Re-mints the access + refresh pair (and cookies) with that workspace active and
+/// its role-expanded scopes. `403` when the user is not a member of the requested workspace —
+/// the active tenant is resolved server-side from membership, never granted on request. `401`
+/// without claims; `501` when no directory is configured.
+#[cfg(feature = "pg")]
+async fn switch(
+    State(state): State<AuthState>,
+    claims: Option<Extension<JwtClaims>>,
+    Json(body): Json<SwitchRequest>,
+) -> Result<(HeaderMap, Json<TokenResponse>), ApiError> {
+    let Extension(claims) = claims.ok_or(ApiError::Unauthenticated)?;
+    let dir = state.memberships.as_ref().ok_or(ApiError::NotConfigured)?;
+    let identity = dir
+        .resolve(&claims.sub, &body.workspace)
+        .await?
+        .ok_or(ApiError::Forbidden)?;
+    let tokens = issue_tokens(&state, identity.sub, identity.workspace, identity.scopes)?;
+    Ok((set_token_cookies(&state, &tokens), Json(tokens)))
 }
 
 /// `GET /auth/jwks` — the verifier's public RS256 keys as an RFC 7517 JWK Set. A client matches a
@@ -877,6 +983,7 @@ mod tests {
             cookie_same_site: SameSite::Lax,
             users: None,
             roles: None,
+            memberships: None,
             // Publish the public half of the same "k1" key the minter signs with.
             jwks: Arc::new(
                 JwtAuthenticator::from_kid_pems([("k1", PUB_PEM)]).unwrap().jwk_set(),
@@ -1139,5 +1246,163 @@ mod tests {
         let cookies = set_cookies(&resp);
         assert!(cookies.iter().any(|c| c.starts_with("gt_web_token=") && c.contains("Max-Age=0")));
         assert!(cookies.iter().any(|c| c.starts_with("gt_refresh=") && c.contains("Max-Age=0")));
+    }
+
+    // --- hq-identity.3: GET /auth/workspaces + POST /auth/switch ---------------------------------
+
+    /// In-memory membership directory double: `sub -> [(workspace, role, scopes)]`. `list` projects
+    /// the slug+role; `resolve` finds the held workspace and yields the identity to re-mint (the
+    /// scopes it carries stand in for that tenant's role expansion).
+    #[derive(Default)]
+    struct MemDirectory {
+        by_sub: std::collections::HashMap<String, Vec<(String, String, Vec<String>)>>,
+    }
+
+    #[async_trait]
+    impl MembershipDirectory for MemDirectory {
+        async fn list(&self, sub: &str) -> Result<Vec<WorkspaceMembership>, AuthError> {
+            Ok(self
+                .by_sub
+                .get(sub)
+                .into_iter()
+                .flatten()
+                .map(|(w, r, _)| WorkspaceMembership { workspace: w.clone(), role: r.clone() })
+                .collect())
+        }
+        async fn resolve(
+            &self,
+            sub: &str,
+            workspace: &str,
+        ) -> Result<Option<VerifiedIdentity>, AuthError> {
+            Ok(self
+                .by_sub
+                .get(sub)
+                .into_iter()
+                .flatten()
+                .find(|(w, _, _)| w == workspace)
+                .map(|(w, _, scopes)| VerifiedIdentity {
+                    sub: sub.to_string(),
+                    workspace: w.clone(),
+                    scopes: scopes.clone(),
+                }))
+        }
+    }
+
+    fn state_with_memberships(dir: Arc<MemDirectory>) -> AuthState {
+        AuthState { memberships: Some(dir), ..state() }
+    }
+
+    /// Two-membership directory for "gwen": lead@ida (beads.read) and lead@idb (rig.read).
+    fn gwen_directory() -> Arc<MemDirectory> {
+        let mut by_sub = std::collections::HashMap::new();
+        by_sub.insert(
+            "gwen".to_string(),
+            vec![
+                ("ida".to_string(), "lead".to_string(), vec!["beads.read".to_string()]),
+                ("idb".to_string(), "lead".to_string(), vec!["rig.read".to_string()]),
+            ],
+        );
+        Arc::new(MemDirectory { by_sub })
+    }
+
+    /// Build a request to `path` with optional verified claims (`sub`/`workspace`) and JSON body.
+    fn authed_req(method: &str, path: &str, sub: Option<&str>, json: Option<&str>) -> Request<Body> {
+        let mut builder = Request::builder().method(method).uri(path);
+        if json.is_some() {
+            builder = builder.header("content-type", "application/json");
+        }
+        let mut req = builder
+            .body(json.map(|j| Body::from(j.to_owned())).unwrap_or_else(Body::empty))
+            .unwrap();
+        if let Some(sub) = sub {
+            req.extensions_mut().insert(JwtClaims {
+                sub: sub.into(),
+                workspace: "ida".into(),
+                scopes: vec!["beads.read".into()],
+                exp: 2_000_000_000,
+                nbf: None,
+                iat: 0,
+            });
+        }
+        req
+    }
+
+    #[tokio::test]
+    async fn workspaces_lists_the_callers_memberships() {
+        let app = auth_router(state_with_memberships(gwen_directory()));
+        let resp = app
+            .oneshot(authed_req("GET", "/auth/workspaces", Some("gwen"), None))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let got: Vec<WorkspaceMembership> = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(
+            got,
+            vec![
+                WorkspaceMembership { workspace: "ida".into(), role: "lead".into() },
+                WorkspaceMembership { workspace: "idb".into(), role: "lead".into() },
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn workspaces_requires_authentication_and_a_directory() {
+        // No claims → 401.
+        let app = auth_router(state_with_memberships(gwen_directory()));
+        let resp = app
+            .oneshot(authed_req("GET", "/auth/workspaces", None, None))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+        // No directory configured → 501.
+        let resp = auth_router(state())
+            .oneshot(authed_req("GET", "/auth/workspaces", Some("gwen"), None))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_IMPLEMENTED);
+    }
+
+    #[tokio::test]
+    async fn switch_remints_for_a_held_workspace_with_that_tenants_scopes() {
+        let app = auth_router(state_with_memberships(gwen_directory()));
+        let resp = app
+            .oneshot(authed_req("POST", "/auth/switch", Some("gwen"), Some(r#"{"workspace":"idb"}"#)))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        // The cookies are re-stamped on switch.
+        let cookies = set_cookies(&resp);
+        assert!(cookies.iter().any(|c| c.starts_with("gt_web_token=")));
+        // The re-minted access token names idb + that tenant's scopes — proving the server
+        // resolved the active workspace from membership, not from the prior claim (ida).
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        let access = body["access_token"].as_str().unwrap();
+        let verifier = JwtAuthenticator::from_kid_pems([("k1", PUB_PEM)]).unwrap();
+        let claims = verifier.authenticate(access).unwrap();
+        assert_eq!(claims.sub, "gwen");
+        assert_eq!(claims.workspace, "idb");
+        assert_eq!(claims.scopes, vec!["rig.read".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn switch_to_an_unheld_workspace_is_forbidden() {
+        let app = auth_router(state_with_memberships(gwen_directory()));
+        let resp = app
+            .oneshot(authed_req("POST", "/auth/switch", Some("gwen"), Some(r#"{"workspace":"ghost"}"#)))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn switch_without_claims_is_unauthorized() {
+        let app = auth_router(state_with_memberships(gwen_directory()));
+        let resp = app
+            .oneshot(authed_req("POST", "/auth/switch", None, Some(r#"{"workspace":"idb"}"#)))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
     }
 }
