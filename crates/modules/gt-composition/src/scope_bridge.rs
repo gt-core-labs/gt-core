@@ -46,9 +46,14 @@ pub async fn bridge_scopes(mut req: Request, next: Next) -> Response {
     next.run(req).await
 }
 
-/// Parse the granted scope strings into a [`CallerScopes`], dropping any that are not a valid
-/// `resource.verb` slug. Pure, so it is unit-testable without a router.
+/// Parse the granted scope strings into a [`CallerScopes`]. A `"*"` grant is the superuser
+/// wildcard (mirrors the MCP path's `gt_rbac` scope) and satisfies every route; otherwise each
+/// string is parsed as a `resource.verb` slug, dropping any that don't parse. Pure, so it is
+/// unit-testable without a router.
 fn caller_scopes(granted: &[String]) -> CallerScopes {
+    if granted.iter().any(|s| s == "*") {
+        return CallerScopes::all();
+    }
     CallerScopes::new(granted.iter().filter_map(|s| Scope::new(s.as_str()).ok()))
 }
 
@@ -134,10 +139,19 @@ mod tests {
         assert_eq!(out, "present:");
     }
 
+    #[tokio::test]
+    async fn star_scope_is_the_superuser_wildcard() {
+        // A "*" grant satisfies every probed scope (admin token ⇒ full REST access).
+        let out = run(Some(claims_with(vec!["*".into()]))).await;
+        assert_eq!(out, "present:beads.read,rig.read,rig.write");
+    }
+
     #[test]
     fn caller_scopes_helper_filters_invalid() {
         let cs = caller_scopes(&["rig.read".into(), "nope".into()]);
         assert!(cs.holds(&Scope::new("rig.read").unwrap()));
         assert_eq!(caller_scopes(&[]), CallerScopes::default());
+        // "*" ⇒ wildcard: holds an arbitrary scope it was never explicitly granted.
+        assert!(caller_scopes(&["*".into()]).holds(&Scope::new("anything.write").unwrap()));
     }
 }

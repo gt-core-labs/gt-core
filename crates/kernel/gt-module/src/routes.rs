@@ -87,17 +87,29 @@ pub fn module_prefix(id: &ModuleId) -> String {
 /// is `gt-mt-auth`/app territory, so spoofing is impossible from a request body
 /// (the set comes only from server-side auth, never the wire).
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct CallerScopes(BTreeSet<Scope>);
+pub struct CallerScopes {
+    scopes: BTreeSet<Scope>,
+    /// A `"*"` grant in the caller's claims: a superuser that [`holds`](Self::holds) every scope.
+    /// Mirrors the MCP dispatch path's `gt_rbac` wildcard, so an admin token minted with
+    /// `scopes:["*"]` authorizes the REST surface the same way it authorizes MCP tools.
+    wildcard: bool,
+}
 
 impl CallerScopes {
-    /// Build a caller-scope set from the granted scopes.
+    /// Build a caller-scope set from the granted scopes (no wildcard).
     pub fn new(scopes: impl IntoIterator<Item = Scope>) -> Self {
-        CallerScopes(scopes.into_iter().collect())
+        CallerScopes { scopes: scopes.into_iter().collect(), wildcard: false }
     }
 
-    /// Whether the caller holds `scope`.
+    /// A superuser scope set — [`holds`](Self::holds) is true for every scope. Built by the
+    /// claims bridge from a `"*"` grant.
+    pub fn all() -> Self {
+        CallerScopes { scopes: BTreeSet::new(), wildcard: true }
+    }
+
+    /// Whether the caller holds `scope` — always true for a wildcard (`"*"`) caller.
     pub fn holds(&self, scope: &Scope) -> bool {
-        self.0.contains(scope)
+        self.wildcard || self.scopes.contains(scope)
     }
 }
 
@@ -257,7 +269,15 @@ mod tests {
         let cs = CallerScopes::new([scope("beads.read")]);
         assert!(cs.holds(&scope("beads.read")));
         assert!(!cs.holds(&scope("beads.write")));
-        assert!(CallerScopes::default().0.is_empty());
+        assert!(!CallerScopes::default().holds(&scope("beads.read")));
+    }
+
+    #[test]
+    fn wildcard_caller_holds_every_scope() {
+        let cs = CallerScopes::all();
+        assert!(cs.holds(&scope("beads.read")));
+        assert!(cs.holds(&scope("beads.write")));
+        assert!(cs.holds(&scope("anything.read")));
     }
 
     /// A `beads` router with a read (GET) and a write (POST) route, guarded by
