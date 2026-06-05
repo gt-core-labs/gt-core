@@ -1794,6 +1794,7 @@ dependencies = [
  "gt-module",
  "gt-module-mcp",
  "gt-store-dolt",
+ "gt-workspace",
  "mysql_async",
  "schemars 0.8.22",
  "semver",

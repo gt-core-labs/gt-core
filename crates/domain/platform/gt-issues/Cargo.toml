@@ -34,12 +34,18 @@ utoipa = { workspace = true, optional = true }
 # `axum` REST adapter, so they are optional + gated by that feature.
 gt-auth = { workspace = true, optional = true }
 async-trait = { workspace = true, optional = true }
+# Per-request tenant resolution (hq-gap-issues-rest-workspace-routing): the REST
+# handlers resolve the caller's workspace from the verified `WorkspaceClaim` the
+# composition auth middleware injects (or an `X-GT-Workspace` header) via the
+# `WorkspaceContext` extractor, then route to that tenant's own Dolt store — the
+# REST mirror of the MCP path's claim-scoped routing. Rides the `axum` adapter.
+gt-workspace = { workspace = true, optional = true, features = ["axum"] }
 
 [features]
 # Compile the axum REST adapter + OpenAPI spec (`http.rs`) and the route/spec
 # overrides on `IssuesModule`. Off by default — the MCP-only build pulls no HTTP
 # stack; the composition bin enables it to expose the REST surface.
-axum = ["dep:axum", "dep:utoipa", "dep:gt-auth", "dep:async-trait"]
+axum = ["dep:axum", "dep:utoipa", "dep:gt-auth", "dep:async-trait", "dep:gt-workspace"]
 
 [dev-dependencies]
 gt-module-mcp = { workspace = true }

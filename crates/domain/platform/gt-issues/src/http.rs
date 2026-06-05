@@ -36,7 +36,10 @@ use axum::{Json, Router};
 use serde::Deserialize;
 use serde_json::{json, Value};
 
-use gt_store_dolt::{AppError, ClaimOutcome, DoltIssues, IssueDetail, IssueFilter, IssuePage};
+use gt_store_dolt::{
+    AppError, ClaimOutcome, DoltIssues, IssueDetail, IssueFilter, IssuePage, WorkspacePools,
+};
+use gt_workspace::WorkspaceContext;
 
 use crate::commands::{ClaimIssue, CloseIssue, CreateIssue, TransitionIssue, UpdateIssue};
 use crate::handlers::{
@@ -52,7 +55,16 @@ use crate::surface::AllowAllTree;
 #[derive(Clone)]
 pub struct IssuesApiState {
     /// The live Dolt issues adapter the binary supplies — the module owns no store of its own.
+    /// In single-tenant mode this is the only store; in multi-tenant mode it is the
+    /// seed/fallback (the default workspace's `GT_DOLT_URL` store), used when no per-workspace
+    /// resolver is wired.
     store: Arc<DoltIssues>,
+    /// Per-workspace Dolt pool cache, present only when the binary runs multi-tenant
+    /// (`GT_DOLT_BASE_URL` set). When `Some`, every request resolves its tenant's own
+    /// `hq_<ws>` store from the verified workspace — the REST mirror of the MCP path's
+    /// claim-scoped routing (`hq-gap-issues-rest-workspace-routing`). When `None`, the REST
+    /// surface stays single-tenant on `store`, exactly as before.
+    workspaces: Option<Arc<WorkspacePools>>,
     /// The attribution actor stamped on `close`/`claim`, server-injected the same way the MCP
     /// path uses `GT_MCP_ACTOR`. It is the server identity, not the per-request caller, so a
     /// request body can never spoof it.
@@ -61,8 +73,29 @@ pub struct IssuesApiState {
 
 impl IssuesApiState {
     /// Build the REST state over a live store and the server attribution actor.
+    /// Single-tenant by default; call [`with_workspaces`](Self::with_workspaces) to enable
+    /// per-request tenant routing.
     pub fn new(store: Arc<DoltIssues>, actor: impl Into<Arc<str>>) -> Self {
-        Self { store, actor: actor.into() }
+        Self { store, workspaces: None, actor: actor.into() }
+    }
+
+    /// Enable multi-tenant routing: each request resolves its tenant's `hq_<ws>` store from the
+    /// shared per-workspace pool cache. Without this the REST surface serves the single
+    /// fallback `store` for every caller.
+    pub fn with_workspaces(mut self, pools: Arc<WorkspacePools>) -> Self {
+        self.workspaces = Some(pools);
+        self
+    }
+
+    /// Resolve the Dolt store for one request from its verified workspace. In multi-tenant mode
+    /// the tenant's own `hq_<ws>` pool is selected (the slug is already validated by the
+    /// `WorkspaceContext` extractor + `pool_for`); single-tenant falls back to the shared
+    /// `store`, ignoring the workspace exactly as the pre-routing behaviour did.
+    fn resolve(&self, ctx: &WorkspaceContext) -> Result<Arc<DoltIssues>, AppError> {
+        match &self.workspaces {
+            Some(pools) => Ok(Arc::new(DoltIssues::new(pools.pool_for(ctx.workspace().as_str())?))),
+            None => Ok(self.store.clone()),
+        }
     }
 }
 
@@ -161,9 +194,11 @@ impl ListQuery {
 ))]
 async fn list_issues(
     State(st): State<IssuesApiState>,
+    ctx: WorkspaceContext,
     Query(q): Query<ListQuery>,
 ) -> Result<Json<IssuePage>, ApiError> {
-    let page = read_issues_page(&st.store, &q.into_filter()).await?;
+    let store = st.resolve(&ctx)?;
+    let page = read_issues_page(&store, &q.into_filter()).await?;
     Ok(Json(page))
 }
 
@@ -216,8 +251,10 @@ struct StatsQuery {
 ))]
 async fn issue_stats(
     State(st): State<IssuesApiState>,
+    ctx: WorkspaceContext,
     Query(q): Query<StatsQuery>,
 ) -> Result<Json<StatsResponse>, ApiError> {
+    let store = st.resolve(&ctx)?;
     let dims = GroupDim::parse_list(q.group_by.as_deref().unwrap_or_default())
         .map_err(|e| ApiError(AppError::Validation(e)))?;
     // Pull the whole workspace tracker (cheap snapshot rows; `full=false`). A `None` limit would
@@ -236,7 +273,7 @@ async fn issue_stats(
         full: false,
         ready: false,
     };
-    let rows = read_issues(&st.store, &filter).await?;
+    let rows = read_issues(&store, &filter).await?;
     Ok(Json(aggregate(&rows, &dims)))
 }
 
@@ -252,9 +289,11 @@ async fn issue_stats(
 ))]
 async fn get_issue(
     State(st): State<IssuesApiState>,
+    ctx: WorkspaceContext,
     Path(id): Path<String>,
 ) -> Result<Json<IssueDetail>, ApiError> {
-    match read_issue(&st.store, &id).await? {
+    let store = st.resolve(&ctx)?;
+    match read_issue(&store, &id).await? {
         Some(detail) => Ok(Json(detail)),
         None => Err(ApiError(AppError::NotFound(format!("issue {id}")))),
     }
@@ -271,9 +310,11 @@ async fn get_issue(
 ))]
 async fn create_issue(
     State(st): State<IssuesApiState>,
+    ctx: WorkspaceContext,
     Json(args): Json<CreateIssue>,
 ) -> Result<Response, ApiError> {
-    run_create_issue(&st.store, &args, &AllowAllTree, false).await?;
+    let store = st.resolve(&ctx)?;
+    run_create_issue(&store, &args, &AllowAllTree, false).await?;
     Ok((StatusCode::CREATED, Json(json!({ "ok": true, "id": args.id }))).into_response())
 }
 
@@ -290,11 +331,13 @@ async fn create_issue(
 ))]
 async fn update_issue(
     State(st): State<IssuesApiState>,
+    ctx: WorkspaceContext,
     Path(id): Path<String>,
     Json(body): Json<Value>,
 ) -> Result<Json<Value>, ApiError> {
+    let store = st.resolve(&ctx)?;
     let args: UpdateIssue = with_path_id(body, id)?;
-    let version = run_update_issue(&st.store, &args, &AllowAllTree, false).await?;
+    let version = run_update_issue(&store, &args, &AllowAllTree, false).await?;
     let mut body = json!({ "ok": true });
     if let Some(v) = version {
         body["version"] = json!(v);
@@ -315,11 +358,13 @@ async fn update_issue(
 ))]
 async fn transition_issue(
     State(st): State<IssuesApiState>,
+    ctx: WorkspaceContext,
     Path(id): Path<String>,
     Json(body): Json<Value>,
 ) -> Result<Json<Value>, ApiError> {
+    let store = st.resolve(&ctx)?;
     let args: TransitionIssue = with_path_id(body, id)?;
-    run_transition_issue(&st.store, &args, false).await?;
+    run_transition_issue(&store, &args, false).await?;
     Ok(Json(json!({ "ok": true })))
 }
 
@@ -338,11 +383,13 @@ async fn transition_issue(
 ))]
 async fn close_issue(
     State(st): State<IssuesApiState>,
+    ctx: WorkspaceContext,
     Path(id): Path<String>,
     Json(body): Json<Value>,
 ) -> Result<Json<Value>, ApiError> {
+    let store = st.resolve(&ctx)?;
     let args: CloseIssue = with_path_id(body, id)?;
-    run_close_issue(&st.store, &args, &st.actor, None, false).await?;
+    run_close_issue(&store, &args, &st.actor, None, false).await?;
     Ok(Json(json!({ "ok": true })))
 }
 
@@ -361,11 +408,13 @@ async fn close_issue(
 ))]
 async fn claim_issue(
     State(st): State<IssuesApiState>,
+    ctx: WorkspaceContext,
     Path(id): Path<String>,
     Json(body): Json<Value>,
 ) -> Result<Json<Value>, ApiError> {
+    let store = st.resolve(&ctx)?;
     let args: ClaimIssue = with_path_id(body, id)?;
-    let res = run_claim_issue(&st.store, &args, &st.actor, false).await?;
+    let res = run_claim_issue(&store, &args, &st.actor, false).await?;
     match res.outcome {
         ClaimOutcome::Won => {
             let mut body = json!({ "outcome": "won", "owner": st.actor.as_ref() });

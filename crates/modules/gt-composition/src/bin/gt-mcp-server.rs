@@ -74,7 +74,7 @@ use gt_rig::{RigApiState, RigsModule};
 use gt_skills::{SkillsApiState, SkillsModule};
 use gt_workspace::{PgWorkspaces, WorkspaceApiState, WorkspaceModule};
 use gt_rbac::{RbacConfig, Scope};
-use gt_store_dolt::DoltIssues;
+use gt_store_dolt::{DoltIssues, WorkspacePools};
 
 /// Path the MCP endpoint mounts at (mirrors the upstream gt-mcp).
 const MCP_PATH: &str = "/mcp";
@@ -108,7 +108,25 @@ async fn main() -> anyhow::Result<()> {
     // routes (docs/03 rule 3). The module carries the live store + attribution actor so its
     // `register_routes` (hq-auth-routes.2) can dispatch to the same handlers as the MCP tools;
     // the builder mounts them at `/api/v1/issues` behind the issues.read/issues.write guard.
-    let issues_api = IssuesApiState::new(store.clone(), actor.clone());
+    // Multi-tenant REST routing for `/api/v1/issues` (hq-gap-issues-rest-workspace-routing):
+    // when `GT_DOLT_BASE_URL` is set, give the issues REST state its own per-workspace Dolt pool
+    // cache so each request resolves its tenant's `hq_<ws>` store from the verified workspace —
+    // the REST mirror of the MCP path's claim-scoped routing. Its own cache (not the MCP
+    // `WorkspaceStores` instance) keeps this change off the live MCP routing path. Unset ⇒ the
+    // REST surface stays single-tenant on `store`, exactly as before.
+    let issues_workspaces = std::env::var("GT_DOLT_BASE_URL")
+        .ok()
+        .map(|base| WorkspacePools::from_url(&base))
+        .transpose()
+        .context("GT_DOLT_BASE_URL is malformed")?
+        .map(Arc::new);
+    let issues_api = match &issues_workspaces {
+        Some(pools) => {
+            eprintln!("[gt-mcp-server] issues REST: per-workspace routing on (X-Workspace/claim selects hq_<ws>)");
+            IssuesApiState::new(store.clone(), actor.clone()).with_workspaces(pools.clone())
+        }
+        None => IssuesApiState::new(store.clone(), actor.clone()),
+    };
     let root = RootBuilder::new()
         .module(IssuesModule::with_http(issues_api))
         .module(MetaModule)

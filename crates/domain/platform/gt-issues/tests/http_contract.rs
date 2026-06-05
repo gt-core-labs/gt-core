@@ -48,17 +48,23 @@ async fn send(app: &axum::Router, req: Request<Body>) -> (StatusCode, Value) {
     (status, value)
 }
 
+/// The tenant header the `WorkspaceContext` extractor reads (`gt_workspace::WORKSPACE_HEADER`).
+/// Every request carries it so the workspace-aware handlers resolve a tenant; the router here is
+/// built single-tenant (no `with_workspaces`), so resolution falls back to the one test store.
+const WS_HEADER: &str = "X-GT-Workspace";
+
 fn post_json(uri: &str, body: Value) -> Request<Body> {
     Request::builder()
         .method("POST")
         .uri(uri)
         .header("content-type", "application/json")
+        .header(WS_HEADER, "test")
         .body(Body::from(body.to_string()))
         .unwrap()
 }
 
 fn get(uri: &str) -> Request<Body> {
-    Request::builder().uri(uri).body(Body::empty()).unwrap()
+    Request::builder().uri(uri).header(WS_HEADER, "test").body(Body::empty()).unwrap()
 }
 
 #[tokio::test]
@@ -133,6 +139,7 @@ async fn patch_takes_id_from_path_not_body() {
         .method("PATCH")
         .uri("/keep")
         .header("content-type", "application/json")
+        .header(WS_HEADER, "test")
         .body(Body::from(json!({ "id": "decoy", "title": "patched" }).to_string()))
         .unwrap();
     let (status, _) = send(&app, req).await;
@@ -217,4 +224,64 @@ async fn stats_groups_by_status_with_progress_and_totals() {
     assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
     let (status, _) = send(&app, get("/stats")).await;
     assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+}
+
+/// Build a request carrying an explicit `X-GT-Workspace` so the routed router resolves a tenant.
+fn req_ws(method: &str, uri: &str, ws: &str, body: Option<Value>) -> Request<Body> {
+    let mut b = Request::builder().method(method).uri(uri).header(WS_HEADER, ws);
+    match body {
+        Some(v) => {
+            b = b.header("content-type", "application/json");
+            b.body(Body::from(v.to_string())).unwrap()
+        }
+        None => b.body(Body::empty()).unwrap(),
+    }
+}
+
+/// With `with_workspaces` wired, each request routes to its own tenant's `hq_<ws>` store: a bead
+/// created under one `X-GT-Workspace` is invisible under another. This is the REST mirror of the
+/// MCP path's claim-scoped routing (`hq-gap-issues-rest-workspace-routing`) — proof that the REST
+/// surface isolates tenants, not just `/me/stats`.
+#[tokio::test]
+async fn multi_tenant_routes_each_request_to_its_own_workspace_store() {
+    let Ok(base) = std::env::var("GT_DOLT_URL") else {
+        eprintln!("GT_DOLT_URL unset — skipping http contract");
+        return;
+    };
+    let base = base.trim_end_matches('/').to_string();
+
+    // Two tenants, each with its own schema'd `hq_<ws>` DB (what the binary provisions per
+    // workspace; here we seed them inline so the per-workspace pool can connect).
+    let (ws_a, ws_b) = ("mtroutea", "mtrouteb");
+    let (db_a, db_b) = (gt_store_dolt::dolt_db_name(ws_a), gt_store_dolt::dolt_db_name(ws_b));
+    for db in [&db_a, &db_b] {
+        fresh_db(&base, db).await.expect("tenant db");
+        DoltIssues::connect(&format!("{base}/{db}"))
+            .expect("connect tenant")
+            .ensure_schema()
+            .await
+            .expect("tenant schema");
+    }
+
+    // Fallback store (never hit on a routed request) + the shared per-workspace pool cache.
+    let fallback = Arc::new(DoltIssues::connect(&format!("{base}/{db_a}")).expect("fallback"));
+    let pools =
+        Arc::new(gt_store_dolt::WorkspacePools::from_url(&format!("{base}/")).expect("pools"));
+    let app = issues_router(IssuesApiState::new(fallback, "test-actor").with_workspaces(pools));
+
+    // Create a bead under tenant A only.
+    let body = json!({ "id": "only-in-a", "title": "a-only", "issue_type": "epic", "created_by": "test", "domain": ["platform.rig"] });
+    let (status, _) = send(&app, req_ws("POST", "/", ws_a, Some(body))).await;
+    assert_eq!(status, StatusCode::CREATED);
+
+    // Tenant A sees exactly that bead; tenant B's tracker is untouched (isolation).
+    let (_, a) = send(&app, req_ws("GET", "/", ws_a, None)).await;
+    assert_eq!(a["total"], 1, "tenant A sees its own bead");
+    assert_eq!(a["rows"][0]["id"], "only-in-a");
+    let (_, b) = send(&app, req_ws("GET", "/", ws_b, None)).await;
+    assert_eq!(b["total"], 0, "tenant B never sees tenant A's bead");
+
+    // A direct read under B for that id is a 404, not a cross-tenant leak.
+    let (status, _) = send(&app, req_ws("GET", "/only-in-a", ws_b, None)).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
 }
