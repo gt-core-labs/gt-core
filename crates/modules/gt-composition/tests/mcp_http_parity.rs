@@ -23,10 +23,10 @@
 //! ## Scope: the REST-surfaced namespaces only
 //!
 //! The bin (`src/bin/gt-mcp-server.rs`) mounts REST modules for [`NAMESPACES`]: `issues` (the
-//! `root` builder) plus `meta` / `agent` / `quota` / `workspace` / `rig` / `documents` (the
-//! `rest_root` builder). The other MCP namespaces — `merge`, `convoy`, `graph`, `audit` —
-//! dispatch over MCP only (no `with_http` module is mounted for them), so they are out of scope
-//! here: this test asserts parity exactly for the namespaces the server serves on both transports.
+//! `root` builder) plus `meta` / `agent` / `quota` / `merge` / `workspace` / `rig` / `documents`
+//! (the `rest_root` builder). The other MCP namespaces — `convoy`, `graph`, `audit` — dispatch
+//! over MCP only (no `with_http` module is mounted for them), so they are out of scope here: this
+//! test asserts parity exactly for the namespaces the server serves on both transports.
 //!
 //! ## How it harvests the two surfaces
 //!
@@ -48,14 +48,16 @@ use gt_mcp_server::DomainHandler;
 use gt_module::{GtModule, McpRegistry};
 use utoipa::OpenApi;
 
-use gt_composition::mcp::{AgentHandler, EventLog, QuotaHandler, RigHandler, WorkspaceHandler, WsPools};
+use gt_composition::mcp::{
+    AgentHandler, EventLog, MergeHandler, QuotaHandler, RigHandler, WorkspaceHandler, WsPools,
+};
 use gt_documents::DocumentsModule;
 use gt_issues::IssuesModule;
 use gt_meta::MetaModule;
 
 /// The namespaces the server exposes over both MCP and HTTP — the parity scope.
 const NAMESPACES: &[&str] =
-    &["issues", "meta", "workspace", "rig", "documents", "agent", "quota"];
+    &["issues", "meta", "workspace", "rig", "documents", "agent", "quota", "merge"];
 
 /// A never-connected Postgres URL: the PG-backed handlers store the pool/url but `descriptors()`
 /// never touches it, so a lazy pool that never dials is enough to harvest the tool set offline.
@@ -133,6 +135,14 @@ fn parity_map(ns: &str) -> Vec<Route> {
             rt("POST", "/{account}/probe", Some("quota.probe")),
             rt("POST", "/{account}/rotate", Some("quota.rotate")),
         ],
+        "merge" => vec![
+            rt("GET", "/", Some("merge.list")),
+            rt("GET", "/{bead}", Some("merge.info")),
+            rt("POST", "/", Some("merge.submit")),
+            rt("POST", "/{bead}/start", Some("merge.start")),
+            rt("POST", "/{bead}/complete", Some("merge.complete")),
+            rt("POST", "/{bead}/fail", Some("merge.fail")),
+        ],
         other => panic!("no parity map for namespace `{other}`"),
     }
 }
@@ -147,6 +157,7 @@ fn served_openapi(ns: &str) -> utoipa::openapi::OpenApi {
         "documents" => gt_documents::ApiDoc::openapi(),
         "agent" => gt_agent::ApiDoc::openapi(),
         "quota" => gt_quota::ApiDoc::openapi(),
+        "merge" => gt_merge::http::ApiDoc::openapi(),
         other => panic!("no OpenAPI for namespace `{other}`"),
     }
 }
@@ -175,6 +186,7 @@ fn served_mcp_tools(ns: &str) -> Vec<String> {
         "rig" => from_handler(&RigHandler::new(Arc::new(WsPools::new(DUMMY_PG)))),
         "agent" => from_handler(&AgentHandler::new(event_log())),
         "quota" => from_handler(&QuotaHandler::new(event_log())),
+        "merge" => from_handler(&MergeHandler::new(event_log())),
         other => panic!("no MCP source for namespace `{other}`"),
     }
 }
