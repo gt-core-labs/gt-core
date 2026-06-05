@@ -221,6 +221,96 @@ impl PgUsers {
         .map_err(|e| AuthError::Backend(format!("user_workspaces postgres: {e}")))?;
         rows.iter().map(row_to_membership).collect()
     }
+
+    /// Global login (hq-identity.2): authenticate against `public.users`, resolve the user's
+    /// workspace memberships, and stamp the ACTIVE workspace + that membership's role-expanded
+    /// scopes onto the returned identity.
+    ///
+    /// Unlike [`authenticate`](Self::authenticate) — per-workspace, where the slug is the pool's
+    /// injected schema — the workspace here comes from the chosen MEMBERSHIP: one global
+    /// credential reaches whichever tenants the user belongs to, and the active tenant is still
+    /// resolved server-side (never from the payload, docs/04 §15). `preferred_workspace` requests
+    /// a specific active tenant (the switch path, hq-identity.3); it is honoured only when the
+    /// user actually holds that membership ([`select_active_membership`]), else the default (first)
+    /// membership wins.
+    ///
+    /// A user with NO membership cannot establish a session: [`AuthError::InvalidCredentials`].
+    /// They authenticate, but a token must name a tenant — there is none to mint, and returning
+    /// the same error as a bad password leaks nothing about which accounts exist but are placeless.
+    pub async fn authenticate_global(
+        &self,
+        creds: &Credentials,
+        preferred_workspace: Option<&str>,
+    ) -> Result<VerifiedIdentity, AuthError> {
+        let Credentials::EmailPassword { email, password } = creds else {
+            return Err(AuthError::UnsupportedProvider(creds.kind()));
+        };
+
+        let row = sqlx::query("SELECT id, password_hash FROM public.users WHERE email = $1")
+            .bind(email)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|e| AuthError::Backend(format!("global users postgres: {e}")))?;
+        // Unknown email is indistinguishable from a wrong password — same error, no enumeration.
+        let Some(row) = row else {
+            return Err(AuthError::InvalidCredentials);
+        };
+        let sub: String = row
+            .try_get("id")
+            .map_err(|e| AuthError::Backend(format!("global users postgres: {e}")))?;
+        let hash: String = row
+            .try_get("password_hash")
+            .map_err(|e| AuthError::Backend(format!("global users postgres: {e}")))?;
+        verify_password(password, &hash)?;
+
+        let memberships = self.memberships(&sub).await?;
+        let active = select_active_membership(&memberships, preferred_workspace)
+            .ok_or(AuthError::InvalidCredentials)?;
+        // The membership's role expands to scopes against the ACTIVE workspace's own `roles`
+        // catalog (hq-rbac), so the very same role name can grant different scopes per tenant.
+        let scopes = self
+            .expand_roles_in_workspace(&active.workspace, std::slice::from_ref(&active.role))
+            .await?;
+        Ok(VerifiedIdentity {
+            sub,
+            workspace: active.workspace.clone(),
+            scopes,
+        })
+    }
+
+    /// Expand role names into the union of their scope bundles against a SPECIFIC workspace's
+    /// `roles` table (`ws_<slug>.roles`) — the variant global login (.2) / switch (.3) need, where
+    /// the active workspace changes per request (so the `search_path`-resolved [`expand_roles`] of
+    /// the per-ws path does not apply). Empty input — including an empty role name (a member with
+    /// no role) — short-circuits without a query. The schema name is derived + validated by
+    /// [`workspace_schema`] before interpolation (identifiers cannot be bound), so a malformed slug
+    /// is a [`AuthError::Backend`], never injected SQL.
+    async fn expand_roles_in_workspace(
+        &self,
+        workspace: &str,
+        roles: &[String],
+    ) -> Result<Vec<String>, AuthError> {
+        let names: Vec<String> = roles.iter().filter(|r| !r.is_empty()).cloned().collect();
+        if names.is_empty() {
+            return Ok(Vec::new());
+        }
+        let schema = workspace_schema(workspace)?;
+        let sql = format!("SELECT scopes FROM {schema}.roles WHERE name = ANY($1)");
+        let rows = sqlx::query(&sql)
+            .bind(&names)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| AuthError::Backend(format!("roles postgres: {e}")))?;
+        let mut out = Vec::new();
+        for row in &rows {
+            let scopes: Vec<String> = row
+                .try_get("scopes")
+                .map_err(|e| AuthError::Backend(format!("roles postgres: {e}")))?;
+            out.extend(scopes);
+        }
+        // De-dup while preserving first-seen order (two roles may share a scope).
+        Ok(merge_scopes(out, Vec::new()))
+    }
 }
 
 /// Build a [`Membership`] from a `public.user_workspaces` row. A column-read fault is an
@@ -241,9 +331,6 @@ fn row_to_membership(row: &PgRow) -> Result<Membership, AuthError> {
 /// fall back to the first (oldest) membership. Returns `None` only when the user has NO
 /// membership at all — the caller maps that to a rejected login, never a tenantless token. Pure,
 /// so it is unit-tested without a database.
-// The login path (hq-identity.2) is the production consumer; until that lands the only caller is
-// the unit test, so a non-test lib build sees it as dead. Allow it for this one bead.
-#[allow(dead_code)]
 pub(crate) fn select_active_membership<'a>(
     memberships: &'a [Membership],
     preferred: Option<&str>,
@@ -254,6 +341,32 @@ pub(crate) fn select_active_membership<'a>(
         }
     }
     memberships.first()
+}
+
+/// Map a workspace slug to its `ws_<slug>` Postgres schema name for a qualified `roles` lookup
+/// (hq-identity.2), validating it is a safe unquoted identifier first. A schema name cannot be a
+/// bound parameter, so it is interpolated — and therefore MUST be proven to hold only the
+/// lowercase DNS-label grammar `WorkspaceId` enforces (`[a-z0-9-]`, ≤ the schema-length cap)
+/// before it touches the SQL string. Anything else is an [`AuthError::Backend`], never injected
+/// SQL. Mirrors `gt_store_pg::schema_for` (gt-auth must not depend on the kernel store — platform
+/// keeps its own one-liner rather than take that dep, docs/03 Rule 4); the `-` → `_` mapping and
+/// `ws_` prefix match it exactly so both resolve the same physical schema.
+fn workspace_schema(slug: &str) -> Result<String, AuthError> {
+    // 60 = 63-byte Postgres identifier limit minus the 3-char `ws_` prefix (gt_store_pg's cap).
+    let valid = !slug.is_empty()
+        && slug.len() <= 60
+        && slug
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-');
+    if !valid {
+        return Err(AuthError::Backend(format!("invalid workspace slug: {slug:?}")));
+    }
+    let mut name = String::with_capacity(3 + slug.len());
+    name.push_str("ws_");
+    for c in slug.chars() {
+        name.push(if c == '-' { '_' } else { c });
+    }
+    Ok(name)
 }
 
 /// Union a user's direct scopes with the scopes expanded from their roles, de-duplicating while
@@ -490,6 +603,40 @@ mod tests {
         .expect("create public.user_workspaces table");
     }
 
+    /// Provision a per-workspace `roles` catalog in the `ws_<slug>` schema (hq-identity.2), so the
+    /// global-login test can prove the active membership's role expands against the RIGHT tenant's
+    /// table. `schema` is the already-mapped schema name (e.g. `ws_ida`). Idempotent.
+    async fn ensure_ws_roles(pool: &PgPool, schema: &str) {
+        sqlx::query(&format!("CREATE SCHEMA IF NOT EXISTS {schema}"))
+            .execute(pool)
+            .await
+            .expect("create ws schema");
+        sqlx::query(&format!(
+            "CREATE TABLE IF NOT EXISTS {schema}.roles ( \
+                name TEXT PRIMARY KEY, \
+                scopes TEXT[] NOT NULL DEFAULT '{{}}', \
+                created_at BIGINT NOT NULL, \
+                updated_at BIGINT NOT NULL )"
+        ))
+        .execute(pool)
+        .await
+        .expect("create ws roles table");
+    }
+
+    /// Upsert a role into a specific `ws_<slug>.roles` catalog (hq-identity.2 test helper).
+    async fn seed_role_in(pool: &PgPool, schema: &str, name: &str, scopes: &[&str]) {
+        let scopes: Vec<String> = scopes.iter().map(|s| s.to_string()).collect();
+        sqlx::query(&format!(
+            "INSERT INTO {schema}.roles (name, scopes, created_at, updated_at) VALUES ($1, $2, 0, 0) \
+             ON CONFLICT (name) DO UPDATE SET scopes = EXCLUDED.scopes"
+        ))
+        .bind(name)
+        .bind(&scopes)
+        .execute(pool)
+        .await
+        .expect("insert ws role");
+    }
+
     async fn seed_user(pool: &PgPool, id: &str, email: &str, hash: &str, scopes: &[&str]) {
         let scopes: Vec<String> = scopes.iter().map(|s| s.to_string()).collect();
         sqlx::query("DELETE FROM users WHERE email = $1")
@@ -580,6 +727,24 @@ mod tests {
         // No memberships → None, so the caller rejects rather than minting a tenantless token.
         assert_eq!(select_active_membership(&[], Some("acme")), None);
         assert_eq!(select_active_membership(&[], None), None);
+    }
+
+    // --- PG-free test: the slug→schema mapping (hq-identity.2) is pure and rejects unsafe slugs. ---
+
+    #[test]
+    fn workspace_schema_maps_valid_slugs_and_rejects_unsafe_ones() {
+        // `-` → `_`, `ws_` prefix — matching gt_store_pg::schema_for so both hit one schema.
+        assert_eq!(workspace_schema("acme").unwrap(), "ws_acme");
+        assert_eq!(workspace_schema("team-1").unwrap(), "ws_team_1");
+        assert_eq!(workspace_schema("default").unwrap(), "ws_default");
+        // Anything outside the lowercase DNS-label grammar is rejected BEFORE it can reach the
+        // interpolated SQL — no quotes, spaces, semicolons, uppercase, or over-long slugs.
+        for bad in ["", "Acme", "a b", "drop;", "a\"b", "a'b", "x.y", &"a".repeat(61)] {
+            assert!(
+                matches!(workspace_schema(bad), Err(AuthError::Backend(_))),
+                "slug {bad:?} must be rejected, not interpolated"
+            );
+        }
     }
 
     // --- PG-free test: provider-kind gating returns before any I/O, so no live DB needed. ---
@@ -738,6 +903,88 @@ mod tests {
         assert_eq!(got.len(), 2, "re-add does not duplicate the pair");
         let acme = got.iter().find(|m| m.workspace == "acme").unwrap();
         assert_eq!(acme.role, "viewer", "re-add updates the role");
+    }
+
+    /// hq-identity.2: global login authenticates against `public.users`, picks the active
+    /// workspace from the user's memberships (default = first, or a held `preferred` one), and
+    /// expands THAT membership's role against the active workspace's own `roles` table — so the
+    /// same credential yields different scopes depending on which tenant it lands in.
+    #[tokio::test]
+    async fn global_login_resolves_active_workspace_and_expands_its_role() {
+        let Some(pool) = pool_or_skip().await else {
+            eprintln!("GT_PG_URL unset; skipping global-login contract test");
+            return;
+        };
+        ensure_global_identity_tables(&pool).await;
+        // Two distinct per-workspace role catalogs: the SAME role name grants different scopes.
+        ensure_ws_roles(&pool, "ws_ida").await;
+        ensure_ws_roles(&pool, "ws_idb").await;
+        sqlx::query("DELETE FROM public.users WHERE id = $1")
+            .bind("u-gwen")
+            .execute(&pool)
+            .await
+            .expect("clear seed global user");
+
+        let users = PgUsers::new(pool.clone(), "default");
+        let hash = hash_password("hunter2").unwrap();
+        users
+            .create_global_user("u-gwen", "gwen@global.test", &hash, 20)
+            .await
+            .unwrap();
+        // Member of two workspaces, holding role "lead" in each — but the catalogs differ.
+        users.add_membership("u-gwen", "ida", "lead", 21).await.unwrap();
+        users.add_membership("u-gwen", "idb", "lead", 22).await.unwrap();
+        seed_role_in(&pool, "ws_ida", "lead", &["beads.read", "merge.submit"]).await;
+        seed_role_in(&pool, "ws_idb", "lead", &["rig.read"]).await;
+
+        let creds = Credentials::EmailPassword {
+            email: "gwen@global.test".into(),
+            password: "hunter2".into(),
+        };
+
+        // No preference → the first membership ("ida") is active; its "lead" → ida's scopes.
+        let got = users.authenticate_global(&creds, None).await.expect("login");
+        assert_eq!(got.sub, "u-gwen");
+        assert_eq!(got.workspace, "ida");
+        let set: std::collections::BTreeSet<&str> = got.scopes.iter().map(String::as_str).collect();
+        assert_eq!(set, ["beads.read", "merge.submit"].into_iter().collect());
+
+        // Preferring a HELD membership switches the active tenant; the role re-expands in idb.
+        let got = users
+            .authenticate_global(&creds, Some("idb"))
+            .await
+            .expect("login preferring idb");
+        assert_eq!(got.workspace, "idb");
+        assert_eq!(got.scopes, vec!["rig.read".to_string()]);
+
+        // Preferring a tenant the user does NOT hold falls back to the default (ida), never grants
+        // the unheld one.
+        let got = users
+            .authenticate_global(&creds, Some("ghost"))
+            .await
+            .expect("login preferring an unheld ws");
+        assert_eq!(got.workspace, "ida");
+
+        // Wrong password is rejected before any membership lookup.
+        let denied = users
+            .authenticate_global(
+                &Credentials::EmailPassword {
+                    email: "gwen@global.test".into(),
+                    password: "nope".into(),
+                },
+                None,
+            )
+            .await;
+        assert_eq!(denied, Err(AuthError::InvalidCredentials));
+
+        // A correct credential with NO membership cannot establish a session.
+        sqlx::query("DELETE FROM public.user_workspaces WHERE user_id = $1")
+            .bind("u-gwen")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let placeless = users.authenticate_global(&creds, None).await;
+        assert_eq!(placeless, Err(AuthError::InvalidCredentials));
     }
 
     /// hq-rbac.3: a user's assigned roles expand to their scope bundles and union with the row's

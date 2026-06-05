@@ -61,6 +61,24 @@ impl LoginProvider for crate::PgUsers {
     }
 }
 
+/// The GLOBAL login adapter (hq-identity.2): the production [`LoginProvider`] once identity is
+/// shared across workspaces. It wraps a [`PgUsers`](crate::PgUsers) and delegates to
+/// [`authenticate_global`](crate::PgUsers::authenticate_global) with NO preferred workspace, so a
+/// plain `POST /auth/login` resolves the user's DEFAULT membership as the active tenant (the
+/// per-workspace [`PgUsers`] login above stays in place for the transition). The composition root
+/// swaps this in for the per-workspace login once the global admin seed exists (hq-identity.4),
+/// keeping login working across the cutover; switching to another membership is hq-identity.3.
+#[cfg(feature = "pg")]
+pub struct GlobalLogin(pub std::sync::Arc<crate::PgUsers>);
+
+#[cfg(feature = "pg")]
+#[async_trait]
+impl LoginProvider for GlobalLogin {
+    async fn login(&self, creds: &Credentials) -> Result<VerifiedIdentity, AuthError> {
+        self.0.authenticate_global(creds, None).await
+    }
+}
+
 /// The async user-administration port behind `POST`/`GET /auth/users` (`hq-web-extras.5`): the
 /// onboarding surface that creates and lists users without hand-written SQL. Separate from
 /// [`LoginProvider`] (which only authenticates) so a deploy can mount login without exposing

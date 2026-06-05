@@ -145,6 +145,11 @@ pub use http::{
     TokenResponse, UserStore, UserSummary,
 };
 
+/// The global-login port adapter (hq-identity.2) needs both the HTTP port (`axum`) and the
+/// Postgres identity store (`pg`).
+#[cfg(all(feature = "axum", feature = "pg"))]
+pub use http::GlobalLogin;
+
 #[cfg(test)]
 pub use provider::InMemoryIdentityProvider;
 
