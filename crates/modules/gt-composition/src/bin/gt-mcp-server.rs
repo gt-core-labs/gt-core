@@ -249,6 +249,35 @@ async fn main() -> anyhow::Result<()> {
     // request rejected. GT_MCP_ALLOWED_HOSTS (comma-separated host or host:port authorities)
     // is APPENDED to the loopback defaults, so local clients keep working and the deploy adds
     // its own domain (e.g. `gt.codecsrayo.com`). Unset ⇒ loopback-only, exactly as before.
+    // The RS256 verifier, built once and shared by the MCP transport's auth, the SSE feed's
+    // cookie auth, and the REST auth chain below. Env-gated (GT_JWT_RS256_KEYS /
+    // GT_JWT_RS256_PUBLIC_KEY_FILE): a deploy that configures no public key gets no auth at all
+    // (legacy X-Actor MCP + MCP/ops only), exactly as before — enabling auth is an opt-in env.
+    let verifier: Option<SharedAuthenticator> = match JwtAuthenticator::from_env() {
+        Ok(v) => Some(Arc::new(v)),
+        Err(e) => {
+            eprintln!("[gt-mcp-server] no RS256 verifier configured ({e}); MCP/REST/cookie auth off");
+            None
+        }
+    };
+
+    // Authenticate the /mcp transport too (hq-mcp-cookie-auth): with a verifier wired, every MCP
+    // call must carry a valid RS256 access JWT — `Authorization: Bearer` OR the `gt_web_token`
+    // cookie — and its scope is derived from the token's claims, not the open X-Actor/dev path.
+    // Without a verifier the server keeps the legacy X-Actor behaviour (loopback dev).
+    if let Some(v) = &verifier {
+        service = service.with_authenticator(v.clone());
+        eprintln!(
+            "[gt-mcp-server] /mcp requires auth (RS256 bearer or gt_web_token cookie; claim-scoped)"
+        );
+    }
+
+    // Streamable-HTTP Host allow-list (rmcp's DNS-rebinding guard). The default only
+    // accepts loopback authorities (localhost/127.0.0.1/::1), so a public deploy behind a
+    // reverse proxy — where the inbound `Host` is the served domain — would have every /mcp
+    // request rejected. GT_MCP_ALLOWED_HOSTS (comma-separated host or host:port authorities)
+    // is APPENDED to the loopback defaults, so local clients keep working and the deploy adds
+    // its own domain (e.g. `gt.codecsrayo.com`). Unset ⇒ loopback-only, exactly as before.
     let mut http_config = StreamableHttpServerConfig::default();
     if let Ok(raw) = std::env::var("GT_MCP_ALLOWED_HOSTS") {
         let extra: Vec<String> = raw
@@ -266,17 +295,6 @@ async fn main() -> anyhow::Result<()> {
         Arc::new(LocalSessionManager::default()),
         http_config,
     );
-    // The RS256 verifier, built once and shared by the SSE feed's cookie auth and the REST
-    // auth chain below. Env-gated (GT_JWT_RS256_KEYS / GT_JWT_RS256_PUBLIC_KEY_FILE): a deploy
-    // that configures no public key gets neither surface (MCP + ops only), exactly as before —
-    // enabling auth is an opt-in env, not a behaviour change.
-    let verifier: Option<SharedAuthenticator> = match JwtAuthenticator::from_env() {
-        Ok(v) => Some(Arc::new(v)),
-        Err(e) => {
-            eprintln!("[gt-mcp-server] no RS256 verifier configured ({e}); REST + cookie auth off");
-            None
-        }
-    };
 
     // Per-workspace SSE event feed (hq-mcp-dispatch.10): GET /stream fans the
     // caller's workspace log out as Server-Sent Events, keyed per (workspace,

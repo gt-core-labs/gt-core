@@ -359,9 +359,9 @@ impl IssuesServer {
         let Some(auth) = &self.authenticator else {
             return Ok(None);
         };
-        // Bearer token is mandatory in JWT mode.
-        let token = bearer_from_ext(ext)
-            .ok_or_else(|| self.deny(op, args, "<anonymous>", "missing bearer token"))?;
+        // A credential is mandatory in JWT mode: Authorization: Bearer, or the gt_web_token cookie.
+        let token = token_from_ext(ext)
+            .ok_or_else(|| self.deny(op, args, "<anonymous>", "missing bearer token or gt_web_token cookie"))?;
         let claims = auth
             .authenticate(token)
             .map_err(|e| self.deny(op, args, "<unverified>", &e.to_string()))?;
@@ -770,6 +770,28 @@ fn bearer_from_ext(ext: &Extensions) -> Option<&str> {
     (!token.is_empty()).then_some(token)
 }
 
+/// Extract the `gt_web_token` JWT from the request's `Cookie` header — the same cookie the
+/// SSE feed authenticates by (hq-mcp-cookie-auth). Lets a client that logged in once
+/// authenticate `/mcp` calls by persisted cookie instead of resending `Authorization` each
+/// run. Borrows the value out of the `Cookie` header; `None` when absent or empty.
+fn cookie_token_from_ext(ext: &Extensions) -> Option<&str> {
+    let raw = ext
+        .get::<axum::http::request::Parts>()
+        .and_then(|p| p.headers.get(axum::http::header::COOKIE))
+        .and_then(|v| v.to_str().ok())?;
+    raw.split(';')
+        .filter_map(|kv| kv.trim().strip_prefix("gt_web_token="))
+        .map(str::trim)
+        .find(|t| !t.is_empty())
+}
+
+/// The MCP request credential: an `Authorization: Bearer` token first, else the
+/// `gt_web_token` cookie (hq-mcp-cookie-auth). Both carry the same RS256 access JWT, so a
+/// CLI/browser can present either.
+fn token_from_ext(ext: &Extensions) -> Option<&str> {
+    bearer_from_ext(ext).or_else(|| cookie_token_from_ext(ext))
+}
+
 /// Server-side wall clock (epoch seconds) for JWT expiry checks.
 fn now_secs() -> u64 {
     std::time::SystemTime::now()
@@ -849,7 +871,7 @@ fn sanitize_tool_name(name: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{actor_from_ext, call_span, IssuesServer};
+    use super::{actor_from_ext, call_span, cookie_token_from_ext, token_from_ext, IssuesServer};
     use gt_audit::{AuditSink, InMemoryAudit, Outcome};
     use gt_auth::{InMemoryAuthenticator, JwtClaims};
     use gt_rbac::{RbacConfig, Scope, WORKSPACE_ADMIN, WORKSPACE_MEMBER};
@@ -901,6 +923,30 @@ mod tests {
     fn reads_x_actor_header() {
         let ext = ext_with_header("x-actor", "alice");
         assert_eq!(actor_from_ext(&ext), Some("alice"));
+    }
+
+    #[test]
+    fn reads_gt_web_token_cookie() {
+        // The token is picked out of a multi-pair Cookie header, trimmed.
+        let ext = ext_with_header("cookie", "foo=bar; gt_web_token=jwt.abc.def ; baz=qux");
+        assert_eq!(cookie_token_from_ext(&ext), Some("jwt.abc.def"));
+        // Absent cookie ⇒ None; an empty value ⇒ None.
+        assert_eq!(cookie_token_from_ext(&ext_with_header("cookie", "foo=bar")), None);
+        assert_eq!(cookie_token_from_ext(&ext_with_header("cookie", "gt_web_token=")), None);
+    }
+
+    #[test]
+    fn token_prefers_bearer_then_falls_back_to_cookie() {
+        // Bearer header wins when present.
+        assert_eq!(
+            token_from_ext(&ext_with_header("authorization", "Bearer hdr.tok")),
+            Some("hdr.tok")
+        );
+        // No Authorization ⇒ the cookie is used.
+        assert_eq!(
+            token_from_ext(&ext_with_header("cookie", "gt_web_token=cookie.tok")),
+            Some("cookie.tok")
+        );
     }
 
     // ----- hq-mcp-native.1: dotted-name sanitization for native MCP clients ----
