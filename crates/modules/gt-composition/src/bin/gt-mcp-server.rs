@@ -35,10 +35,10 @@ use rmcp::transport::{StreamableHttpServerConfig, StreamableHttpService};
 
 use gt_audit::{AuditSink, InMemoryAudit};
 use gt_composition::mcp::{
-    AgentHandler, AuditHandler, ConvoyHandler, DocumentsHandler, EventLog, EventLogFeed,
-    EventLogMerges, EventLogQuota, EventLogSkills, GraphHandler, MergeHandler, PgDocumentsResource,
-    PgRigPrefixes, PgWorkspaceStatus, QuotaHandler, RigHandler, WorkspaceHandler, WsPoolRigs,
-    WsPools,
+    AgentHandler, AuditHandler, ConvoyHandler, DocumentsHandler, EventLog, EventLogConvoy,
+    EventLogFeed, EventLogMerges, EventLogQuota, EventLogSkills, GraphHandler, MergeHandler,
+    PgDocumentsResource, PgRigPrefixes, PgWorkspaceStatus, QuotaHandler, RigHandler,
+    WorkspaceHandler, WsPoolRigs, WsPools,
 };
 use gt_docs_embed::Embedder;
 use gt_docs_extract::Extractor;
@@ -66,6 +66,7 @@ use gt_mcp_server::{
     WorkspaceRigPrefixes, WorkspaceStatusGate, WorkspaceStores,
 };
 use gt_meta::{MetaApiState, MetaModule};
+use gt_orchestration::{ConvoyApiState, ConvoyModule};
 use gt_module::RootBuilder;
 use gt_feed::{FeedApiState, FeedModule};
 use gt_quota::{QuotaApiState, QuotaModule};
@@ -385,6 +386,13 @@ async fn main() -> anyhow::Result<()> {
         // workspace log. Mounted at /api/v1/feed behind the feed.read guard.
         .module(FeedModule::with_http(FeedApiState::new(Arc::new(EventLogFeed::new(
             event_log.clone(),
+        )))))
+        // convoy.* (hq-web-extras.16): read + mutate REST surface — the durable backing replays +
+        // appends the caller's `convoy.*` stream, the same event-sourced board the MCP
+        // ConvoyHandler folds into. Mounted at /api/v1/convoy behind the convoys.read/convoys.write
+        // guard (board read + complete-member/fail-member mutations).
+        .module(ConvoyModule::with_http(ConvoyApiState::new(Arc::new(EventLogConvoy::new(
+            event_log.clone(),
         )))));
     if let Ok(pg_url) = std::env::var("GT_PG_URL") {
         let pool = sqlx::PgPool::connect(&pg_url)
@@ -406,11 +414,11 @@ async fn main() -> anyhow::Result<()> {
             build_embedder(),
         )));
         eprintln!(
-            "[gt-mcp-server] REST domain modules: meta + workspace + rig + documents + agent + quota + merge + skills + feed"
+            "[gt-mcp-server] REST domain modules: meta + workspace + rig + documents + agent + quota + merge + skills + feed + convoy"
         );
     } else {
         eprintln!(
-            "[gt-mcp-server] REST domain modules: meta + agent + quota + merge + skills + feed (GT_PG_URL unset → no workspace/rig/documents)"
+            "[gt-mcp-server] REST domain modules: meta + agent + quota + merge + skills + feed + convoy (GT_PG_URL unset → no workspace/rig/documents)"
         );
     }
     let rest_root = rest

@@ -19,8 +19,10 @@ gt-scheduling = { workspace = true }
 # merge.* dispatch (hq-mcp-dispatch.5): event-sourced MergeBoard. `axum` adds the REST surface
 # + the WorkspaceMerges port the composition EventLog provider backs (hq-fe-api-mount.3).
 gt-merge = { workspace = true, features = ["axum"] }
-# convoy.* dispatch (hq-mcp-dispatch.6): event-sourced ConvoyBoard.
-gt-orchestration = { workspace = true }
+# convoy.* dispatch (hq-mcp-dispatch.6): event-sourced ConvoyBoard. `axum` adds the REST
+# surface + the WorkspaceConvoy port the composition EventLog provider backs (hq-web-extras.16):
+# EventLogConvoy replays the tenant's `convoy.*` stream into the board and appends decided events.
+gt-orchestration = { workspace = true, features = ["axum"] }
 # agent.* dispatch (hq-mcp-dispatch.7): event-sourced SessionRegistry. `axum` adds the
 # REST surface (AgentApiState over the event-log root) the bin mounts at /api/v1/agent
 # (hq-fe-api-mount.1).

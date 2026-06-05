@@ -30,6 +30,7 @@ use gt_merge::{
     DynMergeRepository, MergeBoard, MergeEvent, MergeRepository, MergeSlot, MergeSlotState,
     MergeState, WorkspaceMerges,
 };
+use gt_orchestration::{ConvoyBoard, OrchEvent, OrchState, WorkspaceConvoy};
 use gt_quota::{AccountRegistry, QuotaEvent, QuotaState, WorkspaceQuota};
 use gt_rig::{DynRigRepository, PgRigs, WorkspaceRigs};
 use gt_skills::{SkillCatalog, SkillState, WorkspaceSkills};
@@ -50,6 +51,11 @@ const MERGE_NS: &str = "merge.";
 /// The event-log kind prefix every skill event carries (`skills.*.v1`); the read-only REST
 /// surface replays exactly this stream into the catalog the dashboard hydrates from.
 const SKILLS_NS: &str = "skills.";
+
+/// The event-log kind prefix every convoy event carries (`convoy.*.v1`); matches
+/// [`ConvoyHandler`](super::convoy::ConvoyHandler)'s replay filter so the REST surface and the
+/// MCP handler fold the identical per-workspace stream.
+const CONVOY_NS: &str = "convoy.";
 
 /// Upper bound on how many records the feed REST surface scans per request. The feed paginates the
 /// *whole* tenant log (every namespace, not one prefix), so a generous cap bounds the read without
@@ -220,6 +226,44 @@ impl MergeRepository for EventLogMergeRepo {
     fn list_slots(&self) -> impl Future<Output = Result<Vec<MergeSlot>, AppError>> + Send {
         let res = self.board().map(|b| b.snapshot());
         async move { res }
+    }
+}
+
+/// REST backing for `convoy.*` (`gt_orchestration::WorkspaceConvoy`, hq-web-extras.16): the
+/// durable mirror of [`ConvoyHandler`](super::convoy::ConvoyHandler). Convoys keep no projection
+/// table — the board is replayed from the workspace's `convoy.*` event stream through the
+/// [`OrchState`] reducer into a [`ConvoyBoard`] — so this backing resolves the board by replaying
+/// that stream and appends decided events back to the same authoritative log. A `convoy.launch`
+/// over MCP and a `POST /api/v1/convoy` therefore land in one per-workspace board that survives
+/// restart, the exact read-modify-append the MCP handler runs.
+pub struct EventLogConvoy {
+    log: Arc<EventLog>,
+}
+
+impl EventLogConvoy {
+    /// Wrap the per-workspace event log (the binary's single shared instance).
+    pub fn new(log: Arc<EventLog>) -> Self {
+        Self { log }
+    }
+}
+
+#[async_trait]
+impl WorkspaceConvoy for EventLogConvoy {
+    async fn board(&self, workspace: &str) -> Result<ConvoyBoard, AppError> {
+        let state = self
+            .log
+            .replay_domain(Some(workspace), CONVOY_NS, OrchState::default(), OrchState::apply)
+            .map_err(lift)?;
+        Ok(ConvoyBoard::from_state(&state))
+    }
+
+    async fn append(&self, workspace: &str, events: Vec<OrchEvent>) -> Result<(), AppError> {
+        // One convoy command can emit several events (a launch is created + launched + the first
+        // member-dispatched); append the whole batch in order, exactly as the MCP handler does.
+        for event in events {
+            self.log.append(Some(workspace), event).map_err(lift)?;
+        }
+        Ok(())
     }
 }
 
