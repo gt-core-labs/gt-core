@@ -23,9 +23,9 @@ If the bead you claimed conflicts with these docs, file a doc gap via `meta.repo
 
 ```bash
 # 1) See what's open
-gt-mcp-cli call meta.help
+gt mcp call meta.help
 # or browse epic
-gt-mcp-cli read gt://issues?external_ref=hq-mod-core
+gt mcp resource 'gt://issues?external_ref=hq-mod-core'
 
 # 2) Pre-claim reality check (ONE command — gate on exit 0 == READY).
 #    Verifies dep deliverables exist, own crate is scaffolded, no branch/worktree
@@ -33,9 +33,8 @@ gt-mcp-cli read gt://issues?external_ref=hq-mod-core
 #    lags main by minutes). Exit 1 == BLOCKED/CONTESTED — do NOT claim.
 ~/.claude/bin/gt-bead-check.sh hq-mod-core.1
 
-# 3) Transition to in_progress
-gt-mcp-cli call issues.transition.execute \
-  --id hq-mod-core.1 --to in_progress --actor "$GT_AGENT"
+# 3) Claim it (states are open/working/closed; auth comes from .gt-config)
+gt mcp call issues.transition.execute '{"id":"hq-mod-core.1","target":"working"}'
 
 # 4) Confirm before coding (avoid hijack — see memory)
 git log --all --grep hq-mod-core.1

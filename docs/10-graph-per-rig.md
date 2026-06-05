@@ -168,7 +168,7 @@ the bootstrap calls the refresh once:
 
 ```sh
 # in the rig bootstrap, after `git clone` and `bd init`:
-gt-mcp-cli call graph.refresh --json "{\"rig\":\"$RIG\",\"repo_dir\":\"$CHECKOUT\"}"
+gt mcp call graph.refresh "{\"rig\":\"$RIG\",\"repo_dir\":\"$CHECKOUT\"}"
 ```
 
 That registers custody (`graphwarden.rig-registered.v1`), writes the artifact patterns into
@@ -181,7 +181,7 @@ is operational — any scheduler driving the one batch tool:
 
 ```sh
 # every 5 minutes, as the graph-custodian actor:
-/loop 5m  gt-mcp-cli call graph.refresh-stale --json '{}'
+/loop 5m  gt mcp call graph.refresh-stale '{}'
 # or cron / a long-running gt agent on graph.agent.backend (default: haiku)
 ```
 

@@ -180,7 +180,7 @@ This is the gate that makes every other guarantee real. If the gate fails, suspe
 
 - ❌ `docker exec dolt sql ...` — operator-only escape hatch for forensics, NOT a development path.
 - ❌ Direct PG / Dolt writes from CLI scripts that mutate hq state.
-- ✅ `gt-mcp-cli call <tool>.<verb>.execute --args ...` always.
+- ✅ `gt mcp call <tool>.<verb>.execute '<json-args>'` always.
 
 If a needed tool doesn't exist, file a gap via `meta.report_gap` instead of bypassing.
 
