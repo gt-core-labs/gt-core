@@ -122,6 +122,10 @@ pub mod migrations {
     /// `0002` — durable refresh-token records (`ws_default.refresh_tokens`).
     pub const CREATE_REFRESH_TOKENS: &str =
         include_str!("../migrations/auth/0002__create_refresh_tokens.sql");
+    /// `0003` — the role catalog backing role→scopes expansion (`ws_default.roles`, hq-rbac.3).
+    pub const CREATE_ROLES: &str = include_str!("../migrations/auth/0003__create_roles.sql");
+    /// `0004` — the `users.roles` assignment column (hq-rbac.3).
+    pub const ADD_USER_ROLES: &str = include_str!("../migrations/auth/0004__add_user_roles.sql");
 }
 
 #[cfg(feature = "jsonwebtoken")]

@@ -85,7 +85,7 @@ impl PgUsers {
             return Err(AuthError::UnsupportedProvider(creds.kind()));
         };
 
-        let row = sqlx::query("SELECT id, password_hash, scopes FROM users WHERE email = $1")
+        let row = sqlx::query("SELECT id, password_hash, scopes, roles FROM users WHERE email = $1")
             .bind(email)
             .fetch_optional(&self.pool)
             .await
@@ -103,8 +103,53 @@ impl PgUsers {
         // A mismatch is InvalidCredentials; a corrupt stored hash is HashFailure.
         verify_password(password, &hash)?;
 
-        row_to_identity(&row, &self.workspace)
+        let mut identity = row_to_identity(&row, &self.workspace)?;
+        // hq-rbac.3: expand the user's assigned roles → their scope bundles and union them with
+        // the row's direct scopes. The union is what `into_claims` folds into the JWT, so editing
+        // a role re-shapes every assignee's next token without rewriting user rows.
+        let roles: Vec<String> = row
+            .try_get("roles")
+            .map_err(|e| AuthError::Backend(format!("users postgres: {e}")))?;
+        let role_scopes = self.expand_roles(&roles).await?;
+        identity.scopes = merge_scopes(identity.scopes, role_scopes);
+        Ok(identity)
     }
+
+    /// Expand a set of role names into the union of their scope bundles, looked up in the
+    /// per-workspace `roles` table (hq-rbac.3). Empty input short-circuits without a query (the
+    /// common no-roles case). Order is the table's row order; [`merge_scopes`] de-dups.
+    async fn expand_roles(&self, roles: &[String]) -> Result<Vec<String>, AuthError> {
+        if roles.is_empty() {
+            return Ok(Vec::new());
+        }
+        let rows = sqlx::query("SELECT scopes FROM roles WHERE name = ANY($1)")
+            .bind(roles)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| AuthError::Backend(format!("roles postgres: {e}")))?;
+        let mut out = Vec::new();
+        for row in &rows {
+            let scopes: Vec<String> = row
+                .try_get("scopes")
+                .map_err(|e| AuthError::Backend(format!("roles postgres: {e}")))?;
+            out.extend(scopes);
+        }
+        Ok(out)
+    }
+}
+
+/// Union a user's direct scopes with the scopes expanded from their roles, de-duplicating while
+/// preserving first-seen order (direct scopes first, then role scopes). The PG-free seam of the
+/// role expansion in [`PgUsers::authenticate`] — pure, unit-tested without a database.
+fn merge_scopes(direct: Vec<String>, role_scopes: Vec<String>) -> Vec<String> {
+    let mut seen: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    let mut out = Vec::with_capacity(direct.len() + role_scopes.len());
+    for scope in direct.into_iter().chain(role_scopes) {
+        if seen.insert(scope.clone()) {
+            out.push(scope);
+        }
+    }
+    out
 }
 
 /// Build a [`VerifiedIdentity`] from an authenticated `users` row and the server-injected
@@ -211,12 +256,28 @@ mod tests {
                 email TEXT NOT NULL UNIQUE, \
                 password_hash TEXT NOT NULL, \
                 scopes TEXT[] NOT NULL DEFAULT '{}', \
+                roles TEXT[] NOT NULL DEFAULT '{}', \
                 created_at BIGINT NOT NULL, \
                 updated_at BIGINT NOT NULL )",
         )
         .execute(pool)
         .await
         .expect("create users table");
+    }
+
+    /// Provision the `roles` catalog (hq-rbac.3) in the connection's current schema, mirroring
+    /// migration 0003 unqualified for the contract tests. Idempotent.
+    async fn ensure_roles_table(pool: &PgPool) {
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS roles ( \
+                name TEXT PRIMARY KEY, \
+                scopes TEXT[] NOT NULL DEFAULT '{}', \
+                created_at BIGINT NOT NULL, \
+                updated_at BIGINT NOT NULL )",
+        )
+        .execute(pool)
+        .await
+        .expect("create roles table");
     }
 
     async fn seed_user(pool: &PgPool, id: &str, email: &str, hash: &str, scopes: &[&str]) {
@@ -237,6 +298,43 @@ mod tests {
         .execute(pool)
         .await
         .expect("insert seed user");
+    }
+
+    async fn seed_role(pool: &PgPool, name: &str, scopes: &[&str]) {
+        let scopes: Vec<String> = scopes.iter().map(|s| s.to_string()).collect();
+        sqlx::query(
+            "INSERT INTO roles (name, scopes, created_at, updated_at) VALUES ($1, $2, 0, 0) \
+             ON CONFLICT (name) DO UPDATE SET scopes = EXCLUDED.scopes",
+        )
+        .bind(name)
+        .bind(&scopes)
+        .execute(pool)
+        .await
+        .expect("insert seed role");
+    }
+
+    // --- PG-free test: the scope-union seam is pure, so no live DB needed. ---
+
+    #[test]
+    fn merge_scopes_unions_dedups_and_keeps_direct_first() {
+        // Direct scopes come first; role scopes follow; duplicates are dropped on first sight.
+        let merged = merge_scopes(
+            vec!["beads.read".into(), "merge.read".into()],
+            vec!["merge.read".into(), "issues.write".into()],
+        );
+        assert_eq!(
+            merged,
+            vec![
+                "beads.read".to_string(),
+                "merge.read".to_string(),
+                "issues.write".to_string()
+            ]
+        );
+        // No roles → the direct scopes pass through unchanged.
+        assert_eq!(
+            merge_scopes(vec!["rig.read".into()], vec![]),
+            vec!["rig.read".to_string()]
+        );
     }
 
     // --- PG-free test: provider-kind gating returns before any I/O, so no live DB needed. ---
@@ -325,6 +423,51 @@ mod tests {
             })
             .await;
         assert_eq!(err, Err(AuthError::InvalidCredentials));
+    }
+
+    /// hq-rbac.3: a user's assigned roles expand to their scope bundles and union with the row's
+    /// direct scopes at login — the union is what rides the minted token.
+    #[tokio::test]
+    async fn login_expands_assigned_roles_into_the_identity_scopes() {
+        let Some(pool) = pool_or_skip().await else {
+            eprintln!("GT_PG_URL unset; skipping role-expansion contract test");
+            return;
+        };
+        ensure_users_table(&pool).await;
+        ensure_roles_table(&pool).await;
+        let hash = hash_password("hunter2").unwrap();
+        // A direct scope on the user, plus two roles whose bundles overlap (`merge.read`).
+        seed_user(&pool, "u-dana", "dana@acme.test", &hash, &["beads.read"]).await;
+        seed_role(&pool, "reviewer", &["merge.read", "merge.submit"]).await;
+        seed_role(&pool, "reader", &["merge.read", "issues.read"]).await;
+        sqlx::query("UPDATE users SET roles = $1 WHERE email = $2")
+            .bind(vec!["reviewer".to_string(), "reader".to_string()])
+            .bind("dana@acme.test")
+            .execute(&pool)
+            .await
+            .expect("assign roles");
+
+        let users = PgUsers::new(pool, "acme");
+        let got = users
+            .authenticate(&Credentials::EmailPassword {
+                email: "dana@acme.test".into(),
+                password: "hunter2".into(),
+            })
+            .await
+            .expect("login succeeds");
+
+        // Direct scope first, then the (deduped) union of both roles' scopes. Role row order is
+        // not guaranteed, so assert membership + the direct-first invariant rather than an order.
+        assert_eq!(got.scopes[0], "beads.read", "direct scope leads");
+        let set: std::collections::BTreeSet<&str> = got.scopes.iter().map(String::as_str).collect();
+        assert_eq!(
+            set,
+            ["beads.read", "merge.read", "merge.submit", "issues.read"]
+                .into_iter()
+                .collect(),
+        );
+        // `merge.read` is granted by both roles but appears once.
+        assert_eq!(got.scopes.iter().filter(|s| *s == "merge.read").count(), 1);
     }
 
     // --- mint.4: the full login flow against the REAL stack -------------------------------------

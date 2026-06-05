@@ -444,6 +444,10 @@ async fn main() -> anyhow::Result<()> {
             for sql in [
                 gt_auth::migrations::CREATE_USERS,
                 gt_auth::migrations::CREATE_REFRESH_TOKENS,
+                // hq-rbac.3: the role catalog + the users.roles assignment column, so login can
+                // expand roles → scopes from the first request.
+                gt_auth::migrations::CREATE_ROLES,
+                gt_auth::migrations::ADD_USER_ROLES,
             ] {
                 sqlx::raw_sql(sql)
                     .execute(&pool)
