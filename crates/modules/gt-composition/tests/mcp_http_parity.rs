@@ -83,6 +83,7 @@ fn parity_map(ns: &str) -> Vec<Route> {
         "issues" => vec![
             rt("GET", "/", None),                                  // gt://issues
             rt("GET", "/{id}", None),                              // gt://issue/{id}
+            rt("GET", "/stats", None),                             // REST-only aggregation (hq-web-extras.12)
             rt("POST", "/", Some("issues.create.execute")),
             rt("PATCH", "/{id}", Some("issues.update.execute")),
             rt("POST", "/{id}/transition", Some("issues.transition.execute")),
