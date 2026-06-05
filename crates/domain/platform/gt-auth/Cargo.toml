@@ -64,6 +64,11 @@ gt-rbac = { workspace = true, optional = true }
 # /auth/* from the spec instead of hand-maintaining the types. Gated with the `axum` surface it
 # describes — same as gt-issues (docs/03 Rule 4).
 utoipa = { workspace = true, optional = true }
+# HTTP client for the OAuth/OIDC login adapter (`oauth.rs`, hq-platform-hardening.3): the
+# authorization-code handshake (token exchange + userinfo read) is network I/O. Off-by-default so
+# the core build stays HTTP-client-free — pulled only when a binary serves the OAuth/OIDC login
+# path. Same gating as the `pg`/`password-hash` adapters (docs/03 Rule 4 — adapter beside the port).
+reqwest = { workspace = true, optional = true }
 
 [features]
 # Production email+password provider — argon2 hash + verify.
@@ -77,12 +82,21 @@ pg = ["dep:sqlx", "dep:sha2", "password-hash"]
 # `jsonwebtoken`; the login port is abstract, so the DB-backed adapter is opted in separately
 # via `pg`.
 axum = ["dep:axum", "dep:async-trait", "dep:gt-rbac", "dep:utoipa", "jsonwebtoken"]
+# OAuth 2.0 / OpenID Connect login adapter (`oauth.rs`, hq-platform-hardening.3): the
+# authorization-code handshake against a configured IdP. Implements the async `LoginProvider` port
+# (defined with the `axum` HTTP surface), so it implies `axum`; pulls in `reqwest` as the HTTP
+# client. Kept a separate opt-in so a non-OAuth deploy carries no HTTP client.
+oauth = ["dep:reqwest", "axum"]
 
 [dev-dependencies]
 serde_json = { workspace = true }
 # Async harness for the `pg` adapter's GT_PG_URL-gated contract tests (`#[tokio::test]`). A
 # dev-dependency only — never in the library's dependency closure, so `cargo build -p gt-auth`
-# stays runtime-free.
-tokio = { workspace = true }
+# stays runtime-free. `net` is added for the `oauth` adapter's mock-IdP test, which binds a real
+# loopback socket the `reqwest` handshake calls back into.
+tokio = { workspace = true, features = ["net"] }
 # `ServiceExt::oneshot` to drive the `axum` auth router in-process for the http.rs tests.
 tower = { version = "0.5", features = ["util"] }
+# The mock IdP (token + userinfo endpoints) the `oauth` adapter test handshakes against runs as a
+# tiny in-process axum server. A dev-dependency only — the adapter itself depends on no server.
+axum = { workspace = true }

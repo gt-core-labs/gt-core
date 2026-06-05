@@ -37,8 +37,8 @@ use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    AuthError, Credentials, JwkSet, JwtClaims, JwtMinter, RefreshError, RefreshRecord, RefreshStore,
-    RefreshToken, VerifiedIdentity,
+    AuthError, Credentials, JwkSet, JwtClaims, JwtMinter, ProviderKind, RefreshError, RefreshRecord,
+    RefreshStore, RefreshToken, VerifiedIdentity,
 };
 
 /// The async refresh-store port behind [`AuthState::refresh`] — the I/O-capable boundary the HTTP
@@ -364,8 +364,14 @@ const REFRESH_COOKIE: &str = "gt_refresh";
 /// Everything the auth endpoints need, supplied by the composition root.
 #[derive(Clone)]
 pub struct AuthState {
-    /// The login step (identity verification).
+    /// The login step (identity verification) for the default email+password path.
     pub login: Arc<dyn LoginProvider>,
+    /// The OAuth/OIDC login provider (hq-platform-hardening.3): a `POST /auth/login` carrying a
+    /// `code` (OAuth authorization-code grant) or an `id_token`+`issuer` (OIDC) is routed here
+    /// instead of [`login`](Self::login). The production adapter is
+    /// [`OidcProvider`](crate::OidcProvider) (behind the `oauth` feature). `None` ⇒ an OAuth/OIDC
+    /// login responds `501`; the email+password path is unaffected.
+    pub oauth_login: Option<Arc<dyn LoginProvider>>,
     /// The RS256 access-token minter.
     pub minter: Arc<JwtMinter>,
     /// The refresh-token store (rotation, reuse detection, revocation). The async port, so the
@@ -498,14 +504,55 @@ pub fn auth_openapi() -> utoipa::openapi::OpenApi {
 
 // --- request/response DTOs --------------------------------------------------------------------
 
-/// `POST /auth/login` body.
-#[derive(Debug, Deserialize)]
+/// `POST /auth/login` body — the email+password path by default, or an OAuth/OIDC handshake when
+/// the corresponding fields are present (hq-platform-hardening.3). The server picks the provider
+/// from which fields are supplied: `code` ⇒ the OAuth authorization-code grant, `id_token` ⇒ the
+/// OIDC path, otherwise `email`+`password`.
+#[derive(Debug, Default, Deserialize)]
 #[cfg_attr(feature = "axum", derive(utoipa::ToSchema))]
 pub struct LoginRequest {
-    /// The principal's email address.
-    pub email: String,
-    /// The plaintext password presented this request.
-    pub password: String,
+    /// The principal's email address (email+password path). Absent on an OAuth/OIDC login.
+    #[serde(default)]
+    pub email: Option<String>,
+    /// The plaintext password presented this request (email+password path).
+    #[serde(default)]
+    pub password: Option<String>,
+    /// Upstream provider id for the OAuth authorization-code grant (e.g. `"github"`); pairs with
+    /// [`code`](Self::code).
+    #[serde(default)]
+    pub provider: Option<String>,
+    /// The OAuth authorization code returned to the redirect URI — present ⇒ the OAuth path.
+    #[serde(default)]
+    pub code: Option<String>,
+    /// The issuer (`iss`) an [`id_token`](Self::id_token) claims to come from (OIDC path).
+    #[serde(default)]
+    pub issuer: Option<String>,
+    /// An OpenID Connect `id_token` minted by a trusted issuer — present ⇒ the OIDC path.
+    #[serde(default)]
+    pub id_token: Option<String>,
+}
+
+impl LoginRequest {
+    /// Pick the login provider from the supplied fields and produce the matching [`Credentials`]
+    /// (hq-platform-hardening.3). Precedence: a `code` ⇒ the OAuth authorization-code grant, an
+    /// `id_token` ⇒ the OIDC path, otherwise `email`+`password`. A body that names none of these
+    /// is [`AuthError::InvalidCredentials`] — an empty/garbage login, mapped to `401`, never a
+    /// silent default.
+    fn into_credentials(self) -> Result<Credentials, AuthError> {
+        match self {
+            LoginRequest { code: Some(code), provider, .. } => Ok(Credentials::OAuth {
+                provider: provider.unwrap_or_default(),
+                code,
+            }),
+            LoginRequest { id_token: Some(id_token), issuer: Some(issuer), .. } => {
+                Ok(Credentials::Oidc { issuer, id_token })
+            }
+            LoginRequest { email: Some(email), password: Some(password), .. } => {
+                Ok(Credentials::EmailPassword { email, password })
+            }
+            _ => Err(AuthError::InvalidCredentials),
+        }
+    }
 }
 
 /// A minted token pair, returned by login and refresh.
@@ -640,11 +687,18 @@ async fn login(
     State(state): State<AuthState>,
     Json(body): Json<LoginRequest>,
 ) -> Result<(HeaderMap, Json<TokenResponse>), ApiError> {
-    let creds = Credentials::EmailPassword {
-        email: body.email,
-        password: body.password,
+    let creds = body.into_credentials()?;
+    // The OAuth/OIDC handshake (hq-platform-hardening.3) is a different provider than
+    // email+password: route by `kind()`. An OAuth/OIDC login with no provider configured is
+    // `501 Not Implemented` (the deploy did not opt into the `oauth` adapter) rather than a
+    // misleading `401` — login itself works, this method just is not wired.
+    let provider: &Arc<dyn LoginProvider> = match creds.kind() {
+        ProviderKind::EmailPassword => &state.login,
+        ProviderKind::OAuth | ProviderKind::Oidc => {
+            state.oauth_login.as_ref().ok_or(ApiError::OauthNotConfigured)?
+        }
     };
-    let identity = state.login.login(&creds).await?;
+    let identity = provider.login(&creds).await?;
     let tokens = issue_tokens(&state, identity.sub, identity.workspace, identity.scopes).await?;
     // Set httpOnly cookies for the browser (SSE + refresh) while still returning the JSON body
     // for non-browser clients (`hq-web-extras.1`).
@@ -1169,6 +1223,9 @@ enum ApiError {
     Auth(AuthError),
     /// `GET /auth/me` with no verified claims in the request — `401`.
     Unauthenticated,
+    /// A `POST /auth/login` selected the OAuth/OIDC path but the deploy configured no
+    /// [`oauth_login`](AuthState::oauth_login) provider — `501` (hq-platform-hardening.3).
+    OauthNotConfigured,
     /// Verified caller, but the claims lack the required scope — `403` (`hq-web-extras.5`).
     #[cfg(feature = "pg")]
     Forbidden,
@@ -1204,6 +1261,9 @@ impl IntoResponse for ApiError {
             ApiError::Auth(e) => e.into_response(),
             ApiError::Unauthenticated => {
                 (StatusCode::UNAUTHORIZED, "missing or invalid bearer token").into_response()
+            }
+            ApiError::OauthNotConfigured => {
+                (StatusCode::NOT_IMPLEMENTED, "oauth/oidc login is not configured").into_response()
             }
             #[cfg(feature = "pg")]
             ApiError::Forbidden => {
@@ -1439,6 +1499,7 @@ mod tests {
     fn state() -> AuthState {
         AuthState {
             login: Arc::new(OneUser),
+            oauth_login: None,
             minter: Arc::new(JwtMinter::from_rsa_pem(PRIV_PEM).unwrap().with_kid("k1")),
             refresh: Arc::new(InMemoryRefreshStore::new()),
             access_ttl: 900,
@@ -1536,6 +1597,86 @@ mod tests {
         )
         .await;
         assert_eq!(status, StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn login_with_no_recognizable_provider_fields_is_401() {
+        // A body that names neither a password nor a code/id_token is a rejected (empty) login,
+        // never a silent default (hq-platform-hardening.3).
+        let app = auth_router(state());
+        let (status, _) = post(&app, "/auth/login", r#"{}"#).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn oauth_login_is_501_when_no_provider_is_configured() {
+        // The default state() has `oauth_login: None`, so an OAuth body reports "not configured"
+        // (501) — distinct from a bad credential (401) — while email+password keeps working.
+        let app = auth_router(state());
+        let (status, _) = post(
+            &app,
+            "/auth/login",
+            r#"{"provider":"github","code":"abc"}"#,
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_IMPLEMENTED);
+    }
+
+    /// Spin up a throwaway in-process IdP (token + userinfo endpoints) and wire a real
+    /// [`OidcProvider`](crate::OidcProvider) into `oauth_login`, proving the bead acceptance: a
+    /// `POST /auth/login` carrying an OAuth `code` runs the handshake and issues the SAME
+    /// access/refresh pair the password path yields. No external network (hq-platform-hardening.3).
+    #[cfg(feature = "oauth")]
+    #[tokio::test]
+    async fn login_via_oauth_issues_the_same_token_pair_as_the_password_path() {
+        use axum::routing::{get as axget, post as axpost};
+        use axum::Json as AxJson;
+
+        async fn token_handler() -> AxJson<serde_json::Value> {
+            AxJson(serde_json::json!({ "access_token": "tok-xyz", "token_type": "Bearer" }))
+        }
+        async fn userinfo_handler(headers: HeaderMap) -> Result<AxJson<serde_json::Value>, StatusCode> {
+            let ok = headers
+                .get("authorization")
+                .and_then(|v| v.to_str().ok())
+                .map(|v| v == "Bearer tok-xyz")
+                .unwrap_or(false);
+            if ok {
+                Ok(AxJson(serde_json::json!({ "sub": "oauth-alice" })))
+            } else {
+                Err(StatusCode::UNAUTHORIZED)
+            }
+        }
+        let idp = Router::new()
+            .route("/token", axpost(token_handler))
+            .route("/userinfo", axget(userinfo_handler));
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(listener, idp).await.unwrap() });
+
+        let config = crate::OidcConfig {
+            issuer: format!("{base}/"),
+            client_id: "gt".into(),
+            client_secret: "s".into(),
+            token_endpoint: format!("{base}/token"),
+            userinfo_endpoint: format!("{base}/userinfo"),
+            redirect_uri: "https://gt.test/cb".into(),
+            workspace: "acme".into(),
+            scopes: vec!["rig.read".into()],
+        };
+        let oauth = Arc::new(crate::OidcProvider::new(config).unwrap()) as Arc<dyn LoginProvider>;
+        let app = auth_router(AuthState { oauth_login: Some(oauth), ..state() });
+
+        let (status, body) = post(
+            &app,
+            "/auth/login",
+            r#"{"provider":"mock","code":"good-code"}"#,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "oauth login body: {body}");
+        let (access, refresh) = token_pair(&body);
+        assert!(!access.is_empty() && !refresh.is_empty());
+        assert!(body.contains(r#""token_type":"Bearer""#));
     }
 
     #[tokio::test]

@@ -118,6 +118,10 @@ sqlx = { workspace = true }
 # Compile the local fastembed embedding engine into the server (hq-docs-search.2). Off by
 # default — pulls the onnxruntime ML stack; enable for semantic/hybrid document search.
 embeddings-fastembed = ["gt-docs-embed/embeddings-fastembed"]
+# Compile the OAuth/OIDC login provider into the server (hq-platform-hardening.3). Off by
+# default — pulls gt-auth's `reqwest` HTTP client; enable to serve `POST /auth/login` with a
+# `code`/`id_token` against a configured GT_OIDC_* identity provider. Without it that path is 501.
+oauth = ["gt-auth/oauth"]
 
 [[bin]]
 name = "gt-mcp-server"

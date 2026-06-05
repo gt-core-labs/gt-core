@@ -95,6 +95,9 @@ mod mint;
 #[cfg(feature = "axum")]
 mod http;
 
+#[cfg(feature = "oauth")]
+mod oauth;
+
 pub use error::AuthError;
 pub use provider::{Credentials, IdentityProvider, ProviderKind, VerifiedIdentity};
 pub use refresh::{
@@ -150,6 +153,15 @@ pub use http::{
 /// Postgres identity store (`pg`).
 #[cfg(all(feature = "axum", feature = "pg"))]
 pub use http::GlobalLogin;
+
+/// The OAuth/OIDC login adapter (hq-platform-hardening.3): the authorization-code handshake
+/// against a configured IdP, mapping the upstream identity onto the same [`VerifiedIdentity`] the
+/// password path yields. Behind the off-by-default `oauth` feature.
+#[cfg(feature = "oauth")]
+pub use oauth::{
+    OidcConfig, OidcProvider, ENV_CLIENT_ID, ENV_CLIENT_SECRET, ENV_ISSUER, ENV_REDIRECT_URI,
+    ENV_SCOPES, ENV_TOKEN_ENDPOINT, ENV_USERINFO_ENDPOINT, ENV_WORKSPACE,
+};
 
 #[cfg(test)]
 pub use provider::InMemoryIdentityProvider;

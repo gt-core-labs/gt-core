@@ -611,6 +611,10 @@ async fn main() -> anyhow::Result<()> {
                 // ws_default lookup. The migration + seed above guarantee admin@gt.local already
                 // has a global row + a default membership, so the live login survives the cutover.
                 login: Arc::new(GlobalLogin(pg_users.clone())),
+                // OAuth/OIDC login provider (hq-platform-hardening.3). Wired only when the
+                // `oauth` feature is built AND the GT_OIDC_* env contract is present, so a default
+                // deploy carries no HTTP client and an OAuth/OIDC login responds 501 until opted in.
+                oauth_login: oidc_login_from_env(),
                 users: Some(pg_users.clone() as Arc<dyn gt_auth::UserStore>),
                 roles: Some(pg_users.clone() as Arc<dyn gt_auth::RoleStore>),
                 // Cross-workspace surface (hq-identity.3): list memberships + switch active
@@ -1208,6 +1212,30 @@ fn env_u64(key: &str, default: u64) -> u64 {
 /// The `Secure` flag for the auth cookies (hq-web-extras.1). Defaults to `true` (HTTPS deploy);
 /// `GT_AUTH_COOKIE_SECURE=false` opts a plain-http local dev out. `SameSite=None` forces it on
 /// regardless, since browsers drop a `None` cookie that is not also `Secure`.
+/// The OAuth/OIDC [`LoginProvider`](gt_auth::LoginProvider) for `AuthState::oauth_login`
+/// (hq-platform-hardening.3), built from the `GT_OIDC_*` env contract. Returns `None` (the
+/// email+password path only; an OAuth/OIDC login responds `501`) when:
+///   - the `oauth` feature is not built — a default deploy carries no HTTP client; or
+///   - `GT_OIDC_ISSUER` is unset — the deploy did not opt into a provider.
+/// A configured-but-malformed env (e.g. issuer set but client id missing) is fatal — a
+/// misconfiguration must not silently fall back to "OAuth off".
+fn oidc_login_from_env() -> Option<Arc<dyn gt_auth::LoginProvider>> {
+    #[cfg(feature = "oauth")]
+    {
+        if std::env::var(gt_auth::ENV_ISSUER).ok().filter(|v| !v.trim().is_empty()).is_none() {
+            return None;
+        }
+        let config = gt_auth::OidcConfig::from_env().expect("GT_OIDC_* config is malformed");
+        let provider = gt_auth::OidcProvider::new(config).expect("build the OIDC login provider");
+        eprintln!("[gt-mcp-server] oauth/oidc login enabled (issuer {})", provider.issuer());
+        Some(Arc::new(provider) as Arc<dyn gt_auth::LoginProvider>)
+    }
+    #[cfg(not(feature = "oauth"))]
+    {
+        None
+    }
+}
+
 fn cookie_secure() -> bool {
     if cookie_same_site() == SameSite::None {
         return true;
