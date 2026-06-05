@@ -136,8 +136,9 @@ pub use mint::JwtMinter;
 
 #[cfg(feature = "axum")]
 pub use http::{
-    auth_router, AuthState, Clock, CreateUserRequest, LoginProvider, LoginRequest, MeResponse,
-    RefreshRequest, SameSite, TokenResponse, UserStore, UserSummary,
+    auth_router, AssignRolesRequest, AuthState, Clock, CreateRoleRequest, CreateUserRequest,
+    LoginProvider, LoginRequest, MeResponse, RefreshRequest, RoleStore, RoleSummary, SameSite,
+    TokenResponse, UserStore, UserSummary,
 };
 
 #[cfg(test)]

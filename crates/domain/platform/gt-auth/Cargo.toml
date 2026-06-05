@@ -54,6 +54,11 @@ sha2 = { workspace = true, optional = true }
 # refresh/identity ports this crate owns; pulled only when a binary serves the endpoints.
 axum = { workspace = true, optional = true }
 async-trait = { workspace = true, optional = true }
+# Closed scope-vocabulary validation for the role-CRUD surface (`http.rs`, hq-rbac.4): a role's
+# scopes are checked against `gt_rbac::validate_scope` before write, so a typo is a 400 rather
+# than a silent permission hole. Kernel dep (platform → kernel is allowed), pulled only with the
+# `axum` admin surface.
+gt-rbac = { workspace = true, optional = true }
 
 [features]
 # Production email+password provider — argon2 hash + verify.
@@ -66,7 +71,7 @@ pg = ["dep:sqlx", "dep:sha2", "password-hash"]
 # Axum auth-endpoint router (`http.rs`, hq-auth-routes.1). Needs the minter, so it implies
 # `jsonwebtoken`; the login port is abstract, so the DB-backed adapter is opted in separately
 # via `pg`.
-axum = ["dep:axum", "dep:async-trait", "jsonwebtoken"]
+axum = ["dep:axum", "dep:async-trait", "dep:gt-rbac", "jsonwebtoken"]
 
 [dev-dependencies]
 serde_json = { workspace = true }

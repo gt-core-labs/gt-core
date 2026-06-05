@@ -1455,6 +1455,7 @@ dependencies = [
  "axum",
  "base64 0.22.1",
  "getrandom 0.2.17",
+ "gt-rbac",
  "jsonwebtoken",
  "pem",
  "serde",

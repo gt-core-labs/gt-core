@@ -228,6 +228,74 @@ impl crate::http::UserStore for PgUsers {
     }
 }
 
+/// Role administration + assignment over the per-workspace `roles` table and the `users.roles`
+/// column (hq-rbac.4). Available with the `axum` admin surface; the same `PgUsers` adapter backs
+/// the login, user-admin, and role-admin ports over one workspace pool.
+#[cfg(feature = "axum")]
+#[async_trait::async_trait]
+impl crate::http::RoleStore for PgUsers {
+    async fn upsert_role(&self, name: &str, scopes: &[String], now: u64) -> Result<(), AuthError> {
+        sqlx::query(
+            "INSERT INTO roles (name, scopes, created_at, updated_at) VALUES ($1, $2, $3, $3) \
+             ON CONFLICT (name) DO UPDATE SET scopes = EXCLUDED.scopes, updated_at = EXCLUDED.updated_at",
+        )
+        .bind(name)
+        .bind(scopes)
+        .bind(now as i64)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| AuthError::Backend(format!("roles postgres: {e}")))?;
+        Ok(())
+    }
+
+    async fn list_roles(&self) -> Result<Vec<crate::http::RoleSummary>, AuthError> {
+        let rows = sqlx::query("SELECT name, scopes, created_at FROM roles ORDER BY created_at")
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| AuthError::Backend(format!("roles postgres: {e}")))?;
+        rows.iter()
+            .map(|row| {
+                Ok(crate::http::RoleSummary {
+                    name: row
+                        .try_get("name")
+                        .map_err(|e| AuthError::Backend(format!("roles postgres: {e}")))?,
+                    scopes: row
+                        .try_get("scopes")
+                        .map_err(|e| AuthError::Backend(format!("roles postgres: {e}")))?,
+                    created_at: row
+                        .try_get("created_at")
+                        .map_err(|e| AuthError::Backend(format!("roles postgres: {e}")))?,
+                })
+            })
+            .collect()
+    }
+
+    async fn delete_role(&self, name: &str) -> Result<bool, AuthError> {
+        let res = sqlx::query("DELETE FROM roles WHERE name = $1")
+            .bind(name)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| AuthError::Backend(format!("roles postgres: {e}")))?;
+        Ok(res.rows_affected() > 0)
+    }
+
+    async fn assign_user_roles(
+        &self,
+        email: &str,
+        roles: &[String],
+        now: u64,
+    ) -> Result<bool, AuthError> {
+        let res = sqlx::query("UPDATE users SET roles = $1, updated_at = $2 WHERE email = $3")
+            .bind(roles)
+            .bind(now as i64)
+            .bind(email)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| AuthError::Backend(format!("users postgres: {e}")))?;
+        Ok(res.rows_affected() > 0)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -468,6 +536,59 @@ mod tests {
         );
         // `merge.read` is granted by both roles but appears once.
         assert_eq!(got.scopes.iter().filter(|s| *s == "merge.read").count(), 1);
+    }
+
+    /// hq-rbac.4: the role-admin adapter round-trips — upsert, list, delete — and an assignment
+    /// written through it feeds login-time expansion (the .3 path) end to end.
+    #[cfg(feature = "axum")]
+    #[tokio::test]
+    async fn role_store_crud_and_assignment_feeds_expansion() {
+        use crate::http::RoleStore;
+        let Some(pool) = pool_or_skip().await else {
+            eprintln!("GT_PG_URL unset; skipping role-store contract test");
+            return;
+        };
+        ensure_users_table(&pool).await;
+        ensure_roles_table(&pool).await;
+        let users = PgUsers::new(pool.clone(), "acme");
+
+        // Upsert creates, then replaces the scope bundle for the same name.
+        RoleStore::upsert_role(&users, "crud-role", &["beads.read".into()], 1).await.unwrap();
+        RoleStore::upsert_role(&users, "crud-role", &["beads.read".into(), "merge.submit".into()], 2)
+            .await
+            .unwrap();
+        let listed = RoleStore::list_roles(&users).await.unwrap();
+        let role = listed.iter().find(|r| r.name == "crud-role").expect("role listed");
+        assert_eq!(role.scopes, vec!["beads.read".to_string(), "merge.submit".to_string()]);
+
+        // Assign the role to a user, then log in: the role's scopes ride the identity (.3).
+        let hash = hash_password("hunter2").unwrap();
+        seed_user(&pool, "u-erin", "erin@acme.test", &hash, &["rig.read"]).await;
+        assert!(
+            RoleStore::assign_user_roles(&users, "erin@acme.test", &["crud-role".into()], 3)
+                .await
+                .unwrap(),
+            "assignment to a known user returns true"
+        );
+        assert!(
+            !RoleStore::assign_user_roles(&users, "ghost@acme.test", &["crud-role".into()], 3)
+                .await
+                .unwrap(),
+            "assignment to an unknown user returns false"
+        );
+        let identity = users
+            .authenticate(&Credentials::EmailPassword {
+                email: "erin@acme.test".into(),
+                password: "hunter2".into(),
+            })
+            .await
+            .expect("login");
+        let set: std::collections::BTreeSet<&str> = identity.scopes.iter().map(String::as_str).collect();
+        assert!(set.contains("rig.read") && set.contains("beads.read") && set.contains("merge.submit"));
+
+        // Delete is idempotent: true once, false thereafter.
+        assert!(RoleStore::delete_role(&users, "crud-role").await.unwrap());
+        assert!(!RoleStore::delete_role(&users, "crud-role").await.unwrap());
     }
 
     // --- mint.4: the full login flow against the REAL stack -------------------------------------

@@ -28,6 +28,8 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use axum::extract::{Extension, State};
+#[cfg(feature = "pg")]
+use axum::extract::Path;
 use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
@@ -78,6 +80,32 @@ pub trait UserStore: Send + Sync {
 
     /// List every user (no password material), oldest first.
     async fn list_users(&self) -> Result<Vec<UserSummary>, AuthError>;
+}
+
+/// The async role-administration port behind `/auth/roles` and `/auth/users/{email}/roles`
+/// (hq-rbac.4): create/list/delete a role (a named scope bundle) and assign roles to a user.
+/// Separate from [`UserStore`] so a deploy can expose user onboarding without role management.
+/// The production adapter is [`PgUsers`](crate::PgUsers), over the same workspace pool.
+#[async_trait]
+pub trait RoleStore: Send + Sync {
+    /// Upsert a role: create it, or replace an existing role's scope bundle. The caller has
+    /// already validated `scopes` against the closed vocabulary. A fault is [`AuthError::Backend`].
+    async fn upsert_role(&self, name: &str, scopes: &[String], now: u64) -> Result<(), AuthError>;
+
+    /// List every role and its scope bundle, oldest first.
+    async fn list_roles(&self) -> Result<Vec<RoleSummary>, AuthError>;
+
+    /// Delete a role by name. `Ok(false)` when no such role existed (idempotent delete).
+    async fn delete_role(&self, name: &str) -> Result<bool, AuthError>;
+
+    /// Replace a user's assigned role set, keyed by login email. `Ok(false)` when no user has
+    /// that email — the caller maps it to `404` rather than silently succeeding.
+    async fn assign_user_roles(
+        &self,
+        email: &str,
+        roles: &[String],
+        now: u64,
+    ) -> Result<bool, AuthError>;
 }
 
 /// An injected wall clock: seconds since the Unix epoch. Kept abstract so tests pin time.
@@ -134,6 +162,9 @@ pub struct AuthState {
     /// The user-administration store behind `/auth/users` (`hq-web-extras.5`). `None` ⇒ the
     /// admin endpoints are not configured and respond `501`; login still works without it.
     pub users: Option<Arc<dyn UserStore>>,
+    /// The role-administration store behind `/auth/roles` + `/auth/users/{email}/roles`
+    /// (hq-rbac.4). `None` ⇒ those endpoints respond `501`; login + user admin are unaffected.
+    pub roles: Option<Arc<dyn RoleStore>>,
     /// The verifier's public JWKS, served at `GET /auth/jwks` so clients verify access tokens
     /// offline. Built from the verifier's public keys at the composition root
     /// ([`JwtAuthenticator::jwk_set`](crate::JwtAuthenticator::jwk_set)) — never the signing
@@ -152,7 +183,12 @@ pub fn auth_router(state: AuthState) -> Router {
     // User administration (`hq-web-extras.5`) hashes passwords, so it rides the `pg`/argon2
     // adapter — without it the surface is login-only.
     #[cfg(feature = "pg")]
-    let router = router.route("/auth/users", post(create_user).get(list_users));
+    let router = router
+        .route("/auth/users", post(create_user).get(list_users))
+        // Role administration + assignment (hq-rbac.4), scope-gated like the user surface.
+        .route("/auth/roles", post(create_role).get(list_roles))
+        .route("/auth/roles/:name", axum::routing::delete(delete_role))
+        .route("/auth/users/:email/roles", post(assign_roles));
     router.with_state(state)
 }
 
@@ -222,6 +258,36 @@ pub struct UserSummary {
     pub scopes: Vec<String>,
     /// Creation time (epoch seconds).
     pub created_at: i64,
+}
+
+/// `POST /auth/roles` body — create or replace a role (admin only, hq-rbac.4).
+#[derive(Debug, Deserialize)]
+pub struct CreateRoleRequest {
+    /// The role name (referenced by a user's assigned roles).
+    pub name: String,
+    /// The scope bundle the role grants. Each entry is validated against the closed scope
+    /// vocabulary ([`gt_rbac::validate_scope`]) before write — a typo is a `400`.
+    #[serde(default)]
+    pub scopes: Vec<String>,
+}
+
+/// A role as returned by `GET`/`POST /auth/roles`.
+#[derive(Debug, Serialize)]
+pub struct RoleSummary {
+    /// The role name.
+    pub name: String,
+    /// The scope bundle the role grants.
+    pub scopes: Vec<String>,
+    /// Creation time (epoch seconds).
+    pub created_at: i64,
+}
+
+/// `POST /auth/users/{email}/roles` body — set a user's assigned roles (admin only, hq-rbac.4).
+#[derive(Debug, Deserialize)]
+pub struct AssignRolesRequest {
+    /// The role names to assign, replacing the user's current set.
+    #[serde(default)]
+    pub roles: Vec<String>,
 }
 
 // --- handlers ---------------------------------------------------------------------------------
@@ -336,6 +402,71 @@ async fn list_users(
     require_scope(claims.as_deref(), "users.read")?;
     let store = state.users.as_ref().ok_or(ApiError::NotConfigured)?;
     Ok(Json(store.list_users().await?))
+}
+
+/// `POST /auth/roles` — create or replace a role (admin only). Requires `roles.write` (or `*`).
+/// Every scope in the bundle is validated against the closed vocabulary first, so a typo is a
+/// `400` rather than a silently dead grant.
+#[cfg(feature = "pg")]
+async fn create_role(
+    State(state): State<AuthState>,
+    claims: Option<Extension<JwtClaims>>,
+    Json(body): Json<CreateRoleRequest>,
+) -> Result<(StatusCode, Json<RoleSummary>), ApiError> {
+    require_scope(claims.as_deref(), "roles.write")?;
+    let store = state.roles.as_ref().ok_or(ApiError::NotConfigured)?;
+    gt_rbac::validate_scopes(&body.scopes).map_err(|e| ApiError::BadScope(e.to_string()))?;
+    let now = (state.now)();
+    store.upsert_role(&body.name, &body.scopes, now).await?;
+    Ok((
+        StatusCode::CREATED,
+        Json(RoleSummary { name: body.name, scopes: body.scopes, created_at: now as i64 }),
+    ))
+}
+
+/// `GET /auth/roles` — list roles (admin only). Requires `roles.read` (or `*`).
+#[cfg(feature = "pg")]
+async fn list_roles(
+    State(state): State<AuthState>,
+    claims: Option<Extension<JwtClaims>>,
+) -> Result<Json<Vec<RoleSummary>>, ApiError> {
+    require_scope(claims.as_deref(), "roles.read")?;
+    let store = state.roles.as_ref().ok_or(ApiError::NotConfigured)?;
+    Ok(Json(store.list_roles().await?))
+}
+
+/// `DELETE /auth/roles/{name}` — delete a role (admin only). Requires `roles.write` (or `*`).
+/// Idempotent: deleting an absent role is `404`, deleting a present one is `204`.
+#[cfg(feature = "pg")]
+async fn delete_role(
+    State(state): State<AuthState>,
+    claims: Option<Extension<JwtClaims>>,
+    Path(name): Path<String>,
+) -> Result<StatusCode, ApiError> {
+    require_scope(claims.as_deref(), "roles.write")?;
+    let store = state.roles.as_ref().ok_or(ApiError::NotConfigured)?;
+    match store.delete_role(&name).await? {
+        true => Ok(StatusCode::NO_CONTENT),
+        false => Err(ApiError::NotFound),
+    }
+}
+
+/// `POST /auth/users/{email}/roles` — set a user's assigned roles (admin only). Requires
+/// `users.write` (or `*`): assignment is a write to the user record. `404` for an unknown email.
+#[cfg(feature = "pg")]
+async fn assign_roles(
+    State(state): State<AuthState>,
+    claims: Option<Extension<JwtClaims>>,
+    Path(email): Path<String>,
+    Json(body): Json<AssignRolesRequest>,
+) -> Result<StatusCode, ApiError> {
+    require_scope(claims.as_deref(), "users.write")?;
+    let store = state.roles.as_ref().ok_or(ApiError::NotConfigured)?;
+    let now = (state.now)();
+    match store.assign_user_roles(&email, &body.roles, now).await? {
+        true => Ok(StatusCode::NO_CONTENT),
+        false => Err(ApiError::NotFound),
+    }
 }
 
 /// Gate an admin endpoint: the caller must carry verified claims whose scopes include `needed`
@@ -479,6 +610,12 @@ enum ApiError {
     /// The endpoint needs a backing store the deploy did not configure — `501` (`hq-web-extras.5`).
     #[cfg(feature = "pg")]
     NotConfigured,
+    /// A role's scope failed the closed-vocabulary check — `400` (hq-rbac.4).
+    #[cfg(feature = "pg")]
+    BadScope(String),
+    /// The addressed role/user does not exist — `404` (hq-rbac.4).
+    #[cfg(feature = "pg")]
+    NotFound,
 }
 
 impl From<RefreshError> for ApiError {
@@ -511,6 +648,10 @@ impl IntoResponse for ApiError {
             ApiError::NotConfigured => {
                 (StatusCode::NOT_IMPLEMENTED, "user administration is not configured").into_response()
             }
+            #[cfg(feature = "pg")]
+            ApiError::BadScope(msg) => (StatusCode::BAD_REQUEST, msg).into_response(),
+            #[cfg(feature = "pg")]
+            ApiError::NotFound => (StatusCode::NOT_FOUND, "not found").into_response(),
         }
     }
 }
@@ -549,6 +690,163 @@ mod tests {
         }
     }
 
+    /// In-memory [`RoleStore`] double recording upserts/deletes/assignments for the router tests.
+    #[derive(Default)]
+    struct MemRoles {
+        roles: std::sync::Mutex<Vec<RoleSummary>>,
+        assigned: std::sync::Mutex<Vec<(String, Vec<String>)>>,
+        /// Emails the store "knows"; an assignment to anything else returns `false` (→ 404).
+        known_users: Vec<String>,
+    }
+
+    #[async_trait]
+    impl RoleStore for MemRoles {
+        async fn upsert_role(&self, name: &str, scopes: &[String], now: u64) -> Result<(), AuthError> {
+            let mut roles = self.roles.lock().unwrap();
+            roles.retain(|r| r.name != name);
+            roles.push(RoleSummary { name: name.into(), scopes: scopes.to_vec(), created_at: now as i64 });
+            Ok(())
+        }
+        async fn list_roles(&self) -> Result<Vec<RoleSummary>, AuthError> {
+            Ok(self
+                .roles
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|r| RoleSummary { name: r.name.clone(), scopes: r.scopes.clone(), created_at: r.created_at })
+                .collect())
+        }
+        async fn delete_role(&self, name: &str) -> Result<bool, AuthError> {
+            let mut roles = self.roles.lock().unwrap();
+            let before = roles.len();
+            roles.retain(|r| r.name != name);
+            Ok(roles.len() != before)
+        }
+        async fn assign_user_roles(&self, email: &str, roles: &[String], _now: u64) -> Result<bool, AuthError> {
+            if !self.known_users.iter().any(|e| e == email) {
+                return Ok(false);
+            }
+            self.assigned.lock().unwrap().push((email.into(), roles.to_vec()));
+            Ok(true)
+        }
+    }
+
+    /// Build state whose role store is the given [`MemRoles`] double; everything else as [`state`].
+    fn state_with_roles(roles: Arc<MemRoles>) -> AuthState {
+        AuthState { roles: Some(roles), ..state() }
+    }
+
+    /// A request to `path` with `method`/`json` body and the caller's scopes injected as verified
+    /// claims (as the auth middleware would). `None` scopes ⇒ no claims (unauthenticated).
+    async fn admin_request(
+        app: &Router,
+        method: &str,
+        path: &str,
+        scopes: Option<&[&str]>,
+        json: Option<&str>,
+    ) -> StatusCode {
+        let mut builder = Request::builder().method(method).uri(path);
+        if json.is_some() {
+            builder = builder.header("content-type", "application/json");
+        }
+        let mut req = builder
+            .body(json.map(|j| Body::from(j.to_owned())).unwrap_or_else(Body::empty))
+            .unwrap();
+        if let Some(scopes) = scopes {
+            req.extensions_mut().insert(JwtClaims {
+                sub: "admin".into(),
+                workspace: "acme".into(),
+                scopes: scopes.iter().map(|s| s.to_string()).collect(),
+                exp: 2_000_000_000,
+                nbf: None,
+                iat: 0,
+            });
+        }
+        app.clone().oneshot(req).await.unwrap().status()
+    }
+
+    #[tokio::test]
+    async fn role_create_is_scope_gated_and_validates_the_vocabulary() {
+        let roles = Arc::new(MemRoles::default());
+        let app = auth_router(state_with_roles(roles.clone()));
+        let body = r#"{"name":"reviewer","scopes":["merge.read","merge.submit"]}"#;
+
+        // No claims → 401; wrong scope → 403; right scope → 201.
+        assert_eq!(admin_request(&app, "POST", "/auth/roles", None, Some(body)).await, StatusCode::UNAUTHORIZED);
+        assert_eq!(
+            admin_request(&app, "POST", "/auth/roles", Some(&["roles.read"]), Some(body)).await,
+            StatusCode::FORBIDDEN
+        );
+        assert_eq!(
+            admin_request(&app, "POST", "/auth/roles", Some(&["roles.write"]), Some(body)).await,
+            StatusCode::CREATED
+        );
+        assert_eq!(roles.roles.lock().unwrap().len(), 1);
+
+        // A scope outside the closed vocabulary is a 400, never persisted.
+        let bad = r#"{"name":"oops","scopes":["merge.frobnicate"]}"#;
+        assert_eq!(
+            admin_request(&app, "POST", "/auth/roles", Some(&["roles.write"]), Some(bad)).await,
+            StatusCode::BAD_REQUEST
+        );
+        assert_eq!(roles.roles.lock().unwrap().len(), 1, "bad scope did not persist");
+
+        // The `*` wildcard caller passes the gate too.
+        let body2 = r#"{"name":"reader","scopes":["issues.read"]}"#;
+        assert_eq!(
+            admin_request(&app, "POST", "/auth/roles", Some(&["*"]), Some(body2)).await,
+            StatusCode::CREATED
+        );
+    }
+
+    #[tokio::test]
+    async fn role_delete_is_404_when_absent_204_when_present() {
+        let roles = Arc::new(MemRoles::default());
+        roles.upsert_role("ghost-check", &[], 0).await.unwrap();
+        let app = auth_router(state_with_roles(roles.clone()));
+        assert_eq!(
+            admin_request(&app, "DELETE", "/auth/roles/ghost-check", Some(&["roles.write"]), None).await,
+            StatusCode::NO_CONTENT
+        );
+        assert_eq!(
+            admin_request(&app, "DELETE", "/auth/roles/ghost-check", Some(&["roles.write"]), None).await,
+            StatusCode::NOT_FOUND
+        );
+    }
+
+    #[tokio::test]
+    async fn assigning_roles_needs_users_write_and_404s_unknown_user() {
+        let roles = Arc::new(MemRoles { known_users: vec!["alice@acme.test".into()], ..Default::default() });
+        let app = auth_router(state_with_roles(roles.clone()));
+        let body = r#"{"roles":["reviewer"]}"#;
+
+        // Gated on users.write (assignment is a write to the user record).
+        assert_eq!(
+            admin_request(&app, "POST", "/auth/users/alice@acme.test/roles", Some(&["roles.write"]), Some(body)).await,
+            StatusCode::FORBIDDEN
+        );
+        assert_eq!(
+            admin_request(&app, "POST", "/auth/users/alice@acme.test/roles", Some(&["users.write"]), Some(body)).await,
+            StatusCode::NO_CONTENT
+        );
+        // Unknown user → 404.
+        assert_eq!(
+            admin_request(&app, "POST", "/auth/users/ghost@acme.test/roles", Some(&["users.write"]), Some(body)).await,
+            StatusCode::NOT_FOUND
+        );
+        assert_eq!(roles.assigned.lock().unwrap().as_slice(), &[("alice@acme.test".to_string(), vec!["reviewer".to_string()])]);
+    }
+
+    #[tokio::test]
+    async fn role_endpoints_501_when_no_store_configured() {
+        // Default state() has roles: None → the surface reports "not configured".
+        let app = auth_router(state());
+        assert_eq!(
+            admin_request(&app, "GET", "/auth/roles", Some(&["roles.read"]), None).await,
+            StatusCode::NOT_IMPLEMENTED
+        );
+    }
+
     fn state() -> AuthState {
         AuthState {
             login: Arc::new(OneUser),
@@ -560,6 +858,7 @@ mod tests {
             cookie_secure: true,
             cookie_same_site: SameSite::Lax,
             users: None,
+            roles: None,
             // Publish the public half of the same "k1" key the minter signs with.
             jwks: Arc::new(
                 JwtAuthenticator::from_kid_pems([("k1", PUB_PEM)]).unwrap().jwk_set(),
