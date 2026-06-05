@@ -1548,6 +1548,7 @@ dependencies = [
  "time",
  "tokio",
  "tower",
+ "tower-http",
  "ulid",
  "utoipa",
  "zip",
@@ -5808,6 +5809,7 @@ dependencies = [
  "tower",
  "tower-layer",
  "tower-service",
+ "tracing",
  "url",
 ]
 

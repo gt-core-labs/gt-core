@@ -498,6 +498,17 @@ async fn main() -> anyhow::Result<()> {
         None => app,
     };
 
+    // CORS (hq-web-extras.3): off by default — a same-origin proxy needs none. When
+    // GT_CORS_ALLOWED_ORIGINS lists origins, a credentialed CORS layer wraps the whole app so a
+    // cross-site browser can call /api/v1/* and open the /stream EventSource with cookies.
+    let app = match cors_layer() {
+        Some(cors) => {
+            eprintln!("[gt-mcp-server] CORS on (credentialed) for GT_CORS_ALLOWED_ORIGINS");
+            app.layer(cors)
+        }
+        None => app,
+    };
+
     let listener = tokio::net::TcpListener::bind(&bind).await?;
     eprintln!(
         "[gt-mcp-server] http transport on http://{}{MCP_PATH}",
@@ -819,6 +830,41 @@ fn cookie_same_site() -> SameSite {
         "none" => SameSite::None,
         _ => SameSite::Lax,
     }
+}
+
+/// Build the credentialed CORS layer (hq-web-extras.3) from `GT_CORS_ALLOWED_ORIGINS` — a
+/// comma-separated list of exact origins. Returns `None` when unset/empty so a same-origin
+/// proxy deploy carries no CORS. Credentialed CORS forbids `*`, so origins/methods/headers are
+/// all explicit lists.
+fn cors_layer() -> Option<tower_http::cors::CorsLayer> {
+    use axum::http::header::{ACCEPT, AUTHORIZATION, CONTENT_TYPE};
+    use axum::http::{HeaderValue, Method};
+    use tower_http::cors::{AllowOrigin, CorsLayer};
+
+    let raw = std::env::var("GT_CORS_ALLOWED_ORIGINS").ok()?;
+    let origins: Vec<HeaderValue> = raw
+        .split(',')
+        .map(str::trim)
+        .filter(|o| !o.is_empty())
+        .filter_map(|o| HeaderValue::from_str(o).ok())
+        .collect();
+    if origins.is_empty() {
+        return None;
+    }
+    Some(
+        CorsLayer::new()
+            .allow_origin(AllowOrigin::list(origins))
+            .allow_credentials(true)
+            .allow_methods([
+                Method::GET,
+                Method::POST,
+                Method::PUT,
+                Method::PATCH,
+                Method::DELETE,
+                Method::OPTIONS,
+            ])
+            .allow_headers([AUTHORIZATION, CONTENT_TYPE, ACCEPT]),
+    )
 }
 
 #[cfg(test)]
