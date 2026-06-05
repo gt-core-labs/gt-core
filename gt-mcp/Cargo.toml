@@ -1,0 +1,29 @@
+[package]
+name = "gt-mcp"
+description = "REST client and stdio↔HTTP MCP proxy for a gt-core gt-mcp-server: authenticate, list workspaces/rigs, and bridge a stdio MCP client to the remote /mcp transport."
+keywords = ["mcp", "rmcp", "proxy", "gt-core"]
+categories = ["api-bindings", "command-line-utilities"]
+readme = "README.md"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+authors.workspace = true
+# Published publicly under gt-core-labs; the CLI (`gt`) depends on this crate so the
+# MCP/server-comms logic stays isolated from the CLI/UX logic.
+repository = "https://github.com/gt-core-labs/gt-core"
+
+[dependencies]
+reqwest = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true }
+anyhow = { workspace = true }
+# MCP proxy: rmcp client to the remote streamable-HTTP server + a stdio server
+# transport exposed to the spawning agent.
+rmcp = { version = "1.7", features = [
+    "client",
+    "transport-streamable-http-client-reqwest",
+    "reqwest",
+    "transport-io",
+] }
+http = "1"

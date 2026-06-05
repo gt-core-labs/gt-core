@@ -58,6 +58,7 @@ members = [
     "crates/kernel/gt-rbac",
     "crates/kernel/gt-audit",
     "examples/mod-hello",
+    "gt-mcp",
 ]
 
 [workspace.package]
@@ -148,6 +149,9 @@ opentelemetry = "0.27"
 # MCP server transport (hq-core-host.3) — official rmcp SDK, streamable-HTTP.
 rmcp = { version = "1.7", features = ["server", "transport-streamable-http-server"] }
 anyhow = "1"
+
+# HTTP client for the gt-mcp crate (REST surface). rustls so no system OpenSSL.
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 
 # Internal crates — referenced as `<name> = { workspace = true }` from member Cargo.toml.
 # Path-centralized here so members never juggle relative paths across tiers.

@@ -81,6 +81,12 @@ Dependency direction: down only. Kernel never depends on domain. Domain never de
 
 The dashboard SvelteKit app — including module UI bundles (`ui/nav.ts`, `ui/routes.ts`, widgets) — ships in a separate repo. gt-core publishes contract JSON schemas under `crates/<tier>/<group>/<module>/contracts/v<N>.json`; the frontend codegens TS types from those.
 
+## gt-mcp client crate
+
+The server-comms client (REST + a stdio↔HTTP MCP proxy) ships as the standalone
+[`gt-mcp`](https://crates.io/crates/gt-mcp) crate (`cargo add gt-mcp`), consumed by the
+`gt` operator CLI ([gt-core-labs/gt](https://github.com/gt-core-labs/gt)).
+
 ## License
 
 Dual MIT + Apache-2.0.
