@@ -11,6 +11,7 @@
 //! the claim path is a compare-and-swap (`UPDATE ... WHERE status='open'`),
 //! aligned with Dolt's native grain.
 
+mod branch;
 mod commit;
 mod conn;
 mod error;
@@ -19,6 +20,7 @@ mod lock;
 mod pool;
 mod workspace;
 
+pub use branch::delete_branch;
 pub use commit::{commit, diff_summary, rollback};
 pub use conn::connect;
 pub use error::AppError;

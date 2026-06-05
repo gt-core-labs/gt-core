@@ -49,7 +49,9 @@ use gt_beads::InMemoryBeads;
 use gt_events::{AppError, Envelope};
 use gt_eventlog::{EventRecord, EventStore, JsonlWriter};
 use gt_merge::actor::MergeHandle;
-use gt_merge::{InMemoryMergeRepo, MergeBoard, MergeEvent, MergeState};
+use gt_merge::{
+    BranchReaper, InMemoryBranchReaper, InMemoryMergeRepo, MergeBoard, MergeEvent, MergeState,
+};
 use gt_module::RootBuilder;
 use gt_patrol::actor::PatrolHandle;
 use gt_patrol::{InMemoryPatrolRepo, PatrolEvent};
@@ -132,6 +134,81 @@ impl Plugin for MergePlugin {
             }
         }
         Ok(())
+    }
+}
+
+/// Observer that reaps a delivered branch when its bead merges — the branch-GC reactor arm
+/// (epic hq-branch-gc): `merge.merged.v1` → resolve the slot's branch from the merge board and
+/// [`BranchReaper::reap`] it. This is why delivered branches stop piling up in Dolt, and it
+/// keeps branch deletion **out** of the merge actor (which stays pure state) and **off** any
+/// cron — the delivery event is the trigger. Reaping is idempotent, so a replayed `Merged`
+/// (boot hydration re-emitting) drops nothing the second time.
+///
+/// The `Merged` event carries only `{ bead, sha }`, not the branch. Rather than widen the event
+/// schema (a replay-determinism change), the reactor reads the branch from the live board: the
+/// slot is still present in `Merged` state and still carries its `branch`.
+pub struct BranchGcPlugin<R: BranchReaper> {
+    merge: MergeHandle,
+    reaper: R,
+}
+
+impl<R: BranchReaper> BranchGcPlugin<R> {
+    /// Wire a merge handle (for bead → branch resolution) and a branch reaper as a cross-domain
+    /// observer.
+    pub fn new(merge: MergeHandle, reaper: R) -> Self {
+        Self { merge, reaper }
+    }
+}
+
+#[async_trait]
+impl<R: BranchReaper + 'static> Plugin for BranchGcPlugin<R> {
+    fn name(&self) -> &'static str {
+        "branch-gc"
+    }
+
+    async fn on_event(&self, record: &EventRecord) -> Result<(), AppError> {
+        if record.kind != "merge.merged.v1" {
+            return Ok(());
+        }
+        let MergeEvent::Merged { bead, .. } = record.decode::<MergeEvent>()? else {
+            return Ok(());
+        };
+        // Resolve the branch from the live board (the `Merged` event omits it). A slot may be
+        // absent if the board was never hydrated for this bead — nothing to reap, stay silent.
+        let branch = self
+            .merge
+            .snapshot()
+            .await
+            .into_iter()
+            .find(|s| s.bead == bead)
+            .map(|s| s.branch);
+        if let Some(branch) = branch {
+            self.reaper.reap(&branch).await?;
+        }
+        Ok(())
+    }
+}
+
+/// Production [`BranchReaper`]: drops the branch from the workspace's Dolt database via
+/// [`gt_store_dolt::delete_branch`]. Holds the per-workspace pool; constructed only when a Dolt
+/// server is wired (else [`InMemoryBranchReaper`] stands in, same as the merge repo). Maps the
+/// kernel store's `AppError` onto the domain `gt_events::AppError` at the boundary.
+pub struct DoltBranchReaper {
+    pool: mysql_async::Pool,
+}
+
+impl DoltBranchReaper {
+    /// Wrap a per-workspace Dolt pool (e.g. from `WorkspacePools::pool_for`).
+    pub fn new(pool: mysql_async::Pool) -> Self {
+        Self { pool }
+    }
+}
+
+impl BranchReaper for DoltBranchReaper {
+    async fn reap(&self, branch: &str) -> Result<bool, AppError> {
+        gt_store_dolt::delete_branch(&self.pool, branch)
+            .await
+            .map_err(|e| AppError::Other(e.to_string()))
     }
 }
 
@@ -297,7 +374,8 @@ pub async fn compose_workspace(ws: WorkspaceId) -> Composed {
     let registry = roles
         .plugin_registry()
         .register(SchedulerPlugin::new(sched.clone()))
-        .register(MergePlugin::new(merge.clone()));
+        .register(MergePlugin::new(merge.clone()))
+        .register(BranchGcPlugin::new(merge.clone(), InMemoryBranchReaper::new()));
     handle.spawn_plugins(Arc::new(registry));
 
     handle.start().await;
@@ -471,7 +549,8 @@ pub async fn live_root(
         }
         let registry = registry
             .register(SchedulerPlugin::new(sched))
-            .register(MergePlugin::new(merge))
+            .register(MergePlugin::new(merge.clone()))
+            .register(BranchGcPlugin::new(merge, InMemoryBranchReaper::new()))
             .register(ProbePlugin::new(probe));
         handle.spawn_plugins(Arc::new(registry));
         handle.start().await;
@@ -564,6 +643,7 @@ pub async fn daemon_root(ws: WorkspaceId, log_root: PathBuf) -> DaemonRoot {
         )
         .register(SchedulerPlugin::new(sched))
         .register(MergePlugin::new(merge.clone()))
+        .register(BranchGcPlugin::new(merge.clone(), InMemoryBranchReaper::new()))
         .register(SheriffPlugin::new())
         .register(SessionMinutesPlugin::new(ws_slug.clone()));
     handle.spawn_plugins(Arc::new(registry));

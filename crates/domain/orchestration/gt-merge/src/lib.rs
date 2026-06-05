@@ -12,6 +12,7 @@
 //! tras Merged, liberar capacidad) es trabajo del composition root vía eventos.
 
 pub mod actor;
+pub mod branch;
 pub mod commands;
 #[cfg(feature = "axum")]
 pub mod http;
@@ -21,6 +22,7 @@ mod events;
 mod repo;
 mod state;
 
+pub use branch::{BranchReaper, InMemoryBranchReaper};
 pub use commands::{CompleteMerge, FailMerge, MergeCommand, StartMerge, SubmitMerge};
 pub use events::{MergeEvent, MergeReadyPayload};
 pub use module::MergeModule;

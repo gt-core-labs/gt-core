@@ -106,6 +106,7 @@ gt-meta = { workspace = true, features = ["axum"] }
 gt-rbac = { workspace = true }
 gt-audit = { workspace = true }
 gt-store-dolt = { workspace = true }
+mysql_async = { workspace = true }
 rmcp = { workspace = true, features = ["server", "transport-streamable-http-server"] }
 axum = { workspace = true }
 tower-http = { workspace = true, features = ["cors"] }
@@ -139,11 +140,7 @@ tempfile = { workspace = true }
 # Drive the SSE feed router in-process (hq-mcp-test.7): `oneshot` a request and
 # poll the streaming body frames.
 tower = { version = "0.5", features = ["util"] }
-http-body-util = "0.1"
-# Per-run throwaway Dolt database creation for the resources contract test
-# (hq-mcp-test.3) — CREATE DATABASE before DoltIssues::connect.
-mysql_async = { workspace = true }
-# Build a real OOXML (docx) blob in-test so the documents.attach blob path exercises
+http-body-util = "0.1"# Build a real OOXML (docx) blob in-test so the documents.attach blob path exercises
 # genuine text extraction (hq-docs-test-api.2), no committed binary fixture.
 zip = { version = "2", default-features = false, features = ["deflate"] }
 # Build a real PDF blob for the full-stack e2e (hq-docs-test-e2e.2) — same lopdf the reader
