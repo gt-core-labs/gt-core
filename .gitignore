@@ -17,3 +17,5 @@ node_modules/
 graphify-out/
 .graphify_*
 CLAUDE.md
+.gt-config/
+.mcp.json
