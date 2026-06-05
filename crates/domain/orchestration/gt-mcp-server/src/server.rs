@@ -602,7 +602,10 @@ impl ServerHandler for IssuesServer {
                  notes) on every row. Pass ready=1 for the UNBOUNDED frontier — a \
                  bare array of only SOUND beads (docs/10 §S4): deps delivered, phase \
                  open, own non-planned surfaces exist, status=open — claim straight \
-                 from this list without re-checking the graph.",
+                 from this list without re-checking the graph. Pass format=tsv for a \
+                 dense tabular snapshot (header + one tab-separated row per bead, \
+                 cheap scalar columns only) instead of JSON — fewer tokens on a \
+                 list-heavy read; the JSON default still carries the full row shape.",
             ),
             mk(
                 "gt://issue/{id}",
@@ -632,21 +635,33 @@ impl ServerHandler for IssuesServer {
         context: RequestContext<RoleServer>,
     ) -> Result<ReadResourceResult, McpError> {
         let uri = request.uri.as_str();
+        // hq-mcp-output-format: pull the optional `format=json|tsv` selector off the
+        // querystring and run everything downstream against the cleaned URI, so the
+        // unknown key never reaches `parse_issue_filter` (which rejects it).
+        let (clean_uri, format) = split_format(uri).map_err(|e| Self::to_mcp_error(&e))?;
         // Resources are tenant data too: run the same JWT/leak gate as a tool call
         // (a token for ws A must not read ws B's resources), then resolve that
         // tenant's store so a read reflects the caller's workspace.
-        let workspace = match self.authenticate_claims(uri, &serde_json::json!({}), &context.extensions)? {
+        let workspace = match self.authenticate_claims(&clean_uri, &serde_json::json!({}), &context.extensions)? {
             Some(claims) => Some(claims.workspace),
             None => workspace_from_ext(&context.extensions).map(str::to_string),
         };
         let store = self
             .resolve_store(workspace.as_deref())
             .map_err(|e| Self::to_mcp_error(&e))?;
-        let value = self
-            .read_resource_json(&store, workspace.as_deref(), uri)
+        let payload = self
+            .read_resource_json(&store, workspace.as_deref(), &clean_uri, format)
             .await
             .map_err(|e| Self::to_mcp_error(&e))?;
-        let text = serde_json::to_string_pretty(&value).unwrap_or_else(|_| value.to_string());
+        // hq-mcp-output-format: compact JSON always (no pretty-print whitespace); a
+        // `format=tsv` snapshot arrives already rendered as a dense table.
+        let text = match payload {
+            ResourcePayload::Json(value) => {
+                serde_json::to_string(&value).unwrap_or_else(|_| value.to_string())
+            }
+            ResourcePayload::Text(text) => text,
+        };
+        // Echo the URI the client asked for (format selector intact) so it correlates.
         Ok(ReadResourceResult::new(vec![ResourceContents::text(
             text, uri,
         )]))
@@ -661,7 +676,8 @@ impl IssuesServer {
         store: &DoltIssues,
         workspace: Option<&str>,
         uri: &str,
-    ) -> Result<serde_json::Value, AppError> {
+        format: OutputFormat,
+    ) -> Result<ResourcePayload, AppError> {
         // gt://doc/{id} — one document by id (hq-docs-api.3). Only when a document reader is
         // wired; otherwise it falls through to the not-found at the end.
         if let Some(id) = uri.strip_prefix("gt://doc/") {
@@ -672,7 +688,7 @@ impl IssuesServer {
             }
             if let Some(docs) = &self.documents {
                 return match docs.get(workspace, id).await? {
-                    Some(doc) => Ok(doc),
+                    Some(doc) => Ok(ResourcePayload::Json(doc)),
                     None => Err(AppError::NotFound(format!("document {id}"))),
                 };
             }
@@ -700,14 +716,24 @@ impl IssuesServer {
                 let tree = crate::git_tree::surface_tree(repo_dir);
                 let rows =
                     gt_issues::resources::filter_ready(rows, open_phase, &deps, tree.as_ref());
+                // hq-mcp-output-format: the frontier is list-heavy too — honour tsv.
+                if format == OutputFormat::Tsv {
+                    return Ok(ResourcePayload::Text(gt_issues::resources::rows_to_tsv(&rows)));
+                }
                 return serde_json::to_value(&rows)
+                    .map(ResourcePayload::Json)
                     .map_err(|e| AppError::Other(format!("encode issues: {e}")));
             }
             // hq-core-mcp.13: the default snapshot is a less-style PAGE — rows plus
             // `total`/`next_offset`/`has_more` so no caller mistakes one page for
             // the whole corpus. `?limit=N&offset=M` positions it.
             let page = gt_issues::resources::read_issues_page(store, &filter).await?;
+            // hq-mcp-output-format: the dense tabular shape for the largest read.
+            if format == OutputFormat::Tsv {
+                return Ok(ResourcePayload::Text(gt_issues::resources::page_to_tsv(&page)));
+            }
             return serde_json::to_value(&page)
+                .map(ResourcePayload::Json)
                 .map_err(|e| AppError::Other(format!("encode issues: {e}")));
         }
 
@@ -728,7 +754,9 @@ impl IssuesServer {
                         let attached = docs.list_for_owner(workspace, id).await?;
                         obj.insert("documents".into(), serde_json::Value::Array(attached));
                     }
-                    Ok(value)
+                    // Detail carries nested heavy bodies — always structured JSON
+                    // (the bead's rule: tabular for lists, JSON when re-parsed).
+                    Ok(ResourcePayload::Json(value))
                 }
                 None => Err(AppError::NotFound(format!("issue {id}"))),
             };
@@ -736,6 +764,59 @@ impl IssuesServer {
 
         Err(AppError::NotFound(format!("resource {uri}")))
     }
+}
+
+/// Output selector parsed from a `gt://` URI's `format=` query param
+/// (hq-mcp-output-format). `Json` (default) is compact JSON; `Tsv` is the dense
+/// tabular shape, honoured only by the list-heavy `gt://issues` snapshot — detail
+/// and `?full=1` reads stay JSON because their nested bodies must round-trip as
+/// structured data.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum OutputFormat {
+    Json,
+    Tsv,
+}
+
+/// The resolved body of a resource read: a JSON value the caller serializes
+/// compactly, or an already-rendered text block (the `format=tsv` table).
+enum ResourcePayload {
+    Json(serde_json::Value),
+    Text(String),
+}
+
+/// Split an optional `format=json|tsv` selector out of a `gt://` URI's querystring,
+/// returning the URI with that pair removed (so `parse_issue_filter` never sees the
+/// unknown key) and the chosen [`OutputFormat`]. Absent ⇒ compact JSON. An
+/// unrecognised value is a `Validation` error rather than a silent fallback.
+fn split_format(uri: &str) -> Result<(String, OutputFormat), AppError> {
+    let (base, qs) = match uri.split_once('?') {
+        Some((b, q)) => (b, q),
+        None => return Ok((uri.to_string(), OutputFormat::Json)),
+    };
+    let mut format = OutputFormat::Json;
+    let mut kept: Vec<&str> = Vec::new();
+    for pair in qs.split('&').filter(|p| !p.is_empty()) {
+        match pair.split_once('=') {
+            Some(("format", value)) => {
+                format = match value {
+                    "json" => OutputFormat::Json,
+                    "tsv" => OutputFormat::Tsv,
+                    other => {
+                        return Err(AppError::Validation(format!(
+                            "unknown format `{other}` (expected json|tsv)"
+                        )))
+                    }
+                };
+            }
+            _ => kept.push(pair),
+        }
+    }
+    let cleaned = if kept.is_empty() {
+        base.to_string()
+    } else {
+        format!("{base}?{}", kept.join("&"))
+    };
+    Ok((cleaned, format))
 }
 
 /// Extract the `X-Actor` header from a request's extensions. rmcp injects the
@@ -871,7 +952,10 @@ fn sanitize_tool_name(name: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{actor_from_ext, call_span, cookie_token_from_ext, token_from_ext, IssuesServer};
+    use super::{
+        actor_from_ext, call_span, cookie_token_from_ext, split_format, token_from_ext,
+        IssuesServer, OutputFormat,
+    };
     use gt_audit::{AuditSink, InMemoryAudit, Outcome};
     use gt_auth::{InMemoryAuthenticator, JwtClaims};
     use gt_rbac::{RbacConfig, Scope, WORKSPACE_ADMIN, WORKSPACE_MEMBER};
@@ -879,6 +963,35 @@ mod tests {
     use rmcp::model::{ErrorCode, Extensions};
     use serde_json::json;
     use std::sync::Arc;
+
+    #[test]
+    fn split_format_defaults_to_json_and_leaves_uri_untouched() {
+        let (uri, fmt) = split_format("gt://issues?status=open").unwrap();
+        assert_eq!(uri, "gt://issues?status=open");
+        assert_eq!(fmt, OutputFormat::Json);
+        // No querystring at all.
+        let (uri, fmt) = split_format("gt://issue/a-1").unwrap();
+        assert_eq!(uri, "gt://issue/a-1");
+        assert_eq!(fmt, OutputFormat::Json);
+    }
+
+    #[test]
+    fn split_format_strips_the_selector_from_the_filter_querystring() {
+        // format= is pulled out so parse_issue_filter never sees the unknown key,
+        // and the surviving filter pairs keep their order + join.
+        let (uri, fmt) = split_format("gt://issues?status=open&format=tsv&priority_max=2").unwrap();
+        assert_eq!(uri, "gt://issues?status=open&priority_max=2");
+        assert_eq!(fmt, OutputFormat::Tsv);
+        // Sole param: the cleaned URI drops the now-empty querystring entirely.
+        let (uri, fmt) = split_format("gt://issues?format=tsv").unwrap();
+        assert_eq!(uri, "gt://issues");
+        assert_eq!(fmt, OutputFormat::Tsv);
+    }
+
+    #[test]
+    fn split_format_rejects_an_unknown_format_value() {
+        assert!(split_format("gt://issues?format=yaml").is_err());
+    }
 
     fn ext_with_header(name: &str, value: &str) -> Extensions {
         let parts = axum::http::Request::builder()
