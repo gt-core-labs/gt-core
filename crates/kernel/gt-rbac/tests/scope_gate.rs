@@ -124,3 +124,29 @@ fn workspace_claim_scopes_derive_admin_member_or_denied() {
     let other = Scope::from_workspace_claim("eve", &["some.unknown.scope".to_string()]);
     assert!(other.check("issues.create.validate").is_err());
 }
+
+#[test]
+fn granular_scopes_grant_their_namespace_for_rest_parity() {
+    // A token carrying granular REST scopes (the shape `users`/role assignment mints) is no
+    // longer denied wholesale on MCP: each `<resource>.<verb>` authorizes its `<resource>.*`
+    // tools, while ungranted namespaces stay closed (deny-by-default).
+    let scoped = Scope::from_workspace_claim(
+        "carol",
+        &["issues.write".to_string(), "rig.read".to_string()],
+    );
+    scoped.check("issues.create.execute").expect("issues granted → issues.* tools");
+    scoped.check("rig.add.execute").expect("rig granted → rig.* tools");
+    assert!(
+        scoped.check("merge.submit.execute").is_err(),
+        "a namespace with no granted scope stays denied"
+    );
+    assert!(
+        scoped.check("issuesx.create.execute").is_err(),
+        "`issues.*` must not leak into a sibling namespace by prefix"
+    );
+
+    // The granular grant must never widen `workspace`: `workspace.member` keeps the curated
+    // preset (no `workspace.create`), it is not namespace-expanded into `workspace.*`.
+    let member = Scope::from_workspace_claim("dan", &[WORKSPACE_MEMBER.to_string()]);
+    assert!(member.check("workspace.create.execute").is_err());
+}

@@ -93,19 +93,53 @@ impl Scope {
         }
     }
 
-    /// Resolve a [`Scope`] from a JWT claim's granted scope strings. A bare `"*"` grant or a
-    /// [`WORKSPACE_ADMIN`] role gets the admin grant (every tool, execute included — the same
-    /// reach `matches_pattern("*", _)` yields); [`WORKSPACE_MEMBER`] the member grant; anything
-    /// else folds to [`Scope::denied`] — deny by default, never admin. Admin wins when several
-    /// are present. The `"*"` form is what the seeded super-admin carries, so a `["*"]` token
-    /// authorizes MCP tools the same way it authorizes the REST surface.
+    /// Resolve a [`Scope`] from a JWT claim's granted scope strings — the MCP-side mirror of the
+    /// REST guard, so one token authorizes both surfaces the same way (hq-rbac.2, REST parity).
+    ///
+    /// Precedence, deny-by-default throughout:
+    ///
+    /// 1. A bare `"*"` grant or a [`WORKSPACE_ADMIN`] role → the admin grant (every tool, execute
+    ///    included — the reach `matches_pattern("*", _)` yields). Admin wins over anything else.
+    /// 2. Otherwise the grant is **assembled from the granular scopes**: each
+    ///    `<resource>.<verb>` scope the REST surface honours (`beads.write`, `issues.read`, …)
+    ///    folds into a `<resource>.*` MCP allow pattern, so a token scoped to `issues` on REST
+    ///    can call the `issues.*` tools on MCP instead of being denied wholesale. A
+    ///    [`WORKSPACE_MEMBER`] role additionally unions the curated member preset
+    ///    ([`workspace_member`](Self::workspace_member)).
+    /// 3. No recognised scope at all → [`Scope::denied`].
+    ///
+    /// Granularity note: the grant is **per-resource namespace**. MCP has no read/write tool
+    /// split (its `validate`/`execute` axis is dry-run vs commit, not read vs write), so a
+    /// granular `issues.read` and `issues.write` both authorize the whole `issues.*` namespace
+    /// here; the finer read/write gating stays a REST-surface refinement. `workspace.admin`/
+    /// `workspace.member` are role labels, never namespace-expanded (a `workspace.member` token
+    /// must not reach `workspace.create`). Unrecognised scope strings are ignored, exactly as the
+    /// REST [`CallerScopes`](../../gt-module/src/routes.rs) bridge drops un-parseable scopes.
     pub fn from_workspace_claim(actor: &str, scopes: &[String]) -> Self {
         if scopes.iter().any(|s| s == "*" || s == WORKSPACE_ADMIN) {
-            Self::workspace_admin(actor)
-        } else if scopes.iter().any(|s| s == WORKSPACE_MEMBER) {
-            Self::workspace_member(actor)
-        } else {
+            return Self::workspace_admin(actor);
+        }
+        let mut allow: BTreeSet<String> = BTreeSet::new();
+        for s in scopes {
+            if s == WORKSPACE_MEMBER {
+                allow.extend(Self::workspace_member(actor).allow);
+            } else if let Some((resource, verb)) = s.split_once('.') {
+                // A granular `<resource>.<verb>` REST scope grants the matching MCP namespace.
+                // `workspace.admin` is handled above; `workspace.member` above; any remaining
+                // `workspace.*` (e.g. `workspace.write`) maps to its namespace like the rest.
+                if crate::vocabulary::is_known_verb(verb) && !resource.is_empty() {
+                    allow.insert(format!("{resource}.*"));
+                }
+            }
+        }
+        if allow.is_empty() {
             Self::denied(actor)
+        } else {
+            Self {
+                actor: actor.to_string(),
+                allow,
+                validate_only: false,
+            }
         }
     }
 
