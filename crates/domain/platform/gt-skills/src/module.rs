@@ -36,6 +36,8 @@
 //! (`skills.enabled-for-role.v1`). Aligning the *emitted* strings to `.v1` is the cross-cutting
 //! job of `hq-mod-events.2`, intentionally out of scope for the wrap.
 
+#[cfg(feature = "axum")]
+use gt_module::McpRegistry;
 use gt_module::{Capability, EventKind, GtModule, ModuleId, ModuleMeta, Scope};
 use semver::Version;
 
@@ -50,6 +52,60 @@ impl SkillsModule {
     /// kinds and `skills.{read,write}` scopes. The literal is a known-valid slug.
     pub fn id() -> ModuleId {
         ModuleId::new("skills").expect("`skills` is a valid module id")
+    }
+
+    /// Build the HTTP-enabled skills module (`hq-web-extras.13`), baking `state` (the
+    /// per-workspace catalog provider) into the router its
+    /// [`register_routes`](GtModule::register_routes) returns. The binary calls this to opt the
+    /// module into its read-only REST surface; the MCP harvest path keeps the plain unit
+    /// [`SkillsModule`]. Returns a [`SkillsHttpModule`] rather than mutating `SkillsModule` so the
+    /// unit struct (and its existing call sites) is left untouched.
+    #[cfg(feature = "axum")]
+    pub fn with_http(state: crate::http::SkillsApiState) -> SkillsHttpModule {
+        SkillsHttpModule { http: state }
+    }
+}
+
+/// The HTTP-enabled skills module (`hq-web-extras.13`): the same `GtModule` contract as
+/// [`SkillsModule`] plus the read-only `skills.*` REST routes + OpenAPI spec.
+///
+/// Built by [`SkillsModule::with_http`]. Identity, capability, and MCP tools delegate verbatim to
+/// [`SkillsModule`] (one source of truth for the contract); only
+/// [`register_routes`](GtModule::register_routes) and [`openapi`](GtModule::openapi) are
+/// overridden, carrying the per-workspace [`WorkspaceSkills`](crate::http::WorkspaceSkills)
+/// provider the handlers read through.
+#[cfg(feature = "axum")]
+#[derive(Clone)]
+pub struct SkillsHttpModule {
+    /// The per-workspace REST state the routes read through.
+    http: crate::http::SkillsApiState,
+}
+
+#[cfg(feature = "axum")]
+impl GtModule for SkillsHttpModule {
+    fn meta(&self) -> ModuleMeta {
+        SkillsModule.meta()
+    }
+
+    fn capability(&self) -> Capability {
+        SkillsModule.capability()
+    }
+
+    fn register_mcp_tools(&self, registry: &mut McpRegistry) {
+        SkillsModule.register_mcp_tools(registry);
+    }
+
+    /// The read-only skills REST routes (`hq-web-extras.13`), relative — the builder nests them
+    /// under `/api/v1/skills` and applies the `skills.read` scope guard (every route is a GET).
+    fn register_routes(&self) -> axum::Router {
+        crate::http::skills_router(self.http.clone())
+    }
+
+    /// The OpenAPI spec for the skills REST routes, so the combined document documents exactly the
+    /// routes mounted under the HTTP-enabled module.
+    fn openapi(&self) -> Option<utoipa::openapi::OpenApi> {
+        use utoipa::OpenApi;
+        Some(crate::http::ApiDoc::openapi())
     }
 }
 

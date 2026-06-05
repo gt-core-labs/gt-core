@@ -16,6 +16,29 @@ serde.workspace = true
 schemars.workspace = true
 # `semver::Version` for the module's `ModuleMeta`.
 semver = { workspace = true }
+# Off-by-default `axum` REST adapter (hq-web-extras.13): the read-only `skills.read` surface
+# the FE consumes — `register_routes` maps `skills.*` reads to REST routes the builder mounts
+# at `/api/v1/skills` behind the auth+scope guard, with a utoipa OpenAPI spec. Folds into this
+# crate behind the `axum` feature (docs/03 Rule 4), exactly as gt-rig/gt-workspace gate theirs.
+# `gt-workspace` brings the `WorkspaceContext` extractor (the per-tenant catalog is resolved
+# from the auth context, never the path).
+axum = { workspace = true, optional = true }
+utoipa = { workspace = true, optional = true }
+async-trait = { workspace = true, optional = true }
+serde_json = { workspace = true, optional = true }
+gt-workspace = { workspace = true, optional = true, features = ["axum"] }
+
+[features]
+# Compile the axum REST adapter + OpenAPI spec (`http.rs`) and the route/spec overrides on
+# `SkillsModule`. Off by default — the MCP-only build pulls no HTTP stack; the composition bin
+# enables it to expose the REST surface.
+axum = ["dep:axum", "dep:utoipa", "dep:async-trait", "dep:serde_json", "dep:gt-workspace"]
 
 [dev-dependencies]
 serde_json.workspace = true
+# Exercise the REST router in-process (hq-web-extras.13): `oneshot` a request and read the
+# response without a live socket. Run with `--features axum` so the adapter + these helpers
+# compile for the contract test.
+axum = { workspace = true }
+tower = { workspace = true, features = ["util"] }
+async-trait = { workspace = true }

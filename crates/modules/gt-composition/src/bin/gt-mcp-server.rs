@@ -35,9 +35,10 @@ use rmcp::transport::{StreamableHttpServerConfig, StreamableHttpService};
 
 use gt_audit::{AuditSink, InMemoryAudit};
 use gt_composition::mcp::{
-    AgentHandler, AuditHandler, ConvoyHandler, DocumentsHandler, EventLog, EventLogMerges,
-    EventLogQuota, GraphHandler, MergeHandler, PgDocumentsResource, PgRigPrefixes,
-    PgWorkspaceStatus, QuotaHandler, RigHandler, WorkspaceHandler, WsPoolRigs, WsPools,
+    AgentHandler, AuditHandler, ConvoyHandler, DocumentsHandler, EventLog, EventLogFeed,
+    EventLogMerges, EventLogQuota, EventLogSkills, GraphHandler, MergeHandler, PgDocumentsResource,
+    PgRigPrefixes, PgWorkspaceStatus, QuotaHandler, RigHandler, WorkspaceHandler, WsPoolRigs,
+    WsPools,
 };
 use gt_docs_embed::Embedder;
 use gt_docs_extract::Extractor;
@@ -66,8 +67,10 @@ use gt_mcp_server::{
 };
 use gt_meta::{MetaApiState, MetaModule};
 use gt_module::RootBuilder;
+use gt_feed::{FeedApiState, FeedModule};
 use gt_quota::{QuotaApiState, QuotaModule};
 use gt_rig::{RigApiState, RigsModule};
+use gt_skills::{SkillsApiState, SkillsModule};
 use gt_workspace::{PgWorkspaces, WorkspaceApiState, WorkspaceModule};
 use gt_rbac::{RbacConfig, Scope};
 use gt_store_dolt::DoltIssues;
@@ -372,6 +375,16 @@ async fn main() -> anyhow::Result<()> {
         // board survives restart (the actor's in-memory projection does not).
         .module(MergeModule::with_http(MergeApiState::new(Arc::new(EventLogMerges::new(
             event_log.clone(),
+        )))))
+        // skills.read (hq-web-extras.13): read-only catalog the FE hydrates, replayed from the
+        // caller's `skills.*` event stream. Mounted at /api/v1/skills behind the skills.read guard.
+        .module(SkillsModule::with_http(SkillsApiState::new(Arc::new(EventLogSkills::new(
+            event_log.clone(),
+        )))))
+        // feed.read (hq-web-extras.14): read-only activity feed, folded from the caller's whole
+        // workspace log. Mounted at /api/v1/feed behind the feed.read guard.
+        .module(FeedModule::with_http(FeedApiState::new(Arc::new(EventLogFeed::new(
+            event_log.clone(),
         )))));
     if let Ok(pg_url) = std::env::var("GT_PG_URL") {
         let pool = sqlx::PgPool::connect(&pg_url)
@@ -393,11 +406,11 @@ async fn main() -> anyhow::Result<()> {
             build_embedder(),
         )));
         eprintln!(
-            "[gt-mcp-server] REST domain modules: meta + workspace + rig + documents + agent + quota + merge"
+            "[gt-mcp-server] REST domain modules: meta + workspace + rig + documents + agent + quota + merge + skills + feed"
         );
     } else {
         eprintln!(
-            "[gt-mcp-server] REST domain modules: meta + agent + quota + merge (GT_PG_URL unset → no workspace/rig/documents)"
+            "[gt-mcp-server] REST domain modules: meta + agent + quota + merge + skills + feed (GT_PG_URL unset → no workspace/rig/documents)"
         );
     }
     let rest_root = rest

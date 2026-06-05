@@ -18,6 +18,11 @@ pub mod activity;
 mod curator;
 mod dead;
 pub mod escalation;
+/// The off-by-default `axum` REST adapter (`hq-web-extras.14`): maps the `feed.read` projection to
+/// a REST route the composition builder mounts at `/api/v1/feed` behind the `feed.read` scope
+/// guard, with a utoipa OpenAPI spec. Compiled only under the `axum` feature.
+#[cfg(feature = "axum")]
+pub mod http;
 pub mod module;
 mod problems;
 mod state;
@@ -25,6 +30,10 @@ pub mod view;
 
 pub use activity::{activity_view, ActivityInfo, ActivityRow};
 pub use curator::Curator;
+#[cfg(feature = "axum")]
+pub use http::{feed_router, FeedApiState, FeedItem, FeedPage, WorkspaceFeed};
+#[cfg(feature = "axum")]
+pub use module::FeedHttpModule;
 pub use module::FeedModule;
 pub use dead::DeadEntry;
 pub use escalation::{intents as escalation_intents, EscalationIntent};

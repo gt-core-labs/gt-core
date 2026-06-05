@@ -34,6 +34,8 @@
 //!   logic, which this faithful wrap must not. The empty-router default stands until then —
 //!   the `feed.read` scope this module declares is what that guard already names.
 
+#[cfg(feature = "axum")]
+use gt_module::McpRegistry;
 use gt_module::{Capability, GtModule, ModuleId, ModuleMeta, Scope};
 use semver::Version;
 
@@ -49,6 +51,59 @@ impl FeedModule {
     /// known-valid slug.
     pub fn id() -> ModuleId {
         ModuleId::new("feed").expect("`feed` is a valid module id")
+    }
+
+    /// Build the HTTP-enabled feed module (`hq-web-extras.14`), baking `state` (the per-workspace
+    /// projection provider) into the router its [`register_routes`](GtModule::register_routes)
+    /// returns. The binary calls this to opt the module into its read-only REST surface; the MCP
+    /// harvest path keeps the plain unit [`FeedModule`]. Returns a [`FeedHttpModule`] rather than
+    /// mutating `FeedModule` so the unit struct (and its existing call sites) is left untouched.
+    #[cfg(feature = "axum")]
+    pub fn with_http(state: crate::http::FeedApiState) -> FeedHttpModule {
+        FeedHttpModule { http: state }
+    }
+}
+
+/// The HTTP-enabled feed module (`hq-web-extras.14`): the same `GtModule` contract as
+/// [`FeedModule`] plus the read-only `feed.read` REST route + OpenAPI spec.
+///
+/// Built by [`FeedModule::with_http`]. Identity, capability, and MCP tools delegate verbatim to
+/// [`FeedModule`] (one source of truth for the contract); only
+/// [`register_routes`](GtModule::register_routes) and [`openapi`](GtModule::openapi) are
+/// overridden, carrying the per-workspace [`WorkspaceFeed`](crate::http::WorkspaceFeed) provider
+/// the handler reads through.
+#[cfg(feature = "axum")]
+#[derive(Clone)]
+pub struct FeedHttpModule {
+    /// The per-workspace REST state the route reads through.
+    http: crate::http::FeedApiState,
+}
+
+#[cfg(feature = "axum")]
+impl GtModule for FeedHttpModule {
+    fn meta(&self) -> ModuleMeta {
+        FeedModule.meta()
+    }
+
+    fn capability(&self) -> Capability {
+        FeedModule.capability()
+    }
+
+    fn register_mcp_tools(&self, registry: &mut McpRegistry) {
+        FeedModule.register_mcp_tools(registry);
+    }
+
+    /// The read-only feed REST route (`hq-web-extras.14`), relative — the builder nests it under
+    /// `/api/v1/feed` and applies the `feed.read` scope guard (the single route is a GET).
+    fn register_routes(&self) -> axum::Router {
+        crate::http::feed_router(self.http.clone())
+    }
+
+    /// The OpenAPI spec for the feed REST route, so the combined document documents exactly the
+    /// route mounted under the HTTP-enabled module.
+    fn openapi(&self) -> Option<utoipa::openapi::OpenApi> {
+        use utoipa::OpenApi;
+        Some(crate::http::ApiDoc::openapi())
     }
 }
 

@@ -20,6 +20,29 @@ serde_json.workspace = true
 # RFC3339 timestamp parsing in the activity view (hq-mysw). Parsing is pure + clock-free, so
 # the curator/reducer stay deterministic; only the activity projection reads `now` (injected).
 time = { workspace = true, features = ["parsing"] }
+# Off-by-default `axum` REST adapter (hq-web-extras.14): the read-only `feed.read` surface the FE
+# consumes — `register_routes` maps the feed projection to a REST route the builder mounts at
+# `/api/v1/feed` behind the auth+scope guard, with a utoipa OpenAPI spec. Folds into this crate
+# behind the `axum` feature (docs/03 Rule 4), exactly as gt-rig/gt-workspace gate theirs.
+# `gt-workspace` brings the `WorkspaceContext` extractor (the per-tenant feed is resolved from
+# the auth context, never the path).
+axum = { workspace = true, optional = true }
+utoipa = { workspace = true, optional = true }
+async-trait = { workspace = true, optional = true }
+gt-workspace = { workspace = true, optional = true, features = ["axum"] }
+
+[features]
+# Compile the axum REST adapter + OpenAPI spec (`http.rs`) and the route/spec overrides on
+# `FeedModule`. Off by default — the MCP-only build pulls no HTTP stack; the composition bin
+# enables it to expose the REST surface.
+axum = ["dep:axum", "dep:utoipa", "dep:async-trait", "dep:gt-workspace"]
 
 [dev-dependencies]
 time.workspace = true
+# Exercise the REST router in-process (hq-web-extras.14): `oneshot` a request and read the
+# response without a live socket. Run with `--features axum` so the adapter + these helpers
+# compile for the contract test.
+axum = { workspace = true }
+tower = { workspace = true, features = ["util"] }
+async-trait = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }

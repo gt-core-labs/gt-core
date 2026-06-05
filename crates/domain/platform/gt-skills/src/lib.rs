@@ -23,10 +23,19 @@ pub mod commands;
 pub mod repo;
 
 mod events;
+/// The off-by-default `axum` REST adapter (`hq-web-extras.13`): maps `skills.*` reads to
+/// REST routes the composition builder mounts at `/api/v1/skills` behind the `skills.read`
+/// scope guard, with a utoipa OpenAPI spec. Compiled only under the `axum` feature.
+#[cfg(feature = "axum")]
+pub mod http;
 pub mod module;
 mod state;
 
 pub use actor::{spawn, spawn_hydrated, SkillHandle, SkillMsg};
+#[cfg(feature = "axum")]
+pub use http::{skills_router, SkillsApiState, WorkspaceSkills};
+#[cfg(feature = "axum")]
+pub use module::SkillsHttpModule;
 pub use module::SkillsModule;
 pub use commands::{
     DisableSkillForRole, EnableSkillForRole, RegisterSkill, RetireSkill, SkillCommand,

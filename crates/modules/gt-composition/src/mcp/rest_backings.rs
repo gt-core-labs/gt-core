@@ -25,12 +25,14 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use gt_events::AppError;
 
+use gt_feed::{FeedItem, FeedPage, WorkspaceFeed};
 use gt_merge::{
     DynMergeRepository, MergeBoard, MergeEvent, MergeRepository, MergeSlot, MergeSlotState,
     MergeState, WorkspaceMerges,
 };
 use gt_quota::{AccountRegistry, QuotaEvent, QuotaState, WorkspaceQuota};
 use gt_rig::{DynRigRepository, PgRigs, WorkspaceRigs};
+use gt_skills::{SkillCatalog, SkillState, WorkspaceSkills};
 
 use super::eventlog::EventLog;
 use super::pools::WsPools;
@@ -44,6 +46,15 @@ const QUOTA_NS: &str = "quota.";
 /// [`MergeHandler`](super::merge::MergeHandler)'s replay filter so the REST surface and the
 /// MCP handler fold the identical per-workspace stream.
 const MERGE_NS: &str = "merge.";
+
+/// The event-log kind prefix every skill event carries (`skills.*.v1`); the read-only REST
+/// surface replays exactly this stream into the catalog the dashboard hydrates from.
+const SKILLS_NS: &str = "skills.";
+
+/// Upper bound on how many records the feed REST surface scans per request. The feed paginates the
+/// *whole* tenant log (every namespace, not one prefix), so a generous cap bounds the read without
+/// truncating realistic workloads; `offset`/`limit` then window the matched set.
+const FEED_SCAN_LIMIT: usize = 100_000;
 
 /// Map the edge error ([`gt_store_dolt::AppError`]) onto the domain-core error
 /// ([`gt_events::AppError`]) the REST ports return. The two enums are variant-for-variant
@@ -209,6 +220,85 @@ impl MergeRepository for EventLogMergeRepo {
     fn list_slots(&self) -> impl Future<Output = Result<Vec<MergeSlot>, AppError>> + Send {
         let res = self.board().map(|b| b.snapshot());
         async move { res }
+    }
+}
+
+/// REST backing for the read-only `skills.read` surface (`gt_skills::WorkspaceSkills`,
+/// hq-web-extras.13): rehydrates the catalog from the caller's workspace `skills.*` event log —
+/// the same replay the skills domain folds, exposed read-only over HTTP.
+pub struct EventLogSkills {
+    log: Arc<EventLog>,
+}
+
+impl EventLogSkills {
+    /// Wrap the per-workspace event log (the binary's single shared instance).
+    pub fn new(log: Arc<EventLog>) -> Self {
+        Self { log }
+    }
+}
+
+#[async_trait]
+impl WorkspaceSkills for EventLogSkills {
+    async fn catalog(&self, workspace: &str) -> Result<SkillCatalog, AppError> {
+        let state = self
+            .log
+            .replay_domain(Some(workspace), SKILLS_NS, SkillState::default(), SkillState::apply)
+            .map_err(lift)?;
+        Ok(state.catalog)
+    }
+}
+
+/// REST backing for the read-only `feed.read` surface (`gt_feed::WorkspaceFeed`,
+/// hq-web-extras.14): paginates the caller's *whole* workspace log — the same per-workspace stream
+/// the SSE `/stream` and MCP feed read, exposed read-only + paginated over HTTP. The historical
+/// counterpart to the live push: `/stream` tails new events, this pages back through the log.
+pub struct EventLogFeed {
+    log: Arc<EventLog>,
+}
+
+impl EventLogFeed {
+    /// Wrap the per-workspace event log (the binary's single shared instance).
+    pub fn new(log: Arc<EventLog>) -> Self {
+        Self { log }
+    }
+}
+
+#[async_trait]
+impl WorkspaceFeed for EventLogFeed {
+    async fn page(
+        &self,
+        workspace: &str,
+        channel: Option<&str>,
+        offset: usize,
+        limit: usize,
+    ) -> Result<FeedPage, AppError> {
+        // `read_since` returns the channel-filtered records in chronological order (oldest→newest),
+        // newest-bounded by the scan cap. The feed surfaces newest-first, so reverse, then window
+        // by offset/limit. The channel namespace filter is `read_since`'s own (`merge` matches
+        // `merge.*`), so the REST surface and `/stream` partition the stream identically.
+        let mut records = self
+            .log
+            .read_since(Some(workspace), channel, None, FEED_SCAN_LIMIT)
+            .map_err(lift)?;
+        records.reverse(); // newest-first
+        let total = records.len();
+        let end = offset.saturating_add(limit).min(total);
+        let items: Vec<FeedItem> = if offset < total {
+            records[offset..end]
+                .iter()
+                .map(|r| FeedItem {
+                    event_id: r.event_id.clone(),
+                    kind: r.kind.clone(),
+                    correlation_id: r.correlation_id.clone(),
+                    causation_id: r.causation_id.clone(),
+                    ts: r.ts.clone(),
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
+        let has_more = end < total;
+        Ok(FeedPage { items, offset, limit, has_more, next_offset: has_more.then_some(end) })
     }
 }
 

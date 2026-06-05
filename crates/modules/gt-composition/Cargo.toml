@@ -29,6 +29,14 @@ gt-agent = { workspace = true, features = ["axum"] }
 # REST surface + the WorkspaceQuota port the composition EventLog provider backs
 # (hq-fe-api-mount.1).
 gt-quota = { workspace = true, features = ["axum"] }
+# Read-only skills.read REST surface (hq-web-extras.13): `axum` adds the surface + the
+# WorkspaceSkills port the composition EventLog provider backs (EventLogSkills replays the
+# tenant's `skills.*` stream into the catalog).
+gt-skills = { workspace = true, features = ["axum"] }
+# Read-only feed.read REST surface (hq-web-extras.14): `axum` adds the surface + the
+# WorkspaceFeed port the composition EventLog provider backs (EventLogFeed folds the tenant's
+# whole log into the FeedState projection).
+gt-feed = { workspace = true, features = ["axum"] }
 # Per-workspace consumed-token counter (hq-mt-deploy.8): bump
 # gt_workspace_quota_consumed on each quota.sample.
 gt-telemetry = { workspace = true }
