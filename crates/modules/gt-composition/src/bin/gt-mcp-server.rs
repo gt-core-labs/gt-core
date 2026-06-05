@@ -22,6 +22,7 @@
 //! - `GT_PG_AUDIT_URL` — durable Postgres audit sink; unset ⇒ in-memory.
 
 use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::Context;
 use axum::routing::get;
@@ -43,7 +44,10 @@ use gt_composition::auth::{authenticate, AuthState, SharedAuthenticator};
 use gt_composition::denial_audit::audit_denials;
 use gt_composition::scope_bridge::bridge_scopes;
 use gt_composition::stream::{feed_router, FeedState};
-use gt_auth::JwtAuthenticator;
+use gt_auth::{
+    auth_router, AuthState as LoginState, InMemoryRefreshStore, JwtAuthenticator, JwtMinter, PgUsers,
+};
+use gt_store_pg::WorkspacePool;
 // Domain REST modules + their `with_http` state (hq-fe-api-mount.1): the bin mounts each
 // crate's `register_routes` so the FE reaches every namespace over authenticated HTTP.
 use gt_agent::{AgentApiState, AgentModule};
@@ -375,6 +379,77 @@ async fn main() -> anyhow::Result<()> {
     let app = app.merge(openapi_router(openapi_json));
     eprintln!("[gt-mcp-server] fused OpenAPI on GET /openapi.json (public spec)");
 
+    // Public login surface (hq-web-extras.7): mount `/auth/*` UNGUARDED so login is reachable
+    // without a bearer. Gated on a verifier (for the JWKS), a minter (the RS256 signing key),
+    // and Postgres (the `users` store). The `authenticate` layer here only *injects* claims when
+    // a token IS present — it passes anonymous requests straight through (see `auth::authenticate`)
+    // — so `/auth/me` sees the caller while `/auth/login` stays open. Distinct from the
+    // `/api/v1/*` chain below, which additionally enforces RBAC scopes.
+    let access_ttl = env_u64("GT_AUTH_ACCESS_TTL_SECS", 900);
+    let refresh_ttl = env_u64("GT_AUTH_REFRESH_TTL_SECS", 2_592_000);
+    let app = match (
+        verifier.clone(),
+        JwtMinter::from_env().ok(),
+        std::env::var("GT_PG_URL").ok(),
+    ) {
+        (Some(verifier), Some(minter), Some(pg_url)) => {
+            // ws_default-scoped pool: `PgUsers` issues unqualified `users`, resolved by search_path.
+            let ws_pool = WorkspacePool::connect(&pg_url, "default")
+                .await
+                .context("auth: connect ws_default Postgres pool")?;
+            let pool = ws_pool.pool().clone();
+            // Apply the auth migrations (idempotent CREATE ... IF NOT EXISTS) so `users` +
+            // `refresh_tokens` exist before the first login. `raw_sql` uses the simple-query
+            // protocol, so each multi-statement migration file runs in one round-trip.
+            for sql in [
+                gt_auth::migrations::CREATE_USERS,
+                gt_auth::migrations::CREATE_REFRESH_TOKENS,
+            ] {
+                sqlx::raw_sql(sql)
+                    .execute(&pool)
+                    .await
+                    .context("auth: apply gt-auth migration")?;
+            }
+            seed_admin(&pool).await?;
+            let jwks = Arc::new(
+                JwtAuthenticator::from_env()
+                    .context("auth: build JWKS from the public verifier keys")?
+                    .jwk_set(),
+            );
+            let login_state = LoginState {
+                login: Arc::new(PgUsers::new(pool.clone(), "default")),
+                minter: Arc::new(minter),
+                // MVP refresh store (hq-web-extras.7): in-memory, so refresh tokens do not
+                // survive a restart. Durable PgRefreshStore is async-only and does not implement
+                // the sync `RefreshStore` trait — wiring it is the follow-up (hq-web-extras.2).
+                refresh: Arc::new(InMemoryRefreshStore::new()),
+                access_ttl,
+                refresh_ttl,
+                now: Arc::new(|| {
+                    SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
+                        .expect("system clock before the Unix epoch")
+                        .as_secs()
+                }),
+                jwks,
+            };
+            let auth_app = auth_router(login_state).layer(axum::middleware::from_fn_with_state(
+                AuthState::new(verifier, audit.clone()),
+                authenticate,
+            ));
+            eprintln!(
+                "[gt-mcp-server] login surface on /auth/* (public; access {access_ttl}s / refresh {refresh_ttl}s, in-memory refresh)"
+            );
+            app.merge(auth_app)
+        }
+        _ => {
+            eprintln!(
+                "[gt-mcp-server] login surface off (needs RS256 verifier + GT_JWT_RS256_PRIVATE_KEY_FILE + GT_PG_URL)"
+            );
+            app
+        }
+    };
+
     let module_routes = root.into_router().merge(rest_root.into_router());
     let app = match verifier {
         Some(verifier) => {
@@ -642,6 +717,55 @@ fn build_blob_store() -> (Option<Arc<BlobStore>>, String) {
             (None, bucket)
         }
     }
+}
+
+/// Ensure the default admin user exists in `ws_default.users` (hq-web-extras.4). Idempotent:
+/// `ON CONFLICT (email) DO NOTHING`, and the password is argon2-hashed at boot — never stored
+/// plain. Skipped (with a log line) unless BOTH `GT_ADMIN_EMAIL` and `GT_ADMIN_PASSWORD` are
+/// set, so no insecure default credential is ever baked into a deploy. Scopes are `["*"]`: the
+/// RBAC scope guard treats the wildcard as allow-all, so the seeded admin reaches every route.
+async fn seed_admin(pool: &sqlx::PgPool) -> anyhow::Result<()> {
+    let (email, password) = match (
+        std::env::var("GT_ADMIN_EMAIL"),
+        std::env::var("GT_ADMIN_PASSWORD"),
+    ) {
+        (Ok(e), Ok(p)) if !e.is_empty() && !p.is_empty() => (e, p),
+        _ => {
+            eprintln!(
+                "[gt-mcp-server] admin seed skipped (set GT_ADMIN_EMAIL + GT_ADMIN_PASSWORD)"
+            );
+            return Ok(());
+        }
+    };
+    let hash = gt_auth::password::hash_password(&password)
+        .map_err(|e| anyhow::anyhow!("hash admin password: {e}"))?;
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system clock before the Unix epoch")
+        .as_secs() as i64;
+    let scopes = vec!["*".to_string()];
+    sqlx::query(
+        "INSERT INTO users (id, email, password_hash, scopes, created_at, updated_at) \
+         VALUES ($1, $2, $3, $4, $5, $5) ON CONFLICT (email) DO NOTHING",
+    )
+    .bind("admin")
+    .bind(&email)
+    .bind(&hash)
+    .bind(&scopes)
+    .bind(now)
+    .execute(pool)
+    .await
+    .context("seed default admin user")?;
+    eprintln!("[gt-mcp-server] default admin ensured: {email}");
+    Ok(())
+}
+
+/// Parse a `u64` env var, falling back to `default` when it is unset or unparseable.
+fn env_u64(key: &str, default: u64) -> u64 {
+    std::env::var(key)
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(default)
 }
 
 #[cfg(test)]

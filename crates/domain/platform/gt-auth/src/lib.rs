@@ -109,6 +109,21 @@ pub use pg::PgUsers;
 #[cfg(feature = "pg")]
 pub use refresh_pg::PgRefreshStore;
 
+/// The embedded auth migration SQL — the per-workspace `users` (login store) and
+/// `refresh_tokens` tables, defined once in the `ws_default` template schema. The
+/// composition root applies these against the workspace-scoped Postgres pool at boot
+/// (the crate is not a `GtModule`, so the kernel migration runner does not carry them).
+/// Each file is `CREATE ... IF NOT EXISTS`, so re-applying is idempotent. Exposed under
+/// `pg` because only a Postgres-backed deploy needs them.
+#[cfg(feature = "pg")]
+pub mod migrations {
+    /// `0001` — the email+password login store (`ws_default.users`).
+    pub const CREATE_USERS: &str = include_str!("../migrations/auth/0001__create_users.sql");
+    /// `0002` — durable refresh-token records (`ws_default.refresh_tokens`).
+    pub const CREATE_REFRESH_TOKENS: &str =
+        include_str!("../migrations/auth/0002__create_refresh_tokens.sql");
+}
+
 #[cfg(feature = "jsonwebtoken")]
 pub use jwt::{Jwk, JwkSet, JwtAuthenticator};
 

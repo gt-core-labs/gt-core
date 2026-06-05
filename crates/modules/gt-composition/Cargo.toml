@@ -51,7 +51,7 @@ gt-workspace = { workspace = true, features = ["pg", "axum"] }
 # (hq-auth-context.3): verify a bearer token, inject the verified claim. The
 # `jsonwebtoken` feature pulls the concrete RS256 verifier (JwtAuthenticator::from_env)
 # the gt-mcp-server bin mounts in front of the REST surface (hq-auth-routes.2).
-gt-auth = { workspace = true, features = ["jsonwebtoken"] }
+gt-auth = { workspace = true, features = ["jsonwebtoken", "pg", "axum"] }
 # rig.* dispatch (hq-mcp-dispatch.3): PgRigs over a per-workspace schema pool. `axum`
 # adds the REST surface + the WorkspaceRigs port the composition WsPools provider backs
 # (hq-fe-api-mount.1).
