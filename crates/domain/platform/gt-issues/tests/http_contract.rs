@@ -20,7 +20,8 @@ use std::sync::Arc;
 use tower::ServiceExt; // oneshot
 
 use gt_issues::http::{issues_router, IssuesApiState};
-use gt_store_dolt::DoltIssues;
+use gt_issues::resources::{filter_ready, read_issues};
+use gt_store_dolt::{DoltIssues, IssueFilter};
 
 /// Create a throwaway DB `db` + an empty `issues` table (full schema via `ensure_schema` on the
 /// returned repo). Each test passes its own `db` so the parallel seeds never share a table.
@@ -284,4 +285,67 @@ async fn multi_tenant_routes_each_request_to_its_own_workspace_store() {
     // A direct read under B for that id is a 404, not a cross-tenant leak.
     let (status, _) = send(&app, req_ws("GET", "/only-in-a", ws_b, None)).await;
     assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+/// `GET /?ready=1` returns the SAME sound set as the MCP `gt://issues?ready=1`
+/// resource (`hq-platform-hardening.4`). Both gather the candidate rows then narrow
+/// with the SAME `filter_ready` over the same phase frontier + delivered index + the
+/// surface tree (accept-all here, no repo wired). The REST result must be a bare
+/// array of only the ready ids — no pager envelope — equalling `filter_ready` applied
+/// in-process, which is exactly what the resource serves.
+#[tokio::test]
+async fn ready_filter_matches_the_mcp_resource_sound_set() {
+    let Ok(base) = std::env::var("GT_DOLT_URL") else {
+        eprintln!("GT_DOLT_URL unset — skipping http contract");
+        return;
+    };
+    let base = base.trim_end_matches('/').to_string();
+    let db = "gt_http_ready";
+    fresh_db(&base, db).await.expect("db");
+    let repo = Arc::new(DoltIssues::connect(&format!("{base}/{db}")).expect("connect"));
+    repo.ensure_schema().await.expect("schema");
+    let app = issues_router(IssuesApiState::new(repo.clone(), "test-actor"));
+
+    // A mixed set: two OPEN epics (sound — no deps, accept-all surface, phase open),
+    // plus one that gets claimed -> working (NOT sound: not open).
+    for id in ["hq-ready-a", "hq-ready-b", "hq-claimed"] {
+        let (s, _) = send(
+            &app,
+            post_json("/", json!({ "id": id, "title": "r", "issue_type": "epic", "created_by": "test", "domain": ["platform.rig"] })),
+        )
+        .await;
+        assert_eq!(s, StatusCode::CREATED);
+    }
+    send(&app, post_json("/hq-claimed/claim", json!({}))).await;
+
+    // REST `?ready=1`: a bare array (no `total`/`rows` envelope) of only the sound beads.
+    let (status, ready) = send(&app, get("/?ready=1")).await;
+    assert_eq!(status, StatusCode::OK, "{ready}");
+    let rest_ids: Vec<String> = ready
+        .as_array()
+        .expect("?ready=1 is a bare array, not a page")
+        .iter()
+        .map(|r| r["id"].as_str().unwrap().to_string())
+        .collect();
+
+    // Compute the same set the MCP resource would: read the candidate rows, then narrow
+    // with the identical `filter_ready` over the gathered inputs + an accept-all tree.
+    let filter = IssueFilter { ready: true, ..Default::default() };
+    let rows = read_issues(&repo, &filter).await.expect("rows");
+    let open_phase = repo.open_phase().await.expect("phase");
+    let deps = repo.dep_index().await.expect("deps");
+    let want: Vec<String> = filter_ready(rows, open_phase, &deps, &gt_issues::AllowAllTree)
+        .into_iter()
+        .map(|r| r.id)
+        .collect();
+
+    let mut rest_sorted = rest_ids.clone();
+    rest_sorted.sort();
+    let mut want_sorted = want.clone();
+    want_sorted.sort();
+    assert_eq!(rest_sorted, want_sorted, "REST ?ready=1 == MCP resource sound set");
+    // The claimed (working) bead is excluded; the two open epics are present.
+    assert!(!rest_ids.iter().any(|i| i == "hq-claimed"), "working bead is not ready");
+    assert!(rest_ids.iter().any(|i| i == "hq-ready-a"));
+    assert!(rest_ids.iter().any(|i| i == "hq-ready-b"));
 }

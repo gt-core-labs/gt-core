@@ -76,6 +76,20 @@ pub trait SurfaceTree {
     fn contains(&self, path: &str) -> bool;
 }
 
+/// Per-request factory for the [`SurfaceTree`] (S3 + readiness §S4) on the REST
+/// path (`hq-platform-hardening.4/.5`). The MCP path rebuilds the `main` tree per
+/// create/update/ready call so a freshly-merged path is visible without a server
+/// restart (the bin's `git_tree::surface_tree`); the REST path mirrors that by
+/// holding this provider instead of a single cached tree. The git-backed
+/// implementation lives in the composition bin (orchestration tier, where shelling
+/// out is allowed); the domain crate depends only on this port.
+pub trait SurfaceProvider: Send + Sync {
+    /// Snapshot the surface tree for one request. The no-repo default yields the
+    /// permissive [`AllowAllTree`], degrading S3/readiness to accept-all exactly as
+    /// the MCP path does when `GT_REPO_DIR` is unset.
+    fn surface_tree(&self) -> Box<dyn SurfaceTree + Send + Sync>;
+}
+
 /// A permissive [`SurfaceTree`] that accepts every path. Used when no repo is
 /// wired (the live container has no gt-core checkout) so surface validation
 /// degrades to today's behaviour instead of rejecting every write, and as the
@@ -85,6 +99,17 @@ pub struct AllowAllTree;
 impl SurfaceTree for AllowAllTree {
     fn contains(&self, _path: &str) -> bool {
         true
+    }
+}
+
+/// The default [`SurfaceProvider`]: every request gets an [`AllowAllTree`], so a
+/// REST surface with no repo provider wired behaves exactly as before (accept-all
+/// S3, readiness surface-clause always passes — the §S3 degradation).
+pub struct AllowAllProvider;
+
+impl SurfaceProvider for AllowAllProvider {
+    fn surface_tree(&self) -> Box<dyn SurfaceTree + Send + Sync> {
+        Box::new(AllowAllTree)
     }
 }
 

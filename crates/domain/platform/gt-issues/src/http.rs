@@ -17,14 +17,18 @@
 //! - **It never reads a workspace from the path or body** (docs/04 §15, docs/03 Rule 6). The
 //!   issue id is a plain resource identifier; the tenant a request belongs to is the auth
 //!   context's concern, resolved upstream, never a route parameter.
-//! - **It skips the git-backed S2/S3 checks.** Surface existence (S3) and delivered-commit
-//!   verification (S2) shell out to `git`, which the domain tier may not do — those adapters
-//!   live in the orchestration `gt-mcp-server`. The REST path therefore validates against the
-//!   permissive [`AllowAllTree`] and passes no [`CommitInspector`](crate::CommitInspector),
-//!   exactly the degraded mode the MCP path runs in when `GT_REPO_DIR` is unset. Every other
-//!   domain rule — shape validation, NN-16 taxonomy, optimistic concurrency, the status state
-//!   machine, and the "code surface ⇒ commit_sha required" close rule — still runs, because it
-//!   lives in the shared handlers.
+//! - **It skips the git-backed S2/S3 checks on writes.** Surface existence (S3) and
+//!   delivered-commit verification (S2) shell out to `git`, which the domain tier may not do —
+//!   those adapters live in the orchestration `gt-mcp-server`. Create/update/close therefore
+//!   validate against the permissive [`AllowAllTree`] and pass no
+//!   [`CommitInspector`](crate::CommitInspector), exactly the degraded mode the MCP path runs in
+//!   when `GT_REPO_DIR` is unset. Every other domain rule — shape validation, NN-16 taxonomy,
+//!   optimistic concurrency, the status state machine, and the "code surface ⇒ commit_sha
+//!   required" close rule — still runs, because it lives in the shared handlers.
+//! - **The `?ready` frontier resolves the same sound set as the MCP resource** (`hq-platform-hardening.4`).
+//!   `GET /?ready=1` mirrors `gt://issues?ready=1`: it narrows the candidates with the phase
+//!   frontier + delivered index + the injected [`SurfaceProvider`](crate::SurfaceProvider)'s
+//!   surface tree (accept-all here, the §S3 degradation) via the shared `filter_ready`.
 
 use std::sync::Arc;
 
@@ -37,7 +41,7 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 
 use gt_store_dolt::{
-    AppError, ClaimOutcome, DoltIssues, IssueDetail, IssueFilter, IssuePage, WorkspacePools,
+    AppError, ClaimOutcome, DoltIssues, IssueDetail, IssueFilter, WorkspacePools,
 };
 use gt_workspace::WorkspaceContext;
 
@@ -46,9 +50,9 @@ use crate::events::{emit_issue_event, IssueEventSink, IssueVerb};
 use crate::handlers::{
     run_claim_issue, run_close_issue, run_create_issue, run_transition_issue, run_update_issue,
 };
-use crate::resources::{read_issue, read_issues, read_issues_page};
+use crate::resources::{filter_ready, read_issue, read_issues, read_issues_page};
 use crate::stats::{aggregate, GroupDim, StatsResponse};
-use crate::surface::AllowAllTree;
+use crate::surface::{AllowAllProvider, AllowAllTree, SurfaceProvider};
 
 /// Everything the issues REST handlers need, baked into the router with
 /// [`Router::with_state`] before it leaves [`issues_router`] so the merged application router
@@ -76,6 +80,11 @@ pub struct IssuesApiState {
     /// keyed to the request's workspace. `None` keeps the REST surface emit-free (no feed), so a
     /// build that wires no event log behaves exactly as before.
     event_sink: Option<Arc<dyn IssueEventSink>>,
+    /// Surface-tree factory backing the `?ready` frontier (S4, `hq-platform-hardening.4`). The
+    /// composition bin wires a git-backed provider from `GT_REPO_DIR`; the default is the
+    /// permissive [`AllowAllProvider`], so without a repo the readiness surface clause degrades to
+    /// accept-all exactly as the MCP path does when `GT_REPO_DIR` is unset.
+    surfaces: Arc<dyn SurfaceProvider>,
 }
 
 impl IssuesApiState {
@@ -88,6 +97,7 @@ impl IssuesApiState {
             workspaces: None,
             actor: actor.into(),
             event_sink: None,
+            surfaces: Arc::new(AllowAllProvider),
         }
     }
 
@@ -176,12 +186,18 @@ struct ListQuery {
     /// Inline the heavy text bodies on every row (`?full=true`).
     #[serde(default)]
     full: bool,
+    /// `?ready=1` — the UNBOUNDED frontier of SOUND beads (docs/10 §S4), the REST mirror of the
+    /// MCP `gt://issues?ready=1` resource (`hq-platform-hardening.4`). When set, [`list_issues`]
+    /// returns a bare array of only the ready rows instead of the paged snapshot. Accepts the
+    /// usual truthy forms (`1`/`true`); unset/`0`/`false` ⇒ the normal page.
+    #[serde(default, deserialize_with = "de_bool_flag")]
+    ready: bool,
 }
 
 impl ListQuery {
-    /// Map the parsed querystring onto the store's [`IssueFilter`]. `?ready=` is intentionally
-    /// not exposed on REST yet: readiness needs the phase frontier + delivered index + git tree
-    /// the domain tier does not hold, so it stays an MCP-resource concern.
+    /// Map the parsed querystring onto the store's [`IssueFilter`], carrying the `?ready` frontier
+    /// flag (`hq-platform-hardening.4`) through to the store list so the candidate rows the
+    /// readiness predicate narrows match the MCP resource's input exactly.
     fn into_filter(self) -> IssueFilter {
         IssueFilter {
             status: self
@@ -200,9 +216,21 @@ impl ListQuery {
             limit: self.limit,
             offset: self.offset,
             full: self.full,
-            ready: false,
+            ready: self.ready,
         }
     }
+}
+
+/// Deserialize a querystring boolean flag, accepting the truthy forms a `?ready=1` / `?full=true`
+/// caller sends (`1`, `true`, `yes`, `on`, case-insensitively); everything else (incl. an absent
+/// or empty value) is `false`. A bare `?ready` with no value is the empty string ⇒ `false`, so
+/// callers pass `?ready=1` exactly as the MCP resource expects.
+fn de_bool_flag<'de, D>(de: D) -> Result<bool, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let raw = String::deserialize(de)?;
+    Ok(matches!(raw.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"))
 }
 
 /// `GET /` — a paged snapshot of the tracker (`gt://issues`). Reuses
@@ -219,17 +247,34 @@ impl ListQuery {
         ("limit" = Option<u32>, Query, description = "Page size"),
         ("offset" = Option<u32>, Query, description = "Zero-based row offset"),
         ("full" = Option<bool>, Query, description = "Inline heavy text bodies"),
+        ("ready" = Option<bool>, Query, description = "?ready=1 ⇒ a bare array of only SOUND beads (the unbounded frontier), not a page"),
     ),
-    responses((status = 200, description = "A page of issues")),
+    responses((status = 200, description = "A page of issues, or a bare array of ready beads when ?ready=1")),
 ))]
 async fn list_issues(
     State(st): State<IssuesApiState>,
     ctx: WorkspaceContext,
     Query(q): Query<ListQuery>,
-) -> Result<Json<IssuePage>, ApiError> {
+) -> Result<Response, ApiError> {
     let store = st.resolve(&ctx).await?;
-    let page = read_issues_page(&store, &q.into_filter()).await?;
-    Ok(Json(page))
+    let filter = q.into_filter();
+    // `?ready=1` — the UNBOUNDED SOUND frontier (docs/10 §S4), parity with the MCP
+    // `gt://issues?ready=1` resource (`hq-platform-hardening.4`). Same gather-then-narrow the
+    // server's `read_resource_json` does: pull the candidate rows, then narrow with the phase
+    // frontier + the whole-table delivered index + the `main` git tree (the injected
+    // `SurfaceProvider`, git-backed when a repo is wired, accept-all otherwise). Runs against the
+    // per-request tenant store (`st.resolve`) so a multi-tenant frontier is per-ws (F1/F2). Returns
+    // a bare array — no pager envelope — exactly like the resource.
+    if filter.ready {
+        let rows = read_issues(&store, &filter).await?;
+        let open_phase = store.open_phase().await?;
+        let deps = store.dep_index().await?;
+        let tree = st.surfaces.surface_tree();
+        let ready = filter_ready(rows, open_phase, &deps, tree.as_ref());
+        return Ok(Json(ready).into_response());
+    }
+    let page = read_issues_page(&store, &filter).await?;
+    Ok(Json(page).into_response())
 }
 
 /// Querystring for `GET /stats` (`hq-web-extras.12`). `group_by` is the required, comma-separated

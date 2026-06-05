@@ -87,5 +87,5 @@ pub use policy::{
 };
 pub use readiness::is_ready;
 pub use stats::{MeStatsResponse, WorkspaceStats};
-pub use surface::{AllowAllTree, SurfaceEntry, SurfaceTree};
+pub use surface::{AllowAllProvider, AllowAllTree, SurfaceEntry, SurfaceProvider, SurfaceTree};
 pub use taxonomy::Domain;
