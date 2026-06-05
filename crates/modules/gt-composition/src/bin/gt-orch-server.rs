@@ -1,6 +1,6 @@
 //! `gt-orch-server` — the gt-core autonomous orchestration daemon (`hq-orchd.1`).
 //!
-//! The long-lived daemon entrypoint replacing gastown `bins/gt`. It boots the single
+//! The long-lived daemon entrypoint replacing the upstream `bins/gt`. It boots the single
 //! Tokio runtime (the domain crates never create one — `tokio::spawn` is forbidden in
 //! the kernel; the bin owns the runtime, docs/03), resolves the **durable hydrated**
 //! [`live_root`] for the configured workspace, and stays alive running the reactor

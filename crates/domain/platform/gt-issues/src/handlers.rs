@@ -1,6 +1,6 @@
 //! Transport-free handlers for the `issues.*` tools (hq-core-host.2).
 //!
-//! Ported from gastown `gt-mcp` `service.rs` `run_*_issue`, with the rmcp
+//! Ported from the upstream `gt-mcp` `service.rs` `run_*_issue`, with the rmcp
 //! transport concerns (scope check, audit row, `CallToolResult`/`McpError`
 //! wrapping) stripped — those belong to the server bin (`hq-core-host.3`). What
 //! remains is the scope-and-audit-free core: `validate()` (always), then the

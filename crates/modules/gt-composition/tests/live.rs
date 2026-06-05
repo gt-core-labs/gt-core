@@ -137,7 +137,7 @@ fn boot_hydration_replays_pending_queue_and_merge_board() {
 /// `hq-orchd.2`: a `live_root` with a `log_root` persists every hub record to the workspace's
 /// durable event log. Both the injected trigger and the scheduler's reaction must land on disk,
 /// so a restart can rebuild the in-memory projections by replaying the log (boot hydration,
-/// `hq-orchd.5`). This is the durability the gastown-model "Dolt-backed repos" bead asked for,
+/// `hq-orchd.5`). This is the durability the upstream-model "Dolt-backed repos" bead asked for,
 /// realized over gt-core's event-sourced substrate.
 #[tokio::test]
 async fn live_root_persists_hub_records_to_the_durable_log() {

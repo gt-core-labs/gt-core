@@ -2,9 +2,9 @@
 
 Foundational module system + multi-tenant primitives for Gas Town and downstream apps.
 
-**Role:** library workspace. Kernel-tier plumbing + cross-app domain primitives. App-specific domain logic (rigs/beads/sessions/merge/quota/convoy/crew/feed) stays in [gastown](../gastown) until ported per [docs/01-migration-plan.md](docs/01-migration-plan.md). Frontend lives in a separate repo.
+**Role:** library workspace. Kernel-tier plumbing + cross-app domain primitives. App-specific domain logic (rigs/beads/sessions/merge/quota/convoy/crew/feed) lives in the upstream app repo until ported per [docs/01-migration-plan.md](docs/01-migration-plan.md). Frontend lives in a separate repo.
 
-**Status:** Primary working repo as of 2026-05-31. New `hq-mod-*` / `hq-mt-*` beads code-land here. Tracking remains in gastown's Dolt `hq.issues` (via gt-mcp) until a dedicated tracking surface ships.
+**Status:** Primary working repo as of 2026-05-31. New `hq-mod-*` / `hq-mt-*` beads code-land here. Tracking remains in the upstream Dolt `hq.issues` (via gt-mcp) until a dedicated tracking surface ships.
 
 ## Layered layout
 
@@ -52,7 +52,7 @@ domain     ← Gas Town semantics: workspaces, dogs, polecats, roles
    │
 kernel     ← pure plumbing: GtModule, registries, hooks, events
    │
-gastown-kernel (still in gastown until P4): gt-events, gt-bus, gt-audit, gt-plugin, gt-telemetry
+upstream kernel (ported up by P4): gt-events, gt-bus, gt-audit, gt-plugin, gt-telemetry
 ```
 
 Dependency direction: down only. Kernel never depends on domain. Domain never depends on modules.
@@ -67,11 +67,11 @@ Dependency direction: down only. Kernel never depends on domain. Domain never de
 ## Workflow for agents
 
 1. Read [AGENTS.md](AGENTS.md) for claim/branch/commit conventions.
-2. Tracking: gastown `hq.issues` via gt-mcp.
+2. Tracking: upstream `hq.issues` via gt-mcp.
 3. Code: here. Branch off `main`, PR, ff-merge.
-4. Gastown consumes gt-core via `[workspace.dependencies]` path patches (see Phase 2 in migration plan).
+4. The upstream app consumes gt-core via `[workspace.dependencies]` path patches (see Phase 2 in migration plan).
 
-## What stays in gastown
+## What stays upstream
 
 - Domain crates listed above (until P3/P4 ports them).
 - Bins: `gt`, `gt-web`, `gt-mcp`.

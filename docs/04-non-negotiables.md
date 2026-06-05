@@ -1,4 +1,4 @@
-# Non-negotiables (ported from gastown)
+# Non-negotiables (ported from the upstream app)
 
 Hard invariants. Every rule here has a battle scar behind it — they exist because past violations broke replay, leaked tenants, or fragmented the kernel. **Breaking one of these is a stop-the-line event**, not a tradeoff.
 
@@ -204,7 +204,7 @@ Found a gap that no bead covers? `meta.report_gap` mints `hq-gap-<slug>-<ts>`. P
 
 ## 14. Single tokio Runtime, lives in the app entrypoint
 
-**One `tokio::Runtime`, created in the binary** — the app's entrypoint crate's `main` (its `[[bin]]`; for gt-core's consumers that is gastown). Domain crates never create a runtime; they receive handles.
+**One `tokio::Runtime`, created in the binary** — the app's entrypoint crate's `main` (its `[[bin]]`; for gt-core's consumers that is the upstream app). Domain crates never create a runtime; they receive handles.
 
 - A domain test runs under `#[tokio::test]` in isolation.
 - Multiple runtimes deadlock under shared `mpsc` channels — a class of bug that disappears when the rule is followed.
@@ -222,7 +222,7 @@ Found a gap that no bead covers? `meta.report_gap` mints `hq-gap-<slug>-<ts>`. P
 - The shared `public` schema holds **only** cross-tenant catalogs — chiefly the `workspaces` table itself. Any table that must live in `public` (e.g. `flag_overrides`) carries a `workspace_id` column with FK to `workspaces.id` so even shared-schema rows stay tenant-anchored.
 - SSE/WS channels keyed `(workspace_id, kind)` — cross-tenant leak is the bug class this prevents.
 
-This is a gt-core extension of the gastown principles to the multi-tenant target.
+This is a gt-core extension of the upstream principles to the multi-tenant target.
 
 **Provenance:** new — derived from rules 1, 6 applied to `hq-mt`. See [03-architecture-guardrails.md §6](03-architecture-guardrails.md). The schema-per-workspace clause supersedes the original "every projection table has a `workspace_id` column" wording, which mandated a shared-table model incompatible with the ratified `hq-mt-data` design (`schema_for` + `WorkspacePool`, commit `0e74b84`; `gt_create_workspace_schema`, `4ebb298`). Resolution of gap `hq-gap-spec-conflict-hq-mt-data-partitioning-model`, 2026-05-31.
 

@@ -1,11 +1,11 @@
 //! `gt-meta` — the cross-cutting `meta.*` MCP tools as a [`GtModule`]
 //! (hq-core-host.7).
 //!
-//! Restores the meta surface that retired with the gastown gt-mcp:
+//! Restores the meta surface that retired with the upstream gt-mcp:
 //! - `meta.help.execute` — the server's `tools/list` payload (single-call
 //!   discovery).
 //! - `meta.report-gap.execute` — mint a `hq-gap-<slug>-<ts>` bead so a missing
-//!   operation enters the routine catalog (the gastown `meta.report_gap`,
+//!   operation enters the routine catalog (the upstream `meta.report_gap`,
 //!   renamed to kebab for the kernel's three-segment tool-name rule).
 //!
 //! Descriptor-only seam: this crate declares the tools + the [`ReportGap`] arg

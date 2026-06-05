@@ -5,8 +5,8 @@ version.workspace = true
 
 # CONSUMIDOR PURO del log de eventos. Solo depende del kernel (gt-eventlog / gt-events).
 # No conoce dominios — opera sobre EventRecord type-erased (kind + payload JSON).
-# `gt-eventlog` is gastown's event-replay store ported up (hq-core-port.8); it owns the
-# `EventRecord` type the feed folds. (In gastown this crate was `gt-audit`.)
+# `gt-eventlog` is the upstream event-replay store ported up (hq-core-port.8); it owns the
+# `EventRecord` type the feed folds. (Upstream this crate was `gt-audit`.)
 [dependencies]
 gt-eventlog = { workspace = true }
 gt-events = { workspace = true }

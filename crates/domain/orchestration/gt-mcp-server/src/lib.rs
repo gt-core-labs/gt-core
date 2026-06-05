@@ -1,7 +1,7 @@
 //! `gt-mcp-server` — the gt-core MCP server library (hq-core-host.3).
 //!
 //! The transport pillar of the MVP that hosts the issues tracker inside gt-core
-//! and retired the gastown `gt-mcp` bin. This crate is the orchestration-tier
+//! and retired the upstream `gt-mcp` bin. This crate is the orchestration-tier
 //! **library**: the rmcp [`ServerHandler`](server::IssuesServer), the issues +
 //! meta tool dispatch, the per-connection scope/audit boundary, the per-request
 //! workspace resolver, and the [`DomainRouter`](domain::DomainRouter) seam that

@@ -41,7 +41,7 @@ axum = ["dep:axum", "dep:utoipa", "dep:async-trait", "dep:serde_json", "dep:gt-w
 keyring = { version = "3", default-features = false, features = ["linux-native"] }
 
 [dev-dependencies]
-# The event-log store (replay test harness), ported from gastown's gt-audit (port.8).
+# The event-log store (replay test harness), ported from the upstream gt-audit (port.8).
 gt-eventlog = { workspace = true }
 serde_json.workspace = true
 # Exercise the REST router in-process (hq-fe-api-orch.4): `oneshot` a request and read the

@@ -5,7 +5,7 @@
 //! on `main` that **names the bead-id** (`git log --grep`) AND **touches a
 //! non-`planned` surface path** — the same intersection `close` phase-2 (.10)
 //! verifies inline. The most recent such commit wins. A bead with no qualifying
-//! commit (the gastown-era closed beads that delivered nothing *here*) is left
+//! commit (the upstream-era closed beads that delivered nothing *here*) is left
 //! NULL — correct, not a fallback to the note.
 //!
 //! This module is the pure picker: the IO layer (main) gathers the candidate

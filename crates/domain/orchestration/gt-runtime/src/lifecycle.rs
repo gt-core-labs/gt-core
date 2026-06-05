@@ -9,7 +9,7 @@
 //!
 //! This is that seam (`hq-mt-routing.2`). It is deliberately **actor-agnostic**:
 //! the concrete actor crates (`gt-mayor`, `gt-sheriff`, …) migrate up from
-//! gastown in Phase 4, so today the supervisor manages *zero* tasks and every
+//! upstream in Phase 4, so today the supervisor manages *zero* tasks and every
 //! transition is a trivially-correct no-op. A future module registers its actor
 //! with [`Supervisor::spawn_actor`] before [`start`](Supervisor::start); the
 //! lifecycle contract below is what that actor must honour, and it is fully

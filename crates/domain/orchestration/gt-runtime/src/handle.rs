@@ -46,7 +46,7 @@ const DEFAULT_EVENT_BUFFER: usize = 1024;
 /// (later) the SSE endpoint — each take their own [`broadcast::Receiver`] via
 /// [`subscribe_events`](Self::subscribe_events). [`spawn_plugins`](Self::spawn_plugins) wires a
 /// [`PluginRegistry`] onto that stream: this is the seam role observers (sheriff/witness/deacon/
-/// mayor/refinery) register on, replacing gastown's monolithic `Reactor` match — gt-core's
+/// mayor/refinery) register on, replacing the upstream monolithic `Reactor` match — gt-core's
 /// modular one-namespace-per-module design has no single event enum to match on, so reaction is
 /// pure observer fan-out keyed on [`EventRecord::kind`].
 pub struct RootHandle {

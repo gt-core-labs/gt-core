@@ -2,7 +2,7 @@
 
 ## Why
 
-Three forces pushed the foundation out of `gastown`:
+Three forces pushed the foundation out of the upstream app:
 
 1. **Module system** ([epic hq-mod](../../gastown/apps/api/docs)): add/remove features without touching the rest. Kanban, pages, cycles, intake — each a separate crate, plugged via one line in `RootBuilder`.
 2. **Multi-tenancy** ([epic hq-mt](../../gastown/apps/api/docs)): workspace = full tenant boundary. Per-ws data, compute, RBAC, deploy.
@@ -12,7 +12,7 @@ Three forces pushed the foundation out of `gastown`:
 
 ```
                        ┌───────────────────────────────────────┐
-                       │  apps:  gastown, future-app-X, …      │
+                       │  apps:  upstream, future-app-X, …     │
                        │  - domain crates (rigs, beads, …)     │
                        │  - bins (gt-web, gt-mcp, gt CLI)      │
                        │  - frontend                            │
@@ -32,7 +32,7 @@ Three forces pushed the foundation out of `gastown`:
                        └─────────────────┬─────────────────────┘
                                          │ wraps / re-exports
                        ┌─────────────────▼─────────────────────┐
-                       │  gastown kernel (today)               │
+                       │  upstream kernel (today)              │
                        │  - gt-events, gt-bus, gt-audit,       │
                        │    gt-plugin, gt-telemetry            │
                        │  (migrates upward after refactor train│
@@ -43,7 +43,7 @@ Three forces pushed the foundation out of `gastown`:
 ## Boundaries
 
 - **gt-core MUST NOT** depend on domain crates (rigs, beads, merge, …).
-- **gt-core MAY** depend on gastown kernel crates (gt-events, etc.) until they migrate up.
+- **gt-core MAY** depend on upstream kernel crates (gt-events, etc.) until they migrate up.
 - **apps MUST** consume gt-core via Cargo path patch or git dep (no monkey-patching internals).
 - **MCP / HTTP contracts** are gt-core's responsibility; apps register tools/routes via the builder, don't hand-wire.
 

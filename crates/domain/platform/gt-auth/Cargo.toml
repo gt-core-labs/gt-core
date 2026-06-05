@@ -6,7 +6,7 @@ version.workspace = true
 # hq-mod-refactor.17 — auth identity port for gt-core (first concrete carve-out of the
 # hq-mod-refactor.13 bins decomposition).
 #
-# gastown's `bins/gt-web` carries the JWT/auth layer (auth.rs/jwt.rs/login.rs/scope.rs);
+# the upstream `bins/gt-web` carries the JWT/auth layer (auth.rs/jwt.rs/login.rs/scope.rs);
 # gt-core's `gt-workspace::WorkspaceContext` extractor already resolves the tenant boundary
 # from the `X-GT-Workspace` header but documents a deferred JWT fallback ("the JWT/auth layer
 # is not yet ported to gt-core"). This crate is that missing primitive: the authentication

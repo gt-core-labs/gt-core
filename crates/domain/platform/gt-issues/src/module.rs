@@ -16,7 +16,7 @@
 //!   bus traversal), so the module emits no event kinds.
 //! - **MCP tools** ([`GtModule::register_mcp_tools`]) — the ten
 //!   `issues.{create,update,transition,close,claim}.{validate,execute}` tools, names
-//!   + descriptions verbatim from the gastown `gt-mcp` service, each carrying the
+//!   + descriptions verbatim from the upstream `gt-mcp` service, each carrying the
 //!   JSON input schema generated from its arg struct.
 //!
 //! - **HTTP routes + OpenAPI** ([`GtModule::register_routes`] / [`GtModule::openapi`]) — under

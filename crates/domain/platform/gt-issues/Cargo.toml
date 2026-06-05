@@ -8,7 +8,7 @@ version.workspace = true
 # Wraps the lifted Dolt issues store (`gt-store-dolt`, hq-core-host.1) behind the
 # kernel module seam: `IssuesModule` contributes the `issues.*` MCP tools and the
 # read resources, and the tool-arg structs + transport-free handlers ported from
-# gastown `gt-mcp` live here. No rmcp transport — that is the server bin (.3);
+# the upstream `gt-mcp` live here. No rmcp transport — that is the server bin (.3);
 # this crate only contributes to the `McpRegistry`.
 [dependencies]
 gt-module = { workspace = true }

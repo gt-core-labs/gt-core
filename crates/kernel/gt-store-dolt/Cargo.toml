@@ -3,8 +3,8 @@ name = "gt-store-dolt"
 edition.workspace = true
 version.workspace = true
 
-# Dolt issues-store adapter, lifted from gastown (hq-core-host.1). Issues slice
-# only — no gastown domain deps. Local AppError replaces gt-events.
+# Dolt issues-store adapter, lifted from the upstream app (hq-core-host.1). Issues slice
+# only — no upstream domain deps. Local AppError replaces gt-events.
 [dependencies]
 mysql_async = { workspace = true }
 serde = { workspace = true, features = ["derive"] }

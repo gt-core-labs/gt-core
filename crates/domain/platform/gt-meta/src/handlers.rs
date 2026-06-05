@@ -3,7 +3,7 @@
 //! The gap-minting core of `meta.report-gap` lives here, decoupled from any wire
 //! shape, so the REST adapter ([`crate::http`]) dispatches to the **same** logic
 //! the MCP path runs — the bead's "one source of truth, only the wire differs"
-//! rule. It mirrors the gastown `meta.report_gap`: a reported gap is minted as a
+//! rule. It mirrors the upstream `meta.report_gap`: a reported gap is minted as a
 //! `hq-gap-<slug>-<ts>` bead, parented under the gaps catalog sub-epic so it is
 //! NN-16-sound on mint instead of orphaned, with the graph columns seeded so
 //! `?ready=true` filtering and the reconciler's edge derivation pick it up without

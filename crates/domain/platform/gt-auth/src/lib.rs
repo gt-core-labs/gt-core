@@ -6,9 +6,9 @@
 //! resolves a request's [workspace] from the `X-GT-Workspace` header today, but its module
 //! docs spell out a deferred second source: *"the `X-GT-Workspace` header and a JWT claim.
 //! Only the header path is implemented — the JWT/auth layer is not yet ported to gt-core (it
-//! lives in gastown)."* This crate ports that missing layer up as a **Port + InMemory**
+//! lives upstream)."* This crate ports that missing layer up as a **Port + InMemory**
 //! adapter, the first concrete carve-out of the `hq-mod-refactor.13` bins decomposition
-//! (gastown `bins/gt-web/{auth,jwt,login,scope}.rs`).
+//! (upstream `bins/gt-web/{auth,jwt,login,scope}.rs`).
 //!
 //! ## Shape (hexagonal — docs/03)
 //!

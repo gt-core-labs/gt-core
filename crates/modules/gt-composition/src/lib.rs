@@ -5,7 +5,7 @@
 //! This crate is the **app composition entry, not a `GtModule`**. gt-core has no single
 //! `GtEvent` enum to match on (one event-kind namespace per module), so a cross-domain reaction
 //! is just another `gt_plugin::Plugin` on the per-workspace event hub, like the role observers
-//! (`gt_roles::DeaconPlugin` / `WitnessPlugin`). The two orchestration arms the gastown
+//! (`gt_roles::DeaconPlugin` / `WitnessPlugin`). The two orchestration arms the upstream
 //! `Reactor::react` expressed and that need no edge effects:
 //!
 //! - [`SchedulerPlugin`] — `patrol.lease-expired.v1` → re-enqueue; `merge.merged.v1` → free a slot.
@@ -191,7 +191,7 @@ fn minutes_between(start_ts: &str, end_ts: &str) -> Option<u64> {
 /// blocked this counter; deriving it from the two record timestamps unblocks it without touching
 /// the event vocabulary. Sessions still open at restart lose their start (in-memory map), so only
 /// sessions that both open and close within one daemon run are counted — acceptable for a live
-/// operational metric (matches gastown's in-memory session tracking).
+/// operational metric (matches the upstream in-memory session tracking).
 pub struct SessionMinutesPlugin {
     workspace: String,
     /// session id → its `agent.spawned.v1` record `ts`, pending a close.

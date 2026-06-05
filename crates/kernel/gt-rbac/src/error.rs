@@ -1,6 +1,6 @@
 use thiserror::Error;
 
-/// Local error for the RBAC scope check. Lifted from gastown `gt_events::AppError`
+/// Local error for the RBAC scope check. Lifted from the upstream `gt_events::AppError`
 /// (hq-core-host.4) so the scope/auth pillar no longer depends on the unmigrated
 /// `gt-events` crate — same behaviour-preserving move gt-store-dolt made in
 /// hq-core-host.1. Only the variants this crate actually raises are kept;

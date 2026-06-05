@@ -3,7 +3,7 @@
 //! The server's `call_tool` routes a `<module>.<action>.<verb>` name here; this
 //! module deserializes the arguments into the `gt-issues` command structs and
 //! drives the transport-free `run_*_issue` handlers, then shapes the success
-//! payload the way the gastown service did (so clients see the same responses,
+//! payload the way the upstream service did (so clients see the same responses,
 //! including this session's DX: `{ ok, parsed }` on update.validate, post-bump
 //! `version` on update/claim.execute, the `closed @ <sha>` note on close).
 
@@ -307,7 +307,7 @@ fn slugify(s: &str) -> String {
 }
 
 /// Parse the optional `gt://issues?...` querystring into an [`IssueFilter`].
-/// Ported from the gastown service: unknown keys are rejected so a typo surfaces
+/// Ported from the upstream service: unknown keys are rejected so a typo surfaces
 /// instead of silently returning the unfiltered set. `full=1|true|yes` inlines
 /// the heavy bodies (the DX shipped in hq-gap-issues-list-full).
 pub fn parse_issue_filter(qs: &str) -> Result<IssueFilter, AppError> {

@@ -3,7 +3,7 @@ name = "gt-rbac"
 edition.workspace = true
 version.workspace = true
 
-# Unified RBAC config + frontier scope check, lifted from gastown
+# Unified RBAC config + frontier scope check, lifted from the upstream app
 # (hq-core-host.4). One TOML/JSON file is the source of truth for both the
 # per-actor MCP tool allow-list (`Scope::check`) and the per-role gt-web scopes
 # (`WebGrant`). Local `AppError` replaces the unmigrated gt-events crate, same

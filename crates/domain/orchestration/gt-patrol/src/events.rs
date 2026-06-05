@@ -39,7 +39,7 @@ pub enum PatrolEvent {
 impl EventKind for PatrolEvent {
     fn kind(&self) -> &'static str {
         match self {
-            // Versioned kebab leaf kinds on port-up (gt-core convention; gastown emitted the
+            // Versioned kebab leaf kinds on port-up (gt-core convention; the upstream app emitted the
             // unversioned `patrol.lease_registered` etc., same .v1 backfill events.2 applied to
             // rig/quota/merge — safe here since gt-core has no patrol replay log yet).
             PatrolEvent::LeaseRegistered { .. } => "patrol.lease-registered.v1",

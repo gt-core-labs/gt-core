@@ -1,6 +1,6 @@
 //! Authorization scope — the `<resource>.<verb>` capability label.
 //!
-//! Ported from gastown's per-route RBAC convention (`gt-web/src/scope.rs`,
+//! Ported from the upstream per-route RBAC convention (`gt-web/src/scope.rs`,
 //! `gt-mcp/src/auth.rs`), where a scope is a `&'static str` such as
 //! `beads.write` or `sessions.read`. gt-core owns the type so a module can
 //! *declare* the scopes it enforces in its [`Capability`](crate::Capability),

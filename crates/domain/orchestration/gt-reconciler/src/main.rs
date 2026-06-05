@@ -64,7 +64,7 @@ async fn main() -> anyhow::Result<()> {
         .collect();
 
     // The gt-core workspace = the repo that contains this crate; the rest are port
-    // sources (gastown).
+    // sources (the upstream repo).
     let core_repo = repos
         .iter()
         .find(|r| {

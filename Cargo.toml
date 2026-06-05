@@ -202,11 +202,11 @@ gt-docs-embed    = { path = "crates/kernel/gt-docs-embed" }
 gt-rbac          = { path = "crates/kernel/gt-rbac" }
 gt-audit         = { path = "crates/kernel/gt-audit" }
 
-# Reused from gastown until P4 (foundation kernel crates):
-# gt-bus, gt-plugin, gt-telemetry remain in gastown. gt-events PORTED UP
+# Reused from the upstream app until P4 (foundation kernel crates):
+# gt-bus, gt-plugin, gt-telemetry remain upstream. gt-events PORTED UP
 # (hq-core-port.10, 2026-06-02) now the freeze gate refactor.10..12 closed
 # replay-green. NOTE: gt-core's gt-audit here is the MCP dispatch audit SINK
-# (hq-core-host.4), a different concept from gastown's event-replay gt-audit
+# (hq-core-host.4), a different concept from the upstream event-replay gt-audit
 # (EventStore) that migrates up in P4 — a name collision to resolve then
 # (cf. gt-workspace → gt-townroot).
 

@@ -1,6 +1,6 @@
 //! Tool-argument structs for the `issues.*` MCP tools (hq-core-host.2).
 //!
-//! Ported verbatim-in-behaviour from gastown `gt-mcp` `service.rs`. Each struct
+//! Ported verbatim-in-behaviour from the upstream `gt-mcp` `service.rs`. Each struct
 //! is the wire shape an MCP client sends; `validate()` is the shape-only guard
 //! the `validate` tool runs and the `execute` tool runs before touching Dolt.
 //! The `to_new`/`to_patch` mappers translate the wire shape onto the store's
@@ -9,7 +9,7 @@
 //! ## Two faithful-port notes
 //!
 //! 1. **`domain`/`surface`/`depends_on` are `Vec<String>`, not the closed-set
-//!    `Domain`/`Role` enums.** The gastown service typed `domain` as
+//!    `Domain`/`Role` enums.** The upstream service typed `domain` as
 //!    `Vec<taxonomy::Domain>` and ran a `role.allows(domain)` check; that closed
 //!    set is a separate, larger port (not in this bead's scope). The store
 //!    already persists these columns as raw JSON-array strings
@@ -17,7 +17,7 @@
 //!    — only the compile-time enum narrowing is deferred.
 //! 2. **NN-16 is enforced here**, reusing the already-ported
 //!    [`gt_module_mcp::taxonomy::validate`] (the bead-taxonomy guard), so a
-//!    malformed `external_ref`/id is rejected at the same boundary gastown
+//!    malformed `external_ref`/id is rejected at the same boundary the upstream app
 //!    rejected it.
 
 use std::collections::HashSet;
@@ -172,7 +172,7 @@ impl CreateIssue {
 
         // NN-16: every non-epic bead carries external_ref = its sub-epic and an
         // id of `<external_ref>.<n>`. Epics are exempt. Reuses the already-ported
-        // gt-module-mcp guard so the rule matches gastown's frontier exactly.
+        // gt-module-mcp guard so the rule matches the upstream frontier exactly.
         taxonomy_validate(&BeadTaxonomy {
             id: &self.id,
             issue_type: &self.issue_type,

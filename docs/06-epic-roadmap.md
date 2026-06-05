@@ -2,7 +2,7 @@
 
 Canonical, **semantically reordered** view of the two live epic trees and the
 dependency edges between their sub-epics. Source of truth for *status* and
-*surface* stays in gastown `hq.issues` (via gt-mcp); this file is the
+*surface* stays in the upstream `hq.issues` (via gt-mcp); this file is the
 human-readable map of **how the sub-epics layer and in what order they unlock**.
 
 It exists because the epic-level `depends_on` stored in `hq.issues` was an
@@ -19,7 +19,7 @@ papered over.
 > Convention (NN-16, doc 04): `epic → sub-epic (external_ref) → bead`. The two
 > top epics are **`hq-mod`** (foundation) and **`hq-mt`** (built on top). Every
 > sub-epic below carries `external_ref = hq-mod | hq-mt`; ordering between
-> sub-epics is `depends_on`. Closed legacy gastown epics (the `Paso N` /
+> sub-epics is `depends_on`. Closed legacy upstream epics (the `Paso N` /
 > `v1 operational` / `mcp-*` families) are all `closed` and intentionally
 > omitted — they are superseded by the gt-core migration, not part of this map.
 

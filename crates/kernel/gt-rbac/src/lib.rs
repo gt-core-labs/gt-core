@@ -1,4 +1,4 @@
-//! `gt-rbac` — unified RBAC config + frontier scope check, lifted from gastown
+//! `gt-rbac` — unified RBAC config + frontier scope check, lifted from the upstream app
 //! `gt-rbac` + `gt-mcp::auth` (hq-core-host.4).
 //!
 //! One TOML/JSON file ([`RbacConfig`]) is the source of truth for two consumers:

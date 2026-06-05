@@ -5,7 +5,7 @@ version.workspace = true
 
 [dependencies]
 gt-events = { workspace = true }
-# The event-log store, ported from gastown's gt-audit (hq-core-port.8).
+# The event-log store, ported from the upstream gt-audit (hq-core-port.8).
 gt-eventlog = { workspace = true }
 async-trait.workspace = true
 tokio.workspace = true

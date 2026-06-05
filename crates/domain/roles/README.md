@@ -1,6 +1,6 @@
 # crates/domain/roles/
 
-Behavioral actors that watch state and react. Reserved for role crates migrating from gastown:
+Behavioral actors that watch state and react. Reserved for role crates migrating from the upstream app:
 
 - `gt-sheriff` — pre-merge watchdog + dispatch timeout
 - `gt-deacon` — daemon heartbeat consumer + e-stop drain

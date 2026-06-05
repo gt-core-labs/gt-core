@@ -10,7 +10,7 @@ gt-channel = { workspace = true }
 # from this crate so the composition root can register Sheriff in the plugin chain.
 gt-plugin = { workspace = true }
 # `Plugin::on_event` takes `&EventRecord`; needed in the trait impl signature.
-# `gt-eventlog` is gastown's event-replay store ported up (hq-core-port.8; was `gt-audit`).
+# `gt-eventlog` is the upstream event-replay store ported up (hq-core-port.8; was `gt-audit`).
 gt-eventlog = { workspace = true }
 tokio.workspace = true
 serde.workspace = true

@@ -3,7 +3,7 @@ name = "gt-login"
 edition.workspace = true
 version.workspace = true
 
-# Ported up from gastown (hq-core-port.18; was hq-fe-auth.1). PTY driver for `claude /login`:
+# Ported up from the upstream app (hq-core-port.18; was hq-fe-auth.1). PTY driver for `claude /login`:
 # spawns the Anthropic CLI's OAuth flow under a pseudo-terminal, extracts the authorization
 # URL, writes the user-pasted token back over stdin, and emits LoginEvent state transitions.
 # Pure state machine + URL parser (replay-safe, no wallclock) behind a `Pty` port; only the

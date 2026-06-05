@@ -1,4 +1,4 @@
-# Migration plan: gastown → gt-core
+# Migration plan: upstream → gt-core
 
 Stage-gated migration. Each phase ships independently; nothing destructive happens until the gate before it is green.
 
@@ -7,7 +7,7 @@ Stage-gated migration. Each phase ships independently; nothing destructive happe
 - `/home/nixos/gt-core` created, pushed to `github.com/codecsrayo/gt-core` (commit `d8a5d7d`).
 - 8 crate skeletons + `examples/mod-hello`.
 - `cargo build` green.
-- Gastown CLAUDE.md updated to point at gt-core for `hq-mod-*` / `hq-mt-*` work.
+- The upstream CLAUDE.md updated to point at gt-core for `hq-mod-*` / `hq-mt-*` work.
 
 **Output:** repo exists, agents know where to work.
 
@@ -15,7 +15,7 @@ Stage-gated migration. Each phase ships independently; nothing destructive happe
 
 ## Phase 1 — Module foundation (hq-mod-core/.routes/.mcp/.events/.migrate)
 
-Real implementations of the skeleton crates. Built **in-place** in gt-core; no gastown change yet.
+Real implementations of the skeleton crates. Built **in-place** in gt-core; no upstream change yet.
 
 Order:
 1. `hq-mod-core.1..8` → `gt-module` proper.
@@ -32,7 +32,7 @@ Order:
 
 ---
 
-## Phase 2 — Gastown consumes gt-core (path patch only)
+## Phase 2 — Upstream consumes gt-core (path patch only)
 
 Add the **collision-free module-foundation** crates to `gastown/apps/api/Cargo.toml`
 (done in `hq-mod-refactor.15`; paths reflect the real `crates/kernel/` layout):
@@ -47,28 +47,28 @@ gt-feature-flags    = { path = "../../../gt-core/crates/kernel/gt-feature-flags"
 gt-hooks            = { path = "../../../gt-core/crates/kernel/gt-hooks" }
 ```
 
-`cargo build` in gastown picks them up. No domain change yet — just available.
+`cargo build` in the upstream picks them up. No domain change yet — just available.
 
 **Not in this list (deliberately):**
 
 - `gt-module-routes` / `gt-module-events` — **dropped**: folded into `gt-module`
   (`hq-mod-core.9`, commit `5b6ec66`). They never become separate crates.
-- `gt-workspace` — **name collision**: gastown already had a `gt-workspace` (town
+- `gt-workspace` — **name collision**: the upstream app already had a `gt-workspace` (town
   root / `FindFromCwd`), a different concept from gt-core's tenant `gt-workspace`.
-  Gastown's was renamed to `gt-townroot` (`hq-mod-refactor.15`); gt-core's
+  The upstream's was renamed to `gt-townroot` (`hq-mod-refactor.15`); gt-core's
   `gt-workspace` (+ `gt-runtime`, which pulls it) can be path-patched in once the
   rename lands — needed by Phase 5 (`hq-mt-*`).
-- `gt-store-pg` — gastown already has its own (`QuotaRepository` / audit / outbox
+- `gt-store-pg` — the upstream app already has its own (`QuotaRepository` / audit / outbox
   adapter); gt-core's (migration host + `schema_for`/`WorkspacePool`) **merges with
   it in Phase 4**, not a path-patch here.
 
-**Gate:** gastown `cargo build` + `cargo test` still green. Nothing imports gt-core yet, but the deps resolve.
+**Gate:** upstream `cargo build` + `cargo test` still green. Nothing imports gt-core yet, but the deps resolve.
 
 ---
 
 ## Phase 3 — Wrap existing domains as Modules (hq-mod-refactor)
 
-In **gastown**, each domain crate (`gt-rig`, `gt-quota`, `gt-merge`, `gt-convoy`, `gt-polecat`, `gt-agent`, role crates, `gt-feed`, `gt-terminal`) grows a thin `impl GtModule for FooModule { ... }`. No domain logic change.
+In **the upstream app**, each domain crate (`gt-rig`, `gt-quota`, `gt-merge`, `gt-convoy`, `gt-polecat`, `gt-agent`, role crates, `gt-feed`, `gt-terminal`) grows a thin `impl GtModule for FooModule { ... }`. No domain logic change.
 
 Composition root (`gt-web`, `gt-mcp`, `gt`) drops hand-wired routes + replaces with `RootBuilder::new(ws).module(BeadsModule).module(RigsModule)...build()`.
 
@@ -80,7 +80,7 @@ Beads: `hq-mod-refactor.1..12`.
 
 ## Phase 4 — Move foundational kernel into gt-core
 
-Now the kernel crates that gt-core was depending on through gastown migrate up:
+Now the kernel crates that gt-core was depending on through the upstream app migrate up:
 
 - `gt-events` → `gt-core/crates/gt-events`
 - `gt-bus` → `gt-core/crates/gt-bus`
@@ -88,9 +88,9 @@ Now the kernel crates that gt-core was depending on through gastown migrate up:
 - `gt-plugin` → `gt-core/crates/gt-plugin`
 - `gt-telemetry` → `gt-core/crates/gt-telemetry`
 
-For each: `git mv` source, update Cargo.toml, update gastown `[workspace.dependencies]` to point at gt-core path. Single PR per crate. Replay gate after each.
+For each: `git mv` source, update Cargo.toml, update upstream `[workspace.dependencies]` to point at gt-core path. Single PR per crate. Replay gate after each.
 
-**Gate:** gastown still builds + replay byte-for-byte equal + integration tests green.
+**Gate:** upstream still builds + replay byte-for-byte equal + integration tests green.
 
 ---
 
@@ -99,16 +99,16 @@ For each: `git mv` source, update Cargo.toml, update gastown `[workspace.depende
 By now gt-core hosts the module + workspace primitives and the kernel. hq-mt-* beads layer the tenancy boundary:
 
 1. `hq-mt-core.1..8` → `gt-workspace` proper (in gt-core).
-2. `hq-mt-data.1..12` → PG/Dolt partitioning (migrations in gt-core + gastown).
-3. `hq-mt-auth.1..7` → JWT claim + WorkspaceGuard (split: trait in gt-core, gastown integration).
+2. `hq-mt-data.1..12` → PG/Dolt partitioning (migrations in gt-core + the upstream app).
+3. `hq-mt-auth.1..7` → JWT claim + WorkspaceGuard (split: trait in gt-core, upstream integration).
 4. `hq-mt-routing.1..8` → RootRegistry in gt-core.
-5. `hq-mt-rigs.1..6` → gastown gt-rig refactor (depends on Phase 3 module wrap).
-6. `hq-mt-runtime.1..9` → polecat/sessions/quota in gastown, scoped.
-7. `hq-mt-cli.1..6` → gastown `gt` CLI.
-8. `hq-mt-bootstrap.1..7` → workspace lifecycle (gastown).
-9. `hq-mt-migrate.1..5` → one-shot data migration (gastown).
+5. `hq-mt-rigs.1..6` → upstream gt-rig refactor (depends on Phase 3 module wrap).
+6. `hq-mt-runtime.1..9` → polecat/sessions/quota in the upstream app, scoped.
+7. `hq-mt-cli.1..6` → upstream `gt` CLI.
+8. `hq-mt-bootstrap.1..7` → workspace lifecycle (the upstream app).
+9. `hq-mt-migrate.1..5` → one-shot data migration (the upstream app).
 10. `hq-mt-deploy.1..8` → compose + traefik wildcard.
-11. `hq-mt-ui.1..6` + `hq-mt-views.1..8` → frontend (gastown apps/web).
+11. `hq-mt-ui.1..6` + `hq-mt-views.1..8` → frontend (upstream apps/web).
 12. `hq-mt-ops.1..5` → dashboards + leak detector.
 
 **Gate:** two workspaces (`default` + `acme`) live on the same compose stack; cross-ws leak test green.
@@ -128,13 +128,13 @@ Each = one crate, one composition-root line, one PR. No refactor anywhere else.
 
 ---
 
-## What stays in gastown forever
+## What stays upstream forever
 
 - `apps/web` (Svelte SPA) — frontend is the app, not the kernel. Apps still embed the kernel's UI conventions but ship in their own repo.
 - `deploy/` (compose, traefik config, observability dashboards) — operator artifact, app-specific.
 - Domain crates that ARE specific to gas-town's product (sheriff/deacon/refinery/witness/mayor patrol logic).
 
-## What stays in gastown until further notice
+## What stays upstream until further notice
 
 - `gt-store-pg-*` adapters (PG schema is the kernel's contract; adapters are app-specific until we factor out generic shapes).
 - The Dolt `hq` DB (tracking lives there).

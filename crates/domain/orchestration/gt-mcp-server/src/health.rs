@@ -2,7 +2,7 @@
 //!
 //! ## Reframe note
 //!
-//! The bead targeted gastown `gt-web/src/health.rs`; that bin is being retired
+//! The bead targeted the upstream `gt-web/src/health.rs`; that bin is being retired
 //! and the live HTTP surface is this `gt-mcp-server`, which already mounts a
 //! `/health` route. So the endpoints land here, on the multi-tenant resolver
 //! introduced by hq-mt-routing.5.

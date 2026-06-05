@@ -3,7 +3,7 @@
 //!
 //! ## Reframe note
 //!
-//! The bead was written against the gastown `gt-mcp` bin
+//! The bead was written against the upstream `gt-mcp` bin
 //! (`McpService::with_workspace_registry(Arc<RootRegistry>)`, resolve a `Root`
 //! per request). That bin was retired when gt-core took over the canonical MCP
 //! endpoint (hq-core-host cutover), and gt-core's [`IssuesServer`](crate::server)

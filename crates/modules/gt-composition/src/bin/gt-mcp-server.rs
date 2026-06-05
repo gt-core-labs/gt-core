@@ -76,7 +76,7 @@ use gt_workspace::{PgWorkspaces, WorkspaceApiState, WorkspaceModule};
 use gt_rbac::{RbacConfig, Scope};
 use gt_store_dolt::DoltIssues;
 
-/// Path the MCP endpoint mounts at (mirrors the gastown gt-mcp).
+/// Path the MCP endpoint mounts at (mirrors the upstream gt-mcp).
 const MCP_PATH: &str = "/mcp";
 
 #[tokio::main]

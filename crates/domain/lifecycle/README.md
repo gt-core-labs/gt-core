@@ -1,6 +1,6 @@
 # crates/domain/lifecycle/
 
-State-machine entities. Reserved for crates that migrate from gastown in Phase 4:
+State-machine entities. Reserved for crates that migrate from the upstream app in Phase 4:
 
 - `gt-agent` — agent identity + claim lifecycle
 - `gt-polecat` — polecat session state-machine

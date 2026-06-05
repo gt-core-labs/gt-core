@@ -3,7 +3,7 @@ name = "gt-terminal"
 edition.workspace = true
 version.workspace = true
 
-# Ported up from gastown (hq-core-port.21; was hq-fe-term.1). Substrate for the dashboard's
+# Ported up from the upstream app (hq-core-port.21; was hq-fe-term.1). Substrate for the dashboard's
 # dock terminal. Owns the `Attach` port the term WS route plugs into, plus three adapters:
 #
 # - `TmuxPipeAttach` — primary, attaches to a live tmux session via `tmux pipe-pane -O`

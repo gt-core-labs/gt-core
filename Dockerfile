@@ -21,7 +21,7 @@ FROM debian:bookworm-slim
 # `git ls-tree -r main` over the GT_REPO_DIR checkout so `?ready=true` hides a bead
 # whose own non-`planned` surface is absent from gt-core's `main`. Without git the
 # check degrades to accept-all and the frontier surfaces beads whose surfaces live
-# only in a source repo (gastown) — the gap hq-gap-ready-set-has-no-unblocked-gt-core-work.
+# only in a source repo (the upstream app) — the gap hq-gap-ready-set-has-no-unblocked-gt-core-work.
 # The operator wires GT_REPO_DIR + a read-only checkout via compose (out of this repo).
 RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates git \

@@ -32,7 +32,7 @@ axum = { workspace = true, optional = true }
 utoipa = { workspace = true, optional = true }
 serde_json = { workspace = true, optional = true }
 # The event-log replay/append the REST dispatch runs (the durable backing for this
-# event-sourced domain — there is no projection table). `gt-eventlog` is gastown's event-replay
+# event-sourced domain — there is no projection table). `gt-eventlog` is the upstream event-replay
 # store ported up (hq-core-port.8); it is also a dev-dependency for the replay gate below.
 gt-eventlog = { workspace = true, optional = true }
 
@@ -44,7 +44,7 @@ axum = ["dep:axum", "dep:utoipa", "dep:serde_json", "dep:gt-eventlog"]
 
 [dev-dependencies]
 # Replay gate only (the domain does not depend on the log at runtime). `gt-eventlog`
-# is gastown's event-replay store ported up (hq-core-port.8; was `gt-audit`).
+# is the upstream event-replay store ported up (hq-core-port.8; was `gt-audit`).
 gt-eventlog = { workspace = true }
 serde_json.workspace = true
 # Throwaway event-log root for the REST contract test (`http_contract.rs`), the same way the

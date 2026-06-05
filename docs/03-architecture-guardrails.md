@@ -4,7 +4,7 @@
 
 ## TL;DR
 
-1. **Don't improvise the kernel.** Foundation crates (`gt-events`, `gt-bus`, `gt-audit`, `gt-plugin`, `gt-telemetry`) are already designed and tested in gastown. They migrate UP into `crates/kernel/` per Phase 4 — never re-invented here. Open gastown's source before writing any equivalent.
+1. **Don't improvise the kernel.** Foundation crates (`gt-events`, `gt-bus`, `gt-audit`, `gt-plugin`, `gt-telemetry`) are already designed and tested in the upstream app. They migrate UP into `crates/kernel/` per Phase 4 — never re-invented here. Open the upstream source before writing any equivalent.
 2. **Don't move folders.** The layered taxonomy (`kernel/` / `domain/{platform,orchestration,lifecycle,roles}/` / `modules/`) is fixed. New crates go INTO the existing tier; new tiers are not added without explicit user approval. There is no `bins/` tier — a binary is an entrypoint, not a domain; when a crate needs one it declares `[[bin]]` inside the crate that owns its logic.
 3. **Don't bypass the module system.** Every feature is a `GtModule`. No hand-wired routes, MCP tools, migrations, or actors in app composition roots.
 4. **Don't cross tier boundaries downward.** Kernel never depends on domain. Domain never depends on modules.
@@ -15,9 +15,9 @@ The rest of this document is the long form.
 
 ## Rule 1: kernel migration, not re-invention
 
-### What stays in gastown (until P4)
+### What stays upstream (until P4)
 
-| Crate | Purpose | gastown path |
+| Crate | Purpose | upstream path |
 |-------|---------|--------------|
 | `gt-events` | Event/Command/EventKind primitives, AppError | `apps/api/crates/kernel/gt-events` |
 | `gt-bus` | Synchronous in-process bus + DeadLetter | `apps/api/crates/kernel/gt-bus` |
@@ -25,17 +25,17 @@ The rest of this document is the long form.
 | `gt-plugin` | Observer plugin trait + relay + dead-letter | `apps/api/crates/kernel/gt-plugin` |
 | `gt-telemetry` | OTel adapter + span helpers | `apps/api/crates/kernel/gt-telemetry` |
 
-Until those crates migrate, gt-core crates that need them depend on the **published path** in gastown via `[workspace.dependencies]` in gastown's Cargo.toml during P2 wiring. Never copy-paste their code into gt-core.
+Until those crates migrate, gt-core crates that need them depend on the **published path** in the upstream app via `[workspace.dependencies]` in the upstream Cargo.toml during P2 wiring. Never copy-paste their code into gt-core.
 
 ### What to do when you need an existing kernel primitive
 
-1. **Open** `apps/api/crates/kernel/<crate>/src/` in gastown.
+1. **Open** `apps/api/crates/kernel/<crate>/src/` in the upstream app.
 2. **Use** the type/trait by importing from the crate (via path patch in P2; via gt-core re-export in P4).
 3. **Do not** redefine `Event`, `Command`, `AppError`, `EventRecord`, etc. in gt-core. They exist.
 
 ### When you discover a kernel gap
 
-If gastown's kernel lacks something gt-core needs (e.g., a `RootBuilder` hook):
+If the upstream kernel lacks something gt-core needs (e.g., a `RootBuilder` hook):
 1. **Don't add it to gt-core's kernel** as a parallel type.
 2. **File a bead** under `hq-mod-core` or open a doc-gap ticket.
 3. **Discuss** before extending. Kernel growth is deliberate.
@@ -66,9 +66,9 @@ docs/<NN>-<topic>.md                      ← numbered design docs
 - ❌ New top-level dirs (`api/`, `services/`, `lib/`, `pkg/`, etc.). The tree is the tree. **Sole exception: `.github/` for CI workflows** (`hq-test-regress.3`, owner-ratified) — build/test/contract gates only, no app or deploy code.
 - ❌ Crates outside `crates/` or `examples/`.
 - ❌ "Helper" crates dumped at `crates/<name>` without a tier. Pick kernel or domain.
-- ❌ A standalone `bins/` tier. gt-core ships libraries; apps (gastown) own their binaries. When a crate genuinely needs an executable, it lives as a `[[bin]]` inside that crate, not in a catch-all tier.
+- ❌ A standalone `bins/` tier. gt-core ships libraries; apps (the upstream app) own their binaries. When a crate genuinely needs an executable, it lives as a `[[bin]]` inside that crate, not in a catch-all tier.
 - ❌ Frontend code anywhere. FE has its own repo.
-- ❌ Compose files / Dockerfiles / deploy scripts. Those live in app repos (gastown).
+- ❌ Compose files / Dockerfiles / deploy scripts. Those live in app repos (the upstream app).
 
 ### Picking a tier — flowchart
 
@@ -138,7 +138,7 @@ The remaining 10% is genuinely kernel-level; file a doc gap.
 ## Rule 4: dependency direction
 
 ```
-modules    → domain    → kernel    → (gastown kernel until P4)
+modules    → domain    → kernel    → (upstream kernel until P4)
 ```
 
 ### Allowed Cargo deps
@@ -256,7 +256,7 @@ Touching `gt-events`, any reducer, or any event log writer means you must:
 2. Replay full event log under the new code.
 3. Diff state. **Must equal zero diff.**
 
-This is the Step 3 gate mentioned in gastown's `docs/11-cutover-roadmap.md` and `docs/06-observability.md`. It is the only mechanism keeping the orchestrator deterministic across upgrades.
+This is the Step 3 gate mentioned in the upstream `docs/11-cutover-roadmap.md` and `docs/06-observability.md`. It is the only mechanism keeping the orchestrator deterministic across upgrades.
 
 If your change WILL fail the gate (e.g., adding workspace_id to all events), do it in a single commit with the backfill migration alongside, and gate the commit behind a flag until the rest of the system is ready.
 
@@ -279,5 +279,5 @@ These rules exist because past improvisations broke replay, leaked tenants, or f
 - Layered model: [README.md](../README.md)
 - Migration phases: [01-migration-plan.md](01-migration-plan.md)
 - SSE pattern: [02-sse-pattern.md](02-sse-pattern.md)
-- gastown kernel source: `/home/nixos/gastown/apps/api/crates/kernel/`
+- upstream kernel source: `/home/nixos/gastown/apps/api/crates/kernel/`
 - Replay gate origin: `/home/nixos/gastown/apps/api/docs/11-cutover-roadmap.md` Paso 9.B / `/home/nixos/gastown/apps/api/docs/06-observability.md`

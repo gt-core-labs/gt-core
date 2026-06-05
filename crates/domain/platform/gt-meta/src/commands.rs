@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 
 /// Input for `meta.report-gap.execute`: surface a missing MCP operation so the
 /// server mints a `hq-gap-<slug>-<ts>` bead the routine catalog can pick up.
-/// Mirrors the gastown `meta.report_gap` shape (renamed to kebab `report-gap`
+/// Mirrors the upstream `meta.report_gap` shape (renamed to kebab `report-gap`
 /// for the kernel's three-segment tool-name rule).
 ///
 /// The optional graph fields make a reported gap **taxonomy- and graph-sound on

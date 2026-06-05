@@ -14,7 +14,7 @@ pub enum SchedEvent {
 impl EventKind for SchedEvent {
     fn kind(&self) -> &'static str {
         match self {
-            // Versioned kebab leaf kinds on port-up (gt-core convention; gastown emitted the
+            // Versioned kebab leaf kinds on port-up (gt-core convention; the upstream app emitted the
             // unversioned `scheduling.enqueue` etc. — same .v1 backfill events.2 applied to
             // rig/quota/merge, safe since gt-core has no scheduling replay log yet).
             SchedEvent::Enqueue { .. } => "scheduling.enqueue.v1",

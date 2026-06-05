@@ -13,6 +13,6 @@ schemars.workspace = true
 
 [dev-dependencies]
 # Replay gate: round-trips Envelope -> EventRecord through the event log. `gt-eventlog`
-# is gastown's event-replay store ported up (hq-core-port.8; was `gt-audit`).
+# is the upstream event-replay store ported up (hq-core-port.8; was `gt-audit`).
 gt-eventlog = { workspace = true }
 ulid.workspace = true

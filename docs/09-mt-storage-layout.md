@@ -66,7 +66,7 @@ boot / on first request rather than via a volume definition. PG schemas and
 Dolt databases are created through their own provisioning calls, not compose.
 
 > The compose file and container entrypoint live in the **deployment host**
-> (the gastown compose, `COMPOSE_PROJECT_NAME=gastown`, during the cutover
+> (the upstream compose, `COMPOSE_PROJECT_NAME=gastown`, during the cutover
 > window), not in this repo. gt-core owns this layout spec; the host wires the
 > `mkdir` and mounts. Do not add a `docker-compose.yml` to gt-core for this.
 

@@ -3,7 +3,7 @@ name = "gt-wisp"
 edition.workspace = true
 version.workspace = true
 
-# Ported up from gastown (hq-core-port.19; was hq-t9vt / paso 9.C). Ephemeral memory with
+# Ported up from the upstream app (hq-core-port.19; was hq-t9vt / paso 9.C). Ephemeral memory with
 # per-kind TTL + the reaper's compaction decision logic. Self-contained domain: defines the
 # WispRepository port + an in-memory adapter. The reaper cycle only touches the wisps
 # compaction table — never the event log or domain reducers — so it is replay-safe and needs

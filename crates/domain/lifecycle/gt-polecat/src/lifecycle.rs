@@ -193,7 +193,7 @@ pub struct SpawnTemplate {
 
 impl SpawnTemplate {
     /// Build a production [`SpawnTemplate`] from the daemon's environment (`hq-orchd.3`), the
-    /// gt-core counterpart of the env the gastown `gt` bin read (`GT_RIG`/`GT_RIG_PATH`/
+    /// gt-core counterpart of the env the upstream `gt` bin read (`GT_RIG`/`GT_RIG_PATH`/
     /// `GT_POLECAT_CMD`/…). `workspace` is layered into `base_env` as [`GT_WORKSPACE`] so every
     /// slung polecat carries its tenant for dashboard attribution (`hq-mt-runtime.5`).
     ///

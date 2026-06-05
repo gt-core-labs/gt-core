@@ -3,10 +3,10 @@
 //! A `depends_on` edge is a bare id — it says *what* a bead consumes but not
 //! *where the artifact comes from*. The provenance belongs on the producer NODE,
 //! not the edge: a producer bead lands a crate (a `planned:true` surface), and for
-//! a *ported* crate that crate already exists in a source repo (gastown). Stamping
+//! a *ported* crate that crate already exists in a source repo. Stamping
 //! `design = "port-origin: <repo>:<path>"` on the producer means a model can follow
 //! an edge to the producer, read `surface` (the gt-core target) + `design` (the
-//! gastown origin), and recover the full port path — structurally, no prose.
+//! upstream origin), and recover the full port path — structurally, no prose.
 //!
 //! Pure: resolution is over an in-memory name→path index per source repo, so it
 //! unit-tests without a filesystem.

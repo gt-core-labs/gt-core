@@ -51,7 +51,7 @@ impl IssueStatus {
 /// Lifecycle phase a bead belongs to (docs/10 S1, hq-core-mcp.7). `P1..P4` form
 /// a total order (declaration order is the ordinal): a bead is *phase-gated* when
 /// its `phase` exceeds the [`open_phase`](DoltIssues::open_phase) currently open.
-/// `P4` = kernel migration up from gastown (gated while the frontier sits at
+/// `P4` = kernel migration up from the upstream app (gated while the frontier sits at
 /// `P3`); `P3` = gt-core multi-tenant work, currently open.
 ///
 /// `Ord` is derived so `bead.phase > frontier.open_phase` is the gate predicate
