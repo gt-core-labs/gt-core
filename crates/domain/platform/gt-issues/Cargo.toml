@@ -28,12 +28,18 @@ time = { workspace = true, features = ["parsing"] }
 # gt-workspace/gt-auth gate their axum adapters — never a sibling crate.
 axum = { workspace = true, optional = true }
 utoipa = { workspace = true, optional = true }
+# Cross-workspace `/me/stats` (hq-web-extras.15): the handler reads the caller's
+# verified `sub` from the `gt_auth::JwtClaims` the composition auth middleware
+# injects, and the per-workspace stats source is an async port. Both ride the
+# `axum` REST adapter, so they are optional + gated by that feature.
+gt-auth = { workspace = true, optional = true }
+async-trait = { workspace = true, optional = true }
 
 [features]
 # Compile the axum REST adapter + OpenAPI spec (`http.rs`) and the route/spec
 # overrides on `IssuesModule`. Off by default — the MCP-only build pulls no HTTP
 # stack; the composition bin enables it to expose the REST surface.
-axum = ["dep:axum", "dep:utoipa"]
+axum = ["dep:axum", "dep:utoipa", "dep:gt-auth", "dep:async-trait"]
 
 [dev-dependencies]
 gt-module-mcp = { workspace = true }

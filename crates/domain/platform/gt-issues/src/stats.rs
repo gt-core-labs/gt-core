@@ -342,6 +342,85 @@ pub fn aggregate(rows: &[IssueRow], dims: &[GroupDim]) -> StatsResponse {
     }
 }
 
+// --- cross-workspace roll-up (`hq-web-extras.15`) ---------------------------------------------
+
+/// One workspace's slice of the cross-workspace stats tree (`hq-web-extras.15`): the caller's
+/// membership in that tenant (slug + role) plus the counts/progress/lead-time over **that
+/// workspace's** tracker, and a per-rig breakdown so `gt-web.5` can paint
+/// `Usuario -> Workspace -> Rig` without a second round-trip.
+///
+/// `totals` reuses the same [`StatBucket`] shape as the per-workspace `GET /issues/stats` so the FE
+/// types one bucket model across both surfaces; its `key` is empty (the workspace is named by
+/// `workspace`, not a bucket key). `rigs` is the `group_by=rig` aggregation over the same rows.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[cfg_attr(feature = "axum", derive(utoipa::ToSchema))]
+pub struct WorkspaceStats {
+    /// The workspace slug the caller is a member of (the tenant these counts cover).
+    pub workspace: String,
+    /// The role the caller holds in this workspace (echoed from the membership directory).
+    pub role: String,
+    /// Counts/progress/lead-time over every bead in this workspace's tracker (ungrouped). Empty
+    /// `key`.
+    pub totals: StatBucket,
+    /// Per-rig breakdown (the `group_by=rig` aggregation over the same rows), one bucket per rig.
+    pub rigs: Vec<StatBucket>,
+}
+
+/// The cross-workspace statistics response (`GET /api/v1/me/stats`, `hq-web-extras.15`): the
+/// `Usuario -> Workspace[] -> Rig[]` tree the caller's identity spans. One [`WorkspaceStats`] per
+/// workspace the caller is a member of, plus a `grand_total` folded across every membership's rows
+/// so the FE has a single denominator without re-summing.
+///
+/// Complements the per-workspace `GET /api/v1/issues/stats` (`hq-web-extras.12`): the same counts +
+/// `progress_pct` + `lead_time` bucket math, run once per membership and summed.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[cfg_attr(feature = "axum", derive(utoipa::ToSchema))]
+pub struct MeStatsResponse {
+    /// One entry per workspace the caller is a member of, sorted by slug for a stable render order.
+    pub workspaces: Vec<WorkspaceStats>,
+    /// Counts/progress/lead-time over every bead across **all** the caller's workspaces. Empty
+    /// `key`.
+    pub grand_total: StatBucket,
+}
+
+/// Fold one workspace's rows into a [`WorkspaceStats`]: the ungrouped `totals` plus the per-rig
+/// breakdown. Transport-free — the caller fetches the rows per workspace; this only folds them.
+pub fn workspace_stats(workspace: &str, role: &str, rows: &[IssueRow]) -> WorkspaceStats {
+    let mut totals = Acc::default();
+    for row in rows {
+        totals.observe(row);
+    }
+    let rigs = aggregate(rows, &[GroupDim::Rig]).buckets;
+    WorkspaceStats {
+        workspace: workspace.to_string(),
+        role: role.to_string(),
+        totals: totals.finish(std::collections::BTreeMap::new()),
+        rigs,
+    }
+}
+
+/// Build the cross-workspace response from each membership's `(workspace, role, rows)` slice
+/// (`hq-web-extras.15`). The per-workspace `totals` fold their own rows; `grand_total` folds every
+/// row across every workspace once, so it is the true union denominator. Workspaces are sorted by
+/// slug for a stable render order.
+pub fn me_stats(per_workspace: Vec<(String, String, Vec<IssueRow>)>) -> MeStatsResponse {
+    let mut grand = Acc::default();
+    let mut workspaces: Vec<WorkspaceStats> = per_workspace
+        .into_iter()
+        .map(|(ws, role, rows)| {
+            for row in &rows {
+                grand.observe(row);
+            }
+            workspace_stats(&ws, &role, &rows)
+        })
+        .collect();
+    workspaces.sort_by(|a, b| a.workspace.cmp(&b.workspace));
+    MeStatsResponse {
+        workspaces,
+        grand_total: grand.finish(std::collections::BTreeMap::new()),
+    }
+}
+
 /// Cartesian product of the per-dimension `(field, [values])` lists into a sorted-by-field key for
 /// each combination. With the multi-valued `domain` dimension this fans a row across every
 /// combination; with only scalar dimensions it yields a single key. Each produced key is a vec of
@@ -545,5 +624,72 @@ mod tests {
         let rows = vec![row("hq-a.1", "open", None, None)];
         let resp = aggregate(&rows, &[GroupDim::Assignee]);
         assert_eq!(resp.buckets[0].key.get("assignee").map(String::as_str), Some(""));
+    }
+
+    // --- cross-workspace roll-up (`hq-web-extras.15`) -----------------------------------------
+
+    #[test]
+    fn me_stats_grand_total_is_the_union_across_workspaces() {
+        let me = me_stats(vec![
+            (
+                "acme".into(),
+                "admin".into(),
+                vec![
+                    row("hq-a.1", "open", None, None),
+                    row("hq-a.2", "closed", Some("2026-01-01T00:00:00Z"), Some("2026-01-02T00:00:00Z")),
+                ],
+            ),
+            (
+                "idb".into(),
+                "member".into(),
+                vec![row("tobx-b.1", "closed", Some("2026-01-01T00:00:00Z"), Some("2026-01-03T00:00:00Z"))],
+            ),
+        ]);
+        // Two workspaces, sorted by slug (acme before idb).
+        assert_eq!(me.workspaces.len(), 2);
+        assert_eq!(me.workspaces[0].workspace, "acme");
+        assert_eq!(me.workspaces[0].role, "admin");
+        assert_eq!(me.workspaces[1].workspace, "idb");
+        // Per-workspace totals.
+        assert_eq!(me.workspaces[0].totals.total, 2);
+        assert_eq!(me.workspaces[0].totals.closed, 1);
+        assert_eq!(me.workspaces[1].totals.total, 1);
+        assert_eq!(me.workspaces[1].totals.closed, 1);
+        // Grand total folds every row once: 3 beads, 2 closed => 66.7%.
+        assert_eq!(me.grand_total.total, 3);
+        assert_eq!(me.grand_total.closed, 2);
+        assert_eq!(me.grand_total.progress_pct, 66.7);
+    }
+
+    #[test]
+    fn me_stats_per_workspace_rig_breakdown() {
+        let me = me_stats(vec![(
+            "acme".into(),
+            "admin".into(),
+            vec![
+                row("hq-a.1", "open", None, None),
+                row("tobx-b.1", "closed", Some("2026-01-01T00:00:00Z"), Some("2026-01-02T00:00:00Z")),
+            ],
+        )]);
+        let ws = &me.workspaces[0];
+        // Two rigs: hq and tobx.
+        let rigs: std::collections::HashMap<_, _> = ws
+            .rigs
+            .iter()
+            .map(|b| (b.key.get("rig").unwrap().clone(), b))
+            .collect();
+        assert_eq!(rigs["hq"].total, 1);
+        assert_eq!(rigs["hq"].open, 1);
+        assert_eq!(rigs["tobx"].total, 1);
+        assert_eq!(rigs["tobx"].closed, 1);
+    }
+
+    #[test]
+    fn me_stats_empty_membership_yields_empty_grand_total() {
+        let me = me_stats(vec![]);
+        assert!(me.workspaces.is_empty());
+        assert_eq!(me.grand_total.total, 0);
+        assert_eq!(me.grand_total.progress_pct, 0.0);
+        assert_eq!(me.grand_total.lead_time.count, 0);
     }
 }

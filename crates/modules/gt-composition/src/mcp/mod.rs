@@ -42,7 +42,8 @@ pub use merge::MergeHandler;
 pub use pools::WsPools;
 pub use quota::QuotaHandler;
 pub use rest_backings::{
-    EventLogConvoy, EventLogFeed, EventLogMerges, EventLogQuota, EventLogSkills, WsPoolRigs,
+    EventLogConvoy, EventLogFeed, EventLogMerges, EventLogQuota, EventLogSkills,
+    IdentityDoltMeStats, WsPoolRigs,
 };
 pub use rig::{PgRigPrefixes, RigHandler};
 pub use workspace::{PgWorkspaceStatus, WorkspaceHandler};

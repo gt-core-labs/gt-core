@@ -1735,7 +1735,9 @@ dependencies = [
 name = "gt-issues"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "axum",
+ "gt-auth",
  "gt-module",
  "gt-module-mcp",
  "gt-store-dolt",

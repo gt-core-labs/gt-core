@@ -25,7 +25,11 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use gt_events::AppError;
 
+use gt_auth::MembershipDirectory;
 use gt_feed::{FeedItem, FeedPage, WorkspaceFeed};
+use gt_issues::{MeMembership, MeStatsSource};
+use gt_mcp_server::WorkspaceStores;
+use gt_store_dolt::{issues_max_limit, AppError as DoltError, IssueFilter, IssueRow};
 use gt_merge::{
     DynMergeRepository, MergeBoard, MergeEvent, MergeRepository, MergeSlot, MergeSlotState,
     MergeState, WorkspaceMerges,
@@ -343,6 +347,66 @@ impl WorkspaceFeed for EventLogFeed {
         };
         let has_more = end < total;
         Ok(FeedPage { items, offset, limit, has_more, next_offset: has_more.then_some(end) })
+    }
+}
+
+/// REST backing for the cross-workspace `me.*` surface (`gt_issues::MeStatsSource`,
+/// `hq-web-extras.15`): resolves the caller's workspace memberships through the global identity
+/// directory ([`MembershipDirectory`], `public.user_workspaces`) and each membership's tracker rows
+/// through the per-workspace Dolt store cache ([`WorkspaceStores`], `hq_<ws>`).
+///
+/// Only `modules` may know both the identity directory and the per-workspace issue stores
+/// (docs/03 Rule 4), so this adapter lives here, not in `gt-issues` (whose port is store-agnostic).
+/// It is the REST mirror of the per-workspace stats endpoint run once per membership: the same
+/// snapshot rows `read_issues` folds, sourced from each tenant's own `hq_<ws>` database.
+pub struct IdentityDoltMeStats {
+    /// The global membership directory — lists the caller's `(workspace, role)` rows by `sub`.
+    memberships: Arc<dyn MembershipDirectory>,
+    /// The per-workspace Dolt store resolver — one `hq_<ws>` store per tenant, lazily pooled.
+    stores: Arc<WorkspaceStores>,
+}
+
+impl IdentityDoltMeStats {
+    /// Wire the cross-workspace stats source over the shared membership directory + per-workspace
+    /// Dolt store cache (the binary's single shared instances).
+    pub fn new(memberships: Arc<dyn MembershipDirectory>, stores: Arc<WorkspaceStores>) -> Self {
+        Self { memberships, stores }
+    }
+}
+
+#[async_trait]
+impl MeStatsSource for IdentityDoltMeStats {
+    async fn memberships(&self, sub: &str) -> Result<Vec<MeMembership>, DoltError> {
+        // The directory speaks `gt_auth::AuthError`; relabel a backend fault onto the store error
+        // the port returns (a directory outage is an internal error, never a silent empty list).
+        let rows = self
+            .memberships
+            .list(sub)
+            .await
+            .map_err(|e| DoltError::Other(format!("membership directory: {e}")))?;
+        Ok(rows
+            .into_iter()
+            .map(|m| MeMembership { workspace: m.workspace, role: m.role })
+            .collect())
+    }
+
+    async fn issue_rows(&self, workspace: &str) -> Result<Vec<IssueRow>, DoltError> {
+        // The tenant's own `hq_<ws>` tracker. Request the whole snapshot (full=false, max limit) so
+        // the aggregate covers the workspace in one pass — the same filter the per-workspace
+        // `/issues/stats` uses.
+        let store = self.stores.store_for(workspace)?;
+        let filter = IssueFilter {
+            status: Vec::new(),
+            priority_max: None,
+            assignee: None,
+            external_ref: None,
+            issue_type: None,
+            limit: Some(issues_max_limit()),
+            offset: None,
+            full: false,
+            ready: false,
+        };
+        store.list(&filter).await
     }
 }
 

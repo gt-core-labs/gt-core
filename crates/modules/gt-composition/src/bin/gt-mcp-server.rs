@@ -36,8 +36,8 @@ use rmcp::transport::{StreamableHttpServerConfig, StreamableHttpService};
 use gt_audit::{AuditSink, InMemoryAudit};
 use gt_composition::mcp::{
     AgentHandler, AuditHandler, ConvoyHandler, DocumentsHandler, EventLog, EventLogConvoy,
-    EventLogFeed, EventLogMerges, EventLogQuota, EventLogSkills, GraphHandler, MergeHandler,
-    PgDocumentsResource, PgRigPrefixes, PgWorkspaceStatus, QuotaHandler, RigHandler,
+    EventLogFeed, EventLogMerges, EventLogQuota, EventLogSkills, GraphHandler, IdentityDoltMeStats,
+    MergeHandler, PgDocumentsResource, PgRigPrefixes, PgWorkspaceStatus, QuotaHandler, RigHandler,
     WorkspaceHandler, WsPoolRigs, WsPools,
 };
 use gt_docs_embed::Embedder;
@@ -59,7 +59,7 @@ use sqlx::Row;
 use gt_agent::{AgentApiState, AgentModule};
 use gt_documents::{DocumentsApiState, DocumentsModule};
 use gt_eventlog::DEFAULT_EVENTLOG_ROOT;
-use gt_issues::{IssuesApiState, IssuesModule};
+use gt_issues::{IssuesApiState, IssuesModule, MeApiState, MeModule};
 use gt_merge::{MergeApiState, MergeModule};
 use gt_mcp_server::{
     health, DocumentsResource, DomainRouter, HealthState, IssuesServer, PgAuditSink,
@@ -409,6 +409,10 @@ async fn main() -> anyhow::Result<()> {
                 WsPools::new(pg_url.clone()),
             ))))));
         let (blob, bucket) = build_blob_store();
+        // Capture the PG url before it moves into the documents state — the cross-workspace
+        // /me/stats surface (hq-web-extras.15) below opens its own ws_default pool for the
+        // membership directory.
+        let pg_url_for_me = pg_url.clone();
         // Build the documents REST state once; the authenticated module router and the public
         // share-read router (hq-web-extras.9) share the same store handles.
         let docs_state = DocumentsApiState::new(
@@ -420,9 +424,33 @@ async fn main() -> anyhow::Result<()> {
         );
         public_share = Some(gt_documents::public_share_router(docs_state.clone()));
         rest = rest.module(DocumentsModule::with_http(docs_state));
-        eprintln!(
-            "[gt-mcp-server] REST domain modules: meta + workspace + rig + documents + agent + quota + merge + skills + feed + convoy"
-        );
+        // Cross-workspace self-view (hq-web-extras.15): GET /api/v1/me/stats rolls up issue progress
+        // across every workspace the caller is a member of. It needs BOTH the global identity
+        // directory (`public.user_workspaces`, the membership N:N from hq-identity) over the PG pool
+        // here, AND each tenant's own `hq_<ws>` tracker via the per-workspace Dolt store cache. The
+        // latter only exists when GT_DOLT_BASE_URL configures multi-tenant routing, so the surface
+        // mounts only then; without it, single-tenant Dolt has no per-workspace stores to aggregate.
+        match std::env::var("GT_DOLT_BASE_URL") {
+            Ok(base) => {
+                let me_pool = WorkspacePool::connect(&pg_url_for_me, "default")
+                    .await
+                    .context("me/stats: connect ws_default Postgres pool")?;
+                let memberships = Arc::new(PgUsers::new(me_pool.pool().clone(), "default"))
+                    as Arc<dyn gt_auth::MembershipDirectory>;
+                let stores = Arc::new(
+                    WorkspaceStores::from_base_url(&base)
+                        .context("me/stats: GT_DOLT_BASE_URL is malformed")?,
+                );
+                let me_source = Arc::new(IdentityDoltMeStats::new(memberships, stores));
+                rest = rest.module(MeModule::with_http(MeApiState::new(me_source)));
+                eprintln!(
+                    "[gt-mcp-server] REST domain modules: meta + workspace + rig + documents + agent + quota + merge + skills + feed + convoy + me (cross-workspace stats)"
+                );
+            }
+            Err(_) => eprintln!(
+                "[gt-mcp-server] REST domain modules: meta + workspace + rig + documents + agent + quota + merge + skills + feed + convoy (GT_DOLT_BASE_URL unset → no /me/stats cross-workspace surface)"
+            ),
+        }
     } else {
         eprintln!(
             "[gt-mcp-server] REST domain modules: meta + agent + quota + merge + skills + feed + convoy (GT_PG_URL unset → no workspace/rig/documents)"

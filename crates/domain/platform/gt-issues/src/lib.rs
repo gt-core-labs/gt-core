@@ -39,6 +39,14 @@ pub mod handlers;
 /// mapping `issues.*` to REST routes that reuse the same handlers as the MCP tools.
 #[cfg(feature = "axum")]
 pub mod http;
+/// The off-by-default `axum` REST adapter for the cross-workspace `me.*` surface
+/// (`hq-web-extras.15`): `GET /api/v1/me/stats` rolls up issue progress across every workspace the
+/// caller is a member of, complementing the per-workspace `GET /api/v1/issues/stats`.
+#[cfg(feature = "axum")]
+pub mod me;
+/// The [`GtModule`](gt_module::GtModule) facade for the cross-workspace `me.*` surface
+/// (`hq-web-extras.15`), mounted at `/api/v1/me` behind the `me.read` guard.
+pub mod me_module;
 pub mod park;
 pub mod policy;
 pub mod readiness;
@@ -58,7 +66,11 @@ pub use commands::{
 pub use delivery::{CommitInfo, CommitInspector};
 #[cfg(feature = "axum")]
 pub use http::{issues_router, ApiDoc, IssuesApiState};
+#[cfg(feature = "axum")]
+pub use me::{me_router, MeApiState, MeMembership, MeStatsSource};
+pub use me_module::MeModule;
 pub use module::IssuesModule;
+pub use stats::{MeStatsResponse, WorkspaceStats};
 pub use park::{
     decide as park_decide, HumanPresence, IrreversibleKind, Operation, ParkDecision, ParkQueue,
     ParkedOp, Reversibility,
