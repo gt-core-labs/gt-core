@@ -93,12 +93,14 @@ impl Scope {
         }
     }
 
-    /// Resolve a [`Scope`] from a JWT claim's granted scope strings. A claim bearing
-    /// [`WORKSPACE_ADMIN`] gets the admin grant, [`WORKSPACE_MEMBER`] the member grant;
-    /// anything else folds to [`Scope::denied`] — deny by default, never admin. Admin
-    /// wins when both are present.
+    /// Resolve a [`Scope`] from a JWT claim's granted scope strings. A bare `"*"` grant or a
+    /// [`WORKSPACE_ADMIN`] role gets the admin grant (every tool, execute included — the same
+    /// reach `matches_pattern("*", _)` yields); [`WORKSPACE_MEMBER`] the member grant; anything
+    /// else folds to [`Scope::denied`] — deny by default, never admin. Admin wins when several
+    /// are present. The `"*"` form is what the seeded super-admin carries, so a `["*"]` token
+    /// authorizes MCP tools the same way it authorizes the REST surface.
     pub fn from_workspace_claim(actor: &str, scopes: &[String]) -> Self {
-        if scopes.iter().any(|s| s == WORKSPACE_ADMIN) {
+        if scopes.iter().any(|s| s == "*" || s == WORKSPACE_ADMIN) {
             Self::workspace_admin(actor)
         } else if scopes.iter().any(|s| s == WORKSPACE_MEMBER) {
             Self::workspace_member(actor)
@@ -240,6 +242,11 @@ mod tests {
         // No recognised workspace scope -> closed.
         let none = Scope::from_workspace_claim("n", &["some.other.scope".to_string()]);
         assert!(none.check("issues.read").is_err());
+
+        // A bare "*" grant (the seeded super-admin) is full admin — execute included.
+        let star = Scope::from_workspace_claim("s", &["*".to_string()]);
+        star.check("issues.create.execute").unwrap();
+        star.check("workspace.create").unwrap();
     }
 
     const TOML_CFG: &str = r#"
