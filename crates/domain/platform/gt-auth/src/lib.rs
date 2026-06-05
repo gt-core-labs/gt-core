@@ -104,7 +104,7 @@ pub use refresh::{
 pub use verify::{Authenticator, InMemoryAuthenticator};
 
 #[cfg(feature = "pg")]
-pub use pg::PgUsers;
+pub use pg::{Membership, PgUsers};
 
 #[cfg(feature = "pg")]
 pub use refresh_pg::PgRefreshStore;
@@ -126,6 +126,10 @@ pub mod migrations {
     pub const CREATE_ROLES: &str = include_str!("../migrations/auth/0003__create_roles.sql");
     /// `0004` — the `users.roles` assignment column (hq-rbac.3).
     pub const ADD_USER_ROLES: &str = include_str!("../migrations/auth/0004__add_user_roles.sql");
+    /// `0005` — global identity (`public.users`) + N:N workspace membership
+    /// (`public.user_workspaces`), the foundation of cross-workspace login (hq-identity.1).
+    pub const CREATE_GLOBAL_IDENTITY: &str =
+        include_str!("../migrations/auth/0005__global_identity.sql");
 }
 
 #[cfg(feature = "jsonwebtoken")]
@@ -236,7 +240,12 @@ impl JwtClaims {
     /// is `false`, so the workspace claim is required by default.
     pub fn workspace_optional_from_env() -> bool {
         std::env::var(ENV_WS_OPTIONAL)
-            .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"))
+            .map(|v| {
+                matches!(
+                    v.trim().to_ascii_lowercase().as_str(),
+                    "1" | "true" | "yes" | "on"
+                )
+            })
             .unwrap_or(false)
     }
 

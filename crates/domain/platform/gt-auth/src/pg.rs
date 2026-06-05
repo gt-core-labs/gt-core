@@ -138,6 +138,124 @@ impl PgUsers {
     }
 }
 
+/// A user's membership in a workspace (hq-identity.1): one `public.user_workspaces` row, naming
+/// the workspace slug the user can reach and the role they hold there. Login (hq-identity.2)
+/// resolves these to choose the JWT's active workspace + role; switching (hq-identity.3) re-mints
+/// against another one.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Membership {
+    /// The workspace slug (the `ws_<slug>` tenant the membership grants reach into).
+    pub workspace: String,
+    /// The role held in that workspace — expanded to scopes against `ws_<slug>.roles` at login.
+    /// Empty string ⇒ a member with no role-granted scopes.
+    pub role: String,
+}
+
+/// Global identity administration over `public.users` + `public.user_workspaces` (hq-identity.1).
+///
+/// These methods address the GLOBAL, cross-tenant tables by their fully-qualified `public.` name,
+/// so — unlike the per-workspace login queries above (unqualified, `search_path`-resolved) — they
+/// read/write the same identity rows regardless of which workspace the pool is scoped to. That is
+/// the point: identity is shared across tenants, membership is the N:N bridge into them.
+impl PgUsers {
+    /// Insert a global identity row in `public.users` (hq-identity.1). Idempotent on the unique
+    /// email: `ON CONFLICT (email) DO NOTHING`, so a re-run (e.g. the boot admin seed) is a no-op
+    /// rather than an error. The password is already argon2-hashed by the caller — never plaintext.
+    pub async fn create_global_user(
+        &self,
+        id: &str,
+        email: &str,
+        password_hash: &str,
+        now: u64,
+    ) -> Result<(), AuthError> {
+        sqlx::query(
+            "INSERT INTO public.users (id, email, password_hash, created_at, updated_at) \
+             VALUES ($1, $2, $3, $4, $4) ON CONFLICT (email) DO NOTHING",
+        )
+        .bind(id)
+        .bind(email)
+        .bind(password_hash)
+        .bind(now as i64)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| AuthError::Backend(format!("global users postgres: {e}")))?;
+        Ok(())
+    }
+
+    /// Grant `user_id` membership of `workspace` with `role` (hq-identity.1). Idempotent:
+    /// `ON CONFLICT (user_id, workspace_slug) DO UPDATE SET role`, so re-assigning updates the
+    /// role in place rather than failing the unique pair. The `user_id` must reference an existing
+    /// `public.users` row (the FK rejects a dangling membership as [`AuthError::Backend`]).
+    pub async fn add_membership(
+        &self,
+        user_id: &str,
+        workspace: &str,
+        role: &str,
+        now: u64,
+    ) -> Result<(), AuthError> {
+        sqlx::query(
+            "INSERT INTO public.user_workspaces (user_id, workspace_slug, role, created_at) \
+             VALUES ($1, $2, $3, $4) \
+             ON CONFLICT (user_id, workspace_slug) DO UPDATE SET role = EXCLUDED.role",
+        )
+        .bind(user_id)
+        .bind(workspace)
+        .bind(role)
+        .bind(now as i64)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| AuthError::Backend(format!("user_workspaces postgres: {e}")))?;
+        Ok(())
+    }
+
+    /// List a user's workspace memberships, oldest first (hq-identity.1). Empty ⇒ the user exists
+    /// but reaches no workspace (login must then reject rather than mint a tenantless token).
+    pub async fn memberships(&self, user_id: &str) -> Result<Vec<Membership>, AuthError> {
+        let rows = sqlx::query(
+            "SELECT workspace_slug, role FROM public.user_workspaces \
+             WHERE user_id = $1 ORDER BY created_at, workspace_slug",
+        )
+        .bind(user_id)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| AuthError::Backend(format!("user_workspaces postgres: {e}")))?;
+        rows.iter().map(row_to_membership).collect()
+    }
+}
+
+/// Build a [`Membership`] from a `public.user_workspaces` row. A column-read fault is an
+/// [`AuthError::Backend`] (an outage, not a denied login).
+fn row_to_membership(row: &PgRow) -> Result<Membership, AuthError> {
+    Ok(Membership {
+        workspace: row
+            .try_get("workspace_slug")
+            .map_err(|e| AuthError::Backend(format!("user_workspaces postgres: {e}")))?,
+        role: row
+            .try_get("role")
+            .map_err(|e| AuthError::Backend(format!("user_workspaces postgres: {e}")))?,
+    })
+}
+
+/// Choose a user's active workspace from their memberships (hq-identity.1 seam, reused by login
+/// .2 and switch .3): honour `preferred` when the user actually holds a membership of it, else
+/// fall back to the first (oldest) membership. Returns `None` only when the user has NO
+/// membership at all — the caller maps that to a rejected login, never a tenantless token. Pure,
+/// so it is unit-tested without a database.
+// The login path (hq-identity.2) is the production consumer; until that lands the only caller is
+// the unit test, so a non-test lib build sees it as dead. Allow it for this one bead.
+#[allow(dead_code)]
+pub(crate) fn select_active_membership<'a>(
+    memberships: &'a [Membership],
+    preferred: Option<&str>,
+) -> Option<&'a Membership> {
+    if let Some(want) = preferred {
+        if let Some(found) = memberships.iter().find(|m| m.workspace == want) {
+            return Some(found);
+        }
+    }
+    memberships.first()
+}
+
 /// Union a user's direct scopes with the scopes expanded from their roles, de-duplicating while
 /// preserving first-seen order (direct scopes first, then role scopes). The PG-free seam of the
 /// role expansion in [`PgUsers::authenticate`] — pure, unit-tested without a database.
@@ -348,6 +466,30 @@ mod tests {
         .expect("create roles table");
     }
 
+    /// Provision the global identity tables (hq-identity.1) for the contract test.
+    ///
+    /// All `pg` contract tests share the connection's default schema (`public`), and the per-ws
+    /// login tests above already define `public.users` (via [`ensure_users_table`], the full
+    /// per-ws shape WITH `scopes`/`roles`). Migration 0005's production `public.users` is leaner
+    /// (identity only — scopes come from membership roles), but the global adapter only ever
+    /// touches the identity *subset* of the columns, so reusing the sibling helper here keeps one
+    /// agreed `public.users` shape and avoids a clash under parallel test execution. Only
+    /// `user_workspaces` is exclusive to this epic.
+    async fn ensure_global_identity_tables(pool: &PgPool) {
+        ensure_users_table(pool).await;
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS public.user_workspaces ( \
+                user_id TEXT NOT NULL REFERENCES public.users(id) ON DELETE CASCADE, \
+                workspace_slug TEXT NOT NULL, \
+                role TEXT NOT NULL DEFAULT '', \
+                created_at BIGINT NOT NULL, \
+                UNIQUE (user_id, workspace_slug) )",
+        )
+        .execute(pool)
+        .await
+        .expect("create public.user_workspaces table");
+    }
+
     async fn seed_user(pool: &PgPool, id: &str, email: &str, hash: &str, scopes: &[&str]) {
         let scopes: Vec<String> = scopes.iter().map(|s| s.to_string()).collect();
         sqlx::query("DELETE FROM users WHERE email = $1")
@@ -405,6 +547,41 @@ mod tests {
         );
     }
 
+    // --- PG-free test: the active-workspace selection seam (hq-identity.1) is pure. ---
+
+    #[test]
+    fn select_active_membership_honours_preferred_then_falls_back_to_first() {
+        let memberships = vec![
+            Membership {
+                workspace: "acme".into(),
+                role: "admin".into(),
+            },
+            Membership {
+                workspace: "globex".into(),
+                role: "member".into(),
+            },
+        ];
+        // A preferred slug the user is a member of wins.
+        assert_eq!(
+            select_active_membership(&memberships, Some("globex")),
+            Some(&memberships[1])
+        );
+        // A preferred slug the user does NOT hold falls back to the first (oldest) membership —
+        // never silently grants the requested tenant.
+        assert_eq!(
+            select_active_membership(&memberships, Some("ghost")),
+            Some(&memberships[0])
+        );
+        // No preference → the first membership is the default active workspace.
+        assert_eq!(
+            select_active_membership(&memberships, None),
+            Some(&memberships[0])
+        );
+        // No memberships → None, so the caller rejects rather than minting a tenantless token.
+        assert_eq!(select_active_membership(&[], Some("acme")), None);
+        assert_eq!(select_active_membership(&[], None), None);
+    }
+
     // --- PG-free test: provider-kind gating returns before any I/O, so no live DB needed. ---
 
     #[tokio::test]
@@ -419,7 +596,10 @@ mod tests {
                 code: "c".into(),
             })
             .await;
-        assert_eq!(got, Err(AuthError::UnsupportedProvider(ProviderKind::OAuth)));
+        assert_eq!(
+            got,
+            Err(AuthError::UnsupportedProvider(ProviderKind::OAuth))
+        );
     }
 
     // --- GT_PG_URL-gated contract tests against a live Postgres. ---
@@ -493,6 +673,73 @@ mod tests {
         assert_eq!(err, Err(AuthError::InvalidCredentials));
     }
 
+    /// hq-identity.1: the global-identity adapter creates a `public.users` row and attaches N
+    /// workspace memberships, which `memberships()` lists oldest-first. Both writes are idempotent
+    /// — re-running create is a no-op and re-adding a membership updates its role in place.
+    #[tokio::test]
+    async fn global_identity_create_and_memberships_round_trip() {
+        let Some(pool) = pool_or_skip().await else {
+            eprintln!("GT_PG_URL unset; skipping global-identity contract test");
+            return;
+        };
+        ensure_global_identity_tables(&pool).await;
+        // Isolate from other runs: drop this id's rows first (cascade clears its memberships).
+        sqlx::query("DELETE FROM public.users WHERE id = $1")
+            .bind("u-frank")
+            .execute(&pool)
+            .await
+            .expect("clear seed global user");
+
+        let users = PgUsers::new(pool.clone(), "default");
+        let hash = hash_password("hunter2").unwrap();
+        users
+            .create_global_user("u-frank", "frank@global.test", &hash, 10)
+            .await
+            .expect("create global user");
+        // Idempotent: a second create on the same email is a no-op, not an error.
+        users
+            .create_global_user("u-frank", "frank@global.test", &hash, 11)
+            .await
+            .expect("re-create global user is idempotent");
+
+        // No memberships yet → the user reaches nothing.
+        assert!(users.memberships("u-frank").await.unwrap().is_empty());
+
+        users
+            .add_membership("u-frank", "acme", "admin", 12)
+            .await
+            .unwrap();
+        users
+            .add_membership("u-frank", "globex", "member", 13)
+            .await
+            .unwrap();
+        let got = users.memberships("u-frank").await.unwrap();
+        assert_eq!(
+            got,
+            vec![
+                Membership {
+                    workspace: "acme".into(),
+                    role: "admin".into()
+                },
+                Membership {
+                    workspace: "globex".into(),
+                    role: "member".into()
+                },
+            ],
+            "memberships list oldest-first"
+        );
+
+        // Re-adding an existing membership updates the role in place (no duplicate pair).
+        users
+            .add_membership("u-frank", "acme", "viewer", 14)
+            .await
+            .unwrap();
+        let got = users.memberships("u-frank").await.unwrap();
+        assert_eq!(got.len(), 2, "re-add does not duplicate the pair");
+        let acme = got.iter().find(|m| m.workspace == "acme").unwrap();
+        assert_eq!(acme.role, "viewer", "re-add updates the role");
+    }
+
     /// hq-rbac.3: a user's assigned roles expand to their scope bundles and union with the row's
     /// direct scopes at login — the union is what rides the minted token.
     #[tokio::test]
@@ -553,13 +800,26 @@ mod tests {
         let users = PgUsers::new(pool.clone(), "acme");
 
         // Upsert creates, then replaces the scope bundle for the same name.
-        RoleStore::upsert_role(&users, "crud-role", &["beads.read".into()], 1).await.unwrap();
-        RoleStore::upsert_role(&users, "crud-role", &["beads.read".into(), "merge.submit".into()], 2)
+        RoleStore::upsert_role(&users, "crud-role", &["beads.read".into()], 1)
             .await
             .unwrap();
+        RoleStore::upsert_role(
+            &users,
+            "crud-role",
+            &["beads.read".into(), "merge.submit".into()],
+            2,
+        )
+        .await
+        .unwrap();
         let listed = RoleStore::list_roles(&users).await.unwrap();
-        let role = listed.iter().find(|r| r.name == "crud-role").expect("role listed");
-        assert_eq!(role.scopes, vec!["beads.read".to_string(), "merge.submit".to_string()]);
+        let role = listed
+            .iter()
+            .find(|r| r.name == "crud-role")
+            .expect("role listed");
+        assert_eq!(
+            role.scopes,
+            vec!["beads.read".to_string(), "merge.submit".to_string()]
+        );
 
         // Assign the role to a user, then log in: the role's scopes ride the identity (.3).
         let hash = hash_password("hunter2").unwrap();
@@ -583,8 +843,11 @@ mod tests {
             })
             .await
             .expect("login");
-        let set: std::collections::BTreeSet<&str> = identity.scopes.iter().map(String::as_str).collect();
-        assert!(set.contains("rig.read") && set.contains("beads.read") && set.contains("merge.submit"));
+        let set: std::collections::BTreeSet<&str> =
+            identity.scopes.iter().map(String::as_str).collect();
+        assert!(
+            set.contains("rig.read") && set.contains("beads.read") && set.contains("merge.submit")
+        );
 
         // Delete is idempotent: true once, false thereafter.
         assert!(RoleStore::delete_role(&users, "crud-role").await.unwrap());
@@ -618,7 +881,14 @@ mod tests {
         };
         ensure_users_table(&pool).await;
         let hash = hash_password("hunter2").unwrap();
-        seed_user(&pool, "u-carol", "carol@acme.test", &hash, &["rig.read", "rig.write"]).await;
+        seed_user(
+            &pool,
+            "u-carol",
+            "carol@acme.test",
+            &hash,
+            &["rig.read", "rig.write"],
+        )
+        .await;
 
         let users = PgUsers::new(pool, "acme");
 
@@ -633,7 +903,10 @@ mod tests {
         assert_eq!(identity.sub, "u-carol");
         // Workspace is the server-injected slug, never anything from the payload (docs/04 §15).
         assert_eq!(identity.workspace, "acme");
-        assert_eq!(identity.scopes, vec!["rig.read".to_string(), "rig.write".to_string()]);
+        assert_eq!(
+            identity.scopes,
+            vec!["rig.read".to_string(), "rig.write".to_string()]
+        );
 
         // 2. VerifiedIdentity.into_claims(exp, iat) -> JwtMinter.mint -> the access JWT.
         let (iat, exp) = (1_000u64, 1_900u64);
@@ -648,15 +921,23 @@ mod tests {
         assert_eq!(verified, claims);
         assert_eq!(verified.sub, "u-carol");
         assert_eq!(verified.workspace, "acme");
-        assert_eq!(verified.scopes, vec!["rig.read".to_string(), "rig.write".to_string()]);
+        assert_eq!(
+            verified.scopes,
+            vec!["rig.read".to_string(), "rig.write".to_string()]
+        );
         // The signature-verified token still passes the semantic clock/workspace gate in-window.
         assert_eq!(verified.validate(iat + 1, false), Ok(()));
 
         // 4. RefreshStore issues the long-lived counterpart for the same session, carrying the
         //    identity's sub/workspace/scopes.
         let store = InMemoryRefreshStore::new();
-        let (refresh, record) =
-            store.issue(&identity.sub, &identity.workspace, &identity.scopes, iat, exp);
+        let (refresh, record) = store.issue(
+            &identity.sub,
+            &identity.workspace,
+            &identity.scopes,
+            iat,
+            exp,
+        );
         assert!(!refresh.as_str().is_empty());
         assert_eq!(record.sub, "u-carol");
         assert_eq!(record.workspace, "acme");
