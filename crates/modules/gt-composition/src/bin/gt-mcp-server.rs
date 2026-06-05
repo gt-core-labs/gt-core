@@ -49,6 +49,7 @@ use gt_composition::scope_bridge::bridge_scopes;
 use gt_composition::stream::{feed_router, FeedState};
 use gt_auth::{
     auth_router, AuthState as LoginState, InMemoryRefreshStore, JwtAuthenticator, JwtMinter, PgUsers,
+    SameSite,
 };
 use gt_store_pg::WorkspacePool;
 // Domain REST modules + their `with_http` state (hq-fe-api-mount.1): the bin mounts each
@@ -452,6 +453,10 @@ async fn main() -> anyhow::Result<()> {
                         .expect("system clock before the Unix epoch")
                         .as_secs()
                 }),
+                // Cookie attributes (hq-web-extras.1): Secure on by default (HTTPS deploy); a
+                // cross-site SSR frontend sets GT_AUTH_COOKIE_SAMESITE=None (which forces Secure).
+                cookie_secure: cookie_secure(),
+                cookie_same_site: cookie_same_site(),
                 jwks,
             };
             let auth_app = auth_router(login_state).layer(axum::middleware::from_fn_with_state(
@@ -787,6 +792,33 @@ fn env_u64(key: &str, default: u64) -> u64 {
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(default)
+}
+
+/// The `Secure` flag for the auth cookies (hq-web-extras.1). Defaults to `true` (HTTPS deploy);
+/// `GT_AUTH_COOKIE_SECURE=false` opts a plain-http local dev out. `SameSite=None` forces it on
+/// regardless, since browsers drop a `None` cookie that is not also `Secure`.
+fn cookie_secure() -> bool {
+    if cookie_same_site() == SameSite::None {
+        return true;
+    }
+    !matches!(
+        std::env::var("GT_AUTH_COOKIE_SECURE").ok().as_deref(),
+        Some("false" | "0" | "no")
+    )
+}
+
+/// The `SameSite` attribute for the auth cookies. `GT_AUTH_COOKIE_SAMESITE` ∈ {strict,lax,none},
+/// default `lax` (good for a same-origin deploy); `none` is for a cross-site SSR frontend.
+fn cookie_same_site() -> SameSite {
+    match std::env::var("GT_AUTH_COOKIE_SAMESITE")
+        .unwrap_or_default()
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "strict" => SameSite::Strict,
+        "none" => SameSite::None,
+        _ => SameSite::Lax,
+    }
 }
 
 #[cfg(test)]

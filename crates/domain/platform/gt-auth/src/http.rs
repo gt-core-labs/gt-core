@@ -28,7 +28,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use axum::extract::{Extension, State};
-use axum::http::StatusCode;
+use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
@@ -62,6 +62,34 @@ impl LoginProvider for crate::PgUsers {
 /// An injected wall clock: seconds since the Unix epoch. Kept abstract so tests pin time.
 pub type Clock = Arc<dyn Fn() -> u64 + Send + Sync>;
 
+/// The `SameSite` attribute stamped on the auth cookies (`hq-web-extras.1`). `Lax` suits a
+/// same-origin deploy; `None` is for a cross-site SSR frontend and requires `Secure` — browsers
+/// silently drop a `SameSite=None` cookie that is not also `Secure`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SameSite {
+    Strict,
+    Lax,
+    None,
+}
+
+impl SameSite {
+    /// The wire token for the `SameSite=` cookie attribute.
+    fn as_str(self) -> &'static str {
+        match self {
+            SameSite::Strict => "Strict",
+            SameSite::Lax => "Lax",
+            SameSite::None => "None",
+        }
+    }
+}
+
+/// Browser cookie carrying the access JWT. The SSE `/stream` endpoint reads it by this exact
+/// name (`hq-fe-api-stream.1`) and an SSR frontend forwards it; `HttpOnly` keeps page JS out.
+const ACCESS_COOKIE: &str = "gt_web_token";
+/// Browser cookie carrying the opaque refresh token, scoped to `/auth` so it rides only the
+/// refresh/logout calls, never the rest of the app. `HttpOnly`.
+const REFRESH_COOKIE: &str = "gt_refresh";
+
 /// Everything the auth endpoints need, supplied by the composition root.
 #[derive(Clone)]
 pub struct AuthState {
@@ -77,6 +105,11 @@ pub struct AuthState {
     pub refresh_ttl: u64,
     /// Injected clock.
     pub now: Clock,
+    /// `Secure` flag on the auth cookies — `true` in any HTTPS deploy, and REQUIRED when
+    /// `cookie_same_site` is [`SameSite::None`]. Set `false` only for plain-http local dev.
+    pub cookie_secure: bool,
+    /// `SameSite` attribute stamped on the auth cookies.
+    pub cookie_same_site: SameSite,
     /// The verifier's public JWKS, served at `GET /auth/jwks` so clients verify access tokens
     /// offline. Built from the verifier's public keys at the composition root
     /// ([`JwtAuthenticator::jwk_set`](crate::JwtAuthenticator::jwk_set)) — never the signing
@@ -119,11 +152,12 @@ pub struct TokenResponse {
     pub expires_in: u64,
 }
 
-/// `POST /auth/refresh` / `POST /auth/logout` body.
-#[derive(Debug, Deserialize)]
+/// `POST /auth/refresh` / `POST /auth/logout` body. Optional: a browser supplies the refresh
+/// token through the `gt_refresh` httpOnly cookie instead, so the JSON body may be absent.
+#[derive(Debug, Default, Deserialize)]
 pub struct RefreshRequest {
-    /// The opaque refresh token previously issued.
-    pub refresh_token: String,
+    /// The opaque refresh token previously issued. Absent ⇒ read from the cookie.
+    pub refresh_token: Option<String>,
 }
 
 /// `GET /auth/me` body — the verified identity behind the bearer token.
@@ -142,22 +176,27 @@ pub struct MeResponse {
 async fn login(
     State(state): State<AuthState>,
     Json(body): Json<LoginRequest>,
-) -> Result<Json<TokenResponse>, AuthError> {
+) -> Result<(HeaderMap, Json<TokenResponse>), AuthError> {
     let creds = Credentials::EmailPassword {
         email: body.email,
         password: body.password,
     };
     let identity = state.login.login(&creds).await?;
-    Ok(Json(issue_tokens(&state, identity.sub, identity.workspace, identity.scopes)?))
+    let tokens = issue_tokens(&state, identity.sub, identity.workspace, identity.scopes)?;
+    // Set httpOnly cookies for the browser (SSE + refresh) while still returning the JSON body
+    // for non-browser clients (`hq-web-extras.1`).
+    Ok((set_token_cookies(&state, &tokens), Json(tokens)))
 }
 
 async fn refresh(
     State(state): State<AuthState>,
-    Json(body): Json<RefreshRequest>,
-) -> Result<Json<TokenResponse>, ApiError> {
+    headers: HeaderMap,
+    body: Option<Json<RefreshRequest>>,
+) -> Result<(HeaderMap, Json<TokenResponse>), ApiError> {
+    // Prefer the httpOnly cookie (browser); fall back to the JSON body (non-browser clients).
+    let token = refresh_token_from(&headers, body).ok_or(ApiError::Unauthenticated)?;
     let now = (state.now)();
-    let token = RefreshToken::new(body.refresh_token);
-    let (next, record) = state.refresh.rotate(&token, now)?;
+    let (next, record) = state.refresh.rotate(&RefreshToken::new(token), now)?;
     // Re-mint a faithful access token from the record's carried scopes.
     let claims = JwtClaims {
         sub: record.sub,
@@ -168,21 +207,27 @@ async fn refresh(
         iat: now,
     };
     let access_token = state.minter.mint(&claims)?;
-    Ok(Json(TokenResponse {
+    let tokens = TokenResponse {
         access_token,
         refresh_token: next.as_str().to_owned(),
         token_type: "Bearer",
         expires_in: state.access_ttl,
-    }))
+    };
+    Ok((set_token_cookies(&state, &tokens), Json(tokens)))
 }
 
-async fn logout(State(state): State<AuthState>, Json(body): Json<RefreshRequest>) -> StatusCode {
-    // Idempotent: revoking an unknown token is a no-op, so logout always succeeds and cannot
-    // probe which tokens exist.
-    state
-        .refresh
-        .revoke_by_token(&RefreshToken::new(body.refresh_token));
-    StatusCode::NO_CONTENT
+async fn logout(
+    State(state): State<AuthState>,
+    headers: HeaderMap,
+    body: Option<Json<RefreshRequest>>,
+) -> (HeaderMap, StatusCode) {
+    // Idempotent: revoking an unknown/absent token is a no-op, so logout always succeeds and
+    // cannot probe which tokens exist. Either source (cookie or body) is honoured, and the
+    // cookies are cleared regardless.
+    if let Some(token) = refresh_token_from(&headers, body) {
+        state.refresh.revoke_by_token(&RefreshToken::new(token));
+    }
+    (clear_token_cookies(&state), StatusCode::NO_CONTENT)
 }
 
 async fn me(claims: Option<Extension<JwtClaims>>) -> Result<Json<MeResponse>, ApiError> {
@@ -226,6 +271,70 @@ fn issue_tokens(
         token_type: "Bearer",
         expires_in: state.access_ttl,
     })
+}
+
+// --- cookies (hq-web-extras.1 / .2) -----------------------------------------------------------
+
+/// Resolve the refresh token from the request: the `gt_refresh` httpOnly cookie first (browser),
+/// then the JSON body (non-browser clients). `None` ⇒ neither carried one.
+fn refresh_token_from(headers: &HeaderMap, body: Option<Json<RefreshRequest>>) -> Option<String> {
+    read_cookie(headers, REFRESH_COOKIE)
+        .map(str::to_owned)
+        .or_else(|| body.and_then(|Json(b)| b.refresh_token))
+        .filter(|t| !t.is_empty())
+}
+
+/// Read a single cookie value out of the request's `Cookie` header. No external cookie crate:
+/// the header is `name=value` pairs separated by `;`, and our tokens are JWT / opaque-base64
+/// (no `;` or `,`), so a split is sufficient and unambiguous.
+fn read_cookie<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> {
+    headers
+        .get(header::COOKIE)?
+        .to_str()
+        .ok()?
+        .split(';')
+        .find_map(|kv| {
+            let (k, v) = kv.split_once('=')?;
+            (k.trim() == name).then(|| v.trim())
+        })
+}
+
+/// The `Set-Cookie` header pair stamped on login/refresh: the access JWT (path `/`, so the SSE
+/// endpoint and the whole app see it) and the refresh token (path `/auth`, so it rides only the
+/// refresh/logout calls). Both `HttpOnly`, with the configured `Secure`/`SameSite`.
+fn set_token_cookies(state: &AuthState, tokens: &TokenResponse) -> HeaderMap {
+    let mut headers = HeaderMap::new();
+    headers.append(
+        header::SET_COOKIE,
+        build_cookie(state, ACCESS_COOKIE, &tokens.access_token, "/", state.access_ttl as i64),
+    );
+    headers.append(
+        header::SET_COOKIE,
+        build_cookie(state, REFRESH_COOKIE, &tokens.refresh_token, "/auth", state.refresh_ttl as i64),
+    );
+    headers
+}
+
+/// The `Set-Cookie` header pair that expires both auth cookies (`Max-Age=0`, empty value) on
+/// logout — same name/path as [`set_token_cookies`], which is what makes the browser drop them.
+fn clear_token_cookies(state: &AuthState) -> HeaderMap {
+    let mut headers = HeaderMap::new();
+    headers.append(header::SET_COOKIE, build_cookie(state, ACCESS_COOKIE, "", "/", 0));
+    headers.append(header::SET_COOKIE, build_cookie(state, REFRESH_COOKIE, "", "/auth", 0));
+    headers
+}
+
+/// Build one `Set-Cookie` value. `value` is a JWT or opaque token (ASCII, no cookie-special
+/// chars), so it needs no escaping.
+fn build_cookie(state: &AuthState, name: &str, value: &str, path: &str, max_age: i64) -> HeaderValue {
+    let mut s = format!(
+        "{name}={value}; Path={path}; HttpOnly; Max-Age={max_age}; SameSite={}",
+        state.cookie_same_site.as_str()
+    );
+    if state.cookie_secure {
+        s.push_str("; Secure");
+    }
+    HeaderValue::from_str(&s).expect("cookie attributes + token are ASCII")
 }
 
 // --- error mapping ----------------------------------------------------------------------------
@@ -330,11 +439,30 @@ mod tests {
             access_ttl: 900,
             refresh_ttl: 1_209_600,
             now: Arc::new(|| 1_000_000_000),
+            cookie_secure: true,
+            cookie_same_site: SameSite::Lax,
             // Publish the public half of the same "k1" key the minter signs with.
             jwks: Arc::new(
                 JwtAuthenticator::from_kid_pems([("k1", PUB_PEM)]).unwrap().jwk_set(),
             ),
         }
+    }
+
+    /// Collect the `Set-Cookie` values off a response, lowest-level helper for the cookie tests.
+    async fn login_response(app: &Router) -> axum::response::Response {
+        app.clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/auth/login")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"email":"alice@acme.test","password":"hunter2"}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
     }
 
     async fn get(app: &Router, path: &str) -> (StatusCode, String) {
@@ -508,5 +636,72 @@ mod tests {
                 .unwrap();
         let rebuilt = JwtAuthenticator::empty().with_key_kid("k1", key);
         assert_eq!(rebuilt.authenticate(&access).unwrap().sub, "alice");
+    }
+
+    fn set_cookies(resp: &axum::response::Response) -> Vec<String> {
+        resp.headers()
+            .get_all(header::SET_COOKIE)
+            .iter()
+            .map(|v| v.to_str().unwrap().to_owned())
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn login_sets_httponly_access_and_refresh_cookies() {
+        let resp = login_response(&auth_router(state())).await;
+        let cookies = set_cookies(&resp);
+        let access = cookies.iter().find(|c| c.starts_with("gt_web_token=")).unwrap();
+        let refresh = cookies.iter().find(|c| c.starts_with("gt_refresh=")).unwrap();
+        // access cookie: httpOnly, site-wide, the configured flags.
+        assert!(access.contains("HttpOnly") && access.contains("Path=/"));
+        assert!(access.contains("SameSite=Lax") && access.contains("Secure"));
+        // refresh cookie: httpOnly, scoped to /auth.
+        assert!(refresh.contains("HttpOnly") && refresh.contains("Path=/auth"));
+    }
+
+    #[tokio::test]
+    async fn refresh_reads_the_cookie_when_the_body_is_absent() {
+        let app = auth_router(state());
+        let login = login_response(&app).await;
+        let refresh_cookie = set_cookies(&login)
+            .into_iter()
+            .find(|c| c.starts_with("gt_refresh="))
+            .map(|c| c.split(';').next().unwrap().to_owned())
+            .unwrap();
+
+        // No JSON body — the token rides the cookie alone.
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/auth/refresh")
+                    .header(header::COOKIE, refresh_cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        // And it re-sets a fresh, rotated refresh cookie.
+        assert!(set_cookies(&resp).iter().any(|c| c.starts_with("gt_refresh=")));
+    }
+
+    #[tokio::test]
+    async fn logout_clears_both_cookies() {
+        let resp = auth_router(state())
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/auth/logout")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+        let cookies = set_cookies(&resp);
+        assert!(cookies.iter().any(|c| c.starts_with("gt_web_token=") && c.contains("Max-Age=0")));
+        assert!(cookies.iter().any(|c| c.starts_with("gt_refresh=") && c.contains("Max-Age=0")));
     }
 }
