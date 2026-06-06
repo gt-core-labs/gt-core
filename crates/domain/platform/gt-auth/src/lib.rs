@@ -111,6 +111,9 @@ mod provider_repo;
 #[cfg(feature = "oauth")]
 mod authz_state;
 
+#[cfg(feature = "oauth")]
+mod cli_code;
+
 pub use error::AuthError;
 pub use provider::{Credentials, IdentityProvider, ProviderKind, VerifiedIdentity};
 pub use refresh::{
@@ -181,6 +184,11 @@ pub mod migrations {
     /// ordinary web login (its absence preserves the existing behaviour).
     pub const ADD_CLI_REDIRECT: &str =
         include_str!("../migrations/auth/0009__add_cli_redirect.sql");
+    /// `0010` — the one-shot CLI hand-off code store (`public.oauth_cli_code`,
+    /// hq-gt-login-oauth.2): the short-lived row the callback parks a `gt login` token pair on under
+    /// an opaque `code`, redeemed once at `POST /auth/cli/exchange`.
+    pub const CREATE_OAUTH_CLI_CODE: &str =
+        include_str!("../migrations/auth/0010__create_oauth_cli_code.sql");
 }
 
 #[cfg(feature = "jsonwebtoken")]
@@ -253,8 +261,18 @@ pub use provider_repo::PgProviderRepo;
 #[cfg(feature = "oauth")]
 pub use authz_state::{new_pkce, AuthzStateRepo, NewAuthz, PendingAuthz, Pkce};
 
+/// The one-shot CLI hand-off code store (hq-gt-login-oauth.2): the `CliCodeRepo` port the
+/// `/auth/callback`→`/auth/cli/exchange` `gt login` flow parks the minted token pair on, plus the
+/// `NewCliCode`/`PendingCliCode` row shapes. The Postgres adapter `PgCliCodeRepo` is additionally
+/// gated by `pg`.
+#[cfg(feature = "oauth")]
+pub use cli_code::{CliCodeRepo, NewCliCode, PendingCliCode};
+
 #[cfg(all(feature = "oauth", feature = "pg"))]
 pub use authz_state::PgAuthzStateRepo;
+
+#[cfg(all(feature = "oauth", feature = "pg"))]
+pub use cli_code::PgCliCodeRepo;
 
 #[cfg(test)]
 pub use provider::InMemoryIdentityProvider;

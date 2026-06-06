@@ -645,6 +645,10 @@ async fn main() -> anyhow::Result<()> {
                 // `gt login` browser handshake can park the loopback URL the callback 302s a one-shot
                 // code back to. ALTER ... ADD COLUMN IF NOT EXISTS, idempotent like the rest.
                 gt_auth::migrations::ADD_CLI_REDIRECT,
+                // hq-gt-login-oauth.2: the one-shot CLI hand-off code store, where /auth/callback
+                // parks a `gt login` token pair under an opaque code for /auth/cli/exchange to
+                // redeem. CREATE TABLE IF NOT EXISTS, idempotent like the rest.
+                gt_auth::migrations::CREATE_OAUTH_CLI_CODE,
                 // hq-security-pat.1: the per-workspace Personal Access Token store, defined in the
                 // ws_default template so gt_create_workspace_schema clones it into every tenant —
                 // the table the PAT verifier + the self-service /auth/tokens surface read.
@@ -729,6 +733,14 @@ async fn main() -> anyhow::Result<()> {
                 authz_state: db_oauth.as_ref().map(|_| {
                     Arc::new(gt_auth::PgAuthzStateRepo::new(pool.clone()))
                         as Arc<dyn gt_auth::AuthzStateStore>
+                }),
+                // hq-gt-login-oauth.2: the one-shot CLI hand-off code store
+                // (`public.oauth_cli_code`, migrated above), so `/auth/callback` can park a
+                // `gt login` token pair under an opaque code and `/auth/cli/exchange` redeem it.
+                #[cfg(feature = "oauth")]
+                cli_code: db_oauth.as_ref().map(|_| {
+                    Arc::new(gt_auth::PgCliCodeRepo::new(pool.clone()))
+                        as Arc<dyn gt_auth::CliCodeStore>
                 }),
                 #[cfg(feature = "oauth")]
                 fe_redirect_url: std::env::var("GT_OAUTH_FE_REDIRECT_URL")

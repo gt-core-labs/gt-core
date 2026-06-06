@@ -439,6 +439,32 @@ impl AuthzStateStore for crate::PgAuthzStateRepo {
     }
 }
 
+/// The one-shot CLI hand-off code port behind the `gt login` `/callback`→`/auth/cli/exchange` flow
+/// (hq-gt-login-oauth.2): park the minted token pair under an opaque `code` on the callback, then
+/// ONE-SHOT consume it at the exchange (so a captured loopback URL is useless after first use). The
+/// production adapter is [`PgCliCodeRepo`](crate::PgCliCodeRepo).
+#[cfg(feature = "oauth")]
+#[async_trait]
+pub trait CliCodeStore: Send + Sync {
+    /// Persist a minted hand-off code (the callback leg).
+    async fn insert(&self, code: crate::NewCliCode) -> Result<(), AuthError>;
+    /// Atomically delete + return the row for `code`, or `None` if absent/already-consumed.
+    async fn consume(&self, code: &str) -> Result<Option<crate::PendingCliCode>, AuthError>;
+}
+
+/// The production [`CliCodeStore`]: insert/consume over `public.oauth_cli_code`. Available when both
+/// `oauth` and `pg` are on.
+#[cfg(all(feature = "oauth", feature = "pg"))]
+#[async_trait]
+impl CliCodeStore for crate::PgCliCodeRepo {
+    async fn insert(&self, code: crate::NewCliCode) -> Result<(), AuthError> {
+        crate::CliCodeRepo::insert(self, code).await
+    }
+    async fn consume(&self, code: &str) -> Result<Option<crate::PendingCliCode>, AuthError> {
+        crate::CliCodeRepo::consume(self, code).await
+    }
+}
+
 /// The OAuth redirect-flow port behind `/authorize` + `/callback` (hq-idp-db.3): build the IdP
 /// authorization URL for a provider (with `state` + PKCE `code_challenge`), and finish the flow by
 /// exchanging the returned `code` (replaying the `code_verifier`) into a [`VerifiedIdentity`] — the
@@ -585,6 +611,12 @@ pub struct AuthState {
     /// The production adapter is [`PgAuthzStateRepo`](crate::PgAuthzStateRepo).
     #[cfg(feature = "oauth")]
     pub authz_state: Option<Arc<dyn AuthzStateStore>>,
+    /// The one-shot CLI hand-off code store behind the `gt login` browser flow
+    /// (hq-gt-login-oauth.2): the callback parks the minted token pair here under an opaque code and
+    /// 302s it to the CLI loopback; `POST /auth/cli/exchange` redeems it. `None` ⇒ a `cli_redirect`
+    /// handshake responds `501`. The production adapter is [`PgCliCodeRepo`](crate::PgCliCodeRepo).
+    #[cfg(feature = "oauth")]
+    pub cli_code: Option<Arc<dyn CliCodeStore>>,
     /// Where `GET /auth/callback` sends the browser after a successful login (hq-idp-db.3): the FE
     /// landing URL the freshly minted tokens are handed off to (via a short-lived URL fragment, plus
     /// the httpOnly auth cookies). `None` ⇒ the callback returns the token JSON directly (useful for
@@ -657,7 +689,9 @@ pub fn auth_router(state: AuthState) -> Router {
         // PUBLIC authorize redirect (hq-idp-db.3): 302 to the IdP with state + PKCE challenge.
         .route("/auth/providers/:id/authorize", get(authorize))
         // PUBLIC callback (hq-idp-db.3): validate+consume state, redeem the code, issue tokens.
-        .route("/auth/callback", get(callback));
+        .route("/auth/callback", get(callback))
+        // PUBLIC CLI hand-off exchange (hq-gt-login-oauth.2): redeem the one-shot `gt login` code.
+        .route("/auth/cli/exchange", post(cli_exchange));
     router.with_state(state)
 }
 
@@ -2045,6 +2079,39 @@ async fn callback(
         .exchange(&pending.provider_id, &params.code, &pending.code_verifier)
         .await?;
     let tokens = issue_tokens(&state, identity.sub, identity.workspace, identity.scopes).await?;
+
+    // CLI hand-off (hq-gt-login-oauth.2): a `gt login` handshake carried a loopback `cli_redirect`.
+    // The loopback can't read a URL fragment and the token pair is too sensitive for a query string,
+    // so park the pair under a fresh opaque one-shot code (~60s TTL) and 302 ONLY that code to the
+    // loopback. No auth cookies — they are for the same-origin web app, not 127.0.0.1.
+    if let Some(cli_redirect) = pending.cli_redirect.as_deref() {
+        let codes = state.cli_code.as_ref().ok_or(ApiError::NotConfigured)?;
+        let code = csrf_token().map_err(ApiError::Auth)?;
+        let now = (state.now)();
+        codes
+            .insert(crate::NewCliCode {
+                code: code.clone(),
+                access_token: tokens.access_token,
+                refresh_token: tokens.refresh_token,
+                token_type: tokens.token_type.to_owned(),
+                expires_in: tokens.expires_in,
+                created_at: now,
+                expires_at: now + CLI_CODE_TTL_SECS,
+            })
+            .await?;
+        // Append `code` to the loopback URL, respecting any existing query string.
+        let sep = if cli_redirect.contains('?') { '&' } else { '?' };
+        let location = format!("{cli_redirect}{sep}code={}", url_encode(&code));
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::LOCATION,
+            HeaderValue::from_str(&location).map_err(|_| {
+                ApiError::Auth(AuthError::Backend("invalid CLI loopback URL".into()))
+            })?,
+        );
+        return Ok((StatusCode::FOUND, headers).into_response());
+    }
+
     let mut headers = set_token_cookies(&state, &tokens);
     match state.fe_redirect_url.as_deref() {
         // Browser handoff: 302 to the FE with the access token in a short-lived URL fragment (never
@@ -2080,10 +2147,61 @@ pub struct CallbackParams {
     pub state: String,
 }
 
+/// `POST /auth/cli/exchange` body — the one-shot hand-off `code` the CLI loopback received.
+#[cfg(feature = "oauth")]
+#[derive(Debug, Deserialize)]
+#[cfg_attr(feature = "axum", derive(utoipa::ToSchema))]
+pub struct CliExchangeRequest {
+    /// The opaque one-shot code 302'd to the loopback by `/auth/callback`.
+    pub code: String,
+}
+
+/// `POST /auth/cli/exchange` (PUBLIC, no auth) — redeem a one-shot `gt login` hand-off code
+/// (hq-gt-login-oauth.2) for the token pair the callback parked. ONE-SHOT: an unknown / replayed /
+/// expired code is `401`; `501` when the code store is not configured.
+#[cfg_attr(feature = "axum", utoipa::path(
+    post, path = "/auth/cli/exchange", tag = "auth",
+    request_body = CliExchangeRequest,
+    responses(
+        (status = 200, description = "Redeemed — the access + refresh token pair", body = TokenResponse),
+        (status = 401, description = "Unknown / already-redeemed / expired code"),
+        (status = 501, description = "CLI hand-off code store not configured"),
+    ),
+))]
+#[cfg(feature = "oauth")]
+async fn cli_exchange(
+    State(state): State<AuthState>,
+    Json(body): Json<CliExchangeRequest>,
+) -> Result<Json<TokenResponse>, ApiError> {
+    let codes = state.cli_code.as_ref().ok_or(ApiError::NotConfigured)?;
+    // One-shot consume: an unknown / already-redeemed code is gone, so a captured loopback URL can
+    // never be replayed. A `401` — the caller must restart the login.
+    let pending = codes
+        .consume(&body.code)
+        .await?
+        .ok_or(ApiError::Unauthenticated)?;
+    if (state.now)() > pending.expires_at {
+        return Err(ApiError::Unauthenticated);
+    }
+    Ok(Json(TokenResponse {
+        access_token: pending.access_token,
+        refresh_token: pending.refresh_token,
+        // The stored type is always "Bearer"; TokenResponse carries the static str.
+        token_type: "Bearer",
+        expires_in: pending.expires_in,
+    }))
+}
+
 /// The TTL of a pending `/authorize` handshake — 10 minutes is ample for a human IdP round-trip
 /// while keeping a leaked/abandoned `state` short-lived (hq-idp-db.3).
 #[cfg(feature = "oauth")]
 const AUTHZ_STATE_TTL_SECS: u64 = 600;
+
+/// One-shot CLI hand-off code TTL (hq-gt-login-oauth.2): the window between the callback parking the
+/// token pair and the CLI redeeming it at `/auth/cli/exchange`. Short — the CLI redeems immediately;
+/// 60s only tolerates clock skew + the loopback round-trip.
+#[cfg(feature = "oauth")]
+const CLI_CODE_TTL_SECS: u64 = 60;
 
 /// A fresh anti-CSRF `state`: 32 CSPRNG bytes, base64url (no padding). High-entropy + opaque, so it
 /// is both unguessable (CSRF defence) and a safe primary key for the pending-state row.
@@ -3006,6 +3124,8 @@ mod tests {
             authz_flow: None,
             #[cfg(feature = "oauth")]
             authz_state: None,
+            #[cfg(feature = "oauth")]
+            cli_code: None,
             #[cfg(feature = "oauth")]
             fe_redirect_url: None,
             // Publish the public half of the same "k1" key the minter signs with.
@@ -4352,6 +4472,35 @@ mod tests {
             }
         }
 
+        /// An in-memory one-shot [`CliCodeStore`]: insert + delete-on-read, the durable adapter's
+        /// contract without Postgres (exercises the CLI hand-off replay rejection).
+        #[derive(Default)]
+        struct MemCliCode {
+            rows: Mutex<HashMap<String, crate::PendingCliCode>>,
+        }
+        #[async_trait]
+        impl CliCodeStore for MemCliCode {
+            async fn insert(&self, code: crate::NewCliCode) -> Result<(), AuthError> {
+                self.rows.lock().unwrap().insert(
+                    code.code,
+                    crate::PendingCliCode {
+                        access_token: code.access_token,
+                        refresh_token: code.refresh_token,
+                        token_type: code.token_type,
+                        expires_in: code.expires_in,
+                        expires_at: code.expires_at,
+                    },
+                );
+                Ok(())
+            }
+            async fn consume(
+                &self,
+                code: &str,
+            ) -> Result<Option<crate::PendingCliCode>, AuthError> {
+                Ok(self.rows.lock().unwrap().remove(code))
+            }
+        }
+
         /// A generic-kind record whose endpoints point at `base`, sealing `secret` with the test key.
         fn record(base: &str, id: &str, enabled: bool) -> ProviderRecord {
             std::env::set_var(
@@ -4422,7 +4571,10 @@ mod tests {
         /// Build an [`AuthState`] wired with the discovery store + the DB resolver as both
         /// `authz_flow` and `oauth_login`, plus the in-memory state store. `fe` is the optional FE
         /// redirect URL.
-        fn flow_state(base: &str, fe: Option<&str>) -> (AuthState, Arc<MemAuthzState>) {
+        fn flow_state(
+            base: &str,
+            fe: Option<&str>,
+        ) -> (AuthState, Arc<MemAuthzState>, Arc<MemCliCode>) {
             let providers = Arc::new(MapProviders::default());
             providers
                 .rows
@@ -4444,14 +4596,16 @@ mod tests {
                 .unwrap(),
             );
             let authz_state = Arc::new(MemAuthzState::default());
+            let cli_code = Arc::new(MemCliCode::default());
             let st = AuthState {
                 providers: Some(providers as Arc<dyn ProviderStore>),
                 authz_flow: Some(resolver as Arc<dyn OauthAuthzFlow>),
                 authz_state: Some(authz_state.clone() as Arc<dyn AuthzStateStore>),
+                cli_code: Some(cli_code.clone() as Arc<dyn CliCodeStore>),
                 fe_redirect_url: fe.map(str::to_owned),
                 ..state()
             };
-            (st, authz_state)
+            (st, authz_state, cli_code)
         }
 
         /// Pull the single `Location` header off a response.
@@ -4468,7 +4622,7 @@ mod tests {
         #[tokio::test]
         async fn public_discovery_lists_enabled_without_secret() {
             let base = spawn_idp().await;
-            let (st, _) = flow_state(&base, None);
+            let (st, _, _) = flow_state(&base, None);
             let app = auth_router(st);
             let resp = app
                 .oneshot(
@@ -4498,7 +4652,7 @@ mod tests {
         #[tokio::test]
         async fn authorize_redirects_with_state_and_pkce_challenge() {
             let base = spawn_idp().await;
-            let (st, store) = flow_state(&base, None);
+            let (st, store, _) = flow_state(&base, None);
             let app = auth_router(st);
             let resp = app
                 .oneshot(
@@ -4547,7 +4701,7 @@ mod tests {
         #[tokio::test]
         async fn authorize_then_callback_issues_tokens_and_state_is_one_shot() {
             let base = spawn_idp().await;
-            let (st, _store) = flow_state(&base, None);
+            let (st, _store, _) = flow_state(&base, None);
             let app = auth_router(st);
 
             // Authorize, capture the state the server minted.
@@ -4603,11 +4757,100 @@ mod tests {
             assert_eq!(replay.status(), StatusCode::UNAUTHORIZED);
         }
 
+        /// CLI hand-off (hq-gt-login-oauth.2): authorize with a loopback `cli_redirect` → the
+        /// callback 302s a one-shot `code` to that loopback (no token in the URL), and
+        /// `/auth/cli/exchange` redeems the code ONCE for the token pair (a replay is `401`).
+        #[tokio::test]
+        async fn cli_redirect_hands_off_a_one_shot_code() {
+            let base = spawn_idp().await;
+            let (st, _store, _cli) = flow_state(&base, Some("https://app.gt.test/landed"));
+            let app = auth_router(st);
+
+            // Authorize carrying a loopback cli_redirect; capture the minted state.
+            let authz = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri("/auth/providers/corp/authorize?cli_redirect=http://127.0.0.1:8976/callback")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(authz.status(), StatusCode::FOUND);
+            let state_param = location(&authz)
+                .split("state=")
+                .nth(1)
+                .unwrap()
+                .split('&')
+                .next()
+                .unwrap()
+                .to_owned();
+
+            // Callback: despite a configured FE, the CLI handshake 302s to the LOOPBACK with a
+            // `code` query param — and NO token anywhere in the URL.
+            let cb = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri(format!("/auth/callback?code=good-code&state={state_param}"))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(cb.status(), StatusCode::FOUND);
+            let loc = location(&cb);
+            assert!(
+                loc.starts_with("http://127.0.0.1:8976/callback?code="),
+                "loc: {loc}"
+            );
+            assert!(
+                !loc.contains("access_token"),
+                "token must not be in the URL: {loc}"
+            );
+            let code = loc.split("code=").nth(1).unwrap().to_owned();
+
+            // Exchange the code → the token pair.
+            let ex = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/auth/cli/exchange")
+                        .header("content-type", "application/json")
+                        .body(Body::from(format!(r#"{{"code":"{code}"}}"#)))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(ex.status(), StatusCode::OK);
+            let bytes = axum::body::to_bytes(ex.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            let (access, refresh) = token_pair(&String::from_utf8(bytes.to_vec()).unwrap());
+            assert!(!access.is_empty() && !refresh.is_empty());
+
+            // Replaying the same code is rejected — it was consumed one-shot → 401.
+            let replay = app
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/auth/cli/exchange")
+                        .header("content-type", "application/json")
+                        .body(Body::from(format!(r#"{{"code":"{code}"}}"#)))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(replay.status(), StatusCode::UNAUTHORIZED);
+        }
+
         /// An unknown `state` at the callback is a 401 (anti-CSRF), never a token.
         #[tokio::test]
         async fn callback_with_unknown_state_is_401() {
             let base = spawn_idp().await;
-            let (st, _) = flow_state(&base, None);
+            let (st, _, _) = flow_state(&base, None);
             let app = auth_router(st);
             let resp = app
                 .oneshot(
@@ -4626,7 +4869,7 @@ mod tests {
         #[tokio::test]
         async fn callback_hands_tokens_to_the_fe_via_fragment() {
             let base = spawn_idp().await;
-            let (st, _) = flow_state(&base, Some("https://app.gt.test/auth/landed"));
+            let (st, _, _) = flow_state(&base, Some("https://app.gt.test/auth/landed"));
             let app = auth_router(st);
             let authz = app
                 .clone()
