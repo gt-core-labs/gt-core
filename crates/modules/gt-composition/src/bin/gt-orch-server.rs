@@ -79,6 +79,27 @@ fn env_usize(key: &str, default: usize) -> usize {
         .unwrap_or(default)
 }
 
+/// Resolve a stored claude-account `config_dir` to a path the daemon (HOST) can read
+/// (`hq-quota-onboard-web.5`). Onboarding writes the dir from inside the backend container, so the
+/// stored path is container-absolute; the daemon sees the same shared volume mounted elsewhere on
+/// the host. When `stored` does not exist here but a dir with the same basename exists under
+/// `host_accounts_root`, use the host one (same volume, same `<id>`). Otherwise return it unchanged:
+/// host-native dirs (the `GT_CLAUDE_ACCOUNTS` env bootstrap) already exist and pass through, and a
+/// path we cannot translate is left as-is (claude then falls back to its default, logged at sling).
+fn resolve_host_account_dir(stored: &str, host_accounts_root: &std::path::Path) -> String {
+    let p = std::path::Path::new(stored);
+    if p.exists() {
+        return stored.to_string();
+    }
+    if let Some(base) = p.file_name() {
+        let candidate = host_accounts_root.join(base);
+        if candidate.exists() {
+            return candidate.display().to_string();
+        }
+    }
+    stored.to_string()
+}
+
 /// Build the claude-account keychain from `GT_CLAUDE_ACCOUNTS` and seed the quota actor with the
 /// same accounts (`hq-agent-provisioning.7`). The env is a comma list of `account=CLAUDE_CONFIG_DIR`
 /// pairs; the first becomes the boot-active account (its creds the first polecat burns). Returns the
@@ -109,12 +130,19 @@ async fn seed_claude_accounts(
     let kc = InMemoryKeychain::new();
     let mut first: Option<String> = None;
 
-    // 1) Durable accounts from the log.
+    // 1) Durable accounts from the log. Translate each stored config_dir to a path the daemon (on
+    // the HOST) can actually read: onboarding writes the dir from INSIDE the backend container
+    // (hq-quota-onboard-web.4), so the stored path is container-absolute (/var/lib/gt-core/accounts/
+    // <id>), but the same shared volume mounts elsewhere on the host (/var/lib/docker/volumes/
+    // gt-app_gt-eventlog/_data/accounts/<id>). Resolve by basename under the host accounts root
+    // (hq-quota-onboard-web.5); host-native dirs (env bootstrap below) pass through unchanged.
+    let host_accounts_root = gt_composition::account_dirs::accounts_root(event_root);
     for (account, dir) in &state.registered {
+        let host_dir = resolve_host_account_dir(dir, &host_accounts_root);
         if kc
             .put(CredentialRecord {
                 account: account.clone(),
-                secret: dir.clone(),
+                secret: host_dir,
             })
             .is_ok()
         {
@@ -592,5 +620,33 @@ async fn wait_for_signal() {
             eprintln!("[gt-orch-server] signal install failed: {e}; running until killed externally");
             std::future::pending::<()>().await;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn resolve_translates_container_path_to_host_by_basename() {
+        let host = tempfile::tempdir().unwrap();
+        let id = "01ABCDEF";
+        std::fs::create_dir(host.path().join(id)).unwrap();
+
+        // A container-absolute path that does not exist on the host resolves to the host dir with
+        // the same basename.
+        let stored = format!("/var/lib/gt-core/accounts/{id}");
+        assert_eq!(
+            resolve_host_account_dir(&stored, host.path()),
+            host.path().join(id).display().to_string()
+        );
+
+        // A path that already exists (host-native env bootstrap) passes through unchanged.
+        let native = host.path().join(id).display().to_string();
+        assert_eq!(resolve_host_account_dir(&native, host.path()), native);
+
+        // Untranslatable (no matching basename under the host root) is left as-is.
+        let unknown = "/var/lib/gt-core/accounts/NOPE".to_string();
+        assert_eq!(resolve_host_account_dir(&unknown, host.path()), unknown);
     }
 }
