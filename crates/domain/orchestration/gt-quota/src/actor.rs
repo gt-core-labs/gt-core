@@ -74,6 +74,19 @@ pub enum QuotaMsg {
         to_account: String,
         now_secs: u64,
     },
+    /// Onboard a claude account with its credential dir (`hq-quota-accounts.1`): adds it as a
+    /// rotation candidate and emits `AccountRegistered` so the daemon's keychain hydrates from the
+    /// log. Idempotent.
+    RegisterAccount {
+        account: String,
+        config_dir: String,
+        now_secs: u64,
+    },
+    /// Retire an account (`hq-quota-accounts.1`): drops it and emits `AccountDeregistered`.
+    DeregisterAccount {
+        account: String,
+        now_secs: u64,
+    },
     /// Diagnostics: (live accounts, predictions emitted).
     Snapshot(oneshot::Sender<(usize, usize)>),
     /// Read-only snapshot of every registered account. The edge needs this to pick a healthy
@@ -227,6 +240,34 @@ impl QuotaHandle {
             .send(QuotaMsg::Rotated {
                 from_account: from_account.into(),
                 to_account: to_account.into(),
+                now_secs,
+            })
+            .await;
+    }
+
+    /// Onboard a claude account with its credential dir (`hq-quota-accounts.1`).
+    pub async fn register_account(
+        &self,
+        account: impl Into<String>,
+        config_dir: impl Into<String>,
+        now_secs: u64,
+    ) {
+        let _ = self
+            .tx
+            .send(QuotaMsg::RegisterAccount {
+                account: account.into(),
+                config_dir: config_dir.into(),
+                now_secs,
+            })
+            .await;
+    }
+
+    /// Retire a claude account (`hq-quota-accounts.1`).
+    pub async fn deregister_account(&self, account: impl Into<String>, now_secs: u64) {
+        let _ = self
+            .tx
+            .send(QuotaMsg::DeregisterAccount {
+                account: account.into(),
                 now_secs,
             })
             .await;
@@ -455,6 +496,31 @@ pub fn spawn_hydrated(
                         }))
                         .await;
                 }
+                QuotaMsg::RegisterAccount {
+                    account,
+                    config_dir,
+                    now_secs,
+                } => {
+                    // Make it a live rotation candidate (no window until the first probe); the
+                    // config_dir rides the event for the daemon's keychain hydration (.2).
+                    registry.upsert_account(crate::state::Account::new(&account));
+                    let _ = events
+                        .send(Envelope::root(QuotaEvent::AccountRegistered {
+                            account,
+                            config_dir,
+                            now_secs,
+                        }))
+                        .await;
+                }
+                QuotaMsg::DeregisterAccount { account, now_secs } => {
+                    registry.remove_account(&account);
+                    let _ = events
+                        .send(Envelope::root(QuotaEvent::AccountDeregistered {
+                            account,
+                            now_secs,
+                        }))
+                        .await;
+                }
                 QuotaMsg::Snapshot(reply) => {
                     let _ = reply.send((registry.accounts().count(), predictions_emitted));
                 }
@@ -482,4 +548,38 @@ pub fn spawn_hydrated(
     });
 
     QuotaHandle { tx }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::events::QuotaEvent;
+    use gt_events::EventKind;
+
+    #[tokio::test]
+    async fn register_account_emits_event_and_adds_a_candidate() {
+        // hq-quota-accounts.1: onboarding an account emits AccountRegistered (carrying the
+        // config_dir for keychain hydration) and makes it a live rotation candidate.
+        let (tx, mut rx) = mpsc::channel::<Envelope<QuotaEvent>>(8);
+        let q = spawn(tx, std::collections::HashMap::new());
+        q.register_account("acctB", "/vol/accounts/acctB", 100).await;
+
+        // Sync barrier: the emit happens inside the actor tick; a snapshot round-trip drains it.
+        let (accounts, _) = q.snapshot().await;
+        assert_eq!(accounts, 1, "registered account is a candidate in the live registry");
+
+        let env = rx.try_recv().expect("AccountRegistered emitted");
+        assert_eq!(env.payload.kind(), "quota.account_registered.v1");
+        match env.payload {
+            QuotaEvent::AccountRegistered { account, config_dir, .. } => {
+                assert_eq!(account, "acctB");
+                assert_eq!(config_dir, "/vol/accounts/acctB");
+            }
+            other => panic!("unexpected event: {other:?}"),
+        }
+
+        q.deregister_account("acctB", 200).await;
+        let (accounts, _) = q.snapshot().await;
+        assert_eq!(accounts, 0, "deregistered account dropped from the registry");
+    }
 }

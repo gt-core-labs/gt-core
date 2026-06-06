@@ -67,6 +67,22 @@ pub enum QuotaEvent {
         until_secs: Option<u64>,
         now_secs: u64,
     },
+    /// A claude account was onboarded for rotation (`hq-quota-accounts.1`): its id plus the
+    /// `config_dir` (a `CLAUDE_CONFIG_DIR` holding that account's logged-in creds). The durable,
+    /// event-sourced replacement for the boot-time `GT_CLAUDE_ACCOUNTS` env — the daemon rebuilds
+    /// its credential keychain by replaying these, so an account added live is picked up without an
+    /// env edit or a restart.
+    AccountRegistered {
+        account: String,
+        config_dir: String,
+        now_secs: u64,
+    },
+    /// A claude account was retired (`hq-quota-accounts.1`): the rotation pool drops it and the
+    /// keychain stops pointing at its creds.
+    AccountDeregistered {
+        account: String,
+        now_secs: u64,
+    },
 }
 
 impl EventKind for QuotaEvent {
@@ -79,6 +95,8 @@ impl EventKind for QuotaEvent {
             QuotaEvent::AccountLimited { .. } => "quota.account_limited.v1",
             QuotaEvent::Rotated { .. } => "quota.rotated.v1",
             QuotaEvent::Blocked { .. } => "quota.blocked.v1",
+            QuotaEvent::AccountRegistered { .. } => "quota.account_registered.v1",
+            QuotaEvent::AccountDeregistered { .. } => "quota.account_deregistered.v1",
         }
     }
 }

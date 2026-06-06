@@ -282,6 +282,10 @@ pub struct QuotaState {
     pub rotations: Vec<(String, String)>, // (from, to)
     pub limited: Vec<String>,
     pub blocked: Vec<String>,
+    /// Onboarded claude accounts → their `config_dir` (`CLAUDE_CONFIG_DIR`), rebuilt from
+    /// `AccountRegistered`/`AccountDeregistered` (`hq-quota-accounts.1`). The daemon replays this to
+    /// seed its credential keychain (`.2`), so it does not depend on the `GT_CLAUDE_ACCOUNTS` env.
+    pub registered: BTreeMap<String, String>,
 }
 
 impl QuotaState {
@@ -342,6 +346,20 @@ impl QuotaState {
                     a.status = AccountQuotaStatus::Blocked;
                 }
             }
+            QuotaEvent::AccountRegistered { account, config_dir, .. } => {
+                self.registered.insert(account.clone(), config_dir.clone());
+                // Make it a rotation candidate too (Healthy with no window yet; the window arrives
+                // from the first probe). Idempotent: re-register just refreshes the config_dir.
+                self.accounts.entry(account.clone()).or_insert_with(|| Account {
+                    id: account.clone(),
+                    status: AccountQuotaStatus::Healthy,
+                    window: None,
+                });
+            }
+            QuotaEvent::AccountDeregistered { account, .. } => {
+                self.registered.remove(account);
+                self.accounts.remove(account);
+            }
         }
     }
 }
@@ -349,6 +367,40 @@ impl QuotaState {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn account_register_then_deregister_roundtrips_through_the_reducer() {
+        // hq-quota-accounts.1: AccountRegistered populates the config_dir map AND makes the account
+        // a rotation candidate; AccountDeregistered drops both.
+        let mut s = QuotaState::default();
+        s.apply(&QuotaEvent::AccountRegistered {
+            account: "acctB".into(),
+            config_dir: "/vol/accounts/acctB".into(),
+            now_secs: 100,
+        });
+        assert_eq!(
+            s.registered.get("acctB").map(String::as_str),
+            Some("/vol/accounts/acctB")
+        );
+        assert!(s.accounts.contains_key("acctB"), "registered account is a candidate");
+        assert_eq!(s.accounts["acctB"].status, AccountQuotaStatus::Healthy);
+
+        // Re-register refreshes the dir, idempotent on the candidate set.
+        s.apply(&QuotaEvent::AccountRegistered {
+            account: "acctB".into(),
+            config_dir: "/vol/accounts/acctB-v2".into(),
+            now_secs: 200,
+        });
+        assert_eq!(s.registered["acctB"], "/vol/accounts/acctB-v2");
+        assert_eq!(s.accounts.len(), 1);
+
+        s.apply(&QuotaEvent::AccountDeregistered {
+            account: "acctB".into(),
+            now_secs: 300,
+        });
+        assert!(s.registered.is_empty());
+        assert!(!s.accounts.contains_key("acctB"));
+    }
 
     #[test]
     fn ewma_first_sample_sets_value() {
