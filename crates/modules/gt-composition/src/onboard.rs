@@ -250,6 +250,17 @@ where
     })
 }
 
+/// Append `prompt=select_account` to an authorize URL so the IdP shows the account chooser instead
+/// of silently reusing the browser's active session (`hq-quota-onboard-web.6`). Idempotent: skips if
+/// the param is already present. Uses `&` when the URL already has a query (it always does), else `?`.
+fn with_select_account(url: &str) -> String {
+    if url.contains("prompt=") {
+        return url.to_string();
+    }
+    let sep = if url.contains('?') { '&' } else { '?' };
+    format!("{url}{sep}prompt=select_account")
+}
+
 /// Pull the first `https://…`/`http://…` token out of a line, if any.
 fn extract_url(line: &str) -> Option<String> {
     let start = line.find("https://").or_else(|| line.find("http://"))?;
@@ -321,7 +332,15 @@ impl OnboardState {
                 _readers: readers,
             },
         );
-        Ok(StartResponse { session_id, url })
+        // Force the account chooser (hq-quota-onboard-web.6): without this, claude.ai reuses the
+        // browser's active session and authorizes THAT account — so onboarding a second, different
+        // account silently re-registers the first one. `prompt=select_account` is the standard OIDC
+        // hint to show the chooser even with a live session; if the IdP ignores it the param is
+        // harmless (the user falls back to an incognito window). Appended, not in the CLI-built URL.
+        Ok(StartResponse {
+            session_id,
+            url: with_select_account(&url),
+        })
     }
 
     /// Finish a login: feed the OOB code to the live process, wait for exit, read the account
@@ -475,6 +494,19 @@ fn cookie(headers: &HeaderMap, name: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn with_select_account_appends_once() {
+        assert_eq!(
+            with_select_account("https://x/authorize?code=true&client_id=a"),
+            "https://x/authorize?code=true&client_id=a&prompt=select_account"
+        );
+        // Idempotent / respects an existing prompt.
+        assert_eq!(
+            with_select_account("https://x/authorize?prompt=login"),
+            "https://x/authorize?prompt=login"
+        );
+    }
 
     #[test]
     fn extract_url_pulls_https_token() {
