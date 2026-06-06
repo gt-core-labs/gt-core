@@ -113,6 +113,26 @@ pub fn remove(base_repo: &Path, path: &Path) -> std::io::Result<()> {
     }
 }
 
+/// Seed the polecat's `.mcp.json` into a fresh worktree (`hq-orchd-deploy.10`). The file is
+/// machine-local (untracked, so it does NOT come with the worktree's checkout) yet the polecat's
+/// claude needs it to reach the `gt` MCP server. Copy it from the base rig checkout, which the
+/// operator configures once. Best-effort: a missing source (operator didn't place one) or an
+/// already-present target is a silent no-op — the caller treats MCP wiring as non-fatal.
+pub fn seed_mcp_config(base_repo: &Path, worktree: &Path) {
+    let src = base_repo.join(".mcp.json");
+    let dst = worktree.join(".mcp.json");
+    if dst.exists() || !src.exists() {
+        return;
+    }
+    if let Err(e) = std::fs::copy(&src, &dst) {
+        eprintln!(
+            "[polecat] .mcp.json seed {} -> {} skipped: {e}",
+            src.display(),
+            dst.display()
+        );
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -157,5 +177,50 @@ mod tests {
         let missing = std::env::temp_dir().join("gt-wt-definitely-absent-xyz");
         remove(&PathBuf::from("/nonexistent-base"), &missing)
             .expect("absent path is a no-op, no git call");
+    }
+
+    #[test]
+    fn seed_mcp_config_copies_from_base_when_absent_in_worktree() {
+        let uniq = format!(
+            "{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        let base = std::env::temp_dir().join(format!("gt-mcpseed-base-{uniq}"));
+        let wt = std::env::temp_dir().join(format!("gt-mcpseed-wt-{uniq}"));
+        std::fs::create_dir_all(&base).unwrap();
+        std::fs::create_dir_all(&wt).unwrap();
+        std::fs::write(base.join(".mcp.json"), r#"{"mcpServers":{}}"#).unwrap();
+
+        seed_mcp_config(&base, &wt);
+        assert_eq!(
+            std::fs::read_to_string(wt.join(".mcp.json")).unwrap(),
+            r#"{"mcpServers":{}}"#,
+            "the worktree got the base's .mcp.json"
+        );
+
+        // Idempotent + non-clobbering: a second call with a different source leaves it.
+        std::fs::write(base.join(".mcp.json"), "CHANGED").unwrap();
+        seed_mcp_config(&base, &wt);
+        assert_eq!(
+            std::fs::read_to_string(wt.join(".mcp.json")).unwrap(),
+            r#"{"mcpServers":{}}"#,
+            "existing target is not clobbered"
+        );
+
+        let _ = std::fs::remove_dir_all(&base);
+        let _ = std::fs::remove_dir_all(&wt);
+    }
+
+    #[test]
+    fn seed_mcp_config_is_silent_noop_without_a_source() {
+        let wt = std::env::temp_dir().join(format!("gt-mcpseed-nosrc-{}", std::process::id()));
+        std::fs::create_dir_all(&wt).unwrap();
+        seed_mcp_config(&PathBuf::from("/nonexistent-base"), &wt);
+        assert!(!wt.join(".mcp.json").exists());
+        let _ = std::fs::remove_dir_all(&wt);
     }
 }

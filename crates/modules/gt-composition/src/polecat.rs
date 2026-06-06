@@ -260,7 +260,18 @@ impl Plugin for PolecatSupervisorPlugin {
                 if let Some(root) = &self.worktree_root {
                     let wt = root.join(&spec.session);
                     match crate::worktree::provision(&self.template.workdir, &wt, &bead) {
-                        Ok(()) => spec.workdir = wt,
+                        Ok(()) => {
+                            // The worktree is a FRESH tree: the boot-time hook install + the
+                            // machine-local .mcp.json both live in the base rig checkout, not here
+                            // (hq-orchd-deploy.10). Re-provision them INTO the worktree, else the
+                            // polecat runs with no heartbeat/merge-ready hooks and no `gt` MCP.
+                            // Both best-effort — failures log and the polecat still slings.
+                            if let Err(e) = gt_polecat::install_polecat_hooks(&wt) {
+                                eprintln!("[polecat] hook install into worktree {} skipped: {e}", wt.display());
+                            }
+                            crate::worktree::seed_mcp_config(&self.template.workdir, &wt);
+                            spec.workdir = wt;
+                        }
                         Err(e) => eprintln!(
                             "[polecat] worktree provision failed for {bead} at {}: {e} — using shared checkout {}",
                             wt.display(),
@@ -534,6 +545,9 @@ mod tests {
         std::fs::write(base.join("f"), "x").unwrap();
         assert!(git(&["add", "."]));
         assert!(git(&["commit", "-qm", "init"]));
+        // A machine-local .mcp.json in the base (untracked) — provisioning must seed it into the
+        // worktree (hq-orchd-deploy.10), since an untracked file does not ride the checkout.
+        std::fs::write(base.join(".mcp.json"), r#"{"mcpServers":{"gt":{}}}"#).unwrap();
 
         let fake = Arc::new(FakeTmux::new());
         let tmux: Arc<dyn Tmux> = fake.clone();
@@ -570,6 +584,16 @@ mod tests {
             String::from_utf8_lossy(&head.stdout).trim(),
             "gg-1",
             "the worktree is on the bead's own branch"
+        );
+        // hq-orchd-deploy.10: the fresh worktree carries the report hooks + the seeded .mcp.json,
+        // so the polecat reports back (heartbeat/merge-ready) and reaches the gt MCP.
+        assert!(
+            wt.join(".claude/settings.json").exists(),
+            "polecat hooks installed into the worktree"
+        );
+        assert!(
+            wt.join(".mcp.json").exists(),
+            ".mcp.json seeded into the worktree from the base checkout"
         );
 
         let _ = std::process::Command::new("git")
