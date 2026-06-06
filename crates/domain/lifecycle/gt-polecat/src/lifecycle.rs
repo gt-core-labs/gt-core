@@ -213,12 +213,23 @@ impl SpawnTemplate {
     /// - `GT_CHANNEL_ROOT` → gt-channel mailbox root, layered into `base_env` when set so the
     ///   polecat's merge-ready hook knows where to drop its `{bead,branch}` message
     ///   (`hq-agent-provisioning.1`).
+    /// - `GT_POLECAT_ARGS` → fixed command args (space-split). Unset ⇒ for a `claude` command,
+    ///   defaults to `--dangerously-skip-permissions` so an autonomous polecat doesn't hang on the
+    ///   interactive trust/permission prompt (`hq-agent-provisioning.6`); for any other command,
+    ///   no args.
     pub fn from_env(workspace: &str) -> Self {
         let env = |k: &str| std::env::var(k).ok().filter(|v| !v.is_empty());
         let rig = env("GT_RIG").unwrap_or_else(|| "hq".to_string());
         let prefix = env("GT_POLECAT_PREFIX").unwrap_or_else(|| rig.clone());
         let workdir = PathBuf::from(env("GT_RIG_PATH").unwrap_or_else(|| ".".to_string()));
         let command = env("GT_POLECAT_CMD").unwrap_or_else(|| "claude".to_string());
+        let args = match env("GT_POLECAT_ARGS") {
+            Some(s) => s.split_whitespace().map(String::from).collect(),
+            None if command.ends_with("claude") => {
+                vec!["--dangerously-skip-permissions".to_string()]
+            }
+            None => Vec::new(),
+        };
         let heartbeat_dir = env("GT_HEARTBEAT_DIR")
             .map(PathBuf::from)
             .unwrap_or_else(std::env::temp_dir);
@@ -238,7 +249,7 @@ impl SpawnTemplate {
             prefix,
             workdir,
             command,
-            args: Vec::new(),
+            args,
             base_env,
             heartbeat_dir,
         }
@@ -257,6 +268,17 @@ impl SpawnTemplate {
         // The branch the polecat works the bead on (CLAUDE.md convention: `-b <bead-id>`); its
         // merge-ready hook reports `{bead, branch}` so the refinery submits the right branch.
         env.push(("GT_BRANCH".to_string(), member.to_string()));
+        // Seed the agent's task directive as the final positional arg (hq-agent-provisioning.6):
+        // without it a `claude` polecat opens an idle TUI and never works the bead. The workspace
+        // comes from base_env (GT_WORKSPACE); the branch is the bead id.
+        let workspace = self
+            .base_env
+            .iter()
+            .find(|(k, _)| k == GT_WORKSPACE)
+            .map(|(_, v)| v.as_str())
+            .unwrap_or("default");
+        let mut args = self.args.clone();
+        args.push(polecat_prompt(workspace, member, member));
         SpawnSpec {
             session,
             rig: self.rig.clone(),
@@ -264,13 +286,31 @@ impl SpawnTemplate {
             crew: None,
             workdir: self.workdir.clone(),
             command: self.command.clone(),
-            args: self.args.clone(),
+            args,
             env,
             hook_bead: Some(member.to_string()),
             issue: None,
             heartbeat,
         }
     }
+}
+
+/// The task directive seeded as the polecat agent's first prompt (`hq-agent-provisioning.6`).
+///
+/// A `claude` polecat launched bare opens an interactive TUI and idles — it never works its bead.
+/// Passing this string as the command's positional `[prompt]` makes it work the bead autonomously:
+/// its hooks then fire (PostToolUse → heartbeat; Stop → merge-ready). The agent reads the bead via
+/// the `gt` MCP tools, authenticated by the `GT_TOKEN` the daemon minted into its env
+/// (`hq-agent-provisioning.3`).
+pub fn polecat_prompt(workspace: &str, bead: &str, branch: &str) -> String {
+    format!(
+        "You are an autonomous gt polecat working in workspace `{workspace}`. Your assigned bead is \
+         `{bead}`. Read that bead and its acceptance criteria from the gt issue tracker (the `gt` MCP \
+         tools, authenticated by the GT_TOKEN in your environment), then implement it end-to-end in \
+         this checkout and commit your work on branch `{branch}`. Follow the repository conventions \
+         in CLAUDE.md. Work autonomously and do not ask for confirmation; when the work is delivered \
+         and committed, stop."
+    )
 }
 
 /// Production polecat spawner — the Rust replacement for the Go `gt sling` subprocess
@@ -345,6 +385,28 @@ mod lifecycle_tests {
         assert!(spec.env.iter().any(|(k, v)| k == "GT_CONVOY" && v == "cv-1"));
         let full = spec.env_with_hook();
         assert!(full.iter().any(|(k, v)| k == GT_HOOK_BEAD && v == "hq-abc.1"));
+    }
+
+    #[test]
+    fn spec_seeds_the_bead_task_prompt_after_the_fixed_flags() {
+        // hq-agent-provisioning.6: the per-bead task directive is the LAST positional arg, after the
+        // template's fixed flags — so a `claude` polecat works the bead instead of idling.
+        let spec = template().spec_for("cv-1", "hq-abc.1");
+        assert!(
+            spec.args
+                .iter()
+                .any(|a| a == "--dangerously-skip-permissions"),
+            "fixed launch flag preserved"
+        );
+        let prompt = spec.args.last().expect("a task prompt is appended");
+        assert!(prompt.contains("hq-abc.1"), "prompt names the bead");
+        assert!(prompt.contains("autonomous"), "prompt directs autonomy");
+    }
+
+    #[test]
+    fn polecat_prompt_names_workspace_bead_and_branch() {
+        let p = polecat_prompt("acme", "hq-9.2", "feat/x");
+        assert!(p.contains("acme") && p.contains("hq-9.2") && p.contains("feat/x"));
     }
 
     #[test]

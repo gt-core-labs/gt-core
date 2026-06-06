@@ -24,8 +24,8 @@ pub use install::{install_polecat_hooks, polecat_settings_json};
 pub use pool::{AllocError, ExhaustedScope, PoolAllocator};
 pub use module::SessionsModule;
 pub use lifecycle::{
-    spawn_process, spawn_tmux, PolecatLifecycle, SpawnSpec, SpawnTemplate, SpawnedPolecat,
-    GT_WORKSPACE,
+    polecat_prompt, spawn_process, spawn_tmux, PolecatLifecycle, SpawnSpec, SpawnTemplate,
+    SpawnedPolecat, GT_WORKSPACE,
 };
 pub use restart::{RestartConfig, RestartTracker};
 pub use supervisor::{
