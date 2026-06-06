@@ -50,6 +50,15 @@ jobs:
         run: cargo build --workspace --all-targets --locked
       - name: test
         run: cargo test --workspace --locked
+      # The `oauth` feature is NOT in the default build, so the workspace `build`/`test` above
+      # never compile the OAuth surface (gt-auth http handlers + the composition wiring) — a
+      # missing export there (e.g. CliCodeStore, hq-gt-login-oauth) only surfaced in the
+      # `:embeddings` image build (--features oauth). Compile + test it here so a broken oauth
+      # build is a CI failure, not a deploy-time one. Mirrors what Dockerfile.embeddings builds.
+      - name: oauth feature (gt-auth + composition)
+        run: |
+          cargo test -p gt-auth --features "oauth pg" --locked
+          cargo build -p gt-composition --bin gt-mcp-server --features oauth --locked
       # The feature-gated tesseract OcrEngine impl — built/tested only here where its
       # system libs exist, so a default local build stays free of the OCR dependency.
       - name: ocr feature (tesseract)
