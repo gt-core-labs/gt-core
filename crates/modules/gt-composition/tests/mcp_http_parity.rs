@@ -142,6 +142,9 @@ fn parity_map(ns: &str) -> Vec<Route> {
             rt("POST", "/{account}/sample", Some("quota.sample")),
             rt("POST", "/{account}/probe", Some("quota.probe")),
             rt("POST", "/{account}/rotate", Some("quota.rotate")),
+            // Account onboarding (hq-quota-accounts.4): id in the body, not the path.
+            rt("POST", "/account", Some("quota.register")),
+            rt("DELETE", "/{account}", Some("quota.retire")),
         ],
         "merge" => vec![
             rt("GET", "/", Some("merge.list")),

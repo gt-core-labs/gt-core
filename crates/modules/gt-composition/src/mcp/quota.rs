@@ -24,7 +24,8 @@ use gt_events::{Command, EventKind};
 use gt_mcp_server::{DomainCtx, DomainHandler};
 use gt_module::McpTool;
 use gt_quota::{
-    Account, AccountRegistry, ProbeWindow, QuotaEvent, QuotaState, RotateAccount, SampleTokens,
+    Account, AccountRegistry, ProbeWindow, QuotaEvent, QuotaState, RegisterAccount, RetireAccount,
+    RotateAccount, SampleTokens,
 };
 use gt_store_dolt::AppError;
 
@@ -103,6 +104,16 @@ impl DomainHandler for QuotaHandler {
             ),
             descriptor("quota.list", "List every tracked account with its usage.", &[]),
             descriptor("quota.info", "Show one account's usage + window.", &[req("account", "string")]),
+            descriptor(
+                "quota.register",
+                "Onboard (or replace) a claude account with its CLAUDE_CONFIG_DIR; becomes a rotation candidate. Emits quota.account_registered.",
+                &[req("account", "string"), req("config_dir", "string")],
+            ),
+            descriptor(
+                "quota.retire",
+                "Drop an account from the rotation pool. Emits quota.account_deregistered; idempotent.",
+                &[req("account", "string")],
+            ),
         ]
     }
 
@@ -125,6 +136,8 @@ impl DomainHandler for QuotaHandler {
             }
             "quota.probe" => self.run::<ProbeWindow>(ws, ctx.args),
             "quota.rotate" => self.run::<RotateAccount>(ws, ctx.args),
+            "quota.register" => self.run::<RegisterAccount>(ws, ctx.args),
+            "quota.retire" => self.run::<RetireAccount>(ws, ctx.args),
             "quota.list" => {
                 let registry = self.registry(ws)?;
                 Ok(json!({ "accounts": registry.accounts().map(account_json).collect::<Vec<_>>() }))
