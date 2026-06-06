@@ -137,7 +137,7 @@ impl PatStatus {
 
     /// Parse the column spelling back. An unknown value is `None` (the store maps that to a backend
     /// fault — a row it cannot classify).
-    pub fn from_str(s: &str) -> Option<Self> {
+    pub fn from_wire(s: &str) -> Option<Self> {
         match s {
             "active" => Some(PatStatus::Active),
             "revoked" => Some(PatStatus::Revoked),
@@ -218,7 +218,11 @@ pub fn clamp_scopes(requested: &[String], granted: &[String]) -> Vec<String> {
     use std::collections::BTreeSet;
     let granted_set: BTreeSet<&str> = granted.iter().map(String::as_str).collect();
     // No explicit ask ⇒ grant everything the minter holds (already their own authority).
-    let source: &[String] = if requested.is_empty() { granted } else { requested };
+    let source: &[String] = if requested.is_empty() {
+        granted
+    } else {
+        requested
+    };
     let mut seen: BTreeSet<String> = BTreeSet::new();
     let mut out = Vec::new();
     for scope in source {
@@ -260,7 +264,10 @@ mod tests {
     #[test]
     fn generated_tokens_carry_the_prefix_and_256_bits() {
         let tok = PatToken::generate();
-        assert!(has_pat_prefix(tok.as_str()), "a PAT must carry the gtpat_ prefix");
+        assert!(
+            has_pat_prefix(tok.as_str()),
+            "a PAT must carry the gtpat_ prefix"
+        );
         // gtpat_ + 64 hex chars (256 bits).
         assert_eq!(tok.as_str().len(), PAT_PREFIX.len() + 64);
         let hex = &tok.as_str()[PAT_PREFIX.len()..];

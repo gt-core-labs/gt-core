@@ -301,6 +301,69 @@ mod tests {
         assert!(audit.read_all().unwrap().is_empty(), "a valid token is not a denial");
     }
 
+    /// A PAT verifier double (hq-security-pat): accepts exactly one opaque `gtpat_` token,
+    /// resolving it to claims for "pat-user"; everything else is `Err(())`.
+    struct OnePatVerifier(&'static str);
+
+    #[async_trait]
+    impl PatVerifier for OnePatVerifier {
+        async fn verify(&self, token: &str, _now: u64) -> Result<JwtClaims, ()> {
+            if token == self.0 {
+                Ok(JwtClaims {
+                    sub: "pat-user".into(),
+                    workspace: "pacme".into(),
+                    scopes: vec!["tokens.read".into()],
+                    exp: 9_999_999_999,
+                    nbf: None,
+                    iat: 0,
+                })
+            } else {
+                Err(())
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn a_gtpat_bearer_is_verified_through_the_pat_port() {
+        let (st, audit) = state();
+        let st = st.with_pat(Arc::new(OnePatVerifier("gtpat_good")));
+        let (status, body) = call(st, Some("Bearer gtpat_good")).await;
+        assert_eq!(status, StatusCode::OK);
+        // The PAT's own claims (not the JWT double's) are injected.
+        assert!(body.contains(r#"claims=Some("pat-user")"#), "{body}");
+        assert!(body.contains(r#"ws=Some("pacme")"#), "{body}");
+        assert!(audit.read_all().unwrap().is_empty(), "a valid PAT is not a denial");
+    }
+
+    #[tokio::test]
+    async fn an_unknown_gtpat_bearer_is_unauthorized() {
+        let (st, audit) = state();
+        let st = st.with_pat(Arc::new(OnePatVerifier("gtpat_good")));
+        let (status, _) = call(st, Some("Bearer gtpat_nope")).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        assert_eq!(audit.read_all().unwrap().len(), 1, "a bad PAT is an audited 401");
+    }
+
+    #[tokio::test]
+    async fn a_gtpat_bearer_is_never_tried_as_a_jwt_and_401s_without_a_verifier() {
+        // No PAT verifier configured: a gtpat_ token must NOT fall through to the JWT authenticator
+        // (it could never be a valid JWT) — it is a hard 401.
+        let (st, _audit) = state();
+        let (status, _) = call(st, Some("Bearer gtpat_good")).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn a_non_pat_bearer_still_takes_the_jwt_path_with_a_pat_verifier_present() {
+        // A normal JWT bearer is unaffected by the PAT port — it still verifies through the JWT
+        // authenticator even when a PAT verifier is wired in.
+        let (st, _audit) = state();
+        let st = st.with_pat(Arc::new(OnePatVerifier("gtpat_good")));
+        let (status, body) = call(st, Some("Bearer good")).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(body.contains(r#"claims=Some("alice")"#), "{body}");
+    }
+
     #[tokio::test]
     async fn the_bearer_scheme_is_case_insensitive() {
         let (st, _audit) = state();

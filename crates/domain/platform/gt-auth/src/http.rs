@@ -27,9 +27,9 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use axum::extract::{Extension, State};
 #[cfg(any(feature = "pg", feature = "oauth"))]
 use axum::extract::Path;
+use axum::extract::{Extension, State};
 use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
@@ -37,11 +37,13 @@ use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    AuthError, Credentials, JwkSet, JwtClaims, JwtMinter, ProviderKind, RefreshError, RefreshRecord,
-    RefreshStore, RefreshToken, VerifiedIdentity,
+    AuthError, Credentials, JwkSet, JwtClaims, JwtMinter, PatError, PatRecord, PatToken,
+    ProviderKind, RefreshError, RefreshRecord, RefreshStore, RefreshToken, VerifiedIdentity,
 };
 #[cfg(feature = "oauth")]
-use crate::{NewAuthz, NewProvider, OauthProviderKind, PatchProvider, PendingAuthz, ProviderRecord};
+use crate::{
+    NewAuthz, NewProvider, OauthProviderKind, PatchProvider, PendingAuthz, ProviderRecord,
+};
 
 /// The async refresh-store port behind [`AuthState::refresh`] — the I/O-capable boundary the HTTP
 /// handlers actually call (`hq-platform-hardening.1`).
@@ -98,7 +100,9 @@ impl<S: RefreshStore + Send + Sync> AsyncRefreshStore for S {
         issued_at: u64,
         exp: u64,
     ) -> Result<(RefreshToken, RefreshRecord), RefreshError> {
-        Ok(RefreshStore::issue(self, sub, workspace, scopes, issued_at, exp))
+        Ok(RefreshStore::issue(
+            self, sub, workspace, scopes, issued_at, exp,
+        ))
     }
 
     async fn rotate(
@@ -332,6 +336,36 @@ pub trait RoleStore: Send + Sync {
     ) -> Result<bool, AuthError>;
 }
 
+/// The async Personal Access Token self-service port behind `/auth/tokens` (hq-security-pat.2): a
+/// user mints, lists, and revokes their OWN tokens. Every method is keyed by the caller's verified
+/// `sub`, so the surface is **self-only** by construction — a caller cannot see or revoke another
+/// user's tokens even by guessing an id. The production adapter is [`PgPatStore`](crate::PgPatStore).
+#[async_trait]
+pub trait PatAdmin: Send + Sync {
+    /// Mint a PAT for `sub`/`workspace` labelled `name`, granting the intersection of `requested`
+    /// and the caller's own `granted` scopes (so it can never escalate), valid until `expires_at`
+    /// (`None` ⇒ never), created at `now`. Returns the opaque secret (shown to the user **once**)
+    /// plus its [`PatRecord`].
+    #[allow(clippy::too_many_arguments)]
+    async fn mint(
+        &self,
+        sub: &str,
+        workspace: &str,
+        name: &str,
+        requested: &[String],
+        granted: &[String],
+        now: u64,
+        expires_at: Option<u64>,
+    ) -> Result<(PatToken, PatRecord), PatError>;
+
+    /// List `sub`'s own tokens (newest first), without any secret material.
+    async fn list(&self, sub: &str) -> Result<Vec<PatRecord>, PatError>;
+
+    /// Revoke `sub`'s token addressed by `id` (self-only). `Ok(false)` when no active token of
+    /// that `sub` has that id — the handler maps it to `404`.
+    async fn revoke(&self, sub: &str, id: &str) -> Result<bool, PatError>;
+}
+
 /// The async OAuth/OIDC provider-administration port behind `POST`/`PATCH`/`DELETE
 /// `/auth/providers` (hq-idp-db.4): a SYSTEM admin manages the GLOBAL login providers (presets +
 /// generic OIDC). The `client_secret` is write-only — accepted on create/patch (sealed at rest by
@@ -522,6 +556,11 @@ pub struct AuthState {
     /// The role-administration store behind `/auth/roles` + `/auth/users/{email}/roles`
     /// (hq-rbac.4). `None` ⇒ those endpoints respond `501`; login + user admin are unaffected.
     pub roles: Option<Arc<dyn RoleStore>>,
+    /// The Personal Access Token store behind the SELF-SERVICE `/auth/tokens` surface
+    /// (hq-security-pat.2): a user mints / lists / revokes their OWN tokens, gated by the
+    /// `tokens.read`/`tokens.write` scopes. `None` ⇒ those endpoints respond `501`; everything
+    /// else is unaffected. The production adapter is [`PgPatStore`](crate::PgPatStore).
+    pub pat: Option<Arc<dyn PatAdmin>>,
     /// The workspace-membership directory behind `GET /auth/workspaces` + `POST /auth/switch`
     /// (hq-identity.3). `None` ⇒ those endpoints respond `501`; login + admin are unaffected.
     pub memberships: Option<Arc<dyn MembershipDirectory>>,
@@ -576,6 +615,10 @@ pub fn auth_router(state: AuthState) -> Router {
         .route("/auth/roles", post(create_role).get(list_roles))
         .route("/auth/roles/:name", axum::routing::delete(delete_role))
         .route("/auth/users/:email/roles", post(assign_roles))
+        // Personal Access Tokens (hq-security-pat.2): the SELF-SERVICE surface — a user manages
+        // their OWN tokens, gated by tokens.read / tokens.write. POST returns the secret ONCE.
+        .route("/auth/tokens", get(list_tokens).post(create_token))
+        .route("/auth/tokens/:id", axum::routing::delete(revoke_token))
         // Cross-workspace surface (hq-identity.3): list memberships + switch the active workspace.
         .route("/auth/workspaces", get(workspaces))
         .route("/auth/switch", post(switch))
@@ -594,7 +637,10 @@ pub fn auth_router(state: AuthState) -> Router {
         // PUBLIC discovery (no auth): the FE login page (hq-idp-db.5) fetches this to render a
         // button per enabled provider — secret-free projection. GET is public; the POST admin CRUD
         // (system-admin gated) shares the path.
-        .route("/auth/providers", get(list_public_providers).post(create_provider))
+        .route(
+            "/auth/providers",
+            get(list_public_providers).post(create_provider),
+        )
         // ADMIN list (hq-idp-ui.1): the FULL provider list incl `enabled=false`, secret-free
         // ([`ProviderView`]), for the gt-web admin page. A STATIC segment, so matchit resolves it
         // before the `/:id` capture below — `all` is never read as a provider id.
@@ -630,7 +676,7 @@ pub fn auth_router(state: AuthState) -> Router {
         MeResponse,
         crate::jwt::Jwk,
         crate::jwt::JwkSet,
-    )),
+    ))
 )]
 pub struct ApiDoc;
 
@@ -648,6 +694,9 @@ pub struct ApiDoc;
         list_roles,
         delete_role,
         assign_roles,
+        list_tokens,
+        create_token,
+        revoke_token,
         workspaces,
         switch,
         add_member,
@@ -659,10 +708,13 @@ pub struct ApiDoc;
         CreateRoleRequest,
         RoleSummary,
         AssignRolesRequest,
+        CreateTokenRequest,
+        TokenSummary,
+        CreatedTokenResponse,
         SwitchRequest,
         WorkspaceMembership,
         AddMemberRequest,
-    )),
+    ))
 )]
 struct AdminApiDoc;
 
@@ -687,7 +739,7 @@ struct AdminApiDoc;
         PatchProviderRequest,
         ProviderView,
         PublicProvider,
-    )),
+    ))
 )]
 struct ProviderApiDoc;
 
@@ -751,19 +803,28 @@ impl LoginRequest {
     /// silent default.
     fn into_credentials(self) -> Result<Credentials, AuthError> {
         match self {
-            LoginRequest { code: Some(code), provider_id, provider, .. } => {
+            LoginRequest {
+                code: Some(code),
+                provider_id,
+                provider,
+                ..
+            } => {
                 Ok(Credentials::OAuth {
                     // `provider_id` (the `oauth_providers` PK) wins; `provider` is the pre-DB alias.
                     provider: provider_id.or(provider).unwrap_or_default(),
                     code,
                 })
             }
-            LoginRequest { id_token: Some(id_token), issuer: Some(issuer), .. } => {
-                Ok(Credentials::Oidc { issuer, id_token })
-            }
-            LoginRequest { email: Some(email), password: Some(password), .. } => {
-                Ok(Credentials::EmailPassword { email, password })
-            }
+            LoginRequest {
+                id_token: Some(id_token),
+                issuer: Some(issuer),
+                ..
+            } => Ok(Credentials::Oidc { issuer, id_token }),
+            LoginRequest {
+                email: Some(email),
+                password: Some(password),
+                ..
+            } => Ok(Credentials::EmailPassword { email, password }),
             _ => Err(AuthError::InvalidCredentials),
         }
     }
@@ -885,6 +946,69 @@ pub struct AssignRolesRequest {
     /// The role names to assign, replacing the user's current set.
     #[serde(default)]
     pub roles: Vec<String>,
+}
+
+/// `POST /auth/tokens` body — mint a Personal Access Token for the caller (hq-security-pat.2).
+#[derive(Debug, Deserialize)]
+#[cfg_attr(feature = "axum", derive(utoipa::ToSchema))]
+pub struct CreateTokenRequest {
+    /// A human label so a list of tokens is legible (e.g. "ci-deploy").
+    pub name: String,
+    /// The scopes to grant, **clamped** to the caller's own at mint (asking for a scope you do not
+    /// hold drops it). Absent or empty ⇒ grant everything the caller currently holds.
+    #[serde(default)]
+    pub scopes: Option<Vec<String>>,
+    /// Lifetime in seconds from now. Absent ⇒ the token never expires (revocation is then the only
+    /// way to kill it).
+    #[serde(default)]
+    pub expires_in_secs: Option<u64>,
+}
+
+/// A Personal Access Token as returned by `GET /auth/tokens` and embedded in the create response —
+/// the non-secret projection of a [`PatRecord`] (it carries the token's `id`, never the secret).
+#[derive(Debug, Serialize)]
+#[cfg_attr(feature = "axum", derive(utoipa::ToSchema))]
+pub struct TokenSummary {
+    /// The non-secret id — the handle `DELETE /auth/tokens/{id}` revokes by.
+    pub id: String,
+    /// The human label the owner gave the token.
+    pub name: String,
+    /// The clamped scopes the token grants.
+    pub scopes: Vec<String>,
+    /// Creation time (epoch seconds).
+    pub created_at: i64,
+    /// Expiry (epoch seconds), or `null` for a token that never expires.
+    pub expires_at: Option<i64>,
+    /// Last successful use (epoch seconds), or `null` if never used.
+    pub last_used_at: Option<i64>,
+    /// Lifecycle: `"active"` or `"revoked"`.
+    pub status: String,
+}
+
+impl From<PatRecord> for TokenSummary {
+    fn from(r: PatRecord) -> Self {
+        TokenSummary {
+            id: r.id.as_str().to_owned(),
+            name: r.name,
+            scopes: r.scopes,
+            created_at: r.created_at as i64,
+            expires_at: r.expires_at.map(|e| e as i64),
+            last_used_at: r.last_used_at.map(|e| e as i64),
+            status: r.status.as_str().to_owned(),
+        }
+    }
+}
+
+/// `POST /auth/tokens` 201 body — the freshly minted token. The `token` plaintext is returned
+/// **exactly once**, here; it is never recoverable afterwards (the store keeps only its hash), so
+/// the FE shows it once with a copy affordance.
+#[derive(Debug, Serialize)]
+#[cfg_attr(feature = "axum", derive(utoipa::ToSchema))]
+pub struct CreatedTokenResponse {
+    /// The opaque secret (`gtpat_…`) — shown once, never again.
+    pub token: String,
+    /// The token's non-secret record (id, name, scopes, …), the same shape `GET` lists.
+    pub info: TokenSummary,
 }
 
 /// `POST /auth/providers` body — register a GLOBAL OAuth/OIDC login provider (system admin only,
@@ -1074,9 +1198,10 @@ async fn login(
     // misleading `401` — login itself works, this method just is not wired.
     let provider: &Arc<dyn LoginProvider> = match creds.kind() {
         ProviderKind::EmailPassword => &state.login,
-        ProviderKind::OAuth | ProviderKind::Oidc => {
-            state.oauth_login.as_ref().ok_or(ApiError::OauthNotConfigured)?
-        }
+        ProviderKind::OAuth | ProviderKind::Oidc => state
+            .oauth_login
+            .as_ref()
+            .ok_or(ApiError::OauthNotConfigured)?,
     };
     let identity = provider.login(&creds).await?;
     let tokens = issue_tokens(&state, identity.sub, identity.workspace, identity.scopes).await?;
@@ -1140,7 +1265,10 @@ async fn logout(
         // Best-effort: a backend fault on revoke must not fail logout (the client is leaving and
         // the cookies are cleared regardless). The durable store's reuse/revoke verdicts are
         // already terminal; an outage here is logged-and-dropped, not surfaced.
-        let _ = state.refresh.revoke_by_token(&RefreshToken::new(token)).await;
+        let _ = state
+            .refresh
+            .revoke_by_token(&RefreshToken::new(token))
+            .await;
     }
     (clear_token_cookies(&state), StatusCode::NO_CONTENT)
 }
@@ -1239,9 +1367,15 @@ async fn add_member(
     Json(body): Json<AddMemberRequest>,
 ) -> Result<StatusCode, ApiError> {
     require_workspace_admin(claims.as_deref(), &slug)?;
-    let admin = state.membership_admin.as_ref().ok_or(ApiError::NotConfigured)?;
+    let admin = state
+        .membership_admin
+        .as_ref()
+        .ok_or(ApiError::NotConfigured)?;
     let now = (state.now)();
-    match admin.add_member(&body.email, &slug, &body.role, now).await? {
+    match admin
+        .add_member(&body.email, &slug, &body.role, now)
+        .await?
+    {
         true => Ok(StatusCode::NO_CONTENT),
         false => Err(ApiError::NotFound),
     }
@@ -1271,7 +1405,10 @@ async fn remove_member(
     Path((slug, email)): Path<(String, String)>,
 ) -> Result<StatusCode, ApiError> {
     require_workspace_admin(claims.as_deref(), &slug)?;
-    let admin = state.membership_admin.as_ref().ok_or(ApiError::NotConfigured)?;
+    let admin = state
+        .membership_admin
+        .as_ref()
+        .ok_or(ApiError::NotConfigured)?;
     match admin.remove_member(&email, &slug).await? {
         true => Ok(StatusCode::NO_CONTENT),
         false => Err(ApiError::NotFound),
@@ -1373,7 +1510,11 @@ async fn create_role(
     store.upsert_role(&body.name, &body.scopes, now).await?;
     Ok((
         StatusCode::CREATED,
-        Json(RoleSummary { name: body.name, scopes: body.scopes, created_at: now as i64 }),
+        Json(RoleSummary {
+            name: body.name,
+            scopes: body.scopes,
+            created_at: now as i64,
+        }),
     ))
 }
 
@@ -1451,15 +1592,111 @@ async fn assign_roles(
     }
 }
 
+/// `GET /auth/tokens` — list the CALLER's own Personal Access Tokens (hq-security-pat.2). Requires
+/// `tokens.read` (or `*`). Self-only: keyed by the verified `sub`, so a caller never sees another
+/// user's tokens, and never any secret material.
+#[cfg_attr(feature = "axum", utoipa::path(
+    get, path = "/auth/tokens", tag = "auth",
+    responses(
+        (status = 200, description = "The caller's own tokens (no secret material)", body = Vec<TokenSummary>),
+        (status = 401, description = "No verified claims"),
+        (status = 403, description = "Caller lacks the tokens.read scope"),
+        (status = 501, description = "No PAT store configured"),
+    ),
+))]
+#[cfg(feature = "pg")]
+async fn list_tokens(
+    State(state): State<AuthState>,
+    claims: Option<Extension<JwtClaims>>,
+) -> Result<Json<Vec<TokenSummary>>, ApiError> {
+    let Extension(claims) = claims.ok_or(ApiError::Unauthenticated)?;
+    require_scope(Some(&claims), "tokens.read")?;
+    let store = state.pat.as_ref().ok_or(ApiError::NotConfigured)?;
+    let tokens = store.list(&claims.sub).await?;
+    Ok(Json(tokens.into_iter().map(TokenSummary::from).collect()))
+}
+
+/// `POST /auth/tokens` — mint a Personal Access Token for the caller (hq-security-pat.2). Requires
+/// `tokens.write` (or `*`). The requested scopes are CLAMPED to the caller's own (no escalation),
+/// and the plaintext token is returned **once** in the response — never recoverable afterwards.
+#[cfg_attr(feature = "axum", utoipa::path(
+    post, path = "/auth/tokens", tag = "auth",
+    request_body = CreateTokenRequest,
+    responses(
+        (status = 201, description = "Created — the token plaintext (shown once) + its record", body = CreatedTokenResponse),
+        (status = 401, description = "No verified claims"),
+        (status = 403, description = "Caller lacks the tokens.write scope"),
+        (status = 501, description = "No PAT store configured"),
+    ),
+))]
+#[cfg(feature = "pg")]
+async fn create_token(
+    State(state): State<AuthState>,
+    claims: Option<Extension<JwtClaims>>,
+    Json(body): Json<CreateTokenRequest>,
+) -> Result<(StatusCode, Json<CreatedTokenResponse>), ApiError> {
+    let Extension(claims) = claims.ok_or(ApiError::Unauthenticated)?;
+    require_scope(Some(&claims), "tokens.write")?;
+    let store = state.pat.as_ref().ok_or(ApiError::NotConfigured)?;
+    let now = (state.now)();
+    let expires_at = body.expires_in_secs.map(|ttl| now.saturating_add(ttl));
+    let requested = body.scopes.unwrap_or_default();
+    // The minter's OWN scopes are the clamp ceiling — the store stores the intersection.
+    let (token, record) = store
+        .mint(
+            &claims.sub,
+            &claims.workspace,
+            &body.name,
+            &requested,
+            &claims.scopes,
+            now,
+            expires_at,
+        )
+        .await?;
+    Ok((
+        StatusCode::CREATED,
+        Json(CreatedTokenResponse {
+            token: token.as_str().to_owned(),
+            info: TokenSummary::from(record),
+        }),
+    ))
+}
+
+/// `DELETE /auth/tokens/{id}` — revoke one of the CALLER's own tokens (hq-security-pat.2). Requires
+/// `tokens.write` (or `*`). Self-only: the `sub` predicate means a caller can only revoke their own
+/// tokens. `204` on success, `404` for an unknown id or one that is not the caller's.
+#[cfg_attr(feature = "axum", utoipa::path(
+    delete, path = "/auth/tokens/{id}", tag = "auth",
+    params(("id" = String, Path, description = "The token id to revoke")),
+    responses(
+        (status = 204, description = "Revoked"),
+        (status = 401, description = "No verified claims"),
+        (status = 403, description = "Caller lacks the tokens.write scope"),
+        (status = 404, description = "No such token belonging to the caller"),
+        (status = 501, description = "No PAT store configured"),
+    ),
+))]
+#[cfg(feature = "pg")]
+async fn revoke_token(
+    State(state): State<AuthState>,
+    claims: Option<Extension<JwtClaims>>,
+    Path(id): Path<String>,
+) -> Result<StatusCode, ApiError> {
+    let Extension(claims) = claims.ok_or(ApiError::Unauthenticated)?;
+    require_scope(Some(&claims), "tokens.write")?;
+    let store = state.pat.as_ref().ok_or(ApiError::NotConfigured)?;
+    match store.revoke(&claims.sub, &id).await? {
+        true => Ok(StatusCode::NO_CONTENT),
+        false => Err(ApiError::NotFound),
+    }
+}
+
 /// Gate an admin endpoint: the caller must carry verified claims whose scopes include `needed`
 /// or the `*` wildcard. No claims ⇒ `401`; claims without the scope ⇒ `403`.
 #[cfg(feature = "pg")]
 fn require_scope(claims: Option<&JwtClaims>, needed: &str) -> Result<(), ApiError> {
     let claims = claims.ok_or(ApiError::Unauthenticated)?;
-    let ok = claims
-        .scopes
-        .iter()
-        .any(|s| s == "*" || s == needed);
+    let ok = claims.scopes.iter().any(|s| s == "*" || s == needed);
     ok.then_some(()).ok_or(ApiError::Forbidden)
 }
 
@@ -1702,7 +1939,9 @@ async fn authorize(
     let pkce = crate::new_pkce().map_err(ApiError::Auth)?;
     let csrf_state = csrf_token().map_err(ApiError::Auth)?;
     // Build the IdP URL BEFORE persisting, so an unknown/disabled id (404) leaves no orphan row.
-    let url = flow.authorize_url(&id, &csrf_state, &pkce.challenge).await?;
+    let url = flow
+        .authorize_url(&id, &csrf_state, &pkce.challenge)
+        .await?;
     let now = (state.now)();
     store
         .insert(NewAuthz {
@@ -1780,8 +2019,9 @@ async fn callback(
             );
             headers.insert(
                 header::LOCATION,
-                HeaderValue::from_str(&location)
-                    .map_err(|_| ApiError::Auth(AuthError::Backend("invalid FE redirect URL".into())))?,
+                HeaderValue::from_str(&location).map_err(|_| {
+                    ApiError::Auth(AuthError::Backend("invalid FE redirect URL".into()))
+                })?,
             );
             Ok((StatusCode::FOUND, headers).into_response())
         }
@@ -1847,7 +2087,9 @@ impl CreateProviderRequest {
         let need = |field: Option<String>, from_preset: Option<&str>, name: &str| {
             field
                 .or_else(|| from_preset.map(str::to_owned))
-                .ok_or_else(|| ApiError::BadProvider(format!("missing `{name}` for a generic provider")))
+                .ok_or_else(|| {
+                    ApiError::BadProvider(format!("missing `{name}` for a generic provider"))
+                })
         };
         let display_name = self
             .display_name
@@ -1875,7 +2117,11 @@ impl CreateProviderRequest {
                 preset.as_ref().map(|p| p.userinfo_endpoint),
                 "userinfo_endpoint",
             )?,
-            scopes: need(self.scopes, preset.as_ref().map(|p| p.default_scopes), "scopes")?,
+            scopes: need(
+                self.scopes,
+                preset.as_ref().map(|p| p.default_scopes),
+                "scopes",
+            )?,
             enabled: self.enabled,
         })
     }
@@ -1961,11 +2207,23 @@ fn set_token_cookies(state: &AuthState, tokens: &TokenResponse) -> HeaderMap {
     let mut headers = HeaderMap::new();
     headers.append(
         header::SET_COOKIE,
-        build_cookie(state, ACCESS_COOKIE, &tokens.access_token, "/", state.access_ttl as i64),
+        build_cookie(
+            state,
+            ACCESS_COOKIE,
+            &tokens.access_token,
+            "/",
+            state.access_ttl as i64,
+        ),
     );
     headers.append(
         header::SET_COOKIE,
-        build_cookie(state, REFRESH_COOKIE, &tokens.refresh_token, "/auth", state.refresh_ttl as i64),
+        build_cookie(
+            state,
+            REFRESH_COOKIE,
+            &tokens.refresh_token,
+            "/auth",
+            state.refresh_ttl as i64,
+        ),
     );
     headers
 }
@@ -1974,14 +2232,26 @@ fn set_token_cookies(state: &AuthState, tokens: &TokenResponse) -> HeaderMap {
 /// logout — same name/path as [`set_token_cookies`], which is what makes the browser drop them.
 fn clear_token_cookies(state: &AuthState) -> HeaderMap {
     let mut headers = HeaderMap::new();
-    headers.append(header::SET_COOKIE, build_cookie(state, ACCESS_COOKIE, "", "/", 0));
-    headers.append(header::SET_COOKIE, build_cookie(state, REFRESH_COOKIE, "", "/auth", 0));
+    headers.append(
+        header::SET_COOKIE,
+        build_cookie(state, ACCESS_COOKIE, "", "/", 0),
+    );
+    headers.append(
+        header::SET_COOKIE,
+        build_cookie(state, REFRESH_COOKIE, "", "/auth", 0),
+    );
     headers
 }
 
 /// Build one `Set-Cookie` value. `value` is a JWT or opaque token (ASCII, no cookie-special
 /// chars), so it needs no escaping.
-fn build_cookie(state: &AuthState, name: &str, value: &str, path: &str, max_age: i64) -> HeaderValue {
+fn build_cookie(
+    state: &AuthState,
+    name: &str,
+    value: &str,
+    path: &str,
+    max_age: i64,
+) -> HeaderValue {
     let mut s = format!(
         "{name}={value}; Path={path}; HttpOnly; Max-Age={max_age}; SameSite={}",
         state.cookie_same_site.as_str()
@@ -2010,9 +2280,9 @@ impl IntoResponse for AuthError {
             // An unknown/disabled `provider_id` is a client error (wrong/retired login button),
             // not a server fault: a clear `404`, distinct from the `501` "oauth not wired at all".
             AuthError::UnknownProvider(_) => StatusCode::NOT_FOUND,
-            AuthError::HashFailure(_)
-            | AuthError::SigningFailure(_)
-            | AuthError::Backend(_) => StatusCode::INTERNAL_SERVER_ERROR,
+            AuthError::HashFailure(_) | AuthError::SigningFailure(_) | AuthError::Backend(_) => {
+                StatusCode::INTERNAL_SERVER_ERROR
+            }
         };
         (status, self.to_string()).into_response()
     }
@@ -2039,6 +2309,10 @@ enum ApiError {
     /// A role's scope failed the closed-vocabulary check — `400` (hq-rbac.4).
     #[cfg(feature = "pg")]
     BadScope(String),
+    /// A Personal Access Token store fault on the self-service surface — `500` for a backend
+    /// outage, `401` for a lifecycle verdict (hq-security-pat.2).
+    #[cfg(feature = "pg")]
+    Pat(PatError),
     /// The addressed role/user/provider does not exist — `404` (hq-rbac.4 / hq-idp-db.4).
     #[cfg(any(feature = "pg", feature = "oauth"))]
     NotFound,
@@ -2060,6 +2334,13 @@ impl From<AuthError> for ApiError {
     }
 }
 
+#[cfg(feature = "pg")]
+impl From<PatError> for ApiError {
+    fn from(e: PatError) -> Self {
+        ApiError::Pat(e)
+    }
+}
+
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
         match self {
@@ -2070,19 +2351,28 @@ impl IntoResponse for ApiError {
             ApiError::Unauthenticated => {
                 (StatusCode::UNAUTHORIZED, "missing or invalid bearer token").into_response()
             }
-            ApiError::OauthNotConfigured => {
-                (StatusCode::NOT_IMPLEMENTED, "oauth/oidc login is not configured").into_response()
-            }
+            ApiError::OauthNotConfigured => (
+                StatusCode::NOT_IMPLEMENTED,
+                "oauth/oidc login is not configured",
+            )
+                .into_response(),
             #[cfg(any(feature = "pg", feature = "oauth"))]
-            ApiError::Forbidden => {
-                (StatusCode::FORBIDDEN, "insufficient scope").into_response()
-            }
+            ApiError::Forbidden => (StatusCode::FORBIDDEN, "insufficient scope").into_response(),
             #[cfg(any(feature = "pg", feature = "oauth"))]
-            ApiError::NotConfigured => {
-                (StatusCode::NOT_IMPLEMENTED, "user administration is not configured").into_response()
-            }
+            ApiError::NotConfigured => (
+                StatusCode::NOT_IMPLEMENTED,
+                "user administration is not configured",
+            )
+                .into_response(),
             #[cfg(feature = "pg")]
             ApiError::BadScope(msg) => (StatusCode::BAD_REQUEST, msg).into_response(),
+            #[cfg(feature = "pg")]
+            ApiError::Pat(e) => match e {
+                // A backend outage is a 500 (retryable), not a token verdict; every lifecycle
+                // verdict on this surface (it should only ever see Backend) collapses to a 401.
+                PatError::Backend(msg) => (StatusCode::INTERNAL_SERVER_ERROR, msg).into_response(),
+                other => (StatusCode::UNAUTHORIZED, other.to_string()).into_response(),
+            },
             #[cfg(any(feature = "pg", feature = "oauth"))]
             ApiError::NotFound => (StatusCode::NOT_FOUND, "not found").into_response(),
             #[cfg(feature = "oauth")]
@@ -2106,7 +2396,13 @@ mod tests {
     fn auth_openapi_lists_every_absolute_route() {
         let doc = auth_openapi();
         let paths: Vec<&str> = doc.paths.paths.keys().map(String::as_str).collect();
-        for expected in ["/auth/login", "/auth/refresh", "/auth/logout", "/auth/me", "/auth/jwks"] {
+        for expected in [
+            "/auth/login",
+            "/auth/refresh",
+            "/auth/logout",
+            "/auth/me",
+            "/auth/jwks",
+        ] {
             assert!(paths.contains(&expected), "missing {expected} in {paths:?}");
         }
         #[cfg(feature = "pg")]
@@ -2160,10 +2456,19 @@ mod tests {
 
     #[async_trait]
     impl RoleStore for MemRoles {
-        async fn upsert_role(&self, name: &str, scopes: &[String], now: u64) -> Result<(), AuthError> {
+        async fn upsert_role(
+            &self,
+            name: &str,
+            scopes: &[String],
+            now: u64,
+        ) -> Result<(), AuthError> {
             let mut roles = self.roles.lock().unwrap();
             roles.retain(|r| r.name != name);
-            roles.push(RoleSummary { name: name.into(), scopes: scopes.to_vec(), created_at: now as i64 });
+            roles.push(RoleSummary {
+                name: name.into(),
+                scopes: scopes.to_vec(),
+                created_at: now as i64,
+            });
             Ok(())
         }
         async fn list_roles(&self) -> Result<Vec<RoleSummary>, AuthError> {
@@ -2172,7 +2477,11 @@ mod tests {
                 .lock()
                 .unwrap()
                 .iter()
-                .map(|r| RoleSummary { name: r.name.clone(), scopes: r.scopes.clone(), created_at: r.created_at })
+                .map(|r| RoleSummary {
+                    name: r.name.clone(),
+                    scopes: r.scopes.clone(),
+                    created_at: r.created_at,
+                })
                 .collect())
         }
         async fn delete_role(&self, name: &str) -> Result<bool, AuthError> {
@@ -2181,18 +2490,29 @@ mod tests {
             roles.retain(|r| r.name != name);
             Ok(roles.len() != before)
         }
-        async fn assign_user_roles(&self, email: &str, roles: &[String], _now: u64) -> Result<bool, AuthError> {
+        async fn assign_user_roles(
+            &self,
+            email: &str,
+            roles: &[String],
+            _now: u64,
+        ) -> Result<bool, AuthError> {
             if !self.known_users.iter().any(|e| e == email) {
                 return Ok(false);
             }
-            self.assigned.lock().unwrap().push((email.into(), roles.to_vec()));
+            self.assigned
+                .lock()
+                .unwrap()
+                .push((email.into(), roles.to_vec()));
             Ok(true)
         }
     }
 
     /// Build state whose role store is the given [`MemRoles`] double; everything else as [`state`].
     fn state_with_roles(roles: Arc<MemRoles>) -> AuthState {
-        AuthState { roles: Some(roles), ..state() }
+        AuthState {
+            roles: Some(roles),
+            ..state()
+        }
     }
 
     /// A request to `path` with `method`/`json` body and the caller's scopes injected as verified
@@ -2209,7 +2529,10 @@ mod tests {
             builder = builder.header("content-type", "application/json");
         }
         let mut req = builder
-            .body(json.map(|j| Body::from(j.to_owned())).unwrap_or_else(Body::empty))
+            .body(
+                json.map(|j| Body::from(j.to_owned()))
+                    .unwrap_or_else(Body::empty),
+            )
             .unwrap();
         if let Some(scopes) = scopes {
             req.extensions_mut().insert(JwtClaims {
@@ -2231,13 +2554,30 @@ mod tests {
         let body = r#"{"name":"reviewer","scopes":["merge.read","merge.submit"]}"#;
 
         // No claims → 401; wrong scope → 403; right scope → 201.
-        assert_eq!(admin_request(&app, "POST", "/auth/roles", None, Some(body)).await, StatusCode::UNAUTHORIZED);
         assert_eq!(
-            admin_request(&app, "POST", "/auth/roles", Some(&["roles.read"]), Some(body)).await,
+            admin_request(&app, "POST", "/auth/roles", None, Some(body)).await,
+            StatusCode::UNAUTHORIZED
+        );
+        assert_eq!(
+            admin_request(
+                &app,
+                "POST",
+                "/auth/roles",
+                Some(&["roles.read"]),
+                Some(body)
+            )
+            .await,
             StatusCode::FORBIDDEN
         );
         assert_eq!(
-            admin_request(&app, "POST", "/auth/roles", Some(&["roles.write"]), Some(body)).await,
+            admin_request(
+                &app,
+                "POST",
+                "/auth/roles",
+                Some(&["roles.write"]),
+                Some(body)
+            )
+            .await,
             StatusCode::CREATED
         );
         assert_eq!(roles.roles.lock().unwrap().len(), 1);
@@ -2245,10 +2585,21 @@ mod tests {
         // A scope outside the closed vocabulary is a 400, never persisted.
         let bad = r#"{"name":"oops","scopes":["merge.frobnicate"]}"#;
         assert_eq!(
-            admin_request(&app, "POST", "/auth/roles", Some(&["roles.write"]), Some(bad)).await,
+            admin_request(
+                &app,
+                "POST",
+                "/auth/roles",
+                Some(&["roles.write"]),
+                Some(bad)
+            )
+            .await,
             StatusCode::BAD_REQUEST
         );
-        assert_eq!(roles.roles.lock().unwrap().len(), 1, "bad scope did not persist");
+        assert_eq!(
+            roles.roles.lock().unwrap().len(),
+            1,
+            "bad scope did not persist"
+        );
 
         // The `*` wildcard caller passes the gate too.
         let body2 = r#"{"name":"reader","scopes":["issues.read"]}"#;
@@ -2264,36 +2615,77 @@ mod tests {
         roles.upsert_role("ghost-check", &[], 0).await.unwrap();
         let app = auth_router(state_with_roles(roles.clone()));
         assert_eq!(
-            admin_request(&app, "DELETE", "/auth/roles/ghost-check", Some(&["roles.write"]), None).await,
+            admin_request(
+                &app,
+                "DELETE",
+                "/auth/roles/ghost-check",
+                Some(&["roles.write"]),
+                None
+            )
+            .await,
             StatusCode::NO_CONTENT
         );
         assert_eq!(
-            admin_request(&app, "DELETE", "/auth/roles/ghost-check", Some(&["roles.write"]), None).await,
+            admin_request(
+                &app,
+                "DELETE",
+                "/auth/roles/ghost-check",
+                Some(&["roles.write"]),
+                None
+            )
+            .await,
             StatusCode::NOT_FOUND
         );
     }
 
     #[tokio::test]
     async fn assigning_roles_needs_users_write_and_404s_unknown_user() {
-        let roles = Arc::new(MemRoles { known_users: vec!["alice@acme.test".into()], ..Default::default() });
+        let roles = Arc::new(MemRoles {
+            known_users: vec!["alice@acme.test".into()],
+            ..Default::default()
+        });
         let app = auth_router(state_with_roles(roles.clone()));
         let body = r#"{"roles":["reviewer"]}"#;
 
         // Gated on users.write (assignment is a write to the user record).
         assert_eq!(
-            admin_request(&app, "POST", "/auth/users/alice@acme.test/roles", Some(&["roles.write"]), Some(body)).await,
+            admin_request(
+                &app,
+                "POST",
+                "/auth/users/alice@acme.test/roles",
+                Some(&["roles.write"]),
+                Some(body)
+            )
+            .await,
             StatusCode::FORBIDDEN
         );
         assert_eq!(
-            admin_request(&app, "POST", "/auth/users/alice@acme.test/roles", Some(&["users.write"]), Some(body)).await,
+            admin_request(
+                &app,
+                "POST",
+                "/auth/users/alice@acme.test/roles",
+                Some(&["users.write"]),
+                Some(body)
+            )
+            .await,
             StatusCode::NO_CONTENT
         );
         // Unknown user → 404.
         assert_eq!(
-            admin_request(&app, "POST", "/auth/users/ghost@acme.test/roles", Some(&["users.write"]), Some(body)).await,
+            admin_request(
+                &app,
+                "POST",
+                "/auth/users/ghost@acme.test/roles",
+                Some(&["users.write"]),
+                Some(body)
+            )
+            .await,
             StatusCode::NOT_FOUND
         );
-        assert_eq!(roles.assigned.lock().unwrap().as_slice(), &[("alice@acme.test".to_string(), vec!["reviewer".to_string()])]);
+        assert_eq!(
+            roles.assigned.lock().unwrap().as_slice(),
+            &[("alice@acme.test".to_string(), vec!["reviewer".to_string()])]
+        );
     }
 
     #[tokio::test]
@@ -2304,6 +2696,242 @@ mod tests {
             admin_request(&app, "GET", "/auth/roles", Some(&["roles.read"]), None).await,
             StatusCode::NOT_IMPLEMENTED
         );
+    }
+
+    // --- Personal Access Tokens self-service surface (hq-security-pat.2) -------------------------
+
+    /// An in-memory [`PatAdmin`] double: a `Mutex<Vec<PatRecord>>` keyed by the secret it minted, so
+    /// the handler tests run without Postgres. Mint clamps via the production [`clamp_scopes`].
+    #[derive(Default)]
+    struct MemPat {
+        rows: std::sync::Mutex<Vec<(crate::PatToken, PatRecord)>>,
+    }
+
+    #[async_trait]
+    impl PatAdmin for MemPat {
+        async fn mint(
+            &self,
+            sub: &str,
+            workspace: &str,
+            name: &str,
+            requested: &[String],
+            granted: &[String],
+            now: u64,
+            expires_at: Option<u64>,
+        ) -> Result<(crate::PatToken, PatRecord), PatError> {
+            let rec = PatRecord {
+                id: crate::PatId::generate(),
+                sub: sub.into(),
+                workspace: workspace.into(),
+                name: name.into(),
+                scopes: crate::clamp_scopes(requested, granted),
+                created_at: now,
+                expires_at,
+                last_used_at: None,
+                status: crate::PatStatus::Active,
+            };
+            let token = crate::PatToken::generate();
+            self.rows.lock().unwrap().push((token.clone(), rec.clone()));
+            Ok((token, rec))
+        }
+
+        async fn list(&self, sub: &str) -> Result<Vec<PatRecord>, PatError> {
+            Ok(self
+                .rows
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|(_, r)| r.sub == sub)
+                .map(|(_, r)| r.clone())
+                .collect())
+        }
+
+        async fn revoke(&self, sub: &str, id: &str) -> Result<bool, PatError> {
+            let mut rows = self.rows.lock().unwrap();
+            for (_, r) in rows.iter_mut() {
+                if r.sub == sub && r.id.as_str() == id && r.status == crate::PatStatus::Active {
+                    r.status = crate::PatStatus::Revoked;
+                    return Ok(true);
+                }
+            }
+            Ok(false)
+        }
+    }
+
+    fn state_with_pat(pat: Arc<MemPat>) -> AuthState {
+        AuthState {
+            pat: Some(pat),
+            ..state()
+        }
+    }
+
+    /// Like [`admin_request`] but with a caller-chosen `sub`, so the self-only behaviour (one user
+    /// cannot see/revoke another's tokens) can be exercised. Returns status + body.
+    async fn tokens_request(
+        app: &Router,
+        method: &str,
+        path: &str,
+        sub: &str,
+        scopes: Option<&[&str]>,
+        json: Option<&str>,
+    ) -> (StatusCode, String) {
+        let mut builder = Request::builder().method(method).uri(path);
+        if json.is_some() {
+            builder = builder.header("content-type", "application/json");
+        }
+        let mut req = builder
+            .body(
+                json.map(|j| Body::from(j.to_owned()))
+                    .unwrap_or_else(Body::empty),
+            )
+            .unwrap();
+        if let Some(scopes) = scopes {
+            req.extensions_mut().insert(JwtClaims {
+                sub: sub.into(),
+                workspace: "acme".into(),
+                scopes: scopes.iter().map(|s| s.to_string()).collect(),
+                exp: 2_000_000_000,
+                nbf: None,
+                iat: 0,
+            });
+        }
+        let resp = app.clone().oneshot(req).await.unwrap();
+        let status = resp.status();
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        (status, String::from_utf8(bytes.to_vec()).unwrap())
+    }
+
+    #[tokio::test]
+    async fn tokens_surface_is_scope_gated_and_501_without_a_store() {
+        // No store configured → 501 even with the right scope.
+        let app = auth_router(state());
+        let (st, _) = tokens_request(
+            &app,
+            "GET",
+            "/auth/tokens",
+            "alice",
+            Some(&["tokens.read"]),
+            None,
+        )
+        .await;
+        assert_eq!(st, StatusCode::NOT_IMPLEMENTED);
+
+        let app = auth_router(state_with_pat(Arc::new(MemPat::default())));
+        // No claims → 401.
+        let (st, _) = tokens_request(&app, "GET", "/auth/tokens", "alice", None, None).await;
+        assert_eq!(st, StatusCode::UNAUTHORIZED);
+        // Wrong scope → 403 (read needs tokens.read, write needs tokens.write).
+        let (st, _) = tokens_request(
+            &app,
+            "GET",
+            "/auth/tokens",
+            "alice",
+            Some(&["issues.read"]),
+            None,
+        )
+        .await;
+        assert_eq!(st, StatusCode::FORBIDDEN);
+        let body = r#"{"name":"ci"}"#;
+        let (st, _) = tokens_request(
+            &app,
+            "POST",
+            "/auth/tokens",
+            "alice",
+            Some(&["tokens.read"]),
+            Some(body),
+        )
+        .await;
+        assert_eq!(
+            st,
+            StatusCode::FORBIDDEN,
+            "minting needs tokens.write, not tokens.read"
+        );
+    }
+
+    #[tokio::test]
+    async fn mint_clamps_returns_plaintext_once_then_list_and_revoke_are_self_only() {
+        let pat = Arc::new(MemPat::default());
+        let app = auth_router(state_with_pat(pat.clone()));
+
+        // Alice mints asking for a scope she does NOT hold → it is clamped away; the plaintext
+        // token comes back ONCE in the body.
+        let body = r#"{"name":"ci-deploy","scopes":["tokens.read","issues.write"]}"#;
+        let (st, created) = tokens_request(
+            &app,
+            "POST",
+            "/auth/tokens",
+            "alice",
+            Some(&["tokens.write", "tokens.read"]),
+            Some(body),
+        )
+        .await;
+        assert_eq!(st, StatusCode::CREATED);
+        assert!(
+            created.contains("gtpat_"),
+            "the plaintext token is returned once: {created}"
+        );
+        let v: serde_json::Value = serde_json::from_str(&created).unwrap();
+        let id = v["info"]["id"].as_str().unwrap().to_string();
+        // issues.write was clamped out (alice doesn't hold it); tokens.read survives.
+        let scopes = v["info"]["scopes"].as_array().unwrap();
+        assert_eq!(scopes.len(), 1);
+        assert_eq!(scopes[0], "tokens.read");
+
+        // Alice lists → sees her token.
+        let (st, list) = tokens_request(
+            &app,
+            "GET",
+            "/auth/tokens",
+            "alice",
+            Some(&["tokens.read"]),
+            None,
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK);
+        assert!(list.contains(&id), "alice sees her own token");
+
+        // Bob lists → sees NOTHING of alice's (self-only).
+        let (st, bob_list) = tokens_request(
+            &app,
+            "GET",
+            "/auth/tokens",
+            "bob",
+            Some(&["tokens.read"]),
+            None,
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK);
+        assert!(!bob_list.contains(&id), "bob cannot see alice's tokens");
+
+        // Bob cannot revoke alice's token by id (self-only → 404).
+        let path = format!("/auth/tokens/{id}");
+        let (st, _) =
+            tokens_request(&app, "DELETE", &path, "bob", Some(&["tokens.write"]), None).await;
+        assert_eq!(st, StatusCode::NOT_FOUND);
+
+        // Alice revokes it → 204; a second revoke is an idempotent 404.
+        let (st, _) = tokens_request(
+            &app,
+            "DELETE",
+            &path,
+            "alice",
+            Some(&["tokens.write"]),
+            None,
+        )
+        .await;
+        assert_eq!(st, StatusCode::NO_CONTENT);
+        let (st, _) = tokens_request(
+            &app,
+            "DELETE",
+            &path,
+            "alice",
+            Some(&["tokens.write"]),
+            None,
+        )
+        .await;
+        assert_eq!(st, StatusCode::NOT_FOUND);
     }
 
     fn state() -> AuthState {
@@ -2319,6 +2947,7 @@ mod tests {
             cookie_same_site: SameSite::Lax,
             users: None,
             roles: None,
+            pat: None,
             memberships: None,
             membership_admin: None,
             #[cfg(feature = "oauth")]
@@ -2331,7 +2960,9 @@ mod tests {
             fe_redirect_url: None,
             // Publish the public half of the same "k1" key the minter signs with.
             jwks: Arc::new(
-                JwtAuthenticator::from_kid_pems([("k1", PUB_PEM)]).unwrap().jwk_set(),
+                JwtAuthenticator::from_kid_pems([("k1", PUB_PEM)])
+                    .unwrap()
+                    .jwk_set(),
             ),
         }
     }
@@ -2360,7 +2991,9 @@ mod tests {
             .await
             .unwrap();
         let status = resp.status();
-        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
         (status, String::from_utf8(bytes.to_vec()).unwrap())
     }
 
@@ -2378,7 +3011,9 @@ mod tests {
             .await
             .unwrap();
         let status = resp.status();
-        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
         (status, String::from_utf8(bytes.to_vec()).unwrap())
     }
 
@@ -2431,12 +3066,7 @@ mod tests {
         // The default state() has `oauth_login: None`, so an OAuth body reports "not configured"
         // (501) — distinct from a bad credential (401) — while email+password keeps working.
         let app = auth_router(state());
-        let (status, _) = post(
-            &app,
-            "/auth/login",
-            r#"{"provider":"github","code":"abc"}"#,
-        )
-        .await;
+        let (status, _) = post(&app, "/auth/login", r#"{"provider":"github","code":"abc"}"#).await;
         assert_eq!(status, StatusCode::NOT_IMPLEMENTED);
     }
 
@@ -2453,7 +3083,9 @@ mod tests {
         async fn token_handler() -> AxJson<serde_json::Value> {
             AxJson(serde_json::json!({ "access_token": "tok-xyz", "token_type": "Bearer" }))
         }
-        async fn userinfo_handler(headers: HeaderMap) -> Result<AxJson<serde_json::Value>, StatusCode> {
+        async fn userinfo_handler(
+            headers: HeaderMap,
+        ) -> Result<AxJson<serde_json::Value>, StatusCode> {
             let ok = headers
                 .get("authorization")
                 .and_then(|v| v.to_str().ok())
@@ -2468,7 +3100,9 @@ mod tests {
         let idp = Router::new()
             .route("/token", axpost(token_handler))
             .route("/userinfo", axget(userinfo_handler));
-        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
         let base = format!("http://{}", listener.local_addr().unwrap());
         tokio::spawn(async move { axum::serve(listener, idp).await.unwrap() });
 
@@ -2483,7 +3117,10 @@ mod tests {
             scopes: vec!["rig.read".into()],
         };
         let oauth = Arc::new(crate::OidcProvider::new(config).unwrap()) as Arc<dyn LoginProvider>;
-        let app = auth_router(AuthState { oauth_login: Some(oauth), ..state() });
+        let app = auth_router(AuthState {
+            oauth_login: Some(oauth),
+            ..state()
+        });
 
         let (status, body) = post(
             &app,
@@ -2508,13 +3145,23 @@ mod tests {
         .await;
         let (_, refresh1) = token_pair(&login_body);
 
-        let (status, body) = post(&app, "/auth/refresh", &format!(r#"{{"refresh_token":"{refresh1}"}}"#)).await;
+        let (status, body) = post(
+            &app,
+            "/auth/refresh",
+            &format!(r#"{{"refresh_token":"{refresh1}"}}"#),
+        )
+        .await;
         assert_eq!(status, StatusCode::OK);
         let (_, refresh2) = token_pair(&body);
         assert_ne!(refresh1, refresh2); // rotated
 
         // Reusing the now-rotated first token is rejected (and burns the family).
-        let (status, _) = post(&app, "/auth/refresh", &format!(r#"{{"refresh_token":"{refresh1}"}}"#)).await;
+        let (status, _) = post(
+            &app,
+            "/auth/refresh",
+            &format!(r#"{{"refresh_token":"{refresh1}"}}"#),
+        )
+        .await;
         assert_eq!(status, StatusCode::UNAUTHORIZED);
     }
 
@@ -2529,11 +3176,21 @@ mod tests {
         .await;
         let (_, refresh) = token_pair(&login_body);
 
-        let (status, _) = post(&app, "/auth/logout", &format!(r#"{{"refresh_token":"{refresh}"}}"#)).await;
+        let (status, _) = post(
+            &app,
+            "/auth/logout",
+            &format!(r#"{{"refresh_token":"{refresh}"}}"#),
+        )
+        .await;
         assert_eq!(status, StatusCode::NO_CONTENT);
 
         // The revoked token can no longer be refreshed.
-        let (status, _) = post(&app, "/auth/refresh", &format!(r#"{{"refresh_token":"{refresh}"}}"#)).await;
+        let (status, _) = post(
+            &app,
+            "/auth/refresh",
+            &format!(r#"{{"refresh_token":"{refresh}"}}"#),
+        )
+        .await;
         assert_eq!(status, StatusCode::UNAUTHORIZED);
     }
 
@@ -2550,17 +3207,27 @@ mod tests {
             nbf: None,
             iat: 0,
         };
-        let mut req = Request::builder().uri("/auth/me").body(Body::empty()).unwrap();
+        let mut req = Request::builder()
+            .uri("/auth/me")
+            .body(Body::empty())
+            .unwrap();
         req.extensions_mut().insert(claims);
         let resp = app.clone().oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
-        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
         let body = String::from_utf8(bytes.to_vec()).unwrap();
         assert!(body.contains(r#""sub":"alice""#) && body.contains(r#""workspace":"acme""#));
 
         // Without claims → 401.
         let resp = app
-            .oneshot(Request::builder().uri("/auth/me").body(Body::empty()).unwrap())
+            .oneshot(
+                Request::builder()
+                    .uri("/auth/me")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
@@ -2618,8 +3285,14 @@ mod tests {
     async fn login_sets_httponly_access_and_refresh_cookies() {
         let resp = login_response(&auth_router(state())).await;
         let cookies = set_cookies(&resp);
-        let access = cookies.iter().find(|c| c.starts_with("gt_web_token=")).unwrap();
-        let refresh = cookies.iter().find(|c| c.starts_with("gt_refresh=")).unwrap();
+        let access = cookies
+            .iter()
+            .find(|c| c.starts_with("gt_web_token="))
+            .unwrap();
+        let refresh = cookies
+            .iter()
+            .find(|c| c.starts_with("gt_refresh="))
+            .unwrap();
         // access cookie: httpOnly, site-wide, the configured flags.
         assert!(access.contains("HttpOnly") && access.contains("Path=/"));
         assert!(access.contains("SameSite=Lax") && access.contains("Secure"));
@@ -2652,7 +3325,9 @@ mod tests {
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
         // And it re-sets a fresh, rotated refresh cookie.
-        assert!(set_cookies(&resp).iter().any(|c| c.starts_with("gt_refresh=")));
+        assert!(set_cookies(&resp)
+            .iter()
+            .any(|c| c.starts_with("gt_refresh=")));
     }
 
     #[tokio::test]
@@ -2669,8 +3344,12 @@ mod tests {
             .unwrap();
         assert_eq!(resp.status(), StatusCode::NO_CONTENT);
         let cookies = set_cookies(&resp);
-        assert!(cookies.iter().any(|c| c.starts_with("gt_web_token=") && c.contains("Max-Age=0")));
-        assert!(cookies.iter().any(|c| c.starts_with("gt_refresh=") && c.contains("Max-Age=0")));
+        assert!(cookies
+            .iter()
+            .any(|c| c.starts_with("gt_web_token=") && c.contains("Max-Age=0")));
+        assert!(cookies
+            .iter()
+            .any(|c| c.starts_with("gt_refresh=") && c.contains("Max-Age=0")));
     }
 
     // --- hq-identity.3: GET /auth/workspaces + POST /auth/switch ---------------------------------
@@ -2691,7 +3370,10 @@ mod tests {
                 .get(sub)
                 .into_iter()
                 .flatten()
-                .map(|(w, r, _)| WorkspaceMembership { workspace: w.clone(), role: r.clone() })
+                .map(|(w, r, _)| WorkspaceMembership {
+                    workspace: w.clone(),
+                    role: r.clone(),
+                })
                 .collect())
         }
         async fn resolve(
@@ -2714,7 +3396,10 @@ mod tests {
     }
 
     fn state_with_memberships(dir: Arc<MemDirectory>) -> AuthState {
-        AuthState { memberships: Some(dir), ..state() }
+        AuthState {
+            memberships: Some(dir),
+            ..state()
+        }
     }
 
     /// In-memory [`MembershipAdmin`] double: records add/remove calls, and "knows" a fixed set of
@@ -2745,13 +3430,19 @@ mod tests {
             Ok(true)
         }
         async fn remove_member(&self, email: &str, workspace: &str) -> Result<bool, AuthError> {
-            self.removed.lock().unwrap().push((email.into(), workspace.into()));
+            self.removed
+                .lock()
+                .unwrap()
+                .push((email.into(), workspace.into()));
             Ok(self.known_emails.iter().any(|e| e == email))
         }
     }
 
     fn state_with_membership_admin(admin: Arc<MemAdmin>) -> AuthState {
-        AuthState { membership_admin: Some(admin), ..state() }
+        AuthState {
+            membership_admin: Some(admin),
+            ..state()
+        }
     }
 
     /// A request carrying verified claims whose active `workspace` + `scopes` are the caller's —
@@ -2767,7 +3458,10 @@ mod tests {
             builder = builder.header("content-type", "application/json");
         }
         let mut req = builder
-            .body(json.map(|j| Body::from(j.to_owned())).unwrap_or_else(Body::empty))
+            .body(
+                json.map(|j| Body::from(j.to_owned()))
+                    .unwrap_or_else(Body::empty),
+            )
             .unwrap();
         if let Some((workspace, scopes)) = workspace {
             req.extensions_mut().insert(JwtClaims {
@@ -2784,19 +3478,31 @@ mod tests {
 
     #[tokio::test]
     async fn ws_admin_can_add_a_member_but_a_non_admin_is_forbidden() {
-        let admin = Arc::new(MemAdmin { known_emails: vec!["bob@acme.test".into()], ..Default::default() });
+        let admin = Arc::new(MemAdmin {
+            known_emails: vec!["bob@acme.test".into()],
+            ..Default::default()
+        });
         let app = auth_router(state_with_membership_admin(admin.clone()));
         let path = "/auth/workspaces/acme/members";
         let body = r#"{"email":"bob@acme.test","role":"member"}"#;
 
         // No claims → 401.
-        let resp = app.clone().oneshot(claim_req("POST", path, None, Some(body))).await.unwrap();
+        let resp = app
+            .clone()
+            .oneshot(claim_req("POST", path, None, Some(body)))
+            .await
+            .unwrap();
         assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
 
         // A member of acme WITHOUT the admin grant → 403 (a normal user cannot add).
         let resp = app
             .clone()
-            .oneshot(claim_req("POST", path, Some(("acme", &["beads.read"])), Some(body)))
+            .oneshot(claim_req(
+                "POST",
+                path,
+                Some(("acme", &["beads.read"])),
+                Some(body),
+            ))
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::FORBIDDEN);
@@ -2812,7 +3518,12 @@ mod tests {
         // The workspace's own admin (`workspace.admin` while active in acme) → 204, recorded.
         let resp = app
             .clone()
-            .oneshot(claim_req("POST", path, Some(("acme", &["workspace.admin"])), Some(body)))
+            .oneshot(claim_req(
+                "POST",
+                path,
+                Some(("acme", &["workspace.admin"])),
+                Some(body),
+            ))
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::NO_CONTENT);
@@ -2841,7 +3552,10 @@ mod tests {
 
     #[tokio::test]
     async fn ws_admin_can_remove_a_member_and_non_member_is_404() {
-        let admin = Arc::new(MemAdmin { known_emails: vec!["bob@acme.test".into()], ..Default::default() });
+        let admin = Arc::new(MemAdmin {
+            known_emails: vec!["bob@acme.test".into()],
+            ..Default::default()
+        });
         let app = auth_router(state_with_membership_admin(admin.clone()));
 
         // Non-admin remove → 403.
@@ -2907,21 +3621,37 @@ mod tests {
         by_sub.insert(
             "gwen".to_string(),
             vec![
-                ("ida".to_string(), "lead".to_string(), vec!["beads.read".to_string()]),
-                ("idb".to_string(), "lead".to_string(), vec!["rig.read".to_string()]),
+                (
+                    "ida".to_string(),
+                    "lead".to_string(),
+                    vec!["beads.read".to_string()],
+                ),
+                (
+                    "idb".to_string(),
+                    "lead".to_string(),
+                    vec!["rig.read".to_string()],
+                ),
             ],
         );
         Arc::new(MemDirectory { by_sub })
     }
 
     /// Build a request to `path` with optional verified claims (`sub`/`workspace`) and JSON body.
-    fn authed_req(method: &str, path: &str, sub: Option<&str>, json: Option<&str>) -> Request<Body> {
+    fn authed_req(
+        method: &str,
+        path: &str,
+        sub: Option<&str>,
+        json: Option<&str>,
+    ) -> Request<Body> {
         let mut builder = Request::builder().method(method).uri(path);
         if json.is_some() {
             builder = builder.header("content-type", "application/json");
         }
         let mut req = builder
-            .body(json.map(|j| Body::from(j.to_owned())).unwrap_or_else(Body::empty))
+            .body(
+                json.map(|j| Body::from(j.to_owned()))
+                    .unwrap_or_else(Body::empty),
+            )
             .unwrap();
         if let Some(sub) = sub {
             req.extensions_mut().insert(JwtClaims {
@@ -2944,13 +3674,21 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
-        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
         let got: Vec<WorkspaceMembership> = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(
             got,
             vec![
-                WorkspaceMembership { workspace: "ida".into(), role: "lead".into() },
-                WorkspaceMembership { workspace: "idb".into(), role: "lead".into() },
+                WorkspaceMembership {
+                    workspace: "ida".into(),
+                    role: "lead".into()
+                },
+                WorkspaceMembership {
+                    workspace: "idb".into(),
+                    role: "lead".into()
+                },
             ]
         );
     }
@@ -2976,7 +3714,12 @@ mod tests {
     async fn switch_remints_for_a_held_workspace_with_that_tenants_scopes() {
         let app = auth_router(state_with_memberships(gwen_directory()));
         let resp = app
-            .oneshot(authed_req("POST", "/auth/switch", Some("gwen"), Some(r#"{"workspace":"idb"}"#)))
+            .oneshot(authed_req(
+                "POST",
+                "/auth/switch",
+                Some("gwen"),
+                Some(r#"{"workspace":"idb"}"#),
+            ))
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
@@ -2985,7 +3728,9 @@ mod tests {
         assert!(cookies.iter().any(|c| c.starts_with("gt_web_token=")));
         // The re-minted access token names idb + that tenant's scopes — proving the server
         // resolved the active workspace from membership, not from the prior claim (ida).
-        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
         let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         let access = body["access_token"].as_str().unwrap();
         let verifier = JwtAuthenticator::from_kid_pems([("k1", PUB_PEM)]).unwrap();
@@ -2999,7 +3744,12 @@ mod tests {
     async fn switch_to_an_unheld_workspace_is_forbidden() {
         let app = auth_router(state_with_memberships(gwen_directory()));
         let resp = app
-            .oneshot(authed_req("POST", "/auth/switch", Some("gwen"), Some(r#"{"workspace":"ghost"}"#)))
+            .oneshot(authed_req(
+                "POST",
+                "/auth/switch",
+                Some("gwen"),
+                Some(r#"{"workspace":"ghost"}"#),
+            ))
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::FORBIDDEN);
@@ -3009,7 +3759,12 @@ mod tests {
     async fn switch_without_claims_is_unauthorized() {
         let app = auth_router(state_with_memberships(gwen_directory()));
         let resp = app
-            .oneshot(authed_req("POST", "/auth/switch", None, Some(r#"{"workspace":"idb"}"#)))
+            .oneshot(authed_req(
+                "POST",
+                "/auth/switch",
+                None,
+                Some(r#"{"workspace":"idb"}"#),
+            ))
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
@@ -3086,17 +3841,28 @@ mod tests {
         }
 
         fn state_with_providers(p: Arc<MemProviders>) -> AuthState {
-            AuthState { providers: Some(p), ..state() }
+            AuthState {
+                providers: Some(p),
+                ..state()
+            }
         }
 
         /// A request with the caller's scopes injected as verified claims; `None` ⇒ no claims.
-        fn req(method: &str, path: &str, scopes: Option<&[&str]>, json: Option<&str>) -> Request<Body> {
+        fn req(
+            method: &str,
+            path: &str,
+            scopes: Option<&[&str]>,
+            json: Option<&str>,
+        ) -> Request<Body> {
             let mut builder = Request::builder().method(method).uri(path);
             if json.is_some() {
                 builder = builder.header("content-type", "application/json");
             }
             let mut r = builder
-                .body(json.map(|j| Body::from(j.to_owned())).unwrap_or_else(Body::empty))
+                .body(
+                    json.map(|j| Body::from(j.to_owned()))
+                        .unwrap_or_else(Body::empty),
+                )
                 .unwrap();
             if let Some(scopes) = scopes {
                 r.extensions_mut().insert(JwtClaims {
@@ -3112,7 +3878,9 @@ mod tests {
         }
 
         async fn body_str(resp: axum::response::Response) -> String {
-            let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+            let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+                .await
+                .unwrap();
             String::from_utf8(bytes.to_vec()).unwrap()
         }
 
@@ -3133,7 +3901,12 @@ mod tests {
             // Non-admin (a mere workspace.admin, not the system `*`) → 403; unauthenticated → 401.
             let forbidden = app
                 .clone()
-                .oneshot(req("POST", "/auth/providers", Some(&["workspace.admin"]), Some(create_body)))
+                .oneshot(req(
+                    "POST",
+                    "/auth/providers",
+                    Some(&["workspace.admin"]),
+                    Some(create_body),
+                ))
                 .await
                 .unwrap();
             assert_eq!(forbidden.status(), StatusCode::FORBIDDEN);
@@ -3147,27 +3920,52 @@ mod tests {
             // System admin (`*`) → 201, and the echo omits the secret (sealed or plain).
             let created = app
                 .clone()
-                .oneshot(req("POST", "/auth/providers", Some(&["*"]), Some(create_body)))
+                .oneshot(req(
+                    "POST",
+                    "/auth/providers",
+                    Some(&["*"]),
+                    Some(create_body),
+                ))
                 .await
                 .unwrap();
             assert_eq!(created.status(), StatusCode::CREATED);
             let echo = body_str(created).await;
             assert!(echo.contains("\"id\":\"goog\""), "echo: {echo}");
             assert!(echo.contains("\"client_id\":\"cid\""), "echo: {echo}");
-            assert!(echo.contains("oauth2.googleapis.com"), "preset endpoints filled: {echo}");
-            assert!(!echo.contains("client_secret"), "echo must not name the secret: {echo}");
-            assert!(!echo.contains("top-secret-xyz"), "echo must not carry the secret: {echo}");
+            assert!(
+                echo.contains("oauth2.googleapis.com"),
+                "preset endpoints filled: {echo}"
+            );
+            assert!(
+                !echo.contains("client_secret"),
+                "echo must not name the secret: {echo}"
+            );
+            assert!(
+                !echo.contains("top-secret-xyz"),
+                "echo must not carry the secret: {echo}"
+            );
 
             // Patch `enabled` (no secret re-supplied) → 200, still no secret on the wire.
             let patched = app
                 .clone()
-                .oneshot(req("PATCH", "/auth/providers/goog", Some(&["*"]), Some(r#"{"enabled":false}"#)))
+                .oneshot(req(
+                    "PATCH",
+                    "/auth/providers/goog",
+                    Some(&["*"]),
+                    Some(r#"{"enabled":false}"#),
+                ))
                 .await
                 .unwrap();
             assert_eq!(patched.status(), StatusCode::OK);
             let pbody = body_str(patched).await;
-            assert!(pbody.contains("\"enabled\":false"), "patch toggled enabled: {pbody}");
-            assert!(!pbody.contains("top-secret-xyz"), "patch echo carries no secret: {pbody}");
+            assert!(
+                pbody.contains("\"enabled\":false"),
+                "patch toggled enabled: {pbody}"
+            );
+            assert!(
+                !pbody.contains("top-secret-xyz"),
+                "patch echo carries no secret: {pbody}"
+            );
 
             // The store still holds the SEALED secret (write-only is about the wire, not at rest).
             assert!(!store.rows.lock().unwrap()[0].client_secret_enc.is_empty());
@@ -3175,7 +3973,12 @@ mod tests {
             // A delete by a non-admin is 403; by the system admin, 204; a second delete is 404.
             let del_forbidden = app
                 .clone()
-                .oneshot(req("DELETE", "/auth/providers/goog", Some(&["issues.write"]), None))
+                .oneshot(req(
+                    "DELETE",
+                    "/auth/providers/goog",
+                    Some(&["issues.write"]),
+                    None,
+                ))
                 .await
                 .unwrap();
             assert_eq!(del_forbidden.status(), StatusCode::FORBIDDEN);
@@ -3290,11 +4093,26 @@ mod tests {
             let all = body_str(listed).await;
             assert!(all.contains("\"id\":\"goog\""), "enabled present: {all}");
             assert!(all.contains("\"id\":\"gh\""), "disabled present: {all}");
-            assert!(all.contains("\"client_id\":\"cid-off\""), "client_id present: {all}");
-            assert!(all.contains("github.com/login/oauth"), "endpoints present: {all}");
-            assert!(all.contains("\"enabled\":false"), "disabled flag present: {all}");
-            assert!(!all.contains("client_secret"), "list names no secret: {all}");
-            assert!(!all.contains("sec-on") && !all.contains("sec-off"), "no secret value: {all}");
+            assert!(
+                all.contains("\"client_id\":\"cid-off\""),
+                "client_id present: {all}"
+            );
+            assert!(
+                all.contains("github.com/login/oauth"),
+                "endpoints present: {all}"
+            );
+            assert!(
+                all.contains("\"enabled\":false"),
+                "disabled flag present: {all}"
+            );
+            assert!(
+                !all.contains("client_secret"),
+                "list names no secret: {all}"
+            );
+            assert!(
+                !all.contains("sec-on") && !all.contains("sec-off"),
+                "no secret value: {all}"
+            );
 
             // Admin SINGLE by id → the DISABLED provider, full secret-free shape.
             let single = app
@@ -3305,20 +4123,39 @@ mod tests {
             assert_eq!(single.status(), StatusCode::OK);
             let one = body_str(single).await;
             assert!(one.contains("\"id\":\"gh\""), "single by id: {one}");
-            assert!(one.contains("\"enabled\":false"), "single is the disabled one: {one}");
-            assert!(one.contains("\"client_id\":\"cid-off\""), "single carries client_id: {one}");
-            assert!(!one.contains("client_secret"), "single names no secret: {one}");
+            assert!(
+                one.contains("\"enabled\":false"),
+                "single is the disabled one: {one}"
+            );
+            assert!(
+                one.contains("\"client_id\":\"cid-off\""),
+                "single carries client_id: {one}"
+            );
+            assert!(
+                !one.contains("client_secret"),
+                "single names no secret: {one}"
+            );
 
             // A non-admin is 403 on both admin reads; unauthenticated is 401; an unknown id 404.
             let list_forbidden = app
                 .clone()
-                .oneshot(req("GET", "/auth/providers/all", Some(&["workspace.admin"]), None))
+                .oneshot(req(
+                    "GET",
+                    "/auth/providers/all",
+                    Some(&["workspace.admin"]),
+                    None,
+                ))
                 .await
                 .unwrap();
             assert_eq!(list_forbidden.status(), StatusCode::FORBIDDEN);
             let single_forbidden = app
                 .clone()
-                .oneshot(req("GET", "/auth/providers/gh", Some(&["workspace.admin"]), None))
+                .oneshot(req(
+                    "GET",
+                    "/auth/providers/gh",
+                    Some(&["workspace.admin"]),
+                    None,
+                ))
                 .await
                 .unwrap();
             assert_eq!(single_forbidden.status(), StatusCode::FORBIDDEN);
@@ -3343,9 +4180,18 @@ mod tests {
                 .unwrap();
             assert_eq!(public.status(), StatusCode::OK);
             let pub_body = body_str(public).await;
-            assert!(pub_body.contains("\"id\":\"goog\""), "public lists enabled: {pub_body}");
-            assert!(!pub_body.contains("\"id\":\"gh\""), "public hides disabled: {pub_body}");
-            assert!(!pub_body.contains("client_id"), "public is minimal (no client_id): {pub_body}");
+            assert!(
+                pub_body.contains("\"id\":\"goog\""),
+                "public lists enabled: {pub_body}"
+            );
+            assert!(
+                !pub_body.contains("\"id\":\"gh\""),
+                "public hides disabled: {pub_body}"
+            );
+            assert!(
+                !pub_body.contains("client_id"),
+                "public is minimal (no client_id): {pub_body}"
+            );
         }
     }
 
@@ -3353,7 +4199,9 @@ mod tests {
     #[cfg(feature = "oauth")]
     mod authz_flow {
         use super::*;
-        use crate::provider_repo::{NewProvider, ProviderKind as RepoKind, ProviderRecord, ProviderRepo};
+        use crate::provider_repo::{
+            NewProvider, ProviderKind as RepoKind, ProviderRecord, ProviderRepo,
+        };
         use crate::{NewAuthz, PendingAuthz};
         use std::collections::HashMap;
         use std::sync::Mutex;
@@ -3389,7 +4237,13 @@ mod tests {
                 Ok(self.rows.lock().unwrap().clone())
             }
             async fn get(&self, id: &str) -> Result<Option<ProviderRecord>, AuthError> {
-                Ok(self.rows.lock().unwrap().iter().find(|r| r.id == id).cloned())
+                Ok(self
+                    .rows
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .find(|r| r.id == id)
+                    .cloned())
             }
             async fn create(&self, _p: NewProvider) -> Result<ProviderRecord, AuthError> {
                 unreachable!()
@@ -3458,13 +4312,20 @@ mod tests {
         async fn spawn_idp() -> String {
             use axum::extract::Form;
             use axum::routing::{get as axget, post as axpost};
-            async fn token(Form(form): Form<HashMap<String, String>>) -> Result<Json<serde_json::Value>, StatusCode> {
+            async fn token(
+                Form(form): Form<HashMap<String, String>>,
+            ) -> Result<Json<serde_json::Value>, StatusCode> {
                 // The PKCE verifier MUST have reached the token endpoint (proves the exchange
                 // threaded it through).
                 if form.get("code").map(String::as_str) == Some("good-code")
-                    && form.get("code_verifier").map(|v| !v.is_empty()).unwrap_or(false)
+                    && form
+                        .get("code_verifier")
+                        .map(|v| !v.is_empty())
+                        .unwrap_or(false)
                 {
-                    Ok(Json(serde_json::json!({ "access_token": "tok-1", "token_type": "Bearer" })))
+                    Ok(Json(
+                        serde_json::json!({ "access_token": "tok-1", "token_type": "Bearer" }),
+                    ))
                 } else {
                     Err(StatusCode::BAD_REQUEST)
                 }
@@ -3484,7 +4345,9 @@ mod tests {
             let app = Router::new()
                 .route("/token", axpost(token))
                 .route("/userinfo", axget(userinfo));
-            let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+            let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+                .await
+                .unwrap();
             let base = format!("http://{}", listener.local_addr().unwrap());
             tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
             base
@@ -3527,7 +4390,12 @@ mod tests {
 
         /// Pull the single `Location` header off a response.
         fn location(resp: &axum::response::Response) -> String {
-            resp.headers().get(header::LOCATION).unwrap().to_str().unwrap().to_owned()
+            resp.headers()
+                .get(header::LOCATION)
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .to_owned()
         }
 
         /// `GET /auth/providers` lists ONLY the enabled provider and leaks NO secret (or client id).
@@ -3537,11 +4405,18 @@ mod tests {
             let (st, _) = flow_state(&base, None);
             let app = auth_router(st);
             let resp = app
-                .oneshot(Request::builder().uri("/auth/providers").body(Body::empty()).unwrap())
+                .oneshot(
+                    Request::builder()
+                        .uri("/auth/providers")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
                 .await
                 .unwrap();
             assert_eq!(resp.status(), StatusCode::OK);
-            let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+            let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+                .await
+                .unwrap();
             let body = String::from_utf8(bytes.to_vec()).unwrap();
             let v: serde_json::Value = serde_json::from_str(&body).unwrap();
             let arr = v.as_array().unwrap();
@@ -3642,7 +4517,9 @@ mod tests {
                 .await
                 .unwrap();
             assert_eq!(cb.status(), StatusCode::OK);
-            let bytes = axum::body::to_bytes(cb.into_body(), usize::MAX).await.unwrap();
+            let bytes = axum::body::to_bytes(cb.into_body(), usize::MAX)
+                .await
+                .unwrap();
             let body = String::from_utf8(bytes.to_vec()).unwrap();
             let (access, refresh) = token_pair(&body);
             assert!(!access.is_empty() && !refresh.is_empty());
@@ -3696,7 +4573,14 @@ mod tests {
                 .await
                 .unwrap();
             let loc = location(&authz);
-            let state_param = loc.split("state=").nth(1).unwrap().split('&').next().unwrap().to_owned();
+            let state_param = loc
+                .split("state=")
+                .nth(1)
+                .unwrap()
+                .split('&')
+                .next()
+                .unwrap()
+                .to_owned();
             let cb = app
                 .oneshot(
                     Request::builder()
@@ -3708,7 +4592,10 @@ mod tests {
                 .unwrap();
             assert_eq!(cb.status(), StatusCode::FOUND);
             let dest = location(&cb);
-            assert!(dest.starts_with("https://app.gt.test/auth/landed#access_token="), "dest: {dest}");
+            assert!(
+                dest.starts_with("https://app.gt.test/auth/landed#access_token="),
+                "dest: {dest}"
+            );
             assert!(dest.contains("token_type=Bearer"));
             // The httpOnly auth cookies rode along.
             assert!(cb

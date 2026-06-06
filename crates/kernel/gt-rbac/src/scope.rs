@@ -80,6 +80,10 @@ impl Scope {
             "merge.*",
             "convoy.*",
             "agent.*",
+            // Self-service Personal Access Tokens (hq-security-pat.2): a member manages their OWN
+            // tokens. The REST `/auth/tokens` surface gates on `tokens.read`/`tokens.write`, so the
+            // curated member grant carries that whole namespace.
+            "tokens.*",
             "workspace.info",
             "workspace.list",
         ]
@@ -244,6 +248,9 @@ mod tests {
         let s = Scope::workspace_member("member");
         s.check("issues.close.execute").unwrap();
         s.check("rig.add.execute").unwrap();
+        // A member manages their own Personal Access Tokens (hq-security-pat.2).
+        s.check("tokens.read").unwrap();
+        s.check("tokens.write").unwrap();
         s.check("workspace.info").unwrap();
         s.check("workspace.list").unwrap();
         // Provisioning a tenant is an admin act, outside the member grant.
@@ -349,10 +356,15 @@ validate_only = true
             reader.check("documents.attach.execute").is_err(),
             "a read-only documents actor cannot attach"
         );
-        assert!(reader.check("documents.remove.execute").is_err(), "nor remove");
+        assert!(
+            reader.check("documents.remove.execute").is_err(),
+            "nor remove"
+        );
 
         // The `readonly` profile (validate_only) blocks every execute, including documents.
-        let ro = RbacConfig::from_profile("readonly").unwrap().expect("readonly profile");
+        let ro = RbacConfig::from_profile("readonly")
+            .unwrap()
+            .expect("readonly profile");
         let ro_scope = ro.resolve("mcp-local");
         ro_scope.check("documents.attach.validate").unwrap();
         assert!(
@@ -361,14 +373,26 @@ validate_only = true
         );
 
         // The `closed` profile grants nothing, so even validate is denied.
-        let closed = RbacConfig::from_profile("closed").unwrap().expect("closed profile");
+        let closed = RbacConfig::from_profile("closed")
+            .unwrap()
+            .expect("closed profile");
         let closed_scope = closed.resolve("mcp-local");
-        assert!(closed_scope.check("documents.attach.validate").is_err(), "closed denies all");
-        assert!(closed_scope.check("documents.list.execute").is_err(), "closed denies reads too");
+        assert!(
+            closed_scope.check("documents.attach.validate").is_err(),
+            "closed denies all"
+        );
+        assert!(
+            closed_scope.check("documents.list.execute").is_err(),
+            "closed denies reads too"
+        );
 
         // The `dev` profile (full local access) permits the documents execute path.
-        let dev = RbacConfig::from_profile("dev").unwrap().expect("dev profile");
-        dev.resolve("mcp-local").check("documents.attach.execute").unwrap();
+        let dev = RbacConfig::from_profile("dev")
+            .unwrap()
+            .expect("dev profile");
+        dev.resolve("mcp-local")
+            .check("documents.attach.execute")
+            .unwrap();
     }
 
     #[test]

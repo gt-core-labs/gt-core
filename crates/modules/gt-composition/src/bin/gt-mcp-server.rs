@@ -35,10 +35,10 @@ use rmcp::transport::{StreamableHttpServerConfig, StreamableHttpService};
 
 use gt_audit::{AuditSink, InMemoryAudit};
 use gt_auth::{
-    auth_router, AuthState as LoginState, GlobalLogin, JwtAuthenticator, JwtMinter, PgRefreshStore,
-    PgUsers, SameSite,
+    auth_router, AuthState as LoginState, GlobalLogin, JwtAuthenticator, JwtMinter, PgPatStore,
+    PgRefreshStore, PgUsers, SameSite,
 };
-use gt_composition::auth::{authenticate, AuthState, SharedAuthenticator};
+use gt_composition::auth::{authenticate, AuthState, PatVerifier, SharedAuthenticator};
 use gt_composition::denial_audit::audit_denials;
 use gt_composition::mcp::{
     AgentHandler, AuditHandler, CompositionTenantProvisioner, ConvoyHandler, DocumentsHandler,
@@ -580,6 +580,11 @@ async fn main() -> anyhow::Result<()> {
     // `/api/v1/*` chain below, which additionally enforces RBAC scopes.
     let access_ttl = env_u64("GT_AUTH_ACCESS_TTL_SECS", 900);
     let refresh_ttl = env_u64("GT_AUTH_REFRESH_TTL_SECS", 2_592_000);
+    // The Personal Access Token verifier (hq-security-pat.1), hoisted so BOTH the `/auth/*` chain
+    // (built in the match arm below) and the `/api/v1/*` chain (built afterwards) authenticate a
+    // `gtpat_…` bearer through it. Set inside the arm where the Postgres pool is built; `None`
+    // without a verifier + minter + PG, so a deploy without login carries no PAT surface either.
+    let mut pat_verifier: Option<Arc<dyn PatVerifier>> = None;
     let app = match (
         verifier.clone(),
         JwtMinter::from_env().ok(),
@@ -612,6 +617,10 @@ async fn main() -> anyhow::Result<()> {
                 // `/authorize`→`/callback` redirect flow has somewhere durable to park the
                 // per-login `state`+`code_verifier` (one-shot, ~10 min TTL).
                 gt_auth::migrations::CREATE_OAUTH_AUTHZ_STATE,
+                // hq-security-pat.1: the per-workspace Personal Access Token store, defined in the
+                // ws_default template so gt_create_workspace_schema clones it into every tenant —
+                // the table the PAT verifier + the self-service /auth/tokens surface read.
+                gt_auth::migrations::CREATE_PERSONAL_ACCESS_TOKENS,
             ] {
                 sqlx::raw_sql(sql)
                     .execute(&pool)
@@ -631,6 +640,12 @@ async fn main() -> anyhow::Result<()> {
             // One PgUsers backs the login port, the user-admin store (hq-web-extras.5), and the
             // role-admin store (hq-rbac.4) — one adapter over the ws_default pool.
             let pg_users = Arc::new(PgUsers::new(pool.clone(), "default"));
+            // hq-security-pat: one PgPatStore over the same ws_default pool backs BOTH the
+            // request-time PAT verifier (composition's `PatVerifier`, wired into the auth
+            // middleware) AND the self-service `/auth/tokens` admin surface (`PatAdmin`). Hoist the
+            // verifier so the `/api/v1/*` chain below uses the same store.
+            let pg_pat = Arc::new(PgPatStore::new(pool.clone()));
+            pat_verifier = Some(pg_pat.clone() as Arc<dyn PatVerifier>);
             // hq-idp-db.3: the public OAuth redirect-login flow. One DB-backed resolver
             // (`DbOauthLogin`) drives BOTH `oauth_login` (the JSON `/login` code path) and
             // `authz_flow` (the `/authorize`→`/callback` redirect), so they share the same provider
@@ -657,6 +672,8 @@ async fn main() -> anyhow::Result<()> {
                 oauth_login: None,
                 users: Some(pg_users.clone() as Arc<dyn gt_auth::UserStore>),
                 roles: Some(pg_users.clone() as Arc<dyn gt_auth::RoleStore>),
+                // hq-security-pat.2: the self-service PAT surface — the same store the verifier uses.
+                pat: Some(pg_pat.clone() as Arc<dyn gt_auth::PatAdmin>),
                 // Cross-workspace surface (hq-identity.3): list memberships + switch active
                 // workspace, backed by the same global-identity adapter.
                 memberships: Some(pg_users.clone() as Arc<dyn gt_auth::MembershipDirectory>),
@@ -668,10 +685,8 @@ async fn main() -> anyhow::Result<()> {
                 // shared pool. The secret is AES-GCM-sealed at rest (GT_SECRET_KEY) and never
                 // returned. Wired only with the `oauth` feature (the provider store + crypto).
                 #[cfg(feature = "oauth")]
-                providers: Some(
-                    Arc::new(gt_auth::PgProviderRepo::new(pool.clone()))
-                        as Arc<dyn gt_auth::ProviderStore>,
-                ),
+                providers: Some(Arc::new(gt_auth::PgProviderRepo::new(pool.clone()))
+                    as Arc<dyn gt_auth::ProviderStore>),
                 // hq-idp-db.3: the PUBLIC OAuth redirect-login flow. `authz_flow` is the same
                 // `DbOauthLogin` resolver as `oauth_login` (it builds the IdP authorize URL +
                 // runs the PKCE exchange); `authz_state` is the durable, one-shot state+PKCE store
@@ -713,7 +728,8 @@ async fn main() -> anyhow::Result<()> {
                 jwks,
             };
             let auth_app = auth_router(login_state).layer(axum::middleware::from_fn_with_state(
-                AuthState::new(verifier, audit.clone()),
+                AuthState::new(verifier, audit.clone())
+                    .with_pat(pg_pat.clone() as Arc<dyn PatVerifier>),
                 authenticate,
             ));
             eprintln!(
@@ -742,7 +758,15 @@ async fn main() -> anyhow::Result<()> {
                     audit_denials,
                 ))
                 .layer(axum::middleware::from_fn_with_state(
-                    AuthState::new(verifier, audit.clone()),
+                    {
+                        // hq-security-pat: the API surface authenticates `gtpat_…` bearers through
+                        // the same PAT verifier as `/auth/*` (set above when PG/login is configured).
+                        let mut st = AuthState::new(verifier, audit.clone());
+                        if let Some(pv) = pat_verifier.clone() {
+                            st = st.with_pat(pv);
+                        }
+                        st
+                    },
                     authenticate,
                 ));
             eprintln!(

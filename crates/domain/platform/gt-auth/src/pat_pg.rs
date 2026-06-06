@@ -58,6 +58,7 @@ impl PgPatStore {
     /// `requested` scopes and the minter's `granted` scopes (so it can never escalate), valid until
     /// `expires_at` (`None` ⇒ never) and created at `now`. Returns the opaque secret to hand the
     /// user **once** plus its server-side [`PatRecord`]. A backend fault is [`PatError::Backend`].
+    #[allow(clippy::too_many_arguments)]
     pub async fn mint(
         &self,
         sub: &str,
@@ -157,7 +158,7 @@ impl PgPatStore {
             return Err(PatError::Unknown);
         };
         let status: String = try_col(&row, "status")?;
-        match PatStatus::from_str(&status) {
+        match PatStatus::from_wire(&status) {
             Some(PatStatus::Revoked) => return Err(PatError::Revoked),
             Some(PatStatus::Active) => {}
             None => {
@@ -224,8 +225,10 @@ fn token_hash(token: &PatToken) -> String {
 /// unknown-status fault is a [`PatError::Backend`] (an outage / corrupt row, not a token verdict).
 fn row_to_record(row: &PgRow) -> Result<PatRecord, PatError> {
     let status_str: String = try_col(row, "status")?;
-    let status = PatStatus::from_str(&status_str).ok_or_else(|| {
-        PatError::Backend(format!("personal_access_tokens row has unknown status {status_str:?}"))
+    let status = PatStatus::from_wire(&status_str).ok_or_else(|| {
+        PatError::Backend(format!(
+            "personal_access_tokens row has unknown status {status_str:?}"
+        ))
     })?;
     let expires_at: Option<i64> = try_col(row, "expires_at")?;
     let last_used_at: Option<i64> = try_col(row, "last_used_at")?;
@@ -254,6 +257,39 @@ where
 /// Map a sqlx error to the backend fault variant.
 fn backend(e: sqlx::Error) -> PatError {
     PatError::Backend(format!("personal_access_tokens postgres: {e}"))
+}
+
+/// The self-service `/auth/tokens` port (hq-security-pat.2): the same `PgPatStore` that backs the
+/// PAT verifier also drives the mint/list/revoke surface, so one adapter over one workspace pool
+/// serves both the request-time verify and the user-facing administration. Gated with the `axum`
+/// HTTP surface that defines the port.
+#[cfg(feature = "axum")]
+#[async_trait::async_trait]
+impl crate::http::PatAdmin for PgPatStore {
+    #[allow(clippy::too_many_arguments)]
+    async fn mint(
+        &self,
+        sub: &str,
+        workspace: &str,
+        name: &str,
+        requested: &[String],
+        granted: &[String],
+        now: u64,
+        expires_at: Option<u64>,
+    ) -> Result<(PatToken, PatRecord), PatError> {
+        PgPatStore::mint(
+            self, sub, workspace, name, requested, granted, now, expires_at,
+        )
+        .await
+    }
+
+    async fn list(&self, sub: &str) -> Result<Vec<PatRecord>, PatError> {
+        PgPatStore::list(self, sub).await
+    }
+
+    async fn revoke(&self, sub: &str, id: &str) -> Result<bool, PatError> {
+        PgPatStore::revoke(self, sub, id).await
+    }
 }
 
 #[cfg(test)]
@@ -313,7 +349,10 @@ mod tests {
         assert_eq!(a, b, "hash must be deterministic for index lookups");
         assert_eq!(a.len(), 64, "sha-256 hex is 64 chars");
         assert!(a.chars().all(|c| c.is_ascii_hexdigit()));
-        assert!(!a.contains("super-secret"), "the secret must not leak into its hash");
+        assert!(
+            !a.contains("super-secret"),
+            "the secret must not leak into its hash"
+        );
     }
 
     // --- GT_PG_URL-gated contract tests against a live Postgres. ---
@@ -342,11 +381,18 @@ mod tests {
             .await
             .unwrap();
         assert!(token.as_str().starts_with("gtpat_"));
-        assert_eq!(rec.scopes, vec!["tokens.read".to_string()], "escalation clamped away");
+        assert_eq!(
+            rec.scopes,
+            vec!["tokens.read".to_string()],
+            "escalation clamped away"
+        );
         assert_eq!(rec.workspace, "acme");
 
         // Verify the very token mint handed out → claims carrying the clamped scopes.
-        let claims = store.verify(&token, 200).await.expect("verify a fresh token");
+        let claims = store
+            .verify(&token, 200)
+            .await
+            .expect("verify a fresh token");
         assert_eq!(claims.sub, "alice");
         assert_eq!(claims.workspace, "acme");
         assert_eq!(claims.scopes, vec!["tokens.read".to_string()]);
@@ -374,7 +420,15 @@ mod tests {
         ensure_table(&pool).await;
         let store = PgPatStore::new(pool);
         let (token, _) = store
-            .mint("bob", "acme", "short", &[], &["tokens.read".into()], 0, Some(100))
+            .mint(
+                "bob",
+                "acme",
+                "short",
+                &[],
+                &["tokens.read".into()],
+                0,
+                Some(100),
+            )
             .await
             .unwrap();
         // exp is exclusive: now == exp is already expired.
@@ -393,10 +447,21 @@ mod tests {
         ensure_table(&pool).await;
         let store = PgPatStore::new(pool);
         let (token, _) = store
-            .mint("eve", "acme", "forever", &[], &["tokens.read".into()], 0, None)
+            .mint(
+                "eve",
+                "acme",
+                "forever",
+                &[],
+                &["tokens.read".into()],
+                0,
+                None,
+            )
             .await
             .unwrap();
-        let claims = store.verify(&token, 9_000_000_000).await.expect("no expiry → always valid");
+        let claims = store
+            .verify(&token, 9_000_000_000)
+            .await
+            .expect("no expiry → always valid");
         // The synthesized claims still pass the downstream stateless clock gate.
         assert_eq!(claims.validate(9_000_000_000, false), Ok(()));
     }
@@ -412,11 +477,27 @@ mod tests {
 
         // Two users mint tokens; a list keyed by `sub` shows only that user's own.
         let (carol_tok, carol_rec) = store
-            .mint("carol", "acme", "one", &[], &["tokens.read".into()], 10, None)
+            .mint(
+                "carol",
+                "acme",
+                "one",
+                &[],
+                &["tokens.read".into()],
+                10,
+                None,
+            )
             .await
             .unwrap();
         let (_dave_tok, _) = store
-            .mint("dave", "acme", "two", &[], &["tokens.read".into()], 11, None)
+            .mint(
+                "dave",
+                "acme",
+                "two",
+                &[],
+                &["tokens.read".into()],
+                11,
+                None,
+            )
             .await
             .unwrap();
 
@@ -432,7 +513,10 @@ mod tests {
             !store.revoke("dave", carol_rec.id.as_str()).await.unwrap(),
             "a user cannot revoke another's token"
         );
-        assert!(store.verify(&carol_tok, 20).await.is_ok(), "still active after a foreign revoke");
+        assert!(
+            store.verify(&carol_tok, 20).await.is_ok(),
+            "still active after a foreign revoke"
+        );
 
         // The owner revokes it → verify now rejects, and a second revoke is a no-op 404.
         assert!(store.revoke("carol", carol_rec.id.as_str()).await.unwrap());
