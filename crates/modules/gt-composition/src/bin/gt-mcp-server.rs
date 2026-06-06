@@ -49,6 +49,7 @@ use gt_composition::mcp::{
 };
 use gt_composition::scope_bridge::bridge_scopes;
 use gt_composition::stream::{feed_router, FeedState};
+use gt_composition::terminal::{terminal_router, TerminalState};
 use gt_docs_embed::Embedder;
 use gt_docs_extract::Extractor;
 use gt_graphindex::GraphifyIndexer;
@@ -385,7 +386,27 @@ async fn main() -> anyhow::Result<()> {
         }
     };
 
-    let app = Router::new()
+    // Interactive PTY terminal (hq-terminal): GET /api/v1/terminal/ws opens a `/bin/sh` on a
+    // pseudo-terminal *inside this process* and bridges it to a browser xterm. It is REMOTE
+    // SHELL EXECUTION, so it is mounted only when BOTH a verifier is configured (cookie/bearer
+    // auth + `terminal.exec` scope gate) AND `GT_TERMINAL_ENABLE` is truthy — a default deploy
+    // serves no terminal (the route 404s). See `gt_composition::terminal`.
+    let terminal = match (&verifier, std::env::var("GT_TERMINAL_ENABLE")) {
+        (Some(v), Ok(flag)) if matches!(flag.trim(), "1" | "true" | "yes" | "on") => {
+            eprintln!(
+                "[gt-mcp-server] terminal WS on GET /api/v1/terminal/ws (cookie/bearer auth, scope terminal.exec)"
+            );
+            Some(terminal_router(TerminalState::new(v.clone(), audit.clone())))
+        }
+        _ => {
+            eprintln!(
+                "[gt-mcp-server] terminal WS off (needs RS256 verifier + GT_TERMINAL_ENABLE=1)"
+            );
+            None
+        }
+    };
+
+    let mut app = Router::new()
         .route("/health", get(health::health))
         .route("/readyz", get(health::readyz))
         // Prometheus scrape endpoint (hq-mt-deploy.8): the per-workspace cost
@@ -395,6 +416,9 @@ async fn main() -> anyhow::Result<()> {
         .with_state(health_state)
         .merge(feed)
         .nest_service(MCP_PATH, http);
+    if let Some(terminal) = terminal {
+        app = app.merge(terminal);
+    }
 
     // REST surface (hq-auth-routes.2): the module routers the kernel builder mounted
     // (`/api/v1/<module>/...`, currently issues) behind the auth + scope-bridge + audit chain.

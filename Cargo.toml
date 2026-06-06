@@ -84,6 +84,9 @@ futures-core = "0.3"
 tower = "0.5"
 tower-http = { version = "0.6", features = ["trace"] }
 
+# Interactive terminal — PTY-backed shell over a WebSocket (hq-terminal)
+portable-pty = "0.8"
+
 # Crypto — webhook signature verification (hq-mod-hooks.5+)
 hmac = "0.12"
 sha2 = "0.10"

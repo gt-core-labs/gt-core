@@ -108,7 +108,9 @@ gt-audit = { workspace = true }
 gt-store-dolt = { workspace = true }
 mysql_async = { workspace = true }
 rmcp = { workspace = true, features = ["server", "transport-streamable-http-server"] }
-axum = { workspace = true }
+# `ws` adds the WebSocket extractor the interactive terminal (hq-terminal) upgrades on.
+axum = { workspace = true, features = ["ws"] }
+portable-pty = { workspace = true }
 tower-http = { workspace = true, features = ["cors"] }
 anyhow = { workspace = true }
 serde = { workspace = true }

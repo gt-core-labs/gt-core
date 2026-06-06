@@ -30,9 +30,12 @@ pub const SCOPE_WILDCARD: &str = "*";
 ///
 /// `admin`/`member` are the two workspace-role verbs (`workspace.admin`, `workspace.member`);
 /// the rest are the CRUD/operational verbs the modules' capabilities and the REST guard use
-/// (`read`/`write` are what [`gt_module`]'s route guard derives from the HTTP method).
+/// (`read`/`write` are what [`gt_module`]'s route guard derives from the HTTP method). `exec`
+/// gates capabilities that *run* something rather than read/mutate state — the interactive
+/// terminal (`terminal.exec`, hq-terminal) is the first.
 pub const SCOPE_VERBS: &[&str] = &[
     "read", "write", "create", "update", "delete", "submit", "list", "info", "admin", "member",
+    "exec",
 ];
 
 /// True when `verb` is in the closed [`SCOPE_VERBS`] set.
@@ -141,6 +144,12 @@ mod tests {
     #[test]
     fn accepts_a_kebab_resource() {
         validate_scope("merge-queue.read").unwrap();
+    }
+
+    #[test]
+    fn accepts_the_terminal_exec_scope() {
+        // hq-terminal: the interactive PTY terminal gates on `terminal.exec`.
+        validate_scope("terminal.exec").unwrap();
     }
 
     #[test]

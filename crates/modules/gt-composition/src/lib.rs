@@ -34,6 +34,7 @@ pub mod mcp;
 pub mod polecat;
 pub mod scope_bridge;
 pub mod stream;
+pub mod terminal;
 
 use std::collections::HashMap;
 use std::path::PathBuf;
