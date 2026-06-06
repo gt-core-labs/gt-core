@@ -1913,6 +1913,32 @@ async fn get_provider(
         .ok_or(ApiError::NotFound)
 }
 
+/// Query params for `GET /auth/providers/{id}/authorize`. `cli_redirect` is present only for the
+/// `gt login` browser flow (hq-gt-login-oauth.1): the local loopback URL the callback hands the
+/// minted session back to (via a one-shot code). Absent ⇒ the ordinary web login, redirected to the
+/// FE as before.
+#[cfg(feature = "oauth")]
+#[derive(Debug, Default, Deserialize)]
+struct AuthorizeParams {
+    #[serde(default)]
+    cli_redirect: Option<String>,
+}
+
+/// True when `url` is a strict loopback `http` URL — `http://127.0.0.1[:port]/…` or
+/// `http://localhost[:port]/…`. This is the allowlist that keeps `cli_redirect` from ever pointing
+/// at an attacker host: only a process on THIS machine can bind the loopback and receive the code.
+/// Loopback is plain `http` (no TLS on 127.0.0.1), so any other scheme is rejected too.
+#[cfg(feature = "oauth")]
+fn is_loopback_redirect(url: &str) -> bool {
+    let Some(rest) = url.strip_prefix("http://") else {
+        return false;
+    };
+    // The authority is everything up to the first '/'; strip an optional `:port` to get the host.
+    let authority = rest.split('/').next().unwrap_or("");
+    let host = authority.rsplit_once(':').map_or(authority, |(h, _)| h);
+    host == "127.0.0.1" || host == "localhost"
+}
+
 /// `GET /auth/providers/{id}/authorize` (PUBLIC, no auth) — begin the authorization-code login
 /// (hq-idp-db.3). Mints a fresh anti-CSRF `state` + PKCE pair, persists the pending handshake
 /// (`state` → `code_verifier`, ~10 min TTL), and 302-redirects the browser to the IdP authorize URL
@@ -1920,9 +1946,13 @@ async fn get_provider(
 /// an unknown/disabled id; `501` when the flow/state store is not configured.
 #[cfg_attr(feature = "axum", utoipa::path(
     get, path = "/auth/providers/{id}/authorize", tag = "auth",
-    params(("id" = String, Path, description = "The enabled provider to begin login with")),
+    params(
+        ("id" = String, Path, description = "The enabled provider to begin login with"),
+        ("cli_redirect" = Option<String>, Query, description = "gt login only: a http://127.0.0.1/localhost loopback URL to hand the session back to"),
+    ),
     responses(
         (status = 302, description = "Redirect to the IdP authorize URL (carries state + PKCE challenge)"),
+        (status = 400, description = "cli_redirect is not a loopback URL"),
         (status = 404, description = "No enabled provider with that id"),
         (status = 501, description = "OAuth authorize flow not configured"),
     ),
@@ -1931,9 +1961,17 @@ async fn get_provider(
 async fn authorize(
     State(state): State<AuthState>,
     Path(id): Path<String>,
+    axum::extract::Query(params): axum::extract::Query<AuthorizeParams>,
 ) -> Result<Response, ApiError> {
     let flow = state.authz_flow.as_ref().ok_or(ApiError::NotConfigured)?;
     let store = state.authz_state.as_ref().ok_or(ApiError::NotConfigured)?;
+    // A CLI loopback target, when present, must be a 127.0.0.1/localhost URL — reject anything else
+    // BEFORE minting state, so the authorize endpoint can never be turned into an open redirect.
+    if let Some(cli) = params.cli_redirect.as_deref() {
+        if !is_loopback_redirect(cli) {
+            return Err(ApiError::BadCliRedirect);
+        }
+    }
     // Fresh anti-CSRF state + PKCE: the `state` is replayed by the IdP on the callback (binding the
     // round-trip to this browser); the `code_verifier` proves possession at the token exchange.
     let pkce = crate::new_pkce().map_err(ApiError::Auth)?;
@@ -1949,6 +1987,7 @@ async fn authorize(
             code_verifier: pkce.verifier,
             provider_id: id,
             redirect_uri: flow.redirect_uri().to_owned(),
+            cli_redirect: params.cli_redirect,
             created_at: now,
             expires_at: now + AUTHZ_STATE_TTL_SECS,
         })
@@ -2320,6 +2359,11 @@ enum ApiError {
     /// endpoint — `400` (hq-idp-db.4).
     #[cfg(feature = "oauth")]
     BadProvider(String),
+    /// A `gt login` `cli_redirect` that is not a `127.0.0.1`/`localhost` loopback URL — `400`
+    /// (hq-gt-login-oauth.1). Refusing a non-loopback target is what stops the authorize endpoint
+    /// from becoming an open redirect.
+    #[cfg(feature = "oauth")]
+    BadCliRedirect,
 }
 
 impl From<RefreshError> for ApiError {
@@ -2377,6 +2421,12 @@ impl IntoResponse for ApiError {
             ApiError::NotFound => (StatusCode::NOT_FOUND, "not found").into_response(),
             #[cfg(feature = "oauth")]
             ApiError::BadProvider(msg) => (StatusCode::BAD_REQUEST, msg).into_response(),
+            #[cfg(feature = "oauth")]
+            ApiError::BadCliRedirect => (
+                StatusCode::BAD_REQUEST,
+                "cli_redirect must be a http://127.0.0.1 or http://localhost loopback URL",
+            )
+                .into_response(),
         }
     }
 }
@@ -4206,6 +4256,21 @@ mod tests {
         use std::collections::HashMap;
         use std::sync::Mutex;
 
+        #[test]
+        fn loopback_allowlist_accepts_only_127_and_localhost() {
+            // Accept: 127.0.0.1 / localhost, with or without a port + path.
+            assert!(is_loopback_redirect("http://127.0.0.1:8976/callback"));
+            assert!(is_loopback_redirect("http://localhost:54321/cb"));
+            assert!(is_loopback_redirect("http://127.0.0.1/"));
+            // Reject: external hosts, https, look-alikes, and a missing scheme.
+            assert!(!is_loopback_redirect("http://evil.com/callback"));
+            assert!(!is_loopback_redirect("https://127.0.0.1:8976/callback"));
+            assert!(!is_loopback_redirect("http://127.0.0.1.evil.com/cb"));
+            assert!(!is_loopback_redirect("http://localhost.evil.com/cb"));
+            assert!(!is_loopback_redirect("ftp://127.0.0.1/cb"));
+            assert!(!is_loopback_redirect("127.0.0.1:8976/cb"));
+        }
+
         /// An in-memory [`ProviderStore`] + [`ProviderRepo`] over a fixed record set — enough to
         /// drive both the public discovery projection and the `DbOauthLogin` resolver.
         #[derive(Default)]
@@ -4276,6 +4341,7 @@ mod tests {
                         code_verifier: authz.code_verifier,
                         provider_id: authz.provider_id,
                         redirect_uri: authz.redirect_uri,
+                        cli_redirect: authz.cli_redirect,
                         expires_at: authz.expires_at,
                     },
                 );

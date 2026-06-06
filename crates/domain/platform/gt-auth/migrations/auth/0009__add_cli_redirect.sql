@@ -1,0 +1,21 @@
+-- hq-gt-login-oauth.1: a CLI loopback redirect on the pending authorize handshake.
+--
+-- The `gt login` browser flow (estilo `claude login`) needs the callback to hand the freshly
+-- minted session back to a local loopback server the CLI is listening on, instead of the web FE.
+-- The CLI passes its `http://127.0.0.1:<port>/...` URL on `/authorize`; we remember it here so the
+-- matching `/callback` knows to 302 a one-shot code to that loopback (hq-gt-login-oauth.2) rather
+-- than redirect to the FE.
+--
+-- NULLABLE on purpose: the ordinary web login leaves it unset and behaves exactly as before — only
+-- a CLI-initiated handshake carries a value. STRICTLY a loopback URL; the `/authorize` handler
+-- allowlists `127.0.0.1`/`localhost` before it ever lands here, so this column never holds an
+-- attacker-controlled external redirect.
+--
+-- The IdP `redirect_uri` (0007) is untouched: it must stay the registered server callback the OAuth
+-- spec requires the token exchange to echo. `cli_redirect` is a SEPARATE field — where WE send OUR
+-- tokens after the exchange, not where the IdP sends the code.
+--
+-- `IF NOT EXISTS` keeps the boot-time apply idempotent; never edit an applied file — add a new
+-- migration instead.
+ALTER TABLE public.oauth_authz_state
+    ADD COLUMN IF NOT EXISTS cli_redirect TEXT;

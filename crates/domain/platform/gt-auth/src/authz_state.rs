@@ -64,6 +64,10 @@ pub struct NewAuthz {
     pub provider_id: String,
     /// The app's own callback URL echoed on the exchange (the OAuth spec requires it match).
     pub redirect_uri: String,
+    /// The CLI loopback URL to hand the session back to (`gt login`), or `None` for the ordinary
+    /// web login. STRICTLY a `127.0.0.1`/`localhost` URL — allowlisted at `/authorize` before it
+    /// reaches here. Distinct from [`redirect_uri`](Self::redirect_uri) (the IdP's callback).
+    pub cli_redirect: Option<String>,
     /// Creation time, epoch seconds.
     pub created_at: u64,
     /// Expiry, epoch seconds (~10 min after `created_at`); a consumed-after-expiry row is rejected.
@@ -82,6 +86,9 @@ pub struct PendingAuthz {
     pub provider_id: String,
     /// The app's own callback URL echoed on the exchange.
     pub redirect_uri: String,
+    /// The CLI loopback URL to 302 the one-shot code to (`gt login`), or `None` for the ordinary
+    /// web login (the callback then redirects to the FE as before).
+    pub cli_redirect: Option<String>,
     /// Expiry, epoch seconds — the callback rejects a row read past this instant.
     pub expires_at: u64,
 }
@@ -151,6 +158,10 @@ mod pg_impl {
             redirect_uri: row
                 .try_get("redirect_uri")
                 .map_err(|e| AuthError::Backend(format!("oauth_authz_state postgres: {e}")))?,
+            // Nullable column: a web-login row stores NULL → `None`.
+            cli_redirect: row
+                .try_get("cli_redirect")
+                .map_err(|e| AuthError::Backend(format!("oauth_authz_state postgres: {e}")))?,
             expires_at: expires_at as u64,
         })
     }
@@ -160,13 +171,14 @@ mod pg_impl {
         async fn insert(&self, authz: NewAuthz) -> Result<(), AuthError> {
             sqlx::query(
                 "INSERT INTO public.oauth_authz_state \
-                 (state, code_verifier, provider_id, redirect_uri, created_at, expires_at) \
-                 VALUES ($1, $2, $3, $4, to_timestamp($5), to_timestamp($6))",
+                 (state, code_verifier, provider_id, redirect_uri, cli_redirect, created_at, expires_at) \
+                 VALUES ($1, $2, $3, $4, $5, to_timestamp($6), to_timestamp($7))",
             )
             .bind(&authz.state)
             .bind(&authz.code_verifier)
             .bind(&authz.provider_id)
             .bind(&authz.redirect_uri)
+            .bind(&authz.cli_redirect)
             .bind(authz.created_at as f64)
             .bind(authz.expires_at as f64)
             .execute(&self.pool)
@@ -181,7 +193,7 @@ mod pg_impl {
             // RETURNS no row). A replayed `state` therefore always finds nothing.
             let row = sqlx::query(
                 "DELETE FROM public.oauth_authz_state WHERE state = $1 \
-                 RETURNING state, code_verifier, provider_id, redirect_uri, \
+                 RETURNING state, code_verifier, provider_id, redirect_uri, cli_redirect, \
                  extract(epoch from expires_at)::float8 AS expires_at_epoch",
             )
             .bind(state)
@@ -279,6 +291,7 @@ mod tests {
                 code_verifier: "verifier-xyz".into(),
                 provider_id: "corp".into(),
                 redirect_uri: "https://gt.test/auth/callback".into(),
+                cli_redirect: Some("http://127.0.0.1:8976/callback".into()),
                 created_at: 1_000,
                 expires_at: 1_600,
             })
@@ -290,6 +303,7 @@ mod tests {
             assert_eq!(got.code_verifier, "verifier-xyz");
             assert_eq!(got.provider_id, "corp");
             assert_eq!(got.redirect_uri, "https://gt.test/auth/callback");
+            assert_eq!(got.cli_redirect.as_deref(), Some("http://127.0.0.1:8976/callback"));
             assert_eq!(got.expires_at, 1_600);
 
             // Second consume finds nothing — the row was deleted on read (replay rejected).
@@ -311,6 +325,7 @@ mod tests {
                 code_verifier: "v".into(),
                 provider_id: "p".into(),
                 redirect_uri: "https://gt.test/cb".into(),
+                cli_redirect: None,
                 created_at: 10,
                 expires_at: 100,
             })
@@ -321,6 +336,7 @@ mod tests {
                 code_verifier: "v".into(),
                 provider_id: "p".into(),
                 redirect_uri: "https://gt.test/cb".into(),
+                cli_redirect: None,
                 created_at: 10,
                 expires_at: 9_999_999_999,
             })

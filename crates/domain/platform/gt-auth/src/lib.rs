@@ -175,6 +175,12 @@ pub mod migrations {
     /// SHA-256 hash. Cloned into every tenant schema by `gt_create_workspace_schema`.
     pub const CREATE_PERSONAL_ACCESS_TOKENS: &str =
         include_str!("../migrations/auth/0008__create_personal_access_tokens.sql");
+    /// `0009` — the nullable `cli_redirect` column on `public.oauth_authz_state`
+    /// (hq-gt-login-oauth.1): the loopback URL a `gt login` browser handshake carries, so the
+    /// callback can 302 a one-shot code back to the CLI instead of the web FE. Unset for the
+    /// ordinary web login (its absence preserves the existing behaviour).
+    pub const ADD_CLI_REDIRECT: &str =
+        include_str!("../migrations/auth/0009__add_cli_redirect.sql");
 }
 
 #[cfg(feature = "jsonwebtoken")]

@@ -641,6 +641,10 @@ async fn main() -> anyhow::Result<()> {
                 // `/authorize`→`/callback` redirect flow has somewhere durable to park the
                 // per-login `state`+`code_verifier` (one-shot, ~10 min TTL).
                 gt_auth::migrations::CREATE_OAUTH_AUTHZ_STATE,
+                // hq-gt-login-oauth.1: the nullable `cli_redirect` column on oauth_authz_state, so a
+                // `gt login` browser handshake can park the loopback URL the callback 302s a one-shot
+                // code back to. ALTER ... ADD COLUMN IF NOT EXISTS, idempotent like the rest.
+                gt_auth::migrations::ADD_CLI_REDIRECT,
                 // hq-security-pat.1: the per-workspace Personal Access Token store, defined in the
                 // ws_default template so gt_create_workspace_schema clones it into every tenant —
                 // the table the PAT verifier + the self-service /auth/tokens surface read.
