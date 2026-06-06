@@ -1958,10 +1958,23 @@ struct AuthorizeParams {
     cli_redirect: Option<String>,
 }
 
+/// The out-of-band `cli_redirect` sentinel (the classic OAuth OOB value): `gt login` sends this
+/// instead of a loopback URL when it wants the callback to DISPLAY the one-shot code on a page for
+/// the user to copy + paste, rather than 302 it to a local server (hq-gt-login-oauth.6).
+#[cfg(feature = "oauth")]
+const CLI_REDIRECT_OOB: &str = "urn:ietf:wg:oauth:2.0:oob";
+
+/// True when `cli_redirect` is an accepted target: either the OOB paste sentinel, or a strict
+/// loopback `http` URL (`http://127.0.0.1[:port]/…` / `http://localhost[:port]/…`). Anything else
+/// is rejected so the authorize endpoint can never be turned into an open redirect.
+#[cfg(feature = "oauth")]
+fn is_allowed_cli_redirect(url: &str) -> bool {
+    url == CLI_REDIRECT_OOB || is_loopback_redirect(url)
+}
+
 /// True when `url` is a strict loopback `http` URL — `http://127.0.0.1[:port]/…` or
-/// `http://localhost[:port]/…`. This is the allowlist that keeps `cli_redirect` from ever pointing
-/// at an attacker host: only a process on THIS machine can bind the loopback and receive the code.
-/// Loopback is plain `http` (no TLS on 127.0.0.1), so any other scheme is rejected too.
+/// `http://localhost[:port]/…`. Loopback is plain `http` (no TLS on 127.0.0.1), so any other scheme
+/// is rejected too.
 #[cfg(feature = "oauth")]
 fn is_loopback_redirect(url: &str) -> bool {
     let Some(rest) = url.strip_prefix("http://") else {
@@ -1999,10 +2012,10 @@ async fn authorize(
 ) -> Result<Response, ApiError> {
     let flow = state.authz_flow.as_ref().ok_or(ApiError::NotConfigured)?;
     let store = state.authz_state.as_ref().ok_or(ApiError::NotConfigured)?;
-    // A CLI loopback target, when present, must be a 127.0.0.1/localhost URL — reject anything else
-    // BEFORE minting state, so the authorize endpoint can never be turned into an open redirect.
+    // A CLI target, when present, must be the OOB paste sentinel or a 127.0.0.1/localhost loopback —
+    // reject anything else BEFORE minting state, so authorize can never become an open redirect.
     if let Some(cli) = params.cli_redirect.as_deref() {
-        if !is_loopback_redirect(cli) {
+        if !is_allowed_cli_redirect(cli) {
             return Err(ApiError::BadCliRedirect);
         }
     }
@@ -2080,10 +2093,9 @@ async fn callback(
         .await?;
     let tokens = issue_tokens(&state, identity.sub, identity.workspace, identity.scopes).await?;
 
-    // CLI hand-off (hq-gt-login-oauth.2): a `gt login` handshake carried a loopback `cli_redirect`.
-    // The loopback can't read a URL fragment and the token pair is too sensitive for a query string,
-    // so park the pair under a fresh opaque one-shot code (~60s TTL) and 302 ONLY that code to the
-    // loopback. No auth cookies — they are for the same-origin web app, not 127.0.0.1.
+    // CLI hand-off (hq-gt-login-oauth.2/.6): a `gt login` handshake carried a `cli_redirect`. The
+    // token pair is too sensitive to expose, so park it under a fresh opaque one-shot code and hand
+    // back ONLY that code — never the token. No auth cookies: they are for the same-origin web app.
     if let Some(cli_redirect) = pending.cli_redirect.as_deref() {
         let codes = state.cli_code.as_ref().ok_or(ApiError::NotConfigured)?;
         let code = csrf_token().map_err(ApiError::Auth)?;
@@ -2099,7 +2111,19 @@ async fn callback(
                 expires_at: now + CLI_CODE_TTL_SECS,
             })
             .await?;
-        // Append `code` to the loopback URL, respecting any existing query string.
+
+        if cli_redirect == CLI_REDIRECT_OOB {
+            // OOB paste flow (hq-gt-login-oauth.6): render the code on a page for the user to copy
+            // into the terminal. The CLI redeems it at `/auth/cli/exchange`.
+            return Ok((
+                StatusCode::OK,
+                [(header::CONTENT_TYPE, "text/html; charset=utf-8")],
+                cli_code_page(&code),
+            )
+                .into_response());
+        }
+
+        // Loopback flow (.2): append the code to the 127.0.0.1 URL and 302 there.
         let sep = if cli_redirect.contains('?') { '&' } else { '?' };
         let location = format!("{cli_redirect}{sep}code={}", url_encode(&code));
         let mut headers = HeaderMap::new();
@@ -2197,11 +2221,29 @@ async fn cli_exchange(
 #[cfg(feature = "oauth")]
 const AUTHZ_STATE_TTL_SECS: u64 = 600;
 
-/// One-shot CLI hand-off code TTL (hq-gt-login-oauth.2): the window between the callback parking the
-/// token pair and the CLI redeeming it at `/auth/cli/exchange`. Short — the CLI redeems immediately;
-/// 60s only tolerates clock skew + the loopback round-trip.
+/// One-shot CLI hand-off code TTL (hq-gt-login-oauth.2/.6): the window between the callback parking
+/// the token pair and the CLI redeeming it at `/auth/cli/exchange`. 5 minutes — long enough for the
+/// OOB paste flow (a human copies the code from the page into the terminal), still short for a
+/// one-shot credential.
 #[cfg(feature = "oauth")]
-const CLI_CODE_TTL_SECS: u64 = 60;
+const CLI_CODE_TTL_SECS: u64 = 300;
+
+/// The HTML page the OOB callback renders (hq-gt-login-oauth.6): shows the one-shot `code` for the
+/// user to copy into `gt login`. The code is a base64url token (URL-safe charset), so it needs no
+/// HTML escaping.
+#[cfg(feature = "oauth")]
+fn cli_code_page(code: &str) -> String {
+    format!(
+        "<!doctype html><html><head><meta charset=\"utf-8\"><title>gt login</title></head>\
+         <body style=\"font-family:system-ui,sans-serif;max-width:34rem;margin:4rem auto;padding:0 1rem\">\
+         <h2>Almost there</h2>\
+         <p>Copy this code and paste it back into your <code>gt login</code> terminal:</p>\
+         <pre style=\"font-size:1.25rem;background:#f4f4f5;padding:1rem;border-radius:.5rem;\
+         user-select:all;word-break:break-all\">{code}</pre>\
+         <p style=\"color:#71717a\">This code expires in a few minutes and can be used once.</p>\
+         </body></html>"
+    )
+}
 
 /// A fresh anti-CSRF `state`: 32 CSPRNG bytes, base64url (no padding). High-entropy + opaque, so it
 /// is both unguessable (CSRF defence) and a safe primary key for the pending-state row.
@@ -4391,6 +4433,15 @@ mod tests {
             assert!(!is_loopback_redirect("127.0.0.1:8976/cb"));
         }
 
+        #[test]
+        fn allowed_cli_redirect_covers_oob_and_loopback() {
+            // The broader gate authorize uses: OOB sentinel + loopback are allowed, nothing else.
+            assert!(is_allowed_cli_redirect(CLI_REDIRECT_OOB));
+            assert!(is_allowed_cli_redirect("http://127.0.0.1:8976/callback"));
+            assert!(!is_allowed_cli_redirect("http://evil.com/cb"));
+            assert!(!is_allowed_cli_redirect("urn:ietf:wg:oauth:2.0:oob-ish"));
+        }
+
         /// An in-memory [`ProviderStore`] + [`ProviderRepo`] over a fixed record set — enough to
         /// drive both the public discovery projection and the `DbOauthLogin` resolver.
         #[derive(Default)]
@@ -4844,6 +4895,81 @@ mod tests {
                 .await
                 .unwrap();
             assert_eq!(replay.status(), StatusCode::UNAUTHORIZED);
+        }
+
+        /// OOB paste flow (hq-gt-login-oauth.6): authorize with the OOB sentinel → the callback
+        /// RENDERS the one-shot code on an HTML page (no 302, no token on the page), and
+        /// `/auth/cli/exchange` redeems that code for the token pair.
+        #[tokio::test]
+        async fn oob_cli_redirect_renders_a_code_page() {
+            let base = spawn_idp().await;
+            let (st, _store, _cli) = flow_state(&base, Some("https://app.gt.test/landed"));
+            let app = auth_router(st);
+
+            let authz = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri(
+                            "/auth/providers/corp/authorize?cli_redirect=urn:ietf:wg:oauth:2.0:oob",
+                        )
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(authz.status(), StatusCode::FOUND);
+            let state_param = location(&authz)
+                .split("state=")
+                .nth(1)
+                .unwrap()
+                .split('&')
+                .next()
+                .unwrap()
+                .to_owned();
+
+            // Callback renders a 200 HTML page; the code is in the body, the token is NOT.
+            let cb = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri(format!("/auth/callback?code=good-code&state={state_param}"))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(cb.status(), StatusCode::OK);
+            let body = String::from_utf8(
+                axum::body::to_bytes(cb.into_body(), usize::MAX)
+                    .await
+                    .unwrap()
+                    .to_vec(),
+            )
+            .unwrap();
+            assert!(body.contains("<pre"), "should render a code page: {body}");
+            assert!(!body.contains("access_token"), "no token on the page");
+            // Pull the code out of the <pre>…</pre> and redeem it.
+            let code = body
+                .split("user-select:all;word-break:break-all\">")
+                .nth(1)
+                .unwrap()
+                .split("</pre>")
+                .next()
+                .unwrap()
+                .to_owned();
+            let ex = app
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/auth/cli/exchange")
+                        .header("content-type", "application/json")
+                        .body(Body::from(format!(r#"{{"code":"{code}"}}"#)))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(ex.status(), StatusCode::OK);
         }
 
         /// An unknown `state` at the callback is a 401 (anti-CSRF), never a token.
