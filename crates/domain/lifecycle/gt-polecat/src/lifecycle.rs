@@ -62,13 +62,21 @@ pub struct SpawnSpec {
 }
 
 impl SpawnSpec {
-    /// Full env including the `GT_HOOK_BEAD` pin (if any). Keys already present in `env` are
-    /// kept; the hook entry is appended.
+    /// Full env including the `GT_HOOK_BEAD` pin (if any) and `GT_HEARTBEAT_FILE` — the heartbeat
+    /// path the polecat's hooks `touch` so the supervisor sees it alive (`hq-agent-provisioning.1`).
+    /// Keys already present in `env` are kept; these entries are appended.
     pub fn env_with_hook(&self) -> Vec<(String, String)> {
         let mut env = self.env.clone();
         if let Some(entry) = hook_env(self.hook_bead.as_deref(), self.issue.as_deref()) {
             env.push(entry);
         }
+        // The polecat can't write its own heartbeat without knowing where: export the exact path
+        // the supervisor computes (SpawnSpec::heartbeat) so a `touch $GT_HEARTBEAT_FILE` hook keeps
+        // the session "alive" against the staleness check.
+        env.push((
+            "GT_HEARTBEAT_FILE".to_string(),
+            self.heartbeat.display().to_string(),
+        ));
         env
     }
 
@@ -202,6 +210,9 @@ impl SpawnTemplate {
     /// - `GT_RIG_PATH` → working directory (default `.`).
     /// - `GT_POLECAT_CMD` → agent command (default `claude`).
     /// - `GT_HEARTBEAT_DIR` → heartbeat directory (default the system temp dir).
+    /// - `GT_CHANNEL_ROOT` → gt-channel mailbox root, layered into `base_env` when set so the
+    ///   polecat's merge-ready hook knows where to drop its `{bead,branch}` message
+    ///   (`hq-agent-provisioning.1`).
     pub fn from_env(workspace: &str) -> Self {
         let env = |k: &str| std::env::var(k).ok().filter(|v| !v.is_empty());
         let rig = env("GT_RIG").unwrap_or_else(|| "hq".to_string());
@@ -211,12 +222,17 @@ impl SpawnTemplate {
         let heartbeat_dir = env("GT_HEARTBEAT_DIR")
             .map(PathBuf::from)
             .unwrap_or_else(std::env::temp_dir);
-        let base_env = vec![
+        let mut base_env = vec![
             ("GT_ROLE".to_string(), "polecat".to_string()),
             ("GT_RIG".to_string(), rig.clone()),
             ("GT_RIG_PATH".to_string(), workdir.display().to_string()),
             (GT_WORKSPACE.to_string(), workspace.to_string()),
         ];
+        // Rig-wide channel root: the merge-ready hook resolves `$GT_CHANNEL_ROOT/merge-ready/`.
+        // Only layered when set, so a template built without it stays unchanged.
+        if let Some(channel_root) = env("GT_CHANNEL_ROOT") {
+            base_env.push(("GT_CHANNEL_ROOT".to_string(), channel_root));
+        }
         SpawnTemplate {
             rig,
             prefix,
@@ -238,6 +254,9 @@ impl SpawnTemplate {
         let heartbeat = self.heartbeat_dir.join(format!("{session}.heartbeat"));
         let mut env = self.base_env.clone();
         env.push(("GT_CONVOY".to_string(), convoy.to_string()));
+        // The branch the polecat works the bead on (CLAUDE.md convention: `-b <bead-id>`); its
+        // merge-ready hook reports `{bead, branch}` so the refinery submits the right branch.
+        env.push(("GT_BRANCH".to_string(), member.to_string()));
         SpawnSpec {
             session,
             rig: self.rig.clone(),
@@ -326,6 +345,35 @@ mod lifecycle_tests {
         assert!(spec.env.iter().any(|(k, v)| k == "GT_CONVOY" && v == "cv-1"));
         let full = spec.env_with_hook();
         assert!(full.iter().any(|(k, v)| k == GT_HOOK_BEAD && v == "hq-abc.1"));
+    }
+
+    #[test]
+    fn spawn_tmux_exports_heartbeat_file_branch_and_channel_root() {
+        // The reporting env a polecat's hooks need (hq-agent-provisioning.1): GT_HEARTBEAT_FILE
+        // (the touch target), GT_BRANCH (the merge-ready branch), GT_CHANNEL_ROOT (mailbox root).
+        // All ride the new-session `-e` env, so `tmux show-environment` resolves each.
+        let mut tpl = template();
+        tpl.base_env
+            .push(("GT_CHANNEL_ROOT".to_string(), "/gt/.channels".to_string()));
+        let spec = tpl.spec_for("cv-1", "hq-abc.1");
+        let probe = FakeTmux::new();
+        spawn_tmux(&probe, &spec).unwrap();
+        // GT_BRANCH is the raw bead id (the branch), not the sanitized session name.
+        assert_eq!(
+            probe.show_environment(&spec.session, "GT_BRANCH").unwrap().as_deref(),
+            Some("hq-abc.1")
+        );
+        assert_eq!(
+            probe
+                .show_environment(&spec.session, "GT_CHANNEL_ROOT")
+                .unwrap()
+                .as_deref(),
+            Some("/gt/.channels")
+        );
+        assert_eq!(
+            probe.show_environment(&spec.session, "GT_HEARTBEAT_FILE").unwrap(),
+            Some(spec.heartbeat.display().to_string())
+        );
     }
 
     #[test]
