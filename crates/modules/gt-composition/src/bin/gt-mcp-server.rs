@@ -49,6 +49,7 @@ use gt_composition::mcp::{
 };
 use gt_composition::scope_bridge::bridge_scopes;
 use gt_composition::stream::{feed_router, FeedState};
+use gt_composition::onboard::{onboard_router, OnboardState};
 use gt_composition::terminal::{terminal_router, TerminalState};
 use gt_docs_embed::Embedder;
 use gt_docs_extract::Extractor;
@@ -444,6 +445,27 @@ async fn main() -> anyhow::Result<()> {
         }
     };
 
+    // Web claude-account onboarding (hq-quota-onboard-web.4): POST /api/v1/quota/onboard/{start,
+    // complete} drives the real `claude auth login` lifecycle (claude now lives IN the image) and
+    // registers the captured account into the workspace quota log — the same event the daemon
+    // hydrates its rotation keychain from. Mounted only with an RS256 verifier; each call requires
+    // the `quota.write` scope (audited on denial). See `gt_composition::onboard`.
+    let onboard = verifier.as_ref().map(|v| {
+        eprintln!(
+            "[gt-mcp-server] onboarding on POST /api/v1/quota/onboard/{{start,complete}} (cookie/bearer auth, scope quota.write)"
+        );
+        let onboard_eventlog_root = std::env::var("GT_EVENTLOG_ROOT")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|_| std::path::PathBuf::from(DEFAULT_EVENTLOG_ROOT));
+        let accounts_root = gt_composition::account_dirs::accounts_root(&onboard_eventlog_root);
+        onboard_router(OnboardState::new(
+            v.clone(),
+            audit.clone(),
+            event_log.clone(),
+            accounts_root,
+        ))
+    });
+
     let mut app = Router::new()
         .route("/health", get(health::health))
         .route("/readyz", get(health::readyz))
@@ -456,6 +478,9 @@ async fn main() -> anyhow::Result<()> {
         .nest_service(MCP_PATH, http);
     if let Some(terminal) = terminal {
         app = app.merge(terminal);
+    }
+    if let Some(onboard) = onboard {
+        app = app.merge(onboard);
     }
 
     // REST surface (hq-auth-routes.2): the module routers the kernel builder mounted

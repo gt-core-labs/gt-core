@@ -19,8 +19,19 @@ RUN cargo build --release --locked -p gt-composition --bin gt-mcp-server \
 FROM debian:bookworm-slim
 # git: S3 readiness clause (docs/10 §S4). libssl3: openssl runtime for the embedding stack's
 # HTTPS model download. ca-certificates: TLS roots for that download.
+#
+# node + @anthropic-ai/claude-code (hq-quota-onboard-web.4): the web onboarding route
+# (/api/v1/quota/onboard/*) drives `claude auth login` IN this container, so the `claude` CLI must
+# be on PATH here. Installed from NodeSource (node 20) + a global npm install; `claude auth` provides
+# the login + `auth status --json` the onboarding flow reads the account email from.
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends ca-certificates git libssl3 \
+    && apt-get install -y --no-install-recommends ca-certificates git libssl3 curl gnupg \
+    && curl -fsSL https://deb.nodesource.com/setup_20.x | bash - \
+    && apt-get install -y --no-install-recommends nodejs \
+    && npm install -g @anthropic-ai/claude-code \
+    && npm cache clean --force \
+    && apt-get purge -y gnupg \
+    && apt-get autoremove -y \
     && rm -rf /var/lib/apt/lists/*
 COPY --from=build /build/target/release/gt-mcp-server /usr/local/bin/gt-mcp-server
 # ort downloads the onnxruntime shared lib at build; carry it into the runtime image and
