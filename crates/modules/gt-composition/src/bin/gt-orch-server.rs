@@ -51,12 +51,14 @@ use gt_channel::Channel;
 use gt_composition::polecat::{
     host_cap_from_metrics, AgentTokenMinter, PolecatSupervisorPlugin, ScopeResolver,
 };
+use gt_composition::quota_rotation::{self, QuotaRotationPlugin};
 use gt_composition::{daemon_root, DaemonRoot};
 use gt_eventlog::DEFAULT_EVENTLOG_ROOT;
 use gt_plugin::{spawn_plugin_relay, PluginRegistry};
 use gt_polecat::{
     PoolAllocator, PolecatSupervisor, RestartConfig, RestartTracker, SpawnTemplate, Tmux, TmuxCli,
 };
+use gt_quota::{Account, CredentialRecord, InMemoryKeychain, Keychain};
 use gt_workspace::WorkspaceId;
 
 /// Edge-stamped unix seconds for the supervisor clock.
@@ -74,6 +76,52 @@ fn env_usize(key: &str, default: usize) -> usize {
         .and_then(|s| s.parse::<usize>().ok())
         .filter(|&n| n > 0)
         .unwrap_or(default)
+}
+
+/// Build the claude-account keychain from `GT_CLAUDE_ACCOUNTS` and seed the quota actor with the
+/// same accounts (`hq-agent-provisioning.7`). The env is a comma list of `account=CLAUDE_CONFIG_DIR`
+/// pairs; the first becomes the boot-active account (its creds the first polecat burns). Returns the
+/// shared keychain + the account count, or `None` when the env is unset/empty (single-account mode).
+/// A keychain with a single account is still returned — rotation just has nowhere to go (logged at
+/// runtime when a prediction fires).
+async fn seed_claude_accounts(quota: &gt_quota::QuotaHandle) -> Option<(Arc<dyn Keychain>, usize)> {
+    let raw = std::env::var("GT_CLAUDE_ACCOUNTS").ok()?;
+    let kc = InMemoryKeychain::new();
+    let mut first: Option<String> = None;
+    let mut n = 0usize;
+    for entry in raw.split(',') {
+        let entry = entry.trim();
+        if entry.is_empty() {
+            continue;
+        }
+        let Some((account, dir)) = entry.split_once('=') else {
+            eprintln!(
+                "[gt-orch-server] GT_CLAUDE_ACCOUNTS entry '{entry}' is not account=dir — skipped"
+            );
+            continue;
+        };
+        let (account, dir) = (account.trim(), dir.trim());
+        if account.is_empty() || dir.is_empty() {
+            continue;
+        }
+        if kc
+            .put(CredentialRecord {
+                account: account.to_string(),
+                secret: dir.to_string(),
+            })
+            .is_err()
+        {
+            continue;
+        }
+        // Mirror the account into the quota registry so the rotation observer can pick it as a
+        // target. Window/rate arrive later from the quota feed (GT_QUOTA_FEED_CHANNEL).
+        quota.upsert_account(Account::new(account)).await;
+        first.get_or_insert_with(|| account.to_string());
+        n += 1;
+    }
+    let first = first?; // nothing parsed ⇒ no keychain
+    let _ = kc.set_active(&first);
+    Some((Arc::new(kc), n))
 }
 
 #[tokio::main]
@@ -174,6 +222,21 @@ async fn main() -> anyhow::Result<()> {
         }
     };
 
+    // Claude-account keychain for predictive rotation (hq-agent-provisioning.7). GT_CLAUDE_ACCOUNTS
+    // is a comma list of `account=CLAUDE_CONFIG_DIR` pairs; the first is the boot-active account.
+    // Each is also seeded into the quota actor so the rotation observer has a candidate pool. Unset
+    // / single account ⇒ no rotation possible (logged); the polecat uses the host default ~/.claude.
+    let keychain: Option<Arc<dyn Keychain>> = match seed_claude_accounts(&quota).await {
+        Some((kc, n)) => {
+            eprintln!("[gt-orch-server] claude keychain seeded with {n} account(s) — predictive rotation armed");
+            Some(kc)
+        }
+        None => {
+            eprintln!("[gt-orch-server] GT_CLAUDE_ACCOUNTS unset/empty — single-account mode, no rotation (polecats use host ~/.claude)");
+            None
+        }
+    };
+
     // Observe the SAME hub the root drains actor output onto: a fresh broadcast receiver, so the
     // sling observer runs independently of the root's own plugin relay (durability/roles/reactor).
     let mut pol_plugin = PolecatSupervisorPlugin::new(
@@ -189,7 +252,19 @@ async fn main() -> anyhow::Result<()> {
     if let Some(tm) = agent_token {
         pol_plugin = pol_plugin.with_agent_token(tm);
     }
-    let pol_registry = Arc::new(PluginRegistry::new().register(pol_plugin));
+    if let Some(kc) = &keychain {
+        pol_plugin = pol_plugin.with_keychain(kc.clone());
+    }
+    // Register the polecat supervisor and — when a keychain exists — the predictive rotation
+    // observer on the same relay: a `quota.block_predicted.v1` / `quota.account_limited.v1` flips
+    // the keychain's active pointer so the NEXT sling lands on a healthy account.
+    let mut pol_registry = PluginRegistry::new().register(pol_plugin);
+    if let Some(kc) = &keychain {
+        pol_registry =
+            pol_registry.register(QuotaRotationPlugin::new(quota.clone(), kc.clone()));
+        eprintln!("[gt-orch-server] predictive account rotation observer on");
+    }
+    let pol_registry = Arc::new(pol_registry);
     let pol_relay = spawn_plugin_relay(handle.subscribe_events(), pol_registry);
     eprintln!(
         "[gt-orch-server] polecat supervision on — pool_size={pool_size}, host_cap={} (cpu+ram), max_restarts={max_restarts}",
@@ -237,12 +312,13 @@ async fn main() -> anyhow::Result<()> {
     // consumption crosses the threshold within its window emits the rotation chain on the hub.
     let quota_tick_secs = env_usize("GT_QUOTA_TICK_SECS", 60) as u64;
     let quota_threshold = env_usize("GT_QUOTA_THRESHOLD_SECS", 300) as u64;
+    let quota_tick_handle = quota.clone();
     let quota_timer = tokio::spawn(async move {
         let mut tick = tokio::time::interval(Duration::from_secs(quota_tick_secs));
         tick.tick().await;
         loop {
             tick.tick().await;
-            quota.tick(now_secs(), quota_threshold).await;
+            quota_tick_handle.tick(now_secs(), quota_threshold).await;
         }
     });
     eprintln!(
@@ -323,6 +399,43 @@ async fn main() -> anyhow::Result<()> {
         }
     };
 
+    // Quota feed live loop (hq-agent-provisioning.7): await ratelimit/usage figures on a gt-channel
+    // and fold them into the quota actor — the INPUT half of predictive rotation. An external edge
+    // (a claude-session hook reporting `anthropic-ratelimit-*` headers + token usage, a sidecar
+    // proxy, or a manual probe) drops a {"account","headers"|"sample"} JSON message; without this
+    // feed the predictor stays flat (rate 0 ⇒ no BlockPredicted). Sibling of the dispatch loop,
+    // same restart+backoff supervisor. Absent/unopenable channel ⇒ disabled, the daemon still boots.
+    let quota_feed_channel =
+        std::env::var("GT_QUOTA_FEED_CHANNEL").unwrap_or_else(|_| "quota-feed".to_string());
+    let quota_feed_task = match Channel::open(&channel_root, &quota_feed_channel) {
+        Ok(channel) => {
+            eprintln!(
+                "[gt-orch-server] quota feed: channel {} — drop {{\"account\",\"headers\"|\"sample\"}} to feed the predictor",
+                channel.dir().display()
+            );
+            Some(tokio::spawn(async move {
+                let mut tracker = RestartTracker::new(RestartConfig::default());
+                let make = || {
+                    let channel = channel.clone();
+                    let quota = quota.clone();
+                    async move {
+                        if let Err(e) = quota_rotation::run(channel, quota).await {
+                            eprintln!("[gt-orch-server] quota feed channel error: {e} — supervisor will restart");
+                        }
+                    }
+                };
+                gt_polecat::supervise_daemon("quota-feed", make, &mut tracker, u32::MAX, now_secs)
+                    .await;
+            }))
+        }
+        Err(e) => {
+            eprintln!(
+                "[gt-orch-server] quota feed disabled — channel open failed at {channel_root}/{quota_feed_channel}: {e}"
+            );
+            None
+        }
+    };
+
     wait_for_signal().await;
 
     eprintln!("[gt-orch-server] signal received — draining actor stack");
@@ -338,6 +451,9 @@ async fn main() -> anyhow::Result<()> {
     if let Some(task) = &dispatch_task {
         task.abort();
     }
+    if let Some(task) = &quota_feed_task {
+        task.abort();
+    }
     let _ = pol_timer.await;
     let _ = pol_relay.await;
     let _ = patrol_timer.await;
@@ -346,6 +462,9 @@ async fn main() -> anyhow::Result<()> {
         let _ = task.await;
     }
     if let Some(task) = dispatch_task {
+        let _ = task.await;
+    }
+    if let Some(task) = quota_feed_task {
         let _ = task.await;
     }
     // Cancel the actor stack + stop the observer relay and the per-domain drains. The

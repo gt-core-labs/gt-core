@@ -32,6 +32,7 @@ use gt_events::{AppError, Envelope};
 use gt_merge::MergeEvent;
 use gt_polecat::{spawn_tmux, PoolAllocator, PolecatSupervisor, SpawnTemplate, Tmux};
 use gt_plugin::Plugin;
+use gt_quota::Keychain;
 use gt_scheduling::SchedEvent;
 
 /// Resolves the least-privilege scope set for an agent role (`hq-agent-provisioning.3`). The
@@ -104,6 +105,11 @@ pub struct PolecatSupervisorPlugin {
     /// Per-agent token minter (`hq-agent-provisioning.3`). `None` ⇒ the polecat is slung without a
     /// `GT_TOKEN` (it falls back to whatever creds its checkout carries).
     token: Option<AgentTokenMinter>,
+    /// Claude-account keychain (`hq-agent-provisioning.7`). `None` ⇒ the polecat uses the host's
+    /// default `~/.claude` (a single account). With it, each sling reads the keychain's live
+    /// pointer and stamps that account's `CLAUDE_CONFIG_DIR` so the polecat's claude burns the
+    /// account predictive rotation has selected.
+    keychain: Option<Arc<dyn Keychain>>,
 }
 
 impl PolecatSupervisorPlugin {
@@ -126,6 +132,7 @@ impl PolecatSupervisorPlugin {
             allocator,
             events: None,
             token: None,
+            keychain: None,
         }
     }
 
@@ -133,6 +140,16 @@ impl PolecatSupervisorPlugin {
     /// Without it, a polecat carries no agent identity of its own.
     pub fn with_agent_token(mut self, token: AgentTokenMinter) -> Self {
         self.token = Some(token);
+        self
+    }
+
+    /// Stamp the active claude account's `CLAUDE_CONFIG_DIR` into each slung polecat's env
+    /// (`hq-agent-provisioning.7`). The keychain's live pointer is flipped by the predictive
+    /// rotation observer ([`crate::quota_rotation::QuotaRotationPlugin`]); reading it at sling time
+    /// is what makes the *next* polecat pick up the rotated account. Without this, every polecat
+    /// shares the host default `~/.claude` — one account, one limit.
+    pub fn with_keychain(mut self, keychain: Arc<dyn Keychain>) -> Self {
+        self.keychain = Some(keychain);
         self
     }
 
@@ -193,6 +210,31 @@ impl Plugin for PolecatSupervisorPlugin {
                         Ok(tok) => spec.env.push(("GT_TOKEN".to_string(), tok)),
                         Err(e) => eprintln!(
                             "[polecat] token mint failed for {bead} (role {role}): {e} — slinging without GT_TOKEN"
+                        ),
+                    }
+                }
+                // Point the polecat's claude at the ACTIVE account's credentials dir
+                // (hq-agent-provisioning.7): the keychain's live pointer is what predictive
+                // rotation flips, so reading it here is what hands the next sling the rotated
+                // account. The stored secret IS the account's CLAUDE_CONFIG_DIR. Best-effort: any
+                // miss leaves the polecat on the host default ~/.claude (logged).
+                if let Some(kc) = &self.keychain {
+                    match kc.active() {
+                        Ok(Some(account)) => match kc.get(&account) {
+                            Ok(Some(cred)) => {
+                                spec.env
+                                    .push(("CLAUDE_CONFIG_DIR".to_string(), cred.secret));
+                            }
+                            Ok(None) => eprintln!(
+                                "[polecat] active claude account {account} has no stored credential — host default ~/.claude"
+                            ),
+                            Err(e) => eprintln!(
+                                "[polecat] keychain get({account}) failed: {e} — host default ~/.claude"
+                            ),
+                        },
+                        Ok(None) => {} // no active pointer yet → host default, no log noise
+                        Err(e) => eprintln!(
+                            "[polecat] keychain active() failed: {e} — host default ~/.claude"
                         ),
                     }
                 }
@@ -382,6 +424,46 @@ mod tests {
             vec!["issues.read", "issues.write", "issues.claim", "issues.transition"]
         );
         assert!(!claims.scopes.iter().any(|s| s == "*"), "never the wildcard");
+    }
+
+    #[tokio::test]
+    async fn dispatch_injects_the_active_accounts_claude_config_dir() {
+        // hq-agent-provisioning.7: a slung polecat's env carries CLAUDE_CONFIG_DIR pointing at the
+        // keychain's ACTIVE account — the account predictive rotation has selected.
+        use gt_quota::InMemoryKeychain;
+        let fake = Arc::new(FakeTmux::new());
+        let tmux: Arc<dyn Tmux> = fake.clone();
+        let supervisor = Arc::new(PolecatSupervisor::new(tmux.clone(), RestartConfig::default(), 8));
+        let template = SpawnTemplate {
+            rig: "hq".into(),
+            prefix: "hq".into(),
+            workdir: "/tmp".into(),
+            command: "true".into(),
+            args: vec![],
+            base_env: vec![],
+            heartbeat_dir: std::env::temp_dir(),
+        };
+        let keychain = Arc::new(InMemoryKeychain::seeded([
+            ("acct-a", "/home/nixos/.claude-acct-a"),
+            ("acct-b", "/home/nixos/.claude-acct-b"),
+        ]));
+        keychain.set_active("acct-b").unwrap(); // rotation already moved the pointer to b
+        let alloc = Arc::new(Mutex::new(PoolAllocator::new(10, 5)));
+        let p = PolecatSupervisorPlugin::new("acme", tmux, template, supervisor, alloc)
+            .with_keychain(keychain);
+
+        p.on_event(&record(SchedEvent::Dispatched {
+            bead: "gg-1".into(),
+            worker: "w1".into(),
+        }))
+        .await
+        .unwrap();
+
+        let cfg = fake
+            .show_environment("hq-gg-1", "CLAUDE_CONFIG_DIR")
+            .unwrap()
+            .expect("CLAUDE_CONFIG_DIR injected from the active account");
+        assert_eq!(cfg, "/home/nixos/.claude-acct-b");
     }
 
     #[tokio::test]
