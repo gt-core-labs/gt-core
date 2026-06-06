@@ -7,10 +7,12 @@
 
 pub mod actor;
 pub mod commands;
+pub mod dispatch;
 pub mod expectations;
 mod events;
 mod state;
 
 pub use commands::{Enqueue, MarkDispatched, SchedCommand};
+pub use dispatch::DispatchPayload;
 pub use events::SchedEvent;
 pub use state::{CapacityGovernor, Queue, SchedCore, SchedState};

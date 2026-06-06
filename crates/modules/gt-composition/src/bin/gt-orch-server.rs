@@ -35,6 +35,10 @@
 //! - `GT_QUOTA_TICK_SECS` (60) / `GT_QUOTA_THRESHOLD_SECS` (300) — quota auto-rotation ticker.
 //! - `GT_CHANNEL_ROOT` (`/gt/.channels`) / `GT_MERGE_READY_CHANNEL` (`merge-ready`) — the
 //!   Refinery MERGE_READY gt-channel; absent/unopenable ⇒ the loop is disabled, the daemon boots.
+//! - `GT_DISPATCH_CHANNEL` (`dispatch`, under `GT_CHANNEL_ROOT`) — the dispatch-request gt-channel
+//!   (`hq-orchd-deploy.4`): a `{"bead","priority"}` JSON message seeds + enqueues the bead on the
+//!   scheduler, which auto-dispatches it (`scheduling.dispatched.v1`) → the polecat supervisor
+//!   slings an agent. Absent/unopenable ⇒ the loop is disabled, the daemon boots.
 //! - `GT_METRICS_BIND` (`127.0.0.1:9099`) — Prometheus `/metrics` scrape endpoint (exposes
 //!   `gt_workspace_session_minutes` + the golden counters from this daemon process).
 
@@ -104,7 +108,7 @@ async fn main() -> anyhow::Result<()> {
     // scheduler/merge/patrol/quota actors, drain their events onto the hub, and register the
     // persistence sink + role observers + scheduler/merge reactor arms + the sheriff observer. The
     // returned handles drive the edge loops below (patrol/quota ticks + the Refinery channel).
-    let DaemonRoot { handle, merge, patrol, quota } = daemon_root(ws, event_root).await;
+    let DaemonRoot { handle, sched, merge, patrol, quota } = daemon_root(ws, event_root).await;
     eprintln!(
         "[gt-orch-server] daemon root up — scheduler + merge + patrol + quota actors anchored; persistence + roles + reactor arms + sheriff observer running"
     );
@@ -238,6 +242,43 @@ async fn main() -> anyhow::Result<()> {
         }
     };
 
+    // Dispatch live loop (hq-orchd-deploy.4): await dispatch requests on a gt-channel and seed +
+    // enqueue each onto the scheduler, which auto-dispatches (emits scheduling.dispatched.v1) when
+    // capacity allows — the event the polecat supervisor observes to sling an agent. This is the
+    // concrete trigger for "a bead becomes dispatched": an operator (or the control plane) drops a
+    // {"bead","priority"} JSON message in the channel. Sibling of the Refinery loop, same
+    // restart+backoff supervisor. Absent/unopenable channel ⇒ disabled, the daemon still boots.
+    let dispatch_channel =
+        std::env::var("GT_DISPATCH_CHANNEL").unwrap_or_else(|_| "dispatch".to_string());
+    let dispatch_task = match Channel::open(&channel_root, &dispatch_channel) {
+        Ok(channel) => {
+            eprintln!(
+                "[gt-orch-server] dispatch: request channel {} — drop {{\"bead\",\"priority\"}} to dispatch",
+                channel.dir().display()
+            );
+            Some(tokio::spawn(async move {
+                let mut tracker = RestartTracker::new(RestartConfig::default());
+                let make = || {
+                    let channel = channel.clone();
+                    let sched = sched.clone();
+                    async move {
+                        if let Err(e) = gt_scheduling::dispatch::run(channel, sched).await {
+                            eprintln!("[gt-orch-server] dispatch channel error: {e} — supervisor will restart");
+                        }
+                    }
+                };
+                gt_polecat::supervise_daemon("dispatch", make, &mut tracker, u32::MAX, now_secs)
+                    .await;
+            }))
+        }
+        Err(e) => {
+            eprintln!(
+                "[gt-orch-server] dispatch disabled — channel open failed at {channel_root}/{dispatch_channel}: {e}"
+            );
+            None
+        }
+    };
+
     wait_for_signal().await;
 
     eprintln!("[gt-orch-server] signal received — draining actor stack");
@@ -250,11 +291,17 @@ async fn main() -> anyhow::Result<()> {
     if let Some(task) = &refinery_task {
         task.abort();
     }
+    if let Some(task) = &dispatch_task {
+        task.abort();
+    }
     let _ = pol_timer.await;
     let _ = pol_relay.await;
     let _ = patrol_timer.await;
     let _ = quota_timer.await;
     if let Some(task) = refinery_task {
+        let _ = task.await;
+    }
+    if let Some(task) = dispatch_task {
         let _ = task.await;
     }
     // Cancel the actor stack + stop the observer relay and the per-domain drains. The

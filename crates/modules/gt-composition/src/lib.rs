@@ -569,6 +569,9 @@ pub async fn live_root(
 pub struct DaemonRoot {
     /// The composed root (event hub + supervisor), owned for the process lifetime.
     pub handle: Arc<RootHandle>,
+    /// Scheduler command handle — the dispatch-channel loop seeds + enqueues a requested bead here,
+    /// which the dispatcher auto-dispatches (emitting `scheduling.dispatched.v1`, `hq-orchd-deploy.4`).
+    pub sched: SchedHandle,
     /// Merge command handle — the Refinery loop submits MERGE_READY beads here.
     pub merge: MergeHandle,
     /// Patrol command handle — the lease-expiry ticker drives [`PatrolHandle::tick`].
@@ -642,7 +645,7 @@ pub async fn daemon_root(ws: WorkspaceId, log_root: PathBuf) -> DaemonRoot {
             EventLogPlugin::for_workspace_in(&log_root, &ws_slug)
                 .expect("event log root is writable"),
         )
-        .register(SchedulerPlugin::new(sched))
+        .register(SchedulerPlugin::new(sched.clone()))
         .register(MergePlugin::new(merge.clone()))
         .register(BranchGcPlugin::new(merge.clone(), InMemoryBranchReaper::new()))
         .register(SheriffPlugin::new())
@@ -650,7 +653,7 @@ pub async fn daemon_root(ws: WorkspaceId, log_root: PathBuf) -> DaemonRoot {
     handle.spawn_plugins(Arc::new(registry));
     handle.start().await;
 
-    DaemonRoot { handle, merge, patrol, quota }
+    DaemonRoot { handle, sched, merge, patrol, quota }
 }
 
 #[cfg(test)]

@@ -2181,10 +2181,13 @@ name = "gt-scheduling"
 version = "0.1.0"
 dependencies = [
  "gt-beads",
+ "gt-channel",
  "gt-events",
  "schemars 0.8.22",
  "serde",
+ "serde_json",
  "tokio",
+ "ulid",
 ]
 
 [[package]]

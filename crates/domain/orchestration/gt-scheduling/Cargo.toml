@@ -14,7 +14,15 @@ version.workspace = true
 [dependencies]
 gt-events = { workspace = true }
 gt-beads = { workspace = true }
+# File-backed mailbox: the dispatch-channel intake (sibling of the gt-merge refinery) that
+# turns an external dispatch request into create_bead + enqueue on the dispatcher.
+gt-channel = { workspace = true }
 tokio.workspace = true
 serde.workspace = true
+serde_json.workspace = true
 # JSON Schema derives for Command arguments — surfaced by gt-mcp.
 schemars.workspace = true
+
+[dev-dependencies]
+# The dispatch-channel gate test wires the real channel + actor and waits on the bus.
+ulid.workspace = true
