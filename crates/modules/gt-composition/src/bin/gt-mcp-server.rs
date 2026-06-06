@@ -64,8 +64,8 @@ use gt_eventlog::DEFAULT_EVENTLOG_ROOT;
 use gt_feed::{FeedApiState, FeedModule};
 use gt_issues::{IssuesApiState, IssuesModule, MeApiState, MeModule};
 use gt_mcp_server::{
-    health, DocumentsResource, DomainRouter, HealthState, IssuesServer, PgAuditSink,
-    WorkspaceRigPrefixes, WorkspaceStatusGate, WorkspaceStores,
+    health, DocumentsResource, DomainRouter, HealthState, IssuesServer, PatAuthenticator,
+    PgAuditSink, WorkspaceRigPrefixes, WorkspaceStatusGate, WorkspaceStores,
 };
 use gt_merge::{MergeApiState, MergeModule};
 use gt_meta::{MetaApiState, MetaModule};
@@ -80,6 +80,22 @@ use gt_workspace::{PgWorkspaces, WorkspaceApiState, WorkspaceModule};
 
 /// Path the MCP endpoint mounts at (mirrors the upstream gt-mcp).
 const MCP_PATH: &str = "/mcp";
+
+/// Adapt the composition-tier [`PatVerifier`] to the `/mcp` transport's
+/// [`PatAuthenticator`] port (gt-core#6). Both resolve a `gtpat_…` bearer to
+/// [`JwtClaims`](gt_auth::JwtClaims) via the same Postgres lookup; the transport just needs
+/// the trait from `gt-mcp-server` (the domain crate cannot depend on this `modules` crate, so
+/// the adapter lives here). With it wired, a PAT authenticates an MCP `tools/call` /
+/// `resources/read` exactly as it already does on the REST surface — instead of being
+/// RS256-decoded into `-32600: malformed token: InvalidToken`.
+struct McpPatAuth(Arc<dyn PatVerifier>);
+
+#[async_trait::async_trait]
+impl PatAuthenticator for McpPatAuth {
+    async fn verify(&self, token: &str, now: u64) -> Result<gt_auth::JwtClaims, ()> {
+        self.0.verify(token, now).await
+    }
+}
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -332,9 +348,31 @@ async fn main() -> anyhow::Result<()> {
     // Without a verifier the server keeps the legacy X-Actor behaviour (loopback dev).
     if let Some(v) = &verifier {
         service = service.with_authenticator(v.clone());
-        eprintln!(
-            "[gt-mcp-server] /mcp requires auth (RS256 bearer or gt_web_token cookie; claim-scoped)"
-        );
+        // Personal Access Token verifier for the transport (gt-core#6): a `gtpat_…` bearer
+        // authenticates the SAME on `/mcp` as it already does on `/api/v1/*` — verified through the
+        // PgPatStore PAT port instead of being RS256-decoded into `malformed token: InvalidToken`.
+        // The service is finalized + moved into the transport below, well before the `/auth/*` arm
+        // builds its own ws_default pool, so this opens a dedicated ws_default pool here (the same
+        // lazy pattern /me/stats uses). Gated on GT_PG_URL — without Postgres there is no PAT store,
+        // so a PAT is denied (never tried as a JWT), exactly like the REST chain.
+        match std::env::var("GT_PG_URL") {
+            Ok(pg_url) => match WorkspacePool::connect(&pg_url, "default").await {
+                Ok(pat_pool) => {
+                    let pat: Arc<dyn PatVerifier> =
+                        Arc::new(PgPatStore::new(pat_pool.pool().clone()));
+                    service = service.with_pat_authenticator(Arc::new(McpPatAuth(pat)));
+                    eprintln!(
+                        "[gt-mcp-server] /mcp requires auth (RS256 bearer / gt_web_token cookie / gtpat_ PAT; claim-scoped)"
+                    );
+                }
+                Err(e) => eprintln!(
+                    "[gt-mcp-server] /mcp PAT auth off (ws_default pool connect failed: {e}); RS256/cookie only"
+                ),
+            },
+            Err(_) => eprintln!(
+                "[gt-mcp-server] /mcp requires auth (RS256 bearer or gt_web_token cookie; claim-scoped; no GT_PG_URL → no PAT)"
+            ),
+        }
     }
 
     // Streamable-HTTP Host allow-list (rmcp's DNS-rebinding guard). The default only

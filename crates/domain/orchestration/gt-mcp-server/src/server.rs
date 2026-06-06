@@ -12,7 +12,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use gt_audit::{AuditRecord, AuditSink};
-use gt_auth::Authenticator;
+use gt_auth::{has_pat_prefix, Authenticator};
 use gt_issues::IssueEventSink;
 use gt_module::McpTool;
 use gt_rbac::{RbacConfig, Scope};
@@ -34,6 +34,22 @@ use crate::domain::{DomainCtx, DomainRouter};
 use crate::prefixes::WorkspaceRigPrefixes;
 use crate::workspace::{workspace_from_ext, WorkspaceStores};
 use crate::ws_status::WorkspaceStatusGate;
+
+/// The async port that resolves an opaque Personal Access Token (`gtpat_…`) to verified
+/// [`JwtClaims`](gt_auth::JwtClaims) for the `/mcp` transport (gt-core#6). The sync
+/// [`Authenticator`] verifies an RS256 JWT signature in-process; a PAT is verified by a
+/// Postgres lookup (I/O), so this port is `async`. The composition root supplies the
+/// production adapter (`gt_auth::PgPatStore`); without it a `gtpat_` bearer is rejected
+/// rather than RS256-decoded — a PAT can never be a valid JWT, so it must never reach the
+/// JWT verifier (mirrors the REST `authenticate` chain).
+#[async_trait::async_trait]
+pub trait PatAuthenticator: Send + Sync {
+    /// Verify `token` (a `gtpat_…` bearer) against the injected clock `now` (Unix seconds),
+    /// resolving it to the claims the transport authorizes against — or `Err(())` when the
+    /// token is unknown / expired / revoked / the backend faulted (every rejection is one
+    /// deny, like a bad bearer).
+    async fn verify(&self, token: &str, now: u64) -> Result<gt_auth::JwtClaims, ()>;
+}
 
 /// The shared MCP service. Cheap to clone (every field is `Arc`-backed) so the
 /// streamable-HTTP session manager hands each connection its own handle over the
@@ -84,6 +100,12 @@ pub struct IssuesServer {
     /// gate), and the scope is derived from the claim's workspace role. `None`
     /// keeps the legacy `X-Actor`/`X-Workspace` header behaviour exactly.
     authenticator: Option<Arc<dyn Authenticator + Send + Sync>>,
+    /// Personal Access Token verifier for the `/mcp` transport (gt-core#6). `Some` when the
+    /// composition root wires the Postgres-backed [`PatAuthenticator`]: a `gtpat_…` bearer is
+    /// then verified through this async port instead of being RS256-decoded by
+    /// [`authenticator`](Self::authenticator) (which would reject it as `malformed token`).
+    /// `None` ⇒ a presented PAT is denied (no JWT fall-through), mirroring the REST chain.
+    pat: Option<Arc<dyn PatAuthenticator>>,
     /// Per-workspace rig-prefix policy for `issues.create` (hq-mt-rigs.6). `Some`
     /// when the composition root wires a rig catalog: a new bead whose id prefix is
     /// neither a registered rig prefix in the caller's workspace nor a reserved
@@ -138,6 +160,7 @@ impl IssuesServer {
             repo_dir: repo_dir.map(Arc::new),
             domains: Arc::new(DomainRouter::new()),
             authenticator: None,
+            pat: None,
             rig_prefixes: None,
             workspace_status: None,
             documents: None,
@@ -172,6 +195,17 @@ impl IssuesServer {
         authenticator: Arc<dyn Authenticator + Send + Sync>,
     ) -> Self {
         self.authenticator = Some(authenticator);
+        self
+    }
+
+    /// Wire the Personal Access Token verifier (gt-core#6). With it, a `gtpat_…` bearer on the
+    /// `/mcp` transport is verified through the async PAT port — a Postgres lookup — instead of
+    /// being RS256-decoded by the JWT [`authenticator`](Self::with_authenticator), which would
+    /// reject the opaque token as `malformed token: InvalidToken`. Its workspace-claim + scopes
+    /// then drive the same leak gate + per-tool check a JWT does. Additive — without it a PAT is
+    /// denied (never tried as a JWT), matching the REST chain.
+    pub fn with_pat_authenticator(mut self, pat: Arc<dyn PatAuthenticator>) -> Self {
+        self.pat = Some(pat);
         self
     }
 
@@ -284,13 +318,13 @@ impl IssuesServer {
     /// `call_tool` receives wraps a `Peer` whose constructor is crate-private, so
     /// the wired gate cannot be exercised through `call_tool` itself — only
     /// through this seam (`tests::*` build the `Extensions` directly).
-    fn authorize(
+    async fn authorize(
         &self,
         tool: &str,
         args: &serde_json::Value,
         ext: &Extensions,
     ) -> Result<(Cow<'_, Scope>, Option<String>), McpError> {
-        let (scope, workspace) = match self.authenticate_claims(tool, args, ext)? {
+        let (scope, workspace) = match self.authenticate_claims(tool, args, ext).await? {
             Some(claims) => (
                 Cow::Owned(Scope::from_workspace_claim(&claims.sub, &claims.scopes)),
                 Some(claims.workspace),
@@ -370,7 +404,7 @@ impl IssuesServer {
     /// by both [`authorize`](Self::authorize) and `read_resource` so a resource read
     /// cannot dodge the tenant binding a tool call is held to. `op` labels an audit
     /// denial (the tool name or resource URI).
-    fn authenticate_claims(
+    async fn authenticate_claims(
         &self,
         op: &str,
         args: &serde_json::Value,
@@ -388,9 +422,27 @@ impl IssuesServer {
                 "missing bearer token or gt_web_token cookie",
             )
         })?;
-        let claims = auth
-            .authenticate(token)
-            .map_err(|e| self.deny(op, args, "<unverified>", &e.to_string()))?;
+        // A bearer shaped like a Personal Access Token (`gtpat_…`, gt-core#6) is verified through
+        // the async PAT port — a Postgres lookup, not a signature check — and is NEVER RS256-decoded
+        // (it could never be a valid JWT, so the JWT verifier would reject it as
+        // `malformed token: InvalidToken`). A PAT with no verifier wired is a hard deny, never a
+        // silent JWT fall-through. This mirrors the REST `authenticate` chain.
+        let claims = if has_pat_prefix(token) {
+            let pat = self.pat.as_ref().ok_or_else(|| {
+                self.deny(
+                    op,
+                    args,
+                    "<unverified>",
+                    "personal access tokens are not configured",
+                )
+            })?;
+            pat.verify(token, now_secs())
+                .await
+                .map_err(|()| self.deny(op, args, "<unverified>", "invalid personal access token"))?
+        } else {
+            auth.authenticate(token)
+                .map_err(|e| self.deny(op, args, "<unverified>", &e.to_string()))?
+        };
         // Cheap semantic gate: expiry + workspace-claim presence.
         claims
             .validate(now_secs(), JWT_WORKSPACE_OPTIONAL)
@@ -511,7 +563,7 @@ impl ServerHandler for IssuesServer {
         // In JWT mode this also verifies the bearer token + closes the cross-
         // workspace leak; the authoritative workspace (the claim's tenant, or the
         // X-Workspace header in legacy mode) flows out for store + domain dispatch.
-        let (scope, workspace) = self.authorize(&tool, &args, &context.extensions)?;
+        let (scope, workspace) = self.authorize(&tool, &args, &context.extensions).await?;
 
         // Suspend/archive enforcement (hq-mt-bootstrap.8): a mutating call against a
         // suspended/archived tenant is rejected here, after the tenant is resolved
@@ -665,11 +717,10 @@ impl ServerHandler for IssuesServer {
         // Resources are tenant data too: run the same JWT/leak gate as a tool call
         // (a token for ws A must not read ws B's resources), then resolve that
         // tenant's store so a read reflects the caller's workspace.
-        let workspace = match self.authenticate_claims(
-            &clean_uri,
-            &serde_json::json!({}),
-            &context.extensions,
-        )? {
+        let workspace = match self
+            .authenticate_claims(&clean_uri, &serde_json::json!({}), &context.extensions)
+            .await?
+        {
             Some(claims) => Some(claims.workspace),
             None => workspace_from_ext(&context.extensions).map(str::to_string),
         };
@@ -996,7 +1047,7 @@ fn sanitize_tool_name(name: &str) -> String {
 mod tests {
     use super::{
         actor_from_ext, call_span, cookie_token_from_ext, split_format, token_from_ext,
-        IssuesServer, OutputFormat,
+        IssuesServer, OutputFormat, PatAuthenticator,
     };
     use gt_audit::{AuditSink, InMemoryAudit, Outcome};
     use gt_auth::{InMemoryAuthenticator, JwtClaims};
@@ -1308,13 +1359,14 @@ mod tests {
         Arc::new(RbacConfig::from_toml(toml).expect("rbac toml parses"))
     }
 
-    #[test]
-    fn denied_default_scope_rejects_and_audits_unauthorized() {
+    #[tokio::test]
+    async fn denied_default_scope_rejects_and_audits_unauthorized() {
         let audit = Arc::new(InMemoryAudit::new());
         let srv = server(Scope::denied("boot"), None, audit.clone());
 
         let err = srv
             .authorize("issues.create.execute", &json!({}), &Extensions::new())
+            .await
             .expect_err("a closed scope must deny every tool");
         // invalid_request, not internal — a caller-side fault it cannot retry.
         assert_eq!(err.code, ErrorCode::INVALID_REQUEST);
@@ -1326,8 +1378,8 @@ mod tests {
         assert_eq!(rows[0].tool, "issues.create.execute");
     }
 
-    #[test]
-    fn wrong_scope_actor_is_denied_with_its_own_attribution() {
+    #[tokio::test]
+    async fn wrong_scope_actor_is_denied_with_its_own_attribution() {
         // `watcher` may touch issues.update.*, nothing else; the X-Actor header
         // selects that allow-list per connection (hq-core-mcp.6).
         let cfg = rbac(
@@ -1347,6 +1399,7 @@ allow = ["issues.update.*"]
                 &json!({}),
                 &ext_with_header("x-actor", "watcher"),
             )
+            .await
             .expect_err("create is outside watcher's update-only allow-list");
         assert_eq!(err.code, ErrorCode::INVALID_REQUEST);
 
@@ -1357,8 +1410,8 @@ allow = ["issues.update.*"]
         assert_eq!(rows[0].actor, "watcher");
     }
 
-    #[test]
-    fn validate_only_actor_is_denied_execute_but_allowed_validate() {
+    #[tokio::test]
+    async fn validate_only_actor_is_denied_execute_but_allowed_validate() {
         let cfg = rbac(
             r#"
 [actors.readonly]
@@ -1373,12 +1426,14 @@ validate_only = true
         // `.execute` is barred even with a `*` allow-list...
         let err = srv
             .authorize("issues.create.execute", &json!({}), &ext)
+            .await
             .expect_err("validate_only must block execute");
         assert_eq!(err.code, ErrorCode::INVALID_REQUEST);
 
         // ...while the matching `.validate` passes the gate.
         let (scope, _ws) = srv
             .authorize("issues.create.validate", &json!({}), &ext)
+            .await
             .expect("validate is permitted for a validate_only scope");
         assert_eq!(scope.actor, "readonly");
 
@@ -1388,13 +1443,14 @@ validate_only = true
         assert_eq!(rows[0].tool, "issues.create.execute");
     }
 
-    #[test]
-    fn allowed_call_passes_the_gate_without_an_unauthorized_row() {
+    #[tokio::test]
+    async fn allowed_call_passes_the_gate_without_an_unauthorized_row() {
         let audit = Arc::new(InMemoryAudit::new());
         let srv = server(Scope::admin("boot"), None, audit.clone());
 
         let (scope, _ws) = srv
             .authorize("issues.close.execute", &json!({}), &Extensions::new())
+            .await
             .expect("admin scope permits every tool");
         // The resolved scope flows out for store dispatch + Invoked attribution.
         assert_eq!(scope.actor, "boot");
@@ -1415,8 +1471,8 @@ validate_only = true
     /// workspace B. Same-workspace passes (and pins the tenant to the claim);
     /// a mismatched `X-Workspace` is denied + audited; an absent header pins to the
     /// claim's workspace rather than trusting any header.
-    #[test]
-    fn jwt_token_bound_to_its_workspace_blocks_cross_tenant() {
+    #[tokio::test]
+    async fn jwt_token_bound_to_its_workspace_blocks_cross_tenant() {
         let audit = Arc::new(InMemoryAudit::new());
         let auth = InMemoryAuthenticator::new()
             .with_token("tokA", token("agent-a", "acme", WORKSPACE_ADMIN));
@@ -1429,6 +1485,7 @@ validate_only = true
                 &json!({}),
                 &ext_bearer("tokA", Some("acme")),
             )
+            .await
             .expect("a token operating its own workspace is allowed");
         assert_eq!(scope.actor, "agent-a", "attribution is the token subject");
         assert_eq!(
@@ -1444,6 +1501,7 @@ validate_only = true
                 &json!({}),
                 &ext_bearer("tokA", Some("beta")),
             )
+            .await
             .expect_err("a token for acme must not operate beta");
         assert_eq!(err.code, ErrorCode::INVALID_REQUEST);
 
@@ -1454,6 +1512,7 @@ validate_only = true
                 &json!({}),
                 &ext_bearer("tokA", None),
             )
+            .await
             .expect("an absent header pins to the claim");
         assert_eq!(ws.as_deref(), Some("acme"));
 
@@ -1468,8 +1527,8 @@ validate_only = true
 
     /// JWT mode requires a verifiable bearer token: a missing or unknown token is
     /// denied even though the boot default scope is admin.
-    #[test]
-    fn jwt_missing_or_unverifiable_token_is_denied() {
+    #[tokio::test]
+    async fn jwt_missing_or_unverifiable_token_is_denied() {
         let audit = Arc::new(InMemoryAudit::new());
         let auth =
             InMemoryAuthenticator::new().with_token("good", token("a", "acme", WORKSPACE_ADMIN));
@@ -1477,11 +1536,13 @@ validate_only = true
 
         let no_token = srv
             .authorize("issues.read", &json!({}), &Extensions::new())
+            .await
             .expect_err("JWT mode requires a bearer token");
         assert_eq!(no_token.code, ErrorCode::INVALID_REQUEST);
 
         let bad_token = srv
             .authorize("issues.read", &json!({}), &ext_bearer("nope", Some("acme")))
+            .await
             .expect_err("an unverifiable token is denied");
         assert_eq!(bad_token.code, ErrorCode::INVALID_REQUEST);
 
@@ -1493,8 +1554,8 @@ validate_only = true
     }
 
     /// An expired token is rejected by the claim's semantic gate.
-    #[test]
-    fn jwt_expired_token_is_denied() {
+    #[tokio::test]
+    async fn jwt_expired_token_is_denied() {
         let audit = Arc::new(InMemoryAudit::new());
         let expired = JwtClaims {
             sub: "stale".into(),
@@ -1509,14 +1570,15 @@ validate_only = true
 
         let err = srv
             .authorize("issues.read", &json!({}), &ext_bearer("old", Some("acme")))
+            .await
             .expect_err("an expired token is denied");
         assert_eq!(err.code, ErrorCode::INVALID_REQUEST);
     }
 
     /// The claim's workspace role drives the per-tool scope: a member may run the
     /// operational tools but not provision a tenant (`workspace.create`).
-    #[test]
-    fn jwt_member_role_cannot_create_a_workspace() {
+    #[tokio::test]
+    async fn jwt_member_role_cannot_create_a_workspace() {
         let audit = Arc::new(InMemoryAudit::new());
         let auth =
             InMemoryAuthenticator::new().with_token("mem", token("m", "acme", WORKSPACE_MEMBER));
@@ -1527,6 +1589,7 @@ validate_only = true
             &json!({}),
             &ext_bearer("mem", Some("acme")),
         )
+        .await
         .expect("a member operates the issue tools");
 
         let err = srv
@@ -1535,6 +1598,7 @@ validate_only = true
                 &json!({}),
                 &ext_bearer("mem", Some("acme")),
             )
+            .await
             .expect_err("a member cannot provision a tenant");
         assert_eq!(err.code, ErrorCode::INVALID_REQUEST);
 
@@ -1546,10 +1610,94 @@ validate_only = true
         assert_eq!(denial.workspace_id, "acme");
     }
 
+    // ----- gt-core#6: Personal Access Tokens on the /mcp transport ------------
+
+    /// A PAT verifier double: accepts exactly one opaque `gtpat_` token, resolving it to
+    /// admin claims for "pat-agent" in workspace "acme"; everything else is `Err(())`.
+    struct OnePat(&'static str);
+
+    #[async_trait::async_trait]
+    impl PatAuthenticator for OnePat {
+        async fn verify(&self, presented: &str, _now: u64) -> Result<JwtClaims, ()> {
+            (presented == self.0)
+                .then(|| token("pat-agent", "acme", WORKSPACE_ADMIN))
+                .ok_or(())
+        }
+    }
+
+    /// The fix: a `gtpat_…` bearer on /mcp is verified through the async PAT port — never
+    /// RS256-decoded — so a PAT that already authenticates against REST now works on the
+    /// transport too (its claim drives the scope + tenant, exactly like a JWT).
+    #[tokio::test]
+    async fn gtpat_bearer_is_verified_through_the_pat_port() {
+        let audit = Arc::new(InMemoryAudit::new());
+        // The JWT verifier knows no such token; only the PAT port resolves it.
+        let srv = auth_server(InMemoryAuthenticator::new(), audit.clone())
+            .with_pat_authenticator(Arc::new(OnePat("gtpat_good")));
+
+        let (scope, ws) = srv
+            .authorize(
+                "issues.close.execute",
+                &json!({}),
+                &ext_bearer("gtpat_good", Some("acme")),
+            )
+            .await
+            .expect("a valid PAT authenticates the MCP call");
+        assert_eq!(scope.actor, "pat-agent", "attribution is the PAT subject");
+        assert_eq!(ws.as_deref(), Some("acme"), "tenant resolved from the PAT claim");
+        assert!(
+            audit.read_all().unwrap().is_empty(),
+            "a valid PAT is not a denial"
+        );
+    }
+
+    /// An unknown `gtpat_…` bearer is denied through the PAT port (a 401-equivalent), not
+    /// mistaken for a JWT.
+    #[tokio::test]
+    async fn unknown_gtpat_bearer_is_denied() {
+        let audit = Arc::new(InMemoryAudit::new());
+        let srv = auth_server(InMemoryAuthenticator::new(), audit.clone())
+            .with_pat_authenticator(Arc::new(OnePat("gtpat_good")));
+
+        let err = srv
+            .authorize(
+                "issues.read",
+                &json!({}),
+                &ext_bearer("gtpat_nope", Some("acme")),
+            )
+            .await
+            .expect_err("an unknown PAT is denied");
+        assert_eq!(err.code, ErrorCode::INVALID_REQUEST);
+        assert_eq!(audit.read_all().unwrap().len(), 1, "the deny is audited");
+    }
+
+    /// A `gtpat_…` bearer is NEVER tried as a JWT: with no PAT verifier wired it is a hard
+    /// deny even when the JWT authenticator would (wrongly) accept the same string — the
+    /// prefix short-circuits before the RS256 path, mirroring the REST chain.
+    #[tokio::test]
+    async fn gtpat_bearer_is_never_decoded_as_a_jwt() {
+        let audit = Arc::new(InMemoryAudit::new());
+        // The JWT verifier WOULD accept this exact string; the PAT prefix must short-circuit first.
+        let auth = InMemoryAuthenticator::new()
+            .with_token("gtpat_good", token("ghost", "acme", WORKSPACE_ADMIN));
+        let srv = auth_server(auth, audit.clone());
+
+        let err = srv
+            .authorize(
+                "issues.close.execute",
+                &json!({}),
+                &ext_bearer("gtpat_good", Some("acme")),
+            )
+            .await
+            .expect_err("a PAT with no verifier wired is denied, never JWT-decoded");
+        assert_eq!(err.code, ErrorCode::INVALID_REQUEST);
+        assert_eq!(audit.read_all().unwrap().len(), 1, "the deny is audited");
+    }
+
     /// Legacy header mode (no authenticator): an out-of-scope denial is attributed to
     /// the `X-Workspace` header, and a request with no header falls back to "default".
-    #[test]
-    fn legacy_denial_is_attributed_to_x_workspace_then_default() {
+    #[tokio::test]
+    async fn legacy_denial_is_attributed_to_x_workspace_then_default() {
         let audit = Arc::new(InMemoryAudit::new());
         // A closed boot scope denies every tool, so each call audits one Unauthorized row.
         let srv = server(Scope::denied("watcher"), None, audit.clone());
@@ -1559,8 +1707,10 @@ validate_only = true
             &json!({}),
             &ext_with_header("x-workspace", "globex"),
         )
+        .await
         .expect_err("execute is out of scope");
         srv.authorize("issues.create.execute", &json!({}), &Extensions::new())
+            .await
             .expect_err("execute is out of scope");
 
         let rows = audit.read_all().unwrap();
