@@ -466,6 +466,55 @@ async fn main() -> anyhow::Result<()> {
         ))
     });
 
+    // Orphan claude-credential GC (hq-quota-onboard-web.6): the backend is the only always-on
+    // process, so it sweeps the accounts root on a timer and reaps dirs no live account points at
+    // (a re-onboarded email replaces its dir, a retire drops one, an abandoned /start leaves an
+    // empty one). Off when GT_ACCOUNTS_GC_TICK_SECS=0. The grace window spares onboards in flight.
+    let gc_tick = env_u64("GT_ACCOUNTS_GC_TICK_SECS", 21_600); // 6h
+    if gc_tick > 0 {
+        let gc_grace = std::time::Duration::from_secs(env_u64("GT_ACCOUNTS_GC_GRACE_SECS", 7_200));
+        let gc_root = std::env::var("GT_EVENTLOG_ROOT")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|_| std::path::PathBuf::from(DEFAULT_EVENTLOG_ROOT));
+        let gc_accounts_root = gt_composition::account_dirs::accounts_root(&gc_root);
+        let gc_log = event_log.clone();
+        eprintln!(
+            "[gt-mcp-server] account-dir GC on (every {gc_tick}s, grace {}s) at {}",
+            gc_grace.as_secs(),
+            gc_accounts_root.display()
+        );
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(std::time::Duration::from_secs(gc_tick));
+            loop {
+                tick.tick().await;
+                // Live accounts = the basenames (<id>) of the registered config_dirs. Single-tenant
+                // "default" workspace, where the onboarding flow registers (see onboard::complete).
+                let state = gt_composition::replay_quota_state(&gc_log, "default").unwrap_or_default();
+                let live: std::collections::HashSet<String> = state
+                    .registered
+                    .values()
+                    .filter_map(|d| {
+                        std::path::Path::new(d)
+                            .file_name()
+                            .and_then(|n| n.to_str())
+                            .map(str::to_string)
+                    })
+                    .collect();
+                let removed = gt_composition::account_dirs::gc_orphan_account_dirs(
+                    &gc_accounts_root,
+                    &live,
+                    gc_grace,
+                );
+                if !removed.is_empty() {
+                    eprintln!(
+                        "[gt-mcp-server] account GC reaped {} orphan credential dir(s)",
+                        removed.len()
+                    );
+                }
+            }
+        });
+    }
+
     let mut app = Router::new()
         .route("/health", get(health::health))
         .route("/readyz", get(health::readyz))
