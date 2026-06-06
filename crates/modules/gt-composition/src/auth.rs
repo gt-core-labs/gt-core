@@ -31,13 +31,48 @@ use axum::http::{
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 
-use gt_auth::Authenticator;
+use std::time::{SystemTime, UNIX_EPOCH};
+
+use async_trait::async_trait;
+
+use gt_auth::{has_pat_prefix, Authenticator, JwtClaims};
 use gt_workspace::WorkspaceClaim;
 
 use crate::denial_audit::{record_denial, SharedAudit, ANONYMOUS};
 
 /// A shareable, object-safe authenticator handle the middleware verifies tokens with.
 pub type SharedAuthenticator = Arc<dyn Authenticator + Send + Sync>;
+
+/// The async **port** that turns an opaque Personal Access Token (`gtpat_…`) into verified
+/// [`JwtClaims`] (`hq-security-pat.1`). Distinct from [`Authenticator`] (the *synchronous* JWT
+/// signature verifier): a PAT is verified by a Postgres lookup, which is I/O, so this port is
+/// `async`. The composition root supplies the production adapter ([`gt_auth::PgPatStore`]); a
+/// deploy without it leaves [`AuthState::pat`] `None`, so a presented PAT is rejected (`401`)
+/// rather than mistaken for a JWT.
+#[async_trait]
+pub trait PatVerifier: Send + Sync {
+    /// Verify `token` against the injected clock `now` (Unix seconds), resolving it to the claims
+    /// the middleware injects — or `Err(())` when the token is unknown / expired / revoked / the
+    /// backend faulted (every PAT rejection collapses to a `401`, like a bad bearer).
+    async fn verify(&self, token: &str, now: u64) -> Result<JwtClaims, ()>;
+}
+
+/// A shareable, object-safe PAT verifier handle.
+pub type SharedPatVerifier = Arc<dyn PatVerifier + Send + Sync>;
+
+/// The production [`PatVerifier`]: the Postgres-backed [`gt_auth::PgPatStore`] already exposes an
+/// inherent async `verify` over the same per-workspace `personal_access_tokens` table, so this just
+/// adapts a raw header string to its [`gt_auth::PatToken`] and collapses every store verdict to the
+/// middleware's `Err(())` (one `401` for unknown / expired / revoked / backend).
+#[async_trait]
+impl PatVerifier for gt_auth::PgPatStore {
+    async fn verify(&self, token: &str, now: u64) -> Result<JwtClaims, ()> {
+        let token = gt_auth::PatToken::new(token);
+        gt_auth::PgPatStore::verify(self, &token, now)
+            .await
+            .map_err(|_| ())
+    }
+}
 
 /// State for [`authenticate`]: the verifier it checks tokens with plus the audit sink it
 /// records token rejections (`401`) into. Bundled because the middleware that both
@@ -49,12 +84,25 @@ pub struct AuthState {
     /// The sink token-rejection denials are recorded into (the same `Arc` the
     /// [`audit_denials`](crate::denial_audit::audit_denials) layer holds).
     pub audit: SharedAudit,
+    /// The optional Personal Access Token verifier (`hq-security-pat.1`). When set, a presented
+    /// bearer token shaped like a PAT (`gtpat_…`) is verified through this port instead of the
+    /// JWT [`authenticator`](Self::authenticator); `None` ⇒ no PAT surface is configured and a PAT
+    /// is rejected like any unverifiable token.
+    pub pat: Option<SharedPatVerifier>,
 }
 
 impl AuthState {
-    /// Bundle a verifier and an audit sink for the auth middleware.
+    /// Bundle a verifier and an audit sink for the auth middleware. No PAT verifier — a deploy
+    /// opts into PATs with [`with_pat`](Self::with_pat).
     pub fn new(authenticator: SharedAuthenticator, audit: SharedAudit) -> Self {
-        Self { authenticator, audit }
+        Self { authenticator, audit, pat: None }
+    }
+
+    /// Attach a Personal Access Token verifier so `gtpat_…` bearers authenticate through it
+    /// (`hq-security-pat.1`).
+    pub fn with_pat(mut self, pat: SharedPatVerifier) -> Self {
+        self.pat = Some(pat);
+        self
     }
 }
 
@@ -125,6 +173,23 @@ pub async fn authenticate(
         }
         // Present but not a well-formed bearer token.
         Some(Err(())) => reject(&state, &req, "malformed Authorization header"),
+        // A bearer shaped like a Personal Access Token (`gtpat_…`, hq-security-pat.1) is verified
+        // through the async PAT port — a Postgres lookup, not a signature check — instead of the
+        // JWT authenticator. A token that LOOKS like a PAT is NEVER tried against the JWT verifier
+        // (it could never be a valid JWT), so a missing/failed PAT verifier is a hard `401`, never a
+        // silent fall-through.
+        Some(Ok(token)) if has_pat_prefix(token) => match &state.pat {
+            Some(pat) => match pat.verify(token, now_secs()).await {
+                Ok(claims) => {
+                    req.extensions_mut()
+                        .insert(WorkspaceClaim(claims.workspace.clone()));
+                    req.extensions_mut().insert(claims);
+                    next.run(req).await
+                }
+                Err(()) => reject(&state, &req, "invalid personal access token"),
+            },
+            None => reject(&state, &req, "personal access tokens are not configured"),
+        },
         Some(Ok(token)) => match state.authenticator.authenticate(token) {
             Ok(claims) => {
                 // WorkspaceClaim first (the slug the tenant extractor falls back to), then the
@@ -137,6 +202,16 @@ pub async fn authenticate(
             Err(_) => reject(&state, &req, "invalid bearer token"),
         },
     }
+}
+
+/// The current wall clock in Unix seconds, the `now` the PAT verifier checks expiry against. The
+/// JWT path needs no clock here (its `exp` gate is the verifier's job); a PAT's expiry is a store
+/// field, so the middleware injects the clock at the verify call.
+fn now_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
 }
 
 /// Audit a token-rejection denial (`401`, *unauthenticated* — no verified identity yet) and

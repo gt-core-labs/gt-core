@@ -73,6 +73,7 @@
 //! [workspace]: JwtClaims::workspace
 
 mod error;
+mod pat;
 mod provider;
 mod refresh;
 mod verify;
@@ -85,6 +86,9 @@ mod pg;
 
 #[cfg(feature = "pg")]
 mod refresh_pg;
+
+#[cfg(feature = "pg")]
+mod pat_pg;
 
 #[cfg(feature = "jsonwebtoken")]
 mod jwt;
@@ -115,11 +119,25 @@ pub use refresh::{
 };
 pub use verify::{Authenticator, InMemoryAuthenticator};
 
+/// Personal Access Token domain types (`hq-security-pat.1`): the opaque [`PatToken`] (`gtpat_` +
+/// 256 bits), its non-secret [`PatId`] handle, the [`PatRecord`] bookkeeping, the [`PatStatus`]
+/// lifecycle, the [`PatError`] verify-rejection vocabulary, the [`PAT_PREFIX`]/[`has_pat_prefix`]
+/// discriminator the middleware routes on, and the privilege-clamp [`clamp_scopes`]. The
+/// Postgres-backed store ([`PgPatStore`]) is additionally gated by `pg`.
+pub use pat::{
+    clamp_scopes, has_pat_prefix, PatError, PatId, PatRecord, PatStatus, PatToken, PAT_PREFIX,
+};
+
 #[cfg(feature = "pg")]
 pub use pg::{Membership, PgUsers};
 
 #[cfg(feature = "pg")]
 pub use refresh_pg::PgRefreshStore;
+
+/// The Postgres-backed Personal Access Token store (`hq-security-pat.1`): mint (with scope clamp) /
+/// list / revoke / verify against the per-workspace `personal_access_tokens` table.
+#[cfg(feature = "pg")]
+pub use pat_pg::PgPatStore;
 
 /// The embedded auth migration SQL — the per-workspace `users` (login store) and
 /// `refresh_tokens` tables, defined once in the `ws_default` template schema. The
@@ -152,6 +170,11 @@ pub mod migrations {
     /// recover the PKCE `code_verifier`. Durable so an in-flight login survives a redeploy.
     pub const CREATE_OAUTH_AUTHZ_STATE: &str =
         include_str!("../migrations/auth/0007__create_oauth_authz_state.sql");
+    /// `0008` — the per-workspace Personal Access Token store (`ws_default.personal_access_tokens`,
+    /// hq-security-pat.1): the long-lived opaque `gtpat_` bearer credential, stored only as its
+    /// SHA-256 hash. Cloned into every tenant schema by `gt_create_workspace_schema`.
+    pub const CREATE_PERSONAL_ACCESS_TOKENS: &str =
+        include_str!("../migrations/auth/0008__create_personal_access_tokens.sql");
 }
 
 #[cfg(feature = "jsonwebtoken")]
