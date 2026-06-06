@@ -212,11 +212,19 @@ pub enum PatError {
 ///
 /// `requested` empty ⇒ the caller wants the broadest token they may have, so the full `granted`
 /// set is used (a convenience: "mint me a token with everything I can do"). De-duplicates while
-/// preserving first-seen order. A `*` in `granted` is itself a scope, so a `*` request against a
-/// `*` grant yields `["*"]` (a full-authority PAT — only a system admin holds `*` to begin with).
+/// preserving first-seen order.
+///
+/// The `*` wildcard a system admin holds is the UNIVERSE, not a literal scope: a `*` grantor may
+/// mint a token carrying ANY requested scope (it is still a subset of their authority, never an
+/// escalation), so an admin can hand a CI job a narrow `tokens.read` PAT instead of being forced to
+/// choose between a full `*` token and an empty one. A request for `*` itself only survives when the
+/// grantor actually holds `*` (so a non-admin cannot conjure one).
 pub fn clamp_scopes(requested: &[String], granted: &[String]) -> Vec<String> {
     use std::collections::BTreeSet;
     let granted_set: BTreeSet<&str> = granted.iter().map(String::as_str).collect();
+    // A `*` grantor holds every scope — their grant is the universe, so any requested scope is
+    // within it (the one exception below keeps a literal `*` from being conjured by a non-admin).
+    let grantor_is_super = granted_set.contains("*");
     // No explicit ask ⇒ grant everything the minter holds (already their own authority).
     let source: &[String] = if requested.is_empty() {
         granted
@@ -226,7 +234,8 @@ pub fn clamp_scopes(requested: &[String], granted: &[String]) -> Vec<String> {
     let mut seen: BTreeSet<String> = BTreeSet::new();
     let mut out = Vec::new();
     for scope in source {
-        if granted_set.contains(scope.as_str()) && seen.insert(scope.clone()) {
+        let allowed = granted_set.contains(scope.as_str()) || grantor_is_super;
+        if allowed && seen.insert(scope.clone()) {
             out.push(scope.clone());
         }
     }
@@ -323,6 +332,23 @@ mod tests {
         );
         // A non-admin asking for `*` they do not hold gets nothing of it.
         assert!(clamp_scopes(&["*".into()], &["issues.read".to_string()]).is_empty());
+    }
+
+    #[test]
+    fn clamp_star_grantor_may_mint_a_narrow_scope() {
+        // A `*` admin minting a scoped PAT (least-privilege for CI) gets exactly the requested
+        // scopes — `*` is the universe, so a narrow ask is within it, not an escalation.
+        assert_eq!(
+            clamp_scopes(&["tokens.read".into()], &["*".to_string()]),
+            vec!["tokens.read".to_string()]
+        );
+        assert_eq!(
+            clamp_scopes(
+                &["tokens.read".into(), "issues.write".into()],
+                &["*".to_string()]
+            ),
+            vec!["tokens.read".to_string(), "issues.write".to_string()]
+        );
     }
 
     #[test]
