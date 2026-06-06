@@ -13,7 +13,10 @@ RUN apt-get update \
        clang pkg-config libssl-dev cmake \
     && rm -rf /var/lib/apt/lists/*
 COPY . .
-RUN cargo build --release --locked -p gt-composition --bin gt-mcp-server \
+# Both bins: gt-mcp-server (the HTTP/MCP backend) and gt-orch-server (the autonomous orchestration
+# daemon, hq-orchd-deploy.11). One image serves either, picked by the compose `command` — so the
+# daemon ships + deploys like the rest of the stack instead of a host-side `run.sh`.
+RUN cargo build --release --locked -p gt-composition --bin gt-mcp-server --bin gt-orch-server \
        --features embeddings-fastembed,oauth
 
 FROM debian:bookworm-slim
@@ -24,8 +27,10 @@ FROM debian:bookworm-slim
 # (/api/v1/quota/onboard/*) drives `claude auth login` IN this container, so the `claude` CLI must
 # be on PATH here. Installed from NodeSource (node 20) + a global npm install; `claude auth` provides
 # the login + `auth status --json` the onboarding flow reads the account email from.
+# tmux: the orchestration daemon (gt-orch-server) slings each polecat in a tmux session
+# (hq-orchd-deploy.11), so the daemon-in-container needs tmux on PATH alongside claude + git.
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends ca-certificates git libssl3 curl gnupg \
+    && apt-get install -y --no-install-recommends ca-certificates git libssl3 curl gnupg tmux \
     && curl -fsSL https://deb.nodesource.com/setup_20.x | bash - \
     && apt-get install -y --no-install-recommends nodejs \
     && npm install -g @anthropic-ai/claude-code \
@@ -34,6 +39,7 @@ RUN apt-get update \
     && apt-get autoremove -y \
     && rm -rf /var/lib/apt/lists/*
 COPY --from=build /build/target/release/gt-mcp-server /usr/local/bin/gt-mcp-server
+COPY --from=build /build/target/release/gt-orch-server /usr/local/bin/gt-orch-server
 # ort downloads the onnxruntime shared lib at build; carry it into the runtime image and
 # point ort at it (ORT_DYLIB_PATH), so no runtime download/link is needed.
 COPY --from=build /build/target/release/libonnxruntime.so* /usr/local/lib/
