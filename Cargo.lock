@@ -2055,6 +2055,7 @@ dependencies = [
  "gt-module",
  "semver",
  "serde",
+ "serde_json",
  "tempfile",
  "tokio",
 ]

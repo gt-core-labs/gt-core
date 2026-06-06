@@ -130,6 +130,17 @@ async fn main() -> anyhow::Result<()> {
     ));
     let template = SpawnTemplate::from_env(&ws_slug);
 
+    // Install the polecat hook settings into the rig checkout (hq-agent-provisioning.2) so a slung
+    // claude reports back: heartbeat touches + a merge-ready drop on Stop. Best-effort + marker-safe
+    // — it never clobbers a human's `.claude/settings.json` (returns AlreadyExists, logged + skipped).
+    match gt_polecat::install_polecat_hooks(&template.workdir) {
+        Ok(path) => eprintln!("[gt-orch-server] polecat hooks installed at {}", path.display()),
+        Err(e) => eprintln!(
+            "[gt-orch-server] polecat hooks NOT installed ({}): {e} — slung polecats won't report back",
+            template.workdir.display()
+        ),
+    }
+
     // Observe the SAME hub the root drains actor output onto: a fresh broadcast receiver, so the
     // sling observer runs independently of the root's own plugin relay (durability/roles/reactor).
     let pol_registry = Arc::new(

@@ -14,6 +14,8 @@ gt-module = { workspace = true }
 semver = { workspace = true }
 tokio.workspace = true
 serde.workspace = true
+# Build the polecat hooks settings template (hq-agent-provisioning.2) without hand-escaping JSON.
+serde_json.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
