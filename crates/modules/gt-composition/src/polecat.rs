@@ -110,6 +110,11 @@ pub struct PolecatSupervisorPlugin {
     /// pointer and stamps that account's `CLAUDE_CONFIG_DIR` so the polecat's claude burns the
     /// account predictive rotation has selected.
     keychain: Option<Arc<dyn Keychain>>,
+    /// Per-polecat git worktree root (`hq-orchd-deploy.9`). `None` ⇒ every polecat shares the
+    /// template's `GT_RIG_PATH` checkout (legacy). `Some(root)` ⇒ each sling is provisioned its own
+    /// worktree `<root>/<session>` (branch = bead) off that checkout, so concurrent polecats never
+    /// race on a shared HEAD (CLAUDE.md). The base checkout is `template.workdir`.
+    worktree_root: Option<std::path::PathBuf>,
 }
 
 impl PolecatSupervisorPlugin {
@@ -133,6 +138,7 @@ impl PolecatSupervisorPlugin {
             events: None,
             token: None,
             keychain: None,
+            worktree_root: None,
         }
     }
 
@@ -150,6 +156,14 @@ impl PolecatSupervisorPlugin {
     /// shares the host default `~/.claude` — one account, one limit.
     pub fn with_keychain(mut self, keychain: Arc<dyn Keychain>) -> Self {
         self.keychain = Some(keychain);
+        self
+    }
+
+    /// Provision each polecat its own git worktree under `root` (`hq-orchd-deploy.9`), isolating
+    /// the per-bead branch from the shared rig checkout so concurrent polecats don't race on HEAD.
+    /// Without it, every polecat works in `template.workdir` directly (legacy single-checkout).
+    pub fn with_worktree_root(mut self, root: std::path::PathBuf) -> Self {
+        self.worktree_root = Some(root);
         self
     }
 
@@ -238,6 +252,22 @@ impl Plugin for PolecatSupervisorPlugin {
                         ),
                     }
                 }
+                // Isolate the polecat in its own git worktree (hq-orchd-deploy.9): concurrent
+                // polecats must not share the rig checkout's HEAD. Branch = bead (CLAUDE.md
+                // `-b <bead-id>`), base = the template's rig checkout. Best-effort — a git failure
+                // logs and the polecat falls back to the shared checkout (spec.workdir unchanged),
+                // keeping liveness over isolation. Idempotent: a re-sling reuses the same tree.
+                if let Some(root) = &self.worktree_root {
+                    let wt = root.join(&spec.session);
+                    match crate::worktree::provision(&self.template.workdir, &wt, &bead) {
+                        Ok(()) => spec.workdir = wt,
+                        Err(e) => eprintln!(
+                            "[polecat] worktree provision failed for {bead} at {}: {e} — using shared checkout {}",
+                            wt.display(),
+                            self.template.workdir.display()
+                        ),
+                    }
+                }
                 if let Err(e) = spawn_tmux(self.tmux.as_ref(), &spec) {
                     // Spawn failed → undo the claim so the slot is not leaked.
                     self.allocator.lock().expect("pool mutex").release(&self.workspace);
@@ -266,6 +296,15 @@ impl Plugin for PolecatSupervisorPlugin {
                 // Close the agent session for that bead (hq-orchd.6): the session id is the
                 // deterministic `spec_for` session, so it matches the `Spawned` emitted at sling.
                 let session = self.template.spec_for(&self.workspace, &bead).session;
+                // Tear down the per-bead worktree now its work has landed (hq-orchd-deploy.9):
+                // best-effort, mirrors the deterministic `<root>/<session>` path used at sling. The
+                // branch itself is reaped by the branch-GC reactor on this same event.
+                if let Some(root) = &self.worktree_root {
+                    let wt = root.join(&session);
+                    if let Err(e) = crate::worktree::remove(&self.template.workdir, &wt) {
+                        eprintln!("[polecat] worktree teardown for {bead} at {} skipped: {e}", wt.display());
+                    }
+                }
                 self.emit(AgentEvent::SessionEnd { session });
                 Ok(())
             }
@@ -464,6 +503,82 @@ mod tests {
             .unwrap()
             .expect("CLAUDE_CONFIG_DIR injected from the active account");
         assert_eq!(cfg, "/home/nixos/.claude-acct-b");
+    }
+
+    #[tokio::test]
+    async fn dispatch_provisions_a_per_bead_worktree_off_the_rig_checkout() {
+        // hq-orchd-deploy.9: with a worktree root, a sling lands in its OWN git worktree (branch =
+        // bead) off the rig checkout — not the shared one — so concurrent polecats don't race on
+        // a single HEAD.
+        let uniq = format!(
+            "{}-{}",
+            std::process::id(),
+            SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos()
+        );
+        let base = std::env::temp_dir().join(format!("gt-wtbase-{uniq}"));
+        let wt_root = std::env::temp_dir().join(format!("gt-wtroot-{uniq}"));
+        std::fs::create_dir_all(&base).unwrap();
+        std::fs::create_dir_all(&wt_root).unwrap();
+        let git = |args: &[&str]| {
+            std::process::Command::new("git")
+                .arg("-C")
+                .arg(&base)
+                .args(args)
+                .status()
+                .unwrap()
+                .success()
+        };
+        assert!(git(&["init", "-q", "-b", "main"]));
+        assert!(git(&["config", "user.email", "t@t"]));
+        assert!(git(&["config", "user.name", "t"]));
+        std::fs::write(base.join("f"), "x").unwrap();
+        assert!(git(&["add", "."]));
+        assert!(git(&["commit", "-qm", "init"]));
+
+        let fake = Arc::new(FakeTmux::new());
+        let tmux: Arc<dyn Tmux> = fake.clone();
+        let supervisor = Arc::new(PolecatSupervisor::new(tmux.clone(), RestartConfig::default(), 8));
+        let template = SpawnTemplate {
+            rig: "hq".into(),
+            prefix: "hq".into(),
+            workdir: base.clone(),
+            command: "true".into(),
+            args: vec![],
+            base_env: vec![],
+            heartbeat_dir: std::env::temp_dir(),
+        };
+        let alloc = Arc::new(Mutex::new(PoolAllocator::new(10, 5)));
+        let p = PolecatSupervisorPlugin::new("acme", tmux, template, supervisor, alloc)
+            .with_worktree_root(wt_root.clone());
+
+        p.on_event(&record(SchedEvent::Dispatched {
+            bead: "gg-1".into(),
+            worker: "w1".into(),
+        }))
+        .await
+        .unwrap();
+
+        let wt = wt_root.join("hq-gg-1"); // <prefix>-<sanitized bead>
+        assert!(wt.exists(), "per-bead worktree created at {}", wt.display());
+        let head = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&wt)
+            .args(["rev-parse", "--abbrev-ref", "HEAD"])
+            .output()
+            .unwrap();
+        assert_eq!(
+            String::from_utf8_lossy(&head.stdout).trim(),
+            "gg-1",
+            "the worktree is on the bead's own branch"
+        );
+
+        let _ = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&base)
+            .args(["worktree", "remove", "--force", wt.to_str().unwrap()])
+            .status();
+        let _ = std::fs::remove_dir_all(&base);
+        let _ = std::fs::remove_dir_all(&wt_root);
     }
 
     #[tokio::test]

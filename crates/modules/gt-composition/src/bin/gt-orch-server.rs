@@ -255,6 +255,15 @@ async fn main() -> anyhow::Result<()> {
     if let Some(kc) = &keychain {
         pol_plugin = pol_plugin.with_keychain(kc.clone());
     }
+    // Per-polecat git worktree (hq-orchd-deploy.9): with GT_POLECAT_WORKTREE_ROOT set, each sling
+    // gets its own worktree off the rig checkout (branch = bead) so concurrent polecats don't race
+    // on a shared HEAD (CLAUDE.md). Unset ⇒ the legacy single shared checkout, unchanged.
+    if let Some(root) = std::env::var("GT_POLECAT_WORKTREE_ROOT").ok().filter(|v| !v.is_empty()) {
+        eprintln!("[gt-orch-server] per-polecat worktrees under {root} (branch = bead, off the rig checkout)");
+        pol_plugin = pol_plugin.with_worktree_root(PathBuf::from(root));
+    } else {
+        eprintln!("[gt-orch-server] GT_POLECAT_WORKTREE_ROOT unset — polecats share the rig checkout (single-polecat safe only)");
+    }
     // Register the polecat supervisor and — when a keychain exists — the predictive rotation
     // observer on the same relay: a `quota.block_predicted.v1` / `quota.account_limited.v1` flips
     // the keychain's active pointer so the NEXT sling lands on a healthy account.
