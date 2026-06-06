@@ -52,13 +52,14 @@ use gt_composition::polecat::{
     host_cap_from_metrics, AgentTokenMinter, PolecatSupervisorPlugin, ScopeResolver,
 };
 use gt_composition::quota_rotation::{self, QuotaRotationPlugin};
-use gt_composition::{daemon_root, DaemonRoot};
+use gt_composition::{daemon_root, replay_quota_state, DaemonRoot};
+use gt_composition::mcp::eventlog::EventLog;
 use gt_eventlog::DEFAULT_EVENTLOG_ROOT;
 use gt_plugin::{spawn_plugin_relay, PluginRegistry};
 use gt_polecat::{
     PoolAllocator, PolecatSupervisor, RestartConfig, RestartTracker, SpawnTemplate, Tmux, TmuxCli,
 };
-use gt_quota::{Account, CredentialRecord, InMemoryKeychain, Keychain};
+use gt_quota::{CredentialRecord, InMemoryKeychain, Keychain};
 use gt_workspace::WorkspaceId;
 
 /// Edge-stamped unix seconds for the supervisor clock.
@@ -84,44 +85,94 @@ fn env_usize(key: &str, default: usize) -> usize {
 /// shared keychain + the account count, or `None` when the env is unset/empty (single-account mode).
 /// A keychain with a single account is still returned — rotation just has nowhere to go (logged at
 /// runtime when a prediction fires).
-async fn seed_claude_accounts(quota: &gt_quota::QuotaHandle) -> Option<(Arc<dyn Keychain>, usize)> {
-    let raw = std::env::var("GT_CLAUDE_ACCOUNTS").ok()?;
+/// Build the claude-account keychain (`hq-quota-accounts.2`). Accounts come from TWO sources,
+/// merged so a live-registered account survives restart without an env edit:
+///
+/// 1. **The quota log** (durable, the source of truth): `replay_quota_state(...).registered` maps
+///    each onboarded account → its `CLAUDE_CONFIG_DIR`. These are seeded straight in; the quota
+///    actor is already hydrated with the same accounts (`daemon_root` → `spawn_hydrated`), so no
+///    re-emit.
+/// 2. **`GT_CLAUDE_ACCOUNTS` env** (bootstrap): `account=dir` pairs. An env account NOT yet in the
+///    log is promoted to a durable `AccountRegistered` (emitted ONCE — next boot it is in the log,
+///    so no duplicate). This lets the operator seed the first accounts via env and have them
+///    persist as events.
+///
+/// The active pointer follows the log's last rotation target when present (so a rotation survives
+/// restart), else the first account. `None` when no account exists in either source.
+async fn seed_claude_accounts(
+    quota: &gt_quota::QuotaHandle,
+    event_root: &std::path::Path,
+    ws: &str,
+) -> Option<(Arc<dyn Keychain>, usize)> {
+    let log = EventLog::new(Some(event_root.to_path_buf()));
+    let state = replay_quota_state(&log, ws).unwrap_or_default();
     let kc = InMemoryKeychain::new();
     let mut first: Option<String> = None;
-    let mut n = 0usize;
-    for entry in raw.split(',') {
-        let entry = entry.trim();
-        if entry.is_empty() {
-            continue;
-        }
-        let Some((account, dir)) = entry.split_once('=') else {
-            eprintln!(
-                "[gt-orch-server] GT_CLAUDE_ACCOUNTS entry '{entry}' is not account=dir — skipped"
-            );
-            continue;
-        };
-        let (account, dir) = (account.trim(), dir.trim());
-        if account.is_empty() || dir.is_empty() {
-            continue;
-        }
+
+    // 1) Durable accounts from the log.
+    for (account, dir) in &state.registered {
         if kc
             .put(CredentialRecord {
-                account: account.to_string(),
-                secret: dir.to_string(),
+                account: account.clone(),
+                secret: dir.clone(),
             })
-            .is_err()
+            .is_ok()
         {
-            continue;
+            first.get_or_insert_with(|| account.clone());
         }
-        // Mirror the account into the quota registry so the rotation observer can pick it as a
-        // target. Window/rate arrive later from the quota feed (GT_QUOTA_FEED_CHANNEL).
-        quota.upsert_account(Account::new(account)).await;
-        first.get_or_insert_with(|| account.to_string());
-        n += 1;
     }
-    let first = first?; // nothing parsed ⇒ no keychain
-    let _ = kc.set_active(&first);
-    Some((Arc::new(kc), n))
+
+    // 2) Env bootstrap (promote new ones to durable events).
+    if let Ok(raw) = std::env::var("GT_CLAUDE_ACCOUNTS") {
+        for entry in raw.split(',') {
+            let entry = entry.trim();
+            if entry.is_empty() {
+                continue;
+            }
+            let Some((account, dir)) = entry.split_once('=') else {
+                eprintln!(
+                    "[gt-orch-server] GT_CLAUDE_ACCOUNTS entry '{entry}' is not account=dir — skipped"
+                );
+                continue;
+            };
+            let (account, dir) = (account.trim(), dir.trim());
+            if account.is_empty() || dir.is_empty() {
+                continue;
+            }
+            if kc
+                .put(CredentialRecord {
+                    account: account.to_string(),
+                    secret: dir.to_string(),
+                })
+                .is_err()
+            {
+                continue;
+            }
+            // New to the log ⇒ persist it as an event (also upserts the live actor candidate).
+            if !state.registered.contains_key(account) {
+                quota.register_account(account, dir, now_secs()).await;
+            }
+            first.get_or_insert_with(|| account.to_string());
+        }
+    }
+
+    let first = first?; // no account in either source ⇒ no keychain
+    // Last rotation target wins (log truth), else the first account. set_active fails closed if the
+    // target was deregistered — then the first account stands.
+    let active = state
+        .rotations
+        .last()
+        .map(|(_, to)| to.clone())
+        .filter(|to| kc.get(to).ok().flatten().is_some())
+        .unwrap_or(first);
+    let _ = kc.set_active(&active);
+
+    let n = kc.accounts().map(|a| a.len()).unwrap_or(0);
+    if n == 0 {
+        None
+    } else {
+        Some((Arc::new(kc), n))
+    }
 }
 
 #[tokio::main]
@@ -159,6 +210,8 @@ async fn main() -> anyhow::Result<()> {
     // scheduler/merge/patrol/quota actors, drain their events onto the hub, and register the
     // persistence sink + role observers + scheduler/merge reactor arms + the sheriff observer. The
     // returned handles drive the edge loops below (patrol/quota ticks + the Refinery channel).
+    // Keep a copy of the log root for the keychain seed below: daemon_root consumes event_root.
+    let event_root_for_seed = event_root.clone();
     let DaemonRoot { handle, sched, merge, patrol, quota } = daemon_root(ws, event_root).await;
     eprintln!(
         "[gt-orch-server] daemon root up — scheduler + merge + patrol + quota actors anchored; persistence + roles + reactor arms + sheriff observer running"
@@ -226,7 +279,8 @@ async fn main() -> anyhow::Result<()> {
     // is a comma list of `account=CLAUDE_CONFIG_DIR` pairs; the first is the boot-active account.
     // Each is also seeded into the quota actor so the rotation observer has a candidate pool. Unset
     // / single account ⇒ no rotation possible (logged); the polecat uses the host default ~/.claude.
-    let keychain: Option<Arc<dyn Keychain>> = match seed_claude_accounts(&quota).await {
+    let keychain: Option<Arc<dyn Keychain>> =
+        match seed_claude_accounts(&quota, &event_root_for_seed, &ws_slug).await {
         Some((kc, n)) => {
             eprintln!("[gt-orch-server] claude keychain seeded with {n} account(s) — predictive rotation armed");
             Some(kc)

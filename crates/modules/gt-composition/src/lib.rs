@@ -60,6 +60,7 @@ use gt_patrol::actor::PatrolHandle;
 use gt_patrol::{InMemoryPatrolRepo, PatrolEvent};
 use gt_plugin::{Plugin, SheriffPlugin};
 use gt_quota::actor::QuotaHandle;
+use gt_quota::{AccountRegistry, QuotaEvent, QuotaState};
 use gt_roles::{RoleSinks, RoleStack};
 use gt_runtime::{RootHandle, RootRegistry};
 use gt_scheduling::actor::SchedHandle;
@@ -464,6 +465,20 @@ pub fn replay_merge_board(
     Ok(MergeBoard::from_state(&state))
 }
 
+/// Replay the workspace's quota log into [`QuotaState`] (`hq-quota-accounts.2`) through the domain
+/// reducer. Carries the onboarded-account registry (`registered`: account → `CLAUDE_CONFIG_DIR`)
+/// the daemon seeds its credential keychain from, plus the account windows/statuses that hydrate
+/// the quota actor — so a live-registered account survives restart without the `GT_CLAUDE_ACCOUNTS`
+/// env. Seeds [`gt_quota::actor::spawn_hydrated`].
+pub fn replay_quota_state(log: &EventLog, ws: &str) -> Result<QuotaState, gt_store_dolt::AppError> {
+    log.replay_domain::<QuotaState, QuotaEvent, _>(
+        Some(ws),
+        "quota.",
+        QuotaState::default(),
+        QuotaState::apply,
+    )
+}
+
 /// The result is cached by the registry: a second call returns the same `Arc` without
 /// re-hydrating. `probe` is wired into the hydrated root so a caller can watch the cascade; it
 /// is ignored on a cache hit (the closure does not run).
@@ -609,6 +624,10 @@ pub async fn daemon_root(ws: WorkspaceId, log_root: PathBuf) -> DaemonRoot {
     let sched_pending =
         replay_scheduling_pending(&log, &ws_slug).expect("replay scheduling log");
     let merge_board = replay_merge_board(&log, &ws_slug).expect("replay merge log");
+    // Quota registry hydration (hq-quota-accounts.2): rebuild onboarded accounts + their windows
+    // from the log so a restart keeps the rotation pool (and the daemon seeds its keychain from
+    // `quota_state.registered`) without depending on the GT_CLAUDE_ACCOUNTS env.
+    let quota_state = replay_quota_state(&log, &ws_slug).expect("replay quota log");
 
     let (sched_tx, sched_rx) = mpsc::channel(64);
     let sched =
@@ -618,7 +637,12 @@ pub async fn daemon_root(ws: WorkspaceId, log_root: PathBuf) -> DaemonRoot {
     let (patrol_tx, patrol_rx) = mpsc::channel(64);
     let patrol = gt_patrol::actor::spawn(InMemoryPatrolRepo::default(), patrol_tx);
     let (quota_tx, quota_rx) = mpsc::channel(64);
-    let quota = gt_quota::actor::spawn(quota_tx, std::collections::HashMap::new());
+    let quota = gt_quota::actor::spawn_hydrated(
+        quota_tx,
+        std::collections::HashMap::new(),
+        AccountRegistry::from_state(&quota_state),
+        quota_state.predictions.len(),
+    );
 
     handle.supervisor().anchor(sched.clone()).await.expect("anchors while Built");
     handle.supervisor().anchor(merge.clone()).await.expect("anchors while Built");

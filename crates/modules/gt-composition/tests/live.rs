@@ -14,6 +14,7 @@ use gt_composition::{daemon_root, live_root, replay_merge_board, replay_scheduli
 use gt_eventlog::{EventRecord, EventStore, JsonlWriter};
 use gt_merge::{MergeEvent, MergeSlotState};
 use gt_patrol::PatrolEvent;
+use gt_quota::QuotaEvent;
 use gt_runtime::RootRegistry;
 use gt_scheduling::SchedEvent;
 use gt_workspace::WorkspaceId;
@@ -229,6 +230,41 @@ async fn daemon_root_patrol_expiry_re_enqueues_through_the_hub() {
     assert!(
         kinds.iter().any(|k| k == "scheduling.enqueue.v1"),
         "scheduler must re-enqueue the freed bead via the hub; log saw {kinds:?}"
+    );
+
+    root.handle.shutdown().await;
+}
+
+/// hq-quota-accounts.2: an `AccountRegistered` already in the durable log is rehydrated into the
+/// quota actor at boot, so a live-onboarded claude account survives a daemon restart without the
+/// `GT_CLAUDE_ACCOUNTS` env — the rotation pool is durable, not env-seeded.
+#[tokio::test]
+async fn daemon_root_hydrates_registered_accounts_from_the_log() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    // Seed the log as if an account had been onboarded in a prior run.
+    let log = EventLog::new(Some(dir.path().to_path_buf()));
+    log.append(
+        Some("acme"),
+        QuotaEvent::AccountRegistered {
+            account: "acctX".into(),
+            config_dir: "/vol/accounts/acctX".into(),
+            now_secs: 1000,
+        },
+    )
+    .expect("append AccountRegistered");
+
+    let root = daemon_root(
+        WorkspaceId::new("acme").expect("valid slug"),
+        dir.path().to_path_buf(),
+    )
+    .await;
+
+    // The replayed account is a live rotation candidate in the hydrated quota actor.
+    let accounts = root.quota.accounts().await;
+    assert!(
+        accounts.iter().any(|a| a.id == "acctX"),
+        "registered account must hydrate into the quota registry; saw {:?}",
+        accounts.iter().map(|a| &a.id).collect::<Vec<_>>()
     );
 
     root.handle.shutdown().await;
