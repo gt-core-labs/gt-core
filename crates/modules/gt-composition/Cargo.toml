@@ -91,7 +91,7 @@ async-stream = { workspace = true }
 futures-core = { workspace = true }
 # Parse the RFC3339 record `ts` to compute agent-session durations (hq-orchd.6).
 time = { workspace = true, features = ["parsing"] }
-tokio = { workspace = true, features = ["macros", "rt-multi-thread", "net", "signal", "sync", "time"] }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "net", "process", "signal", "sync", "time", "io-util"] }
 
 # The gt-mcp-server binary lives here (hq-mcp-dispatch): the modules tier is the
 # one Rule-4-legal home for the per-domain DomainHandler wiring. It composes the

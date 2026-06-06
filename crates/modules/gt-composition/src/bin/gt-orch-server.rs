@@ -291,6 +291,22 @@ async fn main() -> anyhow::Result<()> {
         }
     };
 
+    // Web onboarding endpoints (hq-quota-onboard-web.1): serve POST /onboard/{start,complete} so the
+    // web "Add account" flow drives the real `claude auth login` lifecycle on the host (claude is not
+    // in the mcp-server container). Idle-safe — onboarding spawns no polecat, so the daemon serves it
+    // even pre-GO. The captured account registers in-process via the quota handle (no MCP hop). Bound
+    // to localhost (GT_ONBOARD_BIND, default 127.0.0.1:9098); Traefik proxies + auths it in .2.
+    let onboard_bind = std::env::var("GT_ONBOARD_BIND").unwrap_or_else(|_| "127.0.0.1:9098".into());
+    let onboard_state = gt_composition::onboard::OnboardState::new(
+        quota.clone(),
+        gt_composition::account_dirs::accounts_root(&event_root_for_seed),
+    );
+    tokio::spawn(async move {
+        if let Err(e) = serve_onboard(&onboard_bind, onboard_state).await {
+            eprintln!("[gt-orch-server] onboard http server stopped: {e}");
+        }
+    });
+
     // Observe the SAME hub the root drains actor output onto: a fresh broadcast receiver, so the
     // sling observer runs independently of the root's own plugin relay (durability/roles/reactor).
     let mut pol_plugin = PolecatSupervisorPlugin::new(
@@ -556,6 +572,23 @@ async fn serve_metrics(bind: &str) -> anyhow::Result<()> {
     let listener = tokio::net::TcpListener::bind(bind).await?;
     eprintln!(
         "[gt-orch-server] metrics on http://{}/metrics",
+        listener.local_addr()?
+    );
+    axum::serve(listener, app).await?;
+    Ok(())
+}
+
+/// Serve the web onboarding router (`hq-quota-onboard-web.1`) on `bind` (GT_ONBOARD_BIND, default
+/// `127.0.0.1:9098`): `POST /onboard/start` + `POST /onboard/complete`. Localhost-bound so it is not
+/// directly exposed; Traefik proxies + auths it (.2).
+async fn serve_onboard(
+    bind: &str,
+    state: gt_composition::onboard::OnboardState,
+) -> anyhow::Result<()> {
+    let app = gt_composition::onboard::onboard_router(state);
+    let listener = tokio::net::TcpListener::bind(bind).await?;
+    eprintln!(
+        "[gt-orch-server] onboard on http://{}/onboard/{{start,complete}}",
         listener.local_addr()?
     );
     axum::serve(listener, app).await?;

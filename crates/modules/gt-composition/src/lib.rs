@@ -32,6 +32,7 @@ pub mod account_dirs;
 pub mod auth;
 pub mod denial_audit;
 pub mod mcp;
+pub mod onboard;
 pub mod polecat;
 pub mod quota_rotation;
 pub mod scope_bridge;
