@@ -151,7 +151,10 @@ async fn main() -> anyhow::Result<()> {
     // least-privilege (no scopes) by default, never the operator's `*`.
     let agent_token = match JwtMinter::from_env() {
         Ok(minter) => {
-            let catalog = gt_skills::SkillCatalog::default(); // .4 will hydrate this from the log
+            // Least-privilege role→scopes policy as a code preset (hq-agent-provisioning.4):
+            // deterministic, versioned, never `*`. The daemon can't read the operator-driven
+            // gt-skills catalog (separate process / store), so the agent policy lives in code.
+            let catalog = gt_skills::agent_least_privilege_catalog();
             let resolver: ScopeResolver =
                 Arc::new(move |role| catalog.scopes_for_roles(&[role.to_string()]));
             let ttl = env_usize("GT_AGENT_TOKEN_TTL_SECS", 3600) as u64;

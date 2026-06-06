@@ -20,6 +20,7 @@
 
 pub mod actor;
 pub mod commands;
+pub mod presets;
 pub mod repo;
 
 mod events;
@@ -41,6 +42,7 @@ pub use commands::{
     DisableSkillForRole, EnableSkillForRole, RegisterSkill, RetireSkill, SkillCommand,
 };
 pub use events::SkillEvent;
+pub use presets::agent_least_privilege_catalog;
 pub use repo::{InMemorySkills, SkillsRepository};
 pub use state::{
     validate_role_name, validate_skill_id, RoleBinding, Skill, SkillCatalog, SkillState,
