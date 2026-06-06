@@ -46,8 +46,11 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use gt_auth::JwtMinter;
 use gt_channel::Channel;
-use gt_composition::polecat::{host_cap_from_metrics, PolecatSupervisorPlugin};
+use gt_composition::polecat::{
+    host_cap_from_metrics, AgentTokenMinter, PolecatSupervisorPlugin, ScopeResolver,
+};
 use gt_composition::{daemon_root, DaemonRoot};
 use gt_eventlog::DEFAULT_EVENTLOG_ROOT;
 use gt_plugin::{spawn_plugin_relay, PluginRegistry};
@@ -141,22 +144,49 @@ async fn main() -> anyhow::Result<()> {
         ),
     }
 
+    // Per-agent least-privilege token (hq-agent-provisioning.3): mint GT_TOKEN scoped to the
+    // polecat's role so it acts as ITSELF, not the operator. Needs an RS256 signing key
+    // (GT_JWT_RS256_PRIVATE_KEY_FILE); absent ⇒ polecats sling without a token (logged). Scopes
+    // resolve via the gt-skills catalog — empty until hq-agent-provisioning.4 seeds it, i.e.
+    // least-privilege (no scopes) by default, never the operator's `*`.
+    let agent_token = match JwtMinter::from_env() {
+        Ok(minter) => {
+            let catalog = gt_skills::SkillCatalog::default(); // .4 will hydrate this from the log
+            let resolver: ScopeResolver =
+                Arc::new(move |role| catalog.scopes_for_roles(&[role.to_string()]));
+            let ttl = env_usize("GT_AGENT_TOKEN_TTL_SECS", 3600) as u64;
+            eprintln!("[gt-orch-server] per-agent token minting on (ttl {ttl}s)");
+            Some(AgentTokenMinter::new(
+                minter,
+                resolver,
+                ws_slug.clone(),
+                ttl,
+            ))
+        }
+        Err(e) => {
+            eprintln!(
+                "[gt-orch-server] per-agent token minting OFF ({e}) — polecats sling without GT_TOKEN"
+            );
+            None
+        }
+    };
+
     // Observe the SAME hub the root drains actor output onto: a fresh broadcast receiver, so the
     // sling observer runs independently of the root's own plugin relay (durability/roles/reactor).
-    let pol_registry = Arc::new(
-        PluginRegistry::new().register(
-            PolecatSupervisorPlugin::new(
-                ws_slug.clone(),
-                tmux.clone(),
-                template,
-                supervisor.clone(),
-                allocator.clone(),
-            )
-            // Emit agent.spawned/session-end onto the hub (hq-orchd.6) so the session-minutes
-            // projector (registered inside daemon_root) feeds gt_workspace_session_minutes.
-            .with_session_events(handle.events_sender()),
-        ),
-    );
+    let mut pol_plugin = PolecatSupervisorPlugin::new(
+        ws_slug.clone(),
+        tmux.clone(),
+        template,
+        supervisor.clone(),
+        allocator.clone(),
+    )
+    // Emit agent.spawned/session-end onto the hub (hq-orchd.6) so the session-minutes
+    // projector (registered inside daemon_root) feeds gt_workspace_session_minutes.
+    .with_session_events(handle.events_sender());
+    if let Some(tm) = agent_token {
+        pol_plugin = pol_plugin.with_agent_token(tm);
+    }
+    let pol_registry = Arc::new(PluginRegistry::new().register(pol_plugin));
     let pol_relay = spawn_plugin_relay(handle.subscribe_events(), pol_registry);
     eprintln!(
         "[gt-orch-server] polecat supervision on — pool_size={pool_size}, host_cap={} (cpu+ram), max_restarts={max_restarts}",

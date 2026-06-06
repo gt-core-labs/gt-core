@@ -20,17 +20,74 @@
 //! naturally (NN#2, mirrored from [`gt_polecat::pool`]).
 
 use std::sync::{Arc, Mutex};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
 use tokio::sync::broadcast;
 
 use gt_agent::{AgentEvent, SessionRole};
+use gt_auth::{JwtClaims, JwtMinter};
 use gt_eventlog::EventRecord;
 use gt_events::{AppError, Envelope};
 use gt_merge::MergeEvent;
 use gt_polecat::{spawn_tmux, PoolAllocator, PolecatSupervisor, SpawnTemplate, Tmux};
 use gt_plugin::Plugin;
 use gt_scheduling::SchedEvent;
+
+/// Resolves the least-privilege scope set for an agent role (`hq-agent-provisioning.3`). The
+/// production resolver delegates to `gt_skills::SkillCatalog::scopes_for_roles`; tests pass a
+/// closure. Returns the role's scopes, never `*`.
+pub type ScopeResolver = Arc<dyn Fn(&str) -> Vec<String> + Send + Sync>;
+
+/// Mints a per-agent least-privilege JWT for a slung polecat (`hq-agent-provisioning.3`).
+///
+/// On every sling the supervisor stamps `GT_TOKEN` into the polecat's env so its `gt`/hooks/MCP
+/// calls carry the agent's OWN identity — scoped to its role via [`ScopeResolver`] — instead of
+/// inheriting the operator's admin (`*`) config. The token is RS256-signed by [`JwtMinter`] (the
+/// daemon holds the private key); the gateway verifies it with the matching public key. A short
+/// `ttl_secs` bounds exposure — a polecat that outlives it is re-slung with a fresh token.
+pub struct AgentTokenMinter {
+    minter: JwtMinter,
+    scopes_for_role: ScopeResolver,
+    workspace: String,
+    ttl_secs: u64,
+}
+
+impl AgentTokenMinter {
+    /// Wire the RS256 `minter`, the role→scopes `resolver`, the tenant `workspace`, and the token
+    /// `ttl_secs`.
+    pub fn new(
+        minter: JwtMinter,
+        scopes_for_role: ScopeResolver,
+        workspace: impl Into<String>,
+        ttl_secs: u64,
+    ) -> Self {
+        Self {
+            minter,
+            scopes_for_role,
+            workspace: workspace.into(),
+            ttl_secs,
+        }
+    }
+
+    /// Mint a token for `session` running as `role`. `sub` is the session id, scopes come from the
+    /// resolver (least-privilege; never `*`), and `exp` is `now + ttl_secs`.
+    fn token_for(&self, session: &str, role: &str) -> Result<String, gt_auth::AuthError> {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let claims = JwtClaims {
+            sub: session.to_string(),
+            workspace: self.workspace.clone(),
+            scopes: (self.scopes_for_role)(role),
+            exp: now + self.ttl_secs,
+            nbf: None,
+            iat: now,
+        };
+        self.minter.mint(&claims)
+    }
+}
 
 /// Observer that turns the scheduler's dispatch decisions into live, supervised tmux polecats for
 /// one workspace, bounded by a shared [`PoolAllocator`]. Registered on the daemon's event hub
@@ -44,6 +101,9 @@ pub struct PolecatSupervisorPlugin {
     /// Hub sender for the agent session lifecycle events (`hq-orchd.6`). `None` ⇒ no emission
     /// (the `.3` tests construct the plugin without a hub).
     events: Option<broadcast::Sender<EventRecord>>,
+    /// Per-agent token minter (`hq-agent-provisioning.3`). `None` ⇒ the polecat is slung without a
+    /// `GT_TOKEN` (it falls back to whatever creds its checkout carries).
+    token: Option<AgentTokenMinter>,
 }
 
 impl PolecatSupervisorPlugin {
@@ -65,7 +125,15 @@ impl PolecatSupervisorPlugin {
             supervisor,
             allocator,
             events: None,
+            token: None,
         }
+    }
+
+    /// Mint a least-privilege `GT_TOKEN` into each slung polecat's env (`hq-agent-provisioning.3`).
+    /// Without it, a polecat carries no agent identity of its own.
+    pub fn with_agent_token(mut self, token: AgentTokenMinter) -> Self {
+        self.token = Some(token);
+        self
     }
 
     /// Emit the agent session lifecycle events (`agent.spawned.v1` on sling, `agent.session-end.v1`
@@ -110,7 +178,24 @@ impl Plugin for PolecatSupervisorPlugin {
                     );
                     return Ok(());
                 }
-                let spec = self.template.spec_for(&self.workspace, &bead);
+                let mut spec = self.template.spec_for(&self.workspace, &bead);
+                // Stamp a least-privilege per-agent token (hq-agent-provisioning.3) so the polecat
+                // acts as itself, scoped to its role — not as the operator. Best-effort: a mint
+                // failure logs and the polecat still slings (it just lacks GT_TOKEN).
+                if let Some(tm) = &self.token {
+                    let role = spec
+                        .env
+                        .iter()
+                        .find(|(k, _)| k == "GT_ROLE")
+                        .map(|(_, v)| v.as_str())
+                        .unwrap_or("polecat");
+                    match tm.token_for(&spec.session, role) {
+                        Ok(tok) => spec.env.push(("GT_TOKEN".to_string(), tok)),
+                        Err(e) => eprintln!(
+                            "[polecat] token mint failed for {bead} (role {role}): {e} — slinging without GT_TOKEN"
+                        ),
+                    }
+                }
                 if let Err(e) = spawn_tmux(self.tmux.as_ref(), &spec) {
                     // Spawn failed → undo the claim so the slot is not leaked.
                     self.allocator.lock().expect("pool mutex").release(&self.workspace);
@@ -184,9 +269,13 @@ fn mem_available_mb() -> Option<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use gt_auth::{Authenticator, JwtAuthenticator, JwtMinter};
     use gt_eventlog::EventRecord;
     use gt_events::{Envelope, EventKind};
     use gt_polecat::{FakeTmux, RestartConfig};
+
+    const TEST_PRIV: &[u8] = include_bytes!("../tests/fixtures/rs256_priv.pem");
+    const TEST_PUB: &[u8] = include_bytes!("../tests/fixtures/rs256_pub.pem");
 
     fn record<E: EventKind + serde::Serialize>(event: E) -> EventRecord {
         EventRecord::from_envelope(&Envelope::root(event)).expect("encode")
@@ -233,6 +322,66 @@ mod tests {
             .unwrap();
         assert_eq!(sup.watched_count(), 0, "merged bead is unwatched");
         assert_eq!(alloc.lock().unwrap().in_flight("acme"), 0, "slot released");
+    }
+
+    #[tokio::test]
+    async fn dispatch_mints_a_role_scoped_token_into_the_polecat_env() {
+        // hq-agent-provisioning.3: a slung polecat carries GT_TOKEN whose scopes are exactly its
+        // role's least-privilege set (never the operator's `*`).
+        let fake = Arc::new(FakeTmux::new());
+        let tmux: Arc<dyn Tmux> = fake.clone();
+        let supervisor = Arc::new(PolecatSupervisor::new(tmux.clone(), RestartConfig::default(), 8));
+        let template = SpawnTemplate {
+            rig: "hq".into(),
+            prefix: "hq".into(),
+            workdir: "/tmp".into(),
+            command: "true".into(),
+            args: vec![],
+            base_env: vec![("GT_ROLE".to_string(), "polecat".to_string())],
+            heartbeat_dir: std::env::temp_dir(),
+        };
+        let resolver: ScopeResolver = Arc::new(|role| {
+            if role == "polecat" {
+                vec![
+                    "issues.read".to_string(),
+                    "issues.write".to_string(),
+                    "issues.claim".to_string(),
+                    "issues.transition".to_string(),
+                ]
+            } else {
+                vec![]
+            }
+        });
+        let minter = JwtMinter::from_rsa_pem(TEST_PRIV).unwrap();
+        let token = AgentTokenMinter::new(minter, resolver, "acme", 3600);
+        let alloc = Arc::new(Mutex::new(PoolAllocator::new(10, 5)));
+        let p = PolecatSupervisorPlugin::new("acme", tmux, template, supervisor, alloc)
+            .with_agent_token(token);
+
+        p.on_event(&record(SchedEvent::Dispatched {
+            bead: "gg-1".into(),
+            worker: "w1".into(),
+        }))
+        .await
+        .unwrap();
+
+        // The token rides the polecat's session env.
+        let tok = fake
+            .show_environment("hq-gg-1", "GT_TOKEN")
+            .unwrap()
+            .expect("GT_TOKEN injected into the polecat env");
+        // Verifiable with the matching public key, and scoped to the role — not `*`.
+        let claims = JwtAuthenticator::from_rsa_pem(TEST_PUB)
+            .unwrap()
+            .authenticate(&tok)
+            .unwrap();
+        assert_eq!(claims.sub, "hq-gg-1"); // sub = the polecat session
+        assert_eq!(claims.workspace, "acme");
+        assert_eq!(
+            claims.scopes,
+            vec!["issues.read", "issues.write", "issues.claim", "issues.transition"]
+        );
+        assert!(!claims.scopes.iter().any(|s| s == "*"), "never the wildcard");
     }
 
     #[tokio::test]
