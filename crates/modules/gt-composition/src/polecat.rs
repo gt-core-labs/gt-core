@@ -115,6 +115,10 @@ pub struct PolecatSupervisorPlugin {
     /// worktree `<root>/<session>` (branch = bead) off that checkout, so concurrent polecats never
     /// race on a shared HEAD (CLAUDE.md). The base checkout is `template.workdir`.
     worktree_root: Option<std::path::PathBuf>,
+    /// Non-root user the polecat re-execs as (`hq-quota-accounts.6`, `GT_POLECAT_RUN_AS`). When set,
+    /// a freshly-provisioned worktree is `chown`ed to it so the dropped-privilege polecat can use
+    /// the (otherwise root-owned) tree. `None` ⇒ the polecat runs as the daemon's uid (legacy).
+    run_as: Option<String>,
 }
 
 impl PolecatSupervisorPlugin {
@@ -139,6 +143,7 @@ impl PolecatSupervisorPlugin {
             token: None,
             keychain: None,
             worktree_root: None,
+            run_as: None,
         }
     }
 
@@ -164,6 +169,16 @@ impl PolecatSupervisorPlugin {
     /// Without it, every polecat works in `template.workdir` directly (legacy single-checkout).
     pub fn with_worktree_root(mut self, root: std::path::PathBuf) -> Self {
         self.worktree_root = Some(root);
+        self
+    }
+
+    /// Re-exec each polecat as a dedicated non-root user (`hq-quota-accounts.6`): the provisioned
+    /// worktree is `chown`ed to it so the dropped-privilege polecat can use the tree. The command
+    /// re-exec itself is wired by `SpawnTemplate::from_env` (`GT_POLECAT_RUN_AS` → `runuser`); this
+    /// is the matching filesystem half.
+    pub fn with_run_as(mut self, user: impl Into<String>) -> Self {
+        let user = user.into();
+        self.run_as = if user.trim().is_empty() { None } else { Some(user) };
         self
     }
 
@@ -270,6 +285,13 @@ impl Plugin for PolecatSupervisorPlugin {
                                 eprintln!("[polecat] hook install into worktree {} skipped: {e}", wt.display());
                             }
                             crate::worktree::seed_mcp_config(&self.template.workdir, &wt);
+                            // Hand the tree to the non-root polecat user (hq-quota-accounts.6) so the
+                            // dropped-privilege re-exec can read/write it. Best-effort.
+                            if let Some(user) = &self.run_as {
+                                if let Err(e) = crate::worktree::chown_to(&wt, user) {
+                                    eprintln!("[polecat] chown worktree {} to {user} skipped: {e}", wt.display());
+                                }
+                            }
                             spec.workdir = wt;
                         }
                         Err(e) => eprintln!(

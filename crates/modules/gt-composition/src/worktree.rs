@@ -133,6 +133,34 @@ pub fn seed_mcp_config(base_repo: &Path, worktree: &Path) {
     }
 }
 
+/// `chown -R <user> <path>` argv, as data so it can be asserted without shelling.
+fn chown_argv(path: &Path, user: &str) -> Vec<String> {
+    vec!["-R".to_string(), user.to_string(), path.display().to_string()]
+}
+
+/// Hand a freshly-provisioned worktree to the non-root polecat user (`hq-quota-accounts.6`).
+/// `git worktree add` runs as the root daemon, so the tree is root-owned; a polecat re-exec'd under
+/// `GT_POLECAT_RUN_AS` could not read/write it. `chown -R <user>` fixes that. Best-effort: a failure
+/// (no such user, not root) logs and the sling proceeds — the operator sees the cause. No-op for an
+/// empty user.
+pub fn chown_to(path: &Path, user: &str) -> std::io::Result<()> {
+    if user.trim().is_empty() {
+        return Ok(());
+    }
+    let ok = Command::new("chown")
+        .args(chown_argv(path, user.trim()))
+        .status()?
+        .success();
+    if ok {
+        Ok(())
+    } else {
+        Err(std::io::Error::other(format!(
+            "chown -R {user} {} failed",
+            path.display()
+        )))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -155,6 +183,19 @@ mod tests {
             vec!["worktree", "add", "--force", "/wt/hq-gg-1", "gg-1"]
         );
         assert!(!argv.iter().any(|a| a == "-b"));
+    }
+
+    #[test]
+    fn chown_argv_is_recursive() {
+        assert_eq!(
+            chown_argv(&PathBuf::from("/wt/hq-gg-1"), "gtpolecat"),
+            vec!["-R", "gtpolecat", "/wt/hq-gg-1"]
+        );
+    }
+
+    #[test]
+    fn chown_to_empty_user_is_noop() {
+        chown_to(&PathBuf::from("/anything"), "   ").expect("blank user is a no-op, no chown");
     }
 
     #[test]

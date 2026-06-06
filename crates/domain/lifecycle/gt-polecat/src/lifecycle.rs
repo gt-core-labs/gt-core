@@ -230,6 +230,12 @@ impl SpawnTemplate {
             }
             None => Vec::new(),
         };
+        // Drop privileges (hq-quota-accounts.6): the daemon runs as root (it needs the root-owned
+        // eventlog volume), but a polecat must NOT — it carries `--dangerously-skip-permissions`
+        // and its account's claude creds, so a root session could read OTHER accounts' creds, the
+        // RS256 signing key, and the whole volume. `GT_POLECAT_RUN_AS=<user>` re-execs the polecat
+        // as a dedicated non-root uid via `runuser`. Unset ⇒ runs as the daemon's uid (legacy).
+        let (command, args) = wrap_run_as(command, args, env("GT_POLECAT_RUN_AS").as_deref());
         let heartbeat_dir = env("GT_HEARTBEAT_DIR")
             .map(PathBuf::from)
             .unwrap_or_else(std::env::temp_dir);
@@ -302,6 +308,27 @@ impl SpawnTemplate {
 /// its hooks then fire (PostToolUse → heartbeat; Stop → merge-ready). The agent reads the bead via
 /// the `gt` MCP tools, authenticated by the `GT_TOKEN` the daemon minted into its env
 /// (`hq-agent-provisioning.3`).
+/// Wrap a polecat launch so it runs as a dedicated non-root user (`hq-quota-accounts.6`). When
+/// `run_as` is `Some(user)`, the returned command is `runuser -u <user> -- <command> <args…>`, so
+/// `tmux` (spawned by the root daemon) re-execs the polecat — and the claude it carries, with its
+/// account creds — under that uid, away from the signing key and other accounts' dirs. `None`
+/// leaves the command untouched (runs as the daemon's uid). Pure: it shells nothing, just rewrites
+/// the argv, so the privilege boundary is testable without a host user.
+pub fn wrap_run_as(
+    command: String,
+    args: Vec<String>,
+    run_as: Option<&str>,
+) -> (String, Vec<String>) {
+    match run_as.map(str::trim).filter(|u| !u.is_empty()) {
+        Some(user) => {
+            let mut wrapped = vec!["-u".to_string(), user.to_string(), "--".to_string(), command];
+            wrapped.extend(args);
+            ("runuser".to_string(), wrapped)
+        }
+        None => (command, args),
+    }
+}
+
 pub fn polecat_prompt(workspace: &str, bead: &str, branch: &str) -> String {
     format!(
         "You are an autonomous gt polecat working in workspace `{workspace}`. Your assigned bead is \
@@ -370,6 +397,66 @@ mod lifecycle_tests {
             base_env: vec![("GT_ROLE".to_string(), "polecat".to_string())],
             heartbeat_dir: std::env::temp_dir(),
         }
+    }
+
+    #[test]
+    fn wrap_run_as_none_leaves_command_untouched() {
+        let (cmd, args) = wrap_run_as(
+            "claude".to_string(),
+            vec!["--dangerously-skip-permissions".to_string()],
+            None,
+        );
+        assert_eq!(cmd, "claude");
+        assert_eq!(args, vec!["--dangerously-skip-permissions"]);
+    }
+
+    #[test]
+    fn wrap_run_as_reexecs_under_the_user_via_runuser() {
+        // hq-quota-accounts.6: runuser -u gtpolecat -- claude --flag … so the prompt spec_for
+        // appends afterward stays the last positional handed to claude.
+        let (cmd, args) = wrap_run_as(
+            "claude".to_string(),
+            vec!["--dangerously-skip-permissions".to_string()],
+            Some("gtpolecat"),
+        );
+        assert_eq!(cmd, "runuser");
+        assert_eq!(
+            args,
+            vec!["-u", "gtpolecat", "--", "claude", "--dangerously-skip-permissions"]
+        );
+    }
+
+    #[test]
+    fn wrap_run_as_empty_user_is_treated_as_unset() {
+        let (cmd, _) = wrap_run_as("claude".to_string(), vec![], Some("  "));
+        assert_eq!(cmd, "claude", "blank GT_POLECAT_RUN_AS must not wrap");
+    }
+
+    #[test]
+    fn wrapped_template_keeps_the_bead_prompt_last() {
+        // End-to-end through spec_for: a run-as wrapped template still feeds claude the bead prompt
+        // as the final positional (runuser passes everything after `--` through).
+        let (command, args) = wrap_run_as(
+            "claude".to_string(),
+            vec!["--dangerously-skip-permissions".to_string()],
+            Some("gtpolecat"),
+        );
+        let t = SpawnTemplate {
+            command,
+            args,
+            ..template()
+        };
+        let spec = t.spec_for("acme", "gg-1");
+        assert_eq!(spec.command, "runuser");
+        assert_eq!(spec.args.first().map(String::as_str), Some("-u"));
+        assert!(
+            spec.args.last().unwrap().contains("gg-1"),
+            "the bead prompt is the final arg: {:?}",
+            spec.args
+        );
+        // The user + the real command sit between the runuser flags and the prompt.
+        assert!(spec.args.iter().any(|a| a == "claude"));
+        assert!(spec.args.iter().any(|a| a == "gtpolecat"));
     }
 
     #[test]

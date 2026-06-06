@@ -318,6 +318,16 @@ async fn main() -> anyhow::Result<()> {
     } else {
         eprintln!("[gt-orch-server] GT_POLECAT_WORKTREE_ROOT unset — polecats share the rig checkout (single-polecat safe only)");
     }
+    // Drop privileges per polecat (hq-quota-accounts.6): GT_POLECAT_RUN_AS re-execs the polecat as
+    // a dedicated non-root user (the command wrap is in SpawnTemplate::from_env) and chowns its
+    // worktree to that user here. The daemon stays root (for the eventlog volume); the polecat —
+    // which holds account creds + skips permission prompts — does not. Unset ⇒ runs as root (legacy).
+    if let Some(user) = std::env::var("GT_POLECAT_RUN_AS").ok().filter(|v| !v.trim().is_empty()) {
+        eprintln!("[gt-orch-server] polecats run as non-root user '{user}' (privilege drop on)");
+        pol_plugin = pol_plugin.with_run_as(user);
+    } else {
+        eprintln!("[gt-orch-server] GT_POLECAT_RUN_AS unset — polecats run as the daemon uid (root); see hq-quota-accounts.6");
+    }
     // Register the polecat supervisor and — when a keychain exists — the predictive rotation
     // observer on the same relay: a `quota.block_predicted.v1` / `quota.account_limited.v1` flips
     // the keychain's active pointer so the NEXT sling lands on a healthy account.
