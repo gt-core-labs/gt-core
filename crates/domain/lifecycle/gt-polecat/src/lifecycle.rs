@@ -250,6 +250,14 @@ impl SpawnTemplate {
         if let Some(channel_root) = env("GT_CHANNEL_ROOT") {
             base_env.push(("GT_CHANNEL_ROOT".to_string(), channel_root));
         }
+        // Sandbox flag for `claude --dangerously-skip-permissions` (hq-orchd-deploy.12): claude
+        // refuses that flag when running as root unless IS_SANDBOX is set. The containerized daemon
+        // runs polecats as root (the container IS the isolation, GT_POLECAT_RUN_AS unset), so the
+        // compose service declares IS_SANDBOX=1 and we propagate it to the polecat. Only layered
+        // when set, so a host deploy that drops privileges via GT_POLECAT_RUN_AS stays unchanged.
+        if let Some(sandbox) = env("IS_SANDBOX") {
+            base_env.push(("IS_SANDBOX".to_string(), sandbox));
+        }
         SpawnTemplate {
             rig,
             prefix,
