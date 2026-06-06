@@ -32,7 +32,9 @@ mod events;
 mod state;
 
 pub use actor::QuotaHandle;
-pub use commands::{ProbeWindow, QuotaCommand, RotateAccount, SampleTokens};
+pub use commands::{
+    ProbeWindow, QuotaCommand, RegisterAccount, RetireAccount, RotateAccount, SampleTokens,
+};
 pub use cost::{cost_units, Cost, ModelWeights};
 pub use events::QuotaEvent;
 pub use expectations::{predict, Prediction};

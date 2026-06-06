@@ -17,7 +17,7 @@ use serde::{Deserialize, Serialize};
 use gt_events::{AppError, Command};
 
 use crate::events::QuotaEvent;
-use crate::state::AccountRegistry;
+use crate::state::{Account, AccountRegistry};
 
 /// A local usage sample (one model response), attributable to a session.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
@@ -152,6 +152,80 @@ impl Command for RotateAccount {
     }
 }
 
+/// Onboard (or replace) a claude account with its credential dir (`hq-quota-accounts.4`). Unlike a
+/// probe/sample (consumption) this binds IDENTITY: the `config_dir` is the account's
+/// `CLAUDE_CONFIG_DIR`. Event-sourced — emits `AccountRegistered`, the durable replacement for the
+/// `GT_CLAUDE_ACCOUNTS` env. The account becomes a rotation candidate immediately (Healthy, no
+/// window); its window arrives from the first probe (the authoritative source), not from here.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct RegisterAccount {
+    /// Account id (keychain/provider correlative). Must be non-empty.
+    pub account: String,
+    /// The account's `CLAUDE_CONFIG_DIR` (its logged-in creds dir). Must be non-empty. The edge
+    /// (composition `account_dirs`) sanitizes the path before calling; the domain only checks shape.
+    pub config_dir: String,
+    /// UTC epoch seconds, stamped at the edge.
+    pub now_secs: u64,
+}
+
+impl Command for RegisterAccount {
+    type Output = QuotaEvent;
+    type State = AccountRegistry;
+
+    fn validate(&self, _state: &Self::State) -> Result<(), AppError> {
+        if self.account.trim().is_empty() {
+            return Err(AppError::Validation("account is empty".into()));
+        }
+        if self.config_dir.trim().is_empty() {
+            return Err(AppError::Validation("config_dir is empty".into()));
+        }
+        Ok(())
+    }
+
+    fn execute(&self, state: &mut Self::State) -> Result<Self::Output, AppError> {
+        self.validate(state)?;
+        // Bring the account into existence as a rotation candidate (idempotent upsert). The window
+        // is NOT declared here — it is observed from the first probe.
+        state.upsert_account(Account::new(&self.account));
+        Ok(QuotaEvent::AccountRegistered {
+            account: self.account.clone(),
+            config_dir: self.config_dir.clone(),
+            now_secs: self.now_secs,
+        })
+    }
+}
+
+/// Retire an account from the rotation pool (`hq-quota-accounts.4`). Event-sourced — emits
+/// `AccountDeregistered`. Idempotent: removing an absent account still emits (the reducer no-ops).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct RetireAccount {
+    /// Account id to drop. Must be non-empty.
+    pub account: String,
+    /// UTC epoch seconds, stamped at the edge.
+    pub now_secs: u64,
+}
+
+impl Command for RetireAccount {
+    type Output = QuotaEvent;
+    type State = AccountRegistry;
+
+    fn validate(&self, _state: &Self::State) -> Result<(), AppError> {
+        if self.account.trim().is_empty() {
+            return Err(AppError::Validation("account is empty".into()));
+        }
+        Ok(())
+    }
+
+    fn execute(&self, state: &mut Self::State) -> Result<Self::Output, AppError> {
+        self.validate(state)?;
+        state.remove_account(&self.account);
+        Ok(QuotaEvent::AccountDeregistered {
+            account: self.account.clone(),
+            now_secs: self.now_secs,
+        })
+    }
+}
+
 /// Sum type so the actor routes any quota command through a single message variant.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(tag = "kind", rename_all = "snake_case")]
@@ -159,6 +233,8 @@ pub enum QuotaCommand {
     Sample(SampleTokens),
     Probe(ProbeWindow),
     Rotate(RotateAccount),
+    Register(RegisterAccount),
+    Retire(RetireAccount),
 }
 
 impl QuotaCommand {
@@ -168,6 +244,8 @@ impl QuotaCommand {
             Self::Sample(_) => "quota.sample",
             Self::Probe(_) => "quota.probe",
             Self::Rotate(_) => "quota.rotate",
+            Self::Register(_) => "quota.register",
+            Self::Retire(_) => "quota.retire",
         }
     }
 }
@@ -181,6 +259,8 @@ impl Command for QuotaCommand {
             Self::Sample(c) => c.validate(state),
             Self::Probe(c) => c.validate(state),
             Self::Rotate(c) => c.validate(state),
+            Self::Register(c) => c.validate(state),
+            Self::Retire(c) => c.validate(state),
         }
     }
 
@@ -189,6 +269,8 @@ impl Command for QuotaCommand {
             Self::Sample(c) => c.execute(state),
             Self::Probe(c) => c.execute(state),
             Self::Rotate(c) => c.execute(state),
+            Self::Register(c) => c.execute(state),
+            Self::Retire(c) => c.execute(state),
         }
     }
 }
@@ -212,6 +294,86 @@ mod tests {
             }),
         });
         r
+    }
+
+    #[test]
+    fn register_account_emits_event_and_adds_candidate() {
+        let mut r = AccountRegistry::default();
+        let cmd = RegisterAccount {
+            account: "acctB".into(),
+            config_dir: "/vol/accounts/acctB".into(),
+            now_secs: 100,
+        };
+        let ev = cmd.execute(&mut r).expect("register ok");
+        assert_eq!(
+            ev,
+            QuotaEvent::AccountRegistered {
+                account: "acctB".into(),
+                config_dir: "/vol/accounts/acctB".into(),
+                now_secs: 100,
+            }
+        );
+        assert!(r.get("acctB").is_some(), "account is a live candidate");
+    }
+
+    #[test]
+    fn register_rejects_empty_account_or_dir() {
+        let r = AccountRegistry::default();
+        assert!(RegisterAccount {
+            account: "  ".into(),
+            config_dir: "/d".into(),
+            now_secs: 0,
+        }
+        .validate(&r)
+        .is_err());
+        assert!(RegisterAccount {
+            account: "a".into(),
+            config_dir: "".into(),
+            now_secs: 0,
+        }
+        .validate(&r)
+        .is_err());
+    }
+
+    #[test]
+    fn retire_account_emits_event_and_removes() {
+        let mut r = registry_with_account();
+        let cmd = RetireAccount {
+            account: "acc-1".into(),
+            now_secs: 200,
+        };
+        let ev = cmd.execute(&mut r).expect("retire ok");
+        assert_eq!(
+            ev,
+            QuotaEvent::AccountDeregistered {
+                account: "acc-1".into(),
+                now_secs: 200,
+            }
+        );
+        assert!(r.get("acc-1").is_none(), "account dropped");
+        // Idempotent: retiring again still emits (reducer no-ops on absent).
+        assert!(cmd.execute(&mut r).is_ok());
+    }
+
+    #[test]
+    fn quota_command_routes_register_and_retire_tool_names() {
+        assert_eq!(
+            QuotaCommand::Register(RegisterAccount {
+                account: "a".into(),
+                config_dir: "/d".into(),
+                now_secs: 0,
+            })
+            .tool_name(),
+            "quota.register"
+        );
+        assert_eq!(
+            QuotaCommand::Retire(RetireAccount {
+                account: "a".into(),
+                now_secs: 0,
+            })
+            .tool_name(),
+            "quota.retire"
+        );
     }
 
     #[test]

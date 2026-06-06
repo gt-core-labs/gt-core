@@ -49,7 +49,7 @@ use serde_json::{json, Value};
 use gt_events::{AppError, Command, EventKind};
 use gt_workspace::WorkspaceContext;
 
-use crate::commands::{ProbeWindow, RotateAccount, SampleTokens};
+use crate::commands::{ProbeWindow, RegisterAccount, RetireAccount, RotateAccount, SampleTokens};
 use crate::events::QuotaEvent;
 use crate::state::{Account, AccountRegistry};
 
@@ -103,10 +103,15 @@ impl QuotaApiState {
 /// | `POST /:account/sample`   | `quota.sample`   |
 /// | `POST /:account/probe`    | `quota.probe`    |
 /// | `POST /:account/rotate`   | `quota.rotate`   |
+/// | `POST /account`           | `quota.register` |
+/// | `DELETE /:account`        | `quota.retire`   |
 pub fn quota_router(state: QuotaApiState) -> Router {
     Router::new()
         .route("/", get(list_accounts))
-        .route("/:account", get(get_account))
+        // `/account` (singular) is the onboarding collection POST — distinct from `/:account` so the
+        // register body carries the id, not the path (the account does not exist yet).
+        .route("/account", post(register_account))
+        .route("/:account", get(get_account).delete(retire_account))
         .route("/:account/sample", post(sample_account))
         .route("/:account/probe", post(probe_account))
         .route("/:account/rotate", post(rotate_account))
@@ -212,6 +217,50 @@ async fn rotate_account(
     run(&st, ctx.workspace().as_str(), cmd).await
 }
 
+/// `POST /account` — onboard a claude account (`quota.register`, `hq-quota-accounts.4`). Body
+/// carries `{account, config_dir}`; the id is in the body (not the path) because the account does
+/// not exist yet. Emits `AccountRegistered`. The edge sanitizes `config_dir` (composition
+/// `account_dirs`) before this; the domain only checks it is non-empty.
+#[cfg_attr(feature = "axum", utoipa::path(
+    post, path = "/account",
+    responses(
+        (status = 200, description = "Account onboarded; emits quota.account_registered"),
+        (status = 422, description = "Empty account or config_dir"),
+    ),
+))]
+async fn register_account(
+    State(st): State<QuotaApiState>,
+    ctx: WorkspaceContext,
+    Json(mut body): Json<Value>,
+) -> Result<Json<Value>, ApiError> {
+    // No path id to force; just stamp the server clock when the caller omits it.
+    if let Value::Object(map) = &mut body {
+        map.entry("now_secs").or_insert_with(|| json!(now_secs()));
+    }
+    let cmd: RegisterAccount = serde_json::from_value(body)
+        .map_err(|e| ApiError(AppError::Validation(format!("invalid arguments: {e}"))))?;
+    run(&st, ctx.workspace().as_str(), cmd).await
+}
+
+/// `DELETE /:account` — retire an account from the rotation pool (`quota.retire`,
+/// `hq-quota-accounts.4`). Emits `AccountDeregistered`; idempotent.
+#[cfg_attr(feature = "axum", utoipa::path(
+    delete, path = "/{account}",
+    params(("account" = String, Path, description = "Account id")),
+    responses((status = 200, description = "Account retired; emits quota.account_deregistered")),
+))]
+async fn retire_account(
+    State(st): State<QuotaApiState>,
+    ctx: WorkspaceContext,
+    Path(account): Path<String>,
+) -> Result<Json<Value>, ApiError> {
+    let cmd = RetireAccount {
+        account,
+        now_secs: now_secs(),
+    };
+    run(&st, ctx.workspace().as_str(), cmd).await
+}
+
 /// Replay → execute → append: the REST mirror of the MCP `QuotaHandler::run`.
 ///
 /// Rehydrates the registry from the workspace log, runs the command's decide/apply against it
@@ -238,6 +287,8 @@ where
     sample_account,
     probe_account,
     rotate_account,
+    register_account,
+    retire_account,
 ))]
 pub struct ApiDoc;
 
