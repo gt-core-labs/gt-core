@@ -57,6 +57,61 @@ pub fn agent_least_privilege_catalog() -> SkillCatalog {
     s.catalog
 }
 
+/// The canonical INTERACTIVE-session role catalog, as `skills.*` events to seed a fresh workspace's
+/// log at boot (`hq-role-mcp`). Unlike [`agent_least_privilege_catalog`] (the daemon's in-memory
+/// polecat policy), this is event-sourced and operator-overridable via the Knowledge REST surface —
+/// it just guarantees a clean deploy on a new machine gives each role a WORKING least-privilege MCP
+/// grant out of the box, instead of an empty token. The per-role token minter (`terminal.rs`) folds
+/// a role's enabled skills' `default_scopes` into the session's `.gt-config`, which `gt mcp` reads.
+///
+/// Seeded ONLY when the workspace catalog is empty, so it never clobbers a human-curated catalog.
+/// Pure scope-carrier skills (no `SKILL.md` body); a role's grant is the union of its skills' scopes:
+/// - `tracker-ops` → `workspace.member` + `graph.read` — full operate (file + dispatch + graph).
+/// - `merge-ops`   → `merge.read` + `merge.write`.
+/// - `bead-work`   → `issues.read` + `issues.write`.
+/// - `observe`     → `issues.read`.
+///
+/// Bindings: mayor/sheriff/overseer operate; refinery merges; polecat/dog code beads; witness/deacon
+/// observe. `workspace.member` expands to the operational namespace on MCP (`Scope::from_workspace_
+/// claim`) but never to `workspace.create`, so no seeded role is an admin.
+pub fn workspace_seed_events(now: u64) -> Vec<SkillEvent> {
+    const SKILLS: &[(&str, &[&str])] = &[
+        ("tracker-ops", &["workspace.member", "graph.read"]),
+        ("merge-ops", &["merge.read", "merge.write"]),
+        ("bead-work", &["issues.read", "issues.write"]),
+        ("observe", &["issues.read"]),
+    ];
+    const BINDINGS: &[(&str, &str)] = &[
+        ("mayor", "tracker-ops"),
+        ("sheriff", "tracker-ops"),
+        ("overseer", "tracker-ops"),
+        ("refinery", "merge-ops"),
+        ("polecat", "bead-work"),
+        ("dog", "bead-work"),
+        ("witness", "observe"),
+        ("deacon", "observe"),
+    ];
+    let mut events = Vec::with_capacity(SKILLS.len() + BINDINGS.len());
+    for (id, scopes) in SKILLS {
+        events.push(SkillEvent::Registered {
+            skill: (*id).to_string(),
+            label: (*id).to_string(),
+            description: String::new(),
+            default_scopes: scopes.iter().map(|x| (*x).to_string()).collect(),
+            body: String::new(),
+            now_secs: now,
+        });
+    }
+    for (role, skill) in BINDINGS {
+        events.push(SkillEvent::EnabledForRole {
+            role: (*role).to_string(),
+            skill: (*skill).to_string(),
+            now_secs: now,
+        });
+    }
+    events
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -89,5 +144,36 @@ mod tests {
         let c = agent_least_privilege_catalog();
         assert!(scopes(&c, "overseer").is_empty());
         assert!(scopes(&c, "nobody").is_empty());
+    }
+
+    #[test]
+    fn workspace_seed_grants_each_role_a_working_least_privilege_set() {
+        // Replaying the seed events yields a catalog where every role resolves to a non-empty,
+        // non-wildcard scope set — a fresh deploy operates out of the box (hq-role-mcp).
+        let mut s = SkillState::default();
+        for ev in workspace_seed_events(0) {
+            s.apply(&ev);
+        }
+        let c = s.catalog;
+        // mayor/sheriff/overseer operate via the member grant; never the wildcard.
+        for role in ["mayor", "sheriff", "overseer"] {
+            assert_eq!(
+                scopes(&c, role),
+                vec!["workspace.member", "graph.read"],
+                "{role}"
+            );
+        }
+        assert_eq!(scopes(&c, "refinery"), vec!["merge.read", "merge.write"]);
+        assert_eq!(scopes(&c, "polecat"), vec!["issues.read", "issues.write"]);
+        assert_eq!(scopes(&c, "dog"), vec!["issues.read", "issues.write"]);
+        assert_eq!(scopes(&c, "witness"), vec!["issues.read"]);
+        assert_eq!(scopes(&c, "deacon"), vec!["issues.read"]);
+        for role in [
+            "mayor", "sheriff", "overseer", "refinery", "polecat", "dog", "witness", "deacon",
+        ] {
+            let sc = scopes(&c, role);
+            assert!(!sc.is_empty(), "{role} must have a grant");
+            assert!(!sc.iter().any(|s| s == "*"), "{role} must not carry '*'");
+        }
     }
 }

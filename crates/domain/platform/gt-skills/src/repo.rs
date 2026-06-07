@@ -138,7 +138,13 @@ mod tests {
     #[tokio::test]
     async fn in_memory_roundtrips_skills() {
         let repo = InMemorySkills::default();
-        let s = Skill::new("alpha", "Alpha", "first skill", vec!["alpha.read".into()], 1);
+        let s = Skill::new(
+            "alpha",
+            "Alpha",
+            "first skill",
+            vec!["alpha.read".into()],
+            1,
+        );
         repo.upsert_skill(&s).await.unwrap();
         assert_eq!(repo.get_skill("alpha").await.unwrap(), Some(s.clone()));
         assert_eq!(repo.list_skills().await.unwrap(), vec![s]);

@@ -92,7 +92,10 @@ impl SkillsApiState {
     /// Build the REST state over a per-workspace catalog provider. Read-only until a writer is
     /// wired with [`with_writer`](Self::with_writer).
     pub fn new(skills: Arc<dyn WorkspaceSkills>) -> Self {
-        Self { skills, writer: None }
+        Self {
+            skills,
+            writer: None,
+        }
     }
 
     /// Enable the write surface (`hq-agent-observability.7`): POST `/` registers a skill and
@@ -118,7 +121,10 @@ impl SkillsApiState {
 pub fn skills_router(state: SkillsApiState) -> Router {
     Router::new()
         .route("/", get(list_skills).post(register_skill))
-        .route("/:id", get(get_skill).put(update_skill).delete(retire_skill))
+        .route(
+            "/:id",
+            get(get_skill).put(update_skill).delete(retire_skill),
+        )
         // Role bindings (hq-role-skills-term.2): enable/disable a skill for a role, which is what
         // makes "a role = its skills" configurable. POST/DELETE ⇒ skills.write.
         .route(
@@ -137,7 +143,10 @@ pub fn skills_router(state: SkillsApiState) -> Router {
 /// Server-stamped wall-clock seconds for the `now_secs` a [`SkillEvent`] carries — never taken from
 /// the request, so a client can't backdate a catalog mutation.
 fn now_secs() -> u64 {
-    SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
 }
 
 /// `POST /` body — the skill to register (`hq-agent-observability.7`). `now_secs` is stamped by the
@@ -214,9 +223,14 @@ async fn retire_skill(
     let ws = ctx.workspace();
     let mut catalog = st.skills.catalog(ws.as_str()).await?;
     if catalog.get(&id).is_none() {
-        return Err(ApiError::NotFound(format!("no skill registered under id `{id}`")));
+        return Err(ApiError::NotFound(format!(
+            "no skill registered under id `{id}`"
+        )));
     }
-    let cmd = RetireSkill { skill: id, now_secs: now_secs() };
+    let cmd = RetireSkill {
+        skill: id,
+        now_secs: now_secs(),
+    };
     let event = cmd.execute(&mut catalog).map_err(ApiError::from)?;
     writer.append(ws.as_str(), event).await?;
     Ok((StatusCode::OK, Json(json!({ "retired": cmd.skill }))).into_response())
@@ -291,10 +305,18 @@ async fn enable_skill_for_role(
     let writer = st.writer.as_ref().ok_or(ApiError::NotImplemented)?;
     let ws = ctx.workspace();
     let mut catalog = st.skills.catalog(ws.as_str()).await?;
-    let cmd = EnableSkillForRole { role, skill: id, now_secs: now_secs() };
+    let cmd = EnableSkillForRole {
+        role,
+        skill: id,
+        now_secs: now_secs(),
+    };
     let event = cmd.execute(&mut catalog).map_err(ApiError::from)?;
     writer.append(ws.as_str(), event).await?;
-    Ok((StatusCode::CREATED, Json(json!({ "role": cmd.role, "skill": cmd.skill }))).into_response())
+    Ok((
+        StatusCode::CREATED,
+        Json(json!({ "role": cmd.role, "skill": cmd.skill })),
+    )
+        .into_response())
 }
 
 /// `DELETE /{id}/roles/{role}` — disable skill `id` for `role` (`skills.write`,
@@ -320,10 +342,18 @@ async fn disable_skill_for_role(
     let writer = st.writer.as_ref().ok_or(ApiError::NotImplemented)?;
     let ws = ctx.workspace();
     let mut catalog = st.skills.catalog(ws.as_str()).await?;
-    let cmd = DisableSkillForRole { role, skill: id, now_secs: now_secs() };
+    let cmd = DisableSkillForRole {
+        role,
+        skill: id,
+        now_secs: now_secs(),
+    };
     let event = cmd.execute(&mut catalog).map_err(ApiError::from)?;
     writer.append(ws.as_str(), event).await?;
-    Ok((StatusCode::OK, Json(json!({ "role": cmd.role, "skill": cmd.skill }))).into_response())
+    Ok((
+        StatusCode::OK,
+        Json(json!({ "role": cmd.role, "skill": cmd.skill })),
+    )
+        .into_response())
 }
 
 /// `PUT /roles/{role}/prompt` body — the role's system prompt (`hq-role-skills-term.4`). An empty
@@ -355,7 +385,11 @@ async fn set_role_prompt(
     let writer = st.writer.as_ref().ok_or(ApiError::NotImplemented)?;
     let ws = ctx.workspace();
     let mut catalog = st.skills.catalog(ws.as_str()).await?;
-    let cmd = SetRolePrompt { role, prompt: body.prompt, now_secs: now_secs() };
+    let cmd = SetRolePrompt {
+        role,
+        prompt: body.prompt,
+        now_secs: now_secs(),
+    };
     let event = cmd.execute(&mut catalog).map_err(ApiError::from)?;
     writer.append(ws.as_str(), event).await?;
     Ok((StatusCode::OK, Json(json!({ "role": cmd.role }))).into_response())
@@ -538,7 +572,11 @@ mod tests {
                 body: String::new(),
                 now_secs: 2,
             },
-            SkillEvent::EnabledForRole { role: "deacon".into(), skill: "merge_admin".into(), now_secs: 3 },
+            SkillEvent::EnabledForRole {
+                role: "deacon".into(),
+                skill: "merge_admin".into(),
+                now_secs: 3,
+            },
         ] {
             s.apply(&e);
         }
@@ -588,7 +626,9 @@ mod tests {
             StatusCode::NOT_FOUND
         );
         assert_eq!(
-            ApiError::Catalog(AppError::Other("boom".into())).into_response().status(),
+            ApiError::Catalog(AppError::Other("boom".into()))
+                .into_response()
+                .status(),
             StatusCode::INTERNAL_SERVER_ERROR
         );
         // A command's validation rejection (hq-agent-observability.7) is the client's fault (422),
@@ -620,7 +660,10 @@ mod tests {
         };
         let err = cmd.execute(&mut cat).unwrap_err();
         assert!(matches!(err, AppError::Validation(_)));
-        assert_eq!(ApiError::from(err).into_response().status(), StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(
+            ApiError::from(err).into_response().status(),
+            StatusCode::UNPROCESSABLE_ENTITY
+        );
     }
 
     #[test]
@@ -636,9 +679,15 @@ mod tests {
         };
         let ev = reg.execute(&mut cat).unwrap();
         assert!(matches!(ev, SkillEvent::Registered { .. }));
-        assert!(cat.get("graphify").is_some(), "registered skill is in the catalog");
+        assert!(
+            cat.get("graphify").is_some(),
+            "registered skill is in the catalog"
+        );
 
-        let ret = RetireSkill { skill: "graphify".into(), now_secs: 11 };
+        let ret = RetireSkill {
+            skill: "graphify".into(),
+            now_secs: 11,
+        };
         let ev = ret.execute(&mut cat).unwrap();
         assert!(matches!(ev, SkillEvent::Retired { .. }));
         assert!(cat.get("graphify").is_none(), "retired skill is gone");
@@ -649,18 +698,33 @@ mod tests {
         // hq-role-skills-term.2: what the POST/DELETE /{id}/roles/{role} handlers run — bind a
         // skill to a role (so it's part of that role's skill set) and unbind it.
         let mut cat = seeded(); // has merge_admin + feed_viewer
-        let en = EnableSkillForRole { role: "witness".into(), skill: "feed_viewer".into(), now_secs: 1 };
+        let en = EnableSkillForRole {
+            role: "witness".into(),
+            skill: "feed_viewer".into(),
+            now_secs: 1,
+        };
         let ev = en.execute(&mut cat).unwrap();
         assert!(matches!(ev, SkillEvent::EnabledForRole { .. }));
-        assert_eq!(cat.skills_for_role("witness"), vec!["feed_viewer".to_string()]);
+        assert_eq!(
+            cat.skills_for_role("witness"),
+            vec!["feed_viewer".to_string()]
+        );
 
-        let dis = DisableSkillForRole { role: "witness".into(), skill: "feed_viewer".into(), now_secs: 2 };
+        let dis = DisableSkillForRole {
+            role: "witness".into(),
+            skill: "feed_viewer".into(),
+            now_secs: 2,
+        };
         let ev = dis.execute(&mut cat).unwrap();
         assert!(matches!(ev, SkillEvent::DisabledForRole { .. }));
         assert!(cat.skills_for_role("witness").is_empty());
 
         // Enabling an unknown skill is a client error (handler maps to 422).
-        let bad = EnableSkillForRole { role: "witness".into(), skill: "ghost".into(), now_secs: 3 };
+        let bad = EnableSkillForRole {
+            role: "witness".into(),
+            skill: "ghost".into(),
+            now_secs: 3,
+        };
         assert!(bad.execute(&mut cat).is_err());
     }
 }

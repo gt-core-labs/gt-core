@@ -42,7 +42,9 @@ impl RegisterSkill {
         }
         for s in &self.default_scopes {
             if s.trim().is_empty() {
-                return Err(AppError::Validation("default_scopes contains an empty entry".into()));
+                return Err(AppError::Validation(
+                    "default_scopes contains an empty entry".into(),
+                ));
             }
         }
         Ok(())
@@ -350,7 +352,8 @@ impl Command for SetRoleModel {
                 "model id has surrounding or embedded whitespace".into(),
             ));
         }
-        if !self.permission_mode.is_empty() && !PERMISSION_MODES.contains(&self.permission_mode.as_str())
+        if !self.permission_mode.is_empty()
+            && !PERMISSION_MODES.contains(&self.permission_mode.as_str())
         {
             return Err(AppError::Validation(format!(
                 "permission_mode {:?} is not one of {PERMISSION_MODES:?}",
@@ -440,10 +443,16 @@ mod tests {
         // hq-skills-edit.1: editing a skill upserts its body/description but never drops the role
         // bindings (kept in a separate map).
         let mut state = SkillCatalog::default();
-        register("pr-list", &["pr.read"], 1).execute(&mut state).unwrap();
-        EnableSkillForRole { role: "witness".into(), skill: "pr-list".into(), now_secs: 2 }
+        register("pr-list", &["pr.read"], 1)
             .execute(&mut state)
             .unwrap();
+        EnableSkillForRole {
+            role: "witness".into(),
+            skill: "pr-list".into(),
+            now_secs: 2,
+        }
+        .execute(&mut state)
+        .unwrap();
 
         let upd = UpdateSkill {
             skill: "pr-list".into(),
@@ -455,12 +464,24 @@ mod tests {
         let ev = upd.execute(&mut state).unwrap();
         assert!(matches!(ev, SkillEvent::Registered { .. }));
         assert_eq!(state.get("pr-list").unwrap().description, "List open PRs");
-        assert_eq!(state.get("pr-list").unwrap().body, "# pr-list\nrun gh pr list");
+        assert_eq!(
+            state.get("pr-list").unwrap().body,
+            "# pr-list\nrun gh pr list"
+        );
         // Binding survives the edit.
-        assert_eq!(state.skills_for_role("witness"), vec!["pr-list".to_string()]);
+        assert_eq!(
+            state.skills_for_role("witness"),
+            vec!["pr-list".to_string()]
+        );
 
         // Updating a non-existent skill is a client error.
-        let bad = UpdateSkill { skill: "ghost".into(), label: None, description: None, body: None, now_secs: 4 };
+        let bad = UpdateSkill {
+            skill: "ghost".into(),
+            label: None,
+            description: None,
+            body: None,
+            now_secs: 4,
+        };
         assert!(bad.execute(&mut state).is_err());
     }
 
@@ -478,8 +499,13 @@ mod tests {
             now_secs: 1,
         };
         let ev = cmd.execute(&mut state).unwrap();
-        assert_eq!(state.get("graphify").unwrap().body, "# Graphify\nbuild a knowledge graph");
-        let SkillEvent::Registered { body, .. } = ev else { panic!("expected Registered") };
+        assert_eq!(
+            state.get("graphify").unwrap().body,
+            "# Graphify\nbuild a knowledge graph"
+        );
+        let SkillEvent::Registered { body, .. } = ev else {
+            panic!("expected Registered")
+        };
         assert_eq!(body, "# Graphify\nbuild a knowledge graph");
     }
 
@@ -513,9 +539,16 @@ mod tests {
         };
         let ev = set.execute(&mut state).unwrap();
         assert!(matches!(ev, SkillEvent::RolePromptSet { .. }));
-        assert_eq!(state.role_prompt("witness").as_deref(), Some("You are the witness. Audit PRs."));
+        assert_eq!(
+            state.role_prompt("witness").as_deref(),
+            Some("You are the witness. Audit PRs.")
+        );
         // Clear it.
-        let clear = SetRolePrompt { role: "witness".into(), prompt: String::new(), now_secs: 2 };
+        let clear = SetRolePrompt {
+            role: "witness".into(),
+            prompt: String::new(),
+            now_secs: 2,
+        };
         clear.execute(&mut state).unwrap();
         assert!(state.role_prompt("witness").is_none());
     }
@@ -619,7 +652,9 @@ mod tests {
     #[test]
     fn enable_then_disable_round_trip() {
         let mut state = SkillCatalog::default();
-        register("alpha", &["alpha.read"], 1).execute(&mut state).unwrap();
+        register("alpha", &["alpha.read"], 1)
+            .execute(&mut state)
+            .unwrap();
         EnableSkillForRole {
             role: "deacon".into(),
             skill: "alpha".into(),
@@ -662,7 +697,9 @@ mod tests {
     #[test]
     fn retire_cascades_to_bindings() {
         let mut state = SkillCatalog::default();
-        register("alpha", &["alpha.read"], 1).execute(&mut state).unwrap();
+        register("alpha", &["alpha.read"], 1)
+            .execute(&mut state)
+            .unwrap();
         EnableSkillForRole {
             role: "deacon".into(),
             skill: "alpha".into(),

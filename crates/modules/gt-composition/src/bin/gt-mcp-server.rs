@@ -647,6 +647,31 @@ async fn main() -> anyhow::Result<()> {
         // Knowledge skills tab can be populated. One backing serves both read + write.
         .module({
             let skills = Arc::new(EventLogSkills::new(event_log.clone()));
+            // Seed the canonical role catalog into the default workspace's `skills.*` log when it is
+            // empty (hq-role-mcp), so a clean deploy on a new machine gives each role a working
+            // least-privilege MCP grant out of the box — without it every minted per-role token is
+            // scopeless. Empty-check makes it idempotent and never clobbers an operator-curated
+            // catalog (the prod machine, already populated via the Knowledge REST surface, is a
+            // no-op). See `gt_skills::presets::workspace_seed_events`.
+            {
+                use gt_skills::{SkillWriter, WorkspaceSkills};
+                let ws = std::env::var("GT_WORKSPACE").unwrap_or_else(|_| "default".to_string());
+                if let Ok(cat) = skills.catalog(&ws).await {
+                    if cat.is_empty() {
+                        let now = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .map(|d| d.as_secs())
+                            .unwrap_or(0);
+                        let mut seeded = 0usize;
+                        for ev in gt_skills::presets::workspace_seed_events(now) {
+                            if skills.append(&ws, ev).await.is_ok() {
+                                seeded += 1;
+                            }
+                        }
+                        eprintln!("[gt-mcp-server] skills: seeded {seeded} role-catalog event(s) into empty `{ws}` catalog");
+                    }
+                }
+            }
             SkillsModule::with_http(SkillsApiState::new(skills.clone()).with_writer(skills))
         })
         // feed.read (hq-web-extras.14): read-only activity feed, folded from the caller's whole

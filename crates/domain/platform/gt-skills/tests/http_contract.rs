@@ -38,7 +38,9 @@ struct MemProvider {
 
 impl MemProvider {
     fn new() -> Self {
-        Self { by_ws: HashMap::new() }
+        Self {
+            by_ws: HashMap::new(),
+        }
     }
 
     /// Seed `workspace` with a catalog rebuilt from `events`.
@@ -98,7 +100,12 @@ impl WorkspaceSkills for MemStore {
 #[async_trait]
 impl SkillWriter for MemStore {
     async fn append(&self, workspace: &str, event: SkillEvent) -> Result<(), AppError> {
-        self.by_ws.lock().unwrap().entry(workspace.to_string()).or_default().push(event);
+        self.by_ws
+            .lock()
+            .unwrap()
+            .entry(workspace.to_string())
+            .or_default()
+            .push(event);
         Ok(())
     }
 }
@@ -142,7 +149,11 @@ async fn set_role_model_round_trips_into_the_bindings() {
     // A bad permission mode is a client error (422), no mutation.
     let (status, _) = send(
         &app,
-        put_json("acme", "/roles/polecat/model", serde_json::json!({ "permission_mode": "yolo" })),
+        put_json(
+            "acme",
+            "/roles/polecat/model",
+            serde_json::json!({ "permission_mode": "yolo" }),
+        ),
     )
     .await;
     assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
@@ -151,7 +162,9 @@ async fn set_role_model_round_trips_into_the_bindings() {
 async fn send(app: &axum::Router, req: Request<Body>) -> (StatusCode, Value) {
     let resp = app.clone().oneshot(req).await.expect("router responds");
     let status = resp.status();
-    let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.expect("body");
+    let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .expect("body");
     let value = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
     (status, value)
 }
@@ -171,13 +184,22 @@ async fn list_surfaces_every_registered_skill() {
         &[
             skill("merge_admin", &["merge.read", "merge.write"]),
             skill("feed_viewer", &["feed.read"]),
-            SkillEvent::EnabledForRole { role: "deacon".into(), skill: "merge_admin".into(), now_secs: 2 },
+            SkillEvent::EnabledForRole {
+                role: "deacon".into(),
+                skill: "merge_admin".into(),
+                now_secs: 2,
+            },
         ],
     ));
     let (status, body) = send(&app, get_in("acme", "/")).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body["count"], 2);
-    let ids: Vec<&str> = body["skills"].as_array().unwrap().iter().map(|s| s["id"].as_str().unwrap()).collect();
+    let ids: Vec<&str> = body["skills"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|s| s["id"].as_str().unwrap())
+        .collect();
     assert_eq!(ids, vec!["feed_viewer", "merge_admin"], "sorted");
     // The per-role bindings ride along for dashboard hydration.
     assert_eq!(body["bindings"][0]["role"], "deacon");
@@ -189,7 +211,11 @@ async fn get_resolves_a_skill_and_its_enabled_roles() {
         "acme",
         &[
             skill("merge_admin", &["merge.read", "merge.write"]),
-            SkillEvent::EnabledForRole { role: "deacon".into(), skill: "merge_admin".into(), now_secs: 2 },
+            SkillEvent::EnabledForRole {
+                role: "deacon".into(),
+                skill: "merge_admin".into(),
+                now_secs: 2,
+            },
         ],
     ));
     let (status, body) = send(&app, get_in("acme", "/merge_admin")).await;
@@ -217,5 +243,9 @@ async fn catalog_is_per_tenant() {
     assert_eq!(status, StatusCode::OK);
     assert_eq!(other["count"], 0);
     let (s2, _) = send(&app, get_in("other", "/merge_admin")).await;
-    assert_eq!(s2, StatusCode::NOT_FOUND, "acme's skill is invisible to other");
+    assert_eq!(
+        s2,
+        StatusCode::NOT_FOUND,
+        "acme's skill is invisible to other"
+    );
 }

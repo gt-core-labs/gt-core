@@ -33,16 +33,16 @@ pub mod module;
 mod state;
 
 pub use actor::{spawn, spawn_hydrated, SkillHandle, SkillMsg};
-#[cfg(feature = "axum")]
-pub use http::{skills_router, SkillsApiState, SkillWriter, WorkspaceSkills};
-#[cfg(feature = "axum")]
-pub use module::SkillsHttpModule;
-pub use module::SkillsModule;
 pub use commands::{
     DisableSkillForRole, EnableSkillForRole, RegisterSkill, RetireSkill, SetRoleModel,
     SetRolePrompt, SkillCommand, UpdateSkill, EFFORT_LEVELS, PERMISSION_MODES,
 };
 pub use events::SkillEvent;
+#[cfg(feature = "axum")]
+pub use http::{skills_router, SkillWriter, SkillsApiState, WorkspaceSkills};
+#[cfg(feature = "axum")]
+pub use module::SkillsHttpModule;
+pub use module::SkillsModule;
 pub use presets::agent_least_privilege_catalog;
 pub use repo::{InMemorySkills, SkillsRepository};
 pub use state::{

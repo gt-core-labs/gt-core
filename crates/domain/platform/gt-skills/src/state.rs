@@ -343,9 +343,7 @@ pub fn validate_skill_id(id: &str) -> Result<(), String> {
         return Err("skill id is empty".into());
     }
     if id.len() > MAX_SKILL_ID_LEN {
-        return Err(format!(
-            "skill id is longer than {MAX_SKILL_ID_LEN} bytes"
-        ));
+        return Err(format!("skill id is longer than {MAX_SKILL_ID_LEN} bytes"));
     }
     if id.trim() != id {
         return Err("skill id has leading or trailing whitespace".into());
@@ -530,10 +528,7 @@ mod tests {
             ]
         );
         // Unknown role → empty contribution.
-        assert!(s
-            .catalog
-            .scopes_for_roles(&["ghost".into()])
-            .is_empty());
+        assert!(s.catalog.scopes_for_roles(&["ghost".into()]).is_empty());
     }
 
     #[test]

@@ -176,7 +176,10 @@ mod tests {
     fn registers_no_mcp_tools_rest_surface_not_mcp() {
         let mut reg = gt_module::McpRegistry::new();
         SkillsModule.register_mcp_tools(&mut reg);
-        assert!(reg.tools().iter().next().is_none(), "the skills surface is REST, not MCP");
+        assert!(
+            reg.tools().iter().next().is_none(),
+            "the skills surface is REST, not MCP"
+        );
     }
 
     #[test]
@@ -214,9 +217,20 @@ mod tests {
                 body: String::new(),
                 now_secs: 0,
             },
-            SkillEvent::Retired { skill: "s".into(), now_secs: 0 },
-            SkillEvent::EnabledForRole { role: "r".into(), skill: "s".into(), now_secs: 0 },
-            SkillEvent::DisabledForRole { role: "r".into(), skill: "s".into(), now_secs: 0 },
+            SkillEvent::Retired {
+                skill: "s".into(),
+                now_secs: 0,
+            },
+            SkillEvent::EnabledForRole {
+                role: "r".into(),
+                skill: "s".into(),
+                now_secs: 0,
+            },
+            SkillEvent::DisabledForRole {
+                role: "r".into(),
+                skill: "s".into(),
+                now_secs: 0,
+            },
         ] {
             let emitted = ev.kind();
             assert!(
