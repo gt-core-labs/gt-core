@@ -33,6 +33,7 @@
 //! pattern itself (functions #1–#5, #9) is complete: [`live_root`] resolves a workspace through
 //! `RootRegistry::get_or_hydrate_async`, owns its actors via `Supervisor::anchor`, and drains
 //! their events onto the hub via `RootHandle::drain_events_from`.
+//! [`git_merge::GitMergePlugin`] (edge git-merge) and [`witness_sweep::WitnessSweep`] (witness safety-net) are the wired edge effects that close the autonomous loop.
 
 pub mod account_dirs;
 pub mod auth;
