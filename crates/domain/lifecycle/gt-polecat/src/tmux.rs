@@ -243,7 +243,12 @@ impl Tmux for TmuxCli {
         // Creation is NOT retried — a re-run could leave a half-built or duplicate session.
         self.run_checked(&argv_ref)?;
 
-        // Replace the placeholder shell with the real command in the same workdir.
+        // Replace the placeholder shell with the real command in the same workdir. The per-session
+        // `-e` vars set on `new-session` apply to the placeholder shell's environment, but
+        // `respawn-pane -k` starts a BRAND-NEW process that does NOT inherit them (only the server's
+        // inherited env survives) — so the polecat lost GT_HOOK_BEAD / GT_HEARTBEAT_FILE / GT_ROLE /
+        // GT_BRANCH and its hooks no-op'd on the empty guards. Pass the same `-e` to respawn-pane so
+        // the real command gets them (tmux >= 3.2). (hq-orchd-deploy.17)
         let mut respawn: Vec<String> = vec![
             "respawn-pane".into(),
             "-k".into(),
@@ -251,8 +256,12 @@ impl Tmux for TmuxCli {
             session.into(),
             "-c".into(),
             workdir,
-            command.into(),
         ];
+        for (k, v) in &pairs {
+            respawn.push("-e".into());
+            respawn.push(format!("{k}={v}"));
+        }
+        respawn.push(command.into());
         respawn.extend(args.iter().cloned());
         let respawn_ref: Vec<&str> = respawn.iter().map(String::as_str).collect();
         if let Err(e) = self.run_checked(&respawn_ref) {
