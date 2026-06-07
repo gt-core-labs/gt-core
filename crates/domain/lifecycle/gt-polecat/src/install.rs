@@ -26,9 +26,11 @@ use serde_json::json;
 pub const MANAGED_MARKER: &str = "_gt_managed";
 const MANAGED_VALUE: &str = "polecat-hooks";
 
-/// Best-effort heartbeat touch (a missing env var is a silent no-op, never a hook failure).
-const HEARTBEAT_CMD: &str =
-    r#"[ -n "$GT_HEARTBEAT_FILE" ] && touch "$GT_HEARTBEAT_FILE" 2>/dev/null || true"#;
+/// Best-effort heartbeat touch (a missing env var is a silent no-op, never a hook failure). Creates
+/// the heartbeat directory first: `touch` does not create parent dirs, so without this the hook
+/// silently failed when the dir was absent → no heartbeat → the supervisor re-slings forever
+/// (hq-orchd-deploy.19).
+const HEARTBEAT_CMD: &str = r#"[ -n "$GT_HEARTBEAT_FILE" ] && { mkdir -p "$(dirname "$GT_HEARTBEAT_FILE")" 2>/dev/null; touch "$GT_HEARTBEAT_FILE" 2>/dev/null; } || true"#;
 
 /// Drop a `{bead,branch}` merge-ready message as an atomic `*.event` file in the channel dir,
 /// matching the gt-channel `Channel::emit` convention (`.<id>.tmp` written then renamed to
