@@ -24,6 +24,7 @@
 //! same way the REST chain and SSE feed audit theirs.
 
 use std::io::{Read, Write};
+use std::path::{Path, PathBuf};
 
 use axum::{
     extract::{
@@ -42,9 +43,11 @@ use tokio::sync::mpsc;
 
 use std::sync::Arc;
 
+use gt_agent::SessionRegistry;
 use gt_auth::JwtClaims;
 use gt_polecat::tmux_server_name;
 use gt_quota::QuotaState;
+use gt_skills::SkillState;
 
 use crate::auth::SharedAuthenticator;
 use crate::denial_audit::{record_denial, SharedAudit, ANONYMOUS};
@@ -111,19 +114,78 @@ fn active_claude_config_dir(log: &EventLog, workspace: &str) -> Option<String> {
     state.registered.get(&active).cloned().filter(|d| !d.is_empty())
 }
 
+/// Materialise the session's ROLE skills into a per-session workdir and return it, so the launched
+/// claude loads them from `<workdir>/.claude/skills/` (`hq-role-skills-term.3`). "A role = its
+/// skills": resolve the session's role from the agent log → the role's enabled skills + their
+/// `SKILL.md` bodies from the skills catalog → write each `<workdir>/.claude/skills/<id>/SKILL.md` →
+/// seed claude trust for the workdir (via the account `config_dir`) so it opens without the
+/// trust-folder prompt. `None` when the session has no role, the role enables no skills (with a
+/// body), or every write fails — the caller then launches claude in the default dir.
+fn prepare_role_skills(
+    log: &EventLog,
+    term_root: &Path,
+    workspace: &str,
+    session: &str,
+    config_dir: &str,
+) -> Option<PathBuf> {
+    let role = log
+        .replay_domain(
+            Some(workspace),
+            "agent.",
+            SessionRegistry::default(),
+            SessionRegistry::apply,
+        )
+        .ok()?
+        .get(session)?
+        .role
+        .as_str()
+        .to_string();
+    let catalog = log
+        .replay_domain(Some(workspace), "skills.", SkillState::default(), SkillState::apply)
+        .ok()?
+        .catalog;
+    let skill_ids = catalog.skills_for_role(&role);
+    if skill_ids.is_empty() {
+        return None;
+    }
+    let workdir = term_root.join(session);
+    let skills_dir = workdir.join(".claude").join("skills");
+    let mut wrote = 0usize;
+    for id in &skill_ids {
+        let Some(skill) = catalog.get(id) else { continue };
+        if skill.body.trim().is_empty() {
+            continue; // a binding with no SKILL.md body has nothing to materialise
+        }
+        let dir = skills_dir.join(id);
+        if std::fs::create_dir_all(&dir).is_ok()
+            && std::fs::write(dir.join("SKILL.md"), &skill.body).is_ok()
+        {
+            wrote += 1;
+        }
+    }
+    if wrote == 0 {
+        return None;
+    }
+    // Trust the workdir so claude opens without the interactive trust-folder prompt.
+    crate::worktree::seed_claude_onboarding(Path::new(config_dir), &workdir);
+    Some(workdir)
+}
+
 /// What the upgraded socket bridges its pty to.
 enum TerminalTarget {
     /// A fresh login shell (no `session` param).
     Shell,
     /// Attach to a running tmux `session` on the workspace's tmux server, read-only unless `write`.
     /// `claude_config_dir` (`hq-term-dock.4`): when `write` and `Some`, the interactive session
-    /// launches `claude` with that account profile's `CLAUDE_CONFIG_DIR` instead of a bare shell, so
-    /// opening a session's terminal drops you into an authenticated claude.
+    /// launches `claude` with that account profile's `CLAUDE_CONFIG_DIR` instead of a bare shell.
+    /// `workdir` (`hq-role-skills-term.3`): when `Some`, claude is launched there (`tmux -c`) so it
+    /// loads the role's materialised `.claude/skills/`.
     Attach {
         workspace: String,
         session: String,
         write: bool,
         claude_config_dir: Option<String>,
+        workdir: Option<String>,
     },
 }
 
@@ -206,11 +268,24 @@ async fn ws_upgrade(
                 } else {
                     None
                 };
+                // With an account resolved, materialise the session's ROLE skills into a workdir
+                // and launch claude there (hq-role-skills-term.3), so it loads the role's skills.
+                let workdir = match (write, &claude_config_dir, &state.accounts) {
+                    (true, Some(dir), Some(log)) => {
+                        let root = std::env::var("GT_EVENTLOG_ROOT")
+                            .unwrap_or_else(|_| "/var/lib/gt-core".to_string());
+                        let term_root = PathBuf::from(root).join("term");
+                        prepare_role_skills(log, &term_root, &claims.workspace, session, dir)
+                            .map(|p| p.display().to_string())
+                    }
+                    _ => None,
+                };
                 TerminalTarget::Attach {
                     workspace: claims.workspace.clone(),
                     session: session.to_string(),
                     write,
                     claude_config_dir,
+                    workdir,
                 }
             }
             None => {
@@ -283,7 +358,7 @@ fn build_command(target: &TerminalTarget) -> CommandBuilder {
             cmd.env("TERM", "xterm-256color");
             cmd
         }
-        TerminalTarget::Attach { workspace, session, write, claude_config_dir } => {
+        TerminalTarget::Attach { workspace, session, write, claude_config_dir, workdir } => {
             let mut cmd = CommandBuilder::new("tmux");
             cmd.arg("-L");
             cmd.arg(tmux_server_name(workspace));
@@ -295,6 +370,12 @@ fn build_command(target: &TerminalTarget) -> CommandBuilder {
                 cmd.arg("-A");
                 cmd.arg("-s");
                 cmd.arg(session);
+                // Start in the role's materialised workdir (hq-role-skills-term.3) so claude loads
+                // its `.claude/skills/`. Only set when role skills were materialised.
+                if let Some(wd) = workdir {
+                    cmd.arg("-c");
+                    cmd.arg(wd);
+                }
                 // With an active claude account resolved (hq-term-dock.4), launch `claude` under
                 // that account's CLAUDE_CONFIG_DIR (set on the new session via tmux `-e`) instead of
                 // a bare shell — so opening a session drops into an authenticated claude. The
@@ -515,6 +596,7 @@ mod tests {
             session: "hq-gg-1".into(),
             write: false,
             claude_config_dir: None,
+            workdir: None,
         });
         let argv: Vec<String> = ro.get_argv().iter().map(|s| s.to_string_lossy().into_owned()).collect();
         assert_eq!(
@@ -527,21 +609,25 @@ mod tests {
             session: "hq-gg-1".into(),
             write: true,
             claude_config_dir: None,
+            workdir: None,
         });
         let argv: Vec<String> = rw.get_argv().iter().map(|s| s.to_string_lossy().into_owned()).collect();
         assert_eq!(argv, vec!["tmux", "-L", "gt-acme", "new-session", "-A", "-s", "hq-gg-1"]);
-        // Write mode WITH an active account launches claude under that profile (hq-term-dock.4).
+        // Write mode WITH an active account + a role workdir: claude under that profile, started in
+        // the workdir so it loads the role's skills (hq-term-dock.4 + hq-role-skills-term.3).
         let cl = build_command(&TerminalTarget::Attach {
             workspace: "acme".into(),
             session: "hq-gg-1".into(),
             write: true,
             claude_config_dir: Some("/var/lib/gt-core/accounts/abc".into()),
+            workdir: Some("/var/lib/gt-core/term/hq-gg-1".into()),
         });
         let argv: Vec<String> = cl.get_argv().iter().map(|s| s.to_string_lossy().into_owned()).collect();
         assert_eq!(
             argv,
             vec![
                 "tmux", "-L", "gt-acme", "new-session", "-A", "-s", "hq-gg-1",
+                "-c", "/var/lib/gt-core/term/hq-gg-1",
                 "-e", "CLAUDE_CONFIG_DIR=/var/lib/gt-core/accounts/abc",
                 "-e", "IS_SANDBOX=1", "claude"
             ]
@@ -550,6 +636,72 @@ mod tests {
         let sh = build_command(&TerminalTarget::Shell);
         let argv: Vec<String> = sh.get_argv().iter().map(|s| s.to_string_lossy().into_owned()).collect();
         assert_eq!(argv, vec!["/bin/sh"]);
+    }
+
+    #[test]
+    fn prepare_role_skills_materialises_the_roles_skill_md() {
+        // hq-role-skills-term.3: the session's role → its enabled skills (with bodies) → written as
+        // <workdir>/.claude/skills/<id>/SKILL.md so claude loads them.
+        use gt_agent::AgentEvent;
+        use gt_skills::SkillEvent;
+        use tempfile::TempDir;
+
+        let dir = TempDir::new().unwrap();
+        let log = EventLog::new(Some(dir.path().to_path_buf()));
+        // A witness session.
+        log.append(
+            Some("acme"),
+            AgentEvent::Spawned {
+                session: "w1".into(),
+                rig: "hq".into(),
+                role: gt_agent::SessionRole::Dog(gt_agent::DogKind::Witness),
+                crew: None,
+                skills: vec![],
+                hooks: vec![],
+            },
+        )
+        .unwrap();
+        // A skill WITH a body, enabled for witness.
+        log.append(
+            Some("acme"),
+            SkillEvent::Registered {
+                skill: "pr-list".into(),
+                label: "PR list".into(),
+                description: "list PRs".into(),
+                default_scopes: vec![],
+                body: "# PR list\nlist open PRs".into(),
+                now_secs: 1,
+            },
+        )
+        .unwrap();
+        log.append(
+            Some("acme"),
+            SkillEvent::EnabledForRole { role: "witness".into(), skill: "pr-list".into(), now_secs: 2 },
+        )
+        .unwrap();
+
+        let term_root = dir.path().join("term");
+        let cfg = dir.path().join("cfg"); // a throwaway CLAUDE_CONFIG_DIR for trust seeding
+        std::fs::create_dir_all(&cfg).unwrap();
+        let wd = prepare_role_skills(&log, &term_root, "acme", "w1", cfg.to_str().unwrap())
+            .expect("witness has an enabled skill with a body");
+        let skill_md = wd.join(".claude").join("skills").join("pr-list").join("SKILL.md");
+        assert_eq!(std::fs::read_to_string(&skill_md).unwrap(), "# PR list\nlist open PRs");
+
+        // A role with no enabled skills ⇒ None (claude launches in the default dir).
+        log.append(
+            Some("acme"),
+            AgentEvent::Spawned {
+                session: "m1".into(),
+                rig: "hq".into(),
+                role: gt_agent::SessionRole::Mayor,
+                crew: None,
+                skills: vec![],
+                hooks: vec![],
+            },
+        )
+        .unwrap();
+        assert!(prepare_role_skills(&log, &term_root, "acme", "m1", cfg.to_str().unwrap()).is_none());
     }
 
     #[tokio::test]
