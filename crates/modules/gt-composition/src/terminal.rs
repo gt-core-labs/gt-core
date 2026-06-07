@@ -217,11 +217,22 @@ fn build_command(target: &TerminalTarget) -> CommandBuilder {
             let mut cmd = CommandBuilder::new("tmux");
             cmd.arg("-L");
             cmd.arg(tmux_server_name(workspace));
-            cmd.arg("attach-session");
-            cmd.arg("-t");
-            cmd.arg(session);
-            if !write {
-                cmd.arg("-r"); // read-only: watching never disturbs the agent
+            if *write {
+                // Interactive: attach-OR-CREATE (`hq-session-terminal.1`). A session merely
+                // *recorded* (a manual `agent.spawn`) has no tmux yet; `new-session -A` creates it
+                // (a fresh shell) on first open, or attaches if a live agent already holds it — so
+                // the operator can actually communicate with the session.
+                cmd.arg("new-session");
+                cmd.arg("-A");
+                cmd.arg("-s");
+                cmd.arg(session);
+            } else {
+                // Read-only: attach to an EXISTING session to watch a live agent without
+                // disturbing it (closes cleanly if the session does not exist).
+                cmd.arg("attach-session");
+                cmd.arg("-t");
+                cmd.arg(session);
+                cmd.arg("-r");
             }
             cmd.env("TERM", "xterm-256color");
             cmd
@@ -410,14 +421,14 @@ mod tests {
             argv,
             vec!["tmux", "-L", "gt-acme", "attach-session", "-t", "hq-gg-1", "-r"]
         );
-        // Write attach drops the `-r`.
+        // Write mode attaches-OR-CREATES (hq-session-terminal.1): new-session -A, no -r.
         let rw = build_command(&TerminalTarget::Attach {
             workspace: "acme".into(),
             session: "hq-gg-1".into(),
             write: true,
         });
         let argv: Vec<String> = rw.get_argv().iter().map(|s| s.to_string_lossy().into_owned()).collect();
-        assert_eq!(argv, vec!["tmux", "-L", "gt-acme", "attach-session", "-t", "hq-gg-1"]);
+        assert_eq!(argv, vec!["tmux", "-L", "gt-acme", "new-session", "-A", "-s", "hq-gg-1"]);
         // No session ⇒ the original fresh shell.
         let sh = build_command(&TerminalTarget::Shell);
         let argv: Vec<String> = sh.get_argv().iter().map(|s| s.to_string_lossy().into_owned()).collect();
