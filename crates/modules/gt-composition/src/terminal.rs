@@ -48,7 +48,7 @@ use gt_agent::SessionRegistry;
 use gt_auth::{JwtClaims, JwtMinter};
 use gt_claude_hooks::HooksState;
 use gt_polecat::tmux_server_name;
-use gt_quota::QuotaState;
+use gt_quota::{AccountQuotaStatus, QuotaState};
 use gt_skills::{ModelConfig, SkillState};
 
 use crate::auth::SharedAuthenticator;
@@ -101,13 +101,21 @@ fn is_truthy(v: Option<&str>) -> bool {
 /// log can't be read — the caller then falls back to a bare shell. This is the container-reachable
 /// source of the active account (the linux keychain's live pointer lives in the host keyring).
 /// Resolve the active claude account as `(account_id, config_dir)` for `workspace` by replaying the
-/// quota domain (`hq-term-dock.4`). Active = the most recent rotation target, else the first
-/// registered account (`BTreeMap` ⇒ deterministic). `None` when nothing is registered or the log
-/// can't be read — the caller then falls back to a bare shell. The account id lets the session's
-/// quota-feed hook label its token sample (`GT_HOOK_ACCOUNT`, `hq-quota-feed`): the daemon's
-/// predictor keys consumption by this id, the same id the rotation log records, so an interactive
-/// session's burn folds into the very account it is spending. This is the container-reachable source
-/// of the active account (the linux keychain's live pointer lives in the host keyring).
+/// quota domain (`hq-term-dock.4`). Active = the most recent rotation target (when still registered +
+/// HEALTHY), else the first registered account that is HEALTHY, else any registered account
+/// (`BTreeMap` ⇒ deterministic). `None` when nothing is registered or the log can't be read — the
+/// caller then falls back to a bare shell. The account id lets the session's quota-feed hook label
+/// its token sample (`GT_HOOK_ACCOUNT`, `hq-quota-feed`): the daemon's predictor keys consumption by
+/// this id, the same id the rotation log records, so an interactive session's burn folds into the
+/// very account it is spending. This is the container-reachable source of the active account (the
+/// linux keychain's live pointer lives in the host keyring).
+///
+/// Preferring HEALTHY over alphabetical (`hq-quota-healthy`) closes the gap where a fresh log with no
+/// rotation handed every new session the alphabetically-first account even after the predictor cooled
+/// it: a `Rotated` parks the source in `Cooldown`, `AccountLimited`/`Blocked` mark Limited/Blocked,
+/// and those statuses replay from the log here — so a cooled/limited account is skipped for a healthy
+/// one. The last-resort any-account branch keeps a session launchable even if every account is marked
+/// unhealthy (better a maybe-limited claude than a bare shell with no account).
 fn active_claude_account(log: &EventLog, workspace: &str) -> Option<(String, String)> {
     let state = log
         .replay_domain(
@@ -120,11 +128,22 @@ fn active_claude_account(log: &EventLog, workspace: &str) -> Option<(String, Str
     if state.registered.is_empty() {
         return None;
     }
+    // A registered account is healthy unless the log marked it Cooldown/Limited/Blocked. Every
+    // `AccountRegistered` also seeds an `accounts` entry (Healthy), so a missing entry ⇒ treat as
+    // healthy (defensive; should not happen).
+    let is_healthy = |account: &str| {
+        state
+            .accounts
+            .get(account)
+            .map(|a| a.status == AccountQuotaStatus::Healthy)
+            .unwrap_or(true)
+    };
     let active = state
         .rotations
         .last()
         .map(|(_, to)| to.clone())
-        .filter(|a| state.registered.contains_key(a))
+        .filter(|a| state.registered.contains_key(a) && is_healthy(a))
+        .or_else(|| state.registered.keys().find(|a| is_healthy(a)).cloned())
         .or_else(|| state.registered.keys().next().cloned())?;
     state
         .registered
@@ -456,9 +475,7 @@ fn build_settings(
     // the polecat's exact reporter — no merge-ready half, an interactive session never merges.
     if costs_report {
         if let Some(obj) = v.as_object_mut() {
-            let hooks_obj = obj
-                .entry("hooks")
-                .or_insert_with(|| serde_json::json!({}));
+            let hooks_obj = obj.entry("hooks").or_insert_with(|| serde_json::json!({}));
             if let Some(hobj) = hooks_obj.as_object_mut() {
                 let stop = hobj.entry("Stop").or_insert_with(|| serde_json::json!([]));
                 if let Some(arr) = stop.as_array_mut() {
@@ -1495,7 +1512,9 @@ mod tests {
         // No rotation yet → first registered (BTreeMap order: acct-a). The account id rides too.
         assert_eq!(dir_of(&log, "acme").as_deref(), Some("/dirs/a"));
         assert_eq!(
-            active_claude_account(&log, "acme").map(|(a, _)| a).as_deref(),
+            active_claude_account(&log, "acme")
+                .map(|(a, _)| a)
+                .as_deref(),
             Some("acct-a")
         );
         // After rotating to b → b is active.
@@ -1510,11 +1529,69 @@ mod tests {
         .unwrap();
         assert_eq!(dir_of(&log, "acme").as_deref(), Some("/dirs/b"));
         assert_eq!(
-            active_claude_account(&log, "acme").map(|(a, _)| a).as_deref(),
+            active_claude_account(&log, "acme")
+                .map(|(a, _)| a)
+                .as_deref(),
             Some("acct-b")
         );
         // A workspace with no accounts resolves to None (caller falls back to a shell).
         assert!(active_claude_account(&log, "empty").is_none());
+    }
+
+    #[tokio::test]
+    async fn active_claude_account_prefers_healthy_over_alphabetical() {
+        // hq-quota-healthy: with no rotation, skip a cooled/limited account for a healthy one rather
+        // than always handing out the alphabetically-first (which may be the exhausted one).
+        use gt_quota::QuotaEvent;
+        use tempfile::TempDir;
+        let dir = TempDir::new().unwrap();
+        let log = EventLog::new(Some(dir.path().to_path_buf()));
+        for (a, d) in [("acct-a", "/dirs/a"), ("acct-b", "/dirs/b")] {
+            log.append(
+                Some("acme"),
+                QuotaEvent::AccountRegistered {
+                    account: a.into(),
+                    config_dir: d.into(),
+                    now_secs: 0,
+                },
+            )
+            .unwrap();
+        }
+        // acct-a (alphabetical first) hits its limit → Limited. Selection must skip it for acct-b.
+        log.append(
+            Some("acme"),
+            QuotaEvent::AccountLimited {
+                account: "acct-a".into(),
+                now_secs: 1,
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            active_claude_account(&log, "acme")
+                .map(|(a, _)| a)
+                .as_deref(),
+            Some("acct-b"),
+            "the limited alphabetical-first account is skipped for the healthy one"
+        );
+
+        // A stale rotation TARGET that since went unhealthy is not trusted: rotate b→a (so the last
+        // target is acct-a), then limit acct-a too. With every account unhealthy, the last-resort
+        // branch still yields one (acct-a, BTreeMap-first) so the session launches rather than None.
+        log.append(
+            Some("acme"),
+            QuotaEvent::Rotated {
+                from_account: "acct-b".into(),
+                to_account: "acct-a".into(),
+                now_secs: 2,
+            },
+        )
+        .unwrap();
+        // acct-a is Limited (and is the rotation target); acct-b is Cooldown (rotated away from).
+        let picked = active_claude_account(&log, "acme").map(|(a, _)| a);
+        assert!(
+            picked.is_some(),
+            "a session still launches even when no account is healthy"
+        );
     }
 
     #[test]
