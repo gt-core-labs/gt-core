@@ -91,9 +91,12 @@ async fn list_hooks(State(st): State<HooksApiState>, headers: HeaderMap) -> Resp
     }
 }
 
-/// `POST /api/v1/hooks` body — the hook to register/replace. `now_secs` is server-stamped.
+/// `POST /api/v1/hooks` body — the hook to register/replace. `now_secs` is server-stamped. `id` is
+/// optional: omitted/empty ⇒ the server auto-generates one (the common "register a new hook" path);
+/// supplying an existing id upserts it (the edit path).
 #[derive(Debug, Deserialize)]
 struct RegisterHookBody {
+    #[serde(default)]
     id: String,
     event: String,
     #[serde(default)]
@@ -101,6 +104,23 @@ struct RegisterHookBody {
     command: String,
     #[serde(default)]
     target: HookTarget,
+}
+
+/// Auto-generate a readable, unique-enough hook id from the event + a wall-clock nanosecond nonce
+/// (`hq-hooks`: ids are server-generated, not user-typed). Shape `hook-<event-lc>-<8 hex>`, all
+/// lowercase ASCII alnum + `-`, so it passes `validate_hook_id`.
+fn generate_hook_id(event: &str) -> String {
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.subsec_nanos())
+        .unwrap_or(0);
+    let secs = now_secs();
+    let event_slug: String = event
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric())
+        .collect::<String>()
+        .to_ascii_lowercase();
+    format!("hook-{event_slug}-{:08x}", secs.wrapping_mul(1_000_000_000).wrapping_add(nanos as u64) as u32)
 }
 
 /// `POST /api/v1/hooks` — register (or replace) a hook (`hooks.write`). Validates the shape (id /
@@ -118,8 +138,14 @@ async fn register_hook(
         Ok(r) => r,
         Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     };
+    // Auto-generate the id when the client didn't supply one (the default "new hook" path).
+    let id = if body.id.trim().is_empty() {
+        generate_hook_id(&body.event)
+    } else {
+        body.id
+    };
     let cmd = RegisterHook {
-        id: body.id,
+        id,
         event: body.event,
         matcher: body.matcher,
         command: body.command,
@@ -239,6 +265,14 @@ mod tests {
         assert!(has_scope(&["hooks.read".into()], READ_SCOPE));
         assert!(!has_scope(&["hooks.read".into()], WRITE_SCOPE));
         assert!(!has_scope(&[], READ_SCOPE));
+    }
+
+    #[test]
+    fn generated_id_is_valid_and_event_tagged() {
+        let id = generate_hook_id("PreToolUse");
+        assert!(id.starts_with("hook-pretooluse-"));
+        // The generated id must satisfy the domain's validator (lowercase alnum + '-', bounded).
+        assert!(gt_claude_hooks::validate_hook_id(&id).is_ok(), "{id} should be a valid hook id");
     }
 
     #[test]
