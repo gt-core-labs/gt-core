@@ -155,12 +155,29 @@ fn render_prompt(prompt: &str, vars: &[(&str, String)]) -> String {
 }
 
 /// What a role contributes to its session's `claude` launch: a materialised `workdir` (when the role
-/// has skills/prompt to write, `hq-role-skills-term.3`) and a `model` config (`hq-role-model.1`). The
-/// two are independent — a role can carry a model config with no skills, or skills with no model.
+/// has skills/prompt to write, `hq-role-skills-term.3`), a `model` config (`hq-role-model.1`), and a
+/// `kickoff` directive (`hq-role-kickoff`) seeded as claude's first prompt so opening the session
+/// *fires the role's work* instead of dropping into an idle TUI. They are independent.
 #[derive(Default)]
 struct RoleLaunch {
     workdir: Option<PathBuf>,
     model: Option<ModelConfig>,
+    kickoff: Option<String>,
+}
+
+/// The directive seeded as a role session's first claude prompt (`hq-role-kickoff`). Mirrors
+/// `gt_polecat::polecat_prompt`: a bare `claude` opens an interactive TUI and idles, so passing this
+/// as the positional `[prompt]` makes the agent begin its duties autonomously. The role-specific
+/// instructions live in the materialised `CLAUDE.md` (the role's system prompt); this just activates
+/// them. Only seeded on session *creation* (tmux `new-session -A` ignores the command on attach), so
+/// reconnecting an operator never re-fires it.
+fn role_kickoff_prompt(role: &str, workspace: &str) -> String {
+    format!(
+        "You are the gt `{role}` in workspace `{workspace}`. Begin your duties now: follow your role \
+         instructions in CLAUDE.md and use the gt MCP tools (issues.*, agent.*, convoy.*, merge.*, \
+         graph.*) to do your work. Coordinate through shared state (the tracker, channels, the event \
+         log), never directly. Work autonomously and do not wait for confirmation."
+    )
 }
 
 fn prepare_role_skills(
@@ -185,13 +202,20 @@ fn prepare_role_skills(
     };
     let role = sess.role.as_str().to_string();
     let rig = sess.rig.clone();
+    // The kickoff fires the role's work on session open (hq-role-kickoff); known once the role is
+    // resolved, it rides every return below so claude never opens idle.
+    let kickoff = Some(role_kickoff_prompt(&role, workspace));
     let Ok(state) = log.replay_domain(
         Some(workspace),
         "skills.",
         SkillState::default(),
         SkillState::apply,
     ) else {
-        return RoleLaunch::default();
+        return RoleLaunch {
+            workdir: None,
+            model: None,
+            kickoff,
+        };
     };
     let catalog = state.catalog;
     let model = catalog.role_model(&role); // hq-role-model.1 — applies regardless of skills/prompt
@@ -212,6 +236,7 @@ fn prepare_role_skills(
         return RoleLaunch {
             workdir: None,
             model,
+            kickoff,
         };
     }
     let workdir = term_root.join(session);
@@ -295,6 +320,7 @@ fn prepare_role_skills(
         return RoleLaunch {
             workdir: None,
             model,
+            kickoff,
         };
     }
     // Trust the workdir so claude opens without the interactive trust-folder prompt.
@@ -302,6 +328,7 @@ fn prepare_role_skills(
     RoleLaunch {
         workdir: Some(workdir),
         model,
+        kickoff,
     }
 }
 
@@ -421,6 +448,11 @@ enum TerminalTarget {
         /// are stamped onto it (`--model`, `--permission-mode`, `--effort`). `None` ⇒ the bare
         /// `claude` with the account default.
         model: Option<ModelConfig>,
+        /// The role kickoff directive (`hq-role-kickoff`): when `write` launches `claude`, this is
+        /// passed as the positional `[prompt]` so the session begins the role's work on open instead
+        /// of idling. `None` ⇒ a bare interactive claude. Only applied on session creation (tmux
+        /// `new-session -A` ignores the command when attaching to a live session).
+        kickoff: Option<String>,
     },
 }
 
@@ -534,7 +566,7 @@ async fn ws_upgrade(
                 // With an account resolved, materialise the session's ROLE skills into a workdir and
                 // launch claude there (hq-role-skills-term.3) loading the role's skills, plus resolve
                 // the role's model config (hq-role-model.1) stamped onto the claude launch.
-                let (workdir, model) = match (write, &claude_config_dir, &state.accounts) {
+                let (workdir, model, kickoff) = match (write, &claude_config_dir, &state.accounts) {
                     (true, Some(dir), Some(log)) => {
                         let root = std::env::var("GT_EVENTLOG_ROOT")
                             .unwrap_or_else(|_| "/var/lib/gt-core".to_string());
@@ -551,9 +583,10 @@ async fn ws_upgrade(
                         (
                             launch.workdir.map(|p| p.display().to_string()),
                             launch.model,
+                            launch.kickoff,
                         )
                     }
-                    _ => (None, None),
+                    _ => (None, None, None),
                 };
                 TerminalTarget::Attach {
                     workspace: claims.workspace.clone(),
@@ -562,6 +595,7 @@ async fn ws_upgrade(
                     claude_config_dir,
                     workdir,
                     model,
+                    kickoff,
                 }
             }
             None => {
@@ -647,6 +681,7 @@ fn build_command(target: &TerminalTarget) -> CommandBuilder {
             claude_config_dir,
             workdir,
             model,
+            kickoff,
         } => {
             let mut cmd = CommandBuilder::new("tmux");
             cmd.arg("-L");
@@ -697,6 +732,15 @@ fn build_command(target: &TerminalTarget) -> CommandBuilder {
                         if !m.effort.trim().is_empty() {
                             cmd.arg("--effort");
                             cmd.arg(&m.effort);
+                        }
+                    }
+                    // The role kickoff (hq-role-kickoff) as claude's positional `[prompt]` — LAST,
+                    // after every flag — so opening the session fires the role's work instead of an
+                    // idle TUI. A single exec arg (no shell); only consumed when `new-session`
+                    // actually creates the session, so an operator reconnecting never re-fires it.
+                    if let Some(k) = kickoff {
+                        if !k.trim().is_empty() {
+                            cmd.arg(k);
                         }
                     }
                 }
@@ -916,6 +960,7 @@ mod tests {
             claude_config_dir: None,
             workdir: None,
             model: None,
+            kickoff: None,
         });
         let argv: Vec<String> = ro
             .get_argv()
@@ -942,6 +987,7 @@ mod tests {
             claude_config_dir: None,
             workdir: None,
             model: None,
+            kickoff: None,
         });
         let argv: Vec<String> = rw
             .get_argv()
@@ -969,6 +1015,7 @@ mod tests {
             claude_config_dir: Some("/var/lib/gt-core/accounts/abc".into()),
             workdir: Some("/var/lib/gt-core/term/hq-gg-1".into()),
             model: None,
+            kickoff: None,
         });
         let argv: Vec<String> = cl
             .get_argv()
@@ -1007,6 +1054,7 @@ mod tests {
                 permission_mode: "acceptEdits".into(),
                 effort: "xhigh".into(),
             }),
+            kickoff: None,
         });
         let argv: Vec<String> = cm
             .get_argv()
@@ -1044,6 +1092,46 @@ mod tests {
             .map(|s| s.to_string_lossy().into_owned())
             .collect();
         assert_eq!(argv, vec!["/bin/sh"]);
+    }
+
+    #[test]
+    fn build_command_appends_the_role_kickoff_as_claudes_last_arg() {
+        // hq-role-kickoff: the kickoff rides as claude's positional `[prompt]`, AFTER every flag, so
+        // opening the session fires the role's work instead of an idle TUI.
+        let cmd = build_command(&TerminalTarget::Attach {
+            workspace: "acme".into(),
+            session: "hq-gg-1".into(),
+            write: true,
+            claude_config_dir: Some("/var/lib/gt-core/accounts/abc".into()),
+            workdir: Some("/var/lib/gt-core/term/hq-gg-1".into()),
+            model: None,
+            kickoff: Some("Begin your duties now.".into()),
+        });
+        let argv: Vec<String> = cmd
+            .get_argv()
+            .iter()
+            .map(|s| s.to_string_lossy().into_owned())
+            .collect();
+        // claude is launched and the kickoff is the final argument.
+        assert_eq!(argv.last().unwrap(), "Begin your duties now.");
+        let claude_at = argv.iter().position(|a| a == "claude").unwrap();
+        assert!(claude_at < argv.len() - 1, "kickoff must follow `claude`");
+        // A read-only attach never carries a kickoff (no claude launched).
+        let ro = build_command(&TerminalTarget::Attach {
+            workspace: "acme".into(),
+            session: "hq-gg-1".into(),
+            write: false,
+            claude_config_dir: None,
+            workdir: None,
+            model: None,
+            kickoff: Some("Begin your duties now.".into()),
+        });
+        let ro_argv: Vec<String> = ro
+            .get_argv()
+            .iter()
+            .map(|s| s.to_string_lossy().into_owned())
+            .collect();
+        assert!(!ro_argv.iter().any(|a| a == "Begin your duties now."));
     }
 
     #[test]
