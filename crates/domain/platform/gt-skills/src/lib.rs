@@ -40,7 +40,7 @@ pub use module::SkillsHttpModule;
 pub use module::SkillsModule;
 pub use commands::{
     DisableSkillForRole, EnableSkillForRole, RegisterSkill, RetireSkill, SetRolePrompt,
-    SkillCommand,
+    SkillCommand, UpdateSkill,
 };
 pub use events::SkillEvent;
 pub use presets::agent_least_privilege_catalog;

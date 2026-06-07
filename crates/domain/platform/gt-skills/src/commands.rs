@@ -87,6 +87,69 @@ impl Command for RegisterSkill {
     }
 }
 
+/// Edit an existing skill's metadata/body (`hq-skills-edit.1`). Partial: a `None` field is left
+/// as-is. Re-emits `skills.registered.v1` (the reducer upserts the `Skill`), preserving the role
+/// bindings (a separate map) — so editing a skill never drops which roles have it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct UpdateSkill {
+    pub skill: String,
+    #[serde(default)]
+    pub label: Option<String>,
+    #[serde(default)]
+    pub description: Option<String>,
+    #[serde(default)]
+    pub body: Option<String>,
+    pub now_secs: u64,
+}
+
+impl Command for UpdateSkill {
+    type Output = SkillEvent;
+    type State = SkillCatalog;
+
+    fn validate(&self, state: &Self::State) -> Result<(), AppError> {
+        validate_skill_id(&self.skill).map_err(AppError::Validation)?;
+        if !state.contains(&self.skill) {
+            return Err(AppError::Validation(format!(
+                "skill {:?} is not registered",
+                self.skill
+            )));
+        }
+        if let Some(l) = &self.label {
+            if l.trim().is_empty() {
+                return Err(AppError::Validation("label is empty".into()));
+            }
+        }
+        Ok(())
+    }
+
+    fn execute(&self, state: &mut Self::State) -> Result<Self::Output, AppError> {
+        self.validate(state)?;
+        // Merge the partial edit over the current entry (it exists per validate).
+        let cur = state.get(&self.skill).expect("validated present").clone();
+        let label = self.label.clone().unwrap_or(cur.label);
+        let description = self.description.clone().unwrap_or(cur.description);
+        let body = self.body.clone().unwrap_or(cur.body);
+        state.apply_register(
+            Skill::new(
+                self.skill.clone(),
+                label.clone(),
+                description.clone(),
+                cur.default_scopes.clone(),
+                cur.registered_at_secs,
+            )
+            .with_body(body.clone()),
+        );
+        Ok(SkillEvent::Registered {
+            skill: self.skill.clone(),
+            label,
+            description,
+            default_scopes: cur.default_scopes,
+            body,
+            now_secs: self.now_secs,
+        })
+    }
+}
+
 /// Retire a skill from the catalog. Cascades to every role binding (the reducer drops
 /// the skill from each binding's `enabled_skills`) so the live state stays consistent.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -293,6 +356,35 @@ mod tests {
             body: String::new(),
             now_secs: now,
         }
+    }
+
+    #[test]
+    fn update_skill_edits_body_and_keeps_bindings() {
+        // hq-skills-edit.1: editing a skill upserts its body/description but never drops the role
+        // bindings (kept in a separate map).
+        let mut state = SkillCatalog::default();
+        register("pr-list", &["pr.read"], 1).execute(&mut state).unwrap();
+        EnableSkillForRole { role: "witness".into(), skill: "pr-list".into(), now_secs: 2 }
+            .execute(&mut state)
+            .unwrap();
+
+        let upd = UpdateSkill {
+            skill: "pr-list".into(),
+            label: None,
+            description: Some("List open PRs".into()),
+            body: Some("# pr-list\nrun gh pr list".into()),
+            now_secs: 3,
+        };
+        let ev = upd.execute(&mut state).unwrap();
+        assert!(matches!(ev, SkillEvent::Registered { .. }));
+        assert_eq!(state.get("pr-list").unwrap().description, "List open PRs");
+        assert_eq!(state.get("pr-list").unwrap().body, "# pr-list\nrun gh pr list");
+        // Binding survives the edit.
+        assert_eq!(state.skills_for_role("witness"), vec!["pr-list".to_string()]);
+
+        // Updating a non-existent skill is a client error.
+        let bad = UpdateSkill { skill: "ghost".into(), label: None, description: None, body: None, now_secs: 4 };
+        assert!(bad.execute(&mut state).is_err());
     }
 
     #[test]

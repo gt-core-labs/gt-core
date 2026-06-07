@@ -41,7 +41,7 @@ use gt_events::{AppError, Command};
 use gt_workspace::WorkspaceContext;
 
 use crate::commands::{
-    DisableSkillForRole, EnableSkillForRole, RegisterSkill, RetireSkill, SetRolePrompt,
+    DisableSkillForRole, EnableSkillForRole, RegisterSkill, RetireSkill, SetRolePrompt, UpdateSkill,
 };
 use crate::events::SkillEvent;
 
@@ -117,7 +117,7 @@ impl SkillsApiState {
 pub fn skills_router(state: SkillsApiState) -> Router {
     Router::new()
         .route("/", get(list_skills).post(register_skill))
-        .route("/:id", get(get_skill).delete(retire_skill))
+        .route("/:id", get(get_skill).put(update_skill).delete(retire_skill))
         // Role bindings (hq-role-skills-term.2): enable/disable a skill for a role, which is what
         // makes "a role = its skills" configurable. POST/DELETE ⇒ skills.write.
         .route(
@@ -216,6 +216,51 @@ async fn retire_skill(
     let event = cmd.execute(&mut catalog).map_err(ApiError::from)?;
     writer.append(ws.as_str(), event).await?;
     Ok((StatusCode::OK, Json(json!({ "retired": cmd.skill }))).into_response())
+}
+
+/// `PUT /{id}` body — a partial skill edit (`hq-skills-edit.1`). A `None`/omitted field is left
+/// unchanged.
+#[derive(Debug, Deserialize)]
+struct UpdateSkillBody {
+    #[serde(default)]
+    label: Option<String>,
+    #[serde(default)]
+    description: Option<String>,
+    #[serde(default)]
+    body: Option<String>,
+}
+
+/// `PUT /{id}` — edit a skill's label/description/SKILL.md body (`skills.write`,
+/// `hq-skills-edit.1`). Preserves the skill's role bindings + scopes. `404`/`422` when the skill
+/// is not registered.
+#[cfg_attr(feature = "axum", utoipa::path(
+    put, path = "/{id}",
+    params(("id" = String, Path, description = "Skill id")),
+    responses(
+        (status = 200, description = "Skill updated"),
+        (status = 422, description = "Skill not registered / bad shape"),
+        (status = 501, description = "Write surface not enabled"),
+    ),
+))]
+async fn update_skill(
+    State(st): State<SkillsApiState>,
+    ctx: WorkspaceContext,
+    Path(id): Path<String>,
+    Json(body): Json<UpdateSkillBody>,
+) -> Result<Response, ApiError> {
+    let writer = st.writer.as_ref().ok_or(ApiError::NotImplemented)?;
+    let ws = ctx.workspace();
+    let mut catalog = st.skills.catalog(ws.as_str()).await?;
+    let cmd = UpdateSkill {
+        skill: id,
+        label: body.label,
+        description: body.description,
+        body: body.body,
+        now_secs: now_secs(),
+    };
+    let event = cmd.execute(&mut catalog).map_err(ApiError::from)?;
+    writer.append(ws.as_str(), event).await?;
+    Ok((StatusCode::OK, Json(json!({ "skill": cmd.skill }))).into_response())
 }
 
 /// `POST /{id}/roles/{role}` — enable skill `id` for `role` (`skills.write`,
@@ -368,6 +413,7 @@ async fn get_skill(
     list_skills,
     register_skill,
     get_skill,
+    update_skill,
     retire_skill,
     enable_skill_for_role,
     disable_skill_for_role,
