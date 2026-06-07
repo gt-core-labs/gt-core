@@ -56,6 +56,7 @@ use gt_composition::polecat::{
 };
 use gt_composition::git_merge::GitMergePlugin;
 use gt_composition::quota_rotation::{self, QuotaRotationPlugin};
+use gt_composition::session_reconcile::SessionReconciler;
 use gt_composition::witness_sweep::WitnessSweep;
 use gt_composition::{daemon_root, replay_quota_state, DaemonRoot};
 use gt_composition::mcp::eventlog::EventLog;
@@ -245,6 +246,8 @@ async fn main() -> anyhow::Result<()> {
     // returned handles drive the edge loops below (patrol/quota ticks + the Refinery channel).
     // Keep a copy of the log root for the keychain seed below: daemon_root consumes event_root.
     let event_root_for_seed = event_root.clone();
+    // Keep a copy for the session reconciler (hq-orchd-deploy.23): it replays the same agent.* log.
+    let event_root_for_reconcile = event_root.clone();
     let DaemonRoot { handle, sched, merge, patrol, quota } = daemon_root(ws, event_root).await;
     eprintln!(
         "[gt-orch-server] daemon root up — scheduler + merge + patrol + quota actors anchored; persistence + roles + reactor arms + sheriff observer running"
@@ -506,6 +509,40 @@ async fn main() -> anyhow::Result<()> {
         }
     };
 
+    // --- Session reconciler (hq-orchd-deploy.23) ---
+    // The backend's Sessions view folds the shared agent.* log; a polecat spawned but never closed
+    // (daemon stopped/crashed before agent.session-end/killed) shows "spawned" forever. This timer
+    // replays that log each tick and emits agent.killed for any still-open session whose tmux session
+    // is gone AND heartbeat is stale — the daemon's event-log sink persists it, so the next backend
+    // fold shows the ghost as killed. Always on (the daemon always persists).
+    let reconcile_tick_secs = env_usize("GT_RECONCILE_TICK_SECS", 120) as u64;
+    let reconcile_stale_secs = env_usize("GT_RECONCILE_STALE_SECS", 300) as u64;
+    let reconcile_hb_dir = std::env::var("GT_HEARTBEAT_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| std::env::temp_dir());
+    let reconciler = SessionReconciler::new(
+        event_root_for_reconcile,
+        ws_slug.clone(),
+        reconcile_hb_dir,
+        Duration::from_secs(reconcile_stale_secs),
+        tmux.clone(),
+        handle.events_sender(),
+    );
+    eprintln!(
+        "[gt-orch-server] session reconciler on — sweep {reconcile_tick_secs}s (stale {reconcile_stale_secs}s); closes orphaned 'spawned' sessions"
+    );
+    let reconcile_timer = tokio::spawn(async move {
+        let mut tick = tokio::time::interval(Duration::from_secs(reconcile_tick_secs));
+        tick.tick().await; // skip the immediate first fire
+        loop {
+            tick.tick().await;
+            let n = reconciler.sweep().await;
+            if n > 0 {
+                eprintln!("[gt-orch-server] session reconciler closed {n} orphaned session(s)");
+            }
+        }
+    });
+
     // Refinery MERGE_READY live loop: await MERGE_READY messages on a gt-channel and submit each to
     // the merge actor, under a restart+backoff supervisor (gt-core agents may instead submit via
     // the MCP merge.submit path — both feed the same event-sourced board). Absent/unopenable
@@ -622,6 +659,7 @@ async fn main() -> anyhow::Result<()> {
     pol_relay.abort();
     patrol_timer.abort();
     quota_timer.abort();
+    reconcile_timer.abort();
     if let Some(task) = &witness_task {
         task.abort();
     }
@@ -638,6 +676,7 @@ async fn main() -> anyhow::Result<()> {
     let _ = pol_relay.await;
     let _ = patrol_timer.await;
     let _ = quota_timer.await;
+    let _ = reconcile_timer.await;
     if let Some(task) = witness_task {
         let _ = task.await;
     }
