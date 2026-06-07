@@ -19,6 +19,10 @@ pub enum SkillEvent {
         label: String,
         description: String,
         default_scopes: Vec<String>,
+        /// The skill's `SKILL.md` body (`hq-role-skills-term.1`). `#[serde(default)]` keeps pre-`.1`
+        /// log entries replayable.
+        #[serde(default)]
+        body: String,
         now_secs: u64,
     },
     /// A skill was retired (no longer available). Existing role bindings are dropped

@@ -62,6 +62,7 @@ fn skill(id: &str, scopes: &[&str]) -> SkillEvent {
         label: format!("{id} label"),
         description: "test".into(),
         default_scopes: scopes.iter().map(|s| s.to_string()).collect(),
+        body: String::new(),
         now_secs: 1,
     }
 }

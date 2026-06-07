@@ -192,6 +192,7 @@ mod tests {
             label: format!("{id} label"),
             description: "".into(),
             default_scopes: vec![format!("{id}.read")],
+            body: String::new(),
             now_secs: now,
         })
     }

@@ -211,6 +211,7 @@ mod tests {
                 label: "l".into(),
                 description: "d".into(),
                 default_scopes: vec![],
+                body: String::new(),
                 now_secs: 0,
             },
             SkillEvent::Retired { skill: "s".into(), now_secs: 0 },

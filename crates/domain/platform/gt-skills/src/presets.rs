@@ -20,6 +20,7 @@ fn register(s: &mut SkillState, id: &str, scopes: &[&str]) {
         label: id.to_string(),
         description: String::new(),
         default_scopes: scopes.iter().map(|x| x.to_string()).collect(),
+        body: String::new(),
         now_secs: 0,
     });
 }

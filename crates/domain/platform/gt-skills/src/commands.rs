@@ -27,6 +27,10 @@ pub struct RegisterSkill {
     /// the registered ordering survives serde roundtrips.
     #[serde(default)]
     pub default_scopes: Vec<String>,
+    /// The skill's `SKILL.md` body (`hq-role-skills-term.1`); empty when none. What the terminal
+    /// materialises into a session's `.claude/skills/<id>/SKILL.md`.
+    #[serde(default)]
+    pub body: String,
     pub now_secs: u64,
 }
 
@@ -62,18 +66,22 @@ impl Command for RegisterSkill {
 
     fn execute(&self, state: &mut Self::State) -> Result<Self::Output, AppError> {
         self.validate(state)?;
-        state.apply_register(Skill::new(
-            self.skill.clone(),
-            self.label.clone(),
-            self.description.clone(),
-            self.default_scopes.clone(),
-            self.now_secs,
-        ));
+        state.apply_register(
+            Skill::new(
+                self.skill.clone(),
+                self.label.clone(),
+                self.description.clone(),
+                self.default_scopes.clone(),
+                self.now_secs,
+            )
+            .with_body(self.body.clone()),
+        );
         Ok(SkillEvent::Registered {
             skill: self.skill.clone(),
             label: self.label.clone(),
             description: self.description.clone(),
             default_scopes: self.default_scopes.clone(),
+            body: self.body.clone(),
             now_secs: self.now_secs,
         })
     }
@@ -253,8 +261,28 @@ mod tests {
             label: format!("{id} label"),
             description: format!("{id} desc"),
             default_scopes: scopes.iter().map(|s| (*s).to_string()).collect(),
+            body: String::new(),
             now_secs: now,
         }
+    }
+
+    #[test]
+    fn register_carries_the_skill_md_body_into_the_catalog() {
+        // hq-role-skills-term.1: the SKILL.md body registered is stored on the catalog entry and
+        // rides the emitted event (so replay + the terminal materialisation see it).
+        let mut state = SkillCatalog::default();
+        let cmd = RegisterSkill {
+            skill: "graphify".into(),
+            label: "Graphify".into(),
+            description: "kg".into(),
+            default_scopes: vec![],
+            body: "# Graphify\nbuild a knowledge graph".into(),
+            now_secs: 1,
+        };
+        let ev = cmd.execute(&mut state).unwrap();
+        assert_eq!(state.get("graphify").unwrap().body, "# Graphify\nbuild a knowledge graph");
+        let SkillEvent::Registered { body, .. } = ev else { panic!("expected Registered") };
+        assert_eq!(body, "# Graphify\nbuild a knowledge graph");
     }
 
     #[test]
@@ -283,6 +311,7 @@ mod tests {
             label: "x".into(),
             description: "".into(),
             default_scopes: vec![],
+            body: String::new(),
             now_secs: 1,
         };
         assert!(bad_id.validate(&state).is_err());
@@ -292,6 +321,7 @@ mod tests {
             label: "  ".into(),
             description: "".into(),
             default_scopes: vec![],
+            body: String::new(),
             now_secs: 1,
         };
         assert!(bad_label.validate(&state).is_err());

@@ -505,6 +505,7 @@ mod tests {
                     label: "Graphify".into(),
                     description: "knowledge graph".into(),
                     default_scopes: vec!["graph.read".into()],
+                    body: String::new(),
                     now_secs: 1,
                 },
             )

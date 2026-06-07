@@ -139,6 +139,10 @@ struct RegisterSkillBody {
     /// The scopes this skill widens a role's grants by when enabled. Defaults to none.
     #[serde(default)]
     default_scopes: Vec<String>,
+    /// The skill's `SKILL.md` body (`hq-role-skills-term.1`); the definition the terminal
+    /// materialises into a session's `.claude/skills/<id>/SKILL.md`. Defaults to empty.
+    #[serde(default)]
+    body: String,
 }
 
 /// `POST /` — register a new skill in the caller's workspace catalog (`skills.write`). Validates the
@@ -166,6 +170,7 @@ async fn register_skill(
         label: body.label,
         description: body.description,
         default_scopes: body.default_scopes,
+        body: body.body,
         now_secs: now_secs(),
     };
     // execute validates (shape + uniqueness) then yields the event to persist.
@@ -313,6 +318,7 @@ mod tests {
                 label: "Merge admin".into(),
                 description: "Approve merges".into(),
                 default_scopes: vec!["merge.read".into(), "merge.write".into()],
+                body: String::new(),
                 now_secs: 1,
             },
             SkillEvent::Registered {
@@ -320,6 +326,7 @@ mod tests {
                 label: "Feed viewer".into(),
                 description: "Read the feed".into(),
                 default_scopes: vec!["feed.read".into()],
+                body: String::new(),
                 now_secs: 2,
             },
             SkillEvent::EnabledForRole { role: "deacon".into(), skill: "merge_admin".into(), now_secs: 3 },
@@ -399,6 +406,7 @@ mod tests {
             label: "dup".into(),
             description: String::new(),
             default_scopes: vec![],
+            body: String::new(),
             now_secs: 9,
         };
         let err = cmd.execute(&mut cat).unwrap_err();
@@ -414,6 +422,7 @@ mod tests {
             label: "Graphify".into(),
             description: "knowledge graph".into(),
             default_scopes: vec!["graph.read".into()],
+            body: String::new(),
             now_secs: 10,
         };
         let ev = reg.execute(&mut cat).unwrap();
