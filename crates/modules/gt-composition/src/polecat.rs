@@ -255,6 +255,14 @@ impl Plugin for PolecatSupervisorPlugin {
                                 active_config_dir = Some(cred.secret.clone());
                                 spec.env
                                     .push(("CLAUDE_CONFIG_DIR".to_string(), cred.secret));
+                                // Stamp the account id so the polecat's Stop costs-report hook can
+                                // label its quota-feed sample (hq-agent-provisioning.8): the feed
+                                // message needs `{account}`, and only the daemon knows which
+                                // keychain account this sling resolved to.
+                                spec.env.push((
+                                    gt_polecat::GT_HOOK_ACCOUNT.to_string(),
+                                    account.clone(),
+                                ));
                             }
                             Ok(None) => eprintln!(
                                 "[polecat] active claude account {account} has no stored credential — host default ~/.claude"
@@ -564,6 +572,13 @@ mod tests {
             .unwrap()
             .expect("CLAUDE_CONFIG_DIR injected from the active account");
         assert_eq!(cfg, "/home/nixos/.claude-acct-b");
+        // The account id is also pinned so the Stop costs-report hook can label its quota-feed
+        // sample with the right account (hq-agent-provisioning.8).
+        let acct = fake
+            .show_environment("hq-gg-1", gt_polecat::GT_HOOK_ACCOUNT)
+            .unwrap()
+            .expect("GT_HOOK_ACCOUNT injected from the active account");
+        assert_eq!(acct, "acct-b");
     }
 
     #[tokio::test]

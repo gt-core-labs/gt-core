@@ -33,6 +33,9 @@
 //!   the rig's [`SpawnTemplate`] (see [`SpawnTemplate::from_env`]).
 //! - `GT_PATROL_TICK_SECS` (30) / `GT_LEASE_TIMEOUT_SECS` (300) — patrol lease-expiry ticker.
 //! - `GT_QUOTA_TICK_SECS` (60) / `GT_QUOTA_THRESHOLD_SECS` (300) — quota auto-rotation ticker.
+//! - `GT_QUOTA_PLAN_LIMIT` (50_000_000) — synthetic-window budget (cost units) the quota-feed seeds
+//!   for an account when a polecat reports token samples but no `anthropic-ratelimit-*` headers
+//!   (`hq-agent-provisioning.8`); tune to the plan's real 5h budget.
 //! - `GT_CHANNEL_ROOT` (`/gt/.channels`) / `GT_MERGE_READY_CHANNEL` (`merge-ready`) — the
 //!   Refinery MERGE_READY gt-channel; absent/unopenable ⇒ the loop is disabled, the daemon boots.
 //! - `GT_DISPATCH_CHANNEL` (`dispatch`, under `GT_CHANNEL_ROOT`) — the dispatch-request gt-channel

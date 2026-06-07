@@ -17,6 +17,11 @@
 /// Session env variable carrying the pinned bead id.
 pub const GT_HOOK_BEAD: &str = "GT_HOOK_BEAD";
 
+/// Session env variable carrying the keychain account id the sling resolved (hq-agent-provisioning.8).
+/// The polecat's Stop costs-report hook reads it to label the `{account}` of its quota-feed sample;
+/// only the daemon knows which account this sling's `CLAUDE_CONFIG_DIR` belongs to.
+pub const GT_HOOK_ACCOUNT: &str = "GT_HOOK_ACCOUNT";
+
 /// Pick the bead to pin for a spawn. Mirrors Go `session_manager`: prefer an explicit
 /// `hook_bead` (sling already attached the hook), else the direct `issue`. Blank strings are
 /// treated as absent. Returning the bead whenever *either* input is present is the fix for the

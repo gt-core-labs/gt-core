@@ -12,6 +12,9 @@
 //! - `GT_CHANNEL_ROOT` + `GT_HOOK_BEAD` + `GT_BRANCH` — on Stop the polecat drops a
 //!   `{"bead","branch"}` message into `$GT_CHANNEL_ROOT/merge-ready/` (atomic tmp+rename, the
 //!   gt-channel `*.event` convention) so the daemon's refinery submits the merge and frees the slot.
+//! - `GT_CHANNEL_ROOT` + `GT_HOOK_ACCOUNT` — also on Stop, the polecat reports its turn's token
+//!   usage (parsed from the Claude transcript) into `$GT_CHANNEL_ROOT/quota-feed/` so predictive
+//!   account rotation has an INPUT to evaluate (`hq-agent-provisioning.8`).
 //!
 //! `bypassPermissions` + `hasCompletedOnboarding` keep an autonomous claude from blocking on the
 //! interactive "trust this folder" / permission prompts (the `hq-orchd-deploy.2` gotcha).
@@ -43,6 +46,37 @@ const MERGE_READY_CMD: &str = concat!(
     r#"> "$d/.$id.tmp" && mv "$d/.$id.tmp" "$d/$id.event"; fi"#,
 );
 
+/// Report this polecat turn's token usage into the quota-feed so predictive rotation has an INPUT
+/// (hq-agent-provisioning.8). On Stop the hook reads the event JSON on stdin (`transcript_path` +
+/// `session_id`), sums the `message.usage` of the assistant messages WRITTEN SINCE the last report
+/// (a per-session offset file keyed off `GT_HEARTBEAT_FILE` avoids double-counting the cached prompt
+/// re-read every turn), and drops a `{account,session,sample}` [`gt_composition::quota_rotation::
+/// QuotaFeedPayload`] as an atomic `*.event` into `$GT_CHANNEL_ROOT/quota-feed`. The daemon's feed
+/// loop folds it via `quota.sample`, growing the account's consumption + burn-rate EWMA.
+///
+/// `$GT_HOOK_ACCOUNT` (the keychain account the sling resolved) labels the message — Claude Code
+/// hooks never see the `anthropic-ratelimit-*` response headers, so the token sample (not the
+/// authoritative window) is the only figure obtainable here. Best-effort: a missing env var, no
+/// `jq`, or an absent transcript is a silent no-op, never a hook failure.
+const COSTS_REPORT_CMD: &str = concat!(
+    r#"if [ -n "$GT_CHANNEL_ROOT" ] && [ -n "$GT_HOOK_ACCOUNT" ] && command -v jq >/dev/null 2>&1; then "#,
+    r#"ev=$(cat); "#,
+    r#"tp=$(printf '%s' "$ev" | jq -r '.transcript_path // empty' 2>/dev/null); "#,
+    r#"sid=$(printf '%s' "$ev" | jq -r '.session_id // empty' 2>/dev/null); "#,
+    r#"if [ -n "$tp" ] && [ -f "$tp" ]; then "#,
+    r#"off="${GT_HEARTBEAT_FILE:-/tmp/gt-qoff-$sid}.qoff"; "#,
+    r#"start=$(cat "$off" 2>/dev/null || echo 0); "#,
+    r#"end=$(wc -l < "$tp" 2>/dev/null || echo 0); "#,
+    r#"if [ "$end" -gt "$start" ]; then "#,
+    r#"s=$(tail -n +$((start+1)) "$tp" | jq -sc '[.[]|select(.type=="assistant" and .message.usage!=null)] as $a | if ($a|length)==0 then empty else {model:($a[-1].message.model//"unknown"),input:([$a[].message.usage.input_tokens//0]|add),output:([$a[].message.usage.output_tokens//0]|add),cache_read:([$a[].message.usage.cache_read_input_tokens//0]|add),cache_creation:([$a[].message.usage.cache_creation_input_tokens//0]|add)} end' 2>/dev/null); "#,
+    r#"if [ -n "$s" ]; then "#,
+    r#"d="$GT_CHANNEL_ROOT/quota-feed"; mkdir -p "$d"; "#,
+    r#"id=$(cat /proc/sys/kernel/random/uuid 2>/dev/null || date +%s%N); "#,
+    r#"printf '{"account":"%s","session":"%s","sample":%s}' "$GT_HOOK_ACCOUNT" "${sid:-$GT_HOOK_ACCOUNT}" "$s" "#,
+    r#"> "$d/.$id.tmp" && mv "$d/.$id.tmp" "$d/$id.event"; fi; "#,
+    r#"printf '%s' "$end" > "$off"; fi; fi; fi"#,
+);
+
 /// One Claude hook entry running `cmd` for every event of its kind (`matcher: ""`).
 fn hook(cmd: &str) -> serde_json::Value {
     json!({ "matcher": "", "hooks": [ { "type": "command", "command": cmd } ] })
@@ -59,7 +93,7 @@ pub fn polecat_settings_json() -> String {
             "SessionStart": [ hook(HEARTBEAT_CMD) ],
             "UserPromptSubmit": [ hook(HEARTBEAT_CMD) ],
             "PostToolUse": [ hook(HEARTBEAT_CMD) ],
-            "Stop": [ hook(MERGE_READY_CMD) ],
+            "Stop": [ hook(MERGE_READY_CMD), hook(COSTS_REPORT_CMD) ],
         }
     });
     serde_json::to_string_pretty(&v).expect("static template serializes")
@@ -111,6 +145,14 @@ mod tests {
         assert!(stop.contains("$GT_CHANNEL_ROOT/merge-ready"));
         assert!(stop.contains(r#""bead":"%s""#) && stop.contains(r#""branch":"%s""#));
         assert!(stop.contains(".event"));
+        // Second Stop hook reports token usage into the quota-feed (hq-agent-provisioning.8).
+        let costs = v["hooks"]["Stop"][1]["hooks"][0]["command"]
+            .as_str()
+            .unwrap();
+        assert!(costs.contains("$GT_CHANNEL_ROOT/quota-feed"));
+        assert!(costs.contains("$GT_HOOK_ACCOUNT"));
+        assert!(costs.contains(r#""sample":%s"#));
+        assert!(costs.contains("transcript_path"));
     }
 
     #[test]

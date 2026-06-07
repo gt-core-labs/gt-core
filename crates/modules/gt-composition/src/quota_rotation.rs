@@ -50,6 +50,35 @@ fn now_secs() -> u64 {
         .unwrap_or(0)
 }
 
+/// The rolling token window (standard claude plan).
+const ROLLING_5H_SECS: u64 = 5 * 3600;
+
+/// Default budget for a header-less synthetic window, in quota cost units (`gt_quota::cost_units`).
+/// Identity weights (the daemon's default) count cache-read tokens at full price, so a turn is on
+/// the order of 10^5–10^6 units — the default is deliberately generous to avoid over-rotating on an
+/// uncalibrated estimate. Tune via `GT_QUOTA_PLAN_LIMIT`; the predictive `learned_limit` follow-up
+/// (and the authoritative `anthropic-ratelimit-*` headers via a proxy) refine it from real data.
+const DEFAULT_PLAN_LIMIT: u64 = 50_000_000;
+
+/// Configured synthetic-window budget (`GT_QUOTA_PLAN_LIMIT`, else [`DEFAULT_PLAN_LIMIT`]).
+fn plan_limit() -> u64 {
+    std::env::var("GT_QUOTA_PLAN_LIMIT")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(DEFAULT_PLAN_LIMIT)
+}
+
+/// A fresh Rolling5h window anchored at `now`, used when no provider headers supply the real one.
+fn synthetic_window(now: u64) -> AccountWindow {
+    AccountWindow {
+        kind: WindowKind::Rolling5h,
+        limit: plan_limit(),
+        started_at_secs: now,
+        resets_at_secs: now + ROLLING_5H_SECS,
+        consumed: 0.0,
+    }
+}
+
 /// Observer that turns a block prediction (or a reactive limit) into a real credential rotation:
 /// `quota.block_predicted.v1` / `quota.account_limited.v1` → [`Keychain::set_active`] +
 /// [`QuotaHandle::rotated`]. Registered on the daemon hub alongside the polecat supervisor.
@@ -234,6 +263,39 @@ async fn apply_feed(quota: &QuotaHandle, p: QuotaFeedPayload) {
             quota
                 .probe(pw.account, pw.remaining, pw.resets_at_secs, pw.now_secs)
                 .await;
+        }
+    }
+
+    // 1b) Synthetic window when the headers never arrive (hq-agent-provisioning.8). A Claude Code
+    //     hook reports token samples but NOT the `anthropic-ratelimit-*` window, and the predictor
+    //     needs a window (limit + reset) to project a block — a sample against a windowless account
+    //     grows nothing (`rate = consumed/elapsed` reads the window). When a sample arrives for an
+    //     account with no window, seed a Rolling5h window from the configured plan limit so the
+    //     sample-driven `consumed` + rate can fire a `BlockPredicted`. Idempotent: a real
+    //     header-seeded window (above) is left untouched; a stale synthetic window past its 5h reset
+    //     is recycled here because nothing else resets a header-less window.
+    if p.sample.is_some() {
+        let existing = quota
+            .accounts()
+            .await
+            .into_iter()
+            .find(|a| a.id == p.account);
+        match existing.and_then(|a| a.window) {
+            None => {
+                quota
+                    .upsert_account(Account {
+                        id: p.account.clone(),
+                        status: AccountQuotaStatus::Healthy,
+                        window: Some(synthetic_window(now)),
+                    })
+                    .await;
+            }
+            Some(w) if now >= w.resets_at_secs => {
+                quota
+                    .reset_window(p.account.clone(), now, now + ROLLING_5H_SECS)
+                    .await;
+            }
+            Some(_) => {}
         }
     }
 
@@ -425,6 +487,87 @@ mod tests {
             Some("b"),
             "the predicted block rotated the live pointer to the healthy standby"
         );
+    }
+
+    #[tokio::test]
+    async fn sample_only_seeds_a_synthetic_window_then_folds_consumption() {
+        // hq-agent-provisioning.8: a header-less sample (the only figure a Claude Code hook can
+        // report) must still grow the predictor — so apply_feed seeds a synthetic window first.
+        let (tx, _rx) = mpsc::channel(64);
+        let quota = gt_quota::actor::spawn(tx, std::collections::HashMap::new());
+        apply_feed(
+            &quota,
+            QuotaFeedPayload {
+                account: "acc-1".into(),
+                session: Some("s1".into()),
+                headers: vec![],
+                sample: Some(TokenSample {
+                    model: "opus".into(),
+                    input: 1000,
+                    output: 500,
+                    cache_read: 200,
+                    cache_creation: 100,
+                }),
+            },
+        )
+        .await;
+        let acc = quota
+            .accounts()
+            .await
+            .into_iter()
+            .find(|a| a.id == "acc-1")
+            .expect("account seeded");
+        let w = acc.window.expect("synthetic window seeded for a header-less sample");
+        assert_eq!(w.kind, WindowKind::Rolling5h);
+        assert_eq!(w.limit, plan_limit());
+        // Identity weights ⇒ consumed == sum of the sample's tokens (1000+500+200+100).
+        assert_eq!(w.consumed, 1800.0, "the sample folded into the fresh window");
+    }
+
+    #[tokio::test]
+    async fn stale_synthetic_window_is_recycled_on_the_next_sample() {
+        // A header-less window has no provider reset; the edge recycles it once its 5h elapsed.
+        let (tx, _rx) = mpsc::channel(64);
+        let quota = gt_quota::actor::spawn(tx, std::collections::HashMap::new());
+        quota
+            .upsert_account(Account {
+                id: "acc-1".into(),
+                status: AccountQuotaStatus::Healthy,
+                window: Some(AccountWindow {
+                    kind: WindowKind::Rolling5h,
+                    limit: plan_limit(),
+                    started_at_secs: 1, // long ago
+                    resets_at_secs: 2,  // already past → must recycle
+                    consumed: 999_999.0,
+                }),
+            })
+            .await;
+        apply_feed(
+            &quota,
+            QuotaFeedPayload {
+                account: "acc-1".into(),
+                session: None,
+                headers: vec![],
+                sample: Some(TokenSample {
+                    model: "opus".into(),
+                    input: 10,
+                    output: 5,
+                    cache_read: 0,
+                    cache_creation: 0,
+                }),
+            },
+        )
+        .await;
+        let w = quota
+            .accounts()
+            .await
+            .into_iter()
+            .find(|a| a.id == "acc-1")
+            .and_then(|a| a.window)
+            .expect("window");
+        // The stale consumption was cleared by the recycle, then only the new sample folded in.
+        assert_eq!(w.consumed, 15.0, "recycled then folded the fresh sample");
+        assert!(w.resets_at_secs > now_secs(), "reset pushed 5h into the future");
     }
 
     #[test]
