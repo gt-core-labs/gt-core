@@ -137,8 +137,13 @@ impl WorkspaceQuota for EventLogQuota {
 /// `hq-quota-ws-accounts.1`): the onboarded claude accounts whose credential dirs live under the
 /// accounts root (`GT_CLAUDE_ACCOUNTS_ROOT`, the same root the onboarding flow + daemon write/read).
 /// Workspace-independent — the pool a tenant assigns FROM, distinct from [`EventLogQuota`] (which
-/// accounts a tenant has assigned). An account is any direct, non-empty sub-dir (a bare `/start`
-/// placeholder with no creds yet is skipped); its id is the dir basename.
+/// accounts a tenant has assigned).
+///
+/// The on-disk dir is named by an opaque session ULID, but an account's IDENTITY across the system
+/// is its **email** (the id the quota registry keys by — see the registered accounts in any
+/// workspace). So the catalog reports the email read from each dir's `.claude.json`
+/// (`oauthAccount.emailAddress`), and resolves an email back to its creds dir for assignment. A dir
+/// without a readable email (an in-flight `/start`, or non-oauth creds) is not yet a catalog entry.
 pub struct FsAccountCatalog {
     root: std::path::PathBuf,
 }
@@ -148,44 +153,53 @@ impl FsAccountCatalog {
     pub fn new(root: std::path::PathBuf) -> Self {
         Self { root }
     }
-}
 
-/// An onboarded account dir: exists, is a directory, and is non-empty (holds creds). A bare
-/// `/start` placeholder created before `/complete` writes the credentials is empty ⇒ not onboarded.
-fn is_onboarded(path: &std::path::Path) -> bool {
-    path.is_dir()
-        && std::fs::read_dir(path)
-            .map(|mut d| d.next().is_some())
-            .unwrap_or(false)
+    /// The onboarded account's email, read from `<dir>/.claude.json` (`oauthAccount.emailAddress`).
+    /// `None` when the file is absent/unparseable or carries no oauth email — the dir is then not a
+    /// catalog entry (an in-flight onboarding before `/complete`, say).
+    fn email_of(dir: &std::path::Path) -> Option<String> {
+        let raw = std::fs::read_to_string(dir.join(".claude.json")).ok()?;
+        let v: serde_json::Value = serde_json::from_str(&raw).ok()?;
+        v.get("oauthAccount")?
+            .get("emailAddress")?
+            .as_str()
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+    }
+
+    /// Every (email, creds-dir) pair the accounts root holds — the catalog, de-duped by email
+    /// (a re-onboard replaces a dir; the GC reaps the orphan, but a transient dup just collapses).
+    fn entries(&self) -> Vec<(String, std::path::PathBuf)> {
+        let Ok(read) = std::fs::read_dir(&self.root) else {
+            return Vec::new(); // no root yet (nothing onboarded) ⇒ an empty pool, not an error
+        };
+        let mut by_email: std::collections::BTreeMap<String, std::path::PathBuf> =
+            std::collections::BTreeMap::new();
+        for entry in read.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                if let Some(email) = Self::email_of(&path) {
+                    by_email.entry(email).or_insert(path);
+                }
+            }
+        }
+        by_email.into_iter().collect()
+    }
 }
 
 #[async_trait]
 impl AccountCatalog for FsAccountCatalog {
     async fn available(&self) -> Result<Vec<String>, AppError> {
-        let Ok(entries) = std::fs::read_dir(&self.root) else {
-            // No root yet (nothing onboarded) ⇒ an empty pool, not an error.
-            return Ok(Vec::new());
-        };
-        let mut ids = Vec::new();
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if is_onboarded(&path) {
-                if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
-                    ids.push(name.to_string());
-                }
-            }
-        }
-        ids.sort();
-        Ok(ids)
+        Ok(self.entries().into_iter().map(|(email, _)| email).collect())
     }
 
     async fn config_dir(&self, account: &str) -> Result<Option<String>, AppError> {
-        // Sanitize the id to a single safe component, then require the creds dir to be onboarded
-        // (exists + non-empty) — symmetric with `available`, so an empty placeholder is not assignable.
-        let Some(dir) = crate::account_dirs::account_config_dir(&self.root, account) else {
-            return Ok(None);
-        };
-        Ok(is_onboarded(&dir).then(|| dir.to_string_lossy().into_owned()))
+        // Resolve the email back to its creds dir (the path an assignment registers as config_dir).
+        Ok(self
+            .entries()
+            .into_iter()
+            .find(|(email, _)| email == account)
+            .map(|(_, dir)| dir.to_string_lossy().into_owned()))
     }
 }
 
@@ -485,34 +499,37 @@ mod tests {
         MergeSlot { bead: bead.into(), branch: branch.into(), state }
     }
 
-    /// `FsAccountCatalog` lists only non-empty account dirs (a bare `/start` placeholder is
-    /// skipped) and resolves `config_dir` only for an onboarded account, rejecting traversal.
+    /// Write a `.claude.json` carrying `oauthAccount.emailAddress = email` into `<root>/<dir>`.
+    fn onboard(root: &std::path::Path, dir: &str, email: &str) {
+        std::fs::create_dir_all(root.join(dir)).unwrap();
+        let body = serde_json::json!({ "oauthAccount": { "emailAddress": email } });
+        std::fs::write(root.join(dir).join(".claude.json"), body.to_string()).unwrap();
+    }
+
+    /// `FsAccountCatalog` reports onboarded accounts by EMAIL (read from `.claude.json`), keyed off
+    /// the opaque ULID dir, and resolves an email back to its creds dir for assignment. A dir with
+    /// no oauth email (an in-flight `/start`) is not a catalog entry.
     #[tokio::test]
-    async fn fs_account_catalog_lists_onboarded_and_resolves_creds() {
+    async fn fs_account_catalog_lists_by_email_and_resolves_creds() {
         let dir = TempDir::new().unwrap();
         let root = dir.path();
-        // Two onboarded accounts (creds file present) + one empty placeholder + a plain file.
-        for acct in ["acct-a", "acct-b"] {
-            std::fs::create_dir(root.join(acct)).unwrap();
-            std::fs::write(root.join(acct).join(".credentials.json"), b"{}").unwrap();
-        }
-        std::fs::create_dir(root.join("starting")).unwrap(); // empty ⇒ skipped
+        onboard(root, "01ULIDA", "alice@x.com");
+        onboard(root, "01ULIDB", "bob@y.com");
+        std::fs::create_dir(root.join("01STARTING")).unwrap(); // no .claude.json ⇒ skipped
         std::fs::write(root.join("not-a-dir"), b"x").unwrap();
 
         let cat = FsAccountCatalog::new(root.to_path_buf());
+        // Listed by email, sorted; the placeholder is absent.
         assert_eq!(
             cat.available().await.unwrap(),
-            vec!["acct-a".to_string(), "acct-b".to_string()]
+            vec!["alice@x.com".to_string(), "bob@y.com".to_string()]
         );
-        // An onboarded account resolves to its dir; the placeholder + an unknown id do not.
+        // An email resolves to its ULID creds dir; an unknown email does not.
         assert_eq!(
-            cat.config_dir("acct-a").await.unwrap(),
-            Some(root.join("acct-a").to_string_lossy().into_owned())
+            cat.config_dir("alice@x.com").await.unwrap(),
+            Some(root.join("01ULIDA").to_string_lossy().into_owned())
         );
-        assert_eq!(cat.config_dir("starting").await.unwrap(), None);
-        assert_eq!(cat.config_dir("ghost").await.unwrap(), None);
-        // A path-traversal id is rejected (sanitized to None), never escaping the root.
-        assert_eq!(cat.config_dir("../../etc").await.unwrap(), None);
+        assert_eq!(cat.config_dir("ghost@z.com").await.unwrap(), None);
     }
 
     /// A missing accounts root is an empty pool, not an error.
