@@ -6,8 +6,13 @@
 # broken commit never reaches DockerHub even though it compiles in isolation.
 #
 # Publishes codecsrayo/gt-core-mcp-server:
-#   - :latest         moving tag, what compose pulls (pull_policy: always)
-#   - :sha-<7>        immutable per-commit tag for rollback / pinning
+#   - :latest                  moving tag (lean default Dockerfile), what compose pulls
+#   - :sha-<7>                 immutable per-commit tag for rollback / pinning
+#   - :embeddings              moving tag for the heavier embeddings variant (Dockerfile.embeddings:
+#                              fastembed + claude + tmux + the in-container `gt` for per-role MCP).
+#                              compose.embeddings.yml pulls this; rebuilt on every green main so the
+#                              entrypoint/Dockerfile changes ship without a manual local build.
+#   - :sha-embeddings-<7>      immutable per-commit embeddings tag
 #
 # Trade-off vs the old direct-push trigger: workflow_run carries no paths-ignore,
 # so the docs-only / md-only skip is gone. CI runs on every push regardless, so
@@ -77,3 +82,27 @@ jobs:
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
+
+      # The embeddings variant — same commit, heavier image (fastembed + claude + tmux + the
+      # in-container `gt` binary for per-role MCP, hq-role-mcp / hq-gt-container). compose.embeddings.yml
+      # pulls :embeddings, so building it here ships the Dockerfile.embeddings/entrypoint changes
+      # without a manual local build. Own gha cache scope so it never evicts the lean image's cache.
+      - name: Docker metadata (embeddings)
+        id: meta_emb
+        uses: docker/metadata-action@v5
+        with:
+          images: codecsrayo/gt-core-mcp-server
+          tags: |
+            type=raw,value=embeddings
+            type=raw,value=sha-embeddings-${{ steps.vars.outputs.sha7 }}
+
+      - name: Build and push (embeddings)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile.embeddings
+          push: true
+          tags: ${{ steps.meta_emb.outputs.tags }}
+          labels: ${{ steps.meta_emb.outputs.labels }}
+          cache-from: type=gha,scope=embeddings
+          cache-to: type=gha,mode=max,scope=embeddings
