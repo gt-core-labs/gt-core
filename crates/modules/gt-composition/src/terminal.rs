@@ -68,10 +68,22 @@ struct TerminalParams {
     /// The tmux session to attach to (a polecat's `<prefix>-<bead>`). Absent ⇒ a fresh `/bin/sh`,
     /// the original behaviour.
     session: Option<String>,
-    /// `true` ⇒ attach read-write (can type into the agent's session); default `false` ⇒ a
-    /// read-only attach, so watching never disturbs the agent.
+    /// Truthy ⇒ attach read-write (can type into the session, creating it if absent); default ⇒ a
+    /// read-only attach. Carried as a raw string (not `bool`) because `serde_urlencoded` only
+    /// parses `true`/`false` for a `bool`, so a browser `?write=1` would 400 the upgrade
+    /// (`hq-term-dock.1`); [`is_truthy`] interprets `1`/`true`/`yes`/`on` here instead.
     #[serde(default)]
-    write: bool,
+    write: Option<String>,
+}
+
+/// Interpret a query flag as truthy: `1`/`true`/`yes`/`on` (case-insensitive). Anything else —
+/// including absent — is false. Lets `?write=1` and `?write=true` both opt into an interactive
+/// attach (`hq-term-dock.1`).
+fn is_truthy(v: Option<&str>) -> bool {
+    matches!(
+        v.map(|s| s.trim().to_ascii_lowercase()).as_deref(),
+        Some("1" | "true" | "yes" | "on")
+    )
 }
 
 /// What the upgraded socket bridges its pty to.
@@ -141,7 +153,7 @@ async fn ws_upgrade(
             Some(session) => TerminalTarget::Attach {
                 workspace: claims.workspace.clone(),
                 session: session.to_string(),
-                write: params.write,
+                write: is_truthy(params.write.as_deref()),
             },
             None => {
                 return (StatusCode::BAD_REQUEST, "invalid session name").into_response();
@@ -392,6 +404,19 @@ mod tests {
         assert!(has_scope(&["*".into()], REQUIRED_SCOPE));
         assert!(!has_scope(&["agent.write".into()], REQUIRED_SCOPE));
         assert!(!has_scope(&[], REQUIRED_SCOPE));
+    }
+
+    #[test]
+    fn is_truthy_accepts_one_and_true_rejects_others() {
+        // hq-term-dock.1: a browser sends ?write=1, which must opt into interactive — the original
+        // bool field 400'd it. Also accept true/yes/on; absent/0/false stay read-only.
+        for t in ["1", "true", "TRUE", "yes", "on", " 1 "] {
+            assert!(is_truthy(Some(t)), "{t:?} should be truthy");
+        }
+        for f in ["0", "false", "no", "off", "", "x"] {
+            assert!(!is_truthy(Some(f)), "{f:?} should be falsey");
+        }
+        assert!(!is_truthy(None), "absent ⇒ read-only");
     }
 
     #[test]
