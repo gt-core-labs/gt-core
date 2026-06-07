@@ -173,10 +173,15 @@ struct RoleLaunch {
 /// reconnecting an operator never re-fires it.
 fn role_kickoff_prompt(role: &str, workspace: &str) -> String {
     format!(
-        "You are the gt `{role}` in workspace `{workspace}`. Begin your duties now: follow your role \
-         instructions in CLAUDE.md and use the gt MCP tools (issues.*, agent.*, convoy.*, merge.*, \
-         graph.*) to do your work. Coordinate through shared state (the tracker, channels, the event \
-         log), never directly. Work autonomously and do not wait for confirmation."
+        "You are the gt `{role}` in workspace `{workspace}`. Your tools come from the `gt` MCP server \
+         and are named `mcp__gt__*` (e.g. `mcp__gt__issues_create`, `mcp__gt__issues_transition`, \
+         `mcp__gt__agent_spawn`, `mcp__gt__convoy_launch`, `mcp__gt__merge_list`) — the dotted forms \
+         `issues.*`/`agent.*` are the underlying namespaces, not the tool names. The server connects \
+         at startup and may take a few seconds: if no `mcp__gt__*` tool is in your tool list on this \
+         first turn, WAIT briefly and check again — do not conclude the tools are missing or search \
+         for alternatives. Once they are present, begin your duties per CLAUDE.md, coordinating \
+         through shared state (the tracker, channels, the event log), never directly. Work \
+         autonomously and do not wait for confirmation."
     )
 }
 
