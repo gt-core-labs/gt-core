@@ -30,10 +30,15 @@ use gt_auth::{JwtClaims, JwtMinter};
 use gt_eventlog::EventRecord;
 use gt_events::{AppError, Envelope};
 use gt_merge::MergeEvent;
-use gt_polecat::{spawn_tmux, PoolAllocator, PolecatSupervisor, SpawnTemplate, Tmux};
+use gt_polecat::{
+    hooks_from_settings, skills_from_worktree, spawn_tmux, PoolAllocator, PolecatSupervisor,
+    SpawnTemplate, Tmux,
+};
 use gt_plugin::Plugin;
 use gt_quota::Keychain;
 use gt_scheduling::SchedEvent;
+
+use crate::operator_event::IssueOperatorEvent;
 
 /// Resolves the least-privilege scope set for an agent role (`hq-agent-provisioning.3`). The
 /// production resolver delegates to `gt_skills::SkillCatalog::scopes_for_roles`; tests pass a
@@ -200,6 +205,18 @@ impl PolecatSupervisorPlugin {
             }
         }
     }
+
+    /// Publish an [`IssueOperatorEvent`] onto the hub so the FE sees which agent operates a bead
+    /// (`hq-agent-observability.2`). Same best-effort path as [`emit`](Self::emit): the daemon root
+    /// persists the hub record to the per-workspace log the `?channel=issues` SSE feed reads, so a
+    /// closed hub or an encode failure only costs the marker, never the sling itself.
+    fn emit_operator(&self, event: IssueOperatorEvent) {
+        if let Some(tx) = &self.events {
+            if let Ok(record) = EventRecord::from_envelope(&Envelope::root(event)) {
+                let _ = tx.send(record);
+            }
+        }
+    }
 }
 
 #[async_trait]
@@ -352,6 +369,23 @@ impl Plugin for PolecatSupervisorPlugin {
                     role: SessionRole::default(),
                     crew: spec.crew.clone(),
                 });
+                // Mark the bead's operating agent on the issues channel (hq-agent-observability.2)
+                // so the FE shows who works it + what they loaded. Manifest is read from the
+                // FINAL workdir (the per-bead worktree when provisioned, else the shared checkout)
+                // and the static hook template; role is the env's GT_ROLE, defaulting to polecat.
+                let role = spec
+                    .env
+                    .iter()
+                    .find(|(k, _)| k == "GT_ROLE")
+                    .map(|(_, v)| v.clone())
+                    .unwrap_or_else(|| "polecat".to_string());
+                self.emit_operator(IssueOperatorEvent::Operated {
+                    bead: bead.clone(),
+                    session: spec.session.clone(),
+                    role,
+                    skills: skills_from_worktree(&spec.workdir),
+                    hooks: hooks_from_settings(),
+                });
                 self.supervisor.watch(spec);
                 Ok(())
             }
@@ -375,6 +409,9 @@ impl Plugin for PolecatSupervisorPlugin {
                     }
                 }
                 self.emit(AgentEvent::SessionEnd { session });
+                // Clear the bead's operator marker (hq-agent-observability.2): its work landed, so
+                // the FE drops the agent chip. One agent per bead → the id alone identifies it.
+                self.emit_operator(IssueOperatorEvent::Cleared { bead });
                 Ok(())
             }
             _ => Ok(()),
@@ -706,11 +743,74 @@ mod tests {
             .unwrap();
         let opened = rx.try_recv().expect("a session-open record was emitted");
         assert_eq!(opened.kind, "agent.spawned.v1");
+        // A sling also stamps the operator marker on the issues channel (hq-agent-observability.2);
+        // drain it so the merge assertions below read the session-close, not this.
+        assert_eq!(rx.try_recv().unwrap().kind, "issues.operated.v1");
 
         p.on_event(&record(MergeEvent::Merged { bead: "gg-1".into(), sha: "abc".into() }))
             .await
             .unwrap();
         let closed = rx.try_recv().expect("a session-close record was emitted");
         assert_eq!(closed.kind, "agent.session-end.v1");
+        assert_eq!(rx.try_recv().unwrap().kind, "issues.operator-cleared.v1");
+    }
+
+    #[tokio::test]
+    async fn sling_and_merge_emit_issue_operator_events_with_manifest() {
+        // hq-agent-observability.2: a dispatch marks the bead's operating agent on the issues
+        // channel (issues.operated.v1, carrying the skills+hooks manifest), and the bead's merge
+        // clears it (issues.operator-cleared.v1) — what the FE renders/clears as the agent chip.
+        use crate::operator_event::IssueOperatorEvent;
+
+        // A workdir carrying one project skill so the manifest's skills list is non-empty.
+        let work = tempfile::tempdir().unwrap();
+        let skill = work.path().join(".claude").join("skills").join("graphify");
+        std::fs::create_dir_all(&skill).unwrap();
+        std::fs::write(skill.join("SKILL.md"), "x").unwrap();
+
+        let tmux: Arc<dyn Tmux> = Arc::new(FakeTmux::new());
+        let supervisor = Arc::new(PolecatSupervisor::new(tmux.clone(), RestartConfig::default(), 8));
+        let template = SpawnTemplate {
+            rig: "hq".into(),
+            prefix: "hq".into(),
+            workdir: work.path().to_path_buf(),
+            command: "true".into(),
+            args: vec![],
+            base_env: vec![("GT_ROLE".to_string(), "polecat".to_string())],
+            heartbeat_dir: std::env::temp_dir(),
+        };
+        let alloc = Arc::new(Mutex::new(PoolAllocator::new(10, 5)));
+        let (tx, mut rx) = broadcast::channel::<EventRecord>(16);
+        let p = PolecatSupervisorPlugin::new("acme", tmux, template, supervisor, alloc)
+            .with_session_events(tx);
+
+        p.on_event(&record(SchedEvent::Dispatched { bead: "gg-1".into(), worker: "w1".into() }))
+            .await
+            .unwrap();
+        // agent.spawned.v1 first, then the operator marker.
+        assert_eq!(rx.try_recv().unwrap().kind, "agent.spawned.v1");
+        let op = rx.try_recv().expect("an operator record was emitted");
+        assert_eq!(op.kind, "issues.operated.v1");
+        let IssueOperatorEvent::Operated { bead, session, role, skills, hooks } =
+            op.decode::<IssueOperatorEvent>().unwrap()
+        else {
+            panic!("expected Operated");
+        };
+        assert_eq!(bead, "gg-1");
+        assert_eq!(session, "hq-gg-1");
+        assert_eq!(role, "polecat");
+        assert_eq!(skills, vec!["graphify".to_string()], "manifest carries the worktree skill");
+        assert!(!hooks.is_empty(), "manifest carries the loaded hook kinds");
+
+        p.on_event(&record(MergeEvent::Merged { bead: "gg-1".into(), sha: "abc".into() }))
+            .await
+            .unwrap();
+        assert_eq!(rx.try_recv().unwrap().kind, "agent.session-end.v1");
+        let cl = rx.try_recv().expect("an operator-cleared record was emitted");
+        assert_eq!(cl.kind, "issues.operator-cleared.v1");
+        let IssueOperatorEvent::Cleared { bead } = cl.decode::<IssueOperatorEvent>().unwrap() else {
+            panic!("expected Cleared");
+        };
+        assert_eq!(bead, "gg-1");
     }
 }
