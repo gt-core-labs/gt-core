@@ -42,6 +42,7 @@ pub mod git_merge;
 pub mod mcp;
 pub mod onboard;
 pub mod operator_event;
+pub mod operator_resource;
 pub mod polecat;
 pub mod quota_rotation;
 pub mod scope_bridge;

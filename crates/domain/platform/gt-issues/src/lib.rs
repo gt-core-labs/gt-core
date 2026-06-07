@@ -54,6 +54,10 @@ pub mod me;
 /// (`hq-web-extras.15`), mounted at `/api/v1/me` behind the `me.read` guard.
 pub mod me_module;
 mod module;
+/// Read-side seam for the agent operating a bead (`hq-agent-observability.3`): the
+/// [`operator::OperatorResource`] provider the composition root backs with an event-log fold, and
+/// [`operator::attach_operated_by`] which inlines its result as `operated_by` on a served row.
+pub mod operator;
 pub mod park;
 pub mod policy;
 pub mod readiness;
@@ -77,6 +81,7 @@ pub use http::{issues_router, ApiDoc, IssuesApiState};
 pub use me::{me_router, MeApiState, MeMembership, MeStatsSource};
 pub use me_module::MeModule;
 pub use module::IssuesModule;
+pub use operator::{attach_operated_by, OperatorResource};
 pub use park::{
     decide as park_decide, HumanPresence, IrreversibleKind, Operation, ParkDecision, ParkQueue,
     ParkedOp, Reversibility,

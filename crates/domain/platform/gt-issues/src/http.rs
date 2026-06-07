@@ -40,7 +40,7 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 
 use gt_store_dolt::{
-    AppError, ClaimOutcome, DoltIssues, IssueDetail, IssueFilter, WorkspacePools,
+    AppError, ClaimOutcome, DoltIssues, IssueFilter, WorkspacePools,
 };
 use gt_workspace::WorkspaceContext;
 
@@ -91,6 +91,11 @@ pub struct IssuesApiState {
     /// verification, the MCP-path degraded mode (a close is then not rejected for a missing/off-main
     /// sha — only the "code surface ⇒ commit_sha required" rule in the shared handler still applies).
     inspectors: Option<Arc<dyn InspectorProvider>>,
+    /// Resolves the agent operating each bead for the `operated_by` overlay
+    /// (`hq-agent-observability.3`). `Some` when the composition root wires the event-log-folding
+    /// provider; a `GET /` or `GET /:id` then inlines `operated_by` on each working bead. `None`
+    /// serves the rows exactly as before (no overlay).
+    operators: Option<Arc<dyn crate::operator::OperatorResource>>,
 }
 
 impl IssuesApiState {
@@ -105,6 +110,55 @@ impl IssuesApiState {
             event_sink: None,
             surfaces: Arc::new(AllowAllProvider),
             inspectors: None,
+            operators: None,
+        }
+    }
+
+    /// Wire the `operated_by` overlay provider (`hq-agent-observability.3`): a `GET /` snapshot and
+    /// `GET /:id` detail then inline `operated_by` for any bead an agent is currently operating, so
+    /// the frontend shows the agent chip live. Additive — without it the rows serve exactly as
+    /// before.
+    pub fn with_operators(mut self, operators: Arc<dyn crate::operator::OperatorResource>) -> Self {
+        self.operators = Some(operators);
+        self
+    }
+
+    /// Inline `operated_by` onto a serialized issues response (`hq-agent-observability.3`). Handles
+    /// the three served shapes: a `{rows:[…]}` page, a bare `[…]` array (the `?ready` frontier), or
+    /// a single detail object. A no-op when no operator provider is wired or `value` is none of
+    /// these. One provider query per response (every row id at once) so the log is folded once.
+    fn overlay_operators(&self, value: &mut serde_json::Value, workspace: Option<&str>) {
+        let Some(provider) = &self.operators else { return };
+        // The rows to overlay: a page's `rows`, the array itself, or the single object.
+        let rows: Vec<&serde_json::Value> = if let Some(rows) = value.get("rows").and_then(|r| r.as_array()) {
+            rows.iter().collect()
+        } else if let Some(arr) = value.as_array() {
+            arr.iter().collect()
+        } else {
+            vec![&*value]
+        };
+        let ids: Vec<String> = rows
+            .iter()
+            .filter_map(|r| r.get("id").and_then(|v| v.as_str()).map(str::to_string))
+            .collect();
+        if ids.is_empty() {
+            return;
+        }
+        let ops = provider.operators_for(workspace, &ids);
+        if ops.is_empty() {
+            return;
+        }
+        // Re-borrow mutably now that the id scan (immutable) is done.
+        if let Some(rows) = value.get_mut("rows").and_then(|r| r.as_array_mut()) {
+            for row in rows {
+                crate::operator::attach_operated_by(row, &ops);
+            }
+        } else if let Some(arr) = value.as_array_mut() {
+            for row in arr {
+                crate::operator::attach_operated_by(row, &ops);
+            }
+        } else {
+            crate::operator::attach_operated_by(value, &ops);
         }
     }
 
@@ -294,10 +348,18 @@ async fn list_issues(
         let deps = store.dep_index().await?;
         let tree = st.surfaces.surface_tree();
         let ready = filter_ready(rows, open_phase, &deps, tree.as_ref());
-        return Ok(Json(ready).into_response());
+        // hq-agent-observability.3: inline `operated_by` per row when an operator provider is
+        // wired (the bare `ready` array is rows too). Without one, serve the rows unchanged.
+        let ws = ctx.workspace();
+        let mut value = serde_json::to_value(&ready).map_err(|e| ApiError(AppError::Other(format!("encode issues: {e}"))))?;
+        st.overlay_operators(&mut value, Some(ws.as_str()));
+        return Ok(Json(value).into_response());
     }
     let page = read_issues_page(&store, &filter).await?;
-    Ok(Json(page).into_response())
+    let ws = ctx.workspace();
+    let mut value = serde_json::to_value(&page).map_err(|e| ApiError(AppError::Other(format!("encode issues: {e}"))))?;
+    st.overlay_operators(&mut value, Some(ws.as_str()));
+    Ok(Json(value).into_response())
 }
 
 /// Querystring for `GET /stats` (`hq-web-extras.12`). `group_by` is the required, comma-separated
@@ -394,10 +456,17 @@ async fn get_issue(
     State(st): State<IssuesApiState>,
     ctx: WorkspaceContext,
     Path(id): Path<String>,
-) -> Result<Json<IssueDetail>, ApiError> {
+) -> Result<Response, ApiError> {
     let store = st.resolve(&ctx).await?;
     match read_issue(&store, &id).await? {
-        Some(detail) => Ok(Json(detail)),
+        Some(detail) => {
+            // hq-agent-observability.3: inline `operated_by` when an agent is operating this bead.
+            let ws = ctx.workspace();
+            let mut value = serde_json::to_value(&detail)
+                .map_err(|e| ApiError(AppError::Other(format!("encode issue: {e}"))))?;
+            st.overlay_operators(&mut value, Some(ws.as_str()));
+            Ok(Json(value).into_response())
+        }
         None => Err(ApiError(AppError::NotFound(format!("issue {id}")))),
     }
 }

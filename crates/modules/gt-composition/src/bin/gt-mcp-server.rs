@@ -47,6 +47,7 @@ use gt_composition::mcp::{
     PgRigPrefixes, PgWorkspaceStatus, QuotaHandler, RigHandler, WorkspaceHandler, WsPoolRigs,
     WsPools,
 };
+use gt_composition::operator_resource::EventLogOperatorResource;
 use gt_composition::scope_bridge::bridge_scopes;
 use gt_composition::stream::{feed_router, FeedState};
 use gt_composition::onboard::{onboard_router, OnboardState};
@@ -165,7 +166,11 @@ async fn main() -> anyhow::Result<()> {
         None => IssuesApiState::new(store.clone(), actor.clone()),
     }
     // SSE feed (hq-issues-sse): a REST mutation publishes its event into the per-workspace log.
-    .with_event_sink(issue_sink.clone());
+    .with_event_sink(issue_sink.clone())
+    // operated_by overlay (hq-agent-observability.3): GET /api/v1/issues[/{id}] inlines which
+    // agent operates each bead + its skills/hooks, folded from the same per-workspace log the
+    // polecat supervisor emits issues.operated/cleared into, so the FE shows the live agent chip.
+    .with_operators(Arc::new(EventLogOperatorResource::new(event_log.clone())));
     // S2/S3 git verification on the REST surface (hq-platform-hardening.5) + the
     // `?ready` frontier's git tree (hq-platform-hardening.4): when GT_REPO_DIR is
     // set, wire the same git-backed surface tree + commit inspector the MCP path
