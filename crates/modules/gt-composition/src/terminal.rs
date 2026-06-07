@@ -304,6 +304,12 @@ fn build_command(target: &TerminalTarget) -> CommandBuilder {
                 if let Some(dir) = claude_config_dir {
                     cmd.arg("-e");
                     cmd.arg(format!("CLAUDE_CONFIG_DIR={dir}"));
+                    // claude 2.x refuses its global bypass-permissions mode under root ("cannot be
+                    // used with root/sudo privileges") and exits immediately; the mcp-server
+                    // container runs as root with no non-root user, so signal a sandboxed env
+                    // (`IS_SANDBOX=1`), which claude honours to allow it (`hq-term-dock.5`).
+                    cmd.arg("-e");
+                    cmd.arg("IS_SANDBOX=1");
                     cmd.arg("claude");
                 }
             } else {
@@ -536,7 +542,8 @@ mod tests {
             argv,
             vec![
                 "tmux", "-L", "gt-acme", "new-session", "-A", "-s", "hq-gg-1",
-                "-e", "CLAUDE_CONFIG_DIR=/var/lib/gt-core/accounts/abc", "claude"
+                "-e", "CLAUDE_CONFIG_DIR=/var/lib/gt-core/accounts/abc",
+                "-e", "IS_SANDBOX=1", "claude"
             ]
         );
         // No session ⇒ the original fresh shell.
