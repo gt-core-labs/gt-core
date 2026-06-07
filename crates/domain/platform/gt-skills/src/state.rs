@@ -65,6 +65,11 @@ impl Skill {
 pub struct RoleBinding {
     pub role: String,
     pub enabled_skills: BTreeSet<String>,
+    /// The role's system prompt (`hq-role-skills-term.4`): persona/instructions written as
+    /// `<workdir>/CLAUDE.md` for a session of this role. Empty when unset; `#[serde(default)]` keeps
+    /// pre-`.4` bindings replayable.
+    #[serde(default)]
+    pub prompt: String,
 }
 
 impl RoleBinding {
@@ -72,6 +77,7 @@ impl RoleBinding {
         Self {
             role: role.into(),
             enabled_skills: BTreeSet::new(),
+            prompt: String::new(),
         }
     }
 }
@@ -119,6 +125,15 @@ impl SkillCatalog {
             .get(role)
             .map(|b| b.enabled_skills.contains(skill))
             .unwrap_or(false)
+    }
+
+    /// The role's system prompt (`hq-role-skills-term.4`); `None` when unset/empty. The terminal
+    /// writes it as `<workdir>/CLAUDE.md`.
+    pub fn role_prompt(&self, role: &str) -> Option<String> {
+        self.bindings
+            .get(role)
+            .map(|b| b.prompt.clone())
+            .filter(|p| !p.trim().is_empty())
     }
 
     /// All skills enabled for `role`, in stable order. Empty when the role has no
@@ -180,6 +195,14 @@ impl SkillCatalog {
             .insert(skill.to_string());
     }
 
+    pub(crate) fn apply_set_role_prompt(&mut self, role: &str, prompt: &str) {
+        // Materialise the binding on first prompt-set so a role can carry a prompt before any skill.
+        self.bindings
+            .entry(role.to_string())
+            .or_insert_with(|| RoleBinding::new(role))
+            .prompt = prompt.to_string();
+    }
+
     pub(crate) fn apply_disable(&mut self, role: &str, skill: &str) {
         if let Some(b) = self.bindings.get_mut(role) {
             b.enabled_skills.remove(skill);
@@ -231,6 +254,9 @@ impl SkillState {
             }
             SkillEvent::DisabledForRole { role, skill, .. } => {
                 self.catalog.apply_disable(role, skill);
+            }
+            SkillEvent::RolePromptSet { role, prompt, .. } => {
+                self.catalog.apply_set_role_prompt(role, prompt);
             }
         }
     }

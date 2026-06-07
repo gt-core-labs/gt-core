@@ -40,6 +40,14 @@ pub enum SkillEvent {
         skill: String,
         now_secs: u64,
     },
+    /// A role's system prompt was set (`hq-role-skills-term.4`): the persona/instructions the
+    /// terminal writes as `<workdir>/CLAUDE.md` so claude loads them when a session of that role
+    /// opens. Empty `prompt` clears it.
+    RolePromptSet {
+        role: String,
+        prompt: String,
+        now_secs: u64,
+    },
 }
 
 impl EventKind for SkillEvent {
@@ -49,6 +57,7 @@ impl EventKind for SkillEvent {
             SkillEvent::Retired { .. } => "skills.retired.v1",
             SkillEvent::EnabledForRole { .. } => "skills.enabled-for-role.v1",
             SkillEvent::DisabledForRole { .. } => "skills.disabled-for-role.v1",
+            SkillEvent::RolePromptSet { .. } => "skills.role-prompt-set.v1",
         }
     }
 }

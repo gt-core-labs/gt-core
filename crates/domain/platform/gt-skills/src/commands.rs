@@ -217,6 +217,35 @@ impl Command for DisableSkillForRole {
     }
 }
 
+/// Set (or clear) a role's system prompt (`hq-role-skills-term.4`): the persona/instructions the
+/// terminal writes as `<workdir>/CLAUDE.md`. An empty `prompt` clears it. The role need not pre-exist
+/// — the reducer materialises the binding on first set, like [`EnableSkillForRole`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct SetRolePrompt {
+    pub role: String,
+    pub prompt: String,
+    pub now_secs: u64,
+}
+
+impl Command for SetRolePrompt {
+    type Output = SkillEvent;
+    type State = SkillCatalog;
+
+    fn validate(&self, _state: &Self::State) -> Result<(), AppError> {
+        validate_role_name(&self.role).map_err(AppError::Validation)
+    }
+
+    fn execute(&self, state: &mut Self::State) -> Result<Self::Output, AppError> {
+        self.validate(state)?;
+        state.apply_set_role_prompt(&self.role, &self.prompt);
+        Ok(SkillEvent::RolePromptSet {
+            role: self.role.clone(),
+            prompt: self.prompt.clone(),
+            now_secs: self.now_secs,
+        })
+    }
+}
+
 /// Tagged union of every command. The HTTP / MCP edge passes one of these into
 /// [`crate::actor::SkillHandle::exec`] without a per-variant fan-out.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -301,6 +330,25 @@ mod tests {
         register("alpha", &[], 1).execute(&mut state).unwrap();
         let err = register("alpha", &[], 2).validate(&state).unwrap_err();
         assert!(matches!(err, AppError::Validation(_)));
+    }
+
+    #[test]
+    fn set_role_prompt_stores_and_clears_the_role_prompt() {
+        // hq-role-skills-term.4: a role's prompt is stored on its binding (materialised on first
+        // set) and an empty prompt clears it.
+        let mut state = SkillCatalog::default();
+        let set = SetRolePrompt {
+            role: "witness".into(),
+            prompt: "You are the witness. Audit PRs.".into(),
+            now_secs: 1,
+        };
+        let ev = set.execute(&mut state).unwrap();
+        assert!(matches!(ev, SkillEvent::RolePromptSet { .. }));
+        assert_eq!(state.role_prompt("witness").as_deref(), Some("You are the witness. Audit PRs."));
+        // Clear it.
+        let clear = SetRolePrompt { role: "witness".into(), prompt: String::new(), now_secs: 2 };
+        clear.execute(&mut state).unwrap();
+        assert!(state.role_prompt("witness").is_none());
     }
 
     #[test]

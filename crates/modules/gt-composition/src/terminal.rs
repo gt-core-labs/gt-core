@@ -145,7 +145,9 @@ fn prepare_role_skills(
         .ok()?
         .catalog;
     let skill_ids = catalog.skills_for_role(&role);
-    if skill_ids.is_empty() {
+    let prompt = catalog.role_prompt(&role); // hq-role-skills-term.4
+    // Nothing role-specific to materialise → let claude open in the default dir.
+    if skill_ids.is_empty() && prompt.is_none() {
         return None;
     }
     let workdir = term_root.join(session);
@@ -159,6 +161,15 @@ fn prepare_role_skills(
         let dir = skills_dir.join(id);
         if std::fs::create_dir_all(&dir).is_ok()
             && std::fs::write(dir.join("SKILL.md"), &skill.body).is_ok()
+        {
+            wrote += 1;
+        }
+    }
+    // The role's system prompt → CLAUDE.md (claude auto-loads it as project instructions, so it
+    // rides a file instead of an injectable `--append-system-prompt` arg). hq-role-skills-term.4.
+    if let Some(p) = &prompt {
+        if std::fs::create_dir_all(&workdir).is_ok()
+            && std::fs::write(workdir.join("CLAUDE.md"), p).is_ok()
         {
             wrote += 1;
         }
@@ -683,10 +694,22 @@ mod tests {
         let term_root = dir.path().join("term");
         let cfg = dir.path().join("cfg"); // a throwaway CLAUDE_CONFIG_DIR for trust seeding
         std::fs::create_dir_all(&cfg).unwrap();
+        // A role prompt → CLAUDE.md (hq-role-skills-term.4).
+        log.append(
+            Some("acme"),
+            SkillEvent::RolePromptSet {
+                role: "witness".into(),
+                prompt: "You are the witness.".into(),
+                now_secs: 3,
+            },
+        )
+        .unwrap();
+
         let wd = prepare_role_skills(&log, &term_root, "acme", "w1", cfg.to_str().unwrap())
             .expect("witness has an enabled skill with a body");
         let skill_md = wd.join(".claude").join("skills").join("pr-list").join("SKILL.md");
         assert_eq!(std::fs::read_to_string(&skill_md).unwrap(), "# PR list\nlist open PRs");
+        assert_eq!(std::fs::read_to_string(wd.join("CLAUDE.md")).unwrap(), "You are the witness.");
 
         // A role with no enabled skills ⇒ None (claude launches in the default dir).
         log.append(

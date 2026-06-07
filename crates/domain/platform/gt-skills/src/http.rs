@@ -40,7 +40,9 @@ use serde_json::{json, Value};
 use gt_events::{AppError, Command};
 use gt_workspace::WorkspaceContext;
 
-use crate::commands::{DisableSkillForRole, EnableSkillForRole, RegisterSkill, RetireSkill};
+use crate::commands::{
+    DisableSkillForRole, EnableSkillForRole, RegisterSkill, RetireSkill, SetRolePrompt,
+};
 use crate::events::SkillEvent;
 
 use crate::state::{Skill, SkillCatalog};
@@ -122,6 +124,9 @@ pub fn skills_router(state: SkillsApiState) -> Router {
             "/:id/roles/:role",
             axum::routing::post(enable_skill_for_role).delete(disable_skill_for_role),
         )
+        // A role's system prompt (hq-role-skills-term.4): the CLAUDE.md the terminal writes for a
+        // session of that role. PUT ⇒ skills.write.
+        .route("/roles/:role/prompt", axum::routing::put(set_role_prompt))
         .with_state(state)
 }
 
@@ -272,6 +277,41 @@ async fn disable_skill_for_role(
     Ok((StatusCode::OK, Json(json!({ "role": cmd.role, "skill": cmd.skill }))).into_response())
 }
 
+/// `PUT /roles/{role}/prompt` body — the role's system prompt (`hq-role-skills-term.4`). An empty
+/// `prompt` clears it.
+#[derive(Debug, Deserialize)]
+struct RolePromptBody {
+    #[serde(default)]
+    prompt: String,
+}
+
+/// `PUT /roles/{role}/prompt` — set (or clear) a role's system prompt (`skills.write`,
+/// `hq-role-skills-term.4`). The terminal writes it as `<workdir>/CLAUDE.md` for a session of that
+/// role. Persists `skills.role-prompt-set.v1`.
+#[cfg_attr(feature = "axum", utoipa::path(
+    put, path = "/roles/{role}/prompt",
+    params(("role" = String, Path, description = "Role name")),
+    responses(
+        (status = 200, description = "Role prompt set"),
+        (status = 422, description = "Bad role name"),
+        (status = 501, description = "Write surface not enabled"),
+    ),
+))]
+async fn set_role_prompt(
+    State(st): State<SkillsApiState>,
+    ctx: WorkspaceContext,
+    Path(role): Path<String>,
+    Json(body): Json<RolePromptBody>,
+) -> Result<Response, ApiError> {
+    let writer = st.writer.as_ref().ok_or(ApiError::NotImplemented)?;
+    let ws = ctx.workspace();
+    let mut catalog = st.skills.catalog(ws.as_str()).await?;
+    let cmd = SetRolePrompt { role, prompt: body.prompt, now_secs: now_secs() };
+    let event = cmd.execute(&mut catalog).map_err(ApiError::from)?;
+    writer.append(ws.as_str(), event).await?;
+    Ok((StatusCode::OK, Json(json!({ "role": cmd.role }))).into_response())
+}
+
 /// `GET /` — every registered skill in the caller's workspace, in sorted order, with the per-role
 /// bindings the dashboard hydrates from.
 #[cfg_attr(feature = "axum", utoipa::path(
@@ -330,7 +370,8 @@ async fn get_skill(
     get_skill,
     retire_skill,
     enable_skill_for_role,
-    disable_skill_for_role
+    disable_skill_for_role,
+    set_role_prompt
 ))]
 pub struct ApiDoc;
 

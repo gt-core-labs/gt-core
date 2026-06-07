@@ -39,7 +39,8 @@ pub use http::{skills_router, SkillsApiState, SkillWriter, WorkspaceSkills};
 pub use module::SkillsHttpModule;
 pub use module::SkillsModule;
 pub use commands::{
-    DisableSkillForRole, EnableSkillForRole, RegisterSkill, RetireSkill, SkillCommand,
+    DisableSkillForRole, EnableSkillForRole, RegisterSkill, RetireSkill, SetRolePrompt,
+    SkillCommand,
 };
 pub use events::SkillEvent;
 pub use presets::agent_least_privilege_catalog;
