@@ -343,8 +343,14 @@ pub fn polecat_prompt(workspace: &str, bead: &str, branch: &str) -> String {
          `{bead}`. Read that bead and its acceptance criteria from the gt issue tracker (the `gt` MCP \
          tools, authenticated by the GT_TOKEN in your environment), then implement it end-to-end in \
          this checkout and commit your work on branch `{branch}`. Follow the repository conventions \
-         in CLAUDE.md. Work autonomously and do not ask for confirmation; when the work is delivered \
-         and committed, stop."
+         in CLAUDE.md. Work autonomously and do not ask for confirmation. \
+         When the work is delivered and committed, signal completion yourself (this is how the \
+         refinery learns to merge your branch — do not rely on any hook) by running EXACTLY this \
+         Bash command once: \
+         `d=\"$GT_CHANNEL_ROOT/merge-ready\"; mkdir -p \"$d\"; i=$(cat /proc/sys/kernel/random/uuid \
+         2>/dev/null || date +%s%N); printf '{{\"bead\":\"%s\",\"branch\":\"%s\"}}' \"$GT_HOOK_BEAD\" \
+         \"$GT_BRANCH\" > \"$d/.$i.tmp\" && mv \"$d/.$i.tmp\" \"$d/$i.event\"`  \
+         Then stop."
     )
 }
 
