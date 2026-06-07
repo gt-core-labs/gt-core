@@ -40,7 +40,7 @@ use serde_json::{json, Value};
 use gt_events::{AppError, Command};
 use gt_workspace::WorkspaceContext;
 
-use crate::commands::{RegisterSkill, RetireSkill};
+use crate::commands::{DisableSkillForRole, EnableSkillForRole, RegisterSkill, RetireSkill};
 use crate::events::SkillEvent;
 
 use crate::state::{Skill, SkillCatalog};
@@ -116,6 +116,12 @@ pub fn skills_router(state: SkillsApiState) -> Router {
     Router::new()
         .route("/", get(list_skills).post(register_skill))
         .route("/:id", get(get_skill).delete(retire_skill))
+        // Role bindings (hq-role-skills-term.2): enable/disable a skill for a role, which is what
+        // makes "a role = its skills" configurable. POST/DELETE ⇒ skills.write.
+        .route(
+            "/:id/roles/:role",
+            axum::routing::post(enable_skill_for_role).delete(disable_skill_for_role),
+        )
         .with_state(state)
 }
 
@@ -207,6 +213,65 @@ async fn retire_skill(
     Ok((StatusCode::OK, Json(json!({ "retired": cmd.skill }))).into_response())
 }
 
+/// `POST /{id}/roles/{role}` — enable skill `id` for `role` (`skills.write`,
+/// `hq-role-skills-term.2`). This is what defines "a role's skills": the terminal materialises
+/// exactly the skills a role has enabled. Validates (skill registered, not already bound) via the
+/// pure [`EnableSkillForRole`] command, then persists `skills.enabled-for-role.v1`.
+#[cfg_attr(feature = "axum", utoipa::path(
+    post, path = "/{id}/roles/{role}",
+    params(
+        ("id" = String, Path, description = "Skill id"),
+        ("role" = String, Path, description = "Role name"),
+    ),
+    responses(
+        (status = 201, description = "Skill enabled for the role"),
+        (status = 422, description = "Unknown skill / already enabled / bad shape"),
+        (status = 501, description = "Write surface not enabled"),
+    ),
+))]
+async fn enable_skill_for_role(
+    State(st): State<SkillsApiState>,
+    ctx: WorkspaceContext,
+    Path((id, role)): Path<(String, String)>,
+) -> Result<Response, ApiError> {
+    let writer = st.writer.as_ref().ok_or(ApiError::NotImplemented)?;
+    let ws = ctx.workspace();
+    let mut catalog = st.skills.catalog(ws.as_str()).await?;
+    let cmd = EnableSkillForRole { role, skill: id, now_secs: now_secs() };
+    let event = cmd.execute(&mut catalog).map_err(ApiError::from)?;
+    writer.append(ws.as_str(), event).await?;
+    Ok((StatusCode::CREATED, Json(json!({ "role": cmd.role, "skill": cmd.skill }))).into_response())
+}
+
+/// `DELETE /{id}/roles/{role}` — disable skill `id` for `role` (`skills.write`,
+/// `hq-role-skills-term.2`). Symmetric to [`enable_skill_for_role`]; persists
+/// `skills.disabled-for-role.v1`. `422` when the role does not currently have the skill.
+#[cfg_attr(feature = "axum", utoipa::path(
+    delete, path = "/{id}/roles/{role}",
+    params(
+        ("id" = String, Path, description = "Skill id"),
+        ("role" = String, Path, description = "Role name"),
+    ),
+    responses(
+        (status = 200, description = "Skill disabled for the role"),
+        (status = 422, description = "Role does not have the skill / bad shape"),
+        (status = 501, description = "Write surface not enabled"),
+    ),
+))]
+async fn disable_skill_for_role(
+    State(st): State<SkillsApiState>,
+    ctx: WorkspaceContext,
+    Path((id, role)): Path<(String, String)>,
+) -> Result<Response, ApiError> {
+    let writer = st.writer.as_ref().ok_or(ApiError::NotImplemented)?;
+    let ws = ctx.workspace();
+    let mut catalog = st.skills.catalog(ws.as_str()).await?;
+    let cmd = DisableSkillForRole { role, skill: id, now_secs: now_secs() };
+    let event = cmd.execute(&mut catalog).map_err(ApiError::from)?;
+    writer.append(ws.as_str(), event).await?;
+    Ok((StatusCode::OK, Json(json!({ "role": cmd.role, "skill": cmd.skill }))).into_response())
+}
+
 /// `GET /` — every registered skill in the caller's workspace, in sorted order, with the per-role
 /// bindings the dashboard hydrates from.
 #[cfg_attr(feature = "axum", utoipa::path(
@@ -259,7 +324,14 @@ async fn get_skill(
 /// builder mounts it under the module prefix and rewrites its relative paths to
 /// `/api/v1/skills/...`, so the `#[utoipa::path]` annotations stay prefix-free.
 #[derive(utoipa::OpenApi)]
-#[openapi(paths(list_skills, register_skill, get_skill, retire_skill))]
+#[openapi(paths(
+    list_skills,
+    register_skill,
+    get_skill,
+    retire_skill,
+    enable_skill_for_role,
+    disable_skill_for_role
+))]
 pub struct ApiDoc;
 
 /// HTTP wrapper over the skills errors so a handler can `?`-propagate them with the right status:
@@ -433,5 +505,25 @@ mod tests {
         let ev = ret.execute(&mut cat).unwrap();
         assert!(matches!(ev, SkillEvent::Retired { .. }));
         assert!(cat.get("graphify").is_none(), "retired skill is gone");
+    }
+
+    #[test]
+    fn enable_then_disable_role_binding_round_trips() {
+        // hq-role-skills-term.2: what the POST/DELETE /{id}/roles/{role} handlers run — bind a
+        // skill to a role (so it's part of that role's skill set) and unbind it.
+        let mut cat = seeded(); // has merge_admin + feed_viewer
+        let en = EnableSkillForRole { role: "witness".into(), skill: "feed_viewer".into(), now_secs: 1 };
+        let ev = en.execute(&mut cat).unwrap();
+        assert!(matches!(ev, SkillEvent::EnabledForRole { .. }));
+        assert_eq!(cat.skills_for_role("witness"), vec!["feed_viewer".to_string()]);
+
+        let dis = DisableSkillForRole { role: "witness".into(), skill: "feed_viewer".into(), now_secs: 2 };
+        let ev = dis.execute(&mut cat).unwrap();
+        assert!(matches!(ev, SkillEvent::DisabledForRole { .. }));
+        assert!(cat.skills_for_role("witness").is_empty());
+
+        // Enabling an unknown skill is a client error (handler maps to 422).
+        let bad = EnableSkillForRole { role: "witness".into(), skill: "ghost".into(), now_secs: 3 };
+        assert!(bad.execute(&mut cat).is_err());
     }
 }
