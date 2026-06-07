@@ -222,17 +222,20 @@ impl PgUsers {
         rows.iter().map(row_to_membership).collect()
     }
 
-    /// Every provisioned workspace slug, for a system admin's cross-tenant picker (hq-identity.3
-    /// system-admin extension). Sourced from the DISTINCT slugs in `public.user_workspaces`:
-    /// provisioning always seeds the creator's membership, so every workspace has ≥1 row here —
-    /// no dependency on the `gt-workspace` registry (which this crate deliberately does not import).
+    /// Every ACTIVE workspace slug, for a system admin's cross-tenant picker (hq-identity.3
+    /// system-admin extension). Sourced from the `public.workspaces` registry written by the
+    /// `gt-workspace` domain (a co-located table in the SAME Postgres, read by raw SQL — this crate
+    /// keeps NO `gt-workspace` dependency). `public.user_workspaces` is the wrong source: it only
+    /// holds GRANTED memberships, so a workspace with no member would be invisible to the admin who
+    /// must still reach it. Suspended/archived workspaces are excluded — the admin cannot switch
+    /// into a tenant that is no longer live.
     pub async fn all_workspaces(&self) -> Result<Vec<String>, AuthError> {
         let rows = sqlx::query_scalar::<_, String>(
-            "SELECT DISTINCT workspace_slug FROM public.user_workspaces ORDER BY workspace_slug",
+            "SELECT slug FROM public.workspaces WHERE status = 'active' ORDER BY slug",
         )
         .fetch_all(&self.pool)
         .await
-        .map_err(|e| AuthError::Backend(format!("user_workspaces postgres: {e}")))?;
+        .map_err(|e| AuthError::Backend(format!("workspaces registry postgres: {e}")))?;
         Ok(rows)
     }
 
