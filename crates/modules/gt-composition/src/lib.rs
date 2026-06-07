@@ -41,6 +41,7 @@ pub mod denial_audit;
 pub mod git_merge;
 pub mod mcp;
 pub mod onboard;
+pub mod hooks;
 pub mod operator_event;
 pub mod operator_resource;
 pub mod polecat;

@@ -35,6 +35,10 @@ gt-quota = { workspace = true, features = ["axum"] }
 # WorkspaceSkills port the composition EventLog provider backs (EventLogSkills replays the
 # tenant's `skills.*` stream into the catalog).
 gt-skills = { workspace = true, features = ["axum"] }
+# Global Claude Code hook registry (hq-hooks): the HooksStore port the composition EventLog
+# provider backs (EventLogHooks folds the global `hooks.*` stream), + the domain the `hooks.rs`
+# REST router + the terminal `.claude/settings.json` materialiser read through.
+gt-claude-hooks = { workspace = true }
 # Read-only feed.read REST surface (hq-web-extras.14): `axum` adds the surface + the
 # WorkspaceFeed port the composition EventLog provider backs (EventLogFeed folds the tenant's
 # whole log into the FeedState projection).

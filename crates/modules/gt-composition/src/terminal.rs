@@ -47,6 +47,7 @@ use gt_agent::SessionRegistry;
 use gt_auth::JwtClaims;
 use gt_polecat::tmux_server_name;
 use gt_quota::QuotaState;
+use gt_claude_hooks::HooksState;
 use gt_skills::{ModelConfig, SkillState};
 
 use crate::auth::SharedAuthenticator;
@@ -181,8 +182,15 @@ fn prepare_role_skills(
     let model = catalog.role_model(&role); // hq-role-model.1 — applies regardless of skills/prompt
     let skill_ids = catalog.skills_for_role(&role);
     let prompt = catalog.role_prompt(&role); // hq-role-skills-term.4
-    // No skills/prompt to materialise → no workdir, but the model config (if any) still rides.
-    if skill_ids.is_empty() && prompt.is_none() {
+    // The GLOBAL hook registry (hq-hooks): replay the `hooks.*` stream at the `None` scope and keep
+    // only the hooks whose target matches this session's (workspace, rig, role). `None` ⇒ nothing
+    // matches (or the log can't be read) — no settings.json is written.
+    let hooks_settings = log
+        .replay_domain(None, "hooks.", HooksState::default(), HooksState::apply)
+        .ok()
+        .and_then(|s| s.registry.settings_json_for(workspace, &rig, &role));
+    // No skills/prompt/hooks to materialise → no workdir, but the model config (if any) still rides.
+    if skill_ids.is_empty() && prompt.is_none() && hooks_settings.is_none() {
         return RoleLaunch { workdir: None, model };
     }
     let workdir = term_root.join(session);
@@ -220,6 +228,19 @@ fn prepare_role_skills(
             && std::fs::write(workdir.join("CLAUDE.md"), rendered).is_ok()
         {
             wrote += 1;
+        }
+    }
+    // The matching global hooks → `<workdir>/.claude/settings.json`, which claude auto-loads as
+    // project settings (hq-hooks). A session whose role has no skills/prompt but matches a global
+    // guard still gets a workdir purely for this file.
+    if let Some(settings) = &hooks_settings {
+        let claude_dir = workdir.join(".claude");
+        if std::fs::create_dir_all(&claude_dir).is_ok() {
+            if let Ok(body) = serde_json::to_string_pretty(settings) {
+                if std::fs::write(claude_dir.join("settings.json"), body).is_ok() {
+                    wrote += 1;
+                }
+            }
         }
     }
     if wrote == 0 {
@@ -863,6 +884,53 @@ mod tests {
         assert!(prepare_role_skills(&log, &term_root, "acme", "m1", cfg.to_str().unwrap())
             .workdir
             .is_none());
+    }
+
+    #[test]
+    fn prepare_role_skills_writes_matching_global_hooks_settings() {
+        // hq-hooks: a global hook whose target matches the session's (workspace, rig, role) is
+        // materialised into <workdir>/.claude/settings.json, even when the role has no skills/prompt.
+        use gt_agent::AgentEvent;
+        use gt_claude_hooks::{HookEvent, HookTarget};
+        use tempfile::TempDir;
+
+        let dir = TempDir::new().unwrap();
+        let log = EventLog::new(Some(dir.path().to_path_buf()));
+        log.append(
+            Some("acme"),
+            AgentEvent::Spawned {
+                session: "p1".into(),
+                rig: "hq".into(),
+                role: gt_agent::SessionRole::Dog(gt_agent::DogKind::Witness),
+                crew: None,
+                skills: vec![],
+                hooks: vec![],
+            },
+        )
+        .unwrap();
+        // A GLOBAL hook (None scope), all-empty target ⇒ applies to every session.
+        log.append(
+            None,
+            HookEvent::Registered {
+                id: "guard-rm".into(),
+                event: "PreToolUse".into(),
+                matcher: "Bash(rm -rf /*)".into(),
+                command: "echo BLOCKED && exit 2".into(),
+                target: HookTarget::default(),
+                now_secs: 1,
+            },
+        )
+        .unwrap();
+
+        let term_root = dir.path().join("term");
+        let cfg = dir.path().join("cfg");
+        std::fs::create_dir_all(&cfg).unwrap();
+        let launch = prepare_role_skills(&log, &term_root, "acme", "p1", cfg.to_str().unwrap());
+        let wd = launch.workdir.expect("a matching global hook forces a workdir");
+        let settings = std::fs::read_to_string(wd.join(".claude").join("settings.json")).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&settings).unwrap();
+        assert_eq!(v["hooks"]["PreToolUse"][0]["matcher"], "Bash(rm -rf /*)");
+        assert_eq!(v["hooks"]["PreToolUse"][0]["hooks"][0]["command"], "echo BLOCKED && exit 2");
     }
 
     #[tokio::test]

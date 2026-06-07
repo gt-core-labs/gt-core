@@ -38,6 +38,7 @@ use gt_orchestration::{ConvoyBoard, OrchEvent, OrchState, WorkspaceConvoy};
 use gt_quota::{AccountCatalog, AccountRegistry, QuotaEvent, QuotaState, WorkspaceQuota};
 use gt_rig::{DynRigRepository, PgRigs, WorkspaceRigs};
 use gt_skills::{SkillCatalog, SkillEvent, SkillState, SkillWriter, WorkspaceSkills};
+use gt_claude_hooks::{HookEvent, HooksRegistry, HooksState, HooksStore};
 
 use super::eventlog::EventLog;
 use super::pools::WsPools;
@@ -55,6 +56,11 @@ const MERGE_NS: &str = "merge.";
 /// The event-log kind prefix every skill event carries (`skills.*.v1`); the read-only REST
 /// surface replays exactly this stream into the catalog the dashboard hydrates from.
 const SKILLS_NS: &str = "skills.";
+
+/// The event-log kind prefix every hook event carries (`hooks.*.v1`). The hook registry is GLOBAL
+/// (replayed at the `None` event scope, not per-workspace), so this stream is folded once and
+/// filtered by a session's `(workspace, rig, role)` at materialisation, not at replay.
+const HOOKS_NS: &str = "hooks.";
 
 /// The event-log kind prefix every convoy event carries (`convoy.*.v1`); matches
 /// [`ConvoyHandler`](super::convoy::ConvoyHandler)'s replay filter so the REST surface and the
@@ -373,6 +379,36 @@ impl SkillWriter for EventLogSkills {
     /// the SSE feed carries `skills.registered.v1` / `skills.retired.v1` to the dashboard.
     async fn append(&self, workspace: &str, event: SkillEvent) -> Result<(), AppError> {
         self.log.append(Some(workspace), event).map_err(lift)
+    }
+}
+
+/// Store backing for the GLOBAL hook registry (`gt_claude_hooks::HooksStore`, `hq-hooks`): replays
+/// the `hooks.*` stream at the `None` event scope into the registry the `/api/v1/hooks` surface
+/// reads + the terminal materialises from, and appends register/retire events back into it. Unlike
+/// [`EventLogSkills`] this is **not** per-workspace — one global registry, each hook self-scoping
+/// via its [`HookTarget`](gt_claude_hooks::HookTarget).
+pub struct EventLogHooks {
+    log: Arc<EventLog>,
+}
+
+impl EventLogHooks {
+    /// Wrap the shared event log (the binary's single instance).
+    pub fn new(log: Arc<EventLog>) -> Self {
+        Self { log }
+    }
+}
+
+impl HooksStore for EventLogHooks {
+    fn registry(&self) -> Result<HooksRegistry, AppError> {
+        let state = self
+            .log
+            .replay_domain(None, HOOKS_NS, HooksState::default(), HooksState::apply)
+            .map_err(lift)?;
+        Ok(state.registry)
+    }
+
+    fn append(&self, event: HookEvent) -> Result<(), AppError> {
+        self.log.append(None, event).map_err(lift)
     }
 }
 

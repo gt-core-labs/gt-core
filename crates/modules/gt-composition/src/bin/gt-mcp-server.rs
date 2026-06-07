@@ -43,7 +43,7 @@ use gt_composition::denial_audit::audit_denials;
 use gt_composition::mcp::{
     AgentHandler, AuditHandler, CompositionTenantProvisioner, ConvoyHandler, DocumentsHandler,
     EventLog, EventLogConvoy, EventLogFeed, EventLogIssueSink, EventLogMerges, EventLogQuota,
-    EventLogSkills, FsAccountCatalog, GraphHandler, IdentityDoltMeStats, MergeHandler, PgDocumentsResource,
+    EventLogHooks, EventLogSkills, FsAccountCatalog, GraphHandler, IdentityDoltMeStats, MergeHandler, PgDocumentsResource,
     PgRigPrefixes, PgWorkspaceStatus, QuotaHandler, RigHandler, WorkspaceHandler, WsPoolRigs,
     WsPools,
 };
@@ -52,6 +52,8 @@ use gt_composition::scope_bridge::bridge_scopes;
 use gt_composition::stream::{feed_router, FeedState};
 use gt_composition::onboard::{onboard_router, OnboardState};
 use gt_composition::terminal::{terminal_router, TerminalState};
+use gt_composition::hooks::{hooks_router, HooksApiState};
+use gt_claude_hooks::HooksStore;
 use gt_docs_embed::Embedder;
 use gt_docs_extract::Extractor;
 use gt_graphindex::GraphifyIndexer;
@@ -476,6 +478,35 @@ async fn main() -> anyhow::Result<()> {
         ))
     });
 
+    // Global Claude Code hook registry (hq-hooks): GET/POST/DELETE /api/v1/hooks list/register/
+    // retire the global hook set the terminal materialises into a launching session's
+    // .claude/settings.json (filtered by the session's workspace/rig/role target). Mounted with an
+    // RS256 verifier; reads need `hooks.read`, writes `hooks.write` (the admin `*` satisfies both).
+    // The portable safety guards (rm -rf /, git push --force/-f) seed the GLOBAL log once, when the
+    // registry is empty. See `gt_composition::hooks`.
+    let hooks = verifier.as_ref().map(|v| {
+        let store = Arc::new(EventLogHooks::new(event_log.clone()));
+        if let Ok(reg) = store.registry() {
+            if reg.is_empty() {
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0);
+                let mut seeded = 0usize;
+                for ev in gt_claude_hooks::safety_guard_hooks(now) {
+                    if store.append(ev).is_ok() {
+                        seeded += 1;
+                    }
+                }
+                eprintln!("[gt-mcp-server] hooks: seeded {seeded} safety guard(s) into empty global registry");
+            }
+        }
+        eprintln!(
+            "[gt-mcp-server] hooks REST on /api/v1/hooks (cookie/bearer auth, scope hooks.read/write)"
+        );
+        hooks_router(HooksApiState::new(v.clone(), audit.clone(), store))
+    });
+
     // Orphan claude-credential GC (hq-quota-onboard-web.6): the backend is the only always-on
     // process, so it sweeps the accounts root on a timer and reaps dirs no live account points at
     // (a re-onboarded email replaces its dir, a retire drops one, an abandoned /start leaves an
@@ -540,6 +571,9 @@ async fn main() -> anyhow::Result<()> {
     }
     if let Some(onboard) = onboard {
         app = app.merge(onboard);
+    }
+    if let Some(hooks) = hooks {
+        app = app.merge(hooks);
     }
 
     // REST surface (hq-auth-routes.2): the module routers the kernel builder mounted

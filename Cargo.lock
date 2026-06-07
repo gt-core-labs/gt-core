@@ -1607,6 +1607,7 @@ dependencies = [
  "gt-auth",
  "gt-beads",
  "gt-channel",
+ "gt-claude-hooks",
  "gt-docs-embed",
  "gt-docs-extract",
  "gt-documents",
