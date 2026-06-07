@@ -8,11 +8,15 @@
 #
 # Best-effort by design: a failed/offline fetch keeps the binary baked at build time, so the server
 # still starts. Tunables:
-#   GT_RELEASE_URL  source tarball (default: gt-core-labs/gt `latest`, linux-gnu)
+#   GT_RELEASE_URL  source tarball (default: gt-core-labs/gt `latest`, linux-MUSL)
 #   GT_SKIP_UPDATE=1  skip the runtime fetch entirely (use the baked binary)
+#
+# MUSL not gnu: the runtime base is debian:bookworm (GLIBC 2.36) but the gnu release is built on a
+# newer GLIBC (ubuntu-latest), so the gnu binary aborts with `GLIBC_2.38 not found`. The musl asset
+# is statically linked and runs on any linux.
 set -e
 
-GT_RELEASE_URL="${GT_RELEASE_URL:-https://github.com/gt-core-labs/gt/releases/download/latest/gt-x86_64-unknown-linux-gnu.tar.gz}"
+GT_RELEASE_URL="${GT_RELEASE_URL:-https://github.com/gt-core-labs/gt/releases/download/latest/gt-x86_64-unknown-linux-musl.tar.gz}"
 
 if [ "${GT_SKIP_UPDATE:-0}" != "1" ]; then
     tmp="$(mktemp -d)"
