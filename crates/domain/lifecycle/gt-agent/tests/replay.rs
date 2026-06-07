@@ -16,6 +16,8 @@ fn make_events() -> Vec<AgentEvent> {
             rig: "granite".into(),
             role: SessionRole::Polecat,
             crew: None,
+            skills: Vec::new(),
+            hooks: Vec::new(),
         });
     }
     for i in 0..30 {

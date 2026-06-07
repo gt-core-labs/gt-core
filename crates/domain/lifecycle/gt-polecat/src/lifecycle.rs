@@ -87,6 +87,10 @@ impl SpawnSpec {
             rig: self.rig.clone(),
             role: SessionRole::Polecat,
             crew: self.crew.clone(),
+            // This lower-level spawn path carries no worktree manifest; the supervisor's sling
+            // path (gt-composition) stamps skills/hooks (hq-orch-sessions.2).
+            skills: Vec::new(),
+            hooks: Vec::new(),
         }
     }
 

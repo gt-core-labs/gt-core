@@ -118,6 +118,9 @@ impl DomainHandler for AgentHandler {
                         rig: a.rig,
                         role: a.role,
                         crew: a.crew,
+                        // A manual MCP spawn carries no worktree manifest (hq-orch-sessions.2).
+                        skills: Vec::new(),
+                        hooks: Vec::new(),
                     },
                     &session,
                 )

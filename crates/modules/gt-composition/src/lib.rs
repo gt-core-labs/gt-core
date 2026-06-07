@@ -725,6 +725,8 @@ mod session_minutes_tests {
                 rig: "hq".into(),
                 role: Default::default(),
                 crew: None,
+                skills: Vec::new(),
+                hooks: Vec::new(),
             },
             "2026-06-03T12:00:00Z",
         ))

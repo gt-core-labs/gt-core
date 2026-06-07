@@ -221,7 +221,15 @@ async fn spawn_session(
     let session = a.session.clone();
     let body = st.record(
         ws,
-        AgentEvent::Spawned { session: a.session, rig: a.rig, role: a.role, crew: a.crew },
+        AgentEvent::Spawned {
+            session: a.session,
+            rig: a.rig,
+            role: a.role,
+            crew: a.crew,
+            // A manual UI spawn has no worktree manifest (hq-orch-sessions.2).
+            skills: Vec::new(),
+            hooks: Vec::new(),
+        },
         &session,
     )?;
     Ok((StatusCode::CREATED, Json(body)).into_response())

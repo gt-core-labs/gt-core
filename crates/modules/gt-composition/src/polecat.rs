@@ -360,6 +360,18 @@ impl Plugin for PolecatSupervisorPlugin {
                     eprintln!("[polecat] sling failed for {bead}: {e}");
                     return Ok(());
                 }
+                // Compute the agent manifest once (hq-orch-sessions.2): skills from the FINAL
+                // workdir (the per-bead worktree when provisioned, else the shared checkout) + the
+                // static hook kinds. Feeds BOTH the session lifecycle (so /api/v1/agent shows the
+                // polecat's hooks/skills) and the issues operator chip. Role is the env's GT_ROLE.
+                let role_str = spec
+                    .env
+                    .iter()
+                    .find(|(k, _)| k == "GT_ROLE")
+                    .map(|(_, v)| v.clone())
+                    .unwrap_or_else(|| "polecat".to_string());
+                let skills = skills_from_worktree(&spec.workdir);
+                let hooks = hooks_from_settings();
                 // Open the agent session (hq-orchd.6): the slung polecat IS the session; its start
                 // timestamp anchors the session-minutes projection. Built before `watch` consumes
                 // the spec.
@@ -368,23 +380,17 @@ impl Plugin for PolecatSupervisorPlugin {
                     rig: spec.rig.clone(),
                     role: SessionRole::default(),
                     crew: spec.crew.clone(),
+                    skills: skills.clone(),
+                    hooks: hooks.clone(),
                 });
                 // Mark the bead's operating agent on the issues channel (hq-agent-observability.2)
-                // so the FE shows who works it + what they loaded. Manifest is read from the
-                // FINAL workdir (the per-bead worktree when provisioned, else the shared checkout)
-                // and the static hook template; role is the env's GT_ROLE, defaulting to polecat.
-                let role = spec
-                    .env
-                    .iter()
-                    .find(|(k, _)| k == "GT_ROLE")
-                    .map(|(_, v)| v.clone())
-                    .unwrap_or_else(|| "polecat".to_string());
+                // so the FE shows who works it + what they loaded.
                 self.emit_operator(IssueOperatorEvent::Operated {
                     bead: bead.clone(),
                     session: spec.session.clone(),
-                    role,
-                    skills: skills_from_worktree(&spec.workdir),
-                    hooks: hooks_from_settings(),
+                    role: role_str,
+                    skills,
+                    hooks,
                 });
                 self.supervisor.watch(spec);
                 Ok(())
@@ -787,8 +793,17 @@ mod tests {
         p.on_event(&record(SchedEvent::Dispatched { bead: "gg-1".into(), worker: "w1".into() }))
             .await
             .unwrap();
-        // agent.spawned.v1 first, then the operator marker.
-        assert_eq!(rx.try_recv().unwrap().kind, "agent.spawned.v1");
+        // agent.spawned.v1 first, carrying the SAME manifest (hq-orch-sessions.2) so /api/v1/agent
+        // shows the polecat's skills/hooks on the session, then the operator marker.
+        let spawned = rx.try_recv().unwrap();
+        assert_eq!(spawned.kind, "agent.spawned.v1");
+        let AgentEvent::Spawned { skills: sp_skills, hooks: sp_hooks, .. } =
+            spawned.decode::<AgentEvent>().unwrap()
+        else {
+            panic!("expected Spawned");
+        };
+        assert_eq!(sp_skills, vec!["graphify".to_string()], "session carries the worktree skill");
+        assert!(!sp_hooks.is_empty(), "session carries the loaded hook kinds");
         let op = rx.try_recv().expect("an operator record was emitted");
         assert_eq!(op.kind, "issues.operated.v1");
         let IssueOperatorEvent::Operated { bead, session, role, skills, hooks } =

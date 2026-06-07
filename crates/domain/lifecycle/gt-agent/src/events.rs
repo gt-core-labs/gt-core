@@ -19,6 +19,16 @@ pub enum AgentEvent {
         role: SessionRole,
         #[serde(default)]
         crew: Option<String>,
+        /// Skills the agent has loaded (its worktree `.claude/skills`), stamped by the polecat
+        /// supervisor at sling (`hq-orch-sessions.2`). Empty for sessions spawned without a
+        /// worktree (a manual `agent.spawn`). `#[serde(default)]` keeps pre-`.2` log entries
+        /// replayable.
+        #[serde(default)]
+        skills: Vec<String>,
+        /// Hook kinds loaded into the agent (`SessionStart`/`Stop`/…). Same provenance + back-compat
+        /// as `skills`.
+        #[serde(default)]
+        hooks: Vec<String>,
     },
     Heartbeat { session: String },
     SessionEnd { session: String },
