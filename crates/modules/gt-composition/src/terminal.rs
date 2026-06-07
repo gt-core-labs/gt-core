@@ -28,7 +28,7 @@ use std::io::{Read, Write};
 use axum::{
     extract::{
         ws::{Message, WebSocket, WebSocketUpgrade},
-        State,
+        Query, State,
     },
     http::{HeaderMap, Method, StatusCode},
     response::{IntoResponse, Response},
@@ -36,10 +36,12 @@ use axum::{
     Router,
 };
 use portable_pty::{native_pty_system, CommandBuilder, PtySize};
+use serde::Deserialize;
 use time::OffsetDateTime;
 use tokio::sync::mpsc;
 
 use gt_auth::JwtClaims;
+use gt_polecat::tmux_server_name;
 
 use crate::auth::SharedAuthenticator;
 use crate::denial_audit::{record_denial, SharedAudit, ANONYMOUS};
@@ -57,6 +59,42 @@ const SCOPE_WILDCARD: &str = "*";
 
 /// The route the terminal upgrade lives at — also the audited path on a denial.
 const TERMINAL_PATH: &str = "/api/v1/terminal/ws";
+
+/// Query params on the terminal upgrade (`hq-agent-observability.5`). `session` attaches the pty to
+/// a running agent's tmux instead of spawning a fresh shell, so an operator can watch what the
+/// agent is doing live; `write` opts into an interactive (non-read-only) attach.
+#[derive(Debug, Default, Deserialize)]
+struct TerminalParams {
+    /// The tmux session to attach to (a polecat's `<prefix>-<bead>`). Absent ⇒ a fresh `/bin/sh`,
+    /// the original behaviour.
+    session: Option<String>,
+    /// `true` ⇒ attach read-write (can type into the agent's session); default `false` ⇒ a
+    /// read-only attach, so watching never disturbs the agent.
+    #[serde(default)]
+    write: bool,
+}
+
+/// What the upgraded socket bridges its pty to.
+enum TerminalTarget {
+    /// A fresh login shell (no `session` param).
+    Shell,
+    /// Attach to a running tmux `session` on the workspace's tmux server, read-only unless `write`.
+    Attach { workspace: String, session: String, write: bool },
+}
+
+/// Validate a tmux session name from an untrusted query param. The name is passed to `tmux` as a
+/// **separate exec arg** (no shell), so the only injection risk is a value that `tmux` would read as
+/// a flag; we therefore allow only `[A-Za-z0-9._-]`, forbid a leading `-`, and cap the length.
+/// `None` ⇒ reject the upgrade rather than attach to an attacker-chosen target.
+fn sanitize_session(name: &str) -> Option<&str> {
+    let ok = !name.is_empty()
+        && name.len() <= 128
+        && !name.starts_with('-')
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'));
+    ok.then_some(name)
+}
 
 /// Everything the upgrade handler needs: the JWT verifier and the audit sink denials are
 /// recorded into. Built by the composition root only when auth + the env gate are on.
@@ -86,12 +124,31 @@ pub fn terminal_router(state: TerminalState) -> Router {
 async fn ws_upgrade(
     State(state): State<TerminalState>,
     headers: HeaderMap,
+    Query(params): Query<TerminalParams>,
     ws: WebSocketUpgrade,
 ) -> Response {
-    match authorize(&state, &headers) {
-        Ok(()) => ws.on_upgrade(run_pty),
-        Err((status, msg)) => (status, msg).into_response(),
-    }
+    let claims = match authorize(&state, &headers) {
+        Ok(claims) => claims,
+        Err((status, msg)) => return (status, msg).into_response(),
+    };
+    // Resolve the pty target: a `session` param attaches to that agent's tmux (read-only unless
+    // `write`), keyed to the caller's own workspace so one tenant can never attach to another's
+    // session; no param keeps the original fresh-shell behaviour. A present-but-malformed session
+    // is rejected (400) rather than silently downgraded to a shell.
+    let target = match params.session.as_deref() {
+        None => TerminalTarget::Shell,
+        Some(raw) => match sanitize_session(raw) {
+            Some(session) => TerminalTarget::Attach {
+                workspace: claims.workspace.clone(),
+                session: session.to_string(),
+                write: params.write,
+            },
+            None => {
+                return (StatusCode::BAD_REQUEST, "invalid session name").into_response();
+            }
+        },
+    };
+    ws.on_upgrade(move |socket| run_pty(socket, target))
 }
 
 /// Verify the token (cookie or bearer), gate its clock/workspace invariants, and require the
@@ -100,7 +157,7 @@ async fn ws_upgrade(
 fn authorize(
     state: &TerminalState,
     headers: &HeaderMap,
-) -> Result<(), (StatusCode, &'static str)> {
+) -> Result<JwtClaims, (StatusCode, &'static str)> {
     let reject = |status: StatusCode, msg: &'static str| -> (StatusCode, &'static str) {
         record_denial(
             state.audit.as_ref(),
@@ -135,7 +192,7 @@ fn authorize(
     if !has_scope(&claims.scopes, REQUIRED_SCOPE) {
         return Err(reject(StatusCode::FORBIDDEN, "missing terminal.exec scope"));
     }
-    Ok(())
+    Ok(claims)
 }
 
 /// True when `scopes` grants `required` outright or via the `*` superuser wildcard.
@@ -145,13 +202,42 @@ fn has_scope(scopes: &[String], required: &str) -> bool {
         .any(|s| s == SCOPE_WILDCARD || s == required)
 }
 
-/// Bridge an upgraded socket to a freshly-spawned `/bin/sh` pty until either side closes.
+/// Build the pty command for a [`TerminalTarget`]: a plain `/bin/sh`, or a `tmux attach` to the
+/// workspace's tmux server for the named session (read-only unless `write`). Both run with a
+/// `xterm-256color` `TERM`. The session name is pre-sanitized; the workspace comes from the
+/// verified claim — neither is shell-interpolated (exec args), so there is no injection surface.
+fn build_command(target: &TerminalTarget) -> CommandBuilder {
+    match target {
+        TerminalTarget::Shell => {
+            let mut cmd = CommandBuilder::new("/bin/sh");
+            cmd.env("TERM", "xterm-256color");
+            cmd
+        }
+        TerminalTarget::Attach { workspace, session, write } => {
+            let mut cmd = CommandBuilder::new("tmux");
+            cmd.arg("-L");
+            cmd.arg(tmux_server_name(workspace));
+            cmd.arg("attach-session");
+            cmd.arg("-t");
+            cmd.arg(session);
+            if !write {
+                cmd.arg("-r"); // read-only: watching never disturbs the agent
+            }
+            cmd.env("TERM", "xterm-256color");
+            cmd
+        }
+    }
+}
+
+/// Bridge an upgraded socket to a pty until either side closes. The pty runs a fresh `/bin/sh`
+/// ([`TerminalTarget::Shell`]) or a `tmux attach` to a running agent's session
+/// ([`TerminalTarget::Attach`], `hq-agent-observability.5`).
 ///
 /// A blocking std thread drains the pty master into a channel (the master reader is a blocking
 /// `Read`); the async loop multiplexes that channel onto the socket while forwarding inbound
 /// frames into the pty writer. On socket close, pty EOF, or any I/O error the child is killed
 /// and every handle dropped.
-async fn run_pty(mut socket: WebSocket) {
+async fn run_pty(mut socket: WebSocket, target: TerminalTarget) {
     let pair = match native_pty_system().openpty(PtySize {
         rows: 24,
         cols: 80,
@@ -165,8 +251,7 @@ async fn run_pty(mut socket: WebSocket) {
         }
     };
 
-    let mut cmd = CommandBuilder::new("/bin/sh");
-    cmd.env("TERM", "xterm-256color");
+    let cmd = build_command(&target);
     let mut child = match pair.slave.spawn_command(cmd) {
         Ok(child) => child,
         Err(_) => {
@@ -296,6 +381,47 @@ mod tests {
         assert!(has_scope(&["*".into()], REQUIRED_SCOPE));
         assert!(!has_scope(&["agent.write".into()], REQUIRED_SCOPE));
         assert!(!has_scope(&[], REQUIRED_SCOPE));
+    }
+
+    #[test]
+    fn sanitize_session_allows_polecat_names_and_rejects_injection() {
+        // A real polecat session name passes.
+        assert_eq!(sanitize_session("hq-gg-1"), Some("hq-gg-1"));
+        assert_eq!(sanitize_session("hq-agent-observability.5"), Some("hq-agent-observability.5"));
+        // Empty, flag-like, or shell-meta names are rejected (never reach tmux as a flag/arg).
+        assert!(sanitize_session("").is_none());
+        assert!(sanitize_session("-rkill").is_none(), "leading dash could be read as a flag");
+        assert!(sanitize_session("a b").is_none());
+        assert!(sanitize_session("a;rm -rf /").is_none());
+        assert!(sanitize_session("a$(whoami)").is_none());
+        assert!(sanitize_session(&"x".repeat(129)).is_none(), "over the length cap");
+    }
+
+    #[test]
+    fn build_command_attaches_read_only_by_default_and_writable_on_opt_in() {
+        // Read-only attach targets the workspace's tmux server with `-r`.
+        let ro = build_command(&TerminalTarget::Attach {
+            workspace: "acme".into(),
+            session: "hq-gg-1".into(),
+            write: false,
+        });
+        let argv: Vec<String> = ro.get_argv().iter().map(|s| s.to_string_lossy().into_owned()).collect();
+        assert_eq!(
+            argv,
+            vec!["tmux", "-L", "gt-acme", "attach-session", "-t", "hq-gg-1", "-r"]
+        );
+        // Write attach drops the `-r`.
+        let rw = build_command(&TerminalTarget::Attach {
+            workspace: "acme".into(),
+            session: "hq-gg-1".into(),
+            write: true,
+        });
+        let argv: Vec<String> = rw.get_argv().iter().map(|s| s.to_string_lossy().into_owned()).collect();
+        assert_eq!(argv, vec!["tmux", "-L", "gt-acme", "attach-session", "-t", "hq-gg-1"]);
+        // No session ⇒ the original fresh shell.
+        let sh = build_command(&TerminalTarget::Shell);
+        let argv: Vec<String> = sh.get_argv().iter().map(|s| s.to_string_lossy().into_owned()).collect();
+        assert_eq!(argv, vec!["/bin/sh"]);
     }
 
     #[test]
