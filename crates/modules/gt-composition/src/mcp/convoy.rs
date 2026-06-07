@@ -15,12 +15,14 @@ use async_trait::async_trait;
 use serde::de::DeserializeOwned;
 use serde_json::{json, Value};
 
+use gt_channel::Channel;
 use gt_events::{Command, EventKind};
 use gt_mcp_server::{DomainCtx, DomainHandler};
 use gt_module::McpTool;
 use gt_orchestration::{
     CompleteMember, Convoy, ConvoyBoard, FailMember, LaunchConvoy, OrchEvent, OrchState,
 };
+use gt_scheduling::dispatch::DispatchPayload;
 use gt_store_dolt::AppError;
 
 use super::eventlog::EventLog;
@@ -29,15 +31,59 @@ use super::util::{descriptor, ev_err, parse, req, str_arg};
 /// The event-log kind prefix for every convoy event (`convoy.*.v1`).
 const NS: &str = "convoy.";
 
+/// Queue priority for a convoy-dispatched member, matching the dispatch channel's own
+/// default (`gt_scheduling::dispatch::DispatchPayload`) — convoys carry no priority.
+const CONVOY_DISPATCH_PRIORITY: u8 = 1;
+
 /// Event-sourced handler for the `convoy.*` tool namespace.
 pub struct ConvoyHandler {
     log: Arc<EventLog>,
+    /// Optional bridge to the orchd scheduler. A `MemberDispatched` runs in THIS process
+    /// (the MCP server), but the polecat sling lives in the orchd daemon and there is no
+    /// cross-process event bus — the dispatch gt-channel is the IPC. When wired, each
+    /// dispatched member is dropped as a `{bead,priority}` request onto the same channel the
+    /// orchd dispatch loop consumes, so a `convoy.launch` actually slings a polecat. `None`
+    /// ⇒ events are still recorded but no sling fires (in-memory tests, GT_CHANNEL_ROOT
+    /// unset). (hq-daemons-health-20260607.2)
+    dispatch: Option<Arc<Channel>>,
 }
 
 impl ConvoyHandler {
     /// Wrap the per-workspace event log.
     pub fn new(log: Arc<EventLog>) -> Self {
-        Self { log }
+        Self {
+            log,
+            dispatch: None,
+        }
+    }
+
+    /// Wire the dispatch gt-channel so each `MemberDispatched` is bridged to the orchd
+    /// scheduler. Without it the handler only records convoy events (no sling).
+    pub fn with_dispatch_channel(mut self, channel: Arc<Channel>) -> Self {
+        self.dispatch = Some(channel);
+        self
+    }
+
+    /// Drop a `{bead,priority}` dispatch request onto the channel for one convoy member —
+    /// the same shape the orchd dispatch loop already consumes. Best-effort: a failure logs
+    /// but never fails the convoy call (the member is recorded; an operator can re-dispatch).
+    fn bridge_to_scheduler(&self, channel: &Channel, member: String) {
+        let payload = DispatchPayload {
+            bead: member,
+            title: None,
+            priority: CONVOY_DISPATCH_PRIORITY,
+        };
+        match serde_json::to_vec(&payload) {
+            Ok(bytes) => {
+                if let Err(e) = channel.emit(&bytes) {
+                    eprintln!(
+                        "[convoy] dispatch bridge: emit failed for {} — {e}",
+                        payload.bead
+                    );
+                }
+            }
+            Err(e) => eprintln!("[convoy] dispatch bridge: serialize failed — {e}"),
+        }
     }
 
     /// Rebuild the board from the workspace's convoy events.
@@ -57,8 +103,22 @@ impl ConvoyHandler {
         let mut board = self.board(ws)?;
         let events = cmd.execute(&mut board).map_err(ev_err)?;
         let kinds: Vec<String> = events.iter().map(|e| e.kind().to_string()).collect();
+        // Members this command feeds to crew — bridged to the orchd scheduler after the
+        // events are durable (the in-process hub never sees these cross-process events).
+        let dispatched: Vec<String> = events
+            .iter()
+            .filter_map(|e| match e {
+                OrchEvent::MemberDispatched { member, .. } => Some(member.clone()),
+                _ => None,
+            })
+            .collect();
         for event in events {
             self.log.append(ws, event)?;
+        }
+        if let Some(channel) = &self.dispatch {
+            for member in dispatched {
+                self.bridge_to_scheduler(channel, member);
+            }
         }
         Ok(json!({ "ok": true, "events": kinds }))
     }
@@ -215,5 +275,79 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(gone, AppError::NotFound(_)));
+    }
+
+    /// Read every queued dispatch request from a channel dir, parsed as the payload the
+    /// orchd dispatch loop consumes. Reads the files directly (no inotify) for determinism.
+    fn drain_dispatch(dir: &std::path::Path) -> Vec<DispatchPayload> {
+        let mut paths: Vec<_> = std::fs::read_dir(dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.path())
+            .filter(|p| p.extension().is_some_and(|x| x == "event"))
+            .collect();
+        paths.sort();
+        paths
+            .iter()
+            .map(|p| serde_json::from_slice(&std::fs::read(p).unwrap()).unwrap())
+            .collect()
+    }
+
+    /// With the bridge wired, a `convoy.launch` drops a `{bead,priority}` dispatch request
+    /// for the first member, and each handoff drops one for the next — the cross-process
+    /// signal that makes orchd actually sling a polecat (hq-daemons-health-20260607.2).
+    #[tokio::test]
+    async fn launch_and_handoff_bridge_members_to_the_dispatch_channel() {
+        let dir = TempDir::new().unwrap();
+        let chan_dir = TempDir::new().unwrap();
+        let channel = Channel::open(chan_dir.path(), "dispatch").unwrap();
+        let h = ConvoyHandler::new(Arc::new(EventLog::new(Some(dir.path().to_path_buf()))))
+            .with_dispatch_channel(Arc::new(channel));
+
+        h.dispatch(
+            "convoy.launch",
+            ctx(json!({ "convoy": "c1", "members": ["b1", "b2"] })),
+        )
+        .await
+        .unwrap();
+
+        let reqs = drain_dispatch(&chan_dir.path().join("dispatch"));
+        assert_eq!(
+            reqs.len(),
+            1,
+            "only the first member is dispatched on launch"
+        );
+        assert_eq!(reqs[0].bead, "b1");
+        assert_eq!(reqs[0].priority, CONVOY_DISPATCH_PRIORITY);
+
+        h.dispatch(
+            "convoy.complete-member",
+            ctx(json!({ "convoy": "c1", "member": "b1" })),
+        )
+        .await
+        .unwrap();
+
+        let reqs = drain_dispatch(&chan_dir.path().join("dispatch"));
+        let beads: Vec<&str> = reqs.iter().map(|r| r.bead.as_str()).collect();
+        assert!(
+            beads.contains(&"b2"),
+            "handoff dispatches the next member, got {beads:?}"
+        );
+    }
+
+    /// Without a wired channel the handler still records convoy events (no panic, no sling) —
+    /// the in-memory / GT_CHANNEL_ROOT-unset path is unchanged.
+    #[tokio::test]
+    async fn launch_without_a_channel_records_but_does_not_bridge() {
+        let dir = TempDir::new().unwrap();
+        let h = handler(&dir);
+        let out = h
+            .dispatch(
+                "convoy.launch",
+                ctx(json!({ "convoy": "c1", "members": ["b1"] })),
+            )
+            .await
+            .unwrap();
+        assert_eq!(out["ok"], true);
     }
 }

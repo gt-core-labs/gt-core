@@ -1175,6 +1175,39 @@ async fn build_domain_router(
         Some(dolt) => WorkspaceHandler::new(pool.clone()).with_dolt(dolt.clone()),
         None => WorkspaceHandler::new(pool.clone()),
     };
+    // Convoy → scheduler bridge (hq-daemons-health-20260607.2): a convoy.launch runs in THIS
+    // process, but the polecat sling lives in the orchd daemon and there is no cross-process
+    // event bus — the dispatch gt-channel is the IPC. Wire the ConvoyHandler to drop a
+    // {bead,priority} request onto the same channel the orchd dispatch loop consumes, so a
+    // convoy.launch actually slings a polecat. Gated on GT_CHANNEL_ROOT (the shared channel
+    // root both processes mount): unset ⇒ bridge off, convoy events are still recorded.
+    let convoy_handler = {
+        let handler = ConvoyHandler::new(event_log.clone());
+        match std::env::var("GT_CHANNEL_ROOT") {
+            Ok(root) => {
+                let name =
+                    std::env::var("GT_DISPATCH_CHANNEL").unwrap_or_else(|_| "dispatch".to_string());
+                match gt_channel::Channel::open(&root, &name) {
+                    Ok(channel) => {
+                        eprintln!(
+                            "[gt-mcp-server] convoy→scheduler bridge on — dispatch channel {root}/{name}"
+                        );
+                        handler.with_dispatch_channel(Arc::new(channel))
+                    }
+                    Err(e) => {
+                        eprintln!(
+                            "[gt-mcp-server] convoy→scheduler bridge off — channel open failed at {root}/{name}: {e}"
+                        );
+                        handler
+                    }
+                }
+            }
+            Err(_) => {
+                eprintln!("[gt-mcp-server] convoy→scheduler bridge off — GT_CHANNEL_ROOT unset");
+                handler
+            }
+        }
+    };
     let router = DomainRouter::new()
         .register(Arc::new(workspace_handler))
         .register(Arc::new(RigHandler::new(ws_pools.clone())))
@@ -1182,7 +1215,7 @@ async fn build_domain_router(
         .register(Arc::new(
             MergeHandler::new(event_log.clone()).with_rig_pools(ws_pools.clone()),
         ))
-        .register(Arc::new(ConvoyHandler::new(event_log.clone())))
+        .register(Arc::new(convoy_handler))
         .register(Arc::new(AgentHandler::new(event_log.clone())))
         .register(Arc::new(QuotaHandler::new(event_log.clone())))
         // graph.* read-only queries (hq-graphrig.10): graphify-backed indexer; the
