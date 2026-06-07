@@ -19,11 +19,38 @@
 use std::path::Path;
 use std::process::Command;
 
+/// The remote ref every per-polecat branch is cut from (`hq-orchd-deploy.22`). The daemon's rig
+/// checkout is cloned once and never pulled, so its local HEAD drifts behind the real `main`; cutting
+/// from `origin/main` (after a fetch) keeps each polecat on the current tip so the git-merge edge
+/// (`hq-orchd-deploy.12`) fast-forwards instead of rebasing every merge.
+const REMOTE_BASE_REF: &str = "origin/main";
+
+/// `git -C <base> fetch origin` argv — refresh the remote-tracking refs so the worktree below is cut
+/// from the current `origin/main`, not a stale clone-time tip (data, asserted in tests).
+fn fetch_argv() -> Vec<String> {
+    vec!["fetch".to_string(), "origin".to_string()]
+}
+
 /// The `git worktree add` argv (relative to a `-C <base>` invocation), as data so it can be
-/// asserted without running git. Branches `branch` off the base checkout's current HEAD (the rig
-/// checkout tracks `main`, mirroring CLAUDE.md's `-b <bead-id> main`). `--force` lets a re-create
-/// after a crash reuse a registered-but-stale path rather than abort the sling.
-fn add_argv(path: &Path, branch: &str) -> Vec<String> {
+/// asserted without running git. Branches `branch` off `base_ref` (the freshly-fetched
+/// `origin/main`, not the base checkout's drifting HEAD — `hq-orchd-deploy.22`), mirroring
+/// CLAUDE.md's `-b <bead-id> main`. `--force` lets a re-create after a crash reuse a
+/// registered-but-stale path rather than abort the sling.
+fn add_argv(path: &Path, branch: &str, base_ref: &str) -> Vec<String> {
+    vec![
+        "worktree".to_string(),
+        "add".to_string(),
+        "--force".to_string(),
+        path.display().to_string(),
+        "-b".to_string(),
+        branch.to_string(),
+        base_ref.to_string(),
+    ]
+}
+
+/// `git worktree add` argv cutting `branch` off the base checkout's current HEAD (no explicit start
+/// point) — the fallback when `origin/main` is unavailable (no remote, e.g. a local-only rig).
+fn add_off_head_argv(path: &Path, branch: &str) -> Vec<String> {
     vec![
         "worktree".to_string(),
         "add".to_string(),
@@ -56,13 +83,17 @@ fn remove_argv(path: &Path) -> Vec<String> {
     ]
 }
 
-/// Ensure a per-polecat worktree exists at `path`, branched `branch` off `base_repo`'s HEAD.
+/// Ensure a per-polecat worktree exists at `path`, branched `branch` off the current `origin/main`.
 ///
 /// Idempotent: if `path` already exists (a re-sling, or a crash-restart) it is reused as-is and no
-/// git runs. Otherwise `git -C base worktree add --force <path> -b <branch>` runs; if that fails
-/// because the branch already exists, it retries attaching the existing branch. Returns the path on
-/// success. Best-effort by contract: the caller logs and falls back to the shared checkout on
-/// failure, so a git hiccup never strands a sling.
+/// git runs. Otherwise it first `git -C base fetch origin` (best-effort) then
+/// `git -C base worktree add --force <path> -b <branch> origin/main`, so the polecat starts from the
+/// live `main` even though the daemon's rig checkout is cloned once and never pulled
+/// (`hq-orchd-deploy.22`) — the git-merge edge then fast-forwards instead of rebasing every merge.
+/// Falls back to cutting off the base HEAD when `origin/main` is unavailable (no remote), then to
+/// attaching the branch if it already exists. Returns the path on success. Best-effort by contract:
+/// the caller logs and falls back to the shared checkout on failure, so a git hiccup never strands a
+/// sling.
 pub fn provision(base_repo: &Path, path: &Path, branch: &str) -> std::io::Result<()> {
     if path.exists() {
         return Ok(());
@@ -75,10 +106,17 @@ pub fn provision(base_repo: &Path, path: &Path, branch: &str) -> std::io::Result
             .status()?;
         Ok(status.success())
     };
-    if run(&add_argv(path, branch))? {
+    // Refresh origin/main so the branch is cut from the live tip, not the stale clone (best-effort:
+    // a fetch failure just falls through to whatever origin/main is already known locally).
+    let _ = run(&fetch_argv());
+    if run(&add_argv(path, branch, REMOTE_BASE_REF))? {
         return Ok(());
     }
-    // The `-b` form fails if the branch already exists — attach it instead.
+    // No remote / origin/main missing (local-only rig) — cut off the base checkout's HEAD instead.
+    if run(&add_off_head_argv(path, branch))? {
+        return Ok(());
+    }
+    // The `-b` forms fail if the branch already exists — attach it instead.
     if run(&add_existing_branch_argv(path, branch))? {
         return Ok(());
     }
@@ -162,7 +200,10 @@ pub fn seed_user_hooks(config_dir: &Path) {
     match serde_json::to_string_pretty(&root) {
         Ok(s) => {
             if let Err(e) = std::fs::write(&target, s) {
-                eprintln!("[polecat] user hooks seed {} skipped: {e}", target.display());
+                eprintln!(
+                    "[polecat] user hooks seed {} skipped: {e}",
+                    target.display()
+                );
             }
         }
         Err(e) => eprintln!("[polecat] user hooks serialize skipped: {e}"),
@@ -184,11 +225,20 @@ pub fn seed_claude_onboarding(config_dir: &Path, worktree: &Path) {
         .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
         .unwrap_or_else(|| serde_json::json!({}));
     let Some(obj) = root.as_object_mut() else {
-        eprintln!("[polecat] .claude.json at {} is not an object — onboarding seed skipped", path.display());
+        eprintln!(
+            "[polecat] .claude.json at {} is not an object — onboarding seed skipped",
+            path.display()
+        );
         return;
     };
-    obj.insert("hasCompletedOnboarding".into(), serde_json::Value::Bool(true));
-    obj.insert("bypassPermissionsModeAccepted".into(), serde_json::Value::Bool(true));
+    obj.insert(
+        "hasCompletedOnboarding".into(),
+        serde_json::Value::Bool(true),
+    );
+    obj.insert(
+        "bypassPermissionsModeAccepted".into(),
+        serde_json::Value::Bool(true),
+    );
     obj.entry("theme")
         .or_insert_with(|| serde_json::Value::String("dark".into()));
     // Folder trust is per-project: mark THIS worktree path trusted + onboarded.
@@ -207,7 +257,10 @@ pub fn seed_claude_onboarding(config_dir: &Path, worktree: &Path) {
     match serde_json::to_string(&root) {
         Ok(s) => {
             if let Err(e) = std::fs::write(&path, s) {
-                eprintln!("[polecat] onboarding seed write {} skipped: {e}", path.display());
+                eprintln!(
+                    "[polecat] onboarding seed write {} skipped: {e}",
+                    path.display()
+                );
             }
         }
         Err(e) => eprintln!("[polecat] onboarding seed serialize skipped: {e}"),
@@ -216,7 +269,11 @@ pub fn seed_claude_onboarding(config_dir: &Path, worktree: &Path) {
 
 /// `chown -R <user> <path>` argv, as data so it can be asserted without shelling.
 fn chown_argv(path: &Path, user: &str) -> Vec<String> {
-    vec!["-R".to_string(), user.to_string(), path.display().to_string()]
+    vec![
+        "-R".to_string(),
+        user.to_string(),
+        path.display().to_string(),
+    ]
 }
 
 /// Hand a freshly-provisioned worktree to the non-root polecat user (`hq-quota-accounts.6`).
@@ -259,9 +316,10 @@ mod tests {
         let wt = PathBuf::from("/rig-wt/gt-hq-x.1");
         seed_claude_onboarding(cfg.path(), &wt);
 
-        let v: serde_json::Value =
-            serde_json::from_str(&std::fs::read_to_string(cfg.path().join(".claude.json")).unwrap())
-                .unwrap();
+        let v: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(cfg.path().join(".claude.json")).unwrap(),
+        )
+        .unwrap();
         assert_eq!(v["hasCompletedOnboarding"], serde_json::json!(true));
         assert_eq!(v["bypassPermissionsModeAccepted"], serde_json::json!(true));
         assert_eq!(v["theme"], serde_json::json!("light")); // preserved, not overwritten
@@ -282,12 +340,18 @@ mod tests {
         )
         .unwrap();
         seed_user_hooks(cfg.path());
-        let v: serde_json::Value =
-            serde_json::from_str(&std::fs::read_to_string(cfg.path().join("settings.json")).unwrap())
-                .unwrap();
-        assert_eq!(v["skipDangerousModePermissionPrompt"], serde_json::json!(true)); // preserved
+        let v: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(cfg.path().join("settings.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            v["skipDangerousModePermissionPrompt"],
+            serde_json::json!(true)
+        ); // preserved
         assert_eq!(v["_gt_managed"], serde_json::json!("polecat-hooks")); // overlaid
-        let stop = v["hooks"]["Stop"][0]["hooks"][0]["command"].as_str().unwrap();
+        let stop = v["hooks"]["Stop"][0]["hooks"][0]["command"]
+            .as_str()
+            .unwrap();
         assert!(stop.contains("merge-ready"));
     }
 
@@ -295,20 +359,45 @@ mod tests {
     fn seed_onboarding_creates_config_when_absent() {
         let cfg = tempfile::tempdir().unwrap();
         seed_claude_onboarding(cfg.path(), &PathBuf::from("/wt/a"));
-        let v: serde_json::Value =
-            serde_json::from_str(&std::fs::read_to_string(cfg.path().join(".claude.json")).unwrap())
-                .unwrap();
+        let v: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(cfg.path().join(".claude.json")).unwrap(),
+        )
+        .unwrap();
         assert_eq!(v["hasCompletedOnboarding"], serde_json::json!(true));
         assert_eq!(v["theme"], serde_json::json!("dark")); // default when none
     }
 
     #[test]
-    fn add_argv_branches_off_head_with_force() {
-        let argv = add_argv(&PathBuf::from("/wt/hq-gg-1"), "gg-1");
+    fn add_argv_branches_off_origin_main_with_force() {
+        // hq-orchd-deploy.22: the start point is origin/main (the live tip), not the rig's HEAD.
+        let argv = add_argv(&PathBuf::from("/wt/hq-gg-1"), "gg-1", REMOTE_BASE_REF);
+        assert_eq!(
+            argv,
+            vec![
+                "worktree",
+                "add",
+                "--force",
+                "/wt/hq-gg-1",
+                "-b",
+                "gg-1",
+                "origin/main"
+            ]
+        );
+    }
+
+    #[test]
+    fn add_off_head_argv_has_no_start_point() {
+        // The no-remote fallback cuts off the base HEAD (no explicit start ref).
+        let argv = add_off_head_argv(&PathBuf::from("/wt/hq-gg-1"), "gg-1");
         assert_eq!(
             argv,
             vec!["worktree", "add", "--force", "/wt/hq-gg-1", "-b", "gg-1"]
         );
+    }
+
+    #[test]
+    fn fetch_argv_refreshes_origin() {
+        assert_eq!(fetch_argv(), vec!["fetch", "origin"]);
     }
 
     #[test]
