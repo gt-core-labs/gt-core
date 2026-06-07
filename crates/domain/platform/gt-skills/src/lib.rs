@@ -39,13 +39,13 @@ pub use http::{skills_router, SkillsApiState, SkillWriter, WorkspaceSkills};
 pub use module::SkillsHttpModule;
 pub use module::SkillsModule;
 pub use commands::{
-    DisableSkillForRole, EnableSkillForRole, RegisterSkill, RetireSkill, SetRolePrompt,
-    SkillCommand, UpdateSkill,
+    DisableSkillForRole, EnableSkillForRole, RegisterSkill, RetireSkill, SetRoleModel,
+    SetRolePrompt, SkillCommand, UpdateSkill, PERMISSION_MODES,
 };
 pub use events::SkillEvent;
 pub use presets::agent_least_privilege_catalog;
 pub use repo::{InMemorySkills, SkillsRepository};
 pub use state::{
-    validate_role_name, validate_skill_id, RoleBinding, Skill, SkillCatalog, SkillState,
-    MAX_SKILL_ID_LEN,
+    validate_role_name, validate_skill_id, ModelConfig, RoleBinding, Skill, SkillCatalog,
+    SkillState, MAX_SKILL_ID_LEN,
 };

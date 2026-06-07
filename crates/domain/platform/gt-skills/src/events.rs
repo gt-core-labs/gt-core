@@ -48,6 +48,19 @@ pub enum SkillEvent {
         prompt: String,
         now_secs: u64,
     },
+    /// A role's model config was set (`hq-role-model.1`): the model id + permission mode + thinking
+    /// budget the terminal stamps onto the `claude` launch for a session of that role. An all-empty
+    /// config clears it. `#[serde(default)]` on the binding keeps pre-`hq-role-model` logs replayable.
+    RoleModelSet {
+        role: String,
+        /// The claude model id/alias (`claude --model <id>`); empty ⇒ account default.
+        model: String,
+        /// The permission mode (`claude --permission-mode <mode>`); empty ⇒ unset.
+        permission_mode: String,
+        /// The thinking-token budget (env `MAX_THINKING_TOKENS`); `None` ⇒ unset.
+        thinking_budget: Option<u32>,
+        now_secs: u64,
+    },
 }
 
 impl EventKind for SkillEvent {
@@ -58,6 +71,7 @@ impl EventKind for SkillEvent {
             SkillEvent::EnabledForRole { .. } => "skills.enabled-for-role.v1",
             SkillEvent::DisabledForRole { .. } => "skills.disabled-for-role.v1",
             SkillEvent::RolePromptSet { .. } => "skills.role-prompt-set.v1",
+            SkillEvent::RoleModelSet { .. } => "skills.role-model-set.v1",
         }
     }
 }

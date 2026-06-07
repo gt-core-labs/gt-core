@@ -60,6 +60,35 @@ impl Skill {
     }
 }
 
+/// Per-role model config (`hq-role-model.1`): the claude launch levers the terminal stamps onto a
+/// session of this role. All-default (empty model + empty mode + `None` budget) ⇒ "unset", and the
+/// terminal launches the bare `claude` with the account default. Only levers that exist for the
+/// interactive `claude` CLI live here: `--model`, `--permission-mode`, and the `MAX_THINKING_TOKENS`
+/// env (print/SDK-only knobs like `--max-turns` are intentionally absent — they would be inert).
+#[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ModelConfig {
+    /// The model id/alias (`claude --model <id>`); empty ⇒ account default.
+    #[serde(default)]
+    pub model: String,
+    /// The permission mode (`claude --permission-mode <mode>`); empty ⇒ unset. Validated against the
+    /// closed CLI set (`default`/`acceptEdits`/`plan`/`bypassPermissions`) at the command edge.
+    #[serde(default)]
+    pub permission_mode: String,
+    /// The thinking-token budget exported as `MAX_THINKING_TOKENS`; `None` ⇒ unset.
+    #[serde(default)]
+    pub thinking_budget: Option<u32>,
+}
+
+impl ModelConfig {
+    /// `true` when no lever is set — the role rides the account default, so the terminal launches a
+    /// bare `claude`. The `role_model` accessor uses this to collapse an all-empty config to `None`.
+    pub fn is_unset(&self) -> bool {
+        self.model.trim().is_empty()
+            && self.permission_mode.trim().is_empty()
+            && self.thinking_budget.is_none()
+    }
+}
+
 /// Per-role binding. `BTreeSet` so iteration is deterministic across replay.
 #[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RoleBinding {
@@ -70,6 +99,10 @@ pub struct RoleBinding {
     /// pre-`.4` bindings replayable.
     #[serde(default)]
     pub prompt: String,
+    /// The role's model config (`hq-role-model.1`): the `claude` launch levers for a session of this
+    /// role. `#[serde(default)]` keeps pre-`hq-role-model` bindings replayable.
+    #[serde(default)]
+    pub model_config: ModelConfig,
 }
 
 impl RoleBinding {
@@ -78,6 +111,7 @@ impl RoleBinding {
             role: role.into(),
             enabled_skills: BTreeSet::new(),
             prompt: String::new(),
+            model_config: ModelConfig::default(),
         }
     }
 }
@@ -134,6 +168,15 @@ impl SkillCatalog {
             .get(role)
             .map(|b| b.prompt.clone())
             .filter(|p| !p.trim().is_empty())
+    }
+
+    /// The role's model config (`hq-role-model.1`); `None` when unset (all-empty) so the terminal
+    /// launches the bare `claude` with the account default.
+    pub fn role_model(&self, role: &str) -> Option<ModelConfig> {
+        self.bindings
+            .get(role)
+            .map(|b| b.model_config.clone())
+            .filter(|m| !m.is_unset())
     }
 
     /// All skills enabled for `role`, in stable order. Empty when the role has no
@@ -203,6 +246,15 @@ impl SkillCatalog {
             .prompt = prompt.to_string();
     }
 
+    pub(crate) fn apply_set_role_model(&mut self, role: &str, config: ModelConfig) {
+        // Materialise the binding on first model-set so a role can carry a model config before any
+        // skill — symmetric with `apply_set_role_prompt`.
+        self.bindings
+            .entry(role.to_string())
+            .or_insert_with(|| RoleBinding::new(role))
+            .model_config = config;
+    }
+
     pub(crate) fn apply_disable(&mut self, role: &str, skill: &str) {
         if let Some(b) = self.bindings.get_mut(role) {
             b.enabled_skills.remove(skill);
@@ -257,6 +309,22 @@ impl SkillState {
             }
             SkillEvent::RolePromptSet { role, prompt, .. } => {
                 self.catalog.apply_set_role_prompt(role, prompt);
+            }
+            SkillEvent::RoleModelSet {
+                role,
+                model,
+                permission_mode,
+                thinking_budget,
+                ..
+            } => {
+                self.catalog.apply_set_role_model(
+                    role,
+                    ModelConfig {
+                        model: model.clone(),
+                        permission_mode: permission_mode.clone(),
+                        thinking_budget: *thinking_budget,
+                    },
+                );
             }
         }
     }

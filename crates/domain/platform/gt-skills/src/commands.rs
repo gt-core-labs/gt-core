@@ -309,6 +309,72 @@ impl Command for SetRolePrompt {
     }
 }
 
+/// The permission modes the interactive `claude` CLI accepts for `--permission-mode`. An empty
+/// string is also accepted by [`SetRoleModel`] (⇒ "leave the mode unset").
+pub const PERMISSION_MODES: [&str; 4] = ["default", "acceptEdits", "plan", "bypassPermissions"];
+
+/// Set (or clear) a role's model config (`hq-role-model.1`): the `claude` launch levers the terminal
+/// stamps onto a session of that role. An all-empty config clears it. Like [`SetRolePrompt`], the
+/// role need not pre-exist — the reducer materialises the binding on first set.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct SetRoleModel {
+    pub role: String,
+    /// The model id/alias (`claude --model <id>`); empty ⇒ account default.
+    #[serde(default)]
+    pub model: String,
+    /// The permission mode (`claude --permission-mode <mode>`); empty ⇒ unset. Validated against
+    /// [`PERMISSION_MODES`].
+    #[serde(default)]
+    pub permission_mode: String,
+    /// The thinking-token budget (env `MAX_THINKING_TOKENS`); `None` ⇒ unset.
+    #[serde(default)]
+    pub thinking_budget: Option<u32>,
+    pub now_secs: u64,
+}
+
+impl Command for SetRoleModel {
+    type Output = SkillEvent;
+    type State = SkillCatalog;
+
+    fn validate(&self, _state: &Self::State) -> Result<(), AppError> {
+        validate_role_name(&self.role).map_err(AppError::Validation)?;
+        // The model id is a free-form alias claude resolves; we only reject embedded whitespace so it
+        // stays a single exec arg (the terminal passes it unquoted to `claude --model`).
+        if self.model.trim() != self.model || self.model.split_whitespace().count() > 1 {
+            return Err(AppError::Validation(
+                "model id has surrounding or embedded whitespace".into(),
+            ));
+        }
+        if !self.permission_mode.is_empty() && !PERMISSION_MODES.contains(&self.permission_mode.as_str())
+        {
+            return Err(AppError::Validation(format!(
+                "permission_mode {:?} is not one of {PERMISSION_MODES:?}",
+                self.permission_mode
+            )));
+        }
+        Ok(())
+    }
+
+    fn execute(&self, state: &mut Self::State) -> Result<Self::Output, AppError> {
+        self.validate(state)?;
+        state.apply_set_role_model(
+            &self.role,
+            crate::state::ModelConfig {
+                model: self.model.clone(),
+                permission_mode: self.permission_mode.clone(),
+                thinking_budget: self.thinking_budget,
+            },
+        );
+        Ok(SkillEvent::RoleModelSet {
+            role: self.role.clone(),
+            model: self.model.clone(),
+            permission_mode: self.permission_mode.clone(),
+            thinking_budget: self.thinking_budget,
+            now_secs: self.now_secs,
+        })
+    }
+}
+
 /// Tagged union of every command. The HTTP / MCP edge passes one of these into
 /// [`crate::actor::SkillHandle::exec`] without a per-variant fan-out.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -441,6 +507,56 @@ mod tests {
         let clear = SetRolePrompt { role: "witness".into(), prompt: String::new(), now_secs: 2 };
         clear.execute(&mut state).unwrap();
         assert!(state.role_prompt("witness").is_none());
+    }
+
+    #[test]
+    fn set_role_model_stores_clears_and_validates() {
+        // hq-role-model.1: a role's model config is stored on its binding (materialised on first
+        // set); an all-empty config clears it; a bad permission mode is a client error.
+        let mut state = SkillCatalog::default();
+        let set = SetRoleModel {
+            role: "polecat".into(),
+            model: "opus".into(),
+            permission_mode: "acceptEdits".into(),
+            thinking_budget: Some(8000),
+            now_secs: 1,
+        };
+        let ev = set.execute(&mut state).unwrap();
+        assert!(matches!(ev, SkillEvent::RoleModelSet { .. }));
+        let m = state.role_model("polecat").unwrap();
+        assert_eq!(m.model, "opus");
+        assert_eq!(m.permission_mode, "acceptEdits");
+        assert_eq!(m.thinking_budget, Some(8000));
+
+        // Clear it: all-empty config collapses to None.
+        let clear = SetRoleModel {
+            role: "polecat".into(),
+            model: String::new(),
+            permission_mode: String::new(),
+            thinking_budget: None,
+            now_secs: 2,
+        };
+        clear.execute(&mut state).unwrap();
+        assert!(state.role_model("polecat").is_none());
+
+        // A permission mode outside the closed CLI set rejects without mutating.
+        let bad = SetRoleModel {
+            role: "polecat".into(),
+            model: String::new(),
+            permission_mode: "yolo".into(),
+            thinking_budget: None,
+            now_secs: 3,
+        };
+        assert!(bad.validate(&state).is_err());
+        // An embedded-whitespace model id rejects (must stay one exec arg).
+        let bad_model = SetRoleModel {
+            role: "polecat".into(),
+            model: "claude opus".into(),
+            permission_mode: String::new(),
+            thinking_budget: None,
+            now_secs: 4,
+        };
+        assert!(bad_model.validate(&state).is_err());
     }
 
     #[test]

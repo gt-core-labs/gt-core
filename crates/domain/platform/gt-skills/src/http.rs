@@ -41,7 +41,8 @@ use gt_events::{AppError, Command};
 use gt_workspace::WorkspaceContext;
 
 use crate::commands::{
-    DisableSkillForRole, EnableSkillForRole, RegisterSkill, RetireSkill, SetRolePrompt, UpdateSkill,
+    DisableSkillForRole, EnableSkillForRole, RegisterSkill, RetireSkill, SetRoleModel,
+    SetRolePrompt, UpdateSkill,
 };
 use crate::events::SkillEvent;
 
@@ -127,6 +128,9 @@ pub fn skills_router(state: SkillsApiState) -> Router {
         // A role's system prompt (hq-role-skills-term.4): the CLAUDE.md the terminal writes for a
         // session of that role. PUT ⇒ skills.write.
         .route("/roles/:role/prompt", axum::routing::put(set_role_prompt))
+        // A role's model config (hq-role-model.1): the claude launch levers the terminal stamps for
+        // a session of that role. PUT ⇒ skills.write.
+        .route("/roles/:role/model", axum::routing::put(set_role_model))
         .with_state(state)
 }
 
@@ -357,6 +361,51 @@ async fn set_role_prompt(
     Ok((StatusCode::OK, Json(json!({ "role": cmd.role }))).into_response())
 }
 
+/// `PUT /roles/{role}/model` body — the role's model config (`hq-role-model.1`). All-empty clears it.
+#[derive(Debug, Deserialize)]
+struct RoleModelBody {
+    #[serde(default)]
+    model: String,
+    #[serde(default)]
+    permission_mode: String,
+    #[serde(default)]
+    thinking_budget: Option<u32>,
+}
+
+/// `PUT /roles/{role}/model` — set (or clear) a role's model config (`skills.write`,
+/// `hq-role-model.1`). The terminal stamps these onto the `claude` launch (`--model`,
+/// `--permission-mode`, `MAX_THINKING_TOKENS`) for a session of that role. Persists
+/// `skills.role-model-set.v1`. `422` on a bad role name / permission mode / model id.
+#[cfg_attr(feature = "axum", utoipa::path(
+    put, path = "/roles/{role}/model",
+    params(("role" = String, Path, description = "Role name")),
+    responses(
+        (status = 200, description = "Role model config set"),
+        (status = 422, description = "Bad role name, permission mode, or model id"),
+        (status = 501, description = "Write surface not enabled"),
+    ),
+))]
+async fn set_role_model(
+    State(st): State<SkillsApiState>,
+    ctx: WorkspaceContext,
+    Path(role): Path<String>,
+    Json(body): Json<RoleModelBody>,
+) -> Result<Response, ApiError> {
+    let writer = st.writer.as_ref().ok_or(ApiError::NotImplemented)?;
+    let ws = ctx.workspace();
+    let mut catalog = st.skills.catalog(ws.as_str()).await?;
+    let cmd = SetRoleModel {
+        role,
+        model: body.model,
+        permission_mode: body.permission_mode,
+        thinking_budget: body.thinking_budget,
+        now_secs: now_secs(),
+    };
+    let event = cmd.execute(&mut catalog).map_err(ApiError::from)?;
+    writer.append(ws.as_str(), event).await?;
+    Ok((StatusCode::OK, Json(json!({ "role": cmd.role }))).into_response())
+}
+
 /// `GET /` — every registered skill in the caller's workspace, in sorted order, with the per-role
 /// bindings the dashboard hydrates from.
 #[cfg_attr(feature = "axum", utoipa::path(
@@ -417,7 +466,8 @@ async fn get_skill(
     retire_skill,
     enable_skill_for_role,
     disable_skill_for_role,
-    set_role_prompt
+    set_role_prompt,
+    set_role_model
 ))]
 pub struct ApiDoc;
 
