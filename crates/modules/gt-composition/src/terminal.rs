@@ -40,11 +40,15 @@ use serde::Deserialize;
 use time::OffsetDateTime;
 use tokio::sync::mpsc;
 
+use std::sync::Arc;
+
 use gt_auth::JwtClaims;
 use gt_polecat::tmux_server_name;
+use gt_quota::QuotaState;
 
 use crate::auth::SharedAuthenticator;
 use crate::denial_audit::{record_denial, SharedAudit, ANONYMOUS};
+use crate::mcp::eventlog::EventLog;
 
 /// The browser-nav JWT cookie the upgrade authenticates by (same as the SSE feed). A bearer
 /// header is accepted too, for non-browser clients.
@@ -86,12 +90,41 @@ fn is_truthy(v: Option<&str>) -> bool {
     )
 }
 
+/// Resolve the active claude account's `CLAUDE_CONFIG_DIR` for `workspace` by replaying the quota
+/// domain from the event log (`hq-term-dock.4`). Active = the most recent rotation target, else the
+/// first registered account (`BTreeMap` ⇒ deterministic). `None` when nothing is registered or the
+/// log can't be read — the caller then falls back to a bare shell. This is the container-reachable
+/// source of the active account (the linux keychain's live pointer lives in the host keyring).
+fn active_claude_config_dir(log: &EventLog, workspace: &str) -> Option<String> {
+    let state = log
+        .replay_domain(Some(workspace), "quota.", QuotaState::default(), QuotaState::apply)
+        .ok()?;
+    if state.registered.is_empty() {
+        return None;
+    }
+    let active = state
+        .rotations
+        .last()
+        .map(|(_, to)| to.clone())
+        .filter(|a| state.registered.contains_key(a))
+        .or_else(|| state.registered.keys().next().cloned())?;
+    state.registered.get(&active).cloned().filter(|d| !d.is_empty())
+}
+
 /// What the upgraded socket bridges its pty to.
 enum TerminalTarget {
     /// A fresh login shell (no `session` param).
     Shell,
     /// Attach to a running tmux `session` on the workspace's tmux server, read-only unless `write`.
-    Attach { workspace: String, session: String, write: bool },
+    /// `claude_config_dir` (`hq-term-dock.4`): when `write` and `Some`, the interactive session
+    /// launches `claude` with that account profile's `CLAUDE_CONFIG_DIR` instead of a bare shell, so
+    /// opening a session's terminal drops you into an authenticated claude.
+    Attach {
+        workspace: String,
+        session: String,
+        write: bool,
+        claude_config_dir: Option<String>,
+    },
 }
 
 /// Validate a tmux session name from an untrusted query param. The name is passed to `tmux` as a
@@ -114,12 +147,23 @@ fn sanitize_session(name: &str) -> Option<&str> {
 pub struct TerminalState {
     authenticator: SharedAuthenticator,
     audit: SharedAudit,
+    /// The per-workspace event log, replayed to resolve the active claude account's
+    /// `CLAUDE_CONFIG_DIR` when launching an interactive session (`hq-term-dock.4`). `None` ⇒ a
+    /// session attach opens a bare shell instead of claude.
+    accounts: Option<Arc<EventLog>>,
 }
 
 impl TerminalState {
     /// Bundle the shared verifier + audit sink for the terminal router.
     pub fn new(authenticator: SharedAuthenticator, audit: SharedAudit) -> Self {
-        Self { authenticator, audit }
+        Self { authenticator, audit, accounts: None }
+    }
+
+    /// Wire the event log used to resolve the active claude account (`hq-term-dock.4`): an
+    /// interactive session attach then launches `claude` with that account's `CLAUDE_CONFIG_DIR`.
+    pub fn with_active_accounts(mut self, log: Arc<EventLog>) -> Self {
+        self.accounts = Some(log);
+        self
     }
 }
 
@@ -147,14 +191,28 @@ async fn ws_upgrade(
     // `write`), keyed to the caller's own workspace so one tenant can never attach to another's
     // session; no param keeps the original fresh-shell behaviour. A present-but-malformed session
     // is rejected (400) rather than silently downgraded to a shell.
+    let write = is_truthy(params.write.as_deref());
     let target = match params.session.as_deref() {
         None => TerminalTarget::Shell,
         Some(raw) => match sanitize_session(raw) {
-            Some(session) => TerminalTarget::Attach {
-                workspace: claims.workspace.clone(),
-                session: session.to_string(),
-                write: is_truthy(params.write.as_deref()),
-            },
+            Some(session) => {
+                // For an interactive session, resolve the active claude account's config dir so the
+                // session launches an authenticated `claude` (hq-term-dock.4); absent ⇒ bare shell.
+                let claude_config_dir = if write {
+                    state
+                        .accounts
+                        .as_ref()
+                        .and_then(|log| active_claude_config_dir(log, &claims.workspace))
+                } else {
+                    None
+                };
+                TerminalTarget::Attach {
+                    workspace: claims.workspace.clone(),
+                    session: session.to_string(),
+                    write,
+                    claude_config_dir,
+                }
+            }
             None => {
                 return (StatusCode::BAD_REQUEST, "invalid session name").into_response();
             }
@@ -225,19 +283,29 @@ fn build_command(target: &TerminalTarget) -> CommandBuilder {
             cmd.env("TERM", "xterm-256color");
             cmd
         }
-        TerminalTarget::Attach { workspace, session, write } => {
+        TerminalTarget::Attach { workspace, session, write, claude_config_dir } => {
             let mut cmd = CommandBuilder::new("tmux");
             cmd.arg("-L");
             cmd.arg(tmux_server_name(workspace));
             if *write {
                 // Interactive: attach-OR-CREATE (`hq-session-terminal.1`). A session merely
                 // *recorded* (a manual `agent.spawn`) has no tmux yet; `new-session -A` creates it
-                // (a fresh shell) on first open, or attaches if a live agent already holds it — so
-                // the operator can actually communicate with the session.
+                // on first open, or attaches if a live agent already holds it.
                 cmd.arg("new-session");
                 cmd.arg("-A");
                 cmd.arg("-s");
                 cmd.arg(session);
+                // With an active claude account resolved (hq-term-dock.4), launch `claude` under
+                // that account's CLAUDE_CONFIG_DIR (set on the new session via tmux `-e`) instead of
+                // a bare shell — so opening a session drops into an authenticated claude. The
+                // `--dangerously-skip-permissions` bypass is configured globally in the account
+                // profile, so the bare `claude` is enough. The config dir comes from the trusted
+                // quota log, not user input — no shell, exec args only.
+                if let Some(dir) = claude_config_dir {
+                    cmd.arg("-e");
+                    cmd.arg(format!("CLAUDE_CONFIG_DIR={dir}"));
+                    cmd.arg("claude");
+                }
             } else {
                 // Read-only: attach to an EXISTING session to watch a live agent without
                 // disturbing it (closes cleanly if the session does not exist).
@@ -440,24 +508,72 @@ mod tests {
             workspace: "acme".into(),
             session: "hq-gg-1".into(),
             write: false,
+            claude_config_dir: None,
         });
         let argv: Vec<String> = ro.get_argv().iter().map(|s| s.to_string_lossy().into_owned()).collect();
         assert_eq!(
             argv,
             vec!["tmux", "-L", "gt-acme", "attach-session", "-t", "hq-gg-1", "-r"]
         );
-        // Write mode attaches-OR-CREATES (hq-session-terminal.1): new-session -A, no -r.
+        // Write mode without an account attaches-OR-CREATES a bare shell (hq-session-terminal.1).
         let rw = build_command(&TerminalTarget::Attach {
             workspace: "acme".into(),
             session: "hq-gg-1".into(),
             write: true,
+            claude_config_dir: None,
         });
         let argv: Vec<String> = rw.get_argv().iter().map(|s| s.to_string_lossy().into_owned()).collect();
         assert_eq!(argv, vec!["tmux", "-L", "gt-acme", "new-session", "-A", "-s", "hq-gg-1"]);
+        // Write mode WITH an active account launches claude under that profile (hq-term-dock.4).
+        let cl = build_command(&TerminalTarget::Attach {
+            workspace: "acme".into(),
+            session: "hq-gg-1".into(),
+            write: true,
+            claude_config_dir: Some("/var/lib/gt-core/accounts/abc".into()),
+        });
+        let argv: Vec<String> = cl.get_argv().iter().map(|s| s.to_string_lossy().into_owned()).collect();
+        assert_eq!(
+            argv,
+            vec![
+                "tmux", "-L", "gt-acme", "new-session", "-A", "-s", "hq-gg-1",
+                "-e", "CLAUDE_CONFIG_DIR=/var/lib/gt-core/accounts/abc", "claude"
+            ]
+        );
         // No session ⇒ the original fresh shell.
         let sh = build_command(&TerminalTarget::Shell);
         let argv: Vec<String> = sh.get_argv().iter().map(|s| s.to_string_lossy().into_owned()).collect();
         assert_eq!(argv, vec!["/bin/sh"]);
+    }
+
+    #[tokio::test]
+    async fn active_claude_config_dir_resolves_from_the_quota_log() {
+        // hq-term-dock.4: replay the quota domain → the active account's CLAUDE_CONFIG_DIR. Active
+        // is the last rotation target, else the first registered account.
+        use gt_quota::QuotaEvent;
+        use tempfile::TempDir;
+        let dir = TempDir::new().unwrap();
+        let log = EventLog::new(Some(dir.path().to_path_buf()));
+        log.append(
+            Some("acme"),
+            QuotaEvent::AccountRegistered { account: "acct-a".into(), config_dir: "/dirs/a".into(), now_secs: 0 },
+        )
+        .unwrap();
+        log.append(
+            Some("acme"),
+            QuotaEvent::AccountRegistered { account: "acct-b".into(), config_dir: "/dirs/b".into(), now_secs: 0 },
+        )
+        .unwrap();
+        // No rotation yet → first registered (BTreeMap order: acct-a).
+        assert_eq!(active_claude_config_dir(&log, "acme").as_deref(), Some("/dirs/a"));
+        // After rotating to b → b is active.
+        log.append(
+            Some("acme"),
+            QuotaEvent::Rotated { from_account: "acct-a".into(), to_account: "acct-b".into(), now_secs: 1 },
+        )
+        .unwrap();
+        assert_eq!(active_claude_config_dir(&log, "acme").as_deref(), Some("/dirs/b"));
+        // A workspace with no accounts resolves to None (caller falls back to a shell).
+        assert!(active_claude_config_dir(&log, "empty").is_none());
     }
 
     #[test]

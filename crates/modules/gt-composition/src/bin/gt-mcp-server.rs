@@ -440,7 +440,12 @@ async fn main() -> anyhow::Result<()> {
             eprintln!(
                 "[gt-mcp-server] terminal WS on GET /api/v1/terminal/ws (cookie/bearer auth, scope terminal.exec)"
             );
-            Some(terminal_router(TerminalState::new(v.clone(), audit.clone())))
+            // Wire the event log so an interactive session terminal launches `claude` under the
+            // active claude account's CLAUDE_CONFIG_DIR (hq-term-dock.4).
+            Some(terminal_router(
+                TerminalState::new(v.clone(), audit.clone())
+                    .with_active_accounts(event_log.clone()),
+            ))
         }
         _ => {
             eprintln!(
