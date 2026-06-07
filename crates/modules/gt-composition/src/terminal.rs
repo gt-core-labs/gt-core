@@ -121,6 +121,28 @@ fn active_claude_config_dir(log: &EventLog, workspace: &str) -> Option<String> {
 /// seed claude trust for the workdir (via the account `config_dir`) so it opens without the
 /// trust-folder prompt. `None` when the session has no role, the role enables no skills (with a
 /// body), or every write fails — the caller then launches claude in the default dir.
+/// Substitute role-prompt placeholders with the session's context (`hq-role-prompt-render.1`).
+/// Each `(token, value)` replaces every `<token>`, `{{ .token }}` (any inner spacing) and
+/// `{{token}}` occurrence — covering both the seeded `<X>` form and a raw gastown `{{ .X }}` /
+/// `{{ cmd }}` template. Unknown placeholders are left intact (claude reads them as literal text).
+fn render_prompt(prompt: &str, vars: &[(&str, String)]) -> String {
+    let mut out = prompt.to_string();
+    for (token, value) in vars {
+        for pat in [
+            format!("<{token}>"),
+            format!("{{{{ .{token} }}}}"),
+            format!("{{{{.{token}}}}}"),
+            format!("{{{{ {token} }}}}"),
+            format!("{{{{{token}}}}}"),
+        ] {
+            if out.contains(&pat) {
+                out = out.replace(&pat, value);
+            }
+        }
+    }
+    out
+}
+
 fn prepare_role_skills(
     log: &EventLog,
     term_root: &Path,
@@ -128,18 +150,17 @@ fn prepare_role_skills(
     session: &str,
     config_dir: &str,
 ) -> Option<PathBuf> {
-    let role = log
+    let registry = log
         .replay_domain(
             Some(workspace),
             "agent.",
             SessionRegistry::default(),
             SessionRegistry::apply,
         )
-        .ok()?
-        .get(session)?
-        .role
-        .as_str()
-        .to_string();
+        .ok()?;
+    let sess = registry.get(session)?;
+    let role = sess.role.as_str().to_string();
+    let rig = sess.rig.clone();
     let catalog = log
         .replay_domain(Some(workspace), "skills.", SkillState::default(), SkillState::apply)
         .ok()?
@@ -167,9 +188,22 @@ fn prepare_role_skills(
     }
     // The role's system prompt → CLAUDE.md (claude auto-loads it as project instructions, so it
     // rides a file instead of an injectable `--append-system-prompt` arg). hq-role-skills-term.4.
+    // Render the template placeholders with this session's real context (hq-role-prompt-render.1).
     if let Some(p) = &prompt {
+        let town_root = term_root.parent().unwrap_or(term_root).display().to_string();
+        let rendered = render_prompt(
+            p,
+            &[
+                ("WorkDir", workdir.display().to_string()),
+                ("RigName", rig.clone()),
+                ("TownRoot", town_root),
+                ("DefaultBranch", "main".to_string()),
+                ("Polecat", session.to_string()),
+                ("cmd", "gt".to_string()),
+            ],
+        );
         if std::fs::create_dir_all(&workdir).is_ok()
-            && std::fs::write(workdir.join("CLAUDE.md"), p).is_ok()
+            && std::fs::write(workdir.join("CLAUDE.md"), rendered).is_ok()
         {
             wrote += 1;
         }
@@ -647,6 +681,24 @@ mod tests {
         let sh = build_command(&TerminalTarget::Shell);
         let argv: Vec<String> = sh.get_argv().iter().map(|s| s.to_string_lossy().into_owned()).collect();
         assert_eq!(argv, vec!["/bin/sh"]);
+    }
+
+    #[test]
+    fn render_prompt_substitutes_known_placeholders_both_forms() {
+        // hq-role-prompt-render.1: <X>, {{ .X }} and {{ cmd }} all render; unknown stays intact.
+        let p = "Eres <RigName>. cwd <WorkDir>. raw {{ .RigName }} cmd {{ cmd }}. keep <DogName>.";
+        let out = render_prompt(
+            p,
+            &[
+                ("RigName", "gt_core".into()),
+                ("WorkDir", "/var/lib/gt-core/term/w1".into()),
+                ("cmd", "gt".into()),
+            ],
+        );
+        assert_eq!(
+            out,
+            "Eres gt_core. cwd /var/lib/gt-core/term/w1. raw gt_core cmd gt. keep <DogName>."
+        );
     }
 
     #[test]
