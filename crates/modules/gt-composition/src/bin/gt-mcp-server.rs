@@ -43,7 +43,7 @@ use gt_composition::denial_audit::audit_denials;
 use gt_composition::mcp::{
     AgentHandler, AuditHandler, CompositionTenantProvisioner, ConvoyHandler, DocumentsHandler,
     EventLog, EventLogConvoy, EventLogFeed, EventLogIssueSink, EventLogMerges, EventLogQuota,
-    EventLogSkills, GraphHandler, IdentityDoltMeStats, MergeHandler, PgDocumentsResource,
+    EventLogSkills, FsAccountCatalog, GraphHandler, IdentityDoltMeStats, MergeHandler, PgDocumentsResource,
     PgRigPrefixes, PgWorkspaceStatus, QuotaHandler, RigHandler, WorkspaceHandler, WsPoolRigs,
     WsPools,
 };
@@ -579,9 +579,20 @@ async fn main() -> anyhow::Result<()> {
             meta_tools,
         )))
         .module(AgentModule::with_http(AgentApiState::new(agent_root)))
-        .module(QuotaModule::with_http(QuotaApiState::new(Arc::new(
-            EventLogQuota::new(event_log.clone()),
-        ))))
+        // quota.*: per-workspace assignment (EventLogQuota) PLUS the deploy-global account pool
+        // (FsAccountCatalog over the accounts root) so `/api/v1/quota/catalog` lists onboarded
+        // accounts and `/:account/assign` attaches one to the active workspace (hq-quota-ws-accounts).
+        .module(QuotaModule::with_http(
+            QuotaApiState::new(Arc::new(EventLogQuota::new(event_log.clone()))).with_catalog(
+                Arc::new(FsAccountCatalog::new(
+                    gt_composition::account_dirs::accounts_root(
+                        &std::env::var("GT_EVENTLOG_ROOT")
+                            .map(std::path::PathBuf::from)
+                            .unwrap_or_else(|_| std::path::PathBuf::from(DEFAULT_EVENTLOG_ROOT)),
+                    ),
+                )),
+            ),
+        ))
         // merge.* (hq-fe-api-mount.3): the durable backing replays + appends the caller's
         // `merge.*` stream — the same event-sourced board the MCP MergeHandler folds into, so the
         // board survives restart (the actor's in-memory projection does not).

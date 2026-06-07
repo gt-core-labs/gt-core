@@ -145,6 +145,10 @@ fn parity_map(ns: &str) -> Vec<Route> {
             // Account onboarding (hq-quota-accounts.4): id in the body, not the path.
             rt("POST", "/account", Some("quota.register")),
             rt("DELETE", "/{account}", Some("quota.retire")),
+            // Workspace account assignment (hq-quota-ws-accounts.1/.2): REST-only — the deploy-global
+            // pool + attach an onboarded account to the active workspace. No MCP sibling.
+            rt("GET", "/catalog", None),
+            rt("POST", "/{account}/assign", None),
         ],
         "merge" => vec![
             rt("GET", "/", Some("merge.list")),

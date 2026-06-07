@@ -73,6 +73,24 @@ pub trait WorkspaceQuota: Send + Sync {
     async fn append(&self, workspace: &str, event: QuotaEvent) -> Result<(), AppError>;
 }
 
+/// The deploy-global catalog of onboarded claude accounts — every account whose credentials live
+/// on disk, independent of any workspace (`hq-quota-ws-accounts.1`).
+///
+/// Distinct from [`WorkspaceQuota`], which is the per-tenant *assignment* (which accounts a given
+/// workspace rotates through): the catalog is the *pool* a workspace assigns FROM. The composition
+/// root implements it over the accounts root (`GT_CLAUDE_ACCOUNTS_ROOT`); the module owns no
+/// filesystem policy, it only asks "what accounts exist" and "where are this one's creds".
+#[async_trait]
+pub trait AccountCatalog: Send + Sync {
+    /// Every onboarded account id (a credential dir exists for it), for the assignment picker.
+    async fn available(&self) -> Result<Vec<String>, AppError>;
+
+    /// The `CLAUDE_CONFIG_DIR` of an onboarded account, or `None` when no creds exist for it —
+    /// the path an assignment registers into the target workspace. Resolved at the edge so the FE
+    /// never handles host paths; assignment passes only the account id.
+    async fn config_dir(&self, account: &str) -> Result<Option<String>, AppError>;
+}
+
 /// Everything the quota REST handlers need, baked into the router with [`Router::with_state`]
 /// before it leaves [`quota_router`] so the merged application router carries no outstanding
 /// state type (the kernel's state-erased `Router<()>` contract).
@@ -81,12 +99,26 @@ pub struct QuotaApiState {
     /// The per-workspace event-log provider the binary supplies — the module owns no store of
     /// its own, exactly as the MCP `QuotaHandler` owns only its `EventLog`.
     quota: Arc<dyn WorkspaceQuota>,
+    /// The deploy-global account catalog (`hq-quota-ws-accounts.1`). `None` ⇒ no catalog wired, so
+    /// `/catalog` returns an empty pool and `/:account/assign` is unavailable (`422`).
+    catalog: Option<Arc<dyn AccountCatalog>>,
 }
 
 impl QuotaApiState {
-    /// Build the REST state over a per-workspace event-log provider.
+    /// Build the REST state over a per-workspace event-log provider. No catalog by default —
+    /// add one with [`with_catalog`](Self::with_catalog) to enable the assignment surface.
     pub fn new(quota: Arc<dyn WorkspaceQuota>) -> Self {
-        Self { quota }
+        Self {
+            quota,
+            catalog: None,
+        }
+    }
+
+    /// Wire the deploy-global account catalog, enabling `GET /catalog` (the assignable pool) and
+    /// `POST /:account/assign` (attach an onboarded account to the active workspace).
+    pub fn with_catalog(mut self, catalog: Arc<dyn AccountCatalog>) -> Self {
+        self.catalog = Some(catalog);
+        self
     }
 }
 
@@ -111,7 +143,10 @@ pub fn quota_router(state: QuotaApiState) -> Router {
         // `/account` (singular) is the onboarding collection POST — distinct from `/:account` so the
         // register body carries the id, not the path (the account does not exist yet).
         .route("/account", post(register_account))
+        // `/catalog` is the deploy-global pool (static segment, matched ahead of `/:account`).
+        .route("/catalog", get(list_catalog))
         .route("/:account", get(get_account).delete(retire_account))
+        .route("/:account/assign", post(assign_account))
         .route("/:account/sample", post(sample_account))
         .route("/:account/probe", post(probe_account))
         .route("/:account/rotate", post(rotate_account))
@@ -261,6 +296,70 @@ async fn retire_account(
     run(&st, ctx.workspace().as_str(), cmd).await
 }
 
+/// `GET /catalog` — the deploy-global pool of onboarded accounts, each flagged whether it is
+/// already assigned to the ACTIVE workspace (`hq-quota-ws-accounts.1`). The picker in
+/// Orchestration > Quota offers the unassigned ones; `/admin/quota` administers the pool itself
+/// (onboard/retire). Empty `accounts` when no catalog is wired.
+#[cfg_attr(feature = "axum", utoipa::path(
+    get, path = "/catalog",
+    responses((status = 200, description = "The deploy-global account pool, each flagged assigned to the active workspace")),
+))]
+async fn list_catalog(
+    State(st): State<QuotaApiState>,
+    ctx: WorkspaceContext,
+) -> Result<Json<Value>, ApiError> {
+    let Some(catalog) = st.catalog.as_ref() else {
+        return Ok(Json(json!({ "accounts": [] })));
+    };
+    let assigned = st.quota.registry(ctx.workspace().as_str()).await?;
+    let accounts: Vec<Value> = catalog
+        .available()
+        .await?
+        .into_iter()
+        .map(|id| {
+            let is_assigned = assigned.get(&id).is_some();
+            json!({ "id": id, "assigned": is_assigned })
+        })
+        .collect();
+    Ok(Json(json!({ "accounts": accounts })))
+}
+
+/// `POST /:account/assign` — attach an onboarded account from the catalog to the ACTIVE workspace
+/// without re-onboarding (`hq-quota-ws-accounts.2`). The creds dir is resolved from the catalog (so
+/// the caller passes only the id, never a host path) and registered into the workspace, emitting
+/// the same `quota.account_registered` a manual onboard would. The workspace is the auth context's,
+/// never the path. `422` when no catalog is wired or the account has no onboarded credentials;
+/// idempotent (re-assign upserts the same registration).
+#[cfg_attr(feature = "axum", utoipa::path(
+    post, path = "/{account}/assign",
+    params(("account" = String, Path, description = "Account id from the catalog")),
+    responses(
+        (status = 200, description = "Account assigned to the active workspace; emits quota.account_registered"),
+        (status = 422, description = "No catalog configured, or the account has no onboarded credentials"),
+    ),
+))]
+async fn assign_account(
+    State(st): State<QuotaApiState>,
+    ctx: WorkspaceContext,
+    Path(account): Path<String>,
+) -> Result<Json<Value>, ApiError> {
+    let catalog = st
+        .catalog
+        .as_ref()
+        .ok_or_else(|| ApiError(AppError::Validation("no account catalog configured".into())))?;
+    let config_dir = catalog.config_dir(&account).await?.ok_or_else(|| {
+        ApiError(AppError::Validation(format!(
+            "account {account} has no onboarded credentials"
+        )))
+    })?;
+    let cmd = RegisterAccount {
+        account,
+        config_dir,
+        now_secs: now_secs(),
+    };
+    run(&st, ctx.workspace().as_str(), cmd).await
+}
+
 /// Replay → execute → append: the REST mirror of the MCP `QuotaHandler::run`.
 ///
 /// Rehydrates the registry from the workspace log, runs the command's decide/apply against it
@@ -289,6 +388,8 @@ where
     rotate_account,
     register_account,
     retire_account,
+    list_catalog,
+    assign_account,
 ))]
 pub struct ApiDoc;
 
@@ -363,7 +464,15 @@ mod tests {
         // rewrite them. Every declared route must be present so the combined document is complete.
         let doc = ApiDoc::openapi();
         let paths: Vec<&str> = doc.paths.paths.keys().map(String::as_str).collect();
-        for expected in ["/", "/{account}", "/{account}/sample", "/{account}/probe", "/{account}/rotate"] {
+        for expected in [
+            "/",
+            "/{account}",
+            "/{account}/sample",
+            "/{account}/probe",
+            "/{account}/rotate",
+            "/catalog",
+            "/{account}/assign",
+        ] {
             assert!(paths.contains(&expected), "missing {expected} in {paths:?}");
         }
         // Prefix-free: the module builder, not the annotation, owns `/api/v1/quota`.
@@ -421,5 +530,135 @@ mod tests {
         )
         .unwrap_err();
         assert!(matches!(err.0, AppError::Validation(_)));
+    }
+
+    // --- catalog + assign (hq-quota-ws-accounts.1/.2) ------------------------------------------
+
+    use axum::body::Body;
+    use axum::http::Request;
+    use std::sync::Mutex;
+    use tower::ServiceExt; // oneshot
+
+    /// In-memory per-workspace quota double: an empty registry (so catalog flags read `assigned:
+    /// false`) and a recorder of the appended events, so a test can assert assign emitted a
+    /// register for the right workspace.
+    #[derive(Default)]
+    struct MockQuota {
+        appended: Mutex<Vec<(String, String)>>, // (workspace, event_kind)
+    }
+
+    #[async_trait]
+    impl WorkspaceQuota for MockQuota {
+        async fn registry(&self, _workspace: &str) -> Result<AccountRegistry, AppError> {
+            Ok(AccountRegistry::default())
+        }
+        async fn append(&self, workspace: &str, event: QuotaEvent) -> Result<(), AppError> {
+            self.appended
+                .lock()
+                .unwrap()
+                .push((workspace.to_string(), event.kind().to_string()));
+            Ok(())
+        }
+    }
+
+    /// In-memory catalog double: `ids` are the pool; `present` are the ids whose creds dir resolves
+    /// (so an assign of an id NOT in `present` yields `None` ⇒ 422).
+    struct MockCatalog {
+        ids: Vec<String>,
+        present: Vec<String>,
+    }
+
+    #[async_trait]
+    impl AccountCatalog for MockCatalog {
+        async fn available(&self) -> Result<Vec<String>, AppError> {
+            Ok(self.ids.clone())
+        }
+        async fn config_dir(&self, account: &str) -> Result<Option<String>, AppError> {
+            Ok(self
+                .present
+                .iter()
+                .any(|a| a == account)
+                .then(|| format!("/creds/{account}")))
+        }
+    }
+
+    fn router_with(catalog: bool) -> (Router, Arc<MockQuota>) {
+        let quota = Arc::new(MockQuota::default());
+        let mut state = QuotaApiState::new(quota.clone());
+        if catalog {
+            state = state.with_catalog(Arc::new(MockCatalog {
+                ids: vec!["acct-a".into(), "acct-b".into()],
+                present: vec!["acct-a".into()],
+            }));
+        }
+        (quota_router(state), quota)
+    }
+
+    /// Send a request through the router with the workspace header set, returning (status, body).
+    async fn send(router: Router, method: &str, path: &str) -> (StatusCode, Value) {
+        let req = Request::builder()
+            .method(method)
+            .uri(path)
+            .header(gt_workspace::WORKSPACE_HEADER, "ws1")
+            .body(Body::empty())
+            .unwrap();
+        let resp = router.oneshot(req).await.unwrap();
+        let status = resp.status();
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let body = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
+        (status, body)
+    }
+
+    #[tokio::test]
+    async fn catalog_lists_the_pool_flagging_assignment() {
+        let (router, _) = router_with(true);
+        let (status, body) = send(router, "GET", "/catalog").await;
+        assert_eq!(status, StatusCode::OK);
+        // Empty registry ⇒ every pool account reads assigned:false.
+        assert_eq!(
+            body,
+            json!({"accounts":[
+                {"id":"acct-a","assigned":false},
+                {"id":"acct-b","assigned":false},
+            ]})
+        );
+    }
+
+    #[tokio::test]
+    async fn catalog_is_empty_without_a_catalog_wired() {
+        let (router, _) = router_with(false);
+        let (status, body) = send(router, "GET", "/catalog").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body, json!({"accounts": []}));
+    }
+
+    #[tokio::test]
+    async fn assign_registers_a_catalog_account_into_the_active_workspace() {
+        let (router, quota) = router_with(true);
+        let (status, body) = send(router, "POST", "/acct-a/assign").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["event"], "quota.account_registered.v1");
+        // The register landed on the ACTIVE workspace (ws1), not the path/body.
+        let appended = quota.appended.lock().unwrap();
+        assert_eq!(
+            *appended,
+            vec![("ws1".to_string(), "quota.account_registered.v1".to_string())]
+        );
+    }
+
+    #[tokio::test]
+    async fn assign_unknown_account_is_unprocessable() {
+        // acct-b is in the pool listing but has no resolvable creds dir ⇒ 422, no append.
+        let (router, quota) = router_with(true);
+        let (status, _) = send(router, "POST", "/acct-b/assign").await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+        assert!(quota.appended.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn assign_without_a_catalog_is_unprocessable() {
+        let (router, _) = router_with(false);
+        let (status, _) = send(router, "POST", "/acct-a/assign").await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
     }
 }

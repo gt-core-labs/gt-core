@@ -35,7 +35,7 @@ use gt_merge::{
     MergeState, WorkspaceMerges,
 };
 use gt_orchestration::{ConvoyBoard, OrchEvent, OrchState, WorkspaceConvoy};
-use gt_quota::{AccountRegistry, QuotaEvent, QuotaState, WorkspaceQuota};
+use gt_quota::{AccountCatalog, AccountRegistry, QuotaEvent, QuotaState, WorkspaceQuota};
 use gt_rig::{DynRigRepository, PgRigs, WorkspaceRigs};
 use gt_skills::{SkillCatalog, SkillEvent, SkillState, SkillWriter, WorkspaceSkills};
 
@@ -130,6 +130,62 @@ impl WorkspaceQuota for EventLogQuota {
 
     async fn append(&self, workspace: &str, event: QuotaEvent) -> Result<(), AppError> {
         self.log.append(Some(workspace), event).map_err(lift)
+    }
+}
+
+/// REST backing for the deploy-global account catalog (`gt_quota::AccountCatalog`,
+/// `hq-quota-ws-accounts.1`): the onboarded claude accounts whose credential dirs live under the
+/// accounts root (`GT_CLAUDE_ACCOUNTS_ROOT`, the same root the onboarding flow + daemon write/read).
+/// Workspace-independent — the pool a tenant assigns FROM, distinct from [`EventLogQuota`] (which
+/// accounts a tenant has assigned). An account is any direct, non-empty sub-dir (a bare `/start`
+/// placeholder with no creds yet is skipped); its id is the dir basename.
+pub struct FsAccountCatalog {
+    root: std::path::PathBuf,
+}
+
+impl FsAccountCatalog {
+    /// Wrap the accounts root (`crate::account_dirs::accounts_root`).
+    pub fn new(root: std::path::PathBuf) -> Self {
+        Self { root }
+    }
+}
+
+/// An onboarded account dir: exists, is a directory, and is non-empty (holds creds). A bare
+/// `/start` placeholder created before `/complete` writes the credentials is empty ⇒ not onboarded.
+fn is_onboarded(path: &std::path::Path) -> bool {
+    path.is_dir()
+        && std::fs::read_dir(path)
+            .map(|mut d| d.next().is_some())
+            .unwrap_or(false)
+}
+
+#[async_trait]
+impl AccountCatalog for FsAccountCatalog {
+    async fn available(&self) -> Result<Vec<String>, AppError> {
+        let Ok(entries) = std::fs::read_dir(&self.root) else {
+            // No root yet (nothing onboarded) ⇒ an empty pool, not an error.
+            return Ok(Vec::new());
+        };
+        let mut ids = Vec::new();
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if is_onboarded(&path) {
+                if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
+                    ids.push(name.to_string());
+                }
+            }
+        }
+        ids.sort();
+        Ok(ids)
+    }
+
+    async fn config_dir(&self, account: &str) -> Result<Option<String>, AppError> {
+        // Sanitize the id to a single safe component, then require the creds dir to be onboarded
+        // (exists + non-empty) — symmetric with `available`, so an empty placeholder is not assignable.
+        let Some(dir) = crate::account_dirs::account_config_dir(&self.root, account) else {
+            return Ok(None);
+        };
+        Ok(is_onboarded(&dir).then(|| dir.to_string_lossy().into_owned()))
     }
 }
 
@@ -427,6 +483,43 @@ mod tests {
 
     fn slot(bead: &str, branch: &str, state: MergeSlotState) -> MergeSlot {
         MergeSlot { bead: bead.into(), branch: branch.into(), state }
+    }
+
+    /// `FsAccountCatalog` lists only non-empty account dirs (a bare `/start` placeholder is
+    /// skipped) and resolves `config_dir` only for an onboarded account, rejecting traversal.
+    #[tokio::test]
+    async fn fs_account_catalog_lists_onboarded_and_resolves_creds() {
+        let dir = TempDir::new().unwrap();
+        let root = dir.path();
+        // Two onboarded accounts (creds file present) + one empty placeholder + a plain file.
+        for acct in ["acct-a", "acct-b"] {
+            std::fs::create_dir(root.join(acct)).unwrap();
+            std::fs::write(root.join(acct).join(".credentials.json"), b"{}").unwrap();
+        }
+        std::fs::create_dir(root.join("starting")).unwrap(); // empty ⇒ skipped
+        std::fs::write(root.join("not-a-dir"), b"x").unwrap();
+
+        let cat = FsAccountCatalog::new(root.to_path_buf());
+        assert_eq!(
+            cat.available().await.unwrap(),
+            vec!["acct-a".to_string(), "acct-b".to_string()]
+        );
+        // An onboarded account resolves to its dir; the placeholder + an unknown id do not.
+        assert_eq!(
+            cat.config_dir("acct-a").await.unwrap(),
+            Some(root.join("acct-a").to_string_lossy().into_owned())
+        );
+        assert_eq!(cat.config_dir("starting").await.unwrap(), None);
+        assert_eq!(cat.config_dir("ghost").await.unwrap(), None);
+        // A path-traversal id is rejected (sanitized to None), never escaping the root.
+        assert_eq!(cat.config_dir("../../etc").await.unwrap(), None);
+    }
+
+    /// A missing accounts root is an empty pool, not an error.
+    #[tokio::test]
+    async fn fs_account_catalog_missing_root_is_empty() {
+        let cat = FsAccountCatalog::new(std::path::PathBuf::from("/no/such/accounts/root"));
+        assert!(cat.available().await.unwrap().is_empty());
     }
 
     /// A slot upserted through the backing survives a fresh provider over the same on-disk log —
