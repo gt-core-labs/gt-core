@@ -1581,6 +1581,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "gt-claude-hooks"
+version = "0.1.0"
+dependencies = [
+ "gt-events",
+ "gt-module",
+ "schemars 0.8.22",
+ "semver",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "gt-composition"
 version = "0.1.0"
 dependencies = [

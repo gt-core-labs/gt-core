@@ -25,6 +25,7 @@ members = [
     "crates/domain/platform/gt-terminal",
     "crates/domain/platform/gt-feed",
     "crates/domain/platform/gt-skills",
+    "crates/domain/platform/gt-claude-hooks",
     "crates/domain/platform/gt-documents",
     "crates/domain/lifecycle/gt-agent",
     "crates/domain/lifecycle/gt-polecat",
@@ -182,6 +183,7 @@ gt-issues        = { path = "crates/domain/platform/gt-issues" }
 gt-rig           = { path = "crates/domain/platform/gt-rig" }
 gt-feed          = { path = "crates/domain/platform/gt-feed" }
 gt-skills        = { path = "crates/domain/platform/gt-skills" }
+gt-claude-hooks  = { path = "crates/domain/platform/gt-claude-hooks" }
 gt-documents     = { path = "crates/domain/platform/gt-documents" }
 gt-agent         = { path = "crates/domain/lifecycle/gt-agent" }
 gt-polecat       = { path = "crates/domain/lifecycle/gt-polecat" }

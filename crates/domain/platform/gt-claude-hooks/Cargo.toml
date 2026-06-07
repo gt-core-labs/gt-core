@@ -1,0 +1,27 @@
+[package]
+name = "gt-claude-hooks"
+edition.workspace = true
+version.workspace = true
+
+# Global Claude Code hook registry (`hq-hooks`). Same event-sourced shape as gt-skills:
+# owned events + pure replay reducer + sync `Command` path. A *hook* is a Claude Code
+# settings.json hook entry (event + matcher + command) plus a TARGET selector
+# (workspaces / rigs / roles it applies to). The registry is GLOBAL (stored at the
+# `None` event scope), and the terminal materialises the hooks matching a session's
+# (workspace, rig, role) tuple into `<workdir>/.claude/settings.json` on launch.
+#
+# No HTTP here: the global REST surface needs the composition root's shared
+# authenticator + global event log, so it lives in `gt-composition::hooks` (mirroring
+# `terminal.rs`), not behind a feature in this domain crate. This crate stays infra-free.
+[dependencies]
+gt-events = { workspace = true }
+gt-module = { workspace = true }
+serde.workspace = true
+schemars.workspace = true
+semver = { workspace = true }
+# The settings.json the terminal materialises is built as a `serde_json::Value`, so
+# serde_json is a core dependency of the domain (not an optional HTTP-only one).
+serde_json = { workspace = true }
+
+[dev-dependencies]
+serde_json.workspace = true
