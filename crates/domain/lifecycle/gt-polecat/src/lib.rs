@@ -13,6 +13,7 @@
 pub mod hooks;
 pub mod install;
 pub mod lifecycle;
+pub mod manifest;
 pub mod module;
 pub mod pool;
 pub mod restart;
@@ -21,6 +22,7 @@ pub mod tmux;
 
 pub use hooks::{hook_bead_for_spawn, hook_env, resolve_env_hook_bead, GT_HOOK_ACCOUNT, GT_HOOK_BEAD};
 pub use install::{install_polecat_hooks, polecat_settings_json, MANAGED_MARKER};
+pub use manifest::{hooks_from_settings, skills_from_worktree};
 pub use pool::{AllocError, ExhaustedScope, PoolAllocator};
 pub use module::SessionsModule;
 pub use lifecycle::{
