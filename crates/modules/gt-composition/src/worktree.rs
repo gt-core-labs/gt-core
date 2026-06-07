@@ -142,17 +142,30 @@ pub fn seed_mcp_config(base_repo: &Path, worktree: &Path) {
 /// absent or already gt-managed (carries the marker), never over a human's settings.
 pub fn seed_user_hooks(config_dir: &Path) {
     let target = config_dir.join("settings.json");
-    if let Ok(existing) = std::fs::read_to_string(&target) {
-        if !existing.contains(gt_polecat::MANAGED_MARKER) {
-            eprintln!(
-                "[polecat] {} exists and is not gt-managed — user hooks not installed",
-                target.display()
-            );
-            return;
+    // Merge (don't clobber): claude writes its own keys here (e.g. skipDangerousModePermissionPrompt),
+    // so overlay our managed keys (marker + onboarding + bypass + the reporting hooks) onto whatever
+    // exists. The account dir is a dedicated polecat account — there is no human settings to protect.
+    let mut root = std::fs::read_to_string(&target)
+        .ok()
+        .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
+        .unwrap_or_else(|| serde_json::json!({}));
+    let tmpl: serde_json::Value = serde_json::from_str(&gt_polecat::polecat_settings_json())
+        .expect("polecat settings template is valid json");
+    match (root.as_object_mut(), tmpl.as_object()) {
+        (Some(obj), Some(t)) => {
+            for (k, v) in t {
+                obj.insert(k.clone(), v.clone());
+            }
         }
+        _ => return,
     }
-    if let Err(e) = std::fs::write(&target, gt_polecat::polecat_settings_json()) {
-        eprintln!("[polecat] user hooks seed {} skipped: {e}", target.display());
+    match serde_json::to_string_pretty(&root) {
+        Ok(s) => {
+            if let Err(e) = std::fs::write(&target, s) {
+                eprintln!("[polecat] user hooks seed {} skipped: {e}", target.display());
+            }
+        }
+        Err(e) => eprintln!("[polecat] user hooks serialize skipped: {e}"),
     }
 }
 
@@ -257,6 +270,25 @@ mod tests {
             v["projects"]["/rig-wt/gt-hq-x.1"]["hasTrustDialogAccepted"],
             serde_json::json!(true)
         );
+    }
+
+    #[test]
+    fn seed_user_hooks_merges_over_existing_claude_settings() {
+        let cfg = tempfile::tempdir().unwrap();
+        // claude's own settings the merge must preserve.
+        std::fs::write(
+            cfg.path().join("settings.json"),
+            r#"{"skipDangerousModePermissionPrompt":true}"#,
+        )
+        .unwrap();
+        seed_user_hooks(cfg.path());
+        let v: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(cfg.path().join("settings.json")).unwrap())
+                .unwrap();
+        assert_eq!(v["skipDangerousModePermissionPrompt"], serde_json::json!(true)); // preserved
+        assert_eq!(v["_gt_managed"], serde_json::json!("polecat-hooks")); // overlaid
+        let stop = v["hooks"]["Stop"][0]["hooks"][0]["command"].as_str().unwrap();
+        assert!(stop.contains("merge-ready"));
     }
 
     #[test]
