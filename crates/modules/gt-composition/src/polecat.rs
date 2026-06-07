@@ -311,10 +311,23 @@ impl Plugin for PolecatSupervisorPlugin {
                 if let Some(cd) = &active_config_dir {
                     let cd = std::path::Path::new(cd);
                     crate::worktree::seed_claude_onboarding(cd, &spec.workdir);
-                    // Hooks must live in USER settings (CLAUDE_CONFIG_DIR/settings.json): claude does
-                    // not run project hooks for an unapproved repo, so the worktree's settings.json
-                    // never fired (hq-orchd-deploy.15). User settings are trusted → hooks run.
                     crate::worktree::seed_user_hooks(cd);
+                }
+                // Load the polecat hooks via claude's `--settings <file>` flag (hq-orchd-deploy.16):
+                // claude does NOT apply the project/user settings.json hooks on its own in this
+                // headless/container setup (verified: heartbeat + Stop→merge-ready never fired), but
+                // an explicit `--settings` path is loaded deterministically — this is exactly how the
+                // upstream gastown launcher wires polecat hooks. The worktree already carries the
+                // gt-managed settings (install_polecat_hooks above). Insert before the trailing
+                // positional bead prompt so the prompt stays last.
+                let settings_file = spec.workdir.join(".claude").join("settings.json");
+                if settings_file.exists() {
+                    let prompt = spec.args.pop();
+                    spec.args.push("--settings".to_string());
+                    spec.args.push(settings_file.display().to_string());
+                    if let Some(p) = prompt {
+                        spec.args.push(p);
+                    }
                 }
                 if let Err(e) = spawn_tmux(self.tmux.as_ref(), &spec) {
                     // Spawn failed → undo the claim so the slot is not leaked.
