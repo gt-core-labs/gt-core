@@ -125,7 +125,7 @@ async fn set_role_model_round_trips_into_the_bindings() {
         put_json(
             "acme",
             "/roles/polecat/model",
-            serde_json::json!({ "model": "opus", "permission_mode": "acceptEdits", "thinking_budget": 8000 }),
+            serde_json::json!({ "model": "opus", "permission_mode": "acceptEdits", "effort": "xhigh" }),
         ),
     )
     .await;
@@ -137,7 +137,7 @@ async fn set_role_model_round_trips_into_the_bindings() {
     assert_eq!(body["bindings"][0]["role"], "polecat");
     assert_eq!(mc["model"], "opus");
     assert_eq!(mc["permission_mode"], "acceptEdits");
-    assert_eq!(mc["thinking_budget"], 8000);
+    assert_eq!(mc["effort"], "xhigh");
 
     // A bad permission mode is a client error (422), no mutation.
     let (status, _) = send(

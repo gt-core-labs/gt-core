@@ -61,10 +61,10 @@ impl Skill {
 }
 
 /// Per-role model config (`hq-role-model.1`): the claude launch levers the terminal stamps onto a
-/// session of this role. All-default (empty model + empty mode + `None` budget) ⇒ "unset", and the
+/// session of this role. All-default (empty model + empty mode + empty effort) ⇒ "unset", and the
 /// terminal launches the bare `claude` with the account default. Only levers that exist for the
-/// interactive `claude` CLI live here: `--model`, `--permission-mode`, and the `MAX_THINKING_TOKENS`
-/// env (print/SDK-only knobs like `--max-turns` are intentionally absent — they would be inert).
+/// interactive `claude` CLI live here: `--model`, `--permission-mode`, and `--effort` (print/SDK-only
+/// knobs like `--max-turns` are intentionally absent — they would be inert).
 #[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ModelConfig {
     /// The model id/alias (`claude --model <id>`); empty ⇒ account default.
@@ -74,9 +74,10 @@ pub struct ModelConfig {
     /// closed CLI set (`default`/`acceptEdits`/`plan`/`bypassPermissions`) at the command edge.
     #[serde(default)]
     pub permission_mode: String,
-    /// The thinking-token budget exported as `MAX_THINKING_TOKENS`; `None` ⇒ unset.
+    /// The effort level (`claude --effort <level>`); empty ⇒ unset. Validated against the closed CLI
+    /// set (`low`/`medium`/`high`/`xhigh`/`max`) at the command edge.
     #[serde(default)]
-    pub thinking_budget: Option<u32>,
+    pub effort: String,
 }
 
 impl ModelConfig {
@@ -85,7 +86,7 @@ impl ModelConfig {
     pub fn is_unset(&self) -> bool {
         self.model.trim().is_empty()
             && self.permission_mode.trim().is_empty()
-            && self.thinking_budget.is_none()
+            && self.effort.trim().is_empty()
     }
 }
 
@@ -314,7 +315,7 @@ impl SkillState {
                 role,
                 model,
                 permission_mode,
-                thinking_budget,
+                effort,
                 ..
             } => {
                 self.catalog.apply_set_role_model(
@@ -322,7 +323,7 @@ impl SkillState {
                     ModelConfig {
                         model: model.clone(),
                         permission_mode: permission_mode.clone(),
-                        thinking_budget: *thinking_budget,
+                        effort: effort.clone(),
                     },
                 );
             }

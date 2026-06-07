@@ -313,6 +313,11 @@ impl Command for SetRolePrompt {
 /// string is also accepted by [`SetRoleModel`] (⇒ "leave the mode unset").
 pub const PERMISSION_MODES: [&str; 4] = ["default", "acceptEdits", "plan", "bypassPermissions"];
 
+/// The effort levels the interactive `claude` CLI accepts for `--effort` (`xhigh`/`max` are
+/// Opus-tier; claude itself ignores an unsupported level for the chosen model). An empty string is
+/// also accepted by [`SetRoleModel`] (⇒ "leave the effort unset, use the CLI default").
+pub const EFFORT_LEVELS: [&str; 5] = ["low", "medium", "high", "xhigh", "max"];
+
 /// Set (or clear) a role's model config (`hq-role-model.1`): the `claude` launch levers the terminal
 /// stamps onto a session of that role. An all-empty config clears it. Like [`SetRolePrompt`], the
 /// role need not pre-exist — the reducer materialises the binding on first set.
@@ -326,9 +331,9 @@ pub struct SetRoleModel {
     /// [`PERMISSION_MODES`].
     #[serde(default)]
     pub permission_mode: String,
-    /// The thinking-token budget (env `MAX_THINKING_TOKENS`); `None` ⇒ unset.
+    /// The effort level (`claude --effort <level>`); empty ⇒ unset. Validated against [`EFFORT_LEVELS`].
     #[serde(default)]
-    pub thinking_budget: Option<u32>,
+    pub effort: String,
     pub now_secs: u64,
 }
 
@@ -352,6 +357,12 @@ impl Command for SetRoleModel {
                 self.permission_mode
             )));
         }
+        if !self.effort.is_empty() && !EFFORT_LEVELS.contains(&self.effort.as_str()) {
+            return Err(AppError::Validation(format!(
+                "effort {:?} is not one of {EFFORT_LEVELS:?}",
+                self.effort
+            )));
+        }
         Ok(())
     }
 
@@ -362,14 +373,14 @@ impl Command for SetRoleModel {
             crate::state::ModelConfig {
                 model: self.model.clone(),
                 permission_mode: self.permission_mode.clone(),
-                thinking_budget: self.thinking_budget,
+                effort: self.effort.clone(),
             },
         );
         Ok(SkillEvent::RoleModelSet {
             role: self.role.clone(),
             model: self.model.clone(),
             permission_mode: self.permission_mode.clone(),
-            thinking_budget: self.thinking_budget,
+            effort: self.effort.clone(),
             now_secs: self.now_secs,
         })
     }
@@ -512,13 +523,13 @@ mod tests {
     #[test]
     fn set_role_model_stores_clears_and_validates() {
         // hq-role-model.1: a role's model config is stored on its binding (materialised on first
-        // set); an all-empty config clears it; a bad permission mode is a client error.
+        // set); an all-empty config clears it; a bad permission mode / effort is a client error.
         let mut state = SkillCatalog::default();
         let set = SetRoleModel {
             role: "polecat".into(),
             model: "opus".into(),
             permission_mode: "acceptEdits".into(),
-            thinking_budget: Some(8000),
+            effort: "xhigh".into(),
             now_secs: 1,
         };
         let ev = set.execute(&mut state).unwrap();
@@ -526,14 +537,14 @@ mod tests {
         let m = state.role_model("polecat").unwrap();
         assert_eq!(m.model, "opus");
         assert_eq!(m.permission_mode, "acceptEdits");
-        assert_eq!(m.thinking_budget, Some(8000));
+        assert_eq!(m.effort, "xhigh");
 
         // Clear it: all-empty config collapses to None.
         let clear = SetRoleModel {
             role: "polecat".into(),
             model: String::new(),
             permission_mode: String::new(),
-            thinking_budget: None,
+            effort: String::new(),
             now_secs: 2,
         };
         clear.execute(&mut state).unwrap();
@@ -544,17 +555,26 @@ mod tests {
             role: "polecat".into(),
             model: String::new(),
             permission_mode: "yolo".into(),
-            thinking_budget: None,
+            effort: String::new(),
             now_secs: 3,
         };
         assert!(bad.validate(&state).is_err());
+        // An effort outside the closed CLI set rejects too.
+        let bad_effort = SetRoleModel {
+            role: "polecat".into(),
+            model: String::new(),
+            permission_mode: String::new(),
+            effort: "turbo".into(),
+            now_secs: 4,
+        };
+        assert!(bad_effort.validate(&state).is_err());
         // An embedded-whitespace model id rejects (must stay one exec arg).
         let bad_model = SetRoleModel {
             role: "polecat".into(),
             model: "claude opus".into(),
             permission_mode: String::new(),
-            thinking_budget: None,
-            now_secs: 4,
+            effort: String::new(),
+            now_secs: 5,
         };
         assert!(bad_model.validate(&state).is_err());
     }

@@ -246,8 +246,8 @@ enum TerminalTarget {
         claude_config_dir: Option<String>,
         workdir: Option<String>,
         /// The role's model config (`hq-role-model.1`): when `write` launches `claude`, these levers
-        /// are stamped onto it (`--model`, `--permission-mode`, `MAX_THINKING_TOKENS` env). `None` ⇒
-        /// the bare `claude` with the account default.
+        /// are stamped onto it (`--model`, `--permission-mode`, `--effort`). `None` ⇒ the bare
+        /// `claude` with the account default.
         model: Option<ModelConfig>,
     },
 }
@@ -457,17 +457,11 @@ fn build_command(target: &TerminalTarget) -> CommandBuilder {
                     // (`IS_SANDBOX=1`), which claude honours to allow it (`hq-term-dock.5`).
                     cmd.arg("-e");
                     cmd.arg("IS_SANDBOX=1");
-                    // The role's thinking-token budget (hq-role-model.1) rides as an env on the new
-                    // session, like CLAUDE_CONFIG_DIR — it must precede the `claude` command word.
-                    if let Some(n) = model.as_ref().and_then(|m| m.thinking_budget) {
-                        cmd.arg("-e");
-                        cmd.arg(format!("MAX_THINKING_TOKENS={n}"));
-                    }
                     cmd.arg("claude");
-                    // The role's model + permission mode (hq-role-model.1) as claude flags. The values
-                    // come from the trusted skills log; the command validator forbids whitespace in
-                    // the model id and constrains the mode to the closed CLI set, so each stays a
-                    // single exec arg (no shell, tmux passes them verbatim to claude).
+                    // The role's model + permission mode + effort (hq-role-model.1) as claude flags.
+                    // The values come from the trusted skills log; the command validator forbids
+                    // whitespace in the model id and constrains the mode/effort to the closed CLI
+                    // sets, so each stays a single exec arg (no shell, tmux passes them verbatim).
                     if let Some(m) = model {
                         if !m.model.trim().is_empty() {
                             cmd.arg("--model");
@@ -476,6 +470,10 @@ fn build_command(target: &TerminalTarget) -> CommandBuilder {
                         if !m.permission_mode.trim().is_empty() {
                             cmd.arg("--permission-mode");
                             cmd.arg(&m.permission_mode);
+                        }
+                        if !m.effort.trim().is_empty() {
+                            cmd.arg("--effort");
+                            cmd.arg(&m.effort);
                         }
                     }
                 }
@@ -721,8 +719,8 @@ mod tests {
                 "-e", "IS_SANDBOX=1", "claude"
             ]
         );
-        // Write mode WITH a role model config (hq-role-model.1): MAX_THINKING_TOKENS rides as a tmux
-        // `-e` env before the command word; `--model`/`--permission-mode` are claude flags after it.
+        // Write mode WITH a role model config (hq-role-model.1): --model/--permission-mode/--effort
+        // are claude flags after the command word.
         let cm = build_command(&TerminalTarget::Attach {
             workspace: "acme".into(),
             session: "hq-gg-1".into(),
@@ -732,7 +730,7 @@ mod tests {
             model: Some(gt_skills::ModelConfig {
                 model: "opus".into(),
                 permission_mode: "acceptEdits".into(),
-                thinking_budget: Some(8000),
+                effort: "xhigh".into(),
             }),
         });
         let argv: Vec<String> = cm.get_argv().iter().map(|s| s.to_string_lossy().into_owned()).collect();
@@ -742,8 +740,7 @@ mod tests {
                 "tmux", "-L", "gt-acme", "new-session", "-A", "-s", "hq-gg-1",
                 "-e", "CLAUDE_CONFIG_DIR=/var/lib/gt-core/accounts/abc",
                 "-e", "IS_SANDBOX=1",
-                "-e", "MAX_THINKING_TOKENS=8000",
-                "claude", "--model", "opus", "--permission-mode", "acceptEdits"
+                "claude", "--model", "opus", "--permission-mode", "acceptEdits", "--effort", "xhigh"
             ]
         );
         // No session ⇒ the original fresh shell.
@@ -833,7 +830,7 @@ mod tests {
                 role: "witness".into(),
                 model: "sonnet".into(),
                 permission_mode: "plan".into(),
-                thinking_budget: Some(4000),
+                effort: "high".into(),
                 now_secs: 4,
             },
         )
@@ -848,7 +845,7 @@ mod tests {
         let m = launch.model.expect("witness has a model config");
         assert_eq!(m.model, "sonnet");
         assert_eq!(m.permission_mode, "plan");
-        assert_eq!(m.thinking_budget, Some(4000));
+        assert_eq!(m.effort, "high");
 
         // A role with no enabled skills ⇒ no workdir (claude launches in the default dir).
         log.append(

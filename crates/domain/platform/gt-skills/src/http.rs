@@ -369,13 +369,13 @@ struct RoleModelBody {
     #[serde(default)]
     permission_mode: String,
     #[serde(default)]
-    thinking_budget: Option<u32>,
+    effort: String,
 }
 
 /// `PUT /roles/{role}/model` — set (or clear) a role's model config (`skills.write`,
 /// `hq-role-model.1`). The terminal stamps these onto the `claude` launch (`--model`,
-/// `--permission-mode`, `MAX_THINKING_TOKENS`) for a session of that role. Persists
-/// `skills.role-model-set.v1`. `422` on a bad role name / permission mode / model id.
+/// `--permission-mode`, `--effort`) for a session of that role. Persists
+/// `skills.role-model-set.v1`. `422` on a bad role name / permission mode / effort / model id.
 #[cfg_attr(feature = "axum", utoipa::path(
     put, path = "/roles/{role}/model",
     params(("role" = String, Path, description = "Role name")),
@@ -398,7 +398,7 @@ async fn set_role_model(
         role,
         model: body.model,
         permission_mode: body.permission_mode,
-        thinking_budget: body.thinking_budget,
+        effort: body.effort,
         now_secs: now_secs(),
     };
     let event = cmd.execute(&mut catalog).map_err(ApiError::from)?;
