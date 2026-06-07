@@ -11,6 +11,11 @@
 //! - [`SchedulerPlugin`] — `patrol.lease-expired.v1` → re-enqueue; `merge.merged.v1` → free a slot.
 //! - [`MergePlugin`] — `merge.ready.v1` → advance the slot to `Merging`.
 //!
+//! The one arm that DOES need an edge effect — landing the branch on `main` — is
+//! [`git_merge::GitMergePlugin`]: it observes `merge.started.v1` and runs the real `git push`
+//! (rebasing on divergence), then drives the slot to `Merged`/`Failed`. Like the polecat sling it
+//! is real I/O, so the **bin** registers it on the hub relay rather than `daemon_root`.
+//!
 //! ## Tier placement
 //!
 //! The root must name `gt-scheduling` + `gt-patrol` + `gt-merge` + `gt-roles` together; the
@@ -22,8 +27,9 @@
 //!
 //! ## What is still deferred
 //!
-//! The edge-effect arms (sling/rotate/`git merge`/lease release, function #6), hydration (#7),
+//! The remaining edge-effect arms (sling/rotate/lease release, function #6), hydration (#7),
 //! and real PG/Dolt repos (#8) are not wired here — they are the remaining production I/O. The
+//! `git merge` edge IS now wired ([`git_merge::GitMergePlugin`], `hq-orchd-deploy.12`). The
 //! pattern itself (functions #1–#5, #9) is complete: [`live_root`] resolves a workspace through
 //! `RootRegistry::get_or_hydrate_async`, owns its actors via `Supervisor::anchor`, and drains
 //! their events onto the hub via `RootHandle::drain_events_from`.
@@ -31,6 +37,7 @@
 pub mod account_dirs;
 pub mod auth;
 pub mod denial_audit;
+pub mod git_merge;
 pub mod mcp;
 pub mod onboard;
 pub mod polecat;

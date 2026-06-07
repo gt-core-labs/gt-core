@@ -54,6 +54,7 @@ use gt_channel::Channel;
 use gt_composition::polecat::{
     host_cap_from_metrics, AgentTokenMinter, PolecatSupervisorPlugin, ScopeResolver,
 };
+use gt_composition::git_merge::GitMergePlugin;
 use gt_composition::quota_rotation::{self, QuotaRotationPlugin};
 use gt_composition::{daemon_root, replay_quota_state, DaemonRoot};
 use gt_composition::mcp::eventlog::EventLog;
@@ -264,6 +265,9 @@ async fn main() -> anyhow::Result<()> {
         max_restarts,
     ));
     let template = SpawnTemplate::from_env(&ws_slug);
+    // The rig checkout (GT_RIG_PATH) the git-merge edge pushes from (hq-orchd-deploy.12). Captured
+    // before `template` is moved into the polecat supervisor plugin below.
+    let rig_path = template.workdir.clone();
 
     // Install the polecat hook settings into the rig checkout (hq-agent-provisioning.2) so a slung
     // claude reports back: heartbeat touches + a merge-ready drop on Stop. Best-effort + marker-safe
@@ -373,6 +377,15 @@ async fn main() -> anyhow::Result<()> {
             pol_registry.register(QuotaRotationPlugin::new(quota.clone(), kc.clone()));
         eprintln!("[gt-orch-server] predictive account rotation observer on");
     }
+    // Git-merge edge effect (hq-orchd-deploy.12): land a polecat branch on main. On
+    // `merge.started.v1` it pushes <branch>:main from the rig checkout (rebasing on divergence) and
+    // drives the slot to Merged/Failed — the arm that closes the autonomous loop. Registered on the
+    // same hub relay as the polecat sling (both are real I/O, kept out of pure-state daemon_root).
+    pol_registry = pol_registry.register(GitMergePlugin::new(merge.clone(), rig_path.clone()));
+    eprintln!(
+        "[gt-orch-server] git-merge edge on — branches land on main from rig checkout {}",
+        rig_path.display()
+    );
     let pol_registry = Arc::new(pol_registry);
     let pol_relay = spawn_plugin_relay(handle.subscribe_events(), pol_registry);
     eprintln!(
