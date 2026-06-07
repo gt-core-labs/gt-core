@@ -56,6 +56,7 @@ use gt_composition::polecat::{
 };
 use gt_composition::git_merge::GitMergePlugin;
 use gt_composition::quota_rotation::{self, QuotaRotationPlugin};
+use gt_composition::witness_sweep::WitnessSweep;
 use gt_composition::{daemon_root, replay_quota_state, DaemonRoot};
 use gt_composition::mcp::eventlog::EventLog;
 use gt_eventlog::DEFAULT_EVENTLOG_ROOT;
@@ -447,14 +448,68 @@ async fn main() -> anyhow::Result<()> {
         "[gt-orch-server] reactor loops on — patrol tick {patrol_tick_secs}s (lease timeout {lease_timeout}s), quota tick {quota_tick_secs}s (threshold {quota_threshold}s)"
     );
 
-    // Refinery MERGE_READY live loop: await MERGE_READY messages on a gt-channel and submit each to
-    // the merge actor, under a restart+backoff supervisor (gt-core agents may instead submit via
-    // the MCP merge.submit path — both feed the same event-sourced board). Absent/unopenable
-    // channel ⇒ the loop is disabled and the daemon still boots.
+    // The merge-ready channel coordinates (shared by the witness emitter + the refinery consumer).
     let channel_root =
         std::env::var("GT_CHANNEL_ROOT").unwrap_or_else(|_| "/gt/.channels".to_string());
     let merge_ready_channel =
         std::env::var("GT_MERGE_READY_CHANNEL").unwrap_or_else(|_| "merge-ready".to_string());
+
+    // --- Witness completion safety-net (hq-orchd-deploy.6) ---
+    // A periodic sweep that catches a polecat which committed its bead but died before its Stop hook
+    // self-signaled merge-ready (OOM, kill, tmux crash). It scans the per-polecat worktrees and, for
+    // any branch ahead of origin/main whose tmux session is gone / heartbeat stale and not already on
+    // the merge board, emits merge-ready into the SAME channel the refinery consumes — so a finished
+    // polecat's branch still lands on main. The polecat self-signal (hq-orchd-deploy.20) stays the
+    // primary path; this is the net under it ("discover, don't track", gastown DiscoverCompletions).
+    // Only active with per-polecat worktrees (GT_POLECAT_WORKTREE_ROOT) + an openable channel.
+    let witness_task = match (
+        std::env::var("GT_POLECAT_WORKTREE_ROOT").ok().filter(|v| !v.is_empty()),
+        Channel::open(&channel_root, &merge_ready_channel),
+    ) {
+        (Some(wt_root), Ok(channel)) => {
+            let witness_tick_secs = env_usize("GT_WITNESS_TICK_SECS", 60) as u64;
+            let witness_stale_secs = env_usize("GT_WITNESS_STALE_SECS", 300) as u64;
+            let heartbeat_dir = std::env::var("GT_HEARTBEAT_DIR")
+                .map(PathBuf::from)
+                .unwrap_or_else(|_| std::env::temp_dir());
+            let sweep = WitnessSweep::new(
+                PathBuf::from(wt_root),
+                rig_path.clone(),
+                heartbeat_dir,
+                Duration::from_secs(witness_stale_secs),
+                tmux.clone(),
+                merge.clone(),
+                channel,
+            );
+            eprintln!(
+                "[gt-orch-server] witness safety-net on — sweep {witness_tick_secs}s (stale {witness_stale_secs}s); emits merge-ready for completed polecats that didn't self-signal"
+            );
+            Some(tokio::spawn(async move {
+                let mut tick = tokio::time::interval(Duration::from_secs(witness_tick_secs));
+                tick.tick().await; // skip the immediate first fire (no worktrees yet)
+                loop {
+                    tick.tick().await;
+                    let n = sweep.sweep().await;
+                    if n > 0 {
+                        eprintln!("[gt-orch-server] witness emitted {n} missed merge-ready signal(s)");
+                    }
+                }
+            }))
+        }
+        (None, _) => {
+            eprintln!("[gt-orch-server] witness disabled — GT_POLECAT_WORKTREE_ROOT unset (no per-polecat worktrees to scan)");
+            None
+        }
+        (_, Err(e)) => {
+            eprintln!("[gt-orch-server] witness disabled — merge-ready channel open failed at {channel_root}/{merge_ready_channel}: {e}");
+            None
+        }
+    };
+
+    // Refinery MERGE_READY live loop: await MERGE_READY messages on a gt-channel and submit each to
+    // the merge actor, under a restart+backoff supervisor (gt-core agents may instead submit via
+    // the MCP merge.submit path — both feed the same event-sourced board). Absent/unopenable
+    // channel ⇒ the loop is disabled and the daemon still boots.
     let refinery_task = match Channel::open(&channel_root, &merge_ready_channel) {
         Ok(channel) => {
             eprintln!(
@@ -567,6 +622,9 @@ async fn main() -> anyhow::Result<()> {
     pol_relay.abort();
     patrol_timer.abort();
     quota_timer.abort();
+    if let Some(task) = &witness_task {
+        task.abort();
+    }
     if let Some(task) = &refinery_task {
         task.abort();
     }
@@ -580,6 +638,9 @@ async fn main() -> anyhow::Result<()> {
     let _ = pol_relay.await;
     let _ = patrol_timer.await;
     let _ = quota_timer.await;
+    if let Some(task) = witness_task {
+        let _ = task.await;
+    }
     if let Some(task) = refinery_task {
         let _ = task.await;
     }

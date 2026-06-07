@@ -45,6 +45,7 @@ pub mod quota_rotation;
 pub mod scope_bridge;
 pub mod stream;
 pub mod terminal;
+pub mod witness_sweep;
 pub mod worktree;
 
 use std::collections::HashMap;
