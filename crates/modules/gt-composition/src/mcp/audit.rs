@@ -167,11 +167,39 @@ mod tests {
     fn seeded() -> Arc<dyn AuditSink + Send + Sync> {
         let sink = InMemoryAudit::new();
         let recs = [
-            AuditRecord::new("alice", "issues.close.execute", json!({}), Outcome::Invoked, "2026-06-01T10:00:00Z").in_workspace("acme"),
-            AuditRecord::new("bob", "merge.submit.execute", json!({}), Outcome::Unauthorized, "2026-06-02T10:00:00Z").in_workspace("acme"),
-            AuditRecord::new("alice", "rig.add.execute", json!({}), Outcome::Invoked, "2026-06-03T10:00:00Z").in_workspace("acme"),
+            AuditRecord::new(
+                "alice",
+                "issues.close.execute",
+                json!({}),
+                Outcome::Invoked,
+                "2026-06-01T10:00:00Z",
+            )
+            .in_workspace("acme"),
+            AuditRecord::new(
+                "bob",
+                "merge.submit.execute",
+                json!({}),
+                Outcome::Unauthorized,
+                "2026-06-02T10:00:00Z",
+            )
+            .in_workspace("acme"),
+            AuditRecord::new(
+                "alice",
+                "rig.add.execute",
+                json!({}),
+                Outcome::Invoked,
+                "2026-06-03T10:00:00Z",
+            )
+            .in_workspace("acme"),
             // A different tenant — must never surface in an `acme` tail.
-            AuditRecord::new("mallory", "issues.close.execute", json!({}), Outcome::Invoked, "2026-06-03T11:00:00Z").in_workspace("other"),
+            AuditRecord::new(
+                "mallory",
+                "issues.close.execute",
+                json!({}),
+                Outcome::Invoked,
+                "2026-06-03T11:00:00Z",
+            )
+            .in_workspace("other"),
         ];
         for r in recs {
             sink.record(r).unwrap();
@@ -180,13 +208,20 @@ mod tests {
     }
 
     fn ctx(ws: &'static str, args: Value) -> DomainCtx<'static> {
-        DomainCtx { workspace: Some(ws), actor: "tester", args }
+        DomainCtx {
+            workspace: Some(ws),
+            actor: "tester",
+            args,
+        }
     }
 
     #[tokio::test]
     async fn tails_caller_workspace_most_recent_first() {
         let h = AuditHandler::new(seeded());
-        let out = h.dispatch("audit.tail", ctx("acme", json!({}))).await.unwrap();
+        let out = h
+            .dispatch("audit.tail", ctx("acme", json!({})))
+            .await
+            .unwrap();
         assert_eq!(out["count"], 3); // the three acme records, not the `other` one.
         let recs = out["records"].as_array().unwrap();
         // Newest first.
@@ -197,11 +232,17 @@ mod tests {
     #[tokio::test]
     async fn never_leaks_another_tenant() {
         let h = AuditHandler::new(seeded());
-        let out = h.dispatch("audit.tail", ctx("acme", json!({}))).await.unwrap();
+        let out = h
+            .dispatch("audit.tail", ctx("acme", json!({})))
+            .await
+            .unwrap();
         let recs = out["records"].as_array().unwrap();
         assert!(recs.iter().all(|r| r["actor"] != "mallory"));
         // And a tail in the other tenant sees only its one record.
-        let out2 = h.dispatch("audit.tail", ctx("other", json!({}))).await.unwrap();
+        let out2 = h
+            .dispatch("audit.tail", ctx("other", json!({})))
+            .await
+            .unwrap();
         assert_eq!(out2["count"], 1);
         assert_eq!(out2["records"][0]["actor"], "mallory");
     }
@@ -210,24 +251,48 @@ mod tests {
     async fn filters_by_actor_tool_outcome_and_since() {
         let h = AuditHandler::new(seeded());
         // actor.
-        let out = h.dispatch("audit.tail", ctx("acme", json!({ "actor": "alice" }))).await.unwrap();
+        let out = h
+            .dispatch("audit.tail", ctx("acme", json!({ "actor": "alice" })))
+            .await
+            .unwrap();
         assert_eq!(out["count"], 2);
         // tool.
-        let out = h.dispatch("audit.tail", ctx("acme", json!({ "tool": "merge.submit.execute" }))).await.unwrap();
+        let out = h
+            .dispatch(
+                "audit.tail",
+                ctx("acme", json!({ "tool": "merge.submit.execute" })),
+            )
+            .await
+            .unwrap();
         assert_eq!(out["count"], 1);
         // outcome.
-        let out = h.dispatch("audit.tail", ctx("acme", json!({ "outcome": "unauthorized" }))).await.unwrap();
+        let out = h
+            .dispatch(
+                "audit.tail",
+                ctx("acme", json!({ "outcome": "unauthorized" })),
+            )
+            .await
+            .unwrap();
         assert_eq!(out["count"], 1);
         assert_eq!(out["records"][0]["actor"], "bob");
         // since (inclusive lower bound) — drops the 06-01 record.
-        let out = h.dispatch("audit.tail", ctx("acme", json!({ "since": "2026-06-02T00:00:00Z" }))).await.unwrap();
+        let out = h
+            .dispatch(
+                "audit.tail",
+                ctx("acme", json!({ "since": "2026-06-02T00:00:00Z" })),
+            )
+            .await
+            .unwrap();
         assert_eq!(out["count"], 2);
     }
 
     #[tokio::test]
     async fn limit_caps_the_window_to_most_recent() {
         let h = AuditHandler::new(seeded());
-        let out = h.dispatch("audit.tail", ctx("acme", json!({ "limit": 1 }))).await.unwrap();
+        let out = h
+            .dispatch("audit.tail", ctx("acme", json!({ "limit": 1 })))
+            .await
+            .unwrap();
         assert_eq!(out["count"], 1);
         assert_eq!(out["records"][0]["tool"], "rig.add.execute"); // the newest.
     }

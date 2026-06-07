@@ -183,7 +183,11 @@ mod tests {
     }
 
     fn ctx(args: Value) -> DomainCtx<'static> {
-        DomainCtx { workspace: None, actor: "tester", args }
+        DomainCtx {
+            workspace: None,
+            actor: "tester",
+            args,
+        }
     }
 
     /// Full lifecycle over the event log: a `probe` materializes the account in
@@ -205,7 +209,10 @@ mod tests {
         assert_eq!(probed["ok"], true);
         assert_eq!(probed["event"], "quota.usage_probed.v1");
 
-        let info = h.dispatch("quota.info", ctx(json!({ "account": "acc-1" }))).await.unwrap();
+        let info = h
+            .dispatch("quota.info", ctx(json!({ "account": "acc-1" })))
+            .await
+            .unwrap();
         assert_eq!(info["id"], "acc-1");
         assert_eq!(info["status"], "Healthy");
 
@@ -219,7 +226,10 @@ mod tests {
             .unwrap();
         assert_eq!(rotated["event"], "quota.rotated.v1");
 
-        let info = h.dispatch("quota.info", ctx(json!({ "account": "acc-1" }))).await.unwrap();
+        let info = h
+            .dispatch("quota.info", ctx(json!({ "account": "acc-1" })))
+            .await
+            .unwrap();
         assert_eq!(info["status"], "Cooldown", "rotation parked the source");
 
         // Sample appends a usage event (its consumption math no-ops without a live
@@ -254,7 +264,11 @@ mod tests {
             })),
             165
         );
-        assert_eq!(sample_tokens(&json!({ "input": 7 })), 7, "absent fields default to 0");
+        assert_eq!(
+            sample_tokens(&json!({ "input": 7 })),
+            7,
+            "absent fields default to 0"
+        );
         assert_eq!(sample_tokens(&json!({})), 0);
     }
 
@@ -265,7 +279,10 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let h = handler(&dir);
 
-        let gone = h.dispatch("quota.info", ctx(json!({ "account": "nope" }))).await.unwrap_err();
+        let gone = h
+            .dispatch("quota.info", ctx(json!({ "account": "nope" })))
+            .await
+            .unwrap_err();
         assert!(matches!(gone, AppError::NotFound(_)));
 
         let bad = h

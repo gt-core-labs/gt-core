@@ -26,10 +26,10 @@ use async_trait::async_trait;
 use gt_events::AppError;
 
 use gt_auth::MembershipDirectory;
+use gt_claude_hooks::{HookEvent, HooksRegistry, HooksState, HooksStore};
 use gt_feed::{FeedItem, FeedPage, WorkspaceFeed};
 use gt_issues::{MeMembership, MeStatsSource};
 use gt_mcp_server::WorkspaceStores;
-use gt_store_dolt::{issues_max_limit, AppError as DoltError, IssueFilter, IssueRow};
 use gt_merge::{
     DynMergeRepository, MergeBoard, MergeEvent, MergeRepository, MergeSlot, MergeSlotState,
     MergeState, WorkspaceMerges,
@@ -38,7 +38,7 @@ use gt_orchestration::{ConvoyBoard, OrchEvent, OrchState, WorkspaceConvoy};
 use gt_quota::{AccountCatalog, AccountRegistry, QuotaEvent, QuotaState, WorkspaceQuota};
 use gt_rig::{DynRigRepository, PgRigs, WorkspaceRigs};
 use gt_skills::{SkillCatalog, SkillEvent, SkillState, SkillWriter, WorkspaceSkills};
-use gt_claude_hooks::{HookEvent, HooksRegistry, HooksState, HooksStore};
+use gt_store_dolt::{issues_max_limit, AppError as DoltError, IssueFilter, IssueRow};
 
 use super::eventlog::EventLog;
 use super::pools::WsPools;
@@ -129,7 +129,12 @@ impl WorkspaceQuota for EventLogQuota {
     async fn registry(&self, workspace: &str) -> Result<AccountRegistry, AppError> {
         let state = self
             .log
-            .replay_domain(Some(workspace), QUOTA_NS, QuotaState::default(), QuotaState::apply)
+            .replay_domain(
+                Some(workspace),
+                QUOTA_NS,
+                QuotaState::default(),
+                QuotaState::apply,
+            )
             .map_err(lift)?;
         Ok(AccountRegistry::from_state(&state))
     }
@@ -261,7 +266,12 @@ impl EventLogMergeRepo {
     fn board(&self) -> Result<MergeBoard, AppError> {
         let state = self
             .log
-            .replay_domain(Some(&self.workspace), MERGE_NS, MergeState::default(), MergeState::apply)
+            .replay_domain(
+                Some(&self.workspace),
+                MERGE_NS,
+                MergeState::default(),
+                MergeState::apply,
+            )
             .map_err(lift)?;
         Ok(MergeBoard::from_state(&state))
     }
@@ -276,13 +286,17 @@ impl EventLogMergeRepo {
                 branch: slot.branch.clone(),
                 channel_msg_id: String::new(),
             },
-            MergeSlotState::Merging => MergeEvent::Started { bead: slot.bead.clone() },
-            MergeSlotState::Merged => {
-                MergeEvent::Merged { bead: slot.bead.clone(), sha: String::new() }
-            }
-            MergeSlotState::Failed => {
-                MergeEvent::Failed { bead: slot.bead.clone(), reason: String::new() }
-            }
+            MergeSlotState::Merging => MergeEvent::Started {
+                bead: slot.bead.clone(),
+            },
+            MergeSlotState::Merged => MergeEvent::Merged {
+                bead: slot.bead.clone(),
+                sha: String::new(),
+            },
+            MergeSlotState::Failed => MergeEvent::Failed {
+                bead: slot.bead.clone(),
+                reason: String::new(),
+            },
         }
     }
 }
@@ -291,7 +305,10 @@ impl EventLogMergeRepo {
 // moves it into a trivially-ready (and `Send`) future — no borrow of `self` crosses the await.
 impl MergeRepository for EventLogMergeRepo {
     fn upsert_slot(&self, slot: &MergeSlot) -> impl Future<Output = Result<(), AppError>> + Send {
-        let res = self.log.append(Some(&self.workspace), Self::slot_event(slot)).map_err(lift);
+        let res = self
+            .log
+            .append(Some(&self.workspace), Self::slot_event(slot))
+            .map_err(lift);
         async move { res }
     }
 
@@ -332,7 +349,12 @@ impl WorkspaceConvoy for EventLogConvoy {
     async fn board(&self, workspace: &str) -> Result<ConvoyBoard, AppError> {
         let state = self
             .log
-            .replay_domain(Some(workspace), CONVOY_NS, OrchState::default(), OrchState::apply)
+            .replay_domain(
+                Some(workspace),
+                CONVOY_NS,
+                OrchState::default(),
+                OrchState::apply,
+            )
             .map_err(lift)?;
         Ok(ConvoyBoard::from_state(&state))
     }
@@ -366,7 +388,12 @@ impl WorkspaceSkills for EventLogSkills {
     async fn catalog(&self, workspace: &str) -> Result<SkillCatalog, AppError> {
         let state = self
             .log
-            .replay_domain(Some(workspace), SKILLS_NS, SkillState::default(), SkillState::apply)
+            .replay_domain(
+                Some(workspace),
+                SKILLS_NS,
+                SkillState::default(),
+                SkillState::apply,
+            )
             .map_err(lift)?;
         Ok(state.catalog)
     }
@@ -462,7 +489,13 @@ impl WorkspaceFeed for EventLogFeed {
             Vec::new()
         };
         let has_more = end < total;
-        Ok(FeedPage { items, offset, limit, has_more, next_offset: has_more.then_some(end) })
+        Ok(FeedPage {
+            items,
+            offset,
+            limit,
+            has_more,
+            next_offset: has_more.then_some(end),
+        })
     }
 }
 
@@ -486,7 +519,10 @@ impl IdentityDoltMeStats {
     /// Wire the cross-workspace stats source over the shared membership directory + per-workspace
     /// Dolt store cache (the binary's single shared instances).
     pub fn new(memberships: Arc<dyn MembershipDirectory>, stores: Arc<WorkspaceStores>) -> Self {
-        Self { memberships, stores }
+        Self {
+            memberships,
+            stores,
+        }
     }
 }
 
@@ -502,7 +538,10 @@ impl MeStatsSource for IdentityDoltMeStats {
             .map_err(|e| DoltError::Other(format!("membership directory: {e}")))?;
         Ok(rows
             .into_iter()
-            .map(|m| MeMembership { workspace: m.workspace, role: m.role })
+            .map(|m| MeMembership {
+                workspace: m.workspace,
+                role: m.role,
+            })
             .collect())
     }
 
@@ -532,7 +571,11 @@ mod tests {
     use tempfile::TempDir;
 
     fn slot(bead: &str, branch: &str, state: MergeSlotState) -> MergeSlot {
-        MergeSlot { bead: bead.into(), branch: branch.into(), state }
+        MergeSlot {
+            bead: bead.into(),
+            branch: branch.into(),
+            state,
+        }
     }
 
     /// Write a `.claude.json` carrying `oauthAccount.emailAddress = email` into `<root>/<dir>`.
@@ -597,7 +640,10 @@ mod tests {
         assert_eq!(slots.len(), 1);
         assert_eq!(slots[0].bead, "b1");
         assert_eq!(slots[0].state, MergeSlotState::Ready);
-        assert_eq!(repo.get_slot("b1").await.unwrap().unwrap().state, MergeSlotState::Ready);
+        assert_eq!(
+            repo.get_slot("b1").await.unwrap().unwrap().state,
+            MergeSlotState::Ready
+        );
     }
 
     /// The full lifecycle round-trips through the event stream: each upsert appends the event its
@@ -608,10 +654,19 @@ mod tests {
         let merges = EventLogMerges::new(Arc::new(EventLog::new(Some(dir.path().to_path_buf()))));
         let repo = merges.repo("ws").await.unwrap();
 
-        for state in [MergeSlotState::Ready, MergeSlotState::Merging, MergeSlotState::Merged] {
-            repo.upsert_slot(&slot("b1", "feat/b1", state)).await.unwrap();
+        for state in [
+            MergeSlotState::Ready,
+            MergeSlotState::Merging,
+            MergeSlotState::Merged,
+        ] {
+            repo.upsert_slot(&slot("b1", "feat/b1", state))
+                .await
+                .unwrap();
         }
-        assert_eq!(repo.get_slot("b1").await.unwrap().unwrap().state, MergeSlotState::Merged);
+        assert_eq!(
+            repo.get_slot("b1").await.unwrap().unwrap().state,
+            MergeSlotState::Merged
+        );
 
         // An unknown bead is absent, not an error.
         assert!(repo.get_slot("nope").await.unwrap().is_none());
@@ -632,8 +687,25 @@ mod tests {
             .await
             .unwrap();
 
-        assert!(merges.repo("beta").await.unwrap().list_slots().await.unwrap().is_empty());
-        assert_eq!(merges.repo("alpha").await.unwrap().list_slots().await.unwrap().len(), 1);
+        assert!(merges
+            .repo("beta")
+            .await
+            .unwrap()
+            .list_slots()
+            .await
+            .unwrap()
+            .is_empty());
+        assert_eq!(
+            merges
+                .repo("alpha")
+                .await
+                .unwrap()
+                .list_slots()
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
     }
 
     #[tokio::test]
@@ -659,16 +731,35 @@ mod tests {
             .unwrap();
 
         let cat = skills.catalog("acme").await.unwrap();
-        assert!(cat.get("graphify").is_some(), "registered skill is read back");
+        assert!(
+            cat.get("graphify").is_some(),
+            "registered skill is read back"
+        );
         // Tenant isolation: another workspace's catalog is empty.
-        assert!(skills.catalog("beta").await.unwrap().get("graphify").is_none());
+        assert!(skills
+            .catalog("beta")
+            .await
+            .unwrap()
+            .get("graphify")
+            .is_none());
 
         skills
-            .append("acme", SkillEvent::Retired { skill: "graphify".into(), now_secs: 2 })
+            .append(
+                "acme",
+                SkillEvent::Retired {
+                    skill: "graphify".into(),
+                    now_secs: 2,
+                },
+            )
             .await
             .unwrap();
         assert!(
-            skills.catalog("acme").await.unwrap().get("graphify").is_none(),
+            skills
+                .catalog("acme")
+                .await
+                .unwrap()
+                .get("graphify")
+                .is_none(),
             "retired skill is gone after replay"
         );
     }

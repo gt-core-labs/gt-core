@@ -42,7 +42,10 @@ fn two_actor_scope_allows_admin_and_denies_viewer_write() {
     let viewer = Scope::from_rbac(&cfg, "viewer");
 
     // The allowed actor's call passes the gate.
-    assert!(admin.check("issues.create.execute").is_ok(), "admin may execute");
+    assert!(
+        admin.check("issues.create.execute").is_ok(),
+        "admin may execute"
+    );
 
     // The denied actor is rejected on the write it has no grant for...
     assert!(
@@ -50,7 +53,10 @@ fn two_actor_scope_allows_admin_and_denies_viewer_write() {
         "viewer must be denied the execute it has no grant for",
     );
     // ...but its single granted dry-run passes.
-    assert!(viewer.check("issues.create.validate").is_ok(), "viewer may validate");
+    assert!(
+        viewer.check("issues.create.validate").is_ok(),
+        "viewer may validate"
+    );
 }
 
 #[test]
@@ -59,8 +65,14 @@ fn an_unknown_actor_is_denied_by_default() {
     // An actor with no entry resolves to the deny-everything scope — the gate is
     // deny-by-default, not allow-by-default.
     let ghost = Scope::from_rbac(&cfg, "nobody");
-    assert!(ghost.check("issues.create.validate").is_err(), "unknown actor denied reads");
-    assert!(ghost.check("issues.create.execute").is_err(), "unknown actor denied writes");
+    assert!(
+        ghost.check("issues.create.validate").is_err(),
+        "unknown actor denied reads"
+    );
+    assert!(
+        ghost.check("issues.create.execute").is_err(),
+        "unknown actor denied writes"
+    );
 }
 
 // ----- .5 multi-tenant routing ----------------------------------------------
@@ -103,13 +115,26 @@ fn authoritative_tenant_comes_from_the_header_not_a_spoofed_body() {
     // resolves to None → the request falls back to the default-workspace store,
     // never the spoofed "victim" tenant. There is no args/body path at all.
     let spoof = ext_with_header("x-workspace-id", "victim");
-    assert_eq!(workspace_from_ext(&spoof), None, "a non-header channel cannot select a tenant");
+    assert_eq!(
+        workspace_from_ext(&spoof),
+        None,
+        "a non-header channel cannot select a tenant"
+    );
 }
 
 #[test]
 fn status_gate_blocks_mutations_on_suspended_or_archived_tenants() {
     // The gate the server applies after resolving the tenant, before store I/O.
-    assert!(GateStatus::Active.allows_mutation(), "an active tenant accepts writes");
-    assert!(!GateStatus::Suspended.allows_mutation(), "a suspended tenant blocks writes");
-    assert!(!GateStatus::Archived.allows_mutation(), "an archived tenant blocks writes");
+    assert!(
+        GateStatus::Active.allows_mutation(),
+        "an active tenant accepts writes"
+    );
+    assert!(
+        !GateStatus::Suspended.allows_mutation(),
+        "a suspended tenant blocks writes"
+    );
+    assert!(
+        !GateStatus::Archived.allows_mutation(),
+        "an archived tenant blocks writes"
+    );
 }

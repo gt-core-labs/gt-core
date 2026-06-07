@@ -45,9 +45,10 @@ impl GraphHandler {
 
     /// Replay the warden events for `ws` into a fresh [`WardenState`].
     fn warden(&self, ws: Option<&str>) -> Result<WardenState, AppError> {
-        self.log.replay_domain(ws, NS, WardenState::default(), |s, e| {
-            let _ = s.apply(e);
-        })
+        self.log
+            .replay_domain(ws, NS, WardenState::default(), |s, e| {
+                let _ = s.apply(e);
+            })
     }
 
     /// The on-disk checkout for `rig`, or `NotFound` if the warden has no custody of it.
@@ -83,7 +84,11 @@ impl GraphHandler {
         let _ = ensure_ignored(repo, self.indexer.tool());
         let built = self.indexer.status(repo).await.map_err(graph_err)?.built;
         let stats = if built {
-            self.indexer.update(repo, &[]).await.map_err(graph_err)?.after
+            self.indexer
+                .update(repo, &[])
+                .await
+                .map_err(graph_err)?
+                .after
         } else {
             self.indexer.build(repo).await.map_err(graph_err)?
         };
@@ -146,14 +151,26 @@ impl DomainHandler for GraphHandler {
                 "Explain one node (crate/concept) in a rig's knowledge graph.",
                 &[req("rig", "string"), req("node", "string")],
             ),
-            descriptor("graph.status", "Report a rig's graph freshness + index stats.", &[req("rig", "string")]),
+            descriptor(
+                "graph.status",
+                "Report a rig's graph freshness + index stats.",
+                &[req("rig", "string")],
+            ),
             descriptor(
                 "graph.refresh",
                 "Rebuild a rig's knowledge graph; optionally over an explicit repo_dir.",
                 &[req("rig", "string"), opt("repo_dir", "string")],
             ),
-            descriptor("graph.refresh-stale", "Rebuild every rig whose graph the warden marked stale.", &[]),
-            descriptor("graph.list", "List the rigs under warden custody with their freshness.", &[]),
+            descriptor(
+                "graph.refresh-stale",
+                "Rebuild every rig whose graph the warden marked stale.",
+                &[],
+            ),
+            descriptor(
+                "graph.list",
+                "List the rigs under warden custody with their freshness.",
+                &[],
+            ),
         ]
     }
 
@@ -164,7 +181,11 @@ impl DomainHandler for GraphHandler {
                 let rig = str_arg(&ctx.args, "rig")?;
                 let question = str_arg(&ctx.args, "question")?;
                 let repo = self.repo_dir(ws, rig)?;
-                let ans = self.indexer.query(&repo, question).await.map_err(graph_err)?;
+                let ans = self
+                    .indexer
+                    .query(&repo, question)
+                    .await
+                    .map_err(graph_err)?;
                 Ok(json!({ "text": ans.text, "nodes": ans.nodes }))
             }
             "graph.explain" => {
@@ -273,7 +294,11 @@ mod tests {
     use tempfile::TempDir;
 
     fn ctx(args: Value) -> DomainCtx<'static> {
-        DomainCtx { workspace: None, actor: "tester", args }
+        DomainCtx {
+            workspace: None,
+            actor: "tester",
+            args,
+        }
     }
 
     /// Seed the workspace log with a rig under custody, then query/list/status it.
@@ -294,12 +319,18 @@ mod tests {
 
         let indexer = Arc::new(InMemoryGraphIndexer::new());
         // InMemory needs a built graph for that repo to answer.
-        indexer.build(std::path::Path::new("/repo/alpha")).await.unwrap();
+        indexer
+            .build(std::path::Path::new("/repo/alpha"))
+            .await
+            .unwrap();
 
         let h = GraphHandler::new(log, indexer);
 
         let out = h
-            .dispatch("graph.query", ctx(json!({ "rig": "alpha", "question": "where is auth" })))
+            .dispatch(
+                "graph.query",
+                ctx(json!({ "rig": "alpha", "question": "where is auth" })),
+            )
             .await
             .unwrap();
         assert!(out["text"].as_str().unwrap().contains("where is auth"));
@@ -308,7 +339,10 @@ mod tests {
         assert_eq!(list["rigs"].as_array().unwrap().len(), 1);
         assert_eq!(list["rigs"][0]["rig"], "alpha");
 
-        let st = h.dispatch("graph.status", ctx(json!({ "rig": "alpha" }))).await.unwrap();
+        let st = h
+            .dispatch("graph.status", ctx(json!({ "rig": "alpha" })))
+            .await
+            .unwrap();
         assert_eq!(st["built"], true);
         assert_eq!(st["tool"], "inmemory");
     }
@@ -338,13 +372,19 @@ mod tests {
 
         // And queryable (the graph now exists).
         let q = h
-            .dispatch("graph.query", ctx(json!({ "rig": "alpha", "question": "x term" })))
+            .dispatch(
+                "graph.query",
+                ctx(json!({ "rig": "alpha", "question": "x term" })),
+            )
             .await
             .unwrap();
         assert!(q["text"].is_string());
 
         // Second refresh without repo_dir resolves it from custody and updates in place.
-        let again = h.dispatch("graph.refresh", ctx(json!({ "rig": "alpha" }))).await.unwrap();
+        let again = h
+            .dispatch("graph.refresh", ctx(json!({ "rig": "alpha" })))
+            .await
+            .unwrap();
         assert_eq!(again["ok"], true);
     }
 
@@ -354,7 +394,10 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let log = Arc::new(EventLog::new(Some(dir.path().to_path_buf())));
         let h = GraphHandler::new(log, Arc::new(InMemoryGraphIndexer::new()));
-        let err = h.dispatch("graph.refresh", ctx(json!({ "rig": "ghost" }))).await.unwrap_err();
+        let err = h
+            .dispatch("graph.refresh", ctx(json!({ "rig": "ghost" })))
+            .await
+            .unwrap_err();
         assert!(matches!(err, AppError::Validation(_)));
     }
 
@@ -365,7 +408,10 @@ mod tests {
         let log = Arc::new(EventLog::new(Some(dir.path().to_path_buf())));
         let h = GraphHandler::new(log, Arc::new(InMemoryGraphIndexer::new()));
         let err = h
-            .dispatch("graph.query", ctx(json!({ "rig": "ghost", "question": "x" })))
+            .dispatch(
+                "graph.query",
+                ctx(json!({ "rig": "ghost", "question": "x" })),
+            )
             .await
             .unwrap_err();
         assert!(matches!(err, AppError::NotFound(_)));

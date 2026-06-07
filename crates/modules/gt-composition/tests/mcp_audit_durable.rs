@@ -43,7 +43,14 @@ async fn wait_for_rows(sink: &PgAuditSink, want: usize) {
 /// `{count, records}` payload.
 async fn tail(handler: &AuditHandler, ws: &str, args: serde_json::Value) -> serde_json::Value {
     handler
-        .dispatch("audit.tail", DomainCtx { workspace: Some(ws), actor: "tester", args })
+        .dispatch(
+            "audit.tail",
+            DomainCtx {
+                workspace: Some(ws),
+                actor: "tester",
+                args,
+            },
+        )
         .await
         .expect("audit.tail dispatch")
 }
@@ -57,8 +64,13 @@ async fn pg_audit_survives_restart_and_tails_per_tenant() {
 
     // Isolate from any prior run sharing the cross-tenant table.
     {
-        let pool = sqlx::PgPool::connect(&url).await.expect("connect for cleanup");
-        sqlx::query("DROP TABLE IF EXISTS mcp_audit").execute(&pool).await.expect("drop");
+        let pool = sqlx::PgPool::connect(&url)
+            .await
+            .expect("connect for cleanup");
+        sqlx::query("DROP TABLE IF EXISTS mcp_audit")
+            .execute(&pool)
+            .await
+            .expect("drop");
     }
 
     // --- First "process": write the trail through one sink, then drop it. ---
@@ -67,8 +79,7 @@ async fn pg_audit_survives_restart_and_tails_per_tenant() {
         sink.record(AuditRecord::invoked("alice", "issues.read", json!({})).in_workspace("acme"))
             .expect("record acme read");
         sink.record(
-            AuditRecord::unauthorized("mallory", "issues.create", json!({}))
-                .in_workspace("acme"),
+            AuditRecord::unauthorized("mallory", "issues.create", json!({})).in_workspace("acme"),
         )
         .expect("record acme denied");
         sink.record(AuditRecord::invoked("bob", "issues.read", json!({})).in_workspace("globex"))

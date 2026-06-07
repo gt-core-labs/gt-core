@@ -100,7 +100,9 @@ impl DomainHandler for ConvoyHandler {
             "convoy.fail-member" => self.run::<FailMember>(ws, ctx.args),
             "convoy.list" => {
                 let board = self.board(ws)?;
-                Ok(json!({ "convoys": board.snapshot().iter().map(convoy_json).collect::<Vec<_>>() }))
+                Ok(
+                    json!({ "convoys": board.snapshot().iter().map(convoy_json).collect::<Vec<_>>() }),
+                )
             }
             "convoy.info" => {
                 let id = str_arg(&ctx.args, "convoy")?;
@@ -137,7 +139,11 @@ mod tests {
     }
 
     fn ctx(args: Value) -> DomainCtx<'static> {
-        DomainCtx { workspace: None, actor: "tester", args }
+        DomainCtx {
+            workspace: None,
+            actor: "tester",
+            args,
+        }
     }
 
     /// Launch a convoy, then drive its members to done — board rehydrated from
@@ -148,29 +154,53 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let h = handler(&dir);
 
-        h.dispatch("convoy.launch", ctx(json!({ "convoy": "c1", "members": ["b1", "b2"] })))
+        h.dispatch(
+            "convoy.launch",
+            ctx(json!({ "convoy": "c1", "members": ["b1", "b2"] })),
+        )
+        .await
+        .unwrap();
+
+        let info = h
+            .dispatch("convoy.info", ctx(json!({ "convoy": "c1" })))
             .await
             .unwrap();
-
-        let info = h.dispatch("convoy.info", ctx(json!({ "convoy": "c1" }))).await.unwrap();
         assert_eq!(info["state"], "launched");
         let members = info["members"].as_array().unwrap();
-        assert_eq!(members[0]["state"], "active", "first member dispatched on launch");
+        assert_eq!(
+            members[0]["state"], "active",
+            "first member dispatched on launch"
+        );
         assert_eq!(members[1]["state"], "pending");
 
-        h.dispatch("convoy.complete-member", ctx(json!({ "convoy": "c1", "member": "b1" })))
+        h.dispatch(
+            "convoy.complete-member",
+            ctx(json!({ "convoy": "c1", "member": "b1" })),
+        )
+        .await
+        .unwrap();
+        let info = h
+            .dispatch("convoy.info", ctx(json!({ "convoy": "c1" })))
             .await
             .unwrap();
-        let info = h.dispatch("convoy.info", ctx(json!({ "convoy": "c1" }))).await.unwrap();
         let members = info["members"].as_array().unwrap();
         assert_eq!(members[0]["state"], "done");
         assert_eq!(members[1]["state"], "active", "handoff to next member");
 
-        h.dispatch("convoy.complete-member", ctx(json!({ "convoy": "c1", "member": "b2" })))
+        h.dispatch(
+            "convoy.complete-member",
+            ctx(json!({ "convoy": "c1", "member": "b2" })),
+        )
+        .await
+        .unwrap();
+        let info = h
+            .dispatch("convoy.info", ctx(json!({ "convoy": "c1" })))
             .await
             .unwrap();
-        let info = h.dispatch("convoy.info", ctx(json!({ "convoy": "c1" }))).await.unwrap();
-        assert_eq!(info["state"], "closed", "convoy closes when all members done");
+        assert_eq!(
+            info["state"], "closed",
+            "convoy closes when all members done"
+        );
 
         let list = h.dispatch("convoy.list", ctx(json!({}))).await.unwrap();
         assert_eq!(list["convoys"].as_array().unwrap().len(), 1);
@@ -180,7 +210,10 @@ mod tests {
     async fn missing_convoy_is_not_found() {
         let dir = TempDir::new().unwrap();
         let h = handler(&dir);
-        let gone = h.dispatch("convoy.info", ctx(json!({ "convoy": "nope" }))).await.unwrap_err();
+        let gone = h
+            .dispatch("convoy.info", ctx(json!({ "convoy": "nope" })))
+            .await
+            .unwrap_err();
         assert!(matches!(gone, AppError::NotFound(_)));
     }
 }

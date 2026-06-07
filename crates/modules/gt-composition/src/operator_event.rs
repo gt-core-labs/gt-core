@@ -63,7 +63,9 @@ mod tests {
         assert!(op.kind().starts_with("issues."));
         assert!(op.kind().ends_with(".v1"));
 
-        let cl = IssueOperatorEvent::Cleared { bead: "hq-1".into() };
+        let cl = IssueOperatorEvent::Cleared {
+            bead: "hq-1".into(),
+        };
         assert_eq!(cl.kind(), "issues.operator-cleared.v1");
         assert!(cl.kind().starts_with("issues."));
     }

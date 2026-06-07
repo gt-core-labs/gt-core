@@ -51,7 +51,11 @@ pub fn account_config_dir(root: &Path, account: &str) -> Option<PathBuf> {
 /// Only direct children of `root` are considered, so host-native dirs (the `GT_CLAUDE_ACCOUNTS` env
 /// bootstrap, which live elsewhere) are never touched. An unreadable `mtime` is treated as recent
 /// (kept), failing safe. Returns the dirs actually removed.
-pub fn gc_orphan_account_dirs(root: &Path, live: &HashSet<String>, grace: Duration) -> Vec<PathBuf> {
+pub fn gc_orphan_account_dirs(
+    root: &Path,
+    live: &HashSet<String>,
+    grace: Duration,
+) -> Vec<PathBuf> {
     let mut removed = Vec::new();
     let now = SystemTime::now();
     let Ok(entries) = std::fs::read_dir(root) else {

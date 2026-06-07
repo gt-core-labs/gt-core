@@ -169,20 +169,36 @@ pub enum OnboardError {
 impl IntoResponse for OnboardError {
     fn into_response(self) -> Response {
         let (status, msg) = match self {
-            OnboardError::Dir(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("credentials dir: {e}")),
-            OnboardError::Spawn(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("spawn claude: {e}")),
+            OnboardError::Dir(e) => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("credentials dir: {e}"),
+            ),
+            OnboardError::Spawn(e) => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("spawn claude: {e}"),
+            ),
             OnboardError::NoUrl => (
                 StatusCode::BAD_GATEWAY,
                 "claude auth login produced no login URL".to_string(),
             ),
-            OnboardError::Timeout(what) => (StatusCode::GATEWAY_TIMEOUT, format!("timed out: {what}")),
-            OnboardError::UnknownSession => {
-                (StatusCode::NOT_FOUND, "unknown or completed onboarding session".to_string())
+            OnboardError::Timeout(what) => {
+                (StatusCode::GATEWAY_TIMEOUT, format!("timed out: {what}"))
             }
-            OnboardError::Stdin(e) => (StatusCode::BAD_GATEWAY, format!("write code to login: {e}")),
+            OnboardError::UnknownSession => (
+                StatusCode::NOT_FOUND,
+                "unknown or completed onboarding session".to_string(),
+            ),
+            OnboardError::Stdin(e) => {
+                (StatusCode::BAD_GATEWAY, format!("write code to login: {e}"))
+            }
             OnboardError::LoginFailed(e) => (StatusCode::BAD_GATEWAY, format!("login failed: {e}")),
-            OnboardError::NotLoggedIn(e) => (StatusCode::BAD_GATEWAY, format!("login incomplete: {e}")),
-            OnboardError::Register(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("register account: {e}")),
+            OnboardError::NotLoggedIn(e) => {
+                (StatusCode::BAD_GATEWAY, format!("login incomplete: {e}"))
+            }
+            OnboardError::Register(e) => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("register account: {e}"),
+            ),
         };
         (status, Json(serde_json::json!({ "error": msg }))).into_response()
     }
@@ -210,7 +226,12 @@ fn authorize(
 
     let token = bearer(headers)
         .or_else(|| cookie(headers, TOKEN_COOKIE))
-        .ok_or_else(|| reject(StatusCode::UNAUTHORIZED, "missing gt_web_token cookie or bearer"))?;
+        .ok_or_else(|| {
+            reject(
+                StatusCode::UNAUTHORIZED,
+                "missing gt_web_token cookie or bearer",
+            )
+        })?;
 
     let claims = state
         .authenticator
@@ -222,7 +243,10 @@ fn authorize(
         .validate(now, JwtClaims::workspace_optional_from_env())
         .is_err()
     {
-        return Err(reject(StatusCode::UNAUTHORIZED, "expired or incomplete token"));
+        return Err(reject(
+            StatusCode::UNAUTHORIZED,
+            "expired or incomplete token",
+        ));
     }
     if !has_scope(&claims.scopes, REQUIRED_SCOPE) {
         return Err(reject(StatusCode::FORBIDDEN, "missing quota.write scope"));
@@ -291,7 +315,9 @@ impl OnboardState {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .kill_on_drop(true);
-        let mut child = cmd.spawn().map_err(|e| OnboardError::Spawn(e.to_string()))?;
+        let mut child = cmd
+            .spawn()
+            .map_err(|e| OnboardError::Spawn(e.to_string()))?;
 
         let stdin = child.stdin.take().expect("stdin piped");
         let stdout = child.stdout.take().expect("stdout piped");
@@ -345,7 +371,11 @@ impl OnboardState {
 
     /// Finish a login: feed the OOB code to the live process, wait for exit, read the account
     /// identity, and register it into `ws`.
-    async fn complete(&self, ws: &str, req: CompleteRequest) -> Result<CompleteResponse, OnboardError> {
+    async fn complete(
+        &self,
+        ws: &str,
+        req: CompleteRequest,
+    ) -> Result<CompleteResponse, OnboardError> {
         let live = self
             .sessions
             .lock()
@@ -364,7 +394,10 @@ impl OnboardState {
             .write_all(line.as_bytes())
             .await
             .map_err(|e| OnboardError::Stdin(e.to_string()))?;
-        stdin.flush().await.map_err(|e| OnboardError::Stdin(e.to_string()))?;
+        stdin
+            .flush()
+            .await
+            .map_err(|e| OnboardError::Stdin(e.to_string()))?;
         drop(stdin);
 
         let status = match tokio::time::timeout(EXIT_TIMEOUT, child.wait()).await {
@@ -376,13 +409,18 @@ impl OnboardState {
             }
         };
         if !status.success() {
-            return Err(OnboardError::LoginFailed(format!("claude auth login exited {status}")));
+            return Err(OnboardError::LoginFailed(format!(
+                "claude auth login exited {status}"
+            )));
         }
 
         let account = claude_auth_status_email(&dir).await?;
         let config_dir = dir.display().to_string();
         self.register(ws, &account, &config_dir)?;
-        Ok(CompleteResponse { account, config_dir })
+        Ok(CompleteResponse {
+            account,
+            config_dir,
+        })
     }
 
     /// Append the event-sourced `quota.account_registered.v1` to `ws`'s quota log — the same
@@ -474,7 +512,9 @@ fn bearer(headers: &HeaderMap) -> Option<String> {
     let raw = headers
         .get(axum::http::header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok())?;
-    let token = raw.strip_prefix("Bearer ").or_else(|| raw.strip_prefix("bearer "))?;
+    let token = raw
+        .strip_prefix("Bearer ")
+        .or_else(|| raw.strip_prefix("bearer "))?;
     let token = token.trim();
     (!token.is_empty()).then(|| token.to_string())
 }
@@ -528,14 +568,20 @@ mod tests {
     #[test]
     fn bearer_strips_prefix() {
         let mut h = HeaderMap::new();
-        h.insert(axum::http::header::AUTHORIZATION, "Bearer abc.def".parse().unwrap());
+        h.insert(
+            axum::http::header::AUTHORIZATION,
+            "Bearer abc.def".parse().unwrap(),
+        );
         assert_eq!(bearer(&h).as_deref(), Some("abc.def"));
     }
 
     #[test]
     fn cookie_extracts_named_value() {
         let mut h = HeaderMap::new();
-        h.insert(axum::http::header::COOKIE, "a=1; gt_web_token=xyz; b=2".parse().unwrap());
+        h.insert(
+            axum::http::header::COOKIE,
+            "a=1; gt_web_token=xyz; b=2".parse().unwrap(),
+        );
         assert_eq!(cookie(&h, TOKEN_COOKIE).as_deref(), Some("xyz"));
     }
 }

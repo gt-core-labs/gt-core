@@ -30,10 +30,22 @@ fn seeded_log() -> (TempDir, EventLog) {
     // Scheduling: three enqueues then one dispatch — the dispatched bead (`gg-2`)
     // must drop out of the still-pending queue, the other two survive.
     for ev in [
-        SchedEvent::Enqueue { bead: "gg-1".into(), priority: 0 },
-        SchedEvent::Enqueue { bead: "gg-2".into(), priority: 2 },
-        SchedEvent::Enqueue { bead: "gg-3".into(), priority: 1 },
-        SchedEvent::Dispatched { bead: "gg-2".into(), worker: "polecat-1".into() },
+        SchedEvent::Enqueue {
+            bead: "gg-1".into(),
+            priority: 0,
+        },
+        SchedEvent::Enqueue {
+            bead: "gg-2".into(),
+            priority: 2,
+        },
+        SchedEvent::Enqueue {
+            bead: "gg-3".into(),
+            priority: 1,
+        },
+        SchedEvent::Dispatched {
+            bead: "gg-2".into(),
+            worker: "polecat-1".into(),
+        },
     ] {
         log.append(Some(WS), ev).expect("append scheduling event");
     }
@@ -41,10 +53,23 @@ fn seeded_log() -> (TempDir, EventLog) {
     // Merge: one slot run to its `Merged` terminator plus a second still-open
     // `Ready` slot, so the replayed board carries a mix of live + terminal states.
     for ev in [
-        MergeEvent::Ready { bead: "gg-1".into(), branch: "b1".into(), channel_msg_id: "m1".into() },
-        MergeEvent::Started { bead: "gg-1".into() },
-        MergeEvent::Merged { bead: "gg-1".into(), sha: "deadbeef".into() },
-        MergeEvent::Ready { bead: "gg-3".into(), branch: "b3".into(), channel_msg_id: "m3".into() },
+        MergeEvent::Ready {
+            bead: "gg-1".into(),
+            branch: "b1".into(),
+            channel_msg_id: "m1".into(),
+        },
+        MergeEvent::Started {
+            bead: "gg-1".into(),
+        },
+        MergeEvent::Merged {
+            bead: "gg-1".into(),
+            sha: "deadbeef".into(),
+        },
+        MergeEvent::Ready {
+            bead: "gg-3".into(),
+            branch: "b3".into(),
+            channel_msg_id: "m3".into(),
+        },
     ] {
         log.append(Some(WS), ev).expect("append merge event");
     }
@@ -61,7 +86,10 @@ fn scheduling_replay_is_deterministic_and_drops_dispatched() {
     let first = replay_scheduling_pending(&log, WS).expect("replay scheduling");
     let second = replay_scheduling_pending(&log, WS).expect("replay scheduling again");
 
-    assert_eq!(first, second, "the same log replays to the same pending queue");
+    assert_eq!(
+        first, second,
+        "the same log replays to the same pending queue"
+    );
     // Byte-for-byte serialization parity (docs/03 Rule 7).
     assert_eq!(
         serde_json::to_string(&first).expect("serialize first"),
@@ -71,8 +99,14 @@ fn scheduling_replay_is_deterministic_and_drops_dispatched() {
 
     // Semantic anchor: the dispatched bead left the queue; the rest stayed pending.
     let beads: Vec<&str> = first.iter().map(|(b, _)| b.as_str()).collect();
-    assert!(beads.contains(&"gg-1") && beads.contains(&"gg-3"), "pending survives: {beads:?}");
-    assert!(!beads.contains(&"gg-2"), "a dispatched bead is no longer pending: {beads:?}");
+    assert!(
+        beads.contains(&"gg-1") && beads.contains(&"gg-3"),
+        "pending survives: {beads:?}"
+    );
+    assert!(
+        !beads.contains(&"gg-2"),
+        "a dispatched bead is no longer pending: {beads:?}"
+    );
 }
 
 /// The merge reducer replays to an identical board twice over. `MergeBoard` is
@@ -93,7 +127,11 @@ fn merge_board_replay_is_deterministic() {
 
     // Semantic anchor: both slots are present, and `gg-1` reached its terminal state.
     let snap = first.snapshot();
-    assert_eq!(snap.len(), 2, "both submitted slots survive replay: {snap:?}");
+    assert_eq!(
+        snap.len(),
+        2,
+        "both submitted slots survive replay: {snap:?}"
+    );
     assert!(
         first.get("gg-1").is_some() && first.get("gg-3").is_some(),
         "replay rebuilt both slots: {snap:?}",

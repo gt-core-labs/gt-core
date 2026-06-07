@@ -56,8 +56,16 @@ use gt_issues::IssuesModule;
 use gt_meta::MetaModule;
 
 /// The namespaces the server exposes over both MCP and HTTP — the parity scope.
-const NAMESPACES: &[&str] =
-    &["issues", "meta", "workspace", "rig", "documents", "agent", "quota", "merge"];
+const NAMESPACES: &[&str] = &[
+    "issues",
+    "meta",
+    "workspace",
+    "rig",
+    "documents",
+    "agent",
+    "quota",
+    "merge",
+];
 
 /// A never-connected Postgres URL: the PG-backed handlers store the pool/url but `descriptors()`
 /// never touches it, so a lazy pool that never dials is enough to harvest the tool set offline.
@@ -81,12 +89,16 @@ const fn rt(method: &'static str, path: &'static str, tool: Option<&'static str>
 fn parity_map(ns: &str) -> Vec<Route> {
     match ns {
         "issues" => vec![
-            rt("GET", "/", None),                                  // gt://issues
-            rt("GET", "/{id}", None),                              // gt://issue/{id}
-            rt("GET", "/stats", None),                             // REST-only aggregation (hq-web-extras.12)
+            rt("GET", "/", None),      // gt://issues
+            rt("GET", "/{id}", None),  // gt://issue/{id}
+            rt("GET", "/stats", None), // REST-only aggregation (hq-web-extras.12)
             rt("POST", "/", Some("issues.create.execute")),
             rt("PATCH", "/{id}", Some("issues.update.execute")),
-            rt("POST", "/{id}/transition", Some("issues.transition.execute")),
+            rt(
+                "POST",
+                "/{id}/transition",
+                Some("issues.transition.execute"),
+            ),
             rt("POST", "/{id}/close", Some("issues.close.execute")),
             rt("POST", "/{id}/claim", Some("issues.claim.execute")),
         ],
@@ -110,8 +122,16 @@ fn parity_map(ns: &str) -> Vec<Route> {
             rt("POST", "/adopt", Some("rig.adopt")),
             rt("DELETE", "/{name}", Some("rig.remove")),
             rt("POST", "/{name}/set-prefix", Some("rig.set-prefix")),
-            rt("POST", "/{name}/set-default-branch", Some("rig.set-default-branch")),
-            rt("POST", "/{name}/set-worktree-root", Some("rig.set-worktree-root")),
+            rt(
+                "POST",
+                "/{name}/set-default-branch",
+                Some("rig.set-default-branch"),
+            ),
+            rt(
+                "POST",
+                "/{name}/set-worktree-root",
+                Some("rig.set-worktree-root"),
+            ),
         ],
         "documents" => vec![
             rt("POST", "/", Some("documents.attach.execute")),
@@ -316,7 +336,9 @@ fn issues_namespace_has_the_expected_mcp_only_tools() {
     let tools = served_mcp_tools("issues");
     let mcp_only: Vec<&String> = tools.iter().filter(|t| !is_routable(t)).collect();
     assert!(
-        mcp_only.iter().any(|t| t.as_str() == "issues.phase.advance"),
+        mcp_only
+            .iter()
+            .any(|t| t.as_str() == "issues.phase.advance"),
         "expected issues.phase.advance among the MCP-only tools: {mcp_only:?}",
     );
     assert_eq!(

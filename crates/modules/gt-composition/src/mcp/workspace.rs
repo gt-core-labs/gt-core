@@ -107,15 +107,27 @@ impl DomainHandler for WorkspaceHandler {
                 "Archive a workspace (terminal transition from active or suspended).",
                 &[req("id", "string")],
             ),
-            descriptor("workspace.list", "List every workspace in the catalog.", &[]),
-            descriptor("workspace.info", "Show one workspace's id, name + status.", &[req("id", "string")]),
+            descriptor(
+                "workspace.list",
+                "List every workspace in the catalog.",
+                &[],
+            ),
+            descriptor(
+                "workspace.info",
+                "Show one workspace's id, name + status.",
+                &[req("id", "string")],
+            ),
             // Membership management (hq-platform-hardening.2): a ws admin adds/removes ANOTHER
             // user. Not in the `workspace_member` preset's allow-list, so the MCP scope gate
             // reserves these for `workspace.admin` (the same ws-admin guard the REST surface uses).
             descriptor(
                 "workspace.member-add",
                 "Add another user (by email) to a workspace, holding a role.",
-                &[req("id", "string"), req("email", "string"), req("role", "string")],
+                &[
+                    req("id", "string"),
+                    req("email", "string"),
+                    req("role", "string"),
+                ],
             ),
             descriptor(
                 "workspace.member-remove",
@@ -162,7 +174,9 @@ impl DomainHandler for WorkspaceHandler {
                 // Hydrate from Postgres, then run the command through the actor so
                 // the change is an applied event (replay-authoritative), persisted
                 // back to the `workspaces` table.
-                let mut actor = WorkspaceActor::hydrate(self.repo()).await.map_err(actor_err)?;
+                let mut actor = WorkspaceActor::hydrate(self.repo())
+                    .await
+                    .map_err(actor_err)?;
                 actor
                     .handle(WorkspaceCommand::Create {
                         id: id.clone(),
@@ -187,7 +201,9 @@ impl DomainHandler for WorkspaceHandler {
                 // non-active source (IllegalTransition) as a validation fault, so a
                 // suspended/archived workspace cannot be re-suspended.
                 let id = workspace_id(str_arg(&ctx.args, "id")?)?;
-                let mut actor = WorkspaceActor::hydrate(self.repo()).await.map_err(actor_err)?;
+                let mut actor = WorkspaceActor::hydrate(self.repo())
+                    .await
+                    .map_err(actor_err)?;
                 actor
                     .handle(WorkspaceCommand::Suspend { id: id.clone() })
                     .await
@@ -208,7 +224,9 @@ impl DomainHandler for WorkspaceHandler {
                 // The suspend/archive gate (hq-mt-bootstrap.8) whitelists this tool,
                 // so a suspended tenant can be brought back.
                 let id = workspace_id(str_arg(&ctx.args, "id")?)?;
-                let mut actor = WorkspaceActor::hydrate(self.repo()).await.map_err(actor_err)?;
+                let mut actor = WorkspaceActor::hydrate(self.repo())
+                    .await
+                    .map_err(actor_err)?;
                 actor
                     .handle(WorkspaceCommand::Resume { id: id.clone() })
                     .await
@@ -225,7 +243,9 @@ impl DomainHandler for WorkspaceHandler {
                 // on-disk teardown (Dolt snapshot + tar the event log) is a deploy-edge step;
                 // this tool records only the orchestrator's status change.
                 let id = workspace_id(str_arg(&ctx.args, "id")?)?;
-                let mut actor = WorkspaceActor::hydrate(self.repo()).await.map_err(actor_err)?;
+                let mut actor = WorkspaceActor::hydrate(self.repo())
+                    .await
+                    .map_err(actor_err)?;
                 actor
                     .handle(WorkspaceCommand::Archive { id: id.clone() })
                     .await
@@ -279,7 +299,10 @@ impl DomainHandler for WorkspaceHandler {
                     .await
                     .map_err(auth_err)?;
                 if !removed {
-                    return Err(AppError::NotFound(format!("member {email} of {}", id.as_str())));
+                    return Err(AppError::NotFound(format!(
+                        "member {email} of {}",
+                        id.as_str()
+                    )));
                 }
                 Ok(json!({ "ok": true, "id": id.as_str(), "email": email }))
             }
@@ -374,9 +397,15 @@ fn new_provider_from_args(args: &Value) -> Result<gt_auth::NewProvider, AppError
         client_id: str_arg(args, "client_id")?.to_string(),
         client_secret: str_arg(args, "client_secret")?.to_string(),
         issuer: need("issuer", preset.as_ref().map(|p| p.issuer))?,
-        authorize_endpoint: need("authorize_endpoint", preset.as_ref().map(|p| p.authorize_endpoint))?,
+        authorize_endpoint: need(
+            "authorize_endpoint",
+            preset.as_ref().map(|p| p.authorize_endpoint),
+        )?,
         token_endpoint: need("token_endpoint", preset.as_ref().map(|p| p.token_endpoint))?,
-        userinfo_endpoint: need("userinfo_endpoint", preset.as_ref().map(|p| p.userinfo_endpoint))?,
+        userinfo_endpoint: need(
+            "userinfo_endpoint",
+            preset.as_ref().map(|p| p.userinfo_endpoint),
+        )?,
         scopes: need("scopes", preset.as_ref().map(|p| p.default_scopes))?,
         enabled: args.get("enabled").and_then(Value::as_bool).unwrap_or(true),
     })
@@ -522,13 +551,12 @@ async fn seed_workspace_rbac(pool: &PgPool, slug: &str, actor: &str) -> Result<(
     // store, holding the `admin` role. Only when the actor is a known global
     // identity — the boot/system actor has no `public.users` row, and the empty
     // role assignment / absent membership is harmless (operator attaches later).
-    let global: Option<(String, String)> = sqlx::query_as(
-        "SELECT id, password_hash FROM public.users WHERE id = $1",
-    )
-    .bind(actor)
-    .fetch_optional(pool)
-    .await
-    .map_err(|e| AppError::Other(format!("lookup global identity {actor}: {e}")))?;
+    let global: Option<(String, String)> =
+        sqlx::query_as("SELECT id, password_hash FROM public.users WHERE id = $1")
+            .bind(actor)
+            .fetch_optional(pool)
+            .await
+            .map_err(|e| AppError::Other(format!("lookup global identity {actor}: {e}")))?;
 
     if let Some((user_id, password_hash)) = global {
         sqlx::query(&format!(
@@ -566,8 +594,12 @@ async fn seed_workspace_rbac(pool: &PgPool, slug: &str, actor: &str) -> Result<(
 /// [`schema_for`] yields — so it is safe to interpolate into DDL (a schema name
 /// cannot be a bound parameter). Mirrors the server's boot-time guard.
 fn is_safe_ws_schema(s: &str) -> bool {
-    s.strip_prefix("ws_")
-        .is_some_and(|rest| !rest.is_empty() && rest.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_'))
+    s.strip_prefix("ws_").is_some_and(|rest| {
+        !rest.is_empty()
+            && rest
+                .bytes()
+                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_')
+    })
 }
 
 /// Pull a required string argument, rejecting a missing/non-string value as a
@@ -671,7 +703,10 @@ pub struct PgWorkspaceStatus {
 impl PgWorkspaceStatus {
     /// Wrap the shared catalog pool (the `public`-schema `workspaces` table).
     pub fn new(pool: PgPool) -> Self {
-        Self { pool, cache: RwLock::new(HashMap::new()) }
+        Self {
+            pool,
+            cache: RwLock::new(HashMap::new()),
+        }
     }
 
     /// Read a fresh (within [`STATUS_TTL`]) cached entry for `ws`, if any.
@@ -700,7 +735,10 @@ impl WorkspaceStatusGate for PgWorkspaceStatus {
             .await
             .map_err(repo_err)?
             .map(|entry| gate_status(entry.status));
-        self.cache.write().await.insert(ws.to_string(), (status, Instant::now()));
+        self.cache
+            .write()
+            .await
+            .insert(ws.to_string(), (status, Instant::now()));
         Ok(status)
     }
 }
@@ -730,8 +768,15 @@ mod tests {
     async fn suspend_requires_id() {
         let pool = PgPool::connect_lazy("postgres://gt@127.0.0.1:1/none").unwrap();
         let handler = WorkspaceHandler::new(pool);
-        let ctx = DomainCtx { workspace: None, actor: "tester", args: json!({}) };
-        let err = handler.dispatch("workspace.suspend", ctx).await.unwrap_err();
+        let ctx = DomainCtx {
+            workspace: None,
+            actor: "tester",
+            args: json!({}),
+        };
+        let err = handler
+            .dispatch("workspace.suspend", ctx)
+            .await
+            .unwrap_err();
         assert!(matches!(err, AppError::Validation(_)));
     }
 
@@ -740,7 +785,11 @@ mod tests {
     async fn resume_requires_id() {
         let pool = PgPool::connect_lazy("postgres://gt@127.0.0.1:1/none").unwrap();
         let handler = WorkspaceHandler::new(pool);
-        let ctx = DomainCtx { workspace: None, actor: "tester", args: json!({}) };
+        let ctx = DomainCtx {
+            workspace: None,
+            actor: "tester",
+            args: json!({}),
+        };
         let err = handler.dispatch("workspace.resume", ctx).await.unwrap_err();
         assert!(matches!(err, AppError::Validation(_)));
     }
@@ -750,8 +799,15 @@ mod tests {
     async fn archive_requires_id() {
         let pool = PgPool::connect_lazy("postgres://gt@127.0.0.1:1/none").unwrap();
         let handler = WorkspaceHandler::new(pool);
-        let ctx = DomainCtx { workspace: None, actor: "tester", args: json!({}) };
-        let err = handler.dispatch("workspace.archive", ctx).await.unwrap_err();
+        let ctx = DomainCtx {
+            workspace: None,
+            actor: "tester",
+            args: json!({}),
+        };
+        let err = handler
+            .dispatch("workspace.archive", ctx)
+            .await
+            .unwrap_err();
         assert!(matches!(err, AppError::Validation(_)));
     }
 
@@ -765,7 +821,10 @@ mod tests {
             actor: "tester",
             args: json!({}),
         };
-        let err = handler.dispatch("workspace.frobnicate", ctx).await.unwrap_err();
+        let err = handler
+            .dispatch("workspace.frobnicate", ctx)
+            .await
+            .unwrap_err();
         assert!(matches!(err, AppError::Validation(_)));
     }
 
@@ -773,7 +832,11 @@ mod tests {
     /// so the suite is a no-op off a developer box / CI without PG.
     async fn pool_or_skip() -> Option<PgPool> {
         let url = std::env::var("GT_PG_URL").ok()?;
-        Some(PgPool::connect(&url).await.expect("GT_PG_URL must point at a reachable Postgres"))
+        Some(
+            PgPool::connect(&url)
+                .await
+                .expect("GT_PG_URL must point at a reachable Postgres"),
+        )
     }
 
     /// Seed the public-schema catalog the way the server's `apply_pg_catalog` does:
@@ -785,7 +848,10 @@ mod tests {
     /// migrations), so every test can call this on entry.
     async fn apply_workspace_migrations(pool: &PgPool) {
         for m in gt_store_pg::workspace_migrations() {
-            sqlx::raw_sql(&m.sql).execute(pool).await.expect("apply workspaces migration");
+            sqlx::raw_sql(&m.sql)
+                .execute(pool)
+                .await
+                .expect("apply workspaces migration");
         }
         sqlx::raw_sql("CREATE SCHEMA IF NOT EXISTS ws_default")
             .execute(pool)
@@ -852,10 +918,17 @@ mod tests {
             .unwrap();
 
         let handler = WorkspaceHandler::new(pool.clone());
-        let ctx = |args| DomainCtx { workspace: None, actor: "tester", args };
+        let ctx = |args| DomainCtx {
+            workspace: None,
+            actor: "tester",
+            args,
+        };
 
         let created = handler
-            .dispatch("workspace.create", ctx(json!({ "id": "dispatch-test", "name": "Dispatch" })))
+            .dispatch(
+                "workspace.create",
+                ctx(json!({ "id": "dispatch-test", "name": "Dispatch" })),
+            )
             .await
             .unwrap();
         assert_eq!(created["status"], "active");
@@ -871,11 +944,17 @@ mod tests {
         .fetch_one(&pool)
         .await
         .unwrap();
-        assert!(schema_exists, "workspace.create must clone ws_default into ws_dispatch_test");
+        assert!(
+            schema_exists,
+            "workspace.create must clone ws_default into ws_dispatch_test"
+        );
 
         // Re-create is rejected (the actor decides AlreadyExists) as a validation fault.
         let dup = handler
-            .dispatch("workspace.create", ctx(json!({ "id": "dispatch-test", "name": "X" })))
+            .dispatch(
+                "workspace.create",
+                ctx(json!({ "id": "dispatch-test", "name": "X" })),
+            )
             .await
             .unwrap_err();
         assert!(matches!(dup, AppError::Validation(_)));
@@ -888,7 +967,10 @@ mod tests {
         assert_eq!(info["name"], "Dispatch");
 
         // list includes it.
-        let list = handler.dispatch("workspace.list", ctx(json!({}))).await.unwrap();
+        let list = handler
+            .dispatch("workspace.list", ctx(json!({})))
+            .await
+            .unwrap();
         let ids: Vec<&str> = list["workspaces"]
             .as_array()
             .unwrap()
@@ -931,10 +1013,17 @@ mod tests {
             .unwrap();
 
         let handler = WorkspaceHandler::new(pool.clone());
-        let ctx = |args| DomainCtx { workspace: None, actor: "tester", args };
+        let ctx = |args| DomainCtx {
+            workspace: None,
+            actor: "tester",
+            args,
+        };
 
         handler
-            .dispatch("workspace.create", ctx(json!({ "id": "suspend-test", "name": "S" })))
+            .dispatch(
+                "workspace.create",
+                ctx(json!({ "id": "suspend-test", "name": "S" })),
+            )
             .await
             .unwrap();
 
@@ -981,10 +1070,17 @@ mod tests {
             .unwrap();
 
         let handler = WorkspaceHandler::new(pool.clone());
-        let ctx = |args| DomainCtx { workspace: None, actor: "tester", args };
+        let ctx = |args| DomainCtx {
+            workspace: None,
+            actor: "tester",
+            args,
+        };
 
         handler
-            .dispatch("workspace.create", ctx(json!({ "id": "resume-test", "name": "R" })))
+            .dispatch(
+                "workspace.create",
+                ctx(json!({ "id": "resume-test", "name": "R" })),
+            )
             .await
             .unwrap();
         // Resuming an active workspace is illegal (nothing to restore).
@@ -994,7 +1090,10 @@ mod tests {
             .unwrap_err();
         assert!(matches!(illegal, AppError::Validation(_)));
 
-        handler.dispatch("workspace.suspend", ctx(json!({ "id": "resume-test" }))).await.unwrap();
+        handler
+            .dispatch("workspace.suspend", ctx(json!({ "id": "resume-test" })))
+            .await
+            .unwrap();
         let resumed = handler
             .dispatch("workspace.resume", ctx(json!({ "id": "resume-test" })))
             .await
@@ -1002,7 +1101,10 @@ mod tests {
         assert_eq!(resumed["status"], "active");
 
         // Persisted: info reads back active.
-        let info = handler.dispatch("workspace.info", ctx(json!({ "id": "resume-test" }))).await.unwrap();
+        let info = handler
+            .dispatch("workspace.info", ctx(json!({ "id": "resume-test" })))
+            .await
+            .unwrap();
         assert_eq!(info["status"], "active");
 
         sqlx::query("DELETE FROM workspaces WHERE id = $1")
@@ -1028,14 +1130,24 @@ mod tests {
             .unwrap();
 
         let handler = WorkspaceHandler::new(pool.clone());
-        let ctx = |args| DomainCtx { workspace: None, actor: "tester", args };
+        let ctx = |args| DomainCtx {
+            workspace: None,
+            actor: "tester",
+            args,
+        };
 
         handler
-            .dispatch("workspace.create", ctx(json!({ "id": "archive-test", "name": "A" })))
+            .dispatch(
+                "workspace.create",
+                ctx(json!({ "id": "archive-test", "name": "A" })),
+            )
             .await
             .unwrap();
         // Archive straight from Active is allowed too, but go via Suspended to prove both.
-        handler.dispatch("workspace.suspend", ctx(json!({ "id": "archive-test" }))).await.unwrap();
+        handler
+            .dispatch("workspace.suspend", ctx(json!({ "id": "archive-test" })))
+            .await
+            .unwrap();
 
         let archived = handler
             .dispatch("workspace.archive", ctx(json!({ "id": "archive-test" })))
@@ -1044,7 +1156,10 @@ mod tests {
         assert_eq!(archived["status"], "archived");
 
         // Persisted.
-        let info = handler.dispatch("workspace.info", ctx(json!({ "id": "archive-test" }))).await.unwrap();
+        let info = handler
+            .dispatch("workspace.info", ctx(json!({ "id": "archive-test" })))
+            .await
+            .unwrap();
         assert_eq!(info["status"], "archived");
 
         // Re-archive rejected (Archived is terminal) → validation.
@@ -1103,13 +1218,20 @@ mod tests {
 
         // A clean slate for this slug.
         let now = 1_700_000_000i64;
-        sqlx::query("DELETE FROM workspaces WHERE id = $1").bind("prov-test").execute(&pool).await.unwrap();
+        sqlx::query("DELETE FROM workspaces WHERE id = $1")
+            .bind("prov-test")
+            .execute(&pool)
+            .await
+            .unwrap();
         sqlx::query("DELETE FROM public.user_workspaces WHERE workspace_slug = $1")
             .bind("prov-test")
             .execute(&pool)
             .await
             .unwrap();
-        sqlx::raw_sql("DROP SCHEMA IF EXISTS ws_prov_test CASCADE").execute(&pool).await.unwrap();
+        sqlx::raw_sql("DROP SCHEMA IF EXISTS ws_prov_test CASCADE")
+            .execute(&pool)
+            .await
+            .unwrap();
         // The creating user must be a known global identity (membership FK).
         sqlx::query(
             "INSERT INTO public.users (id, email, password_hash, created_at, updated_at) \
@@ -1122,10 +1244,17 @@ mod tests {
         .unwrap();
 
         let handler = WorkspaceHandler::new(pool.clone());
-        let ctx = |args| DomainCtx { workspace: None, actor: "user-prov", args };
+        let ctx = |args| DomainCtx {
+            workspace: None,
+            actor: "user-prov",
+            args,
+        };
 
         let created = handler
-            .dispatch("workspace.create", ctx(json!({ "id": "prov-test", "name": "Prov" })))
+            .dispatch(
+                "workspace.create",
+                ctx(json!({ "id": "prov-test", "name": "Prov" })),
+            )
             .await
             .unwrap();
         assert_eq!(created["status"], "active");
@@ -1158,9 +1287,16 @@ mod tests {
 
         // Idempotent: deleting the catalog row and re-creating re-runs the seed as a
         // no-op (ON CONFLICT DO NOTHING), never a duplicate-key error.
-        sqlx::query("DELETE FROM workspaces WHERE id = $1").bind("prov-test").execute(&pool).await.unwrap();
+        sqlx::query("DELETE FROM workspaces WHERE id = $1")
+            .bind("prov-test")
+            .execute(&pool)
+            .await
+            .unwrap();
         handler
-            .dispatch("workspace.create", ctx(json!({ "id": "prov-test", "name": "Prov" })))
+            .dispatch(
+                "workspace.create",
+                ctx(json!({ "id": "prov-test", "name": "Prov" })),
+            )
             .await
             .expect("re-create with already-seeded RBAC is idempotent");
 
@@ -1170,9 +1306,19 @@ mod tests {
             .execute(&pool)
             .await
             .unwrap();
-        sqlx::query("DELETE FROM workspaces WHERE id = $1").bind("prov-test").execute(&pool).await.unwrap();
-        sqlx::query("DELETE FROM public.users WHERE id = 'user-prov'").execute(&pool).await.unwrap();
-        sqlx::raw_sql("DROP SCHEMA IF EXISTS ws_prov_test CASCADE").execute(&pool).await.unwrap();
+        sqlx::query("DELETE FROM workspaces WHERE id = $1")
+            .bind("prov-test")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("DELETE FROM public.users WHERE id = 'user-prov'")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::raw_sql("DROP SCHEMA IF EXISTS ws_prov_test CASCADE")
+            .execute(&pool)
+            .await
+            .unwrap();
     }
 
     /// PG-backed: the `workspace.provider-*` system-admin tools (hq-idp-db.4) round-trip through
@@ -1203,7 +1349,11 @@ mod tests {
             .unwrap();
 
         let handler = WorkspaceHandler::new(pool.clone());
-        let ctx = |args| DomainCtx { workspace: None, actor: "sysadmin", args };
+        let ctx = |args| DomainCtx {
+            workspace: None,
+            actor: "sysadmin",
+            args,
+        };
 
         // Create a Google preset: only client credentials supplied, endpoints baked.
         let created = handler
@@ -1214,21 +1364,42 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(created["id"], id);
-        assert_eq!(created["token_endpoint"], "https://oauth2.googleapis.com/token");
+        assert_eq!(
+            created["token_endpoint"],
+            "https://oauth2.googleapis.com/token"
+        );
         let created_str = created.to_string();
-        assert!(!created_str.contains("client_secret"), "create echo names no secret: {created_str}");
-        assert!(!created_str.contains("top-secret-xyz"), "create echo carries no secret: {created_str}");
+        assert!(
+            !created_str.contains("client_secret"),
+            "create echo names no secret: {created_str}"
+        );
+        assert!(
+            !created_str.contains("top-secret-xyz"),
+            "create echo carries no secret: {created_str}"
+        );
 
         // List shows it, still no secret.
-        let list = handler.dispatch("workspace.provider-list", ctx(json!({}))).await.unwrap();
+        let list = handler
+            .dispatch("workspace.provider-list", ctx(json!({})))
+            .await
+            .unwrap();
         let list_str = list.to_string();
-        assert!(list_str.contains(&id), "list includes the provider: {list_str}");
+        assert!(
+            list_str.contains(&id),
+            "list includes the provider: {list_str}"
+        );
         assert!(!list_str.contains("client_secret"), "list names no secret");
-        assert!(!list_str.contains("top-secret-xyz"), "list carries no secret");
+        assert!(
+            !list_str.contains("top-secret-xyz"),
+            "list carries no secret"
+        );
 
         // Patch `enabled` (no secret re-supplied).
         let patched = handler
-            .dispatch("workspace.provider-update", ctx(json!({ "id": id, "enabled": false })))
+            .dispatch(
+                "workspace.provider-update",
+                ctx(json!({ "id": id, "enabled": false })),
+            )
             .await
             .unwrap();
         assert_eq!(patched["enabled"], false);
@@ -1260,7 +1431,10 @@ mod tests {
     #[test]
     fn gate_status_maps_every_variant() {
         assert_eq!(gate_status(WorkspaceStatus::Active), GateStatus::Active);
-        assert_eq!(gate_status(WorkspaceStatus::Suspended), GateStatus::Suspended);
+        assert_eq!(
+            gate_status(WorkspaceStatus::Suspended),
+            GateStatus::Suspended
+        );
         assert_eq!(gate_status(WorkspaceStatus::Archived), GateStatus::Archived);
     }
 
@@ -1292,24 +1466,43 @@ mod tests {
             .unwrap();
 
         let handler = WorkspaceHandler::new(pool.clone());
-        let ctx = |args| DomainCtx { workspace: None, actor: "tester", args };
+        let ctx = |args| DomainCtx {
+            workspace: None,
+            actor: "tester",
+            args,
+        };
         handler
-            .dispatch("workspace.create", ctx(json!({ "id": "gate-test", "name": "G" })))
+            .dispatch(
+                "workspace.create",
+                ctx(json!({ "id": "gate-test", "name": "G" })),
+            )
             .await
             .unwrap();
 
         // Active right after create; an unknown slug is None.
         let gate = PgWorkspaceStatus::new(pool.clone());
-        assert_eq!(gate.status("gate-test").await.unwrap(), Some(GateStatus::Active));
+        assert_eq!(
+            gate.status("gate-test").await.unwrap(),
+            Some(GateStatus::Active)
+        );
         assert_eq!(gate.status("no-such-ws").await.unwrap(), None);
 
         // Suspend it, then read with a *fresh* gate (the first gate cached Active).
-        handler.dispatch("workspace.suspend", ctx(json!({ "id": "gate-test" }))).await.unwrap();
+        handler
+            .dispatch("workspace.suspend", ctx(json!({ "id": "gate-test" })))
+            .await
+            .unwrap();
         let fresh = PgWorkspaceStatus::new(pool.clone());
-        assert_eq!(fresh.status("gate-test").await.unwrap(), Some(GateStatus::Suspended));
+        assert_eq!(
+            fresh.status("gate-test").await.unwrap(),
+            Some(GateStatus::Suspended)
+        );
         // The stale gate still serves its cached Active within the TTL — the
         // documented bounded lag, proving the cache is in force.
-        assert_eq!(gate.status("gate-test").await.unwrap(), Some(GateStatus::Active));
+        assert_eq!(
+            gate.status("gate-test").await.unwrap(),
+            Some(GateStatus::Active)
+        );
 
         sqlx::query("DELETE FROM workspaces WHERE id = $1")
             .bind("gate-test")

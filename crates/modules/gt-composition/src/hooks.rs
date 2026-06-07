@@ -58,8 +58,16 @@ pub struct HooksApiState {
 
 impl HooksApiState {
     /// Bundle the verifier + audit sink + global store for the hooks router.
-    pub fn new(authenticator: SharedAuthenticator, audit: SharedAudit, store: Arc<dyn HooksStore>) -> Self {
-        Self { authenticator, audit, store }
+    pub fn new(
+        authenticator: SharedAuthenticator,
+        audit: SharedAudit,
+        store: Arc<dyn HooksStore>,
+    ) -> Self {
+        Self {
+            authenticator,
+            audit,
+            store,
+        }
     }
 }
 
@@ -68,13 +76,19 @@ impl HooksApiState {
 pub fn hooks_router(state: HooksApiState) -> Router {
     Router::new()
         .route(HOOKS_PATH, get(list_hooks).post(register_hook))
-        .route(&format!("{HOOKS_PATH}/:id"), axum::routing::delete(retire_hook))
+        .route(
+            &format!("{HOOKS_PATH}/:id"),
+            axum::routing::delete(retire_hook),
+        )
         .with_state(state)
 }
 
 /// Server-stamped wall-clock seconds for a hook event's `now_secs` — never from the request.
 fn now_secs() -> u64 {
-    SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
 }
 
 /// `GET /api/v1/hooks` — the whole global registry (`hooks.read`).
@@ -85,7 +99,11 @@ async fn list_hooks(State(st): State<HooksApiState>, headers: HeaderMap) -> Resp
     match st.store.registry() {
         Ok(reg) => {
             let hooks = reg.hooks();
-            (StatusCode::OK, Json(json!({ "count": hooks.len(), "hooks": hooks }))).into_response()
+            (
+                StatusCode::OK,
+                Json(json!({ "count": hooks.len(), "hooks": hooks })),
+            )
+                .into_response()
         }
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     }
@@ -120,7 +138,10 @@ fn generate_hook_id(event: &str) -> String {
         .filter(|c| c.is_ascii_alphanumeric())
         .collect::<String>()
         .to_ascii_lowercase();
-    format!("hook-{event_slug}-{:08x}", secs.wrapping_mul(1_000_000_000).wrapping_add(nanos as u64) as u32)
+    format!(
+        "hook-{event_slug}-{:08x}",
+        secs.wrapping_mul(1_000_000_000).wrapping_add(nanos as u64) as u32
+    )
 }
 
 /// `POST /api/v1/hooks` — register (or replace) a hook (`hooks.write`). Validates the shape (id /
@@ -176,9 +197,16 @@ async fn retire_hook(
         Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     };
     if reg.get(&id).is_none() {
-        return (StatusCode::NOT_FOUND, format!("no hook registered under id `{id}`")).into_response();
+        return (
+            StatusCode::NOT_FOUND,
+            format!("no hook registered under id `{id}`"),
+        )
+            .into_response();
     }
-    let cmd = RetireHook { id, now_secs: now_secs() };
+    let cmd = RetireHook {
+        id,
+        now_secs: now_secs(),
+    };
     let event = match cmd.execute(&mut reg) {
         Ok(e) => e,
         Err(e) => return (StatusCode::UNPROCESSABLE_ENTITY, e.to_string()).into_response(),
@@ -212,7 +240,12 @@ fn authorize(
 
     let token = bearer(headers)
         .or_else(|| cookie(headers, TOKEN_COOKIE))
-        .ok_or_else(|| reject(StatusCode::UNAUTHORIZED, "missing gt_web_token cookie or bearer"))?;
+        .ok_or_else(|| {
+            reject(
+                StatusCode::UNAUTHORIZED,
+                "missing gt_web_token cookie or bearer",
+            )
+        })?;
 
     let claims = st
         .authenticator
@@ -220,8 +253,14 @@ fn authorize(
         .map_err(|_| reject(StatusCode::UNAUTHORIZED, "invalid token"))?;
 
     let now = OffsetDateTime::now_utc().unix_timestamp().max(0) as u64;
-    if claims.validate(now, JwtClaims::workspace_optional_from_env()).is_err() {
-        return Err(reject(StatusCode::UNAUTHORIZED, "expired or incomplete token"));
+    if claims
+        .validate(now, JwtClaims::workspace_optional_from_env())
+        .is_err()
+    {
+        return Err(reject(
+            StatusCode::UNAUTHORIZED,
+            "expired or incomplete token",
+        ));
     }
     if !has_scope(&claims.scopes, scope) {
         return Err(reject(StatusCode::FORBIDDEN, "missing hooks scope"));
@@ -236,8 +275,12 @@ fn has_scope(scopes: &[String], required: &str) -> bool {
 
 /// The bearer token from `Authorization: Bearer <jwt>`, trimmed + non-empty.
 fn bearer(headers: &HeaderMap) -> Option<String> {
-    let raw = headers.get(axum::http::header::AUTHORIZATION).and_then(|v| v.to_str().ok())?;
-    let token = raw.strip_prefix("Bearer ").or_else(|| raw.strip_prefix("bearer "))?;
+    let raw = headers
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())?;
+    let token = raw
+        .strip_prefix("Bearer ")
+        .or_else(|| raw.strip_prefix("bearer "))?;
     let token = token.trim();
     (!token.is_empty()).then(|| token.to_string())
 }
@@ -272,20 +315,29 @@ mod tests {
         let id = generate_hook_id("PreToolUse");
         assert!(id.starts_with("hook-pretooluse-"));
         // The generated id must satisfy the domain's validator (lowercase alnum + '-', bounded).
-        assert!(gt_claude_hooks::validate_hook_id(&id).is_ok(), "{id} should be a valid hook id");
+        assert!(
+            gt_claude_hooks::validate_hook_id(&id).is_ok(),
+            "{id} should be a valid hook id"
+        );
     }
 
     #[test]
     fn bearer_strips_prefix() {
         let mut h = HeaderMap::new();
-        h.insert(axum::http::header::AUTHORIZATION, "Bearer abc.def".parse().unwrap());
+        h.insert(
+            axum::http::header::AUTHORIZATION,
+            "Bearer abc.def".parse().unwrap(),
+        );
         assert_eq!(bearer(&h).as_deref(), Some("abc.def"));
     }
 
     #[test]
     fn cookie_extracts_named_value() {
         let mut h = HeaderMap::new();
-        h.insert(axum::http::header::COOKIE, "a=1; gt_web_token=xyz".parse().unwrap());
+        h.insert(
+            axum::http::header::COOKIE,
+            "a=1; gt_web_token=xyz".parse().unwrap(),
+        );
         assert_eq!(cookie(&h, TOKEN_COOKIE).as_deref(), Some("xyz"));
     }
 }

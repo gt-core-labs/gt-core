@@ -27,7 +27,10 @@ use gt_store_blob::BlobStore;
 use serde_json::{json, Value};
 
 fn nonce() -> u128 {
-    SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos()
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos()
 }
 
 /// A single-page PDF whose text stream shows `text` (lopdf — same lib the reader uses).
@@ -71,10 +74,16 @@ fn pdf_with_text(text: &str) -> Vec<u8> {
 /// The wired handler + reader + blob handle over the live PG + S3 stack, or `None` when the
 /// stack env is absent (skip). The bucket must already exist (the compose stack / MinIO init
 /// provisions it, mirroring the deploy).
-async fn stack() -> Option<(DocumentsHandler, PgDocumentsResource, Arc<BlobStore>, String)> {
-    let (Ok(pg), Ok(endpoint)) =
-        (std::env::var("GT_PG_URL"), std::env::var("GT_BLOB_ENDPOINT"))
-    else {
+async fn stack() -> Option<(
+    DocumentsHandler,
+    PgDocumentsResource,
+    Arc<BlobStore>,
+    String,
+)> {
+    let (Ok(pg), Ok(endpoint)) = (
+        std::env::var("GT_PG_URL"),
+        std::env::var("GT_BLOB_ENDPOINT"),
+    ) else {
         eprintln!("GT_PG_URL / GT_BLOB_ENDPOINT unset; skipping documents e2e (stack not up)");
         return None;
     };
@@ -84,16 +93,30 @@ async fn stack() -> Option<(DocumentsHandler, PgDocumentsResource, Arc<BlobStore
     let secret = std::env::var("GT_BLOB_SECRET_KEY").unwrap_or_default();
 
     // Provision the docs template tables (serialized — see documents_dispatch for the why).
-    let admin = sqlx::PgPool::connect(&pg).await.expect("connect admin pool");
+    let admin = sqlx::PgPool::connect(&pg)
+        .await
+        .expect("connect admin pool");
     let mut conn = admin.acquire().await.expect("acquire admin conn");
-    sqlx::query("SELECT pg_advisory_lock(4915623003)").execute(&mut *conn).await.unwrap();
+    sqlx::query("SELECT pg_advisory_lock(4915623003)")
+        .execute(&mut *conn)
+        .await
+        .unwrap();
     for m in gt_store_pg::workspace_migrations() {
-        sqlx::raw_sql(&m.sql).execute(&mut *conn).await.expect("apply workspace migration");
+        sqlx::raw_sql(&m.sql)
+            .execute(&mut *conn)
+            .await
+            .expect("apply workspace migration");
     }
     for m in gt_store_pg::docs_migrations() {
-        sqlx::raw_sql(&m.sql).execute(&mut *conn).await.expect("apply docs migration");
+        sqlx::raw_sql(&m.sql)
+            .execute(&mut *conn)
+            .await
+            .expect("apply docs migration");
     }
-    sqlx::query("SELECT pg_advisory_unlock(4915623003)").execute(&mut *conn).await.unwrap();
+    sqlx::query("SELECT pg_advisory_unlock(4915623003)")
+        .execute(&mut *conn)
+        .await
+        .unwrap();
     drop(conn);
 
     let blob = Arc::new(
@@ -112,49 +135,81 @@ async fn stack() -> Option<(DocumentsHandler, PgDocumentsResource, Arc<BlobStore
 }
 
 async fn call(h: &DocumentsHandler, tool: &str, args: Value) -> Value {
-    h.dispatch(tool, DomainCtx { workspace: None, actor: "e2e", args })
-        .await
-        .unwrap_or_else(|e| panic!("{tool}: {e}"))
+    h.dispatch(
+        tool,
+        DomainCtx {
+            workspace: None,
+            actor: "e2e",
+            args,
+        },
+    )
+    .await
+    .unwrap_or_else(|e| panic!("{tool}: {e}"))
 }
 
 #[tokio::test]
 async fn documents_full_stack_attach_inline_search_and_blob_roundtrip() {
-    let Some((h, res, blob, _bucket)) = stack().await else { return };
+    let Some((h, res, blob, _bucket)) = stack().await else {
+        return;
+    };
     let n = nonce();
     let epic = format!("epic-{n}");
 
     // --- e2e.1: a .md attached to an epic is inlined by the owner read + found by search.
-    let md = call(&h, "documents.attach.execute", json!({
-        "owner_type": "epic", "owner_id": epic, "kind": "md",
-        "filename": "plan.md", "body_md": "the gastown launch runbook", "created_by": "e2e"
-    }))
+    let md = call(
+        &h,
+        "documents.attach.execute",
+        json!({
+            "owner_type": "epic", "owner_id": epic, "kind": "md",
+            "filename": "plan.md", "body_md": "the gastown launch runbook", "created_by": "e2e"
+        }),
+    )
     .await;
     let md_id = md["id"].as_str().unwrap().to_string();
 
     let inline = res.list_for_owner(None, &epic).await.expect("owner inline");
-    assert!(inline.iter().any(|d| d["id"] == md["id"]), "e2e.1: gt://issue inline returns the .md");
+    assert!(
+        inline.iter().any(|d| d["id"] == md["id"]),
+        "e2e.1: gt://issue inline returns the .md"
+    );
 
-    let hits = call(&h, "documents.search.execute", json!({
-        "query": "runbook", "owner_type": "epic", "owner_id": epic, "limit": 10
-    }))
+    let hits = call(
+        &h,
+        "documents.search.execute",
+        json!({
+            "query": "runbook", "owner_type": "epic", "owner_id": epic, "limit": 10
+        }),
+    )
     .await;
     assert!(
-        hits["documents"].as_array().unwrap().iter().any(|d| d["id"] == md["id"]),
+        hits["documents"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|d| d["id"] == md["id"]),
         "e2e.1: documents.search finds the attached .md"
     );
 
     // --- e2e.2: a PDF lands in the bucket (bytes fetchable + presigned URL) and is searchable.
     let pdf = pdf_with_text("DEPLOYMENT TOPOLOGY DIAGRAM");
-    let blob_doc = call(&h, "documents.attach.execute", json!({
-        "owner_type": "epic", "owner_id": epic, "kind": "blob",
-        "filename": "topology.pdf", "content_type": "application/pdf",
-        "data_base64": B64.encode(&pdf), "created_by": "e2e"
-    }))
+    let blob_doc = call(
+        &h,
+        "documents.attach.execute",
+        json!({
+            "owner_type": "epic", "owner_id": epic, "kind": "blob",
+            "filename": "topology.pdf", "content_type": "application/pdf",
+            "data_base64": B64.encode(&pdf), "created_by": "e2e"
+        }),
+    )
     .await;
     let key = blob_doc["key"].as_str().expect("blob key").to_string();
 
     // The object really landed in the object store: bytes roundtrip, and a presigned GET mints.
-    assert_eq!(blob.get(&key).await.expect("object present in bucket"), pdf, "stored bytes match");
+    assert_eq!(
+        blob.get(&key).await.expect("object present in bucket"),
+        pdf,
+        "stored bytes match"
+    );
     let url = blob
         .presign_read(&key, Duration::from_secs(120))
         .await
@@ -162,25 +217,46 @@ async fn documents_full_stack_attach_inline_search_and_blob_roundtrip() {
     assert!(url.starts_with("http"), "presigned URL is http(s): {url}");
 
     // Its extracted text is searchable (the PDF text reached the index).
-    let pdf_hits = call(&h, "documents.search.execute", json!({
-        "query": "topology", "owner_type": "epic", "owner_id": epic, "limit": 10
-    }))
+    let pdf_hits = call(
+        &h,
+        "documents.search.execute",
+        json!({
+            "query": "topology", "owner_type": "epic", "owner_id": epic, "limit": 10
+        }),
+    )
     .await;
     assert!(
-        pdf_hits["documents"].as_array().unwrap().iter().any(|d| d["id"] == blob_doc["id"]),
+        pdf_hits["documents"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|d| d["id"] == blob_doc["id"]),
         "e2e.2: the PDF's extracted_text is searchable"
     );
 
     // --- e2e.3: one owner read surfaces BOTH attachments' text inline (the model-context loop).
     let all = res.list_for_owner(None, &epic).await.expect("owner inline");
-    let body_md_seen = all.iter().any(|d| {
-        d["id"] == md["id"] && d["body_md"].as_str().unwrap_or("").contains("runbook")
-    });
+    let body_md_seen = all
+        .iter()
+        .any(|d| d["id"] == md["id"] && d["body_md"].as_str().unwrap_or("").contains("runbook"));
     let extracted_seen = all.iter().any(|d| {
         d["id"] == blob_doc["id"]
-            && d["extracted_text"].as_str().unwrap_or("").to_uppercase().contains("TOPOLOGY")
+            && d["extracted_text"]
+                .as_str()
+                .unwrap_or("")
+                .to_uppercase()
+                .contains("TOPOLOGY")
     });
-    assert!(body_md_seen, "e2e.3: the .md body is inline in the owner read");
-    assert!(extracted_seen, "e2e.3: the PDF extracted text is inline in the owner read");
-    assert!(md_id != blob_doc["id"].as_str().unwrap(), "two distinct attachments surfaced in one read");
+    assert!(
+        body_md_seen,
+        "e2e.3: the .md body is inline in the owner read"
+    );
+    assert!(
+        extracted_seen,
+        "e2e.3: the PDF extracted text is inline in the owner read"
+    );
+    assert!(
+        md_id != blob_doc["id"].as_str().unwrap(),
+        "two distinct attachments surfaced in one read"
+    );
 }

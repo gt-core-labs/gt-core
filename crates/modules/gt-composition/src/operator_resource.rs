@@ -41,7 +41,10 @@ impl EventLogOperatorResource {
     /// issue read itself).
     fn fold(&self, workspace: Option<&str>) -> HashMap<String, serde_json::Value> {
         let mut operators: HashMap<String, serde_json::Value> = HashMap::new();
-        let records = match self.log.read_since(workspace, Some("issues"), None, FOLD_LIMIT) {
+        let records = match self
+            .log
+            .read_since(workspace, Some("issues"), None, FOLD_LIMIT)
+        {
             Ok(r) => r,
             Err(_) => return operators,
         };
@@ -122,7 +125,13 @@ mod tests {
             },
         );
         // hq-1 merges → its operator clears.
-        append(&log, "acme", IssueOperatorEvent::Cleared { bead: "hq-1".into() });
+        append(
+            &log,
+            "acme",
+            IssueOperatorEvent::Cleared {
+                bead: "hq-1".into(),
+            },
+        );
 
         let provider = EventLogOperatorResource::new(log);
         let ops = provider.operators_for(Some("acme"), &["hq-1".into(), "hq-2".into()]);

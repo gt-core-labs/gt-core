@@ -17,9 +17,9 @@ use base64::engine::general_purpose::STANDARD as B64;
 use base64::Engine as _;
 use serde_json::{json, Value};
 
-use gt_documents::{AttachDoc, DocumentsModule, ListDocs, RemoveDoc, SearchDocs, UpdateDoc};
 use gt_docs_embed::Embedder;
 use gt_docs_extract::Extractor;
+use gt_documents::{AttachDoc, DocumentsModule, ListDocs, RemoveDoc, SearchDocs, UpdateDoc};
 use gt_mcp_server::{DocumentsResource, DomainCtx, DomainHandler};
 use gt_module::{GtModule, McpRegistry, McpTool};
 use gt_store_blob::{sha256_hex, BlobStore};
@@ -56,7 +56,13 @@ impl DocumentsHandler {
         extractor: Extractor,
         embedder: Option<Arc<dyn Embedder>>,
     ) -> Self {
-        Self { pools, blob, bucket: bucket.into(), extractor, embedder }
+        Self {
+            pools,
+            blob,
+            bucket: bucket.into(),
+            extractor,
+            embedder,
+        }
     }
 
     async fn repo(&self, ws: Option<&str>) -> Result<PgDocuments, AppError> {
@@ -128,7 +134,9 @@ impl DomainHandler for DocumentsHandler {
                 let cmd = parse::<RemoveDoc>(ctx.args)?;
                 cmd.validate().map_err(val)?;
                 let repo = self.repo(ctx.workspace).await?;
-                repo.soft_delete(&cmd.id, cmd.expected_version).await.map_err(doc_err)?;
+                repo.soft_delete(&cmd.id, cmd.expected_version)
+                    .await
+                    .map_err(doc_err)?;
                 Ok(json!({ "ok": true, "id": cmd.id, "removed": true }))
             }
             "documents.list.validate" => {
@@ -178,16 +186,25 @@ impl DomainHandler for DocumentsHandler {
                 // phase-1 full-text. An embed failure degrades to full-text rather than erroring.
                 let docs = match &self.embedder {
                     Some(emb) => match emb.embed(&cmd.query).await {
-                        Ok(vec) => {
-                            repo.search_hybrid(&cmd.query, &vec, owner, cmd.limit).await.map_err(doc_err)?
-                        }
-                        Err(_) => repo.search(&cmd.query, owner, cmd.limit).await.map_err(doc_err)?,
+                        Ok(vec) => repo
+                            .search_hybrid(&cmd.query, &vec, owner, cmd.limit)
+                            .await
+                            .map_err(doc_err)?,
+                        Err(_) => repo
+                            .search(&cmd.query, owner, cmd.limit)
+                            .await
+                            .map_err(doc_err)?,
                     },
-                    None => repo.search(&cmd.query, owner, cmd.limit).await.map_err(doc_err)?,
+                    None => repo
+                        .search(&cmd.query, owner, cmd.limit)
+                        .await
+                        .map_err(doc_err)?,
                 };
                 Ok(json!({ "documents": docs.iter().map(doc_json).collect::<Vec<_>>() }))
             }
-            other => Err(AppError::Validation(format!("unknown documents tool `{other}`"))),
+            other => Err(AppError::Validation(format!(
+                "unknown documents tool `{other}`"
+            ))),
         }
     }
 }
@@ -220,19 +237,23 @@ impl DocumentsHandler {
             // kind == "blob": decode, content-address, upload (dedup), extract.
             let bytes = B64
                 .decode(cmd.data_base64.unwrap_or_default())
-                .map_err(|e| AppError::Validation(format!("data_base64 is not valid base64: {e}")))?;
+                .map_err(|e| {
+                    AppError::Validation(format!("data_base64 is not valid base64: {e}"))
+                })?;
             let content_type = cmd.content_type.clone().unwrap_or_default();
-            let blob = self
-                .blob
-                .as_ref()
-                .ok_or_else(|| AppError::Other("no object store configured for blob attachments".into()))?;
+            let blob = self.blob.as_ref().ok_or_else(|| {
+                AppError::Other("no object store configured for blob attachments".into())
+            })?;
             let sha = sha256_hex(&bytes);
             let ws_slug = ws.unwrap_or("default");
-            let key = BlobStore::key_for(ws_slug, &cmd.owner_type, &cmd.owner_id, &sha, &cmd.filename);
+            let key =
+                BlobStore::key_for(ws_slug, &cmd.owner_type, &cmd.owner_id, &sha, &cmd.filename);
 
             // Dedup: only upload if this exact object is absent.
             if !blob.exists(&key).await.map_err(blob_err)? {
-                blob.put(&key, bytes.clone(), Some(&content_type)).await.map_err(blob_err)?;
+                blob.put(&key, bytes.clone(), Some(&content_type))
+                    .await
+                    .map_err(blob_err)?;
             }
             // Extraction is best-effort: an unsupported/garbled binary still attaches (the
             // human can read the original via a presigned URL); only the text index misses it.
@@ -265,7 +286,11 @@ impl DocumentsHandler {
     /// then just misses this row; attach/update never fail on it.
     async fn embed_doc(&self, repo: &PgDocuments, doc: &Document) {
         let Some(emb) = &self.embedder else { return };
-        let text = doc.body_md.as_deref().or(doc.extracted_text.as_deref()).unwrap_or("");
+        let text = doc
+            .body_md
+            .as_deref()
+            .or(doc.extracted_text.as_deref())
+            .unwrap_or("");
         if text.trim().is_empty() {
             return;
         }
@@ -309,7 +334,8 @@ impl DocumentsResource for PgDocumentsResource {
 
 /// Parse tool args into `T`, mapping a shape mismatch onto a validation error.
 fn parse<T: serde::de::DeserializeOwned>(args: Value) -> Result<T, AppError> {
-    serde_json::from_value(args).map_err(|e| AppError::Validation(format!("invalid arguments: {e}")))
+    serde_json::from_value(args)
+        .map_err(|e| AppError::Validation(format!("invalid arguments: {e}")))
 }
 
 /// Map a `gt-documents` shape-validation error onto the MCP error space.
@@ -321,7 +347,9 @@ fn val(e: gt_documents::ValidationError) -> AppError {
 /// version) as `Validation`, backend failures as `Other`.
 fn doc_err(e: DocError) -> AppError {
     match e {
-        DocError::NotFound(_) | DocError::VersionConflict { .. } => AppError::Validation(e.to_string()),
+        DocError::NotFound(_) | DocError::VersionConflict { .. } => {
+            AppError::Validation(e.to_string())
+        }
         DocError::Db(_) => AppError::Other(e.to_string()),
     }
 }

@@ -61,8 +61,14 @@ fn tools_list_exposes_every_expected_tool() {
         expected.insert((*s).to_string());
     }
 
-    let missing: Vec<&String> = expected.iter().filter(|e| !names.contains(e.as_str())).collect();
-    assert!(missing.is_empty(), "tools/list missing expected tools: {missing:?}");
+    let missing: Vec<&String> = expected
+        .iter()
+        .filter(|e| !names.contains(e.as_str()))
+        .collect();
+    assert!(
+        missing.is_empty(),
+        "tools/list missing expected tools: {missing:?}"
+    );
 }
 
 #[test]
@@ -133,7 +139,12 @@ fn meta_help_payload_matches_the_served_tool_set() {
         .as_array()
         .expect("help payload carries a tools array")
         .iter()
-        .map(|t| t["name"].as_str().expect("each tool names itself").to_string())
+        .map(|t| {
+            t["name"]
+                .as_str()
+                .expect("each tool names itself")
+                .to_string()
+        })
         .collect();
     let served_names: BTreeSet<String> = tools.iter().map(|t| t.name.clone()).collect();
 

@@ -124,7 +124,9 @@ async fn call(token: Option<&str>, ws_header: Option<&str>) -> (StatusCode, Stri
         .await
         .unwrap();
     let status = resp.status();
-    let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+    let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
     (status, String::from_utf8(bytes.to_vec()).unwrap())
 }
 
@@ -137,7 +139,10 @@ async fn token_for_a_sees_only_a_data() {
     assert!(body.contains("ws=acme"), "{body}");
     assert!(body.contains("secret-acme"), "{body}");
     // The crux of isolation: A's token never surfaces B's secret.
-    assert!(!body.contains("secret-beta"), "A must not see B's data: {body}");
+    assert!(
+        !body.contains("secret-beta"),
+        "A must not see B's data: {body}"
+    );
 }
 
 #[tokio::test]
@@ -146,7 +151,10 @@ async fn token_for_b_sees_only_b_data() {
     assert_eq!(status, StatusCode::OK);
     assert!(body.contains("ws=beta"), "{body}");
     assert!(body.contains("secret-beta"), "{body}");
-    assert!(!body.contains("secret-acme"), "B must not see A's data: {body}");
+    assert!(
+        !body.contains("secret-acme"),
+        "B must not see A's data: {body}"
+    );
 }
 
 #[tokio::test]
@@ -166,7 +174,10 @@ async fn token_for_a_naming_b_in_the_header_is_forbidden() {
     // by switching the header.
     let (status, body) = call(Some("tok-a"), Some("beta")).await;
     assert_eq!(status, StatusCode::FORBIDDEN);
-    assert!(body.contains("disagrees"), "expected a Mismatch body, got: {body}");
+    assert!(
+        body.contains("disagrees"),
+        "expected a Mismatch body, got: {body}"
+    );
     // And of course B's secret never appears in the rejection.
     assert!(!body.contains("secret-beta"), "{body}");
 }

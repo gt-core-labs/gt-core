@@ -76,7 +76,10 @@ async fn live_root_round_trips_a_reaction_through_the_hub_and_caches() {
         Arc::new(Mutex::new(Vec::new())),
     )
     .await;
-    assert!(Arc::ptr_eq(&h, &again), "second resolve returns the cached root");
+    assert!(
+        Arc::ptr_eq(&h, &again),
+        "second resolve returns the cached root"
+    );
     assert_eq!(reg.len(), 1);
 
     h.shutdown().await;
@@ -93,17 +96,38 @@ fn boot_hydration_replays_pending_queue_and_merge_board() {
     let log = EventLog::new(Some(dir.path().to_path_buf()));
 
     // scheduling: g1 enqueued then dispatched (gone), g2 + g3 still pending.
-    log.append(Some("acme"), SchedEvent::Enqueue { bead: "g1".into(), priority: 0 })
-        .unwrap();
-    log.append(Some("acme"), SchedEvent::Enqueue { bead: "g2".into(), priority: 2 })
-        .unwrap();
     log.append(
         Some("acme"),
-        SchedEvent::Dispatched { bead: "g1".into(), worker: "w1".into() },
+        SchedEvent::Enqueue {
+            bead: "g1".into(),
+            priority: 0,
+        },
     )
     .unwrap();
-    log.append(Some("acme"), SchedEvent::Enqueue { bead: "g3".into(), priority: 1 })
-        .unwrap();
+    log.append(
+        Some("acme"),
+        SchedEvent::Enqueue {
+            bead: "g2".into(),
+            priority: 2,
+        },
+    )
+    .unwrap();
+    log.append(
+        Some("acme"),
+        SchedEvent::Dispatched {
+            bead: "g1".into(),
+            worker: "w1".into(),
+        },
+    )
+    .unwrap();
+    log.append(
+        Some("acme"),
+        SchedEvent::Enqueue {
+            bead: "g3".into(),
+            priority: 1,
+        },
+    )
+    .unwrap();
 
     let pending = replay_scheduling_pending(&log, "acme").expect("replay scheduling");
     assert_eq!(
@@ -115,12 +139,20 @@ fn boot_hydration_replays_pending_queue_and_merge_board() {
     // merge: m1 ready, m2 ready→merging — both open slots, m2 at Merging.
     log.append(
         Some("acme"),
-        MergeEvent::Ready { bead: "m1".into(), branch: "b1".into(), channel_msg_id: "x1".into() },
+        MergeEvent::Ready {
+            bead: "m1".into(),
+            branch: "b1".into(),
+            channel_msg_id: "x1".into(),
+        },
     )
     .unwrap();
     log.append(
         Some("acme"),
-        MergeEvent::Ready { bead: "m2".into(), branch: "b2".into(), channel_msg_id: "x2".into() },
+        MergeEvent::Ready {
+            bead: "m2".into(),
+            branch: "b2".into(),
+            channel_msg_id: "x2".into(),
+        },
     )
     .unwrap();
     log.append(Some("acme"), MergeEvent::Started { bead: "m2".into() })
@@ -128,8 +160,14 @@ fn boot_hydration_replays_pending_queue_and_merge_board() {
 
     let board = replay_merge_board(&log, "acme").expect("replay merge");
     assert_eq!(board.len(), 2, "both merge slots restored");
-    assert_eq!(board.get("m1").expect("m1 slot").state, MergeSlotState::Ready);
-    assert_eq!(board.get("m2").expect("m2 slot").state, MergeSlotState::Merging);
+    assert_eq!(
+        board.get("m1").expect("m1 slot").state,
+        MergeSlotState::Ready
+    );
+    assert_eq!(
+        board.get("m2").expect("m2 slot").state,
+        MergeSlotState::Merging
+    );
 
     // Isolation: a different workspace's log is empty (path-partitioned per tenant).
     assert!(replay_scheduling_pending(&log, "other").unwrap().is_empty());
@@ -217,7 +255,12 @@ async fn daemon_root_patrol_expiry_re_enqueues_through_the_hub() {
     let log = JsonlWriter::for_workspace_in(dir.path(), "acme").expect("open log partition");
     let mut kinds: Vec<String> = Vec::new();
     for _ in 0..200 {
-        kinds = log.read_all().expect("read log").into_iter().map(|r| r.kind).collect();
+        kinds = log
+            .read_all()
+            .expect("read log")
+            .into_iter()
+            .map(|r| r.kind)
+            .collect();
         if kinds.iter().any(|k| k == "scheduling.enqueue.v1") {
             break;
         }

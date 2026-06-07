@@ -26,15 +26,26 @@ use serde_json::json;
 use tempfile::TempDir;
 
 /// The 7 domain dispatch namespaces the production server registers.
-const EXPECTED_NAMESPACES: &[&str] =
-    &["agent", "convoy", "graph", "merge", "quota", "rig", "workspace"];
+const EXPECTED_NAMESPACES: &[&str] = &[
+    "agent",
+    "convoy",
+    "graph",
+    "merge",
+    "quota",
+    "rig",
+    "workspace",
+];
 
 /// The four namespaces whose state is a replayed event stream — buildable
 /// without a database, so they anchor the env-free coverage.
 const EVENT_LOG_NAMESPACES: &[&str] = &["agent", "convoy", "merge", "quota"];
 
 fn ctx(args: serde_json::Value) -> DomainCtx<'static> {
-    DomainCtx { workspace: None, actor: "mcp-test", args }
+    DomainCtx {
+        workspace: None,
+        actor: "mcp-test",
+        args,
+    }
 }
 
 /// A dispatch that proves the namespace is *owned*: not `Ok(None)`.
@@ -94,7 +105,10 @@ async fn advertised_domain_tools_are_dispatchable() {
         .register(Arc::new(QuotaHandler::new(log.clone())));
 
     let descriptors = router.descriptors();
-    assert!(!descriptors.is_empty(), "the registered handlers must advertise tools");
+    assert!(
+        !descriptors.is_empty(),
+        "the registered handlers must advertise tools"
+    );
 
     for tool in &descriptors {
         // The advertised tool's namespace is owned — dispatch is not Ok(None). An
@@ -105,7 +119,11 @@ async fn advertised_domain_tools_are_dispatchable() {
             tool.name
         );
         // A complete tools/list / meta.help entry: non-empty description + object schema.
-        assert!(!tool.description.is_empty(), "`{}` has no description", tool.name);
+        assert!(
+            !tool.description.is_empty(),
+            "`{}` has no description",
+            tool.name
+        );
         assert_eq!(
             tool.input_schema["type"], "object",
             "`{}` input schema is not an object",
@@ -116,8 +134,16 @@ async fn advertised_domain_tools_are_dispatchable() {
     // The four event-log namespaces each surface their representative tools.
     let names: std::collections::BTreeSet<&str> =
         descriptors.iter().map(|t| t.name.as_str()).collect();
-    for expected in ["merge.submit", "convoy.launch", "agent.spawn", "quota.sample"] {
-        assert!(names.contains(expected), "`{expected}` missing from the advertised set");
+    for expected in [
+        "merge.submit",
+        "convoy.launch",
+        "agent.spawn",
+        "quota.sample",
+    ] {
+        assert!(
+            names.contains(expected),
+            "`{expected}` missing from the advertised set"
+        );
     }
 }
 
@@ -127,10 +153,15 @@ async fn all_seven_domain_namespaces_registered_and_respond() {
         eprintln!("GT_PG_URL unset — skipping hq-mcp-test.2 full 7-namespace proof");
         return;
     };
-    let pool = sqlx::PgPool::connect(&pg_url).await.expect("connect postgres");
+    let pool = sqlx::PgPool::connect(&pg_url)
+        .await
+        .expect("connect postgres");
     // Catalog + per-workspace schema scaffolding the PG handlers read against.
     for m in gt_store_pg::workspace_migrations() {
-        sqlx::raw_sql(&m.sql).execute(&pool).await.expect("apply workspace migration");
+        sqlx::raw_sql(&m.sql)
+            .execute(&pool)
+            .await
+            .expect("apply workspace migration");
     }
 
     let tmp = TempDir::new().expect("tempdir");

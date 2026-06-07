@@ -54,7 +54,10 @@ const ISSUES_DDL: &str = "CREATE TABLE IF NOT EXISTS issues (
 
 /// A database name unique to this process + invocation.
 fn unique_db() -> String {
-    let nanos = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
     format!("gt_rs_resources_test_{}_{nanos}", std::process::id())
 }
 
@@ -86,7 +89,9 @@ async fn issues_snapshot_pages_filters_and_resolves_by_id() {
     {
         let pool = gt_store_dolt::connect(&base).expect("connect base");
         let mut conn = pool.get_conn().await.expect("base conn");
-        conn.query_drop(format!("CREATE DATABASE IF NOT EXISTS {db}")).await.expect("create db");
+        conn.query_drop(format!("CREATE DATABASE IF NOT EXISTS {db}"))
+            .await
+            .expect("create db");
         conn.query_drop(format!("USE {db}")).await.expect("use db");
         conn.query_drop(ISSUES_DDL).await.expect("create table");
     }
@@ -95,11 +100,15 @@ async fn issues_snapshot_pages_filters_and_resolves_by_id() {
 
     // Seed 5 issues; priorities span the filter range.
     for n in 0..5u8 {
-        repo.insert(&issue(&format!("hq-res.{n}"), n % 3)).await.expect("insert");
+        repo.insert(&issue(&format!("hq-res.{n}"), n % 3))
+            .await
+            .expect("insert");
     }
 
     // --- Full count, unpaged ---
-    let all = read_issues_page(&repo, &IssueFilter::default()).await.expect("page all");
+    let all = read_issues_page(&repo, &IssueFilter::default())
+        .await
+        .expect("page all");
     assert_eq!(all.total, 5, "all 5 seeded rows counted");
     assert_eq!(all.rows.len(), 5);
     assert!(!all.has_more, "a single page holds the whole set");
@@ -107,7 +116,11 @@ async fn issues_snapshot_pages_filters_and_resolves_by_id() {
     // --- Paging: a 2-row window walks the corpus ---
     let page0 = read_issues_page(
         &repo,
-        &IssueFilter { limit: Some(2), offset: Some(0), ..Default::default() },
+        &IssueFilter {
+            limit: Some(2),
+            offset: Some(0),
+            ..Default::default()
+        },
     )
     .await
     .expect("page 0");
@@ -118,7 +131,11 @@ async fn issues_snapshot_pages_filters_and_resolves_by_id() {
 
     let page2 = read_issues_page(
         &repo,
-        &IssueFilter { limit: Some(2), offset: Some(4), ..Default::default() },
+        &IssueFilter {
+            limit: Some(2),
+            offset: Some(4),
+            ..Default::default()
+        },
     )
     .await
     .expect("page 2");
@@ -128,7 +145,10 @@ async fn issues_snapshot_pages_filters_and_resolves_by_id() {
     // --- Filter: priority<=0 narrows the count (n%3==0 → n in {0,3}) ---
     let p0 = read_issues_page(
         &repo,
-        &IssueFilter { priority_max: Some(0), ..Default::default() },
+        &IssueFilter {
+            priority_max: Some(0),
+            ..Default::default()
+        },
     )
     .await
     .expect("page p0");
@@ -140,11 +160,18 @@ async fn issues_snapshot_pages_filters_and_resolves_by_id() {
     assert!(found.is_some(), "a seeded id resolves to a detail");
     assert_eq!(found.unwrap().id, "hq-res.1");
 
-    let missing = read_issue(&repo, "hq-res.does-not-exist").await.expect("read missing");
-    assert!(missing.is_none(), "an unknown id is None — the resource router's 404");
+    let missing = read_issue(&repo, "hq-res.does-not-exist")
+        .await
+        .expect("read missing");
+    assert!(
+        missing.is_none(),
+        "an unknown id is None — the resource router's 404"
+    );
 
     // Cleanup: drop the throwaway database so reruns don't accrete schemas.
     let pool = gt_store_dolt::connect(&base).expect("connect base for drop");
     let mut conn = pool.get_conn().await.expect("drop conn");
-    let _ = conn.query_drop(format!("DROP DATABASE IF EXISTS {db}")).await;
+    let _ = conn
+        .query_drop(format!("DROP DATABASE IF EXISTS {db}"))
+        .await;
 }

@@ -42,37 +42,73 @@ async fn reconnect_from_last_event_id_misses_nothing_and_duplicates_nothing() {
 
     // Batch 1 — emitted while the client is connected.
     for seq in 0..3 {
-        log.append(ws, FeedEvent { kind: "merge.merged.v1", seq }).unwrap();
+        log.append(
+            ws,
+            FeedEvent {
+                kind: "merge.merged.v1",
+                seq,
+            },
+        )
+        .unwrap();
     }
 
     // Client connects and drains the tail; its Last-Event-ID is the newest record.
     let seen = log.read_since(ws, Some("merge"), None, 256).unwrap();
     let marker = seen.last().unwrap().ts.clone();
-    let seen_seqs: Vec<u64> = seen.iter().map(|r| r.payload["seq"].as_u64().unwrap()).collect();
-    assert_eq!(seen_seqs, [0, 1, 2], "initial read drains the tail in order");
+    let seen_seqs: Vec<u64> = seen
+        .iter()
+        .map(|r| r.payload["seq"].as_u64().unwrap())
+        .collect();
+    assert_eq!(
+        seen_seqs,
+        [0, 1, 2],
+        "initial read drains the tail in order"
+    );
 
     // Distinct timestamps for the second batch (marker is a ts).
     tokio::time::sleep(std::time::Duration::from_millis(2)).await;
 
     // Batch 2 — emitted while the client is "disconnected".
     for seq in 3..6 {
-        log.append(ws, FeedEvent { kind: "merge.merged.v1", seq }).unwrap();
+        log.append(
+            ws,
+            FeedEvent {
+                kind: "merge.merged.v1",
+                seq,
+            },
+        )
+        .unwrap();
     }
 
     // Reconnect with Last-Event-ID: only strictly-newer records replay.
-    let replayed = log.read_since(ws, Some("merge"), Some(&marker), 256).unwrap();
-    let replayed_seqs: Vec<u64> =
-        replayed.iter().map(|r| r.payload["seq"].as_u64().unwrap()).collect();
-    assert_eq!(replayed_seqs, [3, 4, 5], "reconnect replays exactly the missed events");
+    let replayed = log
+        .read_since(ws, Some("merge"), Some(&marker), 256)
+        .unwrap();
+    let replayed_seqs: Vec<u64> = replayed
+        .iter()
+        .map(|r| r.payload["seq"].as_u64().unwrap())
+        .collect();
+    assert_eq!(
+        replayed_seqs,
+        [3, 4, 5],
+        "reconnect replays exactly the missed events"
+    );
 
     // No duplication: nothing seen in batch 1 reappears on reconnect.
     let seen_set: BTreeSet<u64> = seen_seqs.iter().copied().collect();
     let replay_set: BTreeSet<u64> = replayed_seqs.iter().copied().collect();
-    assert!(seen_set.is_disjoint(&replay_set), "reconnect duplicated an event");
+    assert!(
+        seen_set.is_disjoint(&replay_set),
+        "reconnect duplicated an event"
+    );
 
     // No miss: the union covers every appended event.
     let union: BTreeSet<u64> = seen_set.union(&replay_set).copied().collect();
-    assert_eq!(union, BTreeSet::from([0, 1, 2, 3, 4, 5]), "an event was missed");
+    assert_eq!(
+        union,
+        BTreeSet::from([0, 1, 2, 3, 4, 5]),
+        "an event was missed"
+    );
 }
 
 /// A reconnect that has already seen everything (marker == newest ts) replays an
@@ -83,7 +119,14 @@ async fn reconnect_at_head_replays_nothing() {
     let log = EventLog::new(Some(dir.path().to_path_buf()));
     let ws = Some("acme");
     for seq in 0..3 {
-        log.append(ws, FeedEvent { kind: "convoy.launched.v1", seq }).unwrap();
+        log.append(
+            ws,
+            FeedEvent {
+                kind: "convoy.launched.v1",
+                seq,
+            },
+        )
+        .unwrap();
     }
     let all = log.read_since(ws, None, None, 256).unwrap();
     let head = all.last().unwrap().ts.clone();

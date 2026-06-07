@@ -30,11 +30,11 @@ use gt_auth::{JwtClaims, JwtMinter};
 use gt_eventlog::EventRecord;
 use gt_events::{AppError, Envelope};
 use gt_merge::MergeEvent;
+use gt_plugin::Plugin;
 use gt_polecat::{
-    hooks_from_settings, skills_from_worktree, spawn_tmux, PoolAllocator, PolecatSupervisor,
+    hooks_from_settings, skills_from_worktree, spawn_tmux, PolecatSupervisor, PoolAllocator,
     SpawnTemplate, Tmux,
 };
-use gt_plugin::Plugin;
 use gt_quota::Keychain;
 use gt_scheduling::SchedEvent;
 
@@ -183,7 +183,11 @@ impl PolecatSupervisorPlugin {
     /// is the matching filesystem half.
     pub fn with_run_as(mut self, user: impl Into<String>) -> Self {
         let user = user.into();
-        self.run_as = if user.trim().is_empty() { None } else { Some(user) };
+        self.run_as = if user.trim().is_empty() {
+            None
+        } else {
+            Some(user)
+        };
         self
     }
 
@@ -234,7 +238,13 @@ impl Plugin for PolecatSupervisorPlugin {
                 };
                 // Admission first: a refused claim is backpressure, not an error — the bead stays
                 // queued/dispatched in the log; capacity will free up as live polecats finish.
-                if self.allocator.lock().expect("pool mutex").claim(&self.workspace).is_err() {
+                if self
+                    .allocator
+                    .lock()
+                    .expect("pool mutex")
+                    .claim(&self.workspace)
+                    .is_err()
+                {
                     eprintln!(
                         "[polecat] sling skipped for {bead}: pool/host cap reached (workspace {})",
                         self.workspace
@@ -356,7 +366,10 @@ impl Plugin for PolecatSupervisorPlugin {
                 }
                 if let Err(e) = spawn_tmux(self.tmux.as_ref(), &spec) {
                     // Spawn failed → undo the claim so the slot is not leaked.
-                    self.allocator.lock().expect("pool mutex").release(&self.workspace);
+                    self.allocator
+                        .lock()
+                        .expect("pool mutex")
+                        .release(&self.workspace);
                     eprintln!("[polecat] sling failed for {bead}: {e}");
                     return Ok(());
                 }
@@ -401,7 +414,10 @@ impl Plugin for PolecatSupervisorPlugin {
                     return Ok(());
                 };
                 self.supervisor.unwatch_member(&bead);
-                self.allocator.lock().expect("pool mutex").release(&self.workspace);
+                self.allocator
+                    .lock()
+                    .expect("pool mutex")
+                    .release(&self.workspace);
                 // Close the agent session for that bead (hq-orchd.6): the session id is the
                 // deterministic `spec_for` session, so it matches the `Spawned` emitted at sling.
                 let session = self.template.spec_for(&self.workspace, &bead).session;
@@ -411,7 +427,10 @@ impl Plugin for PolecatSupervisorPlugin {
                 if let Some(root) = &self.worktree_root {
                     let wt = root.join(&session);
                     if let Err(e) = crate::worktree::remove(&self.template.workdir, &wt) {
-                        eprintln!("[polecat] worktree teardown for {bead} at {} skipped: {e}", wt.display());
+                        eprintln!(
+                            "[polecat] worktree teardown for {bead} at {} skipped: {e}",
+                            wt.display()
+                        );
                     }
                 }
                 self.emit(AgentEvent::SessionEnd { session });
@@ -433,7 +452,9 @@ impl Plugin for PolecatSupervisorPlugin {
 /// The per-polecat RAM budget is `GT_POLECAT_MEM_MB` (default 1024). When `/proc/meminfo` is
 /// unreadable (non-Linux / sandbox), the cap falls back to the core count alone.
 pub fn host_cap_from_metrics() -> usize {
-    let cores = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1);
+    let cores = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1);
     let per_polecat_mb = std::env::var("GT_POLECAT_MEM_MB")
         .ok()
         .and_then(|s| s.parse::<usize>().ok())
@@ -474,7 +495,9 @@ mod tests {
         EventRecord::from_envelope(&Envelope::root(event)).expect("encode")
     }
 
-    fn plugin(alloc: Arc<Mutex<PoolAllocator>>) -> (PolecatSupervisorPlugin, Arc<PolecatSupervisor>) {
+    fn plugin(
+        alloc: Arc<Mutex<PoolAllocator>>,
+    ) -> (PolecatSupervisorPlugin, Arc<PolecatSupervisor>) {
         let tmux: Arc<dyn Tmux> = Arc::new(FakeTmux::new());
         let supervisor = Arc::new(PolecatSupervisor::new(
             tmux.clone(),
@@ -507,12 +530,19 @@ mod tests {
         .unwrap();
 
         assert_eq!(sup.watched_count(), 1, "dispatched bead is now supervised");
-        assert_eq!(alloc.lock().unwrap().in_flight("acme"), 1, "a pool slot was claimed");
+        assert_eq!(
+            alloc.lock().unwrap().in_flight("acme"),
+            1,
+            "a pool slot was claimed"
+        );
 
         // The merge of that bead frees the slot + stops supervision.
-        p.on_event(&record(MergeEvent::Merged { bead: "gg-1".into(), sha: "abc".into() }))
-            .await
-            .unwrap();
+        p.on_event(&record(MergeEvent::Merged {
+            bead: "gg-1".into(),
+            sha: "abc".into(),
+        }))
+        .await
+        .unwrap();
         assert_eq!(sup.watched_count(), 0, "merged bead is unwatched");
         assert_eq!(alloc.lock().unwrap().in_flight("acme"), 0, "slot released");
     }
@@ -523,7 +553,11 @@ mod tests {
         // role's least-privilege set (never the operator's `*`).
         let fake = Arc::new(FakeTmux::new());
         let tmux: Arc<dyn Tmux> = fake.clone();
-        let supervisor = Arc::new(PolecatSupervisor::new(tmux.clone(), RestartConfig::default(), 8));
+        let supervisor = Arc::new(PolecatSupervisor::new(
+            tmux.clone(),
+            RestartConfig::default(),
+            8,
+        ));
         let template = SpawnTemplate {
             rig: "hq".into(),
             prefix: "hq".into(),
@@ -572,9 +606,17 @@ mod tests {
         assert_eq!(claims.workspace, "acme");
         assert_eq!(
             claims.scopes,
-            vec!["issues.read", "issues.write", "issues.claim", "issues.transition"]
+            vec![
+                "issues.read",
+                "issues.write",
+                "issues.claim",
+                "issues.transition"
+            ]
         );
-        assert!(!claims.scopes.iter().any(|s| s == "*"), "never the wildcard");
+        assert!(
+            !claims.scopes.iter().any(|s| s == "*"),
+            "never the wildcard"
+        );
     }
 
     #[tokio::test]
@@ -584,7 +626,11 @@ mod tests {
         use gt_quota::InMemoryKeychain;
         let fake = Arc::new(FakeTmux::new());
         let tmux: Arc<dyn Tmux> = fake.clone();
-        let supervisor = Arc::new(PolecatSupervisor::new(tmux.clone(), RestartConfig::default(), 8));
+        let supervisor = Arc::new(PolecatSupervisor::new(
+            tmux.clone(),
+            RestartConfig::default(),
+            8,
+        ));
         let template = SpawnTemplate {
             rig: "hq".into(),
             prefix: "hq".into(),
@@ -632,7 +678,10 @@ mod tests {
         let uniq = format!(
             "{}-{}",
             std::process::id(),
-            SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos()
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
         );
         let base = std::env::temp_dir().join(format!("gt-wtbase-{uniq}"));
         let wt_root = std::env::temp_dir().join(format!("gt-wtroot-{uniq}"));
@@ -659,7 +708,11 @@ mod tests {
 
         let fake = Arc::new(FakeTmux::new());
         let tmux: Arc<dyn Tmux> = fake.clone();
-        let supervisor = Arc::new(PolecatSupervisor::new(tmux.clone(), RestartConfig::default(), 8));
+        let supervisor = Arc::new(PolecatSupervisor::new(
+            tmux.clone(),
+            RestartConfig::default(),
+            8,
+        ));
         let template = SpawnTemplate {
             rig: "hq".into(),
             prefix: "hq".into(),
@@ -719,14 +772,24 @@ mod tests {
         let alloc = Arc::new(Mutex::new(PoolAllocator::new(1, 1)));
         let (p, sup) = plugin(alloc.clone());
 
-        p.on_event(&record(SchedEvent::Dispatched { bead: "gg-1".into(), worker: "w1".into() }))
-            .await
-            .unwrap();
-        p.on_event(&record(SchedEvent::Dispatched { bead: "gg-2".into(), worker: "w2".into() }))
-            .await
-            .unwrap();
+        p.on_event(&record(SchedEvent::Dispatched {
+            bead: "gg-1".into(),
+            worker: "w1".into(),
+        }))
+        .await
+        .unwrap();
+        p.on_event(&record(SchedEvent::Dispatched {
+            bead: "gg-2".into(),
+            worker: "w2".into(),
+        }))
+        .await
+        .unwrap();
 
-        assert_eq!(sup.watched_count(), 1, "only the admitted polecat is supervised");
+        assert_eq!(
+            sup.watched_count(),
+            1,
+            "only the admitted polecat is supervised"
+        );
         assert_eq!(alloc.lock().unwrap().total_in_flight(), 1, "host cap held");
     }
 
@@ -744,18 +807,24 @@ mod tests {
         let (tx, mut rx) = broadcast::channel::<EventRecord>(16);
         let p = p.with_session_events(tx);
 
-        p.on_event(&record(SchedEvent::Dispatched { bead: "gg-1".into(), worker: "w1".into() }))
-            .await
-            .unwrap();
+        p.on_event(&record(SchedEvent::Dispatched {
+            bead: "gg-1".into(),
+            worker: "w1".into(),
+        }))
+        .await
+        .unwrap();
         let opened = rx.try_recv().expect("a session-open record was emitted");
         assert_eq!(opened.kind, "agent.spawned.v1");
         // A sling also stamps the operator marker on the issues channel (hq-agent-observability.2);
         // drain it so the merge assertions below read the session-close, not this.
         assert_eq!(rx.try_recv().unwrap().kind, "issues.operated.v1");
 
-        p.on_event(&record(MergeEvent::Merged { bead: "gg-1".into(), sha: "abc".into() }))
-            .await
-            .unwrap();
+        p.on_event(&record(MergeEvent::Merged {
+            bead: "gg-1".into(),
+            sha: "abc".into(),
+        }))
+        .await
+        .unwrap();
         let closed = rx.try_recv().expect("a session-close record was emitted");
         assert_eq!(closed.kind, "agent.session-end.v1");
         assert_eq!(rx.try_recv().unwrap().kind, "issues.operator-cleared.v1");
@@ -775,7 +844,11 @@ mod tests {
         std::fs::write(skill.join("SKILL.md"), "x").unwrap();
 
         let tmux: Arc<dyn Tmux> = Arc::new(FakeTmux::new());
-        let supervisor = Arc::new(PolecatSupervisor::new(tmux.clone(), RestartConfig::default(), 8));
+        let supervisor = Arc::new(PolecatSupervisor::new(
+            tmux.clone(),
+            RestartConfig::default(),
+            8,
+        ));
         let template = SpawnTemplate {
             rig: "hq".into(),
             prefix: "hq".into(),
@@ -790,40 +863,68 @@ mod tests {
         let p = PolecatSupervisorPlugin::new("acme", tmux, template, supervisor, alloc)
             .with_session_events(tx);
 
-        p.on_event(&record(SchedEvent::Dispatched { bead: "gg-1".into(), worker: "w1".into() }))
-            .await
-            .unwrap();
+        p.on_event(&record(SchedEvent::Dispatched {
+            bead: "gg-1".into(),
+            worker: "w1".into(),
+        }))
+        .await
+        .unwrap();
         // agent.spawned.v1 first, carrying the SAME manifest (hq-orch-sessions.2) so /api/v1/agent
         // shows the polecat's skills/hooks on the session, then the operator marker.
         let spawned = rx.try_recv().unwrap();
         assert_eq!(spawned.kind, "agent.spawned.v1");
-        let AgentEvent::Spawned { skills: sp_skills, hooks: sp_hooks, .. } =
-            spawned.decode::<AgentEvent>().unwrap()
+        let AgentEvent::Spawned {
+            skills: sp_skills,
+            hooks: sp_hooks,
+            ..
+        } = spawned.decode::<AgentEvent>().unwrap()
         else {
             panic!("expected Spawned");
         };
-        assert_eq!(sp_skills, vec!["graphify".to_string()], "session carries the worktree skill");
-        assert!(!sp_hooks.is_empty(), "session carries the loaded hook kinds");
+        assert_eq!(
+            sp_skills,
+            vec!["graphify".to_string()],
+            "session carries the worktree skill"
+        );
+        assert!(
+            !sp_hooks.is_empty(),
+            "session carries the loaded hook kinds"
+        );
         let op = rx.try_recv().expect("an operator record was emitted");
         assert_eq!(op.kind, "issues.operated.v1");
-        let IssueOperatorEvent::Operated { bead, session, role, skills, hooks } =
-            op.decode::<IssueOperatorEvent>().unwrap()
+        let IssueOperatorEvent::Operated {
+            bead,
+            session,
+            role,
+            skills,
+            hooks,
+        } = op.decode::<IssueOperatorEvent>().unwrap()
         else {
             panic!("expected Operated");
         };
         assert_eq!(bead, "gg-1");
         assert_eq!(session, "hq-gg-1");
         assert_eq!(role, "polecat");
-        assert_eq!(skills, vec!["graphify".to_string()], "manifest carries the worktree skill");
+        assert_eq!(
+            skills,
+            vec!["graphify".to_string()],
+            "manifest carries the worktree skill"
+        );
         assert!(!hooks.is_empty(), "manifest carries the loaded hook kinds");
 
-        p.on_event(&record(MergeEvent::Merged { bead: "gg-1".into(), sha: "abc".into() }))
-            .await
-            .unwrap();
+        p.on_event(&record(MergeEvent::Merged {
+            bead: "gg-1".into(),
+            sha: "abc".into(),
+        }))
+        .await
+        .unwrap();
         assert_eq!(rx.try_recv().unwrap().kind, "agent.session-end.v1");
-        let cl = rx.try_recv().expect("an operator-cleared record was emitted");
+        let cl = rx
+            .try_recv()
+            .expect("an operator-cleared record was emitted");
         assert_eq!(cl.kind, "issues.operator-cleared.v1");
-        let IssueOperatorEvent::Cleared { bead } = cl.decode::<IssueOperatorEvent>().unwrap() else {
+        let IssueOperatorEvent::Cleared { bead } = cl.decode::<IssueOperatorEvent>().unwrap()
+        else {
             panic!("expected Cleared");
         };
         assert_eq!(bead, "gg-1");

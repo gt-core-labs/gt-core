@@ -95,7 +95,11 @@ impl AuthState {
     /// Bundle a verifier and an audit sink for the auth middleware. No PAT verifier — a deploy
     /// opts into PATs with [`with_pat`](Self::with_pat).
     pub fn new(authenticator: SharedAuthenticator, audit: SharedAudit) -> Self {
-        Self { authenticator, audit, pat: None }
+        Self {
+            authenticator,
+            audit,
+            pat: None,
+        }
     }
 
     /// Attach a Personal Access Token verifier so `gtpat_…` bearers authenticate through it
@@ -135,7 +139,8 @@ fn bearer(req: &Request) -> Option<Result<&str, ()>> {
     let value = req.headers().get(AUTHORIZATION)?;
     let parsed = value.to_str().ok().and_then(|s| {
         let (scheme, token) = s.split_once(' ')?;
-        scheme.eq_ignore_ascii_case("bearer")
+        scheme
+            .eq_ignore_ascii_case("bearer")
             .then(|| token.trim())
             .filter(|t| !t.is_empty())
     });
@@ -162,8 +167,7 @@ pub async fn authenticate(
         // per-route scope guard still rejects protected routes. Only an explicit bad `Authorization`
         // header is a hard client error (below).
         None => {
-            let claims =
-                cookie_token(&req).and_then(|t| state.authenticator.authenticate(t).ok());
+            let claims = cookie_token(&req).and_then(|t| state.authenticator.authenticate(t).ok());
             if let Some(claims) = claims {
                 req.extensions_mut()
                     .insert(WorkspaceClaim(claims.workspace.clone()));
@@ -258,7 +262,10 @@ mod tests {
     /// A probe handler that reports which auth extensions reached it.
     async fn probe(req: Request) -> String {
         let claims = req.extensions().get::<JwtClaims>().map(|c| c.sub.clone());
-        let ws = req.extensions().get::<WorkspaceClaim>().map(|w| w.slug().to_string());
+        let ws = req
+            .extensions()
+            .get::<WorkspaceClaim>()
+            .map(|w| w.slug().to_string());
         format!("claims={claims:?} ws={ws:?}")
     }
 
@@ -278,7 +285,9 @@ mod tests {
             .await
             .unwrap();
         let status = resp.status();
-        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
         (status, String::from_utf8(bytes.to_vec()).unwrap())
     }
 
@@ -298,7 +307,10 @@ mod tests {
         assert_eq!(status, StatusCode::OK);
         assert!(body.contains(r#"claims=Some("alice")"#), "{body}");
         assert!(body.contains(r#"ws=Some("acme")"#), "{body}");
-        assert!(audit.read_all().unwrap().is_empty(), "a valid token is not a denial");
+        assert!(
+            audit.read_all().unwrap().is_empty(),
+            "a valid token is not a denial"
+        );
     }
 
     /// A PAT verifier double (hq-security-pat): accepts exactly one opaque `gtpat_` token,
@@ -332,7 +344,10 @@ mod tests {
         // The PAT's own claims (not the JWT double's) are injected.
         assert!(body.contains(r#"claims=Some("pat-user")"#), "{body}");
         assert!(body.contains(r#"ws=Some("pacme")"#), "{body}");
-        assert!(audit.read_all().unwrap().is_empty(), "a valid PAT is not a denial");
+        assert!(
+            audit.read_all().unwrap().is_empty(),
+            "a valid PAT is not a denial"
+        );
     }
 
     #[tokio::test]
@@ -341,7 +356,11 @@ mod tests {
         let st = st.with_pat(Arc::new(OnePatVerifier("gtpat_good")));
         let (status, _) = call(st, Some("Bearer gtpat_nope")).await;
         assert_eq!(status, StatusCode::UNAUTHORIZED);
-        assert_eq!(audit.read_all().unwrap().len(), 1, "a bad PAT is an audited 401");
+        assert_eq!(
+            audit.read_all().unwrap().len(),
+            1,
+            "a bad PAT is an audited 401"
+        );
     }
 
     #[tokio::test]
@@ -378,7 +397,10 @@ mod tests {
         let (status, body) = call(st, None).await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(body, "claims=None ws=None");
-        assert!(audit.read_all().unwrap().is_empty(), "anonymous pass-through is not a denial");
+        assert!(
+            audit.read_all().unwrap().is_empty(),
+            "anonymous pass-through is not a denial"
+        );
     }
 
     async fn call_cookie(state: AuthState, cookie: &str) -> (StatusCode, String) {
@@ -393,7 +415,9 @@ mod tests {
             .await
             .unwrap();
         let status = resp.status();
-        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
         (status, String::from_utf8(bytes.to_vec()).unwrap())
     }
 
@@ -405,7 +429,10 @@ mod tests {
         assert_eq!(status, StatusCode::OK);
         assert!(body.contains(r#"claims=Some("alice")"#), "{body}");
         assert!(body.contains(r#"ws=Some("acme")"#), "{body}");
-        assert!(audit.read_all().unwrap().is_empty(), "cookie auth is not a denial");
+        assert!(
+            audit.read_all().unwrap().is_empty(),
+            "cookie auth is not a denial"
+        );
     }
 
     #[tokio::test]
@@ -416,7 +443,10 @@ mod tests {
         let (status, body) = call_cookie(st, "gt_web_token=stale").await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(body, "claims=None ws=None");
-        assert!(audit.read_all().unwrap().is_empty(), "an invalid cookie is not an audited denial");
+        assert!(
+            audit.read_all().unwrap().is_empty(),
+            "an invalid cookie is not an audited denial"
+        );
     }
 
     #[tokio::test]

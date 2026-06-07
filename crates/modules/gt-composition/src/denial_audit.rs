@@ -118,7 +118,9 @@ fn verdict(status: StatusCode) -> &'static str {
 /// Current time as an RFC3339 string for the record `ts`. The kernel audit crate stays
 /// clock-free; this tier (the server) stamps the time, as the MCP dispatch path does.
 fn now_rfc3339() -> String {
-    OffsetDateTime::now_utc().format(&Rfc3339).unwrap_or_default()
+    OffsetDateTime::now_utc()
+        .format(&Rfc3339)
+        .unwrap_or_default()
 }
 
 #[cfg(test)]
@@ -163,7 +165,10 @@ mod tests {
         );
         guarded
             .layer(axum::middleware::from_fn(bridge_scopes))
-            .layer(axum::middleware::from_fn_with_state(audit.clone(), audit_denials))
+            .layer(axum::middleware::from_fn_with_state(
+                audit.clone(),
+                audit_denials,
+            ))
             .layer(axum::middleware::from_fn_with_state(
                 AuthState::new(verifier, audit),
                 authenticate,
@@ -245,6 +250,9 @@ mod tests {
         // Verified identity holding `beads.read` → 200, and no denial is recorded.
         let status = call(audit.clone(), &["beads.read"], Some("Bearer good")).await;
         assert_eq!(status, StatusCode::OK);
-        assert!(audit.read_all().unwrap().is_empty(), "success is not audited here");
+        assert!(
+            audit.read_all().unwrap().is_empty(),
+            "success is not audited here"
+        );
     }
 }

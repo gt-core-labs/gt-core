@@ -17,7 +17,11 @@ use gt_mcp_server::{DomainCtx, DomainHandler};
 use tempfile::TempDir;
 
 fn ctx(args: serde_json::Value) -> DomainCtx<'static> {
-    DomainCtx { workspace: None, actor: "custodian", args }
+    DomainCtx {
+        workspace: None,
+        actor: "custodian",
+        args,
+    }
 }
 
 #[tokio::test]
@@ -28,14 +32,20 @@ async fn full_per_rig_loop_register_stale_refresh_query() {
 
     // 1. ATTACH — deploy edge calls graph.refresh with the fresh checkout.
     let reg = h
-        .dispatch("graph.refresh", ctx(json!({ "rig": "alpha", "repo_dir": "/repo/alpha" })))
+        .dispatch(
+            "graph.refresh",
+            ctx(json!({ "rig": "alpha", "repo_dir": "/repo/alpha" })),
+        )
         .await
         .unwrap();
     assert_eq!(reg["ok"], true);
 
     // Queryable right after the initial build.
     let q1 = h
-        .dispatch("graph.query", ctx(json!({ "rig": "alpha", "question": "auth flow" })))
+        .dispatch(
+            "graph.query",
+            ctx(json!({ "rig": "alpha", "question": "auth flow" })),
+        )
         .await
         .unwrap();
     assert!(q1["text"].as_str().unwrap().contains("auth flow"));
@@ -47,7 +57,11 @@ async fn full_per_rig_loop_register_stale_refresh_query() {
     // 2. MERGE LANDS — the merge handler would append marked-stale for the owning rig.
     log.append(
         None,
-        WardenEvent::MarkedStale { rig: "alpha".into(), changed: 3, now_secs: 200 },
+        WardenEvent::MarkedStale {
+            rig: "alpha".into(),
+            changed: 3,
+            now_secs: 200,
+        },
     )
     .unwrap();
 
@@ -56,7 +70,10 @@ async fn full_per_rig_loop_register_stale_refresh_query() {
     assert_eq!(list2["rigs"][0]["pending_changes"], 3);
 
     // 3. CUSTODIAN TICK — refresh every stale rig in one batch.
-    let ticked = h.dispatch("graph.refresh-stale", ctx(json!({}))).await.unwrap();
+    let ticked = h
+        .dispatch("graph.refresh-stale", ctx(json!({})))
+        .await
+        .unwrap();
     let refreshed = ticked["refreshed"].as_array().unwrap();
     assert_eq!(refreshed.len(), 1);
     assert_eq!(refreshed[0]["rig"], "alpha");
@@ -68,12 +85,18 @@ async fn full_per_rig_loop_register_stale_refresh_query() {
 
     // 4. STILL QUERYABLE after the refresh.
     let q2 = h
-        .dispatch("graph.query", ctx(json!({ "rig": "alpha", "question": "auth flow" })))
+        .dispatch(
+            "graph.query",
+            ctx(json!({ "rig": "alpha", "question": "auth flow" })),
+        )
         .await
         .unwrap();
     assert!(q2["text"].is_string());
 
     // A tick with nothing stale is a no-op.
-    let noop = h.dispatch("graph.refresh-stale", ctx(json!({}))).await.unwrap();
+    let noop = h
+        .dispatch("graph.refresh-stale", ctx(json!({})))
+        .await
+        .unwrap();
     assert!(noop["refreshed"].as_array().unwrap().is_empty());
 }

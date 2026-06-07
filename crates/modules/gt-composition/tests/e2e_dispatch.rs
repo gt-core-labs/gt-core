@@ -32,7 +32,14 @@ const WS: &str = "e2e-dispatch";
 /// Dispatch one tool through the router, asserting a handler owned it.
 async fn call(router: &DomainRouter, tool: &str, workspace: Option<&str>, args: Value) -> Value {
     router
-        .dispatch(tool, DomainCtx { workspace, actor: "e2e", args })
+        .dispatch(
+            tool,
+            DomainCtx {
+                workspace,
+                actor: "e2e",
+                args,
+            },
+        )
         .await
         .unwrap_or_else(|e| panic!("{tool} dispatch errored: {e}"))
         .unwrap_or_else(|| panic!("{tool}: no handler owned the namespace"))
@@ -49,11 +56,17 @@ async fn create_workspace_rig_and_session_via_dispatch() {
     // --- Schema preconditions (a deploy/migration concern; applied inline here) ---
     // workspaces catalog + the per-workspace schema provisioning function.
     for m in gt_store_pg::workspace_migrations() {
-        sqlx::raw_sql(&m.sql).execute(&pool).await.expect("apply workspace migration");
+        sqlx::raw_sql(&m.sql)
+            .execute(&pool)
+            .await
+            .expect("apply workspace migration");
     }
     // The rigs table in the ws_default template, so the clone carries it.
     let rig_mig = gt_rig::RigsModule.migrations();
-    sqlx::raw_sql(&rig_mig[0].sql).execute(&pool).await.expect("apply rigs migration");
+    sqlx::raw_sql(&rig_mig[0].sql)
+        .execute(&pool)
+        .await
+        .expect("apply rigs migration");
     // Clean any leak from a prior run, then provision the tenant schema (clones
     // ws_default's structure — including rigs — into ws_e2e_dispatch).
     let schema = gt_store_pg::schema_for(WS);
@@ -61,7 +74,11 @@ async fn create_workspace_rig_and_session_via_dispatch() {
         .execute(&pool)
         .await
         .ok();
-    sqlx::query("DELETE FROM workspaces WHERE id = $1").bind(WS).execute(&pool).await.ok();
+    sqlx::query("DELETE FROM workspaces WHERE id = $1")
+        .bind(WS)
+        .execute(&pool)
+        .await
+        .ok();
     sqlx::query("SELECT gt_create_workspace_schema($1)")
         .bind(WS)
         .execute(&pool)
@@ -121,11 +138,22 @@ async fn create_workspace_rig_and_session_via_dispatch() {
     // --- Isolation: the rig landed in the tenant schema, not the default -------
     let default_rigs = call(&router, "rig.list", None, json!({})).await;
     assert!(
-        !default_rigs["rigs"].as_array().unwrap().iter().any(|r| r["name"] == "plane"),
+        !default_rigs["rigs"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|r| r["name"] == "plane"),
         "the rig must live in the tenant schema, not ws_default",
     );
 
     // --- Teardown ---
-    sqlx::raw_sql(&format!("DROP SCHEMA IF EXISTS {schema} CASCADE")).execute(&pool).await.ok();
-    sqlx::query("DELETE FROM workspaces WHERE id = $1").bind(WS).execute(&pool).await.ok();
+    sqlx::raw_sql(&format!("DROP SCHEMA IF EXISTS {schema} CASCADE"))
+        .execute(&pool)
+        .await
+        .ok();
+    sqlx::query("DELETE FROM workspaces WHERE id = $1")
+        .bind(WS)
+        .execute(&pool)
+        .await
+        .ok();
 }

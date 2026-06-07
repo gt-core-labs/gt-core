@@ -17,8 +17,8 @@ use std::time::Duration;
 
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
-use gt_composition::stream::{feed_router, FeedState};
 use gt_composition::mcp::eventlog::EventLog;
+use gt_composition::stream::{feed_router, FeedState};
 use gt_events::EventKind;
 use http_body_util::BodyExt;
 use serde::Serialize;
@@ -97,17 +97,48 @@ async fn stream_request(
     for (k, v) in headers {
         req = req.header(*k, *v);
     }
-    router.oneshot(req.body(Body::empty()).unwrap()).await.unwrap()
+    router
+        .oneshot(req.body(Body::empty()).unwrap())
+        .await
+        .unwrap()
 }
 
 fn seeded_log() -> (TempDir, Arc<EventLog>) {
     let dir = TempDir::new().unwrap();
     let log = EventLog::new(Some(dir.path().to_path_buf()));
     // acme: two merge events + one convoy event; beta: one merge event.
-    log.append(Some("acme"), TestEvent { kind: "merge.submitted.v1", n: 1 }).unwrap();
-    log.append(Some("acme"), TestEvent { kind: "convoy.launched.v1", n: 2 }).unwrap();
-    log.append(Some("acme"), TestEvent { kind: "merge.merged.v1", n: 3 }).unwrap();
-    log.append(Some("beta"), TestEvent { kind: "merge.merged.v1", n: 9 }).unwrap();
+    log.append(
+        Some("acme"),
+        TestEvent {
+            kind: "merge.submitted.v1",
+            n: 1,
+        },
+    )
+    .unwrap();
+    log.append(
+        Some("acme"),
+        TestEvent {
+            kind: "convoy.launched.v1",
+            n: 2,
+        },
+    )
+    .unwrap();
+    log.append(
+        Some("acme"),
+        TestEvent {
+            kind: "merge.merged.v1",
+            n: 3,
+        },
+    )
+    .unwrap();
+    log.append(
+        Some("beta"),
+        TestEvent {
+            kind: "merge.merged.v1",
+            n: 9,
+        },
+    )
+    .unwrap();
     (dir, Arc::new(log))
 }
 
@@ -130,10 +161,20 @@ async fn stream_is_event_stream_keyed_to_the_workspace() {
     // acme's three events replay; beta's (n=9) never appears.
     let events = collect_events(resp.into_body(), 3).await;
     assert_eq!(events.len(), 3, "acme replays exactly its own three events");
-    let ns: Vec<u64> = events.iter().map(|e| e.data["n"].as_u64().unwrap()).collect();
-    assert_eq!(ns, vec![1, 2, 3], "chronological, tenant-isolated (no n=9 leak)");
+    let ns: Vec<u64> = events
+        .iter()
+        .map(|e| e.data["n"].as_u64().unwrap())
+        .collect();
+    assert_eq!(
+        ns,
+        vec![1, 2, 3],
+        "chronological, tenant-isolated (no n=9 leak)"
+    );
     // The id is the resume marker (the record ts), present on every frame.
-    assert!(events.iter().all(|e| e.id.is_some()), "every frame carries an id");
+    assert!(
+        events.iter().all(|e| e.id.is_some()),
+        "every frame carries an id"
+    );
 }
 
 #[tokio::test]
@@ -144,7 +185,10 @@ async fn channel_query_narrows_the_feed() {
 
     let events = collect_events(resp.into_body(), 2).await;
     assert_eq!(events.len(), 2, "only the two merge.* events, not convoy");
-    let ns: Vec<u64> = events.iter().map(|e| e.data["n"].as_u64().unwrap()).collect();
+    let ns: Vec<u64> = events
+        .iter()
+        .map(|e| e.data["n"].as_u64().unwrap())
+        .collect();
     assert_eq!(ns, vec![1, 3]);
 }
 
@@ -154,7 +198,9 @@ async fn last_event_id_resumes_strictly_after_the_marker() {
 
     // First connect: capture the first event's id (its resume marker).
     let first = collect_events(
-        stream_request(log.clone(), "", &[("x-workspace", "acme")]).await.into_body(),
+        stream_request(log.clone(), "", &[("x-workspace", "acme")])
+            .await
+            .into_body(),
         3,
     )
     .await;
@@ -162,13 +208,20 @@ async fn last_event_id_resumes_strictly_after_the_marker() {
 
     // Reconnect with Last-Event-ID = that marker: only strictly-newer events.
     let resumed = collect_events(
-        stream_request(log, "", &[("x-workspace", "acme"), ("last-event-id", &marker)])
-            .await
-            .into_body(),
+        stream_request(
+            log,
+            "",
+            &[("x-workspace", "acme"), ("last-event-id", &marker)],
+        )
+        .await
+        .into_body(),
         2,
     )
     .await;
-    assert!(resumed.len() < 3, "resume excludes the marker and everything older");
+    assert!(
+        resumed.len() < 3,
+        "resume excludes the marker and everything older"
+    );
     assert!(
         resumed.iter().all(|e| e.data["n"].as_u64().unwrap() > 1),
         "only events after the first replay on resume"
@@ -179,10 +232,16 @@ async fn last_event_id_resumes_strictly_after_the_marker() {
 async fn another_tenant_sees_only_its_own_events() {
     let (_dir, log) = seeded_log();
     let events = collect_events(
-        stream_request(log, "", &[("x-workspace", "beta")]).await.into_body(),
+        stream_request(log, "", &[("x-workspace", "beta")])
+            .await
+            .into_body(),
         1,
     )
     .await;
     assert_eq!(events.len(), 1, "beta has exactly one event");
-    assert_eq!(events[0].data["n"].as_u64(), Some(9), "and it is beta's own");
+    assert_eq!(
+        events[0].data["n"].as_u64(),
+        Some(9),
+        "and it is beta's own"
+    );
 }

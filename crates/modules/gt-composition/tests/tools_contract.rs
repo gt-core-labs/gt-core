@@ -60,7 +60,10 @@ fn every_command_has_a_validate_execute_pair() {
     }
 
     // The single privileged mutation with no pair.
-    assert!(names.contains("issues.phase.advance"), "missing phase.advance");
+    assert!(
+        names.contains("issues.phase.advance"),
+        "missing phase.advance"
+    );
 }
 
 /// Each tool carries a JSON-object input schema. The command tools take arguments,

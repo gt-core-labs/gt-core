@@ -39,9 +39,9 @@ pub mod account_dirs;
 pub mod auth;
 pub mod denial_audit;
 pub mod git_merge;
+pub mod hooks;
 pub mod mcp;
 pub mod onboard;
-pub mod hooks;
 pub mod operator_event;
 pub mod operator_resource;
 pub mod polecat;
@@ -64,8 +64,8 @@ use tokio::sync::mpsc;
 
 use gt_agent::AgentEvent;
 use gt_beads::InMemoryBeads;
-use gt_events::{AppError, Envelope};
 use gt_eventlog::{EventRecord, EventStore, JsonlWriter};
+use gt_events::{AppError, Envelope};
 use gt_merge::actor::MergeHandle;
 use gt_merge::{
     BranchReaper, InMemoryBranchReaper, InMemoryMergeRepo, MergeBoard, MergeEvent, MergeState,
@@ -252,7 +252,9 @@ impl EventLogPlugin {
     /// `<root>/<ws>/` lazily). `root` is the production event-log volume (`GT_EVENTLOG_ROOT`,
     /// defaulting to `/var/lib/gt-core`); tests pass a tempdir.
     pub fn for_workspace_in(root: impl AsRef<std::path::Path>, ws: &str) -> Result<Self, AppError> {
-        Ok(Self { writer: JsonlWriter::for_workspace_in(root, ws)? })
+        Ok(Self {
+            writer: JsonlWriter::for_workspace_in(root, ws)?,
+        })
     }
 }
 
@@ -297,7 +299,10 @@ pub struct SessionMinutesPlugin {
 impl SessionMinutesPlugin {
     /// Project session minutes for `workspace` (the daemon's single tenant).
     pub fn new(workspace: impl Into<String>) -> Self {
-        Self { workspace: workspace.into(), starts: Mutex::new(HashMap::new()) }
+        Self {
+            workspace: workspace.into(),
+            starts: Mutex::new(HashMap::new()),
+        }
     }
 }
 
@@ -383,7 +388,13 @@ pub async fn compose_workspace(ws: WorkspaceId) -> Composed {
     let (rt, _rr) = mpsc::channel(16);
     let roles = RoleStack::register(
         handle.supervisor(),
-        RoleSinks { sheriff: st, witness: wt, deacon: dt, mayor: mt, refinery: rt },
+        RoleSinks {
+            sheriff: st,
+            witness: wt,
+            deacon: dt,
+            mayor: mt,
+            refinery: rt,
+        },
     )
     .await
     .expect("role stack registers while the supervisor is Built");
@@ -394,12 +405,22 @@ pub async fn compose_workspace(ws: WorkspaceId) -> Composed {
         .plugin_registry()
         .register(SchedulerPlugin::new(sched.clone()))
         .register(MergePlugin::new(merge.clone()))
-        .register(BranchGcPlugin::new(merge.clone(), InMemoryBranchReaper::new()));
+        .register(BranchGcPlugin::new(
+            merge.clone(),
+            InMemoryBranchReaper::new(),
+        ));
     handle.spawn_plugins(Arc::new(registry));
 
     handle.start().await;
 
-    Composed { handle, sched, merge, sched_events, merge_events, roles }
+    Composed {
+        handle,
+        sched,
+        merge,
+        sched_events,
+        merge_events,
+        roles,
+    }
 }
 
 /// A read-only observer that records every kind it sees on the hub, in order — a test probe for
@@ -467,10 +488,7 @@ pub fn replay_scheduling_pending(
 /// Replay the workspace's merge log into the in-flight [`MergeBoard`] (`hq-orchd.5`) through the
 /// domain reducer, so a restart restores open merge slots before the actor starts processing
 /// edge messages. Seeds [`gt_merge::actor::spawn_hydrated`].
-pub fn replay_merge_board(
-    log: &EventLog,
-    ws: &str,
-) -> Result<MergeBoard, gt_store_dolt::AppError> {
+pub fn replay_merge_board(log: &EventLog, ws: &str) -> Result<MergeBoard, gt_store_dolt::AppError> {
     let state = log.replay_domain::<MergeState, MergeEvent, _>(
         Some(ws),
         "merge.",
@@ -539,8 +557,12 @@ pub async fn live_root(
         };
 
         let (sched_tx, sched_rx) = mpsc::channel(64);
-        let sched =
-            gt_scheduling::actor::spawn_hydrated(InMemoryBeads::default(), sched_tx, 4, sched_pending);
+        let sched = gt_scheduling::actor::spawn_hydrated(
+            InMemoryBeads::default(),
+            sched_tx,
+            4,
+            sched_pending,
+        );
         let (merge_tx, merge_rx) = mpsc::channel(64);
         let merge =
             gt_merge::actor::spawn_hydrated(InMemoryMergeRepo::default(), merge_tx, merge_board);
@@ -566,7 +588,13 @@ pub async fn live_root(
         let (rt, _rr) = mpsc::channel(16);
         let roles = RoleStack::register(
             handle.supervisor(),
-            RoleSinks { sheriff: st, witness: wt, deacon: dt, mayor: mt, refinery: rt },
+            RoleSinks {
+                sheriff: st,
+                witness: wt,
+                deacon: dt,
+                mayor: mt,
+                refinery: rt,
+            },
         )
         .await
         .expect("role stack registers while the supervisor is Built");
@@ -636,8 +664,7 @@ pub async fn daemon_root(ws: WorkspaceId, log_root: PathBuf) -> DaemonRoot {
     // Boot hydration (hq-orchd.5): rebuild the pending scheduler queue + in-flight merge board
     // from the durable log before spawning the actors. A corrupt log at boot is fatal.
     let log = EventLog::new(Some(log_root.clone()));
-    let sched_pending =
-        replay_scheduling_pending(&log, &ws_slug).expect("replay scheduling log");
+    let sched_pending = replay_scheduling_pending(&log, &ws_slug).expect("replay scheduling log");
     let merge_board = replay_merge_board(&log, &ws_slug).expect("replay merge log");
     // Quota registry hydration (hq-quota-accounts.2): rebuild onboarded accounts + their windows
     // from the log so a restart keeps the rotation pool (and the daemon seeds its keychain from
@@ -648,7 +675,8 @@ pub async fn daemon_root(ws: WorkspaceId, log_root: PathBuf) -> DaemonRoot {
     let sched =
         gt_scheduling::actor::spawn_hydrated(InMemoryBeads::default(), sched_tx, 4, sched_pending);
     let (merge_tx, merge_rx) = mpsc::channel(64);
-    let merge = gt_merge::actor::spawn_hydrated(InMemoryMergeRepo::default(), merge_tx, merge_board);
+    let merge =
+        gt_merge::actor::spawn_hydrated(InMemoryMergeRepo::default(), merge_tx, merge_board);
     let (patrol_tx, patrol_rx) = mpsc::channel(64);
     let patrol = gt_patrol::actor::spawn(InMemoryPatrolRepo::default(), patrol_tx);
     let (quota_tx, quota_rx) = mpsc::channel(64);
@@ -659,10 +687,26 @@ pub async fn daemon_root(ws: WorkspaceId, log_root: PathBuf) -> DaemonRoot {
         quota_state.predictions.len(),
     );
 
-    handle.supervisor().anchor(sched.clone()).await.expect("anchors while Built");
-    handle.supervisor().anchor(merge.clone()).await.expect("anchors while Built");
-    handle.supervisor().anchor(patrol.clone()).await.expect("anchors while Built");
-    handle.supervisor().anchor(quota.clone()).await.expect("anchors while Built");
+    handle
+        .supervisor()
+        .anchor(sched.clone())
+        .await
+        .expect("anchors while Built");
+    handle
+        .supervisor()
+        .anchor(merge.clone())
+        .await
+        .expect("anchors while Built");
+    handle
+        .supervisor()
+        .anchor(patrol.clone())
+        .await
+        .expect("anchors while Built");
+    handle
+        .supervisor()
+        .anchor(quota.clone())
+        .await
+        .expect("anchors while Built");
     handle.drain_events_from(sched_rx);
     handle.drain_events_from(merge_rx);
     handle.drain_events_from(patrol_rx);
@@ -675,7 +719,13 @@ pub async fn daemon_root(ws: WorkspaceId, log_root: PathBuf) -> DaemonRoot {
     let (rt, _rr) = mpsc::channel(16);
     let roles = RoleStack::register(
         handle.supervisor(),
-        RoleSinks { sheriff: st, witness: wt, deacon: dt, mayor: mt, refinery: rt },
+        RoleSinks {
+            sheriff: st,
+            witness: wt,
+            deacon: dt,
+            mayor: mt,
+            refinery: rt,
+        },
     )
     .await
     .expect("role stack registers while the supervisor is Built");
@@ -688,13 +738,22 @@ pub async fn daemon_root(ws: WorkspaceId, log_root: PathBuf) -> DaemonRoot {
         )
         .register(SchedulerPlugin::new(sched.clone()))
         .register(MergePlugin::new(merge.clone()))
-        .register(BranchGcPlugin::new(merge.clone(), InMemoryBranchReaper::new()))
+        .register(BranchGcPlugin::new(
+            merge.clone(),
+            InMemoryBranchReaper::new(),
+        ))
         .register(SheriffPlugin::new())
         .register(SessionMinutesPlugin::new(ws_slug.clone()));
     handle.spawn_plugins(Arc::new(registry));
     handle.start().await;
 
-    DaemonRoot { handle, sched, merge, patrol, quota }
+    DaemonRoot {
+        handle,
+        sched,
+        merge,
+        patrol,
+        quota,
+    }
 }
 
 #[cfg(test)]
@@ -735,7 +794,9 @@ mod session_minutes_tests {
         .unwrap();
         p.on_event(&agent_record(
             "agent.session-end.v1",
-            AgentEvent::SessionEnd { session: "s1".into() },
+            AgentEvent::SessionEnd {
+                session: "s1".into(),
+            },
             "2026-06-03T12:05:00Z",
         ))
         .await

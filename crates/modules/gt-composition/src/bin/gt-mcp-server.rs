@@ -38,22 +38,22 @@ use gt_auth::{
     auth_router, AuthState as LoginState, GlobalLogin, JwtAuthenticator, JwtMinter, PgPatStore,
     PgRefreshStore, PgUsers, SameSite,
 };
+use gt_claude_hooks::HooksStore;
 use gt_composition::auth::{authenticate, AuthState, PatVerifier, SharedAuthenticator};
 use gt_composition::denial_audit::audit_denials;
+use gt_composition::hooks::{hooks_router, HooksApiState};
 use gt_composition::mcp::{
     AgentHandler, AuditHandler, CompositionTenantProvisioner, ConvoyHandler, DocumentsHandler,
-    EventLog, EventLogConvoy, EventLogFeed, EventLogIssueSink, EventLogMerges, EventLogQuota,
-    EventLogHooks, EventLogSkills, FsAccountCatalog, GraphHandler, IdentityDoltMeStats, MergeHandler, PgDocumentsResource,
-    PgRigPrefixes, PgWorkspaceStatus, QuotaHandler, RigHandler, WorkspaceHandler, WsPoolRigs,
-    WsPools,
+    EventLog, EventLogConvoy, EventLogFeed, EventLogHooks, EventLogIssueSink, EventLogMerges,
+    EventLogQuota, EventLogSkills, FsAccountCatalog, GraphHandler, IdentityDoltMeStats,
+    MergeHandler, PgDocumentsResource, PgRigPrefixes, PgWorkspaceStatus, QuotaHandler, RigHandler,
+    WorkspaceHandler, WsPoolRigs, WsPools,
 };
+use gt_composition::onboard::{onboard_router, OnboardState};
 use gt_composition::operator_resource::EventLogOperatorResource;
 use gt_composition::scope_bridge::bridge_scopes;
 use gt_composition::stream::{feed_router, FeedState};
-use gt_composition::onboard::{onboard_router, OnboardState};
 use gt_composition::terminal::{terminal_router, TerminalState};
-use gt_composition::hooks::{hooks_router, HooksApiState};
-use gt_claude_hooks::HooksStore;
 use gt_docs_embed::Embedder;
 use gt_docs_extract::Extractor;
 use gt_graphindex::GraphifyIndexer;
@@ -443,10 +443,17 @@ async fn main() -> anyhow::Result<()> {
                 "[gt-mcp-server] terminal WS on GET /api/v1/terminal/ws (cookie/bearer auth, scope terminal.exec)"
             );
             // Wire the event log so an interactive session terminal launches `claude` under the
-            // active claude account's CLAUDE_CONFIG_DIR (hq-term-dock.4).
+            // active claude account's CLAUDE_CONFIG_DIR (hq-term-dock.4). Also wire the RS256 minter +
+            // this server's URL so each role session gets a least-privilege `.gt-config` and its
+            // `gt mcp` proxy authenticates as the role (hq-role-mcp). `GT_SELF_URL` overrides the
+            // loopback default the role's `gt mcp` dials back into.
+            let role_minter = JwtMinter::from_env().ok().map(Arc::new);
+            let self_url =
+                std::env::var("GT_SELF_URL").unwrap_or_else(|_| format!("http://{bind}"));
             Some(terminal_router(
                 TerminalState::new(v.clone(), audit.clone())
-                    .with_active_accounts(event_log.clone()),
+                    .with_active_accounts(event_log.clone())
+                    .with_role_auth(role_minter, Some(self_url)),
             ))
         }
         _ => {
@@ -530,7 +537,8 @@ async fn main() -> anyhow::Result<()> {
                 tick.tick().await;
                 // Live accounts = the basenames (<id>) of the registered config_dirs. Single-tenant
                 // "default" workspace, where the onboarding flow registers (see onboard::complete).
-                let state = gt_composition::replay_quota_state(&gc_log, "default").unwrap_or_default();
+                let state =
+                    gt_composition::replay_quota_state(&gc_log, "default").unwrap_or_default();
                 let live: std::collections::HashSet<String> = state
                     .registered
                     .values()
@@ -639,9 +647,7 @@ async fn main() -> anyhow::Result<()> {
         // Knowledge skills tab can be populated. One backing serves both read + write.
         .module({
             let skills = Arc::new(EventLogSkills::new(event_log.clone()));
-            SkillsModule::with_http(
-                SkillsApiState::new(skills.clone()).with_writer(skills),
-            )
+            SkillsModule::with_http(SkillsApiState::new(skills.clone()).with_writer(skills))
         })
         // feed.read (hq-web-extras.14): read-only activity feed, folded from the caller's whole
         // workspace log. Mounted at /api/v1/feed behind the feed.read guard.

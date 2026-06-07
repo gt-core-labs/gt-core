@@ -93,7 +93,10 @@ impl FeedState {
     /// tenant is the server-injected `X-Workspace` header (the endpoint's prior behaviour,
     /// for a deploy that configures no RS256 verifier).
     pub fn new(event_log: Arc<EventLog>) -> Self {
-        Self { event_log, auth: None }
+        Self {
+            event_log,
+            auth: None,
+        }
     }
 
     /// Wrap the event log **with** `gt_web_token` cookie auth (`hq-fe-api-stream.1`): every
@@ -105,7 +108,13 @@ impl FeedState {
         authenticator: SharedAuthenticator,
         audit: SharedAudit,
     ) -> Self {
-        Self { event_log, auth: Some(CookieAuth { authenticator, audit }) }
+        Self {
+            event_log,
+            auth: Some(CookieAuth {
+                authenticator,
+                audit,
+            }),
+        }
     }
 }
 
@@ -119,7 +128,9 @@ pub struct FeedParams {
 
 /// The SSE feed router (`GET /stream`), ready to `.merge()` into the server's app.
 pub fn feed_router(state: FeedState) -> Router {
-    Router::new().route("/stream", get(feed_stream)).with_state(state)
+    Router::new()
+        .route("/stream", get(feed_stream))
+        .with_state(state)
 }
 
 /// Stream a workspace's event feed as SSE. The tenant is the verified `gt_web_token`
@@ -292,24 +303,52 @@ mod tests {
         let log = log(&dir);
 
         // Two channels in one workspace's log.
-        log.append(Some("acme"), TestEvent { kind: "merge.submitted.v1", n: 1 }).unwrap();
-        log.append(Some("acme"), TestEvent { kind: "convoy.launched.v1", n: 2 }).unwrap();
-        log.append(Some("acme"), TestEvent { kind: "merge.merged.v1", n: 3 }).unwrap();
+        log.append(
+            Some("acme"),
+            TestEvent {
+                kind: "merge.submitted.v1",
+                n: 1,
+            },
+        )
+        .unwrap();
+        log.append(
+            Some("acme"),
+            TestEvent {
+                kind: "convoy.launched.v1",
+                n: 2,
+            },
+        )
+        .unwrap();
+        log.append(
+            Some("acme"),
+            TestEvent {
+                kind: "merge.merged.v1",
+                n: 3,
+            },
+        )
+        .unwrap();
 
         // Whole feed.
         let all = log.read_since(Some("acme"), None, None, 256).unwrap();
         assert_eq!(all.len(), 3);
 
         // Channel filter: only merge.* (not convoy, not a "merger" false-prefix).
-        let merges = log.read_since(Some("acme"), Some("merge"), None, 256).unwrap();
+        let merges = log
+            .read_since(Some("acme"), Some("merge"), None, 256)
+            .unwrap();
         assert_eq!(merges.len(), 2);
         assert!(merges.iter().all(|r| r.kind.starts_with("merge.")));
 
         // Resume marker: only records strictly newer than a given ts.
         let first_ts = all[0].ts.clone();
-        let after = log.read_since(Some("acme"), None, Some(&first_ts), 256).unwrap();
+        let after = log
+            .read_since(Some("acme"), None, Some(&first_ts), 256)
+            .unwrap();
         assert!(after.iter().all(|r| r.ts.as_str() > first_ts.as_str()));
-        assert!(after.len() < all.len(), "resume excludes the marker and older");
+        assert!(
+            after.len() < all.len(),
+            "resume excludes the marker and older"
+        );
     }
 
     /// The feed is path-partitioned per workspace: one tenant's stream never sees
@@ -319,8 +358,22 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let log = log(&dir);
 
-        log.append(Some("acme"), TestEvent { kind: "merge.merged.v1", n: 1 }).unwrap();
-        log.append(Some("beta"), TestEvent { kind: "merge.merged.v1", n: 2 }).unwrap();
+        log.append(
+            Some("acme"),
+            TestEvent {
+                kind: "merge.merged.v1",
+                n: 1,
+            },
+        )
+        .unwrap();
+        log.append(
+            Some("beta"),
+            TestEvent {
+                kind: "merge.merged.v1",
+                n: 2,
+            },
+        )
+        .unwrap();
 
         let acme = log.read_since(Some("acme"), None, None, 256).unwrap();
         let beta = log.read_since(Some("beta"), None, None, 256).unwrap();
@@ -337,7 +390,14 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let log = log(&dir);
         for n in 0..10 {
-            log.append(Some("acme"), TestEvent { kind: "merge.merged.v1", n }).unwrap();
+            log.append(
+                Some("acme"),
+                TestEvent {
+                    kind: "merge.merged.v1",
+                    n,
+                },
+            )
+            .unwrap();
         }
         let capped = log.read_since(Some("acme"), None, None, 3).unwrap();
         assert_eq!(capped.len(), 3, "only the newest 3 are returned");
@@ -393,16 +453,15 @@ mod cookie_auth_tests {
 
     /// A `FeedState` with cookie auth over `token -> claims`, plus the audit sink so a test can
     /// inspect recorded denials. The log lives in `dir`.
-    fn cookie_state(
-        dir: &TempDir,
-        token: &str,
-        claims: JwtClaims,
-    ) -> (FeedState, SharedAudit) {
+    fn cookie_state(dir: &TempDir, token: &str, claims: JwtClaims) -> (FeedState, SharedAudit) {
         let log = Arc::new(EventLog::new(Some(dir.path().to_path_buf())));
         let audit: SharedAudit = Arc::new(InMemoryAudit::new());
         let verifier: SharedAuthenticator =
             Arc::new(InMemoryAuthenticator::new().with_token(token, claims));
-        (FeedState::with_cookie_auth(log, verifier, audit.clone()), audit)
+        (
+            FeedState::with_cookie_auth(log, verifier, audit.clone()),
+            audit,
+        )
     }
 
     /// Issue a `GET /stream` against the feed router, optionally with a `Cookie` and an
@@ -419,7 +478,10 @@ mod cookie_auth_tests {
         if let Some(ws) = x_workspace {
             b = b.header("x-workspace", ws);
         }
-        feed_router(state).oneshot(b.body(Body::empty()).unwrap()).await.unwrap()
+        feed_router(state)
+            .oneshot(b.body(Body::empty()).unwrap())
+            .await
+            .unwrap()
     }
 
     /// Read the SSE body until one `data:` frame is parsed or a bounded wait elapses (the
@@ -453,17 +515,39 @@ mod cookie_auth_tests {
         let dir = TempDir::new().unwrap();
         // Two tenants in distinct partitions; the cookie's claim is `acme`.
         let log = EventLog::new(Some(dir.path().to_path_buf()));
-        log.append(Some("acme"), TestEvent { kind: "merge.merged.v1", n: 1 }).unwrap();
-        log.append(Some("beta"), TestEvent { kind: "merge.merged.v1", n: 2 }).unwrap();
+        log.append(
+            Some("acme"),
+            TestEvent {
+                kind: "merge.merged.v1",
+                n: 1,
+            },
+        )
+        .unwrap();
+        log.append(
+            Some("beta"),
+            TestEvent {
+                kind: "merge.merged.v1",
+                n: 2,
+            },
+        )
+        .unwrap();
 
         let (state, audit) = cookie_state(&dir, "good", claims("acme", 9_999_999_999));
         // An `X-Workspace: beta` header is present but must be ignored — the claim wins.
         let resp = get_stream(state, Some("gt_web_token=good"), Some("beta")).await;
         assert_eq!(resp.status(), StatusCode::OK);
 
-        let event = first_event(resp.into_body()).await.expect("an SSE data frame");
-        assert_eq!(event["n"], 1, "streamed acme's event (the claim), not beta's header");
-        assert!(audit.read_all().unwrap().is_empty(), "a valid cookie is not a denial");
+        let event = first_event(resp.into_body())
+            .await
+            .expect("an SSE data frame");
+        assert_eq!(
+            event["n"], 1,
+            "streamed acme's event (the claim), not beta's header"
+        );
+        assert!(
+            audit.read_all().unwrap().is_empty(),
+            "a valid cookie is not a denial"
+        );
     }
 
     #[tokio::test]
@@ -503,7 +587,14 @@ mod cookie_auth_tests {
     async fn the_cookie_is_picked_out_of_a_multi_cookie_header() {
         let dir = TempDir::new().unwrap();
         let log = EventLog::new(Some(dir.path().to_path_buf()));
-        log.append(Some("acme"), TestEvent { kind: "merge.merged.v1", n: 7 }).unwrap();
+        log.append(
+            Some("acme"),
+            TestEvent {
+                kind: "merge.merged.v1",
+                n: 7,
+            },
+        )
+        .unwrap();
         let (state, _audit) = cookie_state(&dir, "good", claims("acme", 9_999_999_999));
         // Surrounded by other cookies, with spacing — must still be parsed.
         let resp = get_stream(
@@ -513,7 +604,9 @@ mod cookie_auth_tests {
         )
         .await;
         assert_eq!(resp.status(), StatusCode::OK);
-        let event = first_event(resp.into_body()).await.expect("an SSE data frame");
+        let event = first_event(resp.into_body())
+            .await
+            .expect("an SSE data frame");
         assert_eq!(event["n"], 7);
     }
 
@@ -523,11 +616,20 @@ mod cookie_auth_tests {
     async fn without_auth_the_x_workspace_header_still_keys_the_feed() {
         let dir = TempDir::new().unwrap();
         let log = EventLog::new(Some(dir.path().to_path_buf()));
-        log.append(Some("acme"), TestEvent { kind: "merge.merged.v1", n: 3 }).unwrap();
+        log.append(
+            Some("acme"),
+            TestEvent {
+                kind: "merge.merged.v1",
+                n: 3,
+            },
+        )
+        .unwrap();
         let state = FeedState::new(Arc::new(EventLog::new(Some(dir.path().to_path_buf()))));
         let resp = get_stream(state, None, Some("acme")).await;
         assert_eq!(resp.status(), StatusCode::OK);
-        let event = first_event(resp.into_body()).await.expect("an SSE data frame");
+        let event = first_event(resp.into_body())
+            .await
+            .expect("an SSE data frame");
         assert_eq!(event["n"], 3);
     }
 }

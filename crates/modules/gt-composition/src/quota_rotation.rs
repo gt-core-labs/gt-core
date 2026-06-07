@@ -517,11 +517,16 @@ mod tests {
             .into_iter()
             .find(|a| a.id == "acc-1")
             .expect("account seeded");
-        let w = acc.window.expect("synthetic window seeded for a header-less sample");
+        let w = acc
+            .window
+            .expect("synthetic window seeded for a header-less sample");
         assert_eq!(w.kind, WindowKind::Rolling5h);
         assert_eq!(w.limit, plan_limit());
         // Identity weights ⇒ consumed == sum of the sample's tokens (1000+500+200+100).
-        assert_eq!(w.consumed, 1800.0, "the sample folded into the fresh window");
+        assert_eq!(
+            w.consumed, 1800.0,
+            "the sample folded into the fresh window"
+        );
     }
 
     #[tokio::test]
@@ -567,7 +572,10 @@ mod tests {
             .expect("window");
         // The stale consumption was cleared by the recycle, then only the new sample folded in.
         assert_eq!(w.consumed, 15.0, "recycled then folded the fresh sample");
-        assert!(w.resets_at_secs > now_secs(), "reset pushed 5h into the future");
+        assert!(
+            w.resets_at_secs > now_secs(),
+            "reset pushed 5h into the future"
+        );
     }
 
     #[test]

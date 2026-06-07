@@ -19,7 +19,8 @@ use gt_graphwarden::{MarkStale, WardenCommand, WardenState};
 use gt_mcp_server::prefixes::bead_prefix;
 use gt_mcp_server::{DomainCtx, DomainHandler};
 use gt_merge::{
-    CompleteMerge, FailMerge, MergeBoard, MergeEvent, MergeSlot, MergeState, StartMerge, SubmitMerge,
+    CompleteMerge, FailMerge, MergeBoard, MergeEvent, MergeSlot, MergeState, StartMerge,
+    SubmitMerge,
 };
 use gt_module::McpTool;
 use gt_rig::{PgRigs, RigRepository};
@@ -46,7 +47,10 @@ pub struct MergeHandler {
 impl MergeHandler {
     /// Wrap the per-workspace event log. No graph custody side-effect.
     pub fn new(log: Arc<EventLog>) -> Self {
-        Self { log, rig_pools: None }
+        Self {
+            log,
+            rig_pools: None,
+        }
     }
 
     /// Also mark the owning rig's graph stale on a completed merge, resolving the rig from
@@ -61,9 +65,13 @@ impl MergeHandler {
     /// under graph custody) — a merge must never fail because of a graph side-effect.
     async fn mark_owning_rig_stale(&self, ws: Option<&str>, bead: &str) {
         let Some(pools) = &self.rig_pools else { return };
-        let Ok(pool) = pools.get(ws).await else { return };
+        let Ok(pool) = pools.get(ws).await else {
+            return;
+        };
         let repo = PgRigs::new(pool.pool().clone());
-        let Ok(Some(rig)) = repo.prefix_owner(bead_prefix(bead)).await else { return };
+        let Ok(Some(rig)) = repo.prefix_owner(bead_prefix(bead)).await else {
+            return;
+        };
 
         // Only mark stale if the rig is actually under graph custody.
         let state = self
@@ -75,7 +83,11 @@ impl MergeHandler {
         if !state.rigs.contains_key(&rig) {
             return;
         }
-        let cmd = WardenCommand::MarkStale(MarkStale { rig, changed: 1, now_secs: now_secs() });
+        let cmd = WardenCommand::MarkStale(MarkStale {
+            rig,
+            changed: 1,
+            now_secs: now_secs(),
+        });
         if let Ok(events) = cmd.execute(&state) {
             for ev in events {
                 let _ = self.log.append(ws, ev);
@@ -116,9 +128,17 @@ impl DomainHandler for MergeHandler {
             descriptor(
                 "merge.submit",
                 "Submit a bead's branch into the merge queue.",
-                &[req("bead", "string"), req("branch", "string"), req("channel_msg_id", "string")],
+                &[
+                    req("bead", "string"),
+                    req("branch", "string"),
+                    req("channel_msg_id", "string"),
+                ],
             ),
-            descriptor("merge.start", "Start merging a queued bead.", &[req("bead", "string")]),
+            descriptor(
+                "merge.start",
+                "Start merging a queued bead.",
+                &[req("bead", "string")],
+            ),
             descriptor(
                 "merge.complete",
                 "Mark a bead's merge complete with the landed commit sha.",
@@ -130,7 +150,11 @@ impl DomainHandler for MergeHandler {
                 &[req("bead", "string"), req("reason", "string")],
             ),
             descriptor("merge.list", "List every slot on the merge board.", &[]),
-            descriptor("merge.info", "Show one bead's merge slot.", &[req("bead", "string")]),
+            descriptor(
+                "merge.info",
+                "Show one bead's merge slot.",
+                &[req("bead", "string")],
+            ),
         ]
     }
 
@@ -185,7 +209,11 @@ mod tests {
     }
 
     fn ctx(args: Value) -> DomainCtx<'static> {
-        DomainCtx { workspace: None, actor: "tester", args }
+        DomainCtx {
+            workspace: None,
+            actor: "tester",
+            args,
+        }
     }
 
     /// Full lifecycle over the event log: submit → start → complete, with the
@@ -212,17 +240,31 @@ mod tests {
             .unwrap_err();
         assert!(matches!(dup, AppError::Validation(_)));
 
-        let info = h.dispatch("merge.info", ctx(json!({ "bead": "b1" }))).await.unwrap();
-        assert_eq!(info["state"], "ready");
-
-        h.dispatch("merge.start", ctx(json!({ "bead": "b1" }))).await.unwrap();
-        let info = h.dispatch("merge.info", ctx(json!({ "bead": "b1" }))).await.unwrap();
-        assert_eq!(info["state"], "merging");
-
-        h.dispatch("merge.complete", ctx(json!({ "bead": "b1", "sha": "abc1234" })))
+        let info = h
+            .dispatch("merge.info", ctx(json!({ "bead": "b1" })))
             .await
             .unwrap();
-        let info = h.dispatch("merge.info", ctx(json!({ "bead": "b1" }))).await.unwrap();
+        assert_eq!(info["state"], "ready");
+
+        h.dispatch("merge.start", ctx(json!({ "bead": "b1" })))
+            .await
+            .unwrap();
+        let info = h
+            .dispatch("merge.info", ctx(json!({ "bead": "b1" })))
+            .await
+            .unwrap();
+        assert_eq!(info["state"], "merging");
+
+        h.dispatch(
+            "merge.complete",
+            ctx(json!({ "bead": "b1", "sha": "abc1234" })),
+        )
+        .await
+        .unwrap();
+        let info = h
+            .dispatch("merge.info", ctx(json!({ "bead": "b1" })))
+            .await
+            .unwrap();
         assert_eq!(info["state"], "merged");
 
         let list = h.dispatch("merge.list", ctx(json!({}))).await.unwrap();
@@ -236,7 +278,10 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let h = handler(&dir);
 
-        let gone = h.dispatch("merge.info", ctx(json!({ "bead": "nope" }))).await.unwrap_err();
+        let gone = h
+            .dispatch("merge.info", ctx(json!({ "bead": "nope" })))
+            .await
+            .unwrap_err();
         assert!(matches!(gone, AppError::NotFound(_)));
 
         h.dispatch(
@@ -247,7 +292,10 @@ mod tests {
         .unwrap();
         // Ready → Merged is illegal (must go through Merging).
         let bad = h
-            .dispatch("merge.complete", ctx(json!({ "bead": "b1", "sha": "deadbee" })))
+            .dispatch(
+                "merge.complete",
+                ctx(json!({ "bead": "b1", "sha": "deadbee" })),
+            )
             .await
             .unwrap_err();
         assert!(matches!(bad, AppError::InvalidTransition(_)));

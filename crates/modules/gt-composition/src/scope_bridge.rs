@@ -137,13 +137,19 @@ mod tests {
         }
         let resp = app.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
-        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
         String::from_utf8(bytes.to_vec()).unwrap()
     }
 
     #[tokio::test]
     async fn claims_with_scopes_produce_matching_caller_scopes() {
-        let out = run(Some(claims_with(vec!["rig.read".into(), "rig.write".into()]))).await;
+        let out = run(Some(claims_with(vec![
+            "rig.read".into(),
+            "rig.write".into(),
+        ])))
+        .await;
         assert_eq!(out, "present:rig.read,rig.write");
     }
 
@@ -202,7 +208,9 @@ mod tests {
             req.extensions_mut().insert(c);
         }
         let resp = app.oneshot(req).await.unwrap();
-        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
         String::from_utf8(bytes.to_vec()).unwrap()
     }
 
@@ -214,7 +222,10 @@ mod tests {
     #[tokio::test]
     async fn client_supplied_header_is_overwritten_by_the_claim() {
         // The claim is authoritative — a caller cannot pick its own tenant via the header.
-        assert_eq!(run_ws(Some("evil"), Some(claims_with(vec![]))).await, "ws:acme");
+        assert_eq!(
+            run_ws(Some("evil"), Some(claims_with(vec![]))).await,
+            "ws:acme"
+        );
     }
 
     #[tokio::test]

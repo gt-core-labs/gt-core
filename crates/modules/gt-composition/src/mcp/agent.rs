@@ -58,7 +58,12 @@ impl AgentHandler {
     /// Append a lifecycle event after a light existence check against the
     /// rehydrated registry (the event log itself folds facts unconditionally; the
     /// check keeps the dispatch surface from recording a no-op for a missing id).
-    fn record(&self, ws: Option<&str>, event: AgentEvent, session: &str) -> Result<Value, AppError> {
+    fn record(
+        &self,
+        ws: Option<&str>,
+        event: AgentEvent,
+        session: &str,
+    ) -> Result<Value, AppError> {
         let kind = gt_events::EventKind::kind(&event).to_string();
         self.log.append(ws, event)?;
         Ok(json!({ "ok": true, "session": session, "event": kind }))
@@ -88,17 +93,38 @@ impl DomainHandler for AgentHandler {
             descriptor(
                 "agent.spawn",
                 "Record a new agent session (spawn) under a session id + rig.",
-                &[req("session", "string"), req("rig", "string"), opt("role", "string"), opt("crew", "string")],
+                &[
+                    req("session", "string"),
+                    req("rig", "string"),
+                    opt("role", "string"),
+                    opt("crew", "string"),
+                ],
             ),
-            descriptor("agent.heartbeat", "Record a liveness heartbeat for a session.", &[req("session", "string")]),
-            descriptor("agent.end", "Record a session's normal end.", &[req("session", "string")]),
+            descriptor(
+                "agent.heartbeat",
+                "Record a liveness heartbeat for a session.",
+                &[req("session", "string")],
+            ),
+            descriptor(
+                "agent.end",
+                "Record a session's normal end.",
+                &[req("session", "string")],
+            ),
             descriptor(
                 "agent.kill",
                 "Record a session forcibly killed with a reason.",
                 &[req("session", "string"), req("reason", "string")],
             ),
-            descriptor("agent.list", "List every agent session in the workspace.", &[]),
-            descriptor("agent.info", "Show one agent session's state.", &[req("session", "string")]),
+            descriptor(
+                "agent.list",
+                "List every agent session in the workspace.",
+                &[],
+            ),
+            descriptor(
+                "agent.info",
+                "Show one agent session's state.",
+                &[req("session", "string")],
+            ),
         ]
     }
 
@@ -108,7 +134,10 @@ impl DomainHandler for AgentHandler {
             "agent.spawn" => {
                 let a: SpawnArgs = parse(ctx.args)?;
                 if self.registry(ws)?.get(&a.session).is_some() {
-                    return Err(AppError::Validation(format!("session {} already exists", a.session)));
+                    return Err(AppError::Validation(format!(
+                        "session {} already exists",
+                        a.session
+                    )));
                 }
                 let session = a.session.clone();
                 self.record(
@@ -127,20 +156,41 @@ impl DomainHandler for AgentHandler {
             }
             "agent.heartbeat" => {
                 let session = self.require_session(ws, &ctx.args)?;
-                self.record(ws, AgentEvent::Heartbeat { session: session.clone() }, &session)
+                self.record(
+                    ws,
+                    AgentEvent::Heartbeat {
+                        session: session.clone(),
+                    },
+                    &session,
+                )
             }
             "agent.end" => {
                 let session = self.require_session(ws, &ctx.args)?;
-                self.record(ws, AgentEvent::SessionEnd { session: session.clone() }, &session)
+                self.record(
+                    ws,
+                    AgentEvent::SessionEnd {
+                        session: session.clone(),
+                    },
+                    &session,
+                )
             }
             "agent.kill" => {
                 let session = self.require_session(ws, &ctx.args)?;
                 let reason = str_arg(&ctx.args, "reason")?.to_string();
-                self.record(ws, AgentEvent::Killed { session: session.clone(), reason }, &session)
+                self.record(
+                    ws,
+                    AgentEvent::Killed {
+                        session: session.clone(),
+                        reason,
+                    },
+                    &session,
+                )
             }
             "agent.list" => {
                 let reg = self.registry(ws)?;
-                Ok(json!({ "sessions": reg.snapshot().iter().map(session_json).collect::<Vec<_>>() }))
+                Ok(
+                    json!({ "sessions": reg.snapshot().iter().map(session_json).collect::<Vec<_>>() }),
+                )
             }
             "agent.info" => {
                 let id = str_arg(&ctx.args, "session")?;
@@ -197,7 +247,11 @@ mod tests {
     }
 
     fn ctx(args: Value) -> DomainCtx<'static> {
-        DomainCtx { workspace: None, actor: "tester", args }
+        DomainCtx {
+            workspace: None,
+            actor: "tester",
+            args,
+        }
     }
 
     /// Session lifecycle over the event log: spawn → heartbeat → end, with the
@@ -207,27 +261,46 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let h = handler(&dir);
 
-        h.dispatch("agent.spawn", ctx(json!({ "session": "s1", "rig": "granite" })))
-            .await
-            .unwrap();
+        h.dispatch(
+            "agent.spawn",
+            ctx(json!({ "session": "s1", "rig": "granite" })),
+        )
+        .await
+        .unwrap();
 
         // Re-spawn rejected against the rehydrated registry.
         let dup = h
-            .dispatch("agent.spawn", ctx(json!({ "session": "s1", "rig": "granite" })))
+            .dispatch(
+                "agent.spawn",
+                ctx(json!({ "session": "s1", "rig": "granite" })),
+            )
             .await
             .unwrap_err();
         assert!(matches!(dup, AppError::Validation(_)));
 
-        let info = h.dispatch("agent.info", ctx(json!({ "session": "s1" }))).await.unwrap();
+        let info = h
+            .dispatch("agent.info", ctx(json!({ "session": "s1" })))
+            .await
+            .unwrap();
         assert_eq!(info["state"], "spawned");
         assert_eq!(info["rig"], "granite");
 
         // Heartbeat is a no-op on the registry but must be accepted + logged.
-        h.dispatch("agent.heartbeat", ctx(json!({ "session": "s1" }))).await.unwrap();
+        h.dispatch("agent.heartbeat", ctx(json!({ "session": "s1" })))
+            .await
+            .unwrap();
 
-        h.dispatch("agent.end", ctx(json!({ "session": "s1" }))).await.unwrap();
-        let info = h.dispatch("agent.info", ctx(json!({ "session": "s1" }))).await.unwrap();
-        assert_eq!(info["state"], "done", "SessionEnd folds the session to Done");
+        h.dispatch("agent.end", ctx(json!({ "session": "s1" })))
+            .await
+            .unwrap();
+        let info = h
+            .dispatch("agent.info", ctx(json!({ "session": "s1" })))
+            .await
+            .unwrap();
+        assert_eq!(
+            info["state"], "done",
+            "SessionEnd folds the session to Done"
+        );
 
         let list = h.dispatch("agent.list", ctx(json!({}))).await.unwrap();
         assert_eq!(list["sessions"].as_array().unwrap().len(), 1);
@@ -237,9 +310,15 @@ mod tests {
     async fn heartbeat_and_info_on_unknown_session() {
         let dir = TempDir::new().unwrap();
         let h = handler(&dir);
-        let gone = h.dispatch("agent.heartbeat", ctx(json!({ "session": "nope" }))).await.unwrap_err();
+        let gone = h
+            .dispatch("agent.heartbeat", ctx(json!({ "session": "nope" })))
+            .await
+            .unwrap_err();
         assert!(matches!(gone, AppError::NotFound(_)));
-        let gone2 = h.dispatch("agent.info", ctx(json!({ "session": "nope" }))).await.unwrap_err();
+        let gone2 = h
+            .dispatch("agent.info", ctx(json!({ "session": "nope" })))
+            .await
+            .unwrap_err();
         assert!(matches!(gone2, AppError::NotFound(_)));
     }
 
@@ -247,9 +326,22 @@ mod tests {
     async fn kill_transitions_to_killed() {
         let dir = TempDir::new().unwrap();
         let h = handler(&dir);
-        h.dispatch("agent.spawn", ctx(json!({ "session": "s1", "rig": "granite" }))).await.unwrap();
-        h.dispatch("agent.kill", ctx(json!({ "session": "s1", "reason": "timeout" }))).await.unwrap();
-        let info = h.dispatch("agent.info", ctx(json!({ "session": "s1" }))).await.unwrap();
+        h.dispatch(
+            "agent.spawn",
+            ctx(json!({ "session": "s1", "rig": "granite" })),
+        )
+        .await
+        .unwrap();
+        h.dispatch(
+            "agent.kill",
+            ctx(json!({ "session": "s1", "reason": "timeout" })),
+        )
+        .await
+        .unwrap();
+        let info = h
+            .dispatch("agent.info", ctx(json!({ "session": "s1" })))
+            .await
+            .unwrap();
         assert_eq!(info["state"], "killed");
     }
 }

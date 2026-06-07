@@ -56,12 +56,20 @@ pub struct Field {
 
 /// A required field of the given JSON Schema type.
 pub fn req(name: &'static str, ty: &'static str) -> Field {
-    Field { name, ty, required: true }
+    Field {
+        name,
+        ty,
+        required: true,
+    }
 }
 
 /// An optional field of the given JSON Schema type.
 pub fn opt(name: &'static str, ty: &'static str) -> Field {
-    Field { name, ty, required: false }
+    Field {
+        name,
+        ty,
+        required: false,
+    }
 }
 
 /// Build a tool descriptor (hq-mcp-native.3) with an object input schema derived

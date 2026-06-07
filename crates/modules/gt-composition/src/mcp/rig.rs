@@ -63,8 +63,16 @@ impl DomainHandler for RigHandler {
             ]
         };
         vec![
-            descriptor("rig.add", "Register a new rig (repo) in the workspace catalog.", &provision()),
-            descriptor("rig.adopt", "Adopt an existing repo as a rig in the catalog.", &provision()),
+            descriptor(
+                "rig.add",
+                "Register a new rig (repo) in the workspace catalog.",
+                &provision(),
+            ),
+            descriptor(
+                "rig.adopt",
+                "Adopt an existing repo as a rig in the catalog.",
+                &provision(),
+            ),
             descriptor(
                 "rig.set-prefix",
                 "Change a rig's bead-id prefix.",
@@ -80,9 +88,17 @@ impl DomainHandler for RigHandler {
                 "Change a rig's worktree root path.",
                 &[req("name", "string"), req("new_root", "string")],
             ),
-            descriptor("rig.remove", "Remove a rig from the catalog.", &[req("name", "string")]),
+            descriptor(
+                "rig.remove",
+                "Remove a rig from the catalog.",
+                &[req("name", "string")],
+            ),
             descriptor("rig.list", "List every rig in the workspace catalog.", &[]),
-            descriptor("rig.info", "Show one rig's catalog entry.", &[req("name", "string")]),
+            descriptor(
+                "rig.info",
+                "Show one rig's catalog entry.",
+                &[req("name", "string")],
+            ),
             descriptor(
                 "rig.lookup-by-prefix",
                 "Resolve the rig owning a given bead-id prefix.",

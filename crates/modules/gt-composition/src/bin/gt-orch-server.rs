@@ -51,19 +51,19 @@ use std::time::Duration;
 
 use gt_auth::JwtMinter;
 use gt_channel::Channel;
+use gt_composition::git_merge::GitMergePlugin;
+use gt_composition::mcp::eventlog::EventLog;
 use gt_composition::polecat::{
     host_cap_from_metrics, AgentTokenMinter, PolecatSupervisorPlugin, ScopeResolver,
 };
-use gt_composition::git_merge::GitMergePlugin;
 use gt_composition::quota_rotation::{self, QuotaRotationPlugin};
 use gt_composition::session_reconcile::SessionReconciler;
 use gt_composition::witness_sweep::WitnessSweep;
 use gt_composition::{daemon_root, replay_quota_state, DaemonRoot};
-use gt_composition::mcp::eventlog::EventLog;
 use gt_eventlog::DEFAULT_EVENTLOG_ROOT;
 use gt_plugin::{spawn_plugin_relay, PluginRegistry};
 use gt_polecat::{
-    PoolAllocator, PolecatSupervisor, RestartConfig, RestartTracker, SpawnTemplate, Tmux, TmuxCli,
+    PolecatSupervisor, PoolAllocator, RestartConfig, RestartTracker, SpawnTemplate, Tmux, TmuxCli,
 };
 use gt_quota::{CredentialRecord, InMemoryKeychain, Keychain};
 use gt_workspace::WorkspaceId;
@@ -191,8 +191,8 @@ async fn seed_claude_accounts(
     }
 
     let first = first?; // no account in either source ⇒ no keychain
-    // Last rotation target wins (log truth), else the first account. set_active fails closed if the
-    // target was deregistered — then the first account stands.
+                        // Last rotation target wins (log truth), else the first account. set_active fails closed if the
+                        // target was deregistered — then the first account stands.
     let active = state
         .rotations
         .last()
@@ -229,8 +229,9 @@ async fn main() -> anyhow::Result<()> {
     // The daemon always persists — durability is its whole point — so an unset
     // GT_EVENTLOG_ROOT falls back to the production volume, never to the in-memory
     // (`None`) mode `live_root` uses for tests.
-    let event_root =
-        PathBuf::from(std::env::var("GT_EVENTLOG_ROOT").unwrap_or_else(|_| DEFAULT_EVENTLOG_ROOT.into()));
+    let event_root = PathBuf::from(
+        std::env::var("GT_EVENTLOG_ROOT").unwrap_or_else(|_| DEFAULT_EVENTLOG_ROOT.into()),
+    );
     let ws_slug = std::env::var("GT_WORKSPACE").unwrap_or_else(|_| "default".into());
     let ws = WorkspaceId::new(&ws_slug)
         .map_err(|e| anyhow::anyhow!("invalid GT_WORKSPACE '{ws_slug}': {e}"))?;
@@ -248,7 +249,13 @@ async fn main() -> anyhow::Result<()> {
     let event_root_for_seed = event_root.clone();
     // Keep a copy for the session reconciler (hq-orchd-deploy.23): it replays the same agent.* log.
     let event_root_for_reconcile = event_root.clone();
-    let DaemonRoot { handle, sched, merge, patrol, quota } = daemon_root(ws, event_root).await;
+    let DaemonRoot {
+        handle,
+        sched,
+        merge,
+        patrol,
+        quota,
+    } = daemon_root(ws, event_root).await;
     eprintln!(
         "[gt-orch-server] daemon root up — scheduler + merge + patrol + quota actors anchored; persistence + roles + reactor arms + sheriff observer running"
     );
@@ -261,7 +268,10 @@ async fn main() -> anyhow::Result<()> {
     // metrics. The sling observer claims here before spawning; the timer refreshes the host cap.
     let pool_size = env_usize("GT_POOL_SIZE", 4);
     let max_restarts = env_usize("GT_POLECAT_MAX_RESTARTS", 64) as u32;
-    let allocator = Arc::new(Mutex::new(PoolAllocator::new(host_cap_from_metrics(), pool_size)));
+    let allocator = Arc::new(Mutex::new(PoolAllocator::new(
+        host_cap_from_metrics(),
+        pool_size,
+    )));
     let tmux: Arc<dyn Tmux> = Arc::new(TmuxCli::new());
     let supervisor = Arc::new(PolecatSupervisor::new(
         tmux.clone(),
@@ -318,8 +328,13 @@ async fn main() -> anyhow::Result<()> {
     // is a comma list of `account=CLAUDE_CONFIG_DIR` pairs; the first is the boot-active account.
     // Each is also seeded into the quota actor so the rotation observer has a candidate pool. Unset
     // / single account ⇒ no rotation possible (logged); the polecat uses the host default ~/.claude.
-    let keychain: Option<Arc<dyn Keychain>> =
-        match seed_claude_accounts(&quota, &event_root_for_seed, &ws_slug).await {
+    let keychain: Option<Arc<dyn Keychain>> = match seed_claude_accounts(
+        &quota,
+        &event_root_for_seed,
+        &ws_slug,
+    )
+    .await
+    {
         Some((kc, n)) => {
             eprintln!("[gt-orch-server] claude keychain seeded with {n} account(s) — predictive rotation armed");
             Some(kc)
@@ -356,7 +371,10 @@ async fn main() -> anyhow::Result<()> {
     // Per-polecat git worktree (hq-orchd-deploy.9): with GT_POLECAT_WORKTREE_ROOT set, each sling
     // gets its own worktree off the rig checkout (branch = bead) so concurrent polecats don't race
     // on a shared HEAD (CLAUDE.md). Unset ⇒ the legacy single shared checkout, unchanged.
-    if let Some(root) = std::env::var("GT_POLECAT_WORKTREE_ROOT").ok().filter(|v| !v.is_empty()) {
+    if let Some(root) = std::env::var("GT_POLECAT_WORKTREE_ROOT")
+        .ok()
+        .filter(|v| !v.is_empty())
+    {
         eprintln!("[gt-orch-server] per-polecat worktrees under {root} (branch = bead, off the rig checkout)");
         pol_plugin = pol_plugin.with_worktree_root(PathBuf::from(root));
     } else {
@@ -366,7 +384,10 @@ async fn main() -> anyhow::Result<()> {
     // a dedicated non-root user (the command wrap is in SpawnTemplate::from_env) and chowns its
     // worktree to that user here. The daemon stays root (for the eventlog volume); the polecat —
     // which holds account creds + skips permission prompts — does not. Unset ⇒ runs as root (legacy).
-    if let Some(user) = std::env::var("GT_POLECAT_RUN_AS").ok().filter(|v| !v.trim().is_empty()) {
+    if let Some(user) = std::env::var("GT_POLECAT_RUN_AS")
+        .ok()
+        .filter(|v| !v.trim().is_empty())
+    {
         eprintln!("[gt-orch-server] polecats run as non-root user '{user}' (privilege drop on)");
         pol_plugin = pol_plugin.with_run_as(user);
     } else {
@@ -377,8 +398,7 @@ async fn main() -> anyhow::Result<()> {
     // the keychain's active pointer so the NEXT sling lands on a healthy account.
     let mut pol_registry = PluginRegistry::new().register(pol_plugin);
     if let Some(kc) = &keychain {
-        pol_registry =
-            pol_registry.register(QuotaRotationPlugin::new(quota.clone(), kc.clone()));
+        pol_registry = pol_registry.register(QuotaRotationPlugin::new(quota.clone(), kc.clone()));
         eprintln!("[gt-orch-server] predictive account rotation observer on");
     }
     // Git-merge edge effect (hq-orchd-deploy.12): land a polecat branch on main. On
@@ -408,7 +428,10 @@ async fn main() -> anyhow::Result<()> {
         loop {
             tick.tick().await;
             // Track real headroom: a smaller cap throttles new claims; running polecats finish.
-            alloc_timer.lock().expect("pool mutex").set_host_cap(host_cap_from_metrics());
+            alloc_timer
+                .lock()
+                .expect("pool mutex")
+                .set_host_cap(host_cap_from_metrics());
             // `tick` is blocking tmux I/O — keep it off the runtime workers.
             let sup = sup_timer.clone();
             let reslung = tokio::task::spawn_blocking(move || sup.tick(now_secs()))
@@ -466,7 +489,9 @@ async fn main() -> anyhow::Result<()> {
     // primary path; this is the net under it ("discover, don't track", gastown DiscoverCompletions).
     // Only active with per-polecat worktrees (GT_POLECAT_WORKTREE_ROOT) + an openable channel.
     let witness_task = match (
-        std::env::var("GT_POLECAT_WORKTREE_ROOT").ok().filter(|v| !v.is_empty()),
+        std::env::var("GT_POLECAT_WORKTREE_ROOT")
+            .ok()
+            .filter(|v| !v.is_empty()),
         Channel::open(&channel_root, &merge_ready_channel),
     ) {
         (Some(wt_root), Ok(channel)) => {
@@ -494,7 +519,9 @@ async fn main() -> anyhow::Result<()> {
                     tick.tick().await;
                     let n = sweep.sweep().await;
                     if n > 0 {
-                        eprintln!("[gt-orch-server] witness emitted {n} missed merge-ready signal(s)");
+                        eprintln!(
+                            "[gt-orch-server] witness emitted {n} missed merge-ready signal(s)"
+                        );
                     }
                 }
             }))
@@ -725,7 +752,10 @@ async fn metrics_text() -> axum::response::Response {
 /// auto-exiting at startup.
 async fn wait_for_signal() {
     use tokio::signal::unix::{signal, SignalKind};
-    match (signal(SignalKind::terminate()), signal(SignalKind::interrupt())) {
+    match (
+        signal(SignalKind::terminate()),
+        signal(SignalKind::interrupt()),
+    ) {
         (Ok(mut term), Ok(mut int)) => {
             tokio::select! {
                 _ = term.recv() => eprintln!("[gt-orch-server] SIGTERM received"),
@@ -733,7 +763,9 @@ async fn wait_for_signal() {
             }
         }
         (Err(e), _) | (_, Err(e)) => {
-            eprintln!("[gt-orch-server] signal install failed: {e}; running until killed externally");
+            eprintln!(
+                "[gt-orch-server] signal install failed: {e}; running until killed externally"
+            );
             std::future::pending::<()>().await;
         }
     }

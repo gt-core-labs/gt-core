@@ -7,8 +7,8 @@
 use std::time::Duration;
 
 use gt_composition::{compose_workspace, Composed};
-use gt_events::Envelope;
 use gt_eventlog::EventRecord;
+use gt_events::Envelope;
 use gt_merge::MergeEvent;
 use gt_patrol::PatrolEvent;
 use gt_scheduling::SchedEvent;
@@ -51,7 +51,11 @@ async fn compose_workspace_wires_both_reactor_arms() {
         worker: "polecat-3".into(),
         priority: 1,
     };
-    publish(&c, "patrol.lease-expired.v1", serde_json::to_value(&le).unwrap());
+    publish(
+        &c,
+        "patrol.lease-expired.v1",
+        serde_json::to_value(&le).unwrap(),
+    );
     assert!(
         matches!(next(&mut c.sched_events).await, SchedEvent::Enqueue { ref bead, priority } if bead == "gg-7" && priority == 1),
         "lease expiry should re-enqueue the freed bead through the relay",
