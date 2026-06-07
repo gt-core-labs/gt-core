@@ -247,10 +247,12 @@ impl Plugin for PolecatSupervisorPlugin {
                 // rotation flips, so reading it here is what hands the next sling the rotated
                 // account. The stored secret IS the account's CLAUDE_CONFIG_DIR. Best-effort: any
                 // miss leaves the polecat on the host default ~/.claude (logged).
+                let mut active_config_dir: Option<String> = None;
                 if let Some(kc) = &self.keychain {
                     match kc.active() {
                         Ok(Some(account)) => match kc.get(&account) {
                             Ok(Some(cred)) => {
+                                active_config_dir = Some(cred.secret.clone());
                                 spec.env
                                     .push(("CLAUDE_CONFIG_DIR".to_string(), cred.secret));
                             }
@@ -300,6 +302,14 @@ impl Plugin for PolecatSupervisorPlugin {
                             self.template.workdir.display()
                         ),
                     }
+                }
+                // Seed the account's claude config so the INTERACTIVE polecat skips the onboarding
+                // TUI (hq-orchd-deploy.14): a fresh CLAUDE_CONFIG_DIR otherwise stops at the theme /
+                // trust-folder / bypass-accept prompts and never works the bead. We need interactive
+                // (not --print) so the heartbeat + Stop→merge-ready hooks fire. Marks onboarding +
+                // bypass-mode accepted globally and trusts THIS worktree path. Best-effort.
+                if let Some(cd) = &active_config_dir {
+                    crate::worktree::seed_claude_onboarding(std::path::Path::new(cd), &spec.workdir);
                 }
                 if let Err(e) = spawn_tmux(self.tmux.as_ref(), &spec) {
                     // Spawn failed → undo the claim so the slot is not leaked.

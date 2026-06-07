@@ -133,6 +133,51 @@ pub fn seed_mcp_config(base_repo: &Path, worktree: &Path) {
     }
 }
 
+/// Pre-accept claude's onboarding in an account's `CLAUDE_CONFIG_DIR` so an INTERACTIVE polecat does
+/// not stall on the first-run TUI (`hq-orchd-deploy.14`). A polecat must run interactive (not
+/// `--print`) for its heartbeat + Stop→merge-ready hooks to fire, but a fresh config dir then stops
+/// at three prompts — theme, folder-trust, and the bypass-permissions accept — and never works the
+/// bead. This marks onboarding + bypass-mode accepted (global) and trusts the specific `worktree`
+/// path (folder-trust is per-project). Merges into the existing `.claude.json` (claude owns other
+/// keys like the oauth creds); an existing `theme` is preserved. Best-effort: any IO/parse failure
+/// logs and the polecat still slings (it just shows the TUI again).
+pub fn seed_claude_onboarding(config_dir: &Path, worktree: &Path) {
+    let path = config_dir.join(".claude.json");
+    let mut root = std::fs::read_to_string(&path)
+        .ok()
+        .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
+        .unwrap_or_else(|| serde_json::json!({}));
+    let Some(obj) = root.as_object_mut() else {
+        eprintln!("[polecat] .claude.json at {} is not an object — onboarding seed skipped", path.display());
+        return;
+    };
+    obj.insert("hasCompletedOnboarding".into(), serde_json::Value::Bool(true));
+    obj.insert("bypassPermissionsModeAccepted".into(), serde_json::Value::Bool(true));
+    obj.entry("theme")
+        .or_insert_with(|| serde_json::Value::String("dark".into()));
+    // Folder trust is per-project: mark THIS worktree path trusted + onboarded.
+    let projects = obj
+        .entry("projects")
+        .or_insert_with(|| serde_json::json!({}));
+    if let Some(pobj) = projects.as_object_mut() {
+        pobj.insert(
+            worktree.display().to_string(),
+            serde_json::json!({
+                "hasTrustDialogAccepted": true,
+                "hasCompletedProjectOnboarding": true
+            }),
+        );
+    }
+    match serde_json::to_string(&root) {
+        Ok(s) => {
+            if let Err(e) = std::fs::write(&path, s) {
+                eprintln!("[polecat] onboarding seed write {} skipped: {e}", path.display());
+            }
+        }
+        Err(e) => eprintln!("[polecat] onboarding seed serialize skipped: {e}"),
+    }
+}
+
 /// `chown -R <user> <path>` argv, as data so it can be asserted without shelling.
 fn chown_argv(path: &Path, user: &str) -> Vec<String> {
     vec!["-R".to_string(), user.to_string(), path.display().to_string()]
@@ -165,6 +210,42 @@ pub fn chown_to(path: &Path, user: &str) -> std::io::Result<()> {
 mod tests {
     use super::*;
     use std::path::PathBuf;
+
+    #[test]
+    fn seed_onboarding_marks_flags_and_trusts_the_worktree() {
+        let cfg = tempfile::tempdir().unwrap();
+        // Pre-existing .claude.json with creds + a user theme that must be preserved.
+        std::fs::write(
+            cfg.path().join(".claude.json"),
+            r#"{"oauthAccount":{"x":1},"theme":"light"}"#,
+        )
+        .unwrap();
+        let wt = PathBuf::from("/rig-wt/gt-hq-x.1");
+        seed_claude_onboarding(cfg.path(), &wt);
+
+        let v: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(cfg.path().join(".claude.json")).unwrap())
+                .unwrap();
+        assert_eq!(v["hasCompletedOnboarding"], serde_json::json!(true));
+        assert_eq!(v["bypassPermissionsModeAccepted"], serde_json::json!(true));
+        assert_eq!(v["theme"], serde_json::json!("light")); // preserved, not overwritten
+        assert_eq!(v["oauthAccount"]["x"], serde_json::json!(1)); // creds untouched
+        assert_eq!(
+            v["projects"]["/rig-wt/gt-hq-x.1"]["hasTrustDialogAccepted"],
+            serde_json::json!(true)
+        );
+    }
+
+    #[test]
+    fn seed_onboarding_creates_config_when_absent() {
+        let cfg = tempfile::tempdir().unwrap();
+        seed_claude_onboarding(cfg.path(), &PathBuf::from("/wt/a"));
+        let v: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(cfg.path().join(".claude.json")).unwrap())
+                .unwrap();
+        assert_eq!(v["hasCompletedOnboarding"], serde_json::json!(true));
+        assert_eq!(v["theme"], serde_json::json!("dark")); // default when none
+    }
 
     #[test]
     fn add_argv_branches_off_head_with_force() {
