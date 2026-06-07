@@ -58,7 +58,7 @@ const MERGE_READY_CMD: &str = concat!(
 /// hooks never see the `anthropic-ratelimit-*` response headers, so the token sample (not the
 /// authoritative window) is the only figure obtainable here. Best-effort: a missing env var, no
 /// `jq`, or an absent transcript is a silent no-op, never a hook failure.
-const COSTS_REPORT_CMD: &str = concat!(
+pub const COSTS_REPORT_CMD: &str = concat!(
     r#"if [ -n "$GT_CHANNEL_ROOT" ] && [ -n "$GT_HOOK_ACCOUNT" ] && command -v jq >/dev/null 2>&1; then "#,
     r#"ev=$(cat); "#,
     r#"tp=$(printf '%s' "$ev" | jq -r '.transcript_path // empty' 2>/dev/null); "#,
@@ -80,6 +80,14 @@ const COSTS_REPORT_CMD: &str = concat!(
 /// One Claude hook entry running `cmd` for every event of its kind (`matcher: ""`).
 fn hook(cmd: &str) -> serde_json::Value {
     json!({ "matcher": "", "hooks": [ { "type": "command", "command": cmd } ] })
+}
+
+/// The `Stop` hook entry that reports a turn's token usage into the quota-feed ([`COSTS_REPORT_CMD`]).
+/// Exported so an INTERACTIVE session (the terminal's role-session launch) can install the same
+/// predictive-rotation feed the polecats emit (`hq-quota-feed`) — the command is identical (it reads
+/// `GT_HOOK_ACCOUNT` + `GT_CHANNEL_ROOT` from the env), so the daemon's feed loop folds both the same way.
+pub fn costs_report_hook_entry() -> serde_json::Value {
+    hook(COSTS_REPORT_CMD)
 }
 
 /// The static polecat settings document (`.claude/settings.json`). Identical for every polecat —

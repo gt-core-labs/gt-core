@@ -100,7 +100,15 @@ fn is_truthy(v: Option<&str>) -> bool {
 /// first registered account (`BTreeMap` ⇒ deterministic). `None` when nothing is registered or the
 /// log can't be read — the caller then falls back to a bare shell. This is the container-reachable
 /// source of the active account (the linux keychain's live pointer lives in the host keyring).
-fn active_claude_config_dir(log: &EventLog, workspace: &str) -> Option<String> {
+/// Resolve the active claude account as `(account_id, config_dir)` for `workspace` by replaying the
+/// quota domain (`hq-term-dock.4`). Active = the most recent rotation target, else the first
+/// registered account (`BTreeMap` ⇒ deterministic). `None` when nothing is registered or the log
+/// can't be read — the caller then falls back to a bare shell. The account id lets the session's
+/// quota-feed hook label its token sample (`GT_HOOK_ACCOUNT`, `hq-quota-feed`): the daemon's
+/// predictor keys consumption by this id, the same id the rotation log records, so an interactive
+/// session's burn folds into the very account it is spending. This is the container-reachable source
+/// of the active account (the linux keychain's live pointer lives in the host keyring).
+fn active_claude_account(log: &EventLog, workspace: &str) -> Option<(String, String)> {
     let state = log
         .replay_domain(
             Some(workspace),
@@ -123,6 +131,7 @@ fn active_claude_config_dir(log: &EventLog, workspace: &str) -> Option<String> {
         .get(&active)
         .cloned()
         .filter(|d| !d.is_empty())
+        .map(|dir| (active, dir))
 }
 
 /// Materialise the session's ROLE skills into a per-session workdir and return it, so the launched
@@ -193,6 +202,7 @@ fn prepare_role_skills(
     config_dir: &str,
     minter: Option<&JwtMinter>,
     server_url: Option<&str>,
+    costs_report: bool,
 ) -> RoleLaunch {
     let Ok(registry) = log.replay_domain(
         Some(workspace),
@@ -236,8 +246,15 @@ fn prepare_role_skills(
     // Per-role MCP auth (hq-role-mcp) is materialisable only when both a minter and a server URL were
     // wired; when so, every role write-session gets a workdir (for `.gt-config` + `.mcp.json`).
     let role_mcp = minter.zip(server_url);
-    // No skills/prompt/hooks/MCP to materialise → no workdir, but the model config (if any) still rides.
-    if skill_ids.is_empty() && prompt.is_none() && hooks_settings.is_none() && role_mcp.is_none() {
+    // No skills/prompt/hooks/MCP/costs-feed to materialise → no workdir, but the model config (if
+    // any) still rides. `costs_report` alone is enough to earn a workdir: a role with nothing else
+    // still gets a settings.json carrying the quota-feed Stop hook (hq-quota-feed).
+    if skill_ids.is_empty()
+        && prompt.is_none()
+        && hooks_settings.is_none()
+        && role_mcp.is_none()
+        && !costs_report
+    {
         return RoleLaunch {
             workdir: None,
             model,
@@ -311,7 +328,7 @@ fn prepare_role_skills(
     // claude auto-loads as project settings (hq-hooks). `enabledMcpjsonServers` pre-approves the
     // `gt` server so the role's claude loads it without the interactive project-MCP trust prompt
     // (hq-role-mcp). A session whose role has no skills/prompt still gets a workdir for these files.
-    if let Some(settings) = build_settings(hooks_settings, mcp_enabled) {
+    if let Some(settings) = build_settings(hooks_settings, mcp_enabled, costs_report) {
         let claude_dir = workdir.join(".claude");
         if std::fs::create_dir_all(&claude_dir).is_ok() {
             if let Ok(body) = serde_json::to_string_pretty(&settings) {
@@ -416,19 +433,38 @@ fn write_mcp_json(workdir: &Path) -> bool {
 
 /// Combine the matching global hooks settings with the MCP enable flag into the session's
 /// `settings.json` value (`hq-role-mcp`). `enabledMcpjsonServers: ["gt"]` pre-approves the project
-/// `.mcp.json` server so claude loads it without the interactive trust prompt. `None` when there is
-/// nothing to write (no hooks and no MCP).
+/// `.mcp.json` server so claude loads it without the interactive trust prompt. When `costs_report`,
+/// a `Stop` quota-feed hook (identical to the polecat's, `hq-quota-feed`) is appended so the
+/// interactive session's token usage feeds predictive account rotation. `None` when there is nothing
+/// to write (no hooks, no MCP, no costs report).
 fn build_settings(
     hooks: Option<serde_json::Value>,
     mcp_enabled: bool,
+    costs_report: bool,
 ) -> Option<serde_json::Value> {
-    if hooks.is_none() && !mcp_enabled {
+    if hooks.is_none() && !mcp_enabled && !costs_report {
         return None;
     }
     let mut v = hooks.unwrap_or_else(|| serde_json::json!({}));
     if mcp_enabled {
         if let Some(obj) = v.as_object_mut() {
             obj.insert("enabledMcpjsonServers".into(), serde_json::json!(["gt"]));
+        }
+    }
+    // Append the quota-feed Stop hook beside any global hooks (hq-quota-feed). The command reads
+    // GT_HOOK_ACCOUNT + GT_CHANNEL_ROOT from the session env (stamped by build_command), so it is
+    // the polecat's exact reporter — no merge-ready half, an interactive session never merges.
+    if costs_report {
+        if let Some(obj) = v.as_object_mut() {
+            let hooks_obj = obj
+                .entry("hooks")
+                .or_insert_with(|| serde_json::json!({}));
+            if let Some(hobj) = hooks_obj.as_object_mut() {
+                let stop = hobj.entry("Stop").or_insert_with(|| serde_json::json!([]));
+                if let Some(arr) = stop.as_array_mut() {
+                    arr.push(gt_polecat::costs_report_hook_entry());
+                }
+            }
         }
     }
     Some(v)
@@ -458,6 +494,13 @@ enum TerminalTarget {
         /// of idling. `None` ⇒ a bare interactive claude. Only applied on session creation (tmux
         /// `new-session -A` ignores the command when attaching to a live session).
         kickoff: Option<String>,
+        /// The active claude account id (`hq-quota-feed`): stamped as `GT_HOOK_ACCOUNT` on the tmux
+        /// session so the quota-feed Stop hook labels its token sample with the account being burnt.
+        /// `None` ⇒ no account resolved (the feed hook then no-ops on the missing env var).
+        hook_account: Option<String>,
+        /// The quota-feed channel root (`hq-quota-feed`): stamped as `GT_CHANNEL_ROOT` so the Stop
+        /// hook drops its `*.event` sample where the daemon's feed loop reads it. `None` ⇒ no account.
+        channel_root: Option<String>,
     },
 }
 
@@ -558,19 +601,33 @@ async fn ws_upgrade(
         None => TerminalTarget::Shell,
         Some(raw) => match sanitize_session(raw) {
             Some(session) => {
-                // For an interactive session, resolve the active claude account's config dir so the
-                // session launches an authenticated `claude` (hq-term-dock.4); absent ⇒ bare shell.
-                let claude_config_dir = if write {
+                // For an interactive session, resolve the active claude account (id + config dir) so
+                // the session launches an authenticated `claude` (hq-term-dock.4) AND its quota-feed
+                // hook can label the account it burns (hq-quota-feed); absent ⇒ bare shell.
+                let active = if write {
                     state
                         .accounts
                         .as_ref()
-                        .and_then(|log| active_claude_config_dir(log, &claims.workspace))
+                        .and_then(|log| active_claude_account(log, &claims.workspace))
                 } else {
                     None
                 };
+                let hook_account = active.as_ref().map(|(acct, _)| acct.clone());
+                let claude_config_dir = active.as_ref().map(|(_, dir)| dir.clone());
+                // The quota-feed channel the Stop hook drops its sample into. Matches the daemon's
+                // GT_CHANNEL_ROOT (else `<GT_EVENTLOG_ROOT>/.channels`) — the shared eventlog volume,
+                // so the backend's hook and the daemon's feed loop meet on the same directory.
+                let channel_root = claude_config_dir.as_ref().map(|_| {
+                    std::env::var("GT_CHANNEL_ROOT").unwrap_or_else(|_| {
+                        let root = std::env::var("GT_EVENTLOG_ROOT")
+                            .unwrap_or_else(|_| "/var/lib/gt-core".to_string());
+                        PathBuf::from(root).join(".channels").display().to_string()
+                    })
+                });
                 // With an account resolved, materialise the session's ROLE skills into a workdir and
                 // launch claude there (hq-role-skills-term.3) loading the role's skills, plus resolve
-                // the role's model config (hq-role-model.1) stamped onto the claude launch.
+                // the role's model config (hq-role-model.1) stamped onto the claude launch. An account
+                // also earns the quota-feed Stop hook in the session settings (costs_report=true).
                 let (workdir, model, kickoff) = match (write, &claude_config_dir, &state.accounts) {
                     (true, Some(dir), Some(log)) => {
                         let root = std::env::var("GT_EVENTLOG_ROOT")
@@ -584,6 +641,7 @@ async fn ws_upgrade(
                             dir,
                             state.token_minter.as_deref(),
                             state.server_url.as_deref(),
+                            true,
                         );
                         (
                             launch.workdir.map(|p| p.display().to_string()),
@@ -601,6 +659,8 @@ async fn ws_upgrade(
                     workdir,
                     model,
                     kickoff,
+                    hook_account,
+                    channel_root,
                 }
             }
             None => {
@@ -687,6 +747,8 @@ fn build_command(target: &TerminalTarget) -> CommandBuilder {
             workdir,
             model,
             kickoff,
+            hook_account,
+            channel_root,
         } => {
             let mut cmd = CommandBuilder::new("tmux");
             cmd.arg("-L");
@@ -720,6 +782,18 @@ fn build_command(target: &TerminalTarget) -> CommandBuilder {
                     // (`IS_SANDBOX=1`), which claude honours to allow it (`hq-term-dock.5`).
                     cmd.arg("-e");
                     cmd.arg("IS_SANDBOX=1");
+                    // The quota-feed env the Stop costs-report hook reads (hq-quota-feed): the
+                    // account being burnt + the channel the sample lands in. Both come from the
+                    // trusted quota log / server env (no user input) and feed predictive rotation so
+                    // an interactive session, like a polecat, rotates off an account before it blocks.
+                    if let Some(account) = hook_account {
+                        cmd.arg("-e");
+                        cmd.arg(format!("GT_HOOK_ACCOUNT={account}"));
+                    }
+                    if let Some(root) = channel_root {
+                        cmd.arg("-e");
+                        cmd.arg(format!("GT_CHANNEL_ROOT={root}"));
+                    }
                     cmd.arg("claude");
                     // The role's model + permission mode + effort (hq-role-model.1) as claude flags.
                     // The values come from the trusted skills log; the command validator forbids
@@ -966,6 +1040,8 @@ mod tests {
             workdir: None,
             model: None,
             kickoff: None,
+            hook_account: None,
+            channel_root: None,
         });
         let argv: Vec<String> = ro
             .get_argv()
@@ -993,6 +1069,8 @@ mod tests {
             workdir: None,
             model: None,
             kickoff: None,
+            hook_account: None,
+            channel_root: None,
         });
         let argv: Vec<String> = rw
             .get_argv()
@@ -1021,6 +1099,8 @@ mod tests {
             workdir: Some("/var/lib/gt-core/term/hq-gg-1".into()),
             model: None,
             kickoff: None,
+            hook_account: None,
+            channel_root: None,
         });
         let argv: Vec<String> = cl
             .get_argv()
@@ -1060,6 +1140,8 @@ mod tests {
                 effort: "xhigh".into(),
             }),
             kickoff: None,
+            hook_account: None,
+            channel_root: None,
         });
         let argv: Vec<String> = cm
             .get_argv()
@@ -1111,6 +1193,8 @@ mod tests {
             workdir: Some("/var/lib/gt-core/term/hq-gg-1".into()),
             model: None,
             kickoff: Some("Begin your duties now.".into()),
+            hook_account: None,
+            channel_root: None,
         });
         let argv: Vec<String> = cmd
             .get_argv()
@@ -1130,6 +1214,8 @@ mod tests {
             workdir: None,
             model: None,
             kickoff: Some("Begin your duties now.".into()),
+            hook_account: None,
+            channel_root: None,
         });
         let ro_argv: Vec<String> = ro
             .get_argv()
@@ -1137,6 +1223,35 @@ mod tests {
             .map(|s| s.to_string_lossy().into_owned())
             .collect();
         assert!(!ro_argv.iter().any(|a| a == "Begin your duties now."));
+    }
+
+    #[test]
+    fn build_command_stamps_the_quota_feed_env_when_an_account_is_resolved() {
+        // hq-quota-feed: an interactive claude launch carries GT_HOOK_ACCOUNT + GT_CHANNEL_ROOT (as
+        // tmux `-e` pairs, before the `claude` word) so its Stop hook labels + lands its token sample.
+        let cmd = build_command(&TerminalTarget::Attach {
+            workspace: "acme".into(),
+            session: "hq-gg-1".into(),
+            write: true,
+            claude_config_dir: Some("/var/lib/gt-core/accounts/abc".into()),
+            workdir: None,
+            model: None,
+            kickoff: None,
+            hook_account: Some("brayanrayo@bi-quare.com".into()),
+            channel_root: Some("/var/lib/gt-core/.channels".into()),
+        });
+        let argv: Vec<String> = cmd
+            .get_argv()
+            .iter()
+            .map(|s| s.to_string_lossy().into_owned())
+            .collect();
+        let claude_at = argv.iter().position(|a| a == "claude").unwrap();
+        assert!(argv[..claude_at]
+            .iter()
+            .any(|a| a == "GT_HOOK_ACCOUNT=brayanrayo@bi-quare.com"));
+        assert!(argv[..claude_at]
+            .iter()
+            .any(|a| a == "GT_CHANNEL_ROOT=/var/lib/gt-core/.channels"));
     }
 
     #[test]
@@ -1238,6 +1353,7 @@ mod tests {
             cfg.to_str().unwrap(),
             None,
             None,
+            false,
         );
         let wd = launch
             .workdir
@@ -1281,7 +1397,8 @@ mod tests {
             "m1",
             cfg.to_str().unwrap(),
             None,
-            None
+            None,
+            false
         )
         .workdir
         .is_none());
@@ -1334,6 +1451,7 @@ mod tests {
             cfg.to_str().unwrap(),
             None,
             None,
+            false,
         );
         let wd = launch
             .workdir
@@ -1348,9 +1466,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn active_claude_config_dir_resolves_from_the_quota_log() {
-        // hq-term-dock.4: replay the quota domain → the active account's CLAUDE_CONFIG_DIR. Active
-        // is the last rotation target, else the first registered account.
+    async fn active_claude_account_resolves_from_the_quota_log() {
+        // hq-term-dock.4 + hq-quota-feed: replay the quota domain → the active account's id +
+        // CLAUDE_CONFIG_DIR. Active is the last rotation target, else the first registered account.
+        let dir_of = |log: &EventLog, ws: &str| active_claude_account(log, ws).map(|(_, d)| d);
         use gt_quota::QuotaEvent;
         use tempfile::TempDir;
         let dir = TempDir::new().unwrap();
@@ -1373,10 +1492,11 @@ mod tests {
             },
         )
         .unwrap();
-        // No rotation yet → first registered (BTreeMap order: acct-a).
+        // No rotation yet → first registered (BTreeMap order: acct-a). The account id rides too.
+        assert_eq!(dir_of(&log, "acme").as_deref(), Some("/dirs/a"));
         assert_eq!(
-            active_claude_config_dir(&log, "acme").as_deref(),
-            Some("/dirs/a")
+            active_claude_account(&log, "acme").map(|(a, _)| a).as_deref(),
+            Some("acct-a")
         );
         // After rotating to b → b is active.
         log.append(
@@ -1388,12 +1508,13 @@ mod tests {
             },
         )
         .unwrap();
+        assert_eq!(dir_of(&log, "acme").as_deref(), Some("/dirs/b"));
         assert_eq!(
-            active_claude_config_dir(&log, "acme").as_deref(),
-            Some("/dirs/b")
+            active_claude_account(&log, "acme").map(|(a, _)| a).as_deref(),
+            Some("acct-b")
         );
         // A workspace with no accounts resolves to None (caller falls back to a shell).
-        assert!(active_claude_config_dir(&log, "empty").is_none());
+        assert!(active_claude_account(&log, "empty").is_none());
     }
 
     #[test]
@@ -1474,19 +1595,42 @@ mod tests {
     #[test]
     fn build_settings_merges_mcp_enable_flag_with_hooks() {
         // hq-role-mcp: enable flag rides alongside any hooks; nothing to write ⇒ None.
-        assert!(build_settings(None, false).is_none());
+        assert!(build_settings(None, false, false).is_none());
 
-        let only_mcp = build_settings(None, true).unwrap();
+        let only_mcp = build_settings(None, true, false).unwrap();
         assert_eq!(only_mcp["enabledMcpjsonServers"], serde_json::json!(["gt"]));
 
         let hooks = serde_json::json!({ "hooks": { "PreToolUse": [] } });
-        let merged = build_settings(Some(hooks), true).unwrap();
+        let merged = build_settings(Some(hooks), true, false).unwrap();
         assert_eq!(merged["enabledMcpjsonServers"], serde_json::json!(["gt"]));
         assert!(merged["hooks"]["PreToolUse"].is_array());
 
         // Hooks present but MCP off ⇒ the flag is absent.
         let hooks = serde_json::json!({ "hooks": {} });
-        let no_mcp = build_settings(Some(hooks), false).unwrap();
+        let no_mcp = build_settings(Some(hooks), false, false).unwrap();
         assert!(no_mcp.get("enabledMcpjsonServers").is_none());
+    }
+
+    #[test]
+    fn build_settings_appends_the_quota_feed_stop_hook_when_costs_report() {
+        // hq-quota-feed: costs_report alone earns a settings.json carrying the quota-feed Stop hook,
+        // so an interactive session reports token usage to predictive rotation just like a polecat.
+        let only_costs = build_settings(None, false, true).expect("costs report ⇒ settings");
+        let stop = only_costs["hooks"]["Stop"]
+            .as_array()
+            .expect("Stop hook array");
+        assert_eq!(stop.len(), 1);
+        let cmd = stop[0]["hooks"][0]["command"].as_str().unwrap();
+        assert!(cmd.contains("$GT_CHANNEL_ROOT/quota-feed"));
+        assert!(cmd.contains("$GT_HOOK_ACCOUNT"));
+
+        // It rides ALONGSIDE existing global hooks (a Stop hook is appended, not clobbered).
+        let hooks = serde_json::json!({ "hooks": { "Stop": [ { "matcher": "", "hooks": [] } ] } });
+        let merged = build_settings(Some(hooks), false, true).unwrap();
+        assert_eq!(merged["hooks"]["Stop"].as_array().unwrap().len(), 2);
+
+        // No costs report ⇒ no Stop hook injected.
+        let none = build_settings(None, true, false).unwrap();
+        assert!(none.get("hooks").is_none());
     }
 }

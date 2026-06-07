@@ -29,8 +29,10 @@ FROM debian:bookworm-slim
 # the login + `auth status --json` the onboarding flow reads the account email from.
 # tmux: the orchestration daemon (gt-orch-server) slings each polecat in a tmux session
 # (hq-orchd-deploy.11), so the daemon-in-container needs tmux on PATH alongside claude + git.
+# jq: the polecat + interactive-session Stop hook (hq-quota-feed) parses the claude transcript's
+# token usage with jq to feed predictive account rotation; without it the hook silently no-ops.
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends ca-certificates git libssl3 curl gnupg tmux \
+    && apt-get install -y --no-install-recommends ca-certificates git libssl3 curl gnupg tmux jq \
     && curl -fsSL https://deb.nodesource.com/setup_20.x | bash - \
     && apt-get install -y --no-install-recommends nodejs \
     && npm install -g @anthropic-ai/claude-code \
