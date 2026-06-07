@@ -208,6 +208,15 @@ pub trait MembershipDirectory: Send + Sync {
         sub: &str,
         workspace: &str,
     ) -> Result<Option<VerifiedIdentity>, AuthError>;
+
+    /// Every workspace in the deployment, for a SYSTEM ADMIN's picker: a `*`-scoped caller may
+    /// switch into any tenant, not just their own memberships, so `GET /auth/workspaces` widens to
+    /// this list for them and `/auth/switch` accepts any slug it contains. The role is reported as
+    /// `admin` (the caller carries `*` regardless of any per-tenant role). Default `Ok(vec![])` so
+    /// adapters that predate this — and the non-admin path — need no change.
+    async fn list_all(&self) -> Result<Vec<WorkspaceMembership>, AuthError> {
+        Ok(Vec::new())
+    }
 }
 
 /// One membership row as returned by `GET /auth/workspaces`: the workspace slug and the role the
@@ -243,6 +252,18 @@ impl MembershipDirectory for crate::PgUsers {
         workspace: &str,
     ) -> Result<Option<VerifiedIdentity>, AuthError> {
         self.resolve_membership(sub, workspace).await
+    }
+
+    async fn list_all(&self) -> Result<Vec<WorkspaceMembership>, AuthError> {
+        Ok(self
+            .all_workspaces()
+            .await?
+            .into_iter()
+            .map(|workspace| WorkspaceMembership {
+                workspace,
+                role: "admin".to_string(),
+            })
+            .collect())
     }
 }
 
@@ -1325,8 +1346,9 @@ async fn me(claims: Option<Extension<JwtClaims>>) -> Result<Json<MeResponse>, Ap
 
 /// `GET /auth/workspaces` — the authenticated user's workspace memberships (slug + role), for the
 /// gt-web workspace selector (hq-identity.3). `401` without verified claims; `501` when no
-/// membership directory is configured. The list is keyed by the token's `sub`, so a caller only
-/// ever sees their own memberships.
+/// membership directory is configured. The list is keyed by the token's `sub`, so a normal caller
+/// only ever sees their own memberships; a SYSTEM admin (`*`) sees every provisioned workspace, so
+/// the selector lets them switch into any tenant.
 #[cfg_attr(feature = "axum", utoipa::path(
     get, path = "/auth/workspaces", tag = "auth",
     responses(
@@ -1342,21 +1364,31 @@ async fn workspaces(
 ) -> Result<Json<Vec<WorkspaceMembership>>, ApiError> {
     let Extension(claims) = claims.ok_or(ApiError::Unauthenticated)?;
     let dir = state.memberships.as_ref().ok_or(ApiError::NotConfigured)?;
-    Ok(Json(dir.list(&claims.sub).await?))
+    // A system admin (`*`) reaches every tenant, so widen the picker to all workspaces; a normal
+    // user sees only their own memberships.
+    let rows = if is_system_admin(&claims) {
+        dir.list_all().await?
+    } else {
+        dir.list(&claims.sub).await?
+    };
+    Ok(Json(rows))
 }
 
 /// `POST /auth/switch` `{workspace}` — re-target the session to another of the user's workspaces
 /// (hq-identity.3). Re-mints the access + refresh pair (and cookies) with that workspace active and
 /// its role-expanded scopes. `403` when the user is not a member of the requested workspace —
-/// the active tenant is resolved server-side from membership, never granted on request. `401`
-/// without claims; `501` when no directory is configured.
+/// the active tenant is resolved server-side from membership, never granted on request. A SYSTEM
+/// admin (`*`) is the exception: they may switch into ANY provisioned workspace, carrying their `*`
+/// grant, and get `404` (not `403`) for a slug that names no workspace. `401` without claims; `501`
+/// when no directory is configured.
 #[cfg_attr(feature = "axum", utoipa::path(
     post, path = "/auth/switch", tag = "auth",
     request_body = SwitchRequest,
     responses(
         (status = 200, description = "Re-targeted — a fresh access + refresh pair scoped to the new workspace", body = TokenResponse),
         (status = 401, description = "No verified claims"),
-        (status = 403, description = "Caller is not a member of the requested workspace"),
+        (status = 403, description = "Caller is not a member of the requested workspace (non-admin)"),
+        (status = 404, description = "System admin requested a workspace that does not exist"),
         (status = 501, description = "No membership directory configured"),
     ),
 ))]
@@ -1368,10 +1400,28 @@ async fn switch(
 ) -> Result<(HeaderMap, Json<TokenResponse>), ApiError> {
     let Extension(claims) = claims.ok_or(ApiError::Unauthenticated)?;
     let dir = state.memberships.as_ref().ok_or(ApiError::NotConfigured)?;
-    let identity = dir
-        .resolve(&claims.sub, &body.workspace)
-        .await?
-        .ok_or(ApiError::Forbidden)?;
+    let identity = match dir.resolve(&claims.sub, &body.workspace).await? {
+        Some(identity) => identity,
+        // A system admin may enter any PROVISIONED workspace even without a membership, carrying
+        // their `*` grant into the new tenant. `404` (not `403`) when the slug names no workspace,
+        // so a typo is distinguishable from a permission denial. A non-admin is still `403`.
+        None if is_system_admin(&claims) => {
+            let known = dir
+                .list_all()
+                .await?
+                .iter()
+                .any(|w| w.workspace == body.workspace);
+            if !known {
+                return Err(ApiError::NotFound);
+            }
+            VerifiedIdentity {
+                sub: claims.sub.clone(),
+                workspace: body.workspace.clone(),
+                scopes: claims.scopes.clone(),
+            }
+        }
+        None => return Err(ApiError::Forbidden),
+    };
     let tokens = issue_tokens(&state, identity.sub, identity.workspace, identity.scopes).await?;
     Ok((set_token_cookies(&state, &tokens), Json(tokens)))
 }
@@ -1740,6 +1790,14 @@ fn require_scope(claims: Option<&JwtClaims>, needed: &str) -> Result<(), ApiErro
 /// admin grant is `workspace.admin` or the `*` wildcard (the role the workspace seeds its creator
 /// with). No claims ⇒ `401`; wrong workspace or missing grant ⇒ `403`.
 #[cfg(feature = "pg")]
+/// Whether the verified claims carry the deploy-wide super-admin grant (`*`). Unlike
+/// [`require_system_admin`] this returns a bool (not a gate) and is feature-free, so the membership
+/// handlers can WIDEN — not reject — for a system admin: a `*`-scoped caller lists and switches into
+/// any workspace, while a normal user stays confined to their memberships.
+fn is_system_admin(claims: &JwtClaims) -> bool {
+    claims.scopes.iter().any(|s| s == "*")
+}
+
 fn require_workspace_admin(claims: Option<&JwtClaims>, workspace: &str) -> Result<(), ApiError> {
     let claims = claims.ok_or(ApiError::Unauthenticated)?;
     let is_admin = claims.workspace == workspace
@@ -3572,10 +3630,22 @@ mod tests {
     #[derive(Default)]
     struct MemDirectory {
         by_sub: std::collections::HashMap<String, Vec<(String, String, Vec<String>)>>,
+        /// Every provisioned workspace, for the system-admin (`list_all`) path.
+        all: Vec<String>,
     }
 
     #[async_trait]
     impl MembershipDirectory for MemDirectory {
+        async fn list_all(&self) -> Result<Vec<WorkspaceMembership>, AuthError> {
+            Ok(self
+                .all
+                .iter()
+                .map(|w| WorkspaceMembership {
+                    workspace: w.clone(),
+                    role: "admin".to_string(),
+                })
+                .collect())
+        }
         async fn list(&self, sub: &str) -> Result<Vec<WorkspaceMembership>, AuthError> {
             Ok(self
                 .by_sub
@@ -3845,7 +3915,12 @@ mod tests {
                 ),
             ],
         );
-        Arc::new(MemDirectory { by_sub })
+        // The deployment also has `idc`, which gwen is NOT a member of — only a system admin
+        // reaches it (exercised by the system-admin tests).
+        Arc::new(MemDirectory {
+            by_sub,
+            all: vec!["ida".to_string(), "idb".to_string(), "idc".to_string()],
+        })
     }
 
     /// Build a request to `path` with optional verified claims (`sub`/`workspace`) and JSON body.
@@ -3980,6 +4055,76 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    /// A request carrying SYSTEM-admin claims (`*`) — used to prove the cross-tenant widening of
+    /// the membership endpoints. `sub` is a user with NO membership at all, so any reach beyond
+    /// memberships is purely the admin grant.
+    fn admin_req(method: &str, path: &str, json: Option<&str>) -> Request<Body> {
+        let mut builder = Request::builder().method(method).uri(path);
+        if json.is_some() {
+            builder = builder.header("content-type", "application/json");
+        }
+        let mut req = builder
+            .body(json.map(|j| Body::from(j.to_owned())).unwrap_or_else(Body::empty))
+            .unwrap();
+        req.extensions_mut().insert(JwtClaims {
+            sub: "root".into(),
+            workspace: "default".into(),
+            scopes: vec!["*".into()],
+            exp: 2_000_000_000,
+            nbf: None,
+            iat: 0,
+        });
+        req
+    }
+
+    #[tokio::test]
+    async fn system_admin_workspaces_lists_every_workspace() {
+        // `root` holds no membership, yet the `*` grant widens the picker to all provisioned ws.
+        let app = auth_router(state_with_memberships(gwen_directory()));
+        let resp = app
+            .oneshot(admin_req("GET", "/auth/workspaces", None))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let got: Vec<WorkspaceMembership> = serde_json::from_slice(&bytes).unwrap();
+        let slugs: Vec<&str> = got.iter().map(|w| w.workspace.as_str()).collect();
+        assert_eq!(slugs, vec!["ida", "idb", "idc"]);
+        assert!(got.iter().all(|w| w.role == "admin"));
+    }
+
+    #[tokio::test]
+    async fn system_admin_switches_into_an_unheld_workspace() {
+        // `root` is not a member of `idc`, but a system admin may enter it, carrying `*`.
+        let app = auth_router(state_with_memberships(gwen_directory()));
+        let resp = app
+            .oneshot(admin_req("POST", "/auth/switch", Some(r#"{"workspace":"idc"}"#)))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        let access = body["access_token"].as_str().unwrap();
+        let verifier = JwtAuthenticator::from_kid_pems([("k1", PUB_PEM)]).unwrap();
+        let claims = verifier.authenticate(access).unwrap();
+        assert_eq!(claims.workspace, "idc");
+        assert_eq!(claims.scopes, vec!["*".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn system_admin_switch_to_a_nonexistent_workspace_is_not_found() {
+        let app = auth_router(state_with_memberships(gwen_directory()));
+        let resp = app
+            .oneshot(admin_req("POST", "/auth/switch", Some(r#"{"workspace":"ghost"}"#)))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
     }
 
     // --- OAuth/OIDC provider CRUD (hq-idp-db.4): system-admin gate + secret write-only ----------

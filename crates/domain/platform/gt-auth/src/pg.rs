@@ -222,6 +222,20 @@ impl PgUsers {
         rows.iter().map(row_to_membership).collect()
     }
 
+    /// Every provisioned workspace slug, for a system admin's cross-tenant picker (hq-identity.3
+    /// system-admin extension). Sourced from the DISTINCT slugs in `public.user_workspaces`:
+    /// provisioning always seeds the creator's membership, so every workspace has ≥1 row here —
+    /// no dependency on the `gt-workspace` registry (which this crate deliberately does not import).
+    pub async fn all_workspaces(&self) -> Result<Vec<String>, AuthError> {
+        let rows = sqlx::query_scalar::<_, String>(
+            "SELECT DISTINCT workspace_slug FROM public.user_workspaces ORDER BY workspace_slug",
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| AuthError::Backend(format!("user_workspaces postgres: {e}")))?;
+        Ok(rows)
+    }
+
     /// Global login (hq-identity.2): authenticate against `public.users`, resolve the user's
     /// workspace memberships, and stamp the ACTIVE workspace + that membership's role-expanded
     /// scopes onto the returned identity.
