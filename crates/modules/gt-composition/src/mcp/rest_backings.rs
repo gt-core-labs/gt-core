@@ -37,7 +37,7 @@ use gt_merge::{
 use gt_orchestration::{ConvoyBoard, OrchEvent, OrchState, WorkspaceConvoy};
 use gt_quota::{AccountRegistry, QuotaEvent, QuotaState, WorkspaceQuota};
 use gt_rig::{DynRigRepository, PgRigs, WorkspaceRigs};
-use gt_skills::{SkillCatalog, SkillState, WorkspaceSkills};
+use gt_skills::{SkillCatalog, SkillEvent, SkillState, SkillWriter, WorkspaceSkills};
 
 use super::eventlog::EventLog;
 use super::pools::WsPools;
@@ -296,6 +296,16 @@ impl WorkspaceSkills for EventLogSkills {
     }
 }
 
+#[async_trait]
+impl SkillWriter for EventLogSkills {
+    /// Persist a register/retire event into the workspace's `skills.*` stream (`hq-agent-
+    /// observability.7`) — the same log the read replay folds, so the next `catalog()` sees it and
+    /// the SSE feed carries `skills.registered.v1` / `skills.retired.v1` to the dashboard.
+    async fn append(&self, workspace: &str, event: SkillEvent) -> Result<(), AppError> {
+        self.log.append(Some(workspace), event).map_err(lift)
+    }
+}
+
 /// REST backing for the read-only `feed.read` surface (`gt_feed::WorkspaceFeed`,
 /// hq-web-extras.14): paginates the caller's *whole* workspace log — the same per-workspace stream
 /// the SSE `/stream` and MCP feed read, exposed read-only + paginated over HTTP. The historical
@@ -478,5 +488,41 @@ mod tests {
 
         assert!(merges.repo("beta").await.unwrap().list_slots().await.unwrap().is_empty());
         assert_eq!(merges.repo("alpha").await.unwrap().list_slots().await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn skills_write_then_read_round_trips_per_workspace() {
+        // hq-agent-observability.7: a SkillWriter append lands in the workspace's skills stream and
+        // the WorkspaceSkills replay sees it; retire removes it; another tenant never sees either.
+        let dir = TempDir::new().unwrap();
+        let skills = EventLogSkills::new(Arc::new(EventLog::new(Some(dir.path().to_path_buf()))));
+
+        skills
+            .append(
+                "acme",
+                SkillEvent::Registered {
+                    skill: "graphify".into(),
+                    label: "Graphify".into(),
+                    description: "knowledge graph".into(),
+                    default_scopes: vec!["graph.read".into()],
+                    now_secs: 1,
+                },
+            )
+            .await
+            .unwrap();
+
+        let cat = skills.catalog("acme").await.unwrap();
+        assert!(cat.get("graphify").is_some(), "registered skill is read back");
+        // Tenant isolation: another workspace's catalog is empty.
+        assert!(skills.catalog("beta").await.unwrap().get("graphify").is_none());
+
+        skills
+            .append("acme", SkillEvent::Retired { skill: "graphify".into(), now_secs: 2 })
+            .await
+            .unwrap();
+        assert!(
+            skills.catalog("acme").await.unwrap().get("graphify").is_none(),
+            "retired skill is gone after replay"
+        );
     }
 }

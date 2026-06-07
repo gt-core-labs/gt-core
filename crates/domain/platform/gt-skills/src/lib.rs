@@ -34,7 +34,7 @@ mod state;
 
 pub use actor::{spawn, spawn_hydrated, SkillHandle, SkillMsg};
 #[cfg(feature = "axum")]
-pub use http::{skills_router, SkillsApiState, WorkspaceSkills};
+pub use http::{skills_router, SkillsApiState, SkillWriter, WorkspaceSkills};
 #[cfg(feature = "axum")]
 pub use module::SkillsHttpModule;
 pub use module::SkillsModule;

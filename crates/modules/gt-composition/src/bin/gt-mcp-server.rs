@@ -583,11 +583,16 @@ async fn main() -> anyhow::Result<()> {
         .module(MergeModule::with_http(MergeApiState::new(Arc::new(
             EventLogMerges::new(event_log.clone()),
         ))))
-        // skills.read (hq-web-extras.13): read-only catalog the FE hydrates, replayed from the
-        // caller's `skills.*` event stream. Mounted at /api/v1/skills behind the skills.read guard.
-        .module(SkillsModule::with_http(SkillsApiState::new(Arc::new(
-            EventLogSkills::new(event_log.clone()),
-        ))))
+        // skills.read + skills.write (hq-web-extras.13 + hq-agent-observability.7): the catalog the
+        // FE hydrates, replayed from the caller's `skills.*` stream; with a writer wired, POST /
+        // DELETE register/retire skills (skills.write), appending events into that same log so the
+        // Knowledge skills tab can be populated. One backing serves both read + write.
+        .module({
+            let skills = Arc::new(EventLogSkills::new(event_log.clone()));
+            SkillsModule::with_http(
+                SkillsApiState::new(skills.clone()).with_writer(skills),
+            )
+        })
         // feed.read (hq-web-extras.14): read-only activity feed, folded from the caller's whole
         // workspace log. Mounted at /api/v1/feed behind the feed.read guard.
         .module(FeedModule::with_http(FeedApiState::new(Arc::new(
