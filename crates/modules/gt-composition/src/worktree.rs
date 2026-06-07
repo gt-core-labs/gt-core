@@ -133,6 +133,29 @@ pub fn seed_mcp_config(base_repo: &Path, worktree: &Path) {
     }
 }
 
+/// Install the polecat reporting hooks at the account's USER settings
+/// (`CLAUDE_CONFIG_DIR/settings.json`) so they actually fire (`hq-orchd-deploy.15`). claude does not
+/// run **project** hooks (`<worktree>/.claude/settings.json`) for an unapproved repo — so the
+/// heartbeat + Stop→merge-ready hooks the daemon seeds into the worktree never executed, leaving the
+/// polecat without a heartbeat (supervisor re-slings) and without a merge-ready drop (no push). User
+/// settings are trusted, so their hooks run headlessly. Clobber-safe: only writes when the file is
+/// absent or already gt-managed (carries the marker), never over a human's settings.
+pub fn seed_user_hooks(config_dir: &Path) {
+    let target = config_dir.join("settings.json");
+    if let Ok(existing) = std::fs::read_to_string(&target) {
+        if !existing.contains(gt_polecat::MANAGED_MARKER) {
+            eprintln!(
+                "[polecat] {} exists and is not gt-managed — user hooks not installed",
+                target.display()
+            );
+            return;
+        }
+    }
+    if let Err(e) = std::fs::write(&target, gt_polecat::polecat_settings_json()) {
+        eprintln!("[polecat] user hooks seed {} skipped: {e}", target.display());
+    }
+}
+
 /// Pre-accept claude's onboarding in an account's `CLAUDE_CONFIG_DIR` so an INTERACTIVE polecat does
 /// not stall on the first-run TUI (`hq-orchd-deploy.14`). A polecat must run interactive (not
 /// `--print`) for its heartbeat + Stop→merge-ready hooks to fire, but a fresh config dir then stops

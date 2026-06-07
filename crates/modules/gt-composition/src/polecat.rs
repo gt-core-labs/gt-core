@@ -309,7 +309,12 @@ impl Plugin for PolecatSupervisorPlugin {
                 // (not --print) so the heartbeat + Stop→merge-ready hooks fire. Marks onboarding +
                 // bypass-mode accepted globally and trusts THIS worktree path. Best-effort.
                 if let Some(cd) = &active_config_dir {
-                    crate::worktree::seed_claude_onboarding(std::path::Path::new(cd), &spec.workdir);
+                    let cd = std::path::Path::new(cd);
+                    crate::worktree::seed_claude_onboarding(cd, &spec.workdir);
+                    // Hooks must live in USER settings (CLAUDE_CONFIG_DIR/settings.json): claude does
+                    // not run project hooks for an unapproved repo, so the worktree's settings.json
+                    // never fired (hq-orchd-deploy.15). User settings are trusted → hooks run.
+                    crate::worktree::seed_user_hooks(cd);
                 }
                 if let Err(e) = spawn_tmux(self.tmux.as_ref(), &spec) {
                     // Spawn failed → undo the claim so the slot is not leaked.
