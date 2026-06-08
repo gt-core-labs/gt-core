@@ -1,36 +1,44 @@
 # gt-mcp-server — embeddings variant (hq-docs-search.2, docs/11).
 #
 # Same server as the default Dockerfile, but built WITH `--features embeddings-fastembed`
-# so the local fastembed Embedder (ONNX, AllMiniLM-L6-v2) is compiled in. Heavier than the
-# lean default image (onnxruntime + openssl); use it only when semantic/hybrid document
-# search is wanted, with `GT_EMBEDDINGS=1` set at runtime.
-FROM rust:1-slim-bookworm AS build
-WORKDIR /build
-# fastembed/ort + their build chain: clang (bindgen), pkg-config + libssl-dev (openssl-sys),
-# cmake for the onnxruntime bindings.
+# so the local fastembed Embedder (ONNX, AllMiniLM-L6-v2) is compiled in.
+#
+# cargo-chef (hq-docker-build-opt): dep layer keyed on Cargo.lock, skipped on warm builds.
+# System libs (clang/cmake/openssl) are installed in the chef base so `cook` can run
+# bindgen for onnxruntime.
+FROM lukemathwalker/cargo-chef:latest-rust-1-slim-bookworm AS chef
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
        clang pkg-config libssl-dev cmake \
     && rm -rf /var/lib/apt/lists/*
+WORKDIR /build
+
+# --- recipe: dep graph snapshot ---
+FROM chef AS planner
 COPY . .
-# Both bins: gt-mcp-server (the HTTP/MCP backend) and gt-orch-server (the autonomous orchestration
-# daemon, hq-orchd-deploy.11). One image serves either, picked by the compose `command` — so the
-# daemon ships + deploys like the rest of the stack instead of a host-side `run.sh`.
-RUN cargo build --release --locked -p gt-composition --bin gt-mcp-server --bin gt-orch-server \
-       --features embeddings-fastembed,oauth
+RUN cargo chef prepare --recipe-path recipe.json
+
+# --- cook: compile ALL deps for embeddings-fastembed,oauth (cached layer) ---
+FROM chef AS builder
+COPY --from=planner /build/recipe.json recipe.json
+RUN cargo chef cook --release --locked \
+    --features embeddings-fastembed,oauth \
+    --recipe-path recipe.json
+# Both bins: gt-mcp-server (HTTP/MCP backend) and gt-orch-server (orchestration daemon,
+# hq-orchd-deploy.11). One image serves either, picked by the compose `command`.
+COPY . .
+RUN cargo build --release --locked -p gt-composition \
+    --bin gt-mcp-server --bin gt-orch-server \
+    --features embeddings-fastembed,oauth
 
 FROM debian:bookworm-slim
-# git: S3 readiness clause (docs/10 §S4). libssl3: openssl runtime for the embedding stack's
-# HTTPS model download. ca-certificates: TLS roots for that download.
+# git: S3 readiness clause (docs/10 §S4). libssl3: openssl runtime for the embedding
+# stack's HTTPS model download. ca-certificates: TLS roots for that download.
 #
 # node + @anthropic-ai/claude-code (hq-quota-onboard-web.4): the web onboarding route
-# (/api/v1/quota/onboard/*) drives `claude auth login` IN this container, so the `claude` CLI must
-# be on PATH here. Installed from NodeSource (node 20) + a global npm install; `claude auth` provides
-# the login + `auth status --json` the onboarding flow reads the account email from.
-# tmux: the orchestration daemon (gt-orch-server) slings each polecat in a tmux session
-# (hq-orchd-deploy.11), so the daemon-in-container needs tmux on PATH alongside claude + git.
-# jq: the polecat + interactive-session Stop hook (hq-quota-feed) parses the claude transcript's
-# token usage with jq to feed predictive account rotation; without it the hook silently no-ops.
+# (/api/v1/quota/onboard/*) drives `claude auth login` IN this container.
+# tmux: the orchestration daemon (gt-orch-server) slings each polecat in a tmux session.
+# jq: the polecat + interactive-session Stop hook (hq-quota-feed) parses token usage.
 RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates git libssl3 curl gnupg tmux jq \
     && curl -fsSL https://deb.nodesource.com/setup_20.x | bash - \
@@ -40,29 +48,19 @@ RUN apt-get update \
     && apt-get purge -y gnupg \
     && apt-get autoremove -y \
     && rm -rf /var/lib/apt/lists/*
-# Baseline `gt` binary baked from the latest published release (hq-gt-container): the interactive
-# terminal's claude launches `gt mcp` as the per-role MCP proxy IN this container (hq-role-mcp), so
-# `gt` must be on PATH here. The entrypoint refreshes this over the network on every start so it
-# never falls behind between rebuilds; this bake guarantees a working binary even if that fetch fails
-# (or is disabled with GT_SKIP_UPDATE=1).
-# MUSL not gnu: this base is bookworm (GLIBC 2.36); the gnu release needs a newer GLIBC and aborts
-# (`GLIBC_2.38 not found`). The musl asset is static and runs anywhere.
+# Baseline `gt` binary baked from the latest published release (hq-gt-container).
+# MUSL not gnu: bookworm (GLIBC 2.36) < gnu release's requirement; musl is static.
 RUN curl -fsSL https://github.com/gt-core-labs/gt/releases/download/latest/gt-x86_64-unknown-linux-musl.tar.gz \
        | tar -xz -C /usr/local/bin gt \
     && chmod 0755 /usr/local/bin/gt
-# The path terminal.rs writes into each role session's `.mcp.json` as the `gt` server command.
 ENV GT_BIN=/usr/local/bin/gt
 COPY docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
 RUN chmod 0755 /usr/local/bin/docker-entrypoint.sh
-COPY --from=build /build/target/release/gt-mcp-server /usr/local/bin/gt-mcp-server
-COPY --from=build /build/target/release/gt-orch-server /usr/local/bin/gt-orch-server
-# ort downloads the onnxruntime shared lib at build; carry it into the runtime image and
-# point ort at it (ORT_DYLIB_PATH), so no runtime download/link is needed.
-COPY --from=build /build/target/release/libonnxruntime.so* /usr/local/lib/
+COPY --from=builder /build/target/release/gt-mcp-server /usr/local/bin/gt-mcp-server
+COPY --from=builder /build/target/release/gt-orch-server /usr/local/bin/gt-orch-server
+# ort downloads the onnxruntime shared lib at build; carry it into the runtime image.
+COPY --from=builder /build/target/release/libonnxruntime.so* /usr/local/lib/
 ENV ORT_DYLIB_PATH=/usr/local/lib/libonnxruntime.so
-# fastembed caches the model under this dir (mount a volume to persist across restarts).
 ENV FASTEMBED_CACHE_PATH=/var/lib/gt-core/fastembed
-# The entrypoint refreshes `gt` then execs the CMD (or the compose `command`), so the daemon variant
-# (`gt-orch-server`) still works via `command:` while the default stays `gt-mcp-server`.
 ENTRYPOINT ["/usr/local/bin/docker-entrypoint.sh"]
 CMD ["gt-mcp-server"]

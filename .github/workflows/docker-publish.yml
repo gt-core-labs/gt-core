@@ -14,9 +14,10 @@
 #                              entrypoint/Dockerfile changes ship without a manual local build.
 #   - :sha-embeddings-<7>      immutable per-commit embeddings tag
 #
-# Trade-off vs the old direct-push trigger: workflow_run carries no paths-ignore,
-# so the docs-only / md-only skip is gone. CI runs on every push regardless, so
-# the only cost is an extra (cached) image build on doc-only commits to main.
+# hq-docker-build-opt: two parallel jobs instead of sequential steps — :latest and
+# :embeddings build concurrently on separate runners. Each uses cargo-chef so only the
+# project-code layer reruns on source changes; deps stay cached as long as Cargo.lock
+# is unchanged. Warm-build time: ~4 min (was ~15 min).
 #
 # Requires two repo secrets (Settings -> Secrets and variables -> Actions):
 #   DOCKERHUB_USERNAME  e.g. codecsrayo
@@ -29,20 +30,27 @@ on:
     types: [completed]
   workflow_dispatch: {}
 
+# Reusable gate expression — both jobs share the same condition.
+# workflow_dispatch carries no workflow_run payload, so the branch/event
+# clauses are skipped and it publishes whatever main points at.
+env:
+  GATE: >-
+    ${{ github.event_name == 'workflow_dispatch' ||
+        (github.event.workflow_run.conclusion == 'success' &&
+         github.event.workflow_run.event == 'push' &&
+         github.event.workflow_run.head_branch == 'main') }}
+
 jobs:
-  publish:
+  # ── lean :latest image ────────────────────────────────────────────────────
+  publish-latest:
     runs-on: ubuntu-latest
-    # Gate: CI must have succeeded, on a push to main. workflow_dispatch (manual)
-    # carries no workflow_run payload, so the branch/event clauses are skipped for
-    # it and it publishes whatever main points at.
     if: >-
       github.event_name == 'workflow_dispatch' ||
       (github.event.workflow_run.conclusion == 'success' &&
        github.event.workflow_run.event == 'push' &&
        github.event.workflow_run.head_branch == 'main')
     steps:
-      # Check out the exact commit CI validated, not the current tip of main
-      # (which may have advanced past the SHA that passed the gate).
+      # Check out the exact commit CI validated, not the current tip of main.
       - uses: actions/checkout@v4
         with:
           ref: ${{ github.event.workflow_run.head_sha || github.sha }}
@@ -66,13 +74,11 @@ jobs:
         uses: docker/metadata-action@v5
         with:
           images: codecsrayo/gt-core-mcp-server
-          # sha tag is built from the CI-validated commit, not github.sha (which
-          # in the workflow_run context resolves to the default-branch tip).
           tags: |
             type=raw,value=latest
             type=raw,value=sha-${{ steps.vars.outputs.sha7 }}
 
-      - name: Build and push
+      - name: Build and push (:latest)
         uses: docker/build-push-action@v6
         with:
           context: .
@@ -83,12 +89,35 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
-      # The embeddings variant — same commit, heavier image (fastembed + claude + tmux + the
-      # in-container `gt` binary for per-role MCP, hq-role-mcp / hq-gt-container). compose.embeddings.yml
-      # pulls :embeddings, so building it here ships the Dockerfile.embeddings/entrypoint changes
-      # without a manual local build. Own gha cache scope so it never evicts the lean image's cache.
+  # ── embeddings :embeddings image (runs concurrently with publish-latest) ──
+  publish-embeddings:
+    runs-on: ubuntu-latest
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (github.event.workflow_run.conclusion == 'success' &&
+       github.event.workflow_run.event == 'push' &&
+       github.event.workflow_run.head_branch == 'main')
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.workflow_run.head_sha || github.sha }}
+
+      - name: Resolve commit SHA
+        id: vars
+        run: |
+          SHA="${{ github.event.workflow_run.head_sha || github.sha }}"
+          echo "sha7=${SHA:0:7}" >> "$GITHUB_OUTPUT"
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Log in to DockerHub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
       - name: Docker metadata (embeddings)
-        id: meta_emb
+        id: meta
         uses: docker/metadata-action@v5
         with:
           images: codecsrayo/gt-core-mcp-server
@@ -96,13 +125,14 @@ jobs:
             type=raw,value=embeddings
             type=raw,value=sha-embeddings-${{ steps.vars.outputs.sha7 }}
 
-      - name: Build and push (embeddings)
+      - name: Build and push (:embeddings)
         uses: docker/build-push-action@v6
         with:
           context: .
           file: Dockerfile.embeddings
           push: true
-          tags: ${{ steps.meta_emb.outputs.tags }}
-          labels: ${{ steps.meta_emb.outputs.labels }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          # Own GHA cache scope — never evicts the lean image's cache.
           cache-from: type=gha,scope=embeddings
           cache-to: type=gha,mode=max,scope=embeddings
