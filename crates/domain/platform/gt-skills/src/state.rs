@@ -33,6 +33,10 @@ pub struct Skill {
     /// was registered without one; `#[serde(default)]` keeps pre-`.1` catalog entries replayable.
     #[serde(default)]
     pub body: String,
+    /// Optional grouping label for the UI (e.g. `"design"`, `"research"`). Empty when unset;
+    /// `#[serde(default)]` keeps pre-group log entries replayable.
+    #[serde(default)]
+    pub group: String,
 }
 
 impl Skill {
@@ -50,12 +54,19 @@ impl Skill {
             default_scopes,
             registered_at_secs,
             body: String::new(),
+            group: String::new(),
         }
     }
 
     /// Builder-style setter for the `SKILL.md` body (`hq-role-skills-term.1`).
     pub fn with_body(mut self, body: impl Into<String>) -> Self {
         self.body = body.into();
+        self
+    }
+
+    /// Builder-style setter for the grouping label.
+    pub fn with_group(mut self, group: impl Into<String>) -> Self {
+        self.group = group.into();
         self
     }
 }
@@ -286,6 +297,7 @@ impl SkillState {
                 description,
                 default_scopes,
                 body,
+                group,
                 now_secs,
             } => {
                 self.catalog.apply_register(
@@ -296,7 +308,8 @@ impl SkillState {
                         default_scopes.clone(),
                         *now_secs,
                     )
-                    .with_body(body.clone()),
+                    .with_body(body.clone())
+                    .with_group(group.clone()),
                 );
             }
             SkillEvent::Retired { skill, .. } => {
@@ -390,6 +403,7 @@ mod tests {
             description: "test skill".into(),
             default_scopes: vec![format!("{id}.read"), format!("{id}.write")],
             body: String::new(),
+            group: String::new(),
             now_secs: now,
         }
     }
@@ -490,7 +504,8 @@ mod tests {
             description: "".into(),
             default_scopes: vec!["feed.read".into(), "merge.read".into()],
             body: String::new(),
-            now_secs: 1,
+            group: String::new(),
+        now_secs: 1,
         });
         s.apply(&SkillEvent::Registered {
             skill: "beta".into(),
@@ -498,7 +513,8 @@ mod tests {
             description: "".into(),
             default_scopes: vec!["feed.read".into(), "beads.read".into()],
             body: String::new(),
-            now_secs: 2,
+            group: String::new(),
+        now_secs: 2,
         });
         s.apply(&SkillEvent::EnabledForRole {
             role: "deacon".into(),

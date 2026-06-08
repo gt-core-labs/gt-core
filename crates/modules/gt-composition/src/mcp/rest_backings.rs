@@ -724,7 +724,8 @@ mod tests {
                     description: "knowledge graph".into(),
                     default_scopes: vec!["graph.read".into()],
                     body: String::new(),
-                    now_secs: 1,
+                    group: String::new(),
+        now_secs: 1,
                 },
             )
             .await

@@ -31,6 +31,9 @@ pub struct RegisterSkill {
     /// materialises into a session's `.claude/skills/<id>/SKILL.md`.
     #[serde(default)]
     pub body: String,
+    /// Optional grouping label for the UI (e.g. `"design"`). Empty when unset.
+    #[serde(default)]
+    pub group: String,
     pub now_secs: u64,
 }
 
@@ -76,7 +79,8 @@ impl Command for RegisterSkill {
                 self.default_scopes.clone(),
                 self.now_secs,
             )
-            .with_body(self.body.clone()),
+            .with_body(self.body.clone())
+            .with_group(self.group.clone()),
         );
         Ok(SkillEvent::Registered {
             skill: self.skill.clone(),
@@ -84,6 +88,7 @@ impl Command for RegisterSkill {
             description: self.description.clone(),
             default_scopes: self.default_scopes.clone(),
             body: self.body.clone(),
+            group: self.group.clone(),
             now_secs: self.now_secs,
         })
     }
@@ -101,6 +106,8 @@ pub struct UpdateSkill {
     pub description: Option<String>,
     #[serde(default)]
     pub body: Option<String>,
+    #[serde(default)]
+    pub group: Option<String>,
     pub now_secs: u64,
 }
 
@@ -131,6 +138,7 @@ impl Command for UpdateSkill {
         let label = self.label.clone().unwrap_or(cur.label);
         let description = self.description.clone().unwrap_or(cur.description);
         let body = self.body.clone().unwrap_or(cur.body);
+        let group = self.group.clone().unwrap_or(cur.group);
         state.apply_register(
             Skill::new(
                 self.skill.clone(),
@@ -139,7 +147,8 @@ impl Command for UpdateSkill {
                 cur.default_scopes.clone(),
                 cur.registered_at_secs,
             )
-            .with_body(body.clone()),
+            .with_body(body.clone())
+            .with_group(group.clone()),
         );
         Ok(SkillEvent::Registered {
             skill: self.skill.clone(),
@@ -147,6 +156,7 @@ impl Command for UpdateSkill {
             description,
             default_scopes: cur.default_scopes,
             body,
+            group,
             now_secs: self.now_secs,
         })
     }
@@ -434,6 +444,7 @@ mod tests {
             description: format!("{id} desc"),
             default_scopes: scopes.iter().map(|s| (*s).to_string()).collect(),
             body: String::new(),
+            group: String::new(),
             now_secs: now,
         }
     }
@@ -459,7 +470,8 @@ mod tests {
             label: None,
             description: Some("List open PRs".into()),
             body: Some("# pr-list\nrun gh pr list".into()),
-            now_secs: 3,
+            group: None,
+        now_secs: 3,
         };
         let ev = upd.execute(&mut state).unwrap();
         assert!(matches!(ev, SkillEvent::Registered { .. }));
@@ -480,7 +492,8 @@ mod tests {
             label: None,
             description: None,
             body: None,
-            now_secs: 4,
+            group: None,
+        now_secs: 4,
         };
         assert!(bad.execute(&mut state).is_err());
     }
@@ -496,7 +509,8 @@ mod tests {
             description: "kg".into(),
             default_scopes: vec![],
             body: "# Graphify\nbuild a knowledge graph".into(),
-            now_secs: 1,
+            group: String::new(),
+        now_secs: 1,
         };
         let ev = cmd.execute(&mut state).unwrap();
         assert_eq!(
@@ -621,7 +635,8 @@ mod tests {
             description: "".into(),
             default_scopes: vec![],
             body: String::new(),
-            now_secs: 1,
+            group: String::new(),
+        now_secs: 1,
         };
         assert!(bad_id.validate(&state).is_err());
 
@@ -631,7 +646,8 @@ mod tests {
             description: "".into(),
             default_scopes: vec![],
             body: String::new(),
-            now_secs: 1,
+            group: String::new(),
+        now_secs: 1,
         };
         assert!(bad_label.validate(&state).is_err());
         // Neither call should have mutated state.

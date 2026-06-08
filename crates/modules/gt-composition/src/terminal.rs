@@ -1348,7 +1348,8 @@ mod tests {
                 description: "list PRs".into(),
                 default_scopes: vec![],
                 body: "# PR list\nlist open PRs".into(),
-                now_secs: 1,
+                group: String::new(),
+        now_secs: 1,
             },
         )
         .unwrap();

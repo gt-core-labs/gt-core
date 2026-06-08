@@ -21,6 +21,7 @@ fn register(s: &mut SkillState, id: &str, scopes: &[&str]) {
         description: String::new(),
         default_scopes: scopes.iter().map(|x| x.to_string()).collect(),
         body: String::new(),
+        group: String::new(),
         now_secs: 0,
     });
 }
@@ -99,6 +100,7 @@ pub fn workspace_seed_events(now: u64) -> Vec<SkillEvent> {
             description: String::new(),
             default_scopes: scopes.iter().map(|x| (*x).to_string()).collect(),
             body: String::new(),
+            group: String::new(),
             now_secs: now,
         });
     }

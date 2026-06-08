@@ -23,6 +23,9 @@ pub enum SkillEvent {
         /// log entries replayable.
         #[serde(default)]
         body: String,
+        /// Optional grouping label for the UI. `#[serde(default)]` keeps pre-group log entries replayable.
+        #[serde(default)]
+        group: String,
         now_secs: u64,
     },
     /// A skill was retired (no longer available). Existing role bindings are dropped

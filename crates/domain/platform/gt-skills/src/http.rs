@@ -167,6 +167,9 @@ struct RegisterSkillBody {
     /// materialises into a session's `.claude/skills/<id>/SKILL.md`. Defaults to empty.
     #[serde(default)]
     body: String,
+    /// Optional grouping label for the UI (e.g. `"design"`). Defaults to empty.
+    #[serde(default)]
+    group: String,
 }
 
 /// `POST /` — register a new skill in the caller's workspace catalog (`skills.write`). Validates the
@@ -195,6 +198,7 @@ async fn register_skill(
         description: body.description,
         default_scopes: body.default_scopes,
         body: body.body,
+        group: body.group,
         now_secs: now_secs(),
     };
     // execute validates (shape + uniqueness) then yields the event to persist.
@@ -246,6 +250,8 @@ struct UpdateSkillBody {
     description: Option<String>,
     #[serde(default)]
     body: Option<String>,
+    #[serde(default)]
+    group: Option<String>,
 }
 
 /// `PUT /{id}` — edit a skill's label/description/SKILL.md body (`skills.write`,
@@ -274,6 +280,7 @@ async fn update_skill(
         label: body.label,
         description: body.description,
         body: body.body,
+        group: body.group,
         now_secs: now_secs(),
     };
     let event = cmd.execute(&mut catalog).map_err(ApiError::from)?;
@@ -562,7 +569,8 @@ mod tests {
                 description: "Approve merges".into(),
                 default_scopes: vec!["merge.read".into(), "merge.write".into()],
                 body: String::new(),
-                now_secs: 1,
+                group: String::new(),
+        now_secs: 1,
             },
             SkillEvent::Registered {
                 skill: "feed_viewer".into(),
@@ -570,7 +578,8 @@ mod tests {
                 description: "Read the feed".into(),
                 default_scopes: vec!["feed.read".into()],
                 body: String::new(),
-                now_secs: 2,
+                group: String::new(),
+        now_secs: 2,
             },
             SkillEvent::EnabledForRole {
                 role: "deacon".into(),
@@ -656,7 +665,8 @@ mod tests {
             description: String::new(),
             default_scopes: vec![],
             body: String::new(),
-            now_secs: 9,
+            group: String::new(),
+        now_secs: 9,
         };
         let err = cmd.execute(&mut cat).unwrap_err();
         assert!(matches!(err, AppError::Validation(_)));
@@ -675,7 +685,8 @@ mod tests {
             description: "knowledge graph".into(),
             default_scopes: vec!["graph.read".into()],
             body: String::new(),
-            now_secs: 10,
+            group: String::new(),
+        now_secs: 10,
         };
         let ev = reg.execute(&mut cat).unwrap();
         assert!(matches!(ev, SkillEvent::Registered { .. }));
