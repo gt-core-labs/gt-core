@@ -812,6 +812,16 @@ fn build_command(target: &TerminalTarget) -> CommandBuilder {
                         cmd.arg(format!("GT_CHANNEL_ROOT={root}"));
                     }
                     cmd.arg("claude");
+                    // Load the session's hooks via claude's `--settings <file>` flag (hq-quota-feed):
+                    // claude does NOT apply a project `.claude/settings.json`'s hooks on its own in
+                    // this container setup (the hq-orchd-deploy.16 gotcha the polecat launch already
+                    // works around) — so the global hooks AND the quota-feed Stop hook prepare_role_skills
+                    // wrote there never fire without this. The workdir is server-derived (no user input).
+                    if let Some(wd) = workdir {
+                        let settings = Path::new(wd).join(".claude").join("settings.json");
+                        cmd.arg("--settings");
+                        cmd.arg(settings.display().to_string());
+                    }
                     // The role's model + permission mode + effort (hq-role-model.1) as claude flags.
                     // The values come from the trusted skills log; the command validator forbids
                     // whitespace in the model id and constrains the mode/effort to the closed CLI
@@ -1140,7 +1150,9 @@ mod tests {
                 "CLAUDE_CONFIG_DIR=/var/lib/gt-core/accounts/abc",
                 "-e",
                 "IS_SANDBOX=1",
-                "claude"
+                "claude",
+                "--settings",
+                "/var/lib/gt-core/term/hq-gg-1/.claude/settings.json"
             ]
         );
         // Write mode WITH a role model config (hq-role-model.1): --model/--permission-mode/--effort
