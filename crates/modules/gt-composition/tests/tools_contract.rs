@@ -26,9 +26,13 @@ fn served_tools() -> Vec<gt_module::McpTool> {
     reg.tools().to_vec()
 }
 
+/// Execute-only tools with no `.validate` sibling: read-only queries that need
+/// no dry-run step.
+const EXECUTE_SINGLETONS: &[&str] = &["issues.list.execute", "issues.read.execute"];
+
 /// Every command exposes a `validate` (dry-run, no state change) and an `execute`
-/// counterpart; the lone exception is the operator-only `issues.phase.advance`,
-/// which has no validate/execute split (hq-core-mcp.7).
+/// counterpart; exceptions are `issues.phase.advance` (operator-only, no split)
+/// and the read-only query tools listed in `EXECUTE_SINGLETONS`.
 #[test]
 fn every_command_has_a_validate_execute_pair() {
     let tools = served_tools();
@@ -42,6 +46,8 @@ fn every_command_has_a_validate_execute_pair() {
         assert!(names.contains(execute.as_str()), "missing {execute}");
     }
 
+    let singletons: BTreeSet<&str> = EXECUTE_SINGLETONS.iter().copied().collect();
+
     // Symmetry the other direction: no orphan `.validate` without its `.execute`
     // (or vice versa), so the pairing is total over the command tools.
     for name in &names {
@@ -50,6 +56,9 @@ fn every_command_has_a_validate_execute_pair() {
                 names.contains(format!("{stem}.execute").as_str()),
                 "{name} has no matching .execute",
             );
+        }
+        if singletons.contains(name) {
+            continue;
         }
         if let Some(stem) = name.strip_suffix(".execute") {
             assert!(
