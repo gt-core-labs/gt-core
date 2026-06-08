@@ -536,8 +536,8 @@ async fn main() -> anyhow::Result<()> {
         tokio::spawn(ArchiveDaemon::new(system_store.clone(), config.clone()).run());
         eprintln!(
             "[gt-mcp-server] archive daemon on (interval {}min, archive_after {}d)",
-            config.blocking_read().interval_minutes,
-            config.blocking_read().archive_after_days,
+            initial_cfg.interval_minutes,
+            initial_cfg.archive_after_days,
         );
         eprintln!(
             "[gt-mcp-server] system config REST on /api/v1/system/* (scope system.read/write)"
