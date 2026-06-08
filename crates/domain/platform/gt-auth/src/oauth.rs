@@ -661,6 +661,12 @@ mod tests {
         async fn list(&self) -> Result<Vec<ProviderRecord>, AuthError> {
             Ok(self.rows.values().cloned().collect())
         }
+        async fn list_for_workspace(&self, workspace: &str) -> Result<Vec<ProviderRecord>, AuthError> {
+            Ok(self.rows.values()
+                .filter(|r| r.workspace_id.is_none() || r.workspace_id.as_deref() == Some(workspace))
+                .cloned()
+                .collect())
+        }
         async fn get(&self, id: &str) -> Result<Option<ProviderRecord>, AuthError> {
             Ok(self.rows.get(id).cloned())
         }
@@ -697,6 +703,7 @@ mod tests {
             userinfo_endpoint: format!("{base}/userinfo"),
             scopes: "rig.read".into(),
             enabled,
+            workspace_id: None,
         }
     }
 

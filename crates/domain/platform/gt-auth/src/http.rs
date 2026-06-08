@@ -1104,6 +1104,10 @@ pub struct CreateProviderRequest {
     /// Whether the provider shows as a login button. Omitted ⇒ `true`.
     #[serde(default = "default_true")]
     pub enabled: bool,
+    /// Optional workspace scope (hq-epic.auth-refactor.2). `null`/absent = global (shown on every
+    /// workspace's login page). A non-null slug scopes the provider to that workspace only.
+    #[serde(default)]
+    pub workspace_id: Option<String>,
 }
 
 /// The default for [`CreateProviderRequest::enabled`] — a freshly registered provider is live.
@@ -1146,6 +1150,10 @@ pub struct PatchProviderRequest {
     /// Toggle whether the provider shows as a login button, or absent to leave it.
     #[serde(default)]
     pub enabled: Option<bool>,
+    /// New workspace scope (hq-epic.auth-refactor.2). Absent leaves the column untouched.
+    /// `Some(None)` clears to global; `Some(Some(slug))` scopes to that workspace.
+    #[serde(default)]
+    pub workspace_id: Option<Option<String>>,
 }
 
 /// A provider as returned by every read/echo on `/auth/providers` (hq-idp-db.4) — the projection
@@ -1175,6 +1183,8 @@ pub struct ProviderView {
     pub scopes: String,
     /// Whether the provider shows as a login button.
     pub enabled: bool,
+    /// Optional workspace scope (hq-epic.auth-refactor.2). `null` = global.
+    pub workspace_id: Option<String>,
 }
 
 /// A login provider as returned by the PUBLIC `GET /auth/providers` (hq-idp-db.3) — the projection
@@ -1228,6 +1238,7 @@ impl From<ProviderRecord> for ProviderView {
             userinfo_endpoint: r.userinfo_endpoint,
             scopes: r.scopes,
             enabled: r.enabled,
+            workspace_id: r.workspace_id,
         }
     }
 }
@@ -2380,6 +2391,7 @@ impl CreateProviderRequest {
                 "scopes",
             )?,
             enabled: self.enabled,
+            workspace_id: self.workspace_id,
         })
     }
 }
@@ -2399,6 +2411,7 @@ impl PatchProviderRequest {
             userinfo_endpoint: self.userinfo_endpoint,
             scopes: self.scopes,
             enabled: self.enabled,
+            workspace_id: self.workspace_id,
         }
     }
 }
@@ -4165,6 +4178,7 @@ mod tests {
                     userinfo_endpoint: provider.userinfo_endpoint,
                     scopes: provider.scopes,
                     enabled: provider.enabled,
+                    workspace_id: provider.workspace_id,
                 };
                 self.rows.lock().unwrap().push(rec.clone());
                 Ok(rec)
@@ -4617,6 +4631,12 @@ mod tests {
             async fn list(&self) -> Result<Vec<ProviderRecord>, AuthError> {
                 Ok(self.rows.lock().unwrap().clone())
             }
+            async fn list_for_workspace(&self, workspace: &str) -> Result<Vec<ProviderRecord>, AuthError> {
+                Ok(self.rows.lock().unwrap().iter()
+                    .filter(|r| r.workspace_id.is_none() || r.workspace_id.as_deref() == Some(workspace))
+                    .cloned()
+                    .collect())
+            }
             async fn get(&self, id: &str) -> Result<Option<ProviderRecord>, AuthError> {
                 Ok(self
                     .rows
@@ -4715,6 +4735,7 @@ mod tests {
                 userinfo_endpoint: format!("{base}/userinfo"),
                 scopes: "rig.read".into(),
                 enabled,
+                workspace_id: None,
             }
         }
 

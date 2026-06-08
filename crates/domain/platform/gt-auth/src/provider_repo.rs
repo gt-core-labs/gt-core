@@ -158,12 +158,18 @@ pub struct NewProvider {
     pub scopes: String,
     /// Whether the provider shows as a login button.
     pub enabled: bool,
+    /// Optional workspace scope (hq-epic.auth-refactor.2). `None` = global (appears on every
+    /// workspace's login page). `Some(slug)` = only this workspace's login page shows it,
+    /// enabling enterprise SSO where each org owns its own IdP.
+    pub workspace_id: Option<String>,
 }
 
 impl NewProvider {
     /// Build a [`NewProvider`] for a preset `kind` from its baked endpoints + default scopes,
     /// supplying only the per-deploy `id` / `display_name` / client credentials. Returns `None` for
     /// [`ProviderKind::Generic`] (it has no preset — use the struct literal with explicit endpoints).
+    /// The resulting provider is **global** (`workspace_id: None`); set the field after the call to
+    /// scope it to a workspace.
     pub fn from_preset(
         id: impl Into<String>,
         kind: ProviderKind,
@@ -183,6 +189,7 @@ impl NewProvider {
             userinfo_endpoint: p.userinfo_endpoint.to_owned(),
             scopes: p.default_scopes.to_owned(),
             enabled: true,
+            workspace_id: None,
         })
     }
 }
@@ -212,6 +219,9 @@ pub struct PatchProvider {
     pub scopes: Option<String>,
     /// Toggle whether the provider shows as a login button, or `None` to leave it.
     pub enabled: Option<bool>,
+    /// New workspace scope (hq-epic.auth-refactor.2): `Some(None)` clears to global,
+    /// `Some(Some(slug))` scopes to that workspace, `None` leaves the column untouched.
+    pub workspace_id: Option<Option<String>>,
 }
 
 /// A provider read back from the store. The `client_secret_enc` is the SEALED blob — the cleartext
@@ -242,6 +252,9 @@ pub struct ProviderRecord {
     pub scopes: String,
     /// Whether the provider shows as a login button.
     pub enabled: bool,
+    /// Optional workspace scope (hq-epic.auth-refactor.2). `None` = global (shown on every
+    /// workspace's login page). `Some(slug)` = scoped to that one workspace (enterprise SSO).
+    pub workspace_id: Option<String>,
 }
 
 impl ProviderRecord {
@@ -286,6 +299,11 @@ impl ProviderRecord {
 pub trait ProviderRepo: Send + Sync {
     /// All registered providers, ordered by `created_at` (oldest first).
     async fn list(&self) -> Result<Vec<ProviderRecord>, AuthError>;
+    /// Providers visible on `workspace`'s login page (hq-epic.auth-refactor.2): global providers
+    /// (`workspace_id IS NULL`) plus any scoped to this specific workspace. This is the list the
+    /// FE login page renders as buttons and the authorize flow validates against. Ordered by
+    /// `created_at`.
+    async fn list_for_workspace(&self, workspace: &str) -> Result<Vec<ProviderRecord>, AuthError>;
     /// One provider by id, or `None` if absent.
     async fn get(&self, id: &str) -> Result<Option<ProviderRecord>, AuthError>;
     /// Register `provider`, sealing its client secret before it is stored. Returns the stored
@@ -331,6 +349,10 @@ mod pg_impl {
         }
     }
 
+    const COLS: &str = "id, kind, display_name, client_id, client_secret_enc, issuer, \
+                        authorize_endpoint, token_endpoint, userinfo_endpoint, scopes, enabled, \
+                        workspace_id";
+
     /// Decode a `public.oauth_providers` row into a [`ProviderRecord`]. A column read fault is
     /// [`AuthError::Backend`] (an outage/corruption, never a denied request).
     fn row_to_record(row: &PgRow) -> Result<ProviderRecord, AuthError> {
@@ -369,29 +391,41 @@ mod pg_impl {
             enabled: row
                 .try_get("enabled")
                 .map_err(|e| AuthError::Backend(format!("oauth_providers postgres: {e}")))?,
+            workspace_id: row
+                .try_get("workspace_id")
+                .map_err(|e| AuthError::Backend(format!("oauth_providers postgres: {e}")))?,
         })
     }
 
     #[async_trait]
     impl ProviderRepo for PgProviderRepo {
         async fn list(&self) -> Result<Vec<ProviderRecord>, AuthError> {
-            let rows = sqlx::query(
-                "SELECT id, kind, display_name, client_id, client_secret_enc, issuer, \
-                 authorize_endpoint, token_endpoint, userinfo_endpoint, scopes, enabled \
-                 FROM public.oauth_providers ORDER BY created_at",
-            )
+            let rows = sqlx::query(&format!(
+                "SELECT {COLS} FROM public.oauth_providers ORDER BY created_at"
+            ))
             .fetch_all(&self.pool)
             .await
             .map_err(|e| AuthError::Backend(format!("oauth_providers list: {e}")))?;
             rows.iter().map(row_to_record).collect()
         }
 
+        async fn list_for_workspace(&self, workspace: &str) -> Result<Vec<ProviderRecord>, AuthError> {
+            let rows = sqlx::query(&format!(
+                "SELECT {COLS} FROM public.oauth_providers \
+                 WHERE workspace_id IS NULL OR workspace_id = $1 \
+                 ORDER BY created_at"
+            ))
+            .bind(workspace)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| AuthError::Backend(format!("oauth_providers list_for_workspace: {e}")))?;
+            rows.iter().map(row_to_record).collect()
+        }
+
         async fn get(&self, id: &str) -> Result<Option<ProviderRecord>, AuthError> {
-            let row = sqlx::query(
-                "SELECT id, kind, display_name, client_id, client_secret_enc, issuer, \
-                 authorize_endpoint, token_endpoint, userinfo_endpoint, scopes, enabled \
-                 FROM public.oauth_providers WHERE id = $1",
-            )
+            let row = sqlx::query(&format!(
+                "SELECT {COLS} FROM public.oauth_providers WHERE id = $1"
+            ))
             .bind(id)
             .fetch_optional(&self.pool)
             .await
@@ -405,8 +439,9 @@ mod pg_impl {
             sqlx::query(
                 "INSERT INTO public.oauth_providers \
                  (id, kind, display_name, client_id, client_secret_enc, issuer, \
-                  authorize_endpoint, token_endpoint, userinfo_endpoint, scopes, enabled) \
-                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)",
+                  authorize_endpoint, token_endpoint, userinfo_endpoint, scopes, enabled, \
+                  workspace_id) \
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)",
             )
             .bind(&provider.id)
             .bind(provider.kind.as_str())
@@ -419,6 +454,7 @@ mod pg_impl {
             .bind(&provider.userinfo_endpoint)
             .bind(&provider.scopes)
             .bind(provider.enabled)
+            .bind(&provider.workspace_id)
             .execute(&self.pool)
             .await
             .map_err(|e| AuthError::Backend(format!("oauth_providers create: {e}")))?;
@@ -434,6 +470,7 @@ mod pg_impl {
                 userinfo_endpoint: provider.userinfo_endpoint,
                 scopes: provider.scopes,
                 enabled: provider.enabled,
+                workspace_id: provider.workspace_id,
             })
         }
 
@@ -464,12 +501,16 @@ mod pg_impl {
                 userinfo_endpoint: patch.userinfo_endpoint.unwrap_or(current.userinfo_endpoint),
                 scopes: patch.scopes.unwrap_or(current.scopes),
                 enabled: patch.enabled.unwrap_or(current.enabled),
+                workspace_id: match patch.workspace_id {
+                    Some(new_ws) => new_ws,
+                    None => current.workspace_id,
+                },
             };
             sqlx::query(
                 "UPDATE public.oauth_providers SET \
                  display_name = $2, client_id = $3, client_secret_enc = $4, issuer = $5, \
                  authorize_endpoint = $6, token_endpoint = $7, userinfo_endpoint = $8, \
-                 scopes = $9, enabled = $10 WHERE id = $1",
+                 scopes = $9, enabled = $10, workspace_id = $11 WHERE id = $1",
             )
             .bind(&next.id)
             .bind(&next.display_name)
@@ -481,6 +522,7 @@ mod pg_impl {
             .bind(&next.userinfo_endpoint)
             .bind(&next.scopes)
             .bind(next.enabled)
+            .bind(&next.workspace_id)
             .execute(&self.pool)
             .await
             .map_err(|e| AuthError::Backend(format!("oauth_providers patch: {e}")))?;
@@ -572,6 +614,10 @@ mod tests {
                 .execute(&mut *tx)
                 .await
                 .expect("create oauth_providers table");
+            sqlx::query(crate::migrations::ADD_PROVIDER_WORKSPACE)
+                .execute(&mut *tx)
+                .await
+                .expect("add workspace_id column");
             tx.commit().await.expect("commit ddl tx");
         }
 
@@ -731,6 +777,7 @@ mod tests {
                 userinfo_endpoint: "https://sso.corp.test/userinfo".into(),
                 scopes: "openid,email".into(),
                 enabled: true,
+                workspace_id: None,
             };
             repo.create(new).await.unwrap();
             let cfg = repo
@@ -745,6 +792,58 @@ mod tests {
             assert_eq!(cfg.client_secret, "corp-secret");
             assert_eq!(cfg.scopes, vec!["openid".to_string(), "email".to_string()]);
             repo.delete(&id).await.unwrap();
+        }
+
+        #[tokio::test]
+        async fn list_for_workspace_returns_global_and_scoped(
+        ) {
+            std::env::set_var(
+                crate::ENV_SECRET_KEY,
+                "0000000000000000000000000000000000000000000000000000000000000000",
+            );
+            let Some(pool) = pool_or_skip().await else {
+                return;
+            };
+            ensure_table(&pool).await;
+            let repo = PgProviderRepo::new(pool.clone());
+
+            // Seed: one global, one scoped to "acme", one scoped to "other".
+            let make = |id: &str, ws: Option<&str>| NewProvider {
+                id: id.into(),
+                kind: ProviderKind::Generic,
+                display_name: id.into(),
+                client_id: "c".into(),
+                client_secret: "s".into(),
+                issuer: "https://idp.test/".into(),
+                authorize_endpoint: "https://idp.test/authorize".into(),
+                token_endpoint: "https://idp.test/token".into(),
+                userinfo_endpoint: "https://idp.test/userinfo".into(),
+                scopes: "openid".into(),
+                enabled: true,
+                workspace_id: ws.map(str::to_owned),
+            };
+            let id_global = unique_id("lfw-global");
+            let id_acme = unique_id("lfw-acme");
+            let id_other = unique_id("lfw-other");
+            repo.create(make(&id_global, None)).await.unwrap();
+            repo.create(make(&id_acme, Some("acme"))).await.unwrap();
+            repo.create(make(&id_other, Some("other"))).await.unwrap();
+
+            let for_acme = repo.list_for_workspace("acme").await.unwrap();
+            let ids: Vec<_> = for_acme.iter().map(|r| r.id.as_str()).collect();
+            assert!(ids.contains(&id_global.as_str()), "global must appear for acme");
+            assert!(ids.contains(&id_acme.as_str()), "acme-scoped must appear for acme");
+            assert!(!ids.contains(&id_other.as_str()), "other workspace must NOT appear for acme");
+
+            let for_other = repo.list_for_workspace("other").await.unwrap();
+            let ids2: Vec<_> = for_other.iter().map(|r| r.id.as_str()).collect();
+            assert!(ids2.contains(&id_global.as_str()), "global must appear for other");
+            assert!(ids2.contains(&id_other.as_str()), "other-scoped must appear for other");
+            assert!(!ids2.contains(&id_acme.as_str()), "acme workspace must NOT appear for other");
+
+            repo.delete(&id_global).await.unwrap();
+            repo.delete(&id_acme).await.unwrap();
+            repo.delete(&id_other).await.unwrap();
         }
     }
 }

@@ -189,6 +189,11 @@ pub mod migrations {
     /// an opaque `code`, redeemed once at `POST /auth/cli/exchange`.
     pub const CREATE_OAUTH_CLI_CODE: &str =
         include_str!("../migrations/auth/0010__create_oauth_cli_code.sql");
+    /// `0011` — optional `workspace_id` column on `public.oauth_providers`
+    /// (hq-epic.auth-refactor.2): `NULL` = global (shown on every workspace's login page),
+    /// non-NULL = scoped to one workspace (enterprise SSO — each org owns its IdP).
+    pub const ADD_PROVIDER_WORKSPACE: &str =
+        include_str!("../migrations/auth/0011__add_provider_workspace.sql");
 }
 
 #[cfg(feature = "jsonwebtoken")]
