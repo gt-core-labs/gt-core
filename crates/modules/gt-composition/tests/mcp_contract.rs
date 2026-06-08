@@ -39,10 +39,12 @@ fn harvest_tools() -> Vec<McpTool> {
 /// no state change) and an `execute` (the atomic Dolt write).
 const PAIRED_VERBS: &[&str] = &["create", "update", "transition", "close", "claim"];
 
-/// Single-call tools with no `validate` sibling (operator phase advance + the
-/// two `meta.*` self-service tools).
+/// Single-call tools with no `validate` sibling (operator phase advance,
+/// the two `meta.*` self-service tools, and the read-only issues query tools).
 const SINGLETONS: &[&str] = &[
     "issues.phase.advance",
+    "issues.list.execute",
+    "issues.read.execute",
     "meta.help.execute",
     "meta.report-gap.execute",
 ];
