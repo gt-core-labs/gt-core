@@ -164,7 +164,7 @@ fn active_claude_account(log: &EventLog, workspace: &str) -> Option<(String, Str
 /// Each `(token, value)` replaces every `<token>`, `{{ .token }}` (any inner spacing) and
 /// `{{token}}` occurrence — covering both the seeded `<X>` form and a raw gastown `{{ .X }}` /
 /// `{{ cmd }}` template. Unknown placeholders are left intact (claude reads them as literal text).
-fn render_prompt(prompt: &str, vars: &[(&str, String)]) -> String {
+pub(crate) fn render_prompt(prompt: &str, vars: &[(&str, String)]) -> String {
     let mut out = prompt.to_string();
     for (token, value) in vars {
         for pat in [

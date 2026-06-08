@@ -37,7 +37,9 @@ use gt_polecat::{
 };
 use gt_quota::Keychain;
 use gt_scheduling::SchedEvent;
+use gt_skills::SkillState;
 
+use crate::mcp::EventLog;
 use crate::operator_event::IssueOperatorEvent;
 
 /// Resolves the least-privilege scope set for an agent role (`hq-agent-provisioning.3`). The
@@ -130,6 +132,13 @@ pub struct PolecatSupervisorPlugin {
     /// static file. `None` ⇒ falls back to copying the operator-placed `.mcp.json` from the base
     /// checkout (legacy behaviour, the token in that file may be expired or rig-specific).
     server_url: Option<String>,
+    /// Event log to read the Knowledge role prompt from (`hq-polecat-knowledge.1`). When set,
+    /// each sling replays the `skills.*` stream and writes the polecat role's prompt as
+    /// `CLAUDE.md` in the worktree — the same pattern `terminal.rs` uses for interactive
+    /// sessions. Placeholders `<workspace>`, `<bead>`, `<branch>` are rendered with the sling's
+    /// real values. `None` ⇒ no CLAUDE.md is written (the repo's project CLAUDE.md is all the
+    /// polecat sees).
+    event_log: Option<Arc<EventLog>>,
 }
 
 impl PolecatSupervisorPlugin {
@@ -156,7 +165,18 @@ impl PolecatSupervisorPlugin {
             worktree_root: None,
             run_as: None,
             server_url: None,
+            event_log: None,
         }
+    }
+
+    /// Load the polecat role's prompt from the Knowledge event log at sling time and materialise
+    /// it as `CLAUDE.md` in the worktree (`hq-polecat-knowledge.1`). Mirrors `terminal.rs`'s
+    /// `prepare_role_skills`: the behavioral instructions live in a configurable Knowledge prompt,
+    /// the positional kickoff carries only the task context (bead + completion command). Without
+    /// this, the polecat sees only the repo's project CLAUDE.md.
+    pub fn with_event_log(mut self, log: Arc<EventLog>) -> Self {
+        self.event_log = Some(log);
+        self
     }
 
     /// Wire the daemon's base URL so each sling gets a fresh per-session `.mcp.json`
@@ -388,6 +408,49 @@ impl Plugin for PolecatSupervisorPlugin {
                 if let Some(cd) = &effective_config_dir {
                     crate::worktree::seed_claude_onboarding(cd, &spec.workdir);
                     crate::worktree::seed_user_hooks(cd);
+                }
+                // Materialise the polecat role's Knowledge prompt as CLAUDE.md in the worktree
+                // (hq-polecat-knowledge.1): mirrors terminal.rs::prepare_role_skills — behavioral
+                // instructions live in a configurable Knowledge prompt, the positional kickoff
+                // carries only the task context. Role comes from GT_ROLE in the spec env (default
+                // "polecat"). Placeholders <workspace>, <bead>, <branch> are rendered. Best-effort.
+                if let Some(log) = &self.event_log {
+                    let role = spec
+                        .env
+                        .iter()
+                        .find(|(k, _)| k == "GT_ROLE")
+                        .map(|(_, v)| v.as_str())
+                        .unwrap_or("polecat");
+                    match log.replay_domain(
+                        Some(&self.workspace),
+                        "skills.",
+                        SkillState::default(),
+                        SkillState::apply,
+                    ) {
+                        Ok(state) => {
+                            if let Some(prompt) = state.catalog.role_prompt(role) {
+                                let rendered = crate::terminal::render_prompt(
+                                    &prompt,
+                                    &[
+                                        ("workspace", self.workspace.clone()),
+                                        ("bead", bead.clone()),
+                                        ("branch", bead.clone()),
+                                    ],
+                                );
+                                if let Err(e) =
+                                    std::fs::write(spec.workdir.join("CLAUDE.md"), &rendered)
+                                {
+                                    eprintln!(
+                                        "[polecat] CLAUDE.md write for role {role} in {} skipped: {e}",
+                                        spec.workdir.display()
+                                    );
+                                }
+                            }
+                        }
+                        Err(e) => eprintln!(
+                            "[polecat] skills replay failed — no CLAUDE.md written for {bead}: {e}"
+                        ),
+                    }
                 }
                 // Load the polecat hooks via claude's `--settings <file>` flag (hq-orchd-deploy.16):
                 // claude does NOT apply the project/user settings.json hooks on its own in this

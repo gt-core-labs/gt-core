@@ -249,6 +249,8 @@ async fn main() -> anyhow::Result<()> {
     let event_root_for_seed = event_root.clone();
     // Keep a copy for the session reconciler (hq-orchd-deploy.23): it replays the same agent.* log.
     let event_root_for_reconcile = event_root.clone();
+    // Keep a copy for the polecat Knowledge prompt reader (hq-polecat-knowledge.1).
+    let event_root_for_polecat = event_root.clone();
     let DaemonRoot {
         handle,
         sched,
@@ -402,6 +404,12 @@ async fn main() -> anyhow::Result<()> {
     } else {
         eprintln!("[gt-orch-server] GT_POLECAT_RUN_AS unset — polecats run as the daemon uid (root); see hq-quota-accounts.6");
     }
+    // Knowledge role prompt for each sling (hq-polecat-knowledge.1): replay skills.* from the same
+    // event log the backend writes to — the polecat role's prompt becomes CLAUDE.md in its worktree,
+    // the same pattern terminal.rs uses for interactive sessions.
+    let knowledge_log = Arc::new(EventLog::new(Some(event_root_for_polecat)));
+    pol_plugin = pol_plugin.with_event_log(knowledge_log);
+    eprintln!("[gt-orch-server] Knowledge role prompt on — polecat CLAUDE.md from skills.* log");
     // Register the polecat supervisor and — when a keychain exists — the predictive rotation
     // observer on the same relay: a `quota.block_predicted.v1` / `quota.account_limited.v1` flips
     // the keychain's active pointer so the NEXT sling lands on a healthy account.
