@@ -92,10 +92,16 @@ pub fn costs_report_hook_entry() -> serde_json::Value {
 
 /// The static polecat settings document (`.claude/settings.json`). Identical for every polecat —
 /// the per-agent values live in the env the hooks read at execution, not in the file.
+///
+/// `enabledMcpjsonServers` pre-trusts the project `.mcp.json` `gt` server so an autonomous polecat
+/// never stalls on the interactive "New MCP server found … Use this MCP server?" prompt
+/// (`hq-polecat-provisioning-20260608.1`): the `.mcp.json` the daemon seeds into the worktree is
+/// project-scoped, and without this allowlist claude blocks on first launch waiting for a keypress.
 pub fn polecat_settings_json() -> String {
     let v = json!({
         MANAGED_MARKER: MANAGED_VALUE,
         "hasCompletedOnboarding": true,
+        "enabledMcpjsonServers": ["gt"],
         "permissions": { "defaultMode": "bypassPermissions" },
         "hooks": {
             "SessionStart": [ hook(HEARTBEAT_CMD) ],
@@ -142,6 +148,9 @@ mod tests {
         assert_eq!(v[MANAGED_MARKER], json!("polecat-hooks"));
         assert_eq!(v["permissions"]["defaultMode"], json!("bypassPermissions"));
         assert_eq!(v["hasCompletedOnboarding"], json!(true));
+        // The project .mcp.json `gt` server is pre-trusted so the polecat never stalls on the
+        // interactive "Use this MCP server?" prompt (hq-polecat-provisioning-20260608.1).
+        assert_eq!(v["enabledMcpjsonServers"], json!(["gt"]));
         // Heartbeat touch on an activity event; merge-ready emit on Stop.
         let post = v["hooks"]["PostToolUse"][0]["hooks"][0]["command"]
             .as_str()
