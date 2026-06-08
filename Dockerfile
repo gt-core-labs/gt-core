@@ -23,13 +23,17 @@ COPY . .
 RUN cargo build --release --locked -p gt-composition --bin gt-mcp-server
 
 FROM debian:bookworm-slim
-# `git` backs the S3 readiness clause (docs/10 §S4): GitSurfaceTree shells out to
-# `git ls-tree -r main` over the GT_REPO_DIR checkout so `?ready=true` hides a bead
-# whose own non-`planned` surface is absent from gt-core's `main`. Without git the
-# check degrades to accept-all and the frontier surfaces beads whose surfaces live
-# only in a source repo (the upstream app).
+# git: S3 readiness clause (docs/10 §S4). tmux: PTY terminal WS (hq-terminal).
+# node + @anthropic-ai/claude-code: interactive role terminal sessions spawn claude
+# inside the container — must be baked in, not mounted from the host (hq-doctor).
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends ca-certificates curl git tmux \
+    && apt-get install -y --no-install-recommends ca-certificates curl git gnupg tmux \
+    && curl -fsSL https://deb.nodesource.com/setup_20.x | bash - \
+    && apt-get install -y --no-install-recommends nodejs \
+    && npm install -g @anthropic-ai/claude-code \
+    && npm cache clean --force \
+    && apt-get purge -y gnupg \
+    && apt-get autoremove -y \
     && rm -rf /var/lib/apt/lists/*
 COPY --from=builder /build/target/release/gt-mcp-server /usr/local/bin/gt-mcp-server
 # Bake the `gt` CLI binary so role-session MCP proxies (`gt mcp`) work out of the box.
