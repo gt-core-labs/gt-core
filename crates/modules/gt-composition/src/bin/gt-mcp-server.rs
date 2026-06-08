@@ -532,7 +532,7 @@ async fn main() -> anyhow::Result<()> {
                     .map(|r| std::path::PathBuf::from(r).with_file_name("system_config.json"))
             });
         let initial_cfg = config_path.as_ref().map(load_config).unwrap_or_default();
-        let config = std::sync::Arc::new(RwLock::new(initial_cfg));
+        let config = std::sync::Arc::new(RwLock::new(initial_cfg.clone()));
         tokio::spawn(ArchiveDaemon::new(system_store.clone(), config.clone()).run());
         eprintln!(
             "[gt-mcp-server] archive daemon on (interval {}min, archive_after {}d)",
