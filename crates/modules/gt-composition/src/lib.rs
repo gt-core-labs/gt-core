@@ -49,6 +49,7 @@ pub mod quota_rotation;
 pub mod scope_bridge;
 pub mod session_reconcile;
 pub mod stream;
+pub mod system;
 pub mod terminal;
 pub mod witness_sweep;
 pub mod worktree;

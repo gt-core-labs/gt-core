@@ -612,6 +612,9 @@ impl DoltIssues {
             // `close` phase-2 once the closing sha is verified to touch a
             // non-planned surface. NULL until delivered; the readiness signal.
             ("delivered_sha", "CHAR(40) NULL"),
+            // hq-system-config: archive sweep stamps this when a closed issue is
+            // rotated out of the live tracker view. NULL = not yet archived.
+            ("archived_at", "DATETIME NULL"),
         ];
 
         let mut added_any = false;
@@ -1397,6 +1400,41 @@ impl DoltIssues {
         .await
         .map_err(map_err)?;
         Ok(())
+    }
+
+    /// Archive closed issues that have been closed for longer than `older_than_days` (hq-system-config).
+    /// Sets `archived_at = NOW()` on matching rows; already-archived rows are skipped via
+    /// `archived_at IS NULL`. Returns the number of rows archived. Commits to Dolt only when
+    /// at least one row changed so idle ticks leave no noise in the branch history.
+    pub async fn archive_old_closed(&self, older_than_days: u32) -> Result<u64, AppError> {
+        if older_than_days == 0 {
+            return Ok(0);
+        }
+        let mut conn = self.pool.get_conn().await.map_err(map_err)?;
+        let result = conn
+            .exec_iter(
+                "UPDATE issues
+                 SET archived_at = NOW(), updated_at = NOW(), version = version + 1
+                 WHERE status = 'closed'
+                   AND archived_at IS NULL
+                   AND closed_at < DATE_SUB(NOW(), INTERVAL :days DAY)",
+                mysql_async::params! { "days" => older_than_days },
+            )
+            .await
+            .map_err(map_err)?;
+        let archived = result.affected_rows();
+        let _ = result.drop_result().await.map_err(map_err)?;
+        if archived > 0 {
+            conn.exec_drop(
+                "CALL DOLT_COMMIT('-A', '-m', :msg)",
+                mysql_async::params! {
+                    "msg" => format!("archive-sweep: archived {archived} closed issues (>{older_than_days}d)")
+                },
+            )
+            .await
+            .map_err(map_err)?;
+        }
+        Ok(archived)
     }
 
     /// Map every bead id to the [`DepFact`] readiness needs to judge whether it

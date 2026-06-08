@@ -81,6 +81,8 @@ use gt_rig::{RigApiState, RigsModule};
 use gt_skills::{SkillsApiState, SkillsModule};
 use gt_store_dolt::{DoltIssues, WorkspacePools};
 use gt_workspace::{PgWorkspaces, WorkspaceApiState, WorkspaceModule};
+use gt_composition::system::{system_router, ArchiveDaemon, SystemApiState, load_config};
+use tokio::sync::RwLock;
 
 /// Path the MCP endpoint mounts at (mirrors the upstream gt-mcp).
 const MCP_PATH: &str = "/mcp";
@@ -256,6 +258,9 @@ async fn main() -> anyhow::Result<()> {
     // serves the full tools/list — the issues+meta descriptors here, extended below with the
     // domain handlers' descriptors so the REST `/help` matches the MCP `meta.help` exactly.
     let meta_store = store.clone();
+    // Clone for the system config surface (hq-system-config): the archive daemon and
+    // POST /api/v1/system/archive/run need the same Dolt store the MCP server uses.
+    let system_store = store.clone();
     let meta_base_tools = tools.clone();
     // `with_issue_sink` (hq-issues-sse): an `issues.*.execute` over MCP — the agent-driven
     // movement the REST surface alone would miss — publishes its event into the same per-workspace
@@ -514,6 +519,38 @@ async fn main() -> anyhow::Result<()> {
         hooks_router(HooksApiState::new(v.clone(), audit.clone(), store))
     });
 
+    // System config REST surface (hq-system-config): GET/PUT /api/v1/system/config and
+    // POST /api/v1/system/archive/run. Scoped to system.read/system.write (admin `*` satisfies both).
+    // Spawns the background archive daemon that sweeps old closed issues on a configurable interval.
+    let system = verifier.as_ref().map(|v| {
+        let config_path = std::env::var("GT_SYSTEM_CONFIG_PATH")
+            .map(std::path::PathBuf::from)
+            .ok()
+            .or_else(|| {
+                std::env::var("GT_EVENTLOG_ROOT")
+                    .ok()
+                    .map(|r| std::path::PathBuf::from(r).with_file_name("system_config.json"))
+            });
+        let initial_cfg = config_path.as_ref().map(load_config).unwrap_or_default();
+        let config = std::sync::Arc::new(RwLock::new(initial_cfg));
+        tokio::spawn(ArchiveDaemon::new(system_store.clone(), config.clone()).run());
+        eprintln!(
+            "[gt-mcp-server] archive daemon on (interval {}min, archive_after {}d)",
+            config.blocking_read().interval_minutes,
+            config.blocking_read().archive_after_days,
+        );
+        eprintln!(
+            "[gt-mcp-server] system config REST on /api/v1/system/* (scope system.read/write)"
+        );
+        system_router(SystemApiState::new(
+            v.clone(),
+            audit.clone(),
+            system_store.clone(),
+            config,
+            config_path,
+        ))
+    });
+
     // Orphan claude-credential GC (hq-quota-onboard-web.6): the backend is the only always-on
     // process, so it sweeps the accounts root on a timer and reaps dirs no live account points at
     // (a re-onboarded email replaces its dir, a retire drops one, an abandoned /start leaves an
@@ -582,6 +619,9 @@ async fn main() -> anyhow::Result<()> {
     }
     if let Some(hooks) = hooks {
         app = app.merge(hooks);
+    }
+    if let Some(system) = system {
+        app = app.merge(system);
     }
 
     // REST surface (hq-auth-routes.2): the module routers the kernel builder mounted
