@@ -721,7 +721,7 @@ async fn main() -> anyhow::Result<()> {
         ))))
         // convoy.* (hq-web-extras.16): read + mutate REST surface — the durable backing replays +
         // appends the caller's `convoy.*` stream, the same event-sourced board the MCP
-        // ConvoyHandler folds into. Mounted at /api/v1/convoy behind the convoys.read/convoys.write
+        // ConvoyHandler folds into. Mounted at /api/v1/convoy behind the convoy.read/convoy.write
         // guard (board read + complete-member/fail-member mutations).
         .module(ConvoyModule::with_http(ConvoyApiState::new(Arc::new(
             EventLogConvoy::new(event_log.clone()),

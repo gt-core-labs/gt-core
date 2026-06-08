@@ -10,7 +10,7 @@
 //! What it declares:
 //!
 //! - **Identity** ([`GtModule::meta`]) — id `convoy`, semver, description.
-//! - **Capability** ([`GtModule::capability`]) — the `convoys.read` / `convoys.write` scopes
+//! - **Capability** ([`GtModule::capability`]) — the `convoy.read` / `convoy.write` scopes
 //!   the module owns and the seven versioned event kinds it emits.
 //! - **MCP tools** ([`GtModule::register_mcp_tools`]) — the six `orch.*` validate/execute
 //!   tools, named verbatim from the current `gt-mcp` service.
@@ -106,7 +106,7 @@ impl GtModule for ConvoyHttpModule {
     }
 
     /// The convoy REST routes (`hq-fe-api-orch.3`), relative — the builder nests them under
-    /// `/api/v1/convoy` and applies the `convoys.read`/`convoys.write` scope guard.
+    /// `/api/v1/convoy` and applies the `convoy.read`/`convoy.write` scope guard.
     fn register_routes(&self) -> axum::Router {
         crate::http::convoy_router(self.http.clone())
     }
@@ -132,13 +132,12 @@ impl GtModule for ConvoyModule {
     }
 
     fn capability(&self) -> Capability {
-        // The `convoys.read` / `convoys.write` scopes the module owns (the guards `gt-web`
-        // names on the convoy HTTP routes). The seven emitted kinds mirror `OrchEvent`'s
-        // variants, declared in the canonical versioned + kebab shape (`convoy.*.v1`).
+        // `convoy.read` / `convoy.write`: singular matches the MCP tool namespace (`convoy.*`)
+        // so `from_workspace_claim` maps these REST scopes to the right allow pattern.
         Capability::empty()
             .claiming_all([
-                Scope::new("convoys.read").expect("valid scope"),
-                Scope::new("convoys.write").expect("valid scope"),
+                Scope::new("convoy.read").expect("valid scope"),
+                Scope::new("convoy.write").expect("valid scope"),
             ])
             .emitting_all([
                 EventKind::new("convoy.created.v1").expect("valid event kind"),
@@ -203,11 +202,11 @@ mod tests {
     }
 
     #[test]
-    fn capability_claims_convoys_scopes_and_emits_seven_kinds() {
+    fn capability_claims_convoy_scopes_and_emits_seven_kinds() {
         let cap = ConvoyModule.capability();
 
         let scopes: Vec<&str> = cap.scopes().iter().map(Scope::as_str).collect();
-        assert_eq!(scopes, ["convoys.read", "convoys.write"]);
+        assert_eq!(scopes, ["convoy.read", "convoy.write"]);
 
         let kinds: Vec<&str> = cap.emits().iter().map(EventKind::as_str).collect();
         assert_eq!(

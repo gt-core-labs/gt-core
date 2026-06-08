@@ -29,7 +29,7 @@
 //!   `/api/v1/convoy` and wraps it with the capability-derived scope guard
 //!   ([`guard_module_scopes`](gt_module::guard_module_scopes)); the composition root layers the
 //!   auth middleware in front. A handler here only runs once the caller already holds
-//!   `convoys.read` / `convoys.write` for the request's verb-class.
+//!   `convoy.read` / `convoy.write` for the request's verb-class.
 
 use std::sync::Arc;
 

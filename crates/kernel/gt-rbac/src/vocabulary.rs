@@ -32,10 +32,11 @@ pub const SCOPE_WILDCARD: &str = "*";
 /// the rest are the CRUD/operational verbs the modules' capabilities and the REST guard use
 /// (`read`/`write` are what [`gt_module`]'s route guard derives from the HTTP method). `exec`
 /// gates capabilities that *run* something rather than read/mutate state — the interactive
-/// terminal (`terminal.exec`, hq-terminal) is the first.
+/// terminal (`terminal.exec`, hq-terminal) is the first. `attach` gates the dock-terminal
+/// WebSocket attach surface (`terminal.attach`, hq-term-dock).
 pub const SCOPE_VERBS: &[&str] = &[
     "read", "write", "create", "update", "delete", "submit", "list", "info", "admin", "member",
-    "exec",
+    "exec", "attach",
 ];
 
 /// True when `verb` is in the closed [`SCOPE_VERBS`] set.
