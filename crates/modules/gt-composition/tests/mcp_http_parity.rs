@@ -234,6 +234,10 @@ fn served_mcp_tools(ns: &str) -> Vec<String> {
 fn is_routable(tool: &str) -> bool {
     !tool.ends_with(".validate")
         && tool != "issues.phase.advance"
+        // Read-only issues query tools: MCP-only, backed by the Dolt issues store directly;
+        // the REST surface uses GET /api/v1/issues (separate OpenAPI surface).
+        && tool != "issues.list.execute"
+        && tool != "issues.read.execute"
         && tool != "workspace.member-add"
         && tool != "workspace.member-remove"
         // OAuth/OIDC provider CRUD (hq-idp-db.4): the system-admin provider tools whose REST sibling
@@ -329,8 +333,8 @@ async fn every_routable_mcp_tool_has_a_route() {
 }
 
 /// Guards the exemption predicate itself: the `issues` namespace carries known MCP-only tools
-/// (the five `.validate` dry-runs + `issues.phase.advance`) that must stay route-free, so the
-/// test above genuinely exercises the exemption path rather than vacuously passing.
+/// (the five `.validate` dry-runs + `issues.phase.advance` + the two read-only query tools)
+/// that must stay route-free, so the test above genuinely exercises the exemption path.
 #[test]
 fn issues_namespace_has_the_expected_mcp_only_tools() {
     let tools = served_mcp_tools("issues");
@@ -346,4 +350,10 @@ fn issues_namespace_has_the_expected_mcp_only_tools() {
         5,
         "expected the five issues `.validate` dry-runs to be MCP-only: {mcp_only:?}",
     );
+    for read_tool in ["issues.list.execute", "issues.read.execute"] {
+        assert!(
+            mcp_only.iter().any(|t| t.as_str() == read_tool),
+            "expected {read_tool} among the MCP-only tools: {mcp_only:?}",
+        );
+    }
 }
