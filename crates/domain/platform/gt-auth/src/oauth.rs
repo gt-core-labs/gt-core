@@ -32,8 +32,10 @@
 //! - `GT_OIDC_SCOPES` (optional) — comma-separated scopes granted to a successful login.
 
 use std::sync::Arc;
+use std::time::Instant;
 
 use async_trait::async_trait;
+use jsonwebtoken::{decode, decode_header, Algorithm, DecodingKey, Validation};
 use serde::Deserialize;
 
 use crate::provider_repo::ProviderRepo;
@@ -131,6 +133,10 @@ fn req_env(name: &str) -> Result<String, AuthError> {
 pub struct OidcProvider {
     config: OidcConfig,
     http: reqwest::Client,
+    /// In-memory JWKS cache: the fetched remote keys + the instant they were fetched.
+    /// `std::sync::Mutex` so the guard is never held across `.await` (the fetch happens outside
+    /// the critical section).
+    jwks_cache: std::sync::Mutex<Option<(Instant, Vec<RemoteJwk>)>>,
 }
 
 /// The token endpoint's response — only the fields the userinfo read needs.
@@ -146,19 +152,55 @@ struct UserInfo {
     sub: String,
 }
 
+/// OIDC discovery document (`{issuer}/.well-known/openid-configuration`). Only the field we need.
+#[derive(Deserialize)]
+struct OidcDiscovery {
+    jwks_uri: String,
+}
+
+/// One JWK entry from the IdP's JWKS endpoint. Only the RSA `n`/`e` components and the `kid`
+/// selector — enough to build a `DecodingKey` for id_token signature verification.
+#[derive(Clone, Deserialize)]
+struct RemoteJwk {
+    #[serde(default)]
+    kid: Option<String>,
+    /// Base64url-encoded RSA modulus.
+    #[serde(default)]
+    n: Option<String>,
+    /// Base64url-encoded RSA public exponent.
+    #[serde(default)]
+    e: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct RemoteJwkSet {
+    keys: Vec<RemoteJwk>,
+}
+
+/// The minimal OIDC id_token claims we validate locally (`sub` + `iss`). The `aud`/`exp` checks
+/// are handled by [`jsonwebtoken::Validation`] without needing to name them in this struct.
+#[derive(Deserialize)]
+struct IdTokenClaims {
+    sub: String,
+    iss: String,
+}
+
+/// How long (seconds) a fetched JWKS is held in memory before re-fetching.
+const JWKS_TTL_SECS: u64 = 300; // 5 minutes
+
 impl OidcProvider {
     /// Build a provider over `config`, with a fresh reqwest client.
     pub fn new(config: OidcConfig) -> Result<Self, AuthError> {
         let http = reqwest::Client::builder()
             .build()
             .map_err(|e| AuthError::Backend(format!("oidc http client: {e}")))?;
-        Ok(Self { config, http })
+        Ok(Self { config, http, jwks_cache: std::sync::Mutex::new(None) })
     }
 
     /// Build a provider over `config` reusing an existing reqwest client (e.g. one the
     /// composition root already pools).
     pub fn with_client(config: OidcConfig, http: reqwest::Client) -> Self {
-        Self { config, http }
+        Self { config, http, jwks_cache: std::sync::Mutex::new(None) }
     }
 
     /// The configured issuer URL.
@@ -235,6 +277,116 @@ impl OidcProvider {
         Ok(info.sub)
     }
 
+    /// Return the cached JWKS keys, re-fetching via OIDC discovery if the cache is cold or stale.
+    /// The `std::sync::Mutex` guard is never held across an `.await` — the async fetch happens
+    /// outside the critical section.
+    async fn cached_jwks(&self) -> Result<Vec<RemoteJwk>, AuthError> {
+        // Fast path: cache hit within TTL.
+        {
+            let guard = self.jwks_cache.lock().unwrap();
+            if let Some((fetched_at, ref keys)) = *guard {
+                if fetched_at.elapsed().as_secs() < JWKS_TTL_SECS {
+                    return Ok(keys.clone());
+                }
+            }
+        }
+        // Slow path: fetch and populate cache.
+        let keys = self.fetch_remote_jwks().await?;
+        *self.jwks_cache.lock().unwrap() = Some((Instant::now(), keys.clone()));
+        Ok(keys)
+    }
+
+    /// Fetch the IdP's JWKS via OIDC discovery (two round-trips: discovery doc → JWKS endpoint).
+    async fn fetch_remote_jwks(&self) -> Result<Vec<RemoteJwk>, AuthError> {
+        let disc_url = format!(
+            "{}/.well-known/openid-configuration",
+            self.config.issuer.trim_end_matches('/')
+        );
+        let disc: OidcDiscovery = self
+            .http
+            .get(&disc_url)
+            .send()
+            .await
+            .map_err(|e| AuthError::Backend(format!("oidc discovery request: {e}")))?
+            .error_for_status()
+            .map_err(|e| AuthError::Backend(format!("oidc discovery status: {e}")))?
+            .json()
+            .await
+            .map_err(|e| AuthError::Backend(format!("oidc discovery decode: {e}")))?;
+
+        let jwks: RemoteJwkSet = self
+            .http
+            .get(&disc.jwks_uri)
+            .send()
+            .await
+            .map_err(|e| AuthError::Backend(format!("oidc jwks request: {e}")))?
+            .error_for_status()
+            .map_err(|e| AuthError::Backend(format!("oidc jwks status: {e}")))?
+            .json()
+            .await
+            .map_err(|e| AuthError::Backend(format!("oidc jwks decode: {e}")))?;
+        Ok(jwks.keys)
+    }
+
+    /// Validate an OIDC `id_token` JWT against the IdP's JWKS, checking:
+    /// - RS256 signature (using the matching key by `kid`, or the first RSA key as a fallback)
+    /// - `aud` contains [`OidcConfig::client_id`] (via [`jsonwebtoken::Validation`])
+    /// - `exp` is not in the past (via [`jsonwebtoken::Validation`])
+    /// - `iss` matches [`OidcConfig::issuer`] (validated after decode)
+    ///
+    /// Returns the token's `sub` claim on success. An invalid/expired/wrong-issuer token is
+    /// [`AuthError::InvalidCredentials`] (indistinguishable to callers — no enumeration).
+    async fn validate_id_token(&self, id_token: &str) -> Result<String, AuthError> {
+        let jwks = self.cached_jwks().await?;
+        let header = decode_header(id_token).map_err(|_| AuthError::InvalidCredentials)?;
+
+        // Select the JWK by kid. When the token carries a kid, pick the matching key; when it
+        // does not, fall back to the first key in the set (single-key IdPs omit kid).
+        let jwk = jwks
+            .iter()
+            .find(|k| match (&header.kid, &k.kid) {
+                (Some(h), Some(k)) => h == k,
+                (None, _) => true,
+                (Some(_), None) => false,
+            })
+            .or_else(|| jwks.first())
+            .ok_or(AuthError::InvalidCredentials)?;
+
+        let (n, e) = match (jwk.n.as_deref(), jwk.e.as_deref()) {
+            (Some(n), Some(e)) => (n, e),
+            _ => {
+                return Err(AuthError::Backend(
+                    "oidc jwks: missing RSA n/e components".into(),
+                ))
+            }
+        };
+        let dec_key = DecodingKey::from_rsa_components(n, e)
+            .map_err(|_| AuthError::InvalidCredentials)?;
+
+        let mut validation = Validation::new(Algorithm::RS256);
+        validation.set_audience(&[self.config.client_id.as_str()]);
+        // validate_exp = true (default) — expired tokens are rejected.
+        // validate_aud = true (set by set_audience) — aud must contain client_id.
+        // Clear required_spec_claims so jsonwebtoken doesn't insist on fields we validate ourselves.
+        validation.required_spec_claims.clear();
+
+        let data = decode::<IdTokenClaims>(id_token, &dec_key, &validation).map_err(|e| {
+            match e.kind() {
+                jsonwebtoken::errors::ErrorKind::ExpiredSignature => AuthError::Expired,
+                _ => AuthError::InvalidCredentials,
+            }
+        })?;
+
+        // Validate the issuer manually (trim trailing slash for tolerance).
+        let got_iss = data.claims.iss.trim_end_matches('/');
+        let want_iss = self.config.issuer.trim_end_matches('/');
+        if got_iss != want_iss {
+            return Err(AuthError::InvalidCredentials);
+        }
+
+        Ok(data.claims.sub)
+    }
+
     /// Map an upstream `sub` onto the [`VerifiedIdentity`] this login resolves to, scoped to the
     /// configured workspace + scopes — the SAME shape the password path yields.
     fn identity_for(&self, sub: String) -> VerifiedIdentity {
@@ -279,26 +431,30 @@ impl OidcProvider {
 #[async_trait]
 impl LoginProvider for OidcProvider {
     async fn login(&self, creds: &Credentials) -> Result<VerifiedIdentity, AuthError> {
-        let access_token = match creds {
-            // OAuth authorization-code grant: exchange the code, then read userinfo. The plain
-            // login port carries no PKCE verifier (the `/login` JSON path); the PKCE flow goes
-            // through `exchange_for_identity` below instead.
-            Credentials::OAuth { code, .. } => self.exchange_code(code, None).await?,
-            // OIDC: the issuer must match this provider; the id_token is the access token the
-            // userinfo endpoint accepts (the IdP minted both for this client).
+        match creds {
+            // OAuth authorization-code grant: exchange the code for an access token, then read
+            // userinfo. The plain login port carries no PKCE verifier (the `/login` JSON path);
+            // the PKCE flow goes through `exchange_for_identity` instead.
+            Credentials::OAuth { code, .. } => {
+                let access_token = self.exchange_code(code, None).await?;
+                let sub = self.userinfo(&access_token).await?;
+                Ok(self.identity_for(sub))
+            }
+            // OIDC id_token: validate the JWT locally against the IdP's JWKS (discovery +
+            // signature + aud + exp + iss). The `sub` is extracted from the validated token
+            // directly — no second userinfo round-trip needed for the identity.
             Credentials::Oidc { issuer, id_token } => {
                 if issuer != &self.config.issuer {
                     return Err(AuthError::InvalidCredentials);
                 }
-                id_token.clone()
+                let sub = self.validate_id_token(id_token).await?;
+                Ok(self.identity_for(sub))
             }
             // Email+password is the other provider's job.
             Credentials::EmailPassword { .. } => {
-                return Err(AuthError::UnsupportedProvider(creds.kind()))
+                Err(AuthError::UnsupportedProvider(creds.kind()))
             }
-        };
-        let sub = self.userinfo(&access_token).await?;
-        Ok(self.identity_for(sub))
+        }
     }
 }
 
@@ -471,15 +627,27 @@ mod tests {
     use std::net::SocketAddr;
     use std::sync::Arc;
 
+    // RSA test fixtures (same pair used by jwt.rs tests).
+    const TEST_PRIV_PEM: &[u8] = include_bytes!("../tests/fixtures/rs256_priv.pem");
+    const TEST_PUB_PEM: &[u8] = include_bytes!("../tests/fixtures/rs256_pub.pem");
+    const OTHER_PRIV_PEM: &[u8] = include_bytes!("../tests/fixtures/rs256_other_priv.pem");
+
     /// A throwaway in-process IdP: a token endpoint that swaps a known code for an access token,
-    /// and a userinfo endpoint that returns a `sub` for that bearer. Mirrors the two round-trips
-    /// the adapter makes — no external network.
+    /// a userinfo endpoint that returns a `sub` for that bearer, and (optionally) OIDC discovery
+    /// + JWKS endpoints for id_token validation tests.
+    ///
+    /// `base_url` is filled in by `spawn_idp` after the listener binds — callers leave it as
+    /// `Default::default()` when constructing and let `spawn_idp` patch it in.
     #[derive(Clone, Default)]
     struct MockIdp {
         /// `code -> access_token` the token endpoint will honour.
         codes: Arc<HashMap<String, String>>,
         /// `access_token -> sub` the userinfo endpoint will resolve.
         tokens: Arc<HashMap<String, String>>,
+        /// The server's own base URL; set by `spawn_idp`. Needed for the discovery document.
+        base_url: Arc<String>,
+        /// RSA public PEM bytes for the JWKS endpoint. `None` ⇒ `/jwks` returns empty keys.
+        pub_pem: Arc<Option<Vec<u8>>>,
     }
 
     async fn token_handler(
@@ -512,20 +680,46 @@ mod tests {
         }
     }
 
-    /// Spin up the mock IdP on an ephemeral port; returns its base URL and a guard task.
-    async fn spawn_idp(idp: MockIdp) -> String {
-        let app = Router::new()
-            .route("/token", post(token_handler))
-            .route("/userinfo", get(userinfo_handler))
-            .with_state(idp);
+    /// `GET /.well-known/openid-configuration` — points the JWKS URL at `/jwks`.
+    async fn discovery_handler(State(idp): State<MockIdp>) -> Json<serde_json::Value> {
+        Json(serde_json::json!({
+            "issuer": format!("{}/", idp.base_url.as_str()),
+            "jwks_uri": format!("{}/jwks", idp.base_url.as_str()),
+        }))
+    }
+
+    /// `GET /jwks` — returns the RSA public key as a JWK Set (or empty keys when none configured).
+    async fn jwks_handler(State(idp): State<MockIdp>) -> Json<serde_json::Value> {
+        match idp.pub_pem.as_ref().as_ref() {
+            Some(pem) => {
+                let jwk_set = crate::JwtAuthenticator::from_rsa_pem(pem)
+                    .expect("test pub PEM must be valid")
+                    .jwk_set();
+                Json(serde_json::to_value(jwk_set).unwrap())
+            }
+            None => Json(serde_json::json!({"keys": []})),
+        }
+    }
+
+    /// Spin up the mock IdP on an ephemeral port; returns its base URL.
+    /// Fills in `idp.base_url` after binding so discovery/JWKS handlers know their own origin.
+    async fn spawn_idp(mut idp: MockIdp) -> String {
         let listener = tokio::net::TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0)))
             .await
             .unwrap();
         let addr = listener.local_addr().unwrap();
+        let base = format!("http://{addr}");
+        idp.base_url = Arc::new(base.clone());
+        let app = Router::new()
+            .route("/token", post(token_handler))
+            .route("/userinfo", get(userinfo_handler))
+            .route("/.well-known/openid-configuration", get(discovery_handler))
+            .route("/jwks", get(jwks_handler))
+            .with_state(idp);
         tokio::spawn(async move {
             axum::serve(listener, app).await.unwrap();
         });
-        format!("http://{addr}")
+        base
     }
 
     fn config_for(base: &str) -> OidcConfig {
@@ -568,26 +762,67 @@ mod tests {
         );
     }
 
+    /// Mint a short-lived RS256 id_token for the given `issuer` and `client_id`.
+    fn mint_id_token(priv_pem: &[u8], issuer: &str, client_id: &str, sub: &str) -> String {
+        use jsonwebtoken::{encode, Algorithm, EncodingKey, Header};
+        #[derive(serde::Serialize)]
+        struct Claims<'a> {
+            sub: &'a str,
+            iss: &'a str,
+            aud: &'a str,
+            exp: u64,
+            iat: u64,
+        }
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let claims = Claims { sub, iss: issuer, aud: client_id, exp: now + 3600, iat: now };
+        let key = EncodingKey::from_rsa_pem(priv_pem).expect("test private key");
+        encode(&Header::new(Algorithm::RS256), &claims, &key).expect("mint id_token")
+    }
+
     #[tokio::test]
-    async fn oidc_id_token_reads_userinfo_for_the_matching_issuer() {
+    async fn oidc_id_token_validates_signature_and_resolves_identity() {
+        // Serve a JWKS endpoint with the test public key so the provider can validate id_tokens.
         let idp = MockIdp {
-            codes: Arc::new(HashMap::new()),
-            tokens: Arc::new(HashMap::from([("id-tok".into(), "bob-sub".into())])),
+            pub_pem: Arc::new(Some(TEST_PUB_PEM.to_vec())),
+            ..Default::default()
         };
         let base = spawn_idp(idp).await;
         let config = config_for(&base);
         let issuer = config.issuer.clone();
+        let client_id = config.client_id.clone();
         let provider = OidcProvider::new(config).unwrap();
 
+        let id_token = mint_id_token(TEST_PRIV_PEM, &issuer, &client_id, "bob-sub");
         let identity = provider
-            .login(&Credentials::Oidc {
-                issuer,
-                id_token: "id-tok".into(),
-            })
+            .login(&Credentials::Oidc { issuer, id_token })
             .await
             .unwrap();
+
         assert_eq!(identity.sub, "bob-sub");
         assert_eq!(identity.workspace, "acme");
+    }
+
+    #[tokio::test]
+    async fn oidc_id_token_rejects_a_wrong_key_signature() {
+        let idp = MockIdp {
+            pub_pem: Arc::new(Some(TEST_PUB_PEM.to_vec())),
+            ..Default::default()
+        };
+        let base = spawn_idp(idp).await;
+        let config = config_for(&base);
+        let issuer = config.issuer.clone();
+        let client_id = config.client_id.clone();
+        let provider = OidcProvider::new(config).unwrap();
+
+        // Sign with the OTHER private key — JWKS has the TEST public key → signature mismatch.
+        let id_token = mint_id_token(OTHER_PRIV_PEM, &issuer, &client_id, "mallory");
+        let err = provider
+            .login(&Credentials::Oidc { issuer, id_token })
+            .await;
+        assert_eq!(err, Err(AuthError::InvalidCredentials));
     }
 
     #[tokio::test]
