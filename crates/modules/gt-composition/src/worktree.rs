@@ -179,6 +179,9 @@ pub fn seed_mcp_config(base_repo: &Path, worktree: &Path) {
 /// settings are trusted, so their hooks run headlessly. Clobber-safe: only writes when the file is
 /// absent or already gt-managed (carries the marker), never over a human's settings.
 pub fn seed_user_hooks(config_dir: &Path) {
+    // The dir may not exist yet when seeding a host-default `$HOME/.claude`
+    // (hq-polecat-provisioning-20260608.2); create it so the write below lands. Best-effort.
+    let _ = std::fs::create_dir_all(config_dir);
     let target = config_dir.join("settings.json");
     // Merge (don't clobber): claude writes its own keys here (e.g. skipDangerousModePermissionPrompt),
     // so overlay our managed keys (marker + onboarding + bypass + the reporting hooks) onto whatever
@@ -219,6 +222,9 @@ pub fn seed_user_hooks(config_dir: &Path) {
 /// keys like the oauth creds); an existing `theme` is preserved. Best-effort: any IO/parse failure
 /// logs and the polecat still slings (it just shows the TUI again).
 pub fn seed_claude_onboarding(config_dir: &Path, worktree: &Path) {
+    // The dir may not exist yet when seeding a host-default `$HOME/.claude`
+    // (hq-polecat-provisioning-20260608.2); create it so the write below lands. Best-effort.
+    let _ = std::fs::create_dir_all(config_dir);
     let path = config_dir.join(".claude.json");
     let mut root = std::fs::read_to_string(&path)
         .ok()
@@ -365,6 +371,28 @@ mod tests {
         .unwrap();
         assert_eq!(v["hasCompletedOnboarding"], serde_json::json!(true));
         assert_eq!(v["theme"], serde_json::json!("dark")); // default when none
+    }
+
+    #[test]
+    fn seed_creates_the_config_dir_when_it_does_not_exist() {
+        // hq-polecat-provisioning-20260608.2: seeding a host-default `$HOME/.claude` that was never
+        // created must still land — both seeders create the dir first.
+        let base = tempfile::tempdir().unwrap();
+        let cfg = base.path().join("nonexistent").join(".claude");
+        assert!(!cfg.exists());
+        seed_claude_onboarding(&cfg, &PathBuf::from("/wt/a"));
+        seed_user_hooks(&cfg);
+        let onboarding: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(cfg.join(".claude.json")).unwrap())
+                .unwrap();
+        assert_eq!(
+            onboarding["bypassPermissionsModeAccepted"],
+            serde_json::json!(true)
+        );
+        let settings: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(cfg.join("settings.json")).unwrap())
+                .unwrap();
+        assert_eq!(settings["enabledMcpjsonServers"], serde_json::json!(["gt"]));
     }
 
     #[test]

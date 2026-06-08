@@ -343,8 +343,21 @@ impl Plugin for PolecatSupervisorPlugin {
                 // trust-folder / bypass-accept prompts and never works the bead. We need interactive
                 // (not --print) so the heartbeat + Stop→merge-ready hooks fire. Marks onboarding +
                 // bypass-mode accepted globally and trusts THIS worktree path. Best-effort.
-                if let Some(cd) = &active_config_dir {
-                    let cd = std::path::Path::new(cd);
+                // Seed the EFFECTIVE config dir, not only a keychain-resolved one
+                // (hq-polecat-provisioning-20260608.2): the seed used to run only when the keychain
+                // handed back an account's CLAUDE_CONFIG_DIR, so a polecat slung WITHOUT a resolved
+                // account (no keychain, or the active pointer not rehydrated after a daemon restart)
+                // fell back to claude's default `$HOME/.claude` — which never got the onboarding /
+                // bypass-accept flags, and the interactive claude stalled on the first-run dialogs
+                // again. Resolve the dir claude will actually read (the stamped CLAUDE_CONFIG_DIR, or
+                // `$HOME/.claude` when none) and seed THAT. Best-effort.
+                let effective_config_dir: Option<std::path::PathBuf> = active_config_dir
+                    .as_ref()
+                    .map(std::path::PathBuf::from)
+                    .or_else(|| {
+                        std::env::var_os("HOME").map(|h| std::path::Path::new(&h).join(".claude"))
+                    });
+                if let Some(cd) = &effective_config_dir {
                     crate::worktree::seed_claude_onboarding(cd, &spec.workdir);
                     crate::worktree::seed_user_hooks(cd);
                 }
