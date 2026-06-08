@@ -146,10 +146,13 @@ struct TokenResponse {
 }
 
 /// The userinfo endpoint's response — the OIDC standard `sub` plus the optional `email`/`name`.
-/// `sub` is the stable principal id we carry onto [`VerifiedIdentity::sub`].
+/// `sub` is the stable principal id; `email`/`name` flow into [`VerifiedIdentity::email`] for JIT
+/// user provisioning on first OAuth/OIDC login.
 #[derive(Deserialize)]
 struct UserInfo {
     sub: String,
+    #[serde(default)]
+    email: Option<String>,
 }
 
 /// OIDC discovery document (`{issuer}/.well-known/openid-configuration`). Only the field we need.
@@ -252,8 +255,8 @@ impl OidcProvider {
         Ok(token.access_token)
     }
 
-    /// Read the userinfo endpoint with `access_token`, returning the principal's `sub`.
-    async fn userinfo(&self, access_token: &str) -> Result<String, AuthError> {
+    /// Read the userinfo endpoint with `access_token`, returning the principal profile.
+    async fn userinfo(&self, access_token: &str) -> Result<UserInfo, AuthError> {
         let resp = self
             .http
             .get(&self.config.userinfo_endpoint)
@@ -274,7 +277,7 @@ impl OidcProvider {
         if info.sub.trim().is_empty() {
             return Err(AuthError::InvalidCredentials);
         }
-        Ok(info.sub)
+        Ok(info)
     }
 
     /// Return the cached JWKS keys, re-fetching via OIDC discovery if the cache is cold or stale.
@@ -387,13 +390,15 @@ impl OidcProvider {
         Ok(data.claims.sub)
     }
 
-    /// Map an upstream `sub` onto the [`VerifiedIdentity`] this login resolves to, scoped to the
-    /// configured workspace + scopes — the SAME shape the password path yields.
-    fn identity_for(&self, sub: String) -> VerifiedIdentity {
+    /// Map an upstream `sub` (+ optional `email`) onto the [`VerifiedIdentity`] this login
+    /// resolves to, scoped to the configured workspace + scopes — the SAME shape the password
+    /// path yields. `email` is forwarded for JIT user provisioning on first SSO login.
+    fn identity_for(&self, sub: String, email: Option<String>) -> VerifiedIdentity {
         VerifiedIdentity {
             sub,
             workspace: self.config.workspace.clone(),
             scopes: self.config.scopes.clone(),
+            email,
         }
     }
 
@@ -408,8 +413,8 @@ impl OidcProvider {
         code_verifier: Option<&str>,
     ) -> Result<VerifiedIdentity, AuthError> {
         let access_token = self.exchange_code(code, code_verifier).await?;
-        let sub = self.userinfo(&access_token).await?;
-        Ok(self.identity_for(sub))
+        let info = self.userinfo(&access_token).await?;
+        Ok(self.identity_for(info.sub, info.email))
     }
 
     /// The configured client id (sent on the authorize URL).
@@ -433,12 +438,13 @@ impl LoginProvider for OidcProvider {
     async fn login(&self, creds: &Credentials) -> Result<VerifiedIdentity, AuthError> {
         match creds {
             // OAuth authorization-code grant: exchange the code for an access token, then read
-            // userinfo. The plain login port carries no PKCE verifier (the `/login` JSON path);
-            // the PKCE flow goes through `exchange_for_identity` instead.
+            // userinfo (carrying email for JIT provisioning). The plain login port carries no
+            // PKCE verifier (the `/login` JSON path); the PKCE flow goes through
+            // `exchange_for_identity` instead.
             Credentials::OAuth { code, .. } => {
                 let access_token = self.exchange_code(code, None).await?;
-                let sub = self.userinfo(&access_token).await?;
-                Ok(self.identity_for(sub))
+                let info = self.userinfo(&access_token).await?;
+                Ok(self.identity_for(info.sub, info.email))
             }
             // OIDC id_token: validate the JWT locally against the IdP's JWKS (discovery +
             // signature + aud + exp + iss). The `sub` is extracted from the validated token
@@ -448,7 +454,7 @@ impl LoginProvider for OidcProvider {
                     return Err(AuthError::InvalidCredentials);
                 }
                 let sub = self.validate_id_token(id_token).await?;
-                Ok(self.identity_for(sub))
+                Ok(self.identity_for(sub, None))
             }
             // Email+password is the other provider's job.
             Credentials::EmailPassword { .. } => {
@@ -746,6 +752,7 @@ mod tests {
         let idp = MockIdp {
             codes: Arc::new(HashMap::from([("good-code".into(), "tok-123".into())])),
             tokens: Arc::new(HashMap::from([("tok-123".into(), "alice-sub".into())])),
+            ..Default::default()
         };
         let base = spawn_idp(idp).await;
         let provider = OidcProvider::new(config_for(&base)).unwrap();
@@ -758,14 +765,11 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(
-            identity,
-            VerifiedIdentity {
-                sub: "alice-sub".into(),
-                workspace: "acme".into(),
-                scopes: vec!["rig.read".into()],
-            }
-        );
+        assert_eq!(identity.sub, "alice-sub");
+        assert_eq!(identity.workspace, "acme");
+        assert_eq!(identity.scopes, vec!["rig.read".to_string()]);
+        // The mock userinfo endpoint returns `email: u@idp.test` — threaded through.
+        assert_eq!(identity.email.as_deref(), Some("u@idp.test"));
     }
 
     /// Mint a short-lived RS256 id_token for the given `issuer` and `client_id`.
@@ -953,6 +957,7 @@ mod tests {
         let idp = MockIdp {
             codes: Arc::new(HashMap::from([("good-code".into(), "tok-1".into())])),
             tokens: Arc::new(HashMap::from([("tok-1".into(), "carol-sub".into())])),
+            ..Default::default()
         };
         let base = spawn_idp(idp).await;
         let mut repo = MapRepo::default();
@@ -966,14 +971,9 @@ mod tests {
             .await
             .unwrap();
         // Same VerifiedIdentity shape the password path yields, scoped to the resolver's workspace.
-        assert_eq!(
-            identity,
-            VerifiedIdentity {
-                sub: "carol-sub".into(),
-                workspace: "acme".into(),
-                scopes: vec!["rig.read".into()],
-            }
-        );
+        assert_eq!(identity.sub, "carol-sub");
+        assert_eq!(identity.workspace, "acme");
+        assert_eq!(identity.scopes, vec!["rig.read".to_string()]);
     }
 
     #[tokio::test]

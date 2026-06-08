@@ -104,6 +104,7 @@ mod tests {
             sub: "alice".into(),
             workspace: "acme".into(),
             scopes: vec!["rig.read".into()],
+            email: None,
         }
     }
 

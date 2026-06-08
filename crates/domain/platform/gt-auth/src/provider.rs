@@ -103,6 +103,10 @@ pub struct VerifiedIdentity {
     pub workspace: String,
     /// Authorization scopes granted to the principal.
     pub scopes: Vec<String>,
+    /// Email address returned by the IdP (OAuth/OIDC userinfo or id_token claim). `None` for
+    /// email+password logins (the email is already in the users table) and for paths that do not
+    /// request an `email` scope. Used by JIT provisioning to populate the SSO user row on first login.
+    pub email: Option<String>,
 }
 
 impl VerifiedIdentity {
@@ -189,6 +193,7 @@ mod tests {
             sub: "alice".into(),
             workspace: "acme".into(),
             scopes: vec!["rig.read".into()],
+            email: None,
         }
     }
 

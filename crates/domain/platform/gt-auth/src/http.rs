@@ -512,6 +512,27 @@ pub trait OauthAuthzFlow: Send + Sync {
     ) -> Result<VerifiedIdentity, AuthError>;
 }
 
+/// JIT (Just-In-Time) SSO user provisioner (hq-epic.auth-refactor.4).
+///
+/// Called after a successful OAuth/OIDC `code` exchange, before the token pair is issued.
+/// Implementations should create the user row on first login and attach them to the workspace
+/// derived from the provider — a no-op on subsequent logins (idempotent upsert). Available only
+/// with the `oauth` feature since it is only exercised by the OAuth redirect flow.
+#[cfg(feature = "oauth")]
+#[async_trait]
+pub trait SsoProvisioner: Send + Sync {
+    /// Ensure `sub` (IdP subject) exists in `workspace`, using `email` to seed the display
+    /// address on first login. Idempotent — calling it twice for the same `(sub, workspace)` is
+    /// safe and cheap. `now` is seconds-since-epoch (for TTL / audit columns).
+    async fn provision(
+        &self,
+        sub: &str,
+        email: Option<&str>,
+        workspace: &str,
+        now: u64,
+    ) -> Result<(), AuthError>;
+}
+
 /// The production [`OauthAuthzFlow`]: the DB-backed resolver builds the authorize URL + runs the
 /// PKCE exchange against the provider selected by `provider_id`. Available with the `oauth` feature.
 #[cfg(feature = "oauth")]
@@ -644,6 +665,13 @@ pub struct AuthState {
     /// a non-browser client / test). From `GT_OAUTH_FE_REDIRECT_URL`.
     #[cfg(feature = "oauth")]
     pub fe_redirect_url: Option<String>,
+    /// JIT SSO user provisioner (hq-epic.auth-refactor.4): called after a successful OAuth code
+    /// exchange to ensure the IdP subject is provisioned as a local user in the target workspace.
+    /// `None` ⇒ no JIT provisioning (SSO users must be pre-created). The production adapter is
+    /// [`PgUsers`](crate::PgUsers). Present only with the `oauth` feature (only the redirect
+    /// callback ever calls it).
+    #[cfg(feature = "oauth")]
+    pub sso_provisioner: Option<Arc<dyn SsoProvisioner>>,
     /// The verifier's public JWKS, served at `GET /auth/jwks` so clients verify access tokens
     /// offline. Built from the verifier's public keys at the composition root
     /// ([`JwtAuthenticator::jwk_set`](crate::JwtAuthenticator::jwk_set)) — never the signing
@@ -1429,6 +1457,7 @@ async fn switch(
                 sub: claims.sub.clone(),
                 workspace: body.workspace.clone(),
                 scopes: claims.scopes.clone(),
+                email: None,
             }
         }
         None => return Err(ApiError::Forbidden),
@@ -2160,6 +2189,18 @@ async fn callback(
     let identity = flow
         .exchange(&pending.provider_id, &params.code, &pending.code_verifier)
         .await?;
+    // JIT provisioning (hq-epic.auth-refactor.4): ensure the IdP subject exists as a local user
+    // in the target workspace before we mint tokens. Idempotent — no-op on subsequent logins.
+    if let Some(ref prov) = state.sso_provisioner {
+        prov.provision(
+            &identity.sub,
+            identity.email.as_deref(),
+            &identity.workspace,
+            (state.now)(),
+        )
+        .await
+        .map_err(ApiError::Auth)?;
+    }
     let tokens = issue_tokens(&state, identity.sub, identity.workspace, identity.scopes).await?;
 
     // CLI hand-off (hq-gt-login-oauth.2/.6): a `gt login` handshake carried a `cli_redirect`. The
@@ -2429,6 +2470,7 @@ async fn issue_tokens(
         sub: sub.clone(),
         workspace: workspace.clone(),
         scopes: scopes.clone(),
+        email: None,
     };
     let claims = identity.into_claims(now + state.access_ttl, now);
     let access_token = state.minter.mint(&claims)?;
@@ -2719,6 +2761,7 @@ mod tests {
                         sub: "alice".into(),
                         workspace: "acme".into(),
                         scopes: vec!["rig.read".into()],
+                        email: None,
                     })
                 }
                 _ => Err(AuthError::InvalidCredentials),
@@ -3241,6 +3284,8 @@ mod tests {
             cli_code: None,
             #[cfg(feature = "oauth")]
             fe_redirect_url: None,
+            #[cfg(feature = "oauth")]
+            sso_provisioner: None,
             // Publish the public half of the same "k1" key the minter signs with.
             jwks: Arc::new(
                 JwtAuthenticator::from_kid_pems([("k1", PUB_PEM)])
@@ -3686,6 +3731,7 @@ mod tests {
                     sub: sub.to_string(),
                     workspace: w.clone(),
                     scopes: scopes.clone(),
+                    email: None,
                 }))
         }
     }

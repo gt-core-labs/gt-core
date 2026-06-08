@@ -194,6 +194,11 @@ pub mod migrations {
     /// non-NULL = scoped to one workspace (enterprise SSO — each org owns its IdP).
     pub const ADD_PROVIDER_WORKSPACE: &str =
         include_str!("../migrations/auth/0011__add_provider_workspace.sql");
+    /// `0012` — make `public.users.password_hash` nullable (hq-epic.auth-refactor.4): SSO users
+    /// are provisioned by `PgUsers::find_or_create_sso_user` with no password; existing
+    /// email+password rows keep their non-NULL hash unchanged.
+    pub const SSO_USER_PASSWORD_NULLABLE: &str =
+        include_str!("../migrations/auth/0012__sso_user_password_nullable.sql");
 }
 
 #[cfg(feature = "jsonwebtoken")]

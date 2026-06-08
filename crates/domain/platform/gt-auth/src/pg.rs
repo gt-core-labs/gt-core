@@ -275,9 +275,13 @@ impl PgUsers {
         let sub: String = row
             .try_get("id")
             .map_err(|e| AuthError::Backend(format!("global users postgres: {e}")))?;
-        let hash: String = row
+        let hash: Option<String> = row
             .try_get("password_hash")
             .map_err(|e| AuthError::Backend(format!("global users postgres: {e}")))?;
+        // SSO-only users have NULL password_hash — they cannot log in with a password.
+        let Some(hash) = hash else {
+            return Err(AuthError::InvalidCredentials);
+        };
         verify_password(password, &hash)?;
 
         let memberships = self.memberships(&sub).await?;
@@ -292,6 +296,7 @@ impl PgUsers {
             sub,
             workspace: active.workspace.clone(),
             scopes,
+            email: None,
         })
     }
 
@@ -350,6 +355,7 @@ impl PgUsers {
             sub: sub.to_string(),
             workspace: workspace.to_string(),
             scopes,
+            email: None,
         }))
     }
 
@@ -453,6 +459,60 @@ impl PgUsers {
 
         Ok(deleted)
     }
+
+    /// JIT (just-in-time) user provisioning for SSO logins (hq-epic.auth-refactor.4): ensure a
+    /// global identity row + workspace membership exist for an OAuth/OIDC principal before minting
+    /// their first token. Idempotent — re-calling on subsequent logins is a no-op.
+    ///
+    /// Two writes, both `ON CONFLICT DO NOTHING`:
+    /// 1. `public.users (id, email, password_hash = NULL)` — the SSO stub, no password.
+    /// 2. `public.user_workspaces (user_id, workspace_slug, role = '')` — a placeless membership
+    ///    (no role-granted scopes by default; an admin can promote the user later).
+    ///
+    /// `email` is taken from the IdP's userinfo; a fallback `{sub}@sso` is used when the IdP
+    /// omits the claim so the `NOT NULL UNIQUE` constraint is still satisfied. The `email` value
+    /// of an EXISTING row is NOT overwritten — `ON CONFLICT … DO NOTHING` leaves it untouched.
+    ///
+    /// Migration `0012` must have run first (makes `public.users.password_hash` nullable).
+    pub async fn find_or_create_sso_user(
+        &self,
+        sub: &str,
+        email: Option<&str>,
+        workspace: &str,
+        now: u64,
+    ) -> Result<(), AuthError> {
+        let resolved_email = email
+            .filter(|e| !e.trim().is_empty())
+            .map(str::to_owned)
+            .unwrap_or_else(|| format!("{sub}@sso"));
+        // Upsert the global identity row. ON CONFLICT on `id` (PK) — re-login is a no-op.
+        // A second conflict path on `email` (UNIQUE) can arise if the same SSO account was
+        // previously registered with a password; we DO NOTHING to avoid clobbering the hash.
+        sqlx::query(
+            "INSERT INTO public.users (id, email, password_hash, created_at, updated_at) \
+             VALUES ($1, $2, NULL, $3, $3) \
+             ON CONFLICT DO NOTHING",
+        )
+        .bind(sub)
+        .bind(&resolved_email)
+        .bind(now as i64)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| AuthError::Backend(format!("sso user upsert: {e}")))?;
+        // Ensure a workspace membership exists (no role — admin can promote later).
+        sqlx::query(
+            "INSERT INTO public.user_workspaces (user_id, workspace_slug, role, created_at) \
+             VALUES ($1, $2, '', $3) \
+             ON CONFLICT (user_id, workspace_slug) DO NOTHING",
+        )
+        .bind(sub)
+        .bind(workspace)
+        .bind(now as i64)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| AuthError::Backend(format!("sso membership upsert: {e}")))?;
+        Ok(())
+    }
 }
 
 /// Build a [`Membership`] from a `public.user_workspaces` row. A column-read fault is an
@@ -543,6 +603,7 @@ fn row_to_identity(row: &PgRow, workspace: &str) -> Result<VerifiedIdentity, Aut
         sub,
         workspace: workspace.to_string(),
         scopes,
+        email: None,
     })
 }
 
@@ -598,6 +659,23 @@ impl crate::http::UserStore for PgUsers {
                 })
             })
             .collect()
+    }
+}
+
+/// JIT SSO user provisioner (hq-epic.auth-refactor.4): wraps [`PgUsers::find_or_create_sso_user`]
+/// behind the [`SsoProvisioner`](crate::http::SsoProvisioner) port so the OAuth callback can call
+/// it without knowing about the `PgUsers` type.
+#[cfg(all(feature = "axum", feature = "oauth"))]
+#[async_trait::async_trait]
+impl crate::http::SsoProvisioner for PgUsers {
+    async fn provision(
+        &self,
+        sub: &str,
+        email: Option<&str>,
+        workspace: &str,
+        now: u64,
+    ) -> Result<(), AuthError> {
+        self.find_or_create_sso_user(sub, email, workspace, now).await
     }
 }
 
@@ -960,6 +1038,7 @@ mod tests {
                 // Stamped from the server-injected slug, NOT from the row (which has none).
                 workspace: "acme".into(),
                 scopes: vec!["rig.read".into()],
+                email: None,
             }
         );
     }
@@ -1463,5 +1542,77 @@ mod tests {
             })
             .await;
         assert_eq!(denied, Err(AuthError::InvalidCredentials));
+    }
+
+    // --- JIT provisioning contract test (hq-epic.auth-refactor.4) ---
+
+    #[tokio::test]
+    async fn find_or_create_sso_user_provisions_and_is_idempotent() {
+        let Some(pool) = pool_or_skip().await else {
+            eprintln!("GT_PG_URL unset; skipping JIT-provisioning contract test");
+            return;
+        };
+        ensure_users_table(&pool).await;
+        // Ensure the workspace membership bridge exists so the FK is satisfied.
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS public.user_workspaces ( \
+               user_id TEXT NOT NULL, \
+               workspace_slug TEXT NOT NULL, \
+               role TEXT NOT NULL DEFAULT '', \
+               created_at BIGINT NOT NULL, \
+               PRIMARY KEY (user_id, workspace_slug) \
+             )",
+        )
+        .execute(&pool)
+        .await
+        .expect("ensure user_workspaces table");
+
+        let users = PgUsers::new(pool.clone(), "sso-ws");
+
+        // First call: provisions a new SSO user row + membership.
+        users
+            .find_or_create_sso_user("sso-sub-1", Some("sso@idp.test"), "sso-ws", 1_000_000)
+            .await
+            .expect("first provision succeeds");
+
+        let email: String =
+            sqlx::query_scalar("SELECT email FROM public.users WHERE id = 'sso-sub-1'")
+                .fetch_one(&pool)
+                .await
+                .expect("user row exists after provision");
+        assert_eq!(email, "sso@idp.test");
+
+        let ws_count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM public.user_workspaces WHERE user_id = 'sso-sub-1' AND workspace_slug = 'sso-ws'")
+                .fetch_one(&pool)
+                .await
+                .expect("membership row query");
+        assert_eq!(ws_count, 1, "exactly one membership row");
+
+        // Second call (re-login): idempotent — no error, no duplicate rows.
+        users
+            .find_or_create_sso_user("sso-sub-1", Some("sso@idp.test"), "sso-ws", 1_000_001)
+            .await
+            .expect("second provision is a no-op");
+
+        let ws_count_after: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM public.user_workspaces WHERE user_id = 'sso-sub-1' AND workspace_slug = 'sso-ws'")
+                .fetch_one(&pool)
+                .await
+                .expect("membership row query after re-login");
+        assert_eq!(ws_count_after, 1, "still exactly one membership row");
+
+        // Fallback email: IdP omits the claim → synthetic `{sub}@sso` address is used.
+        users
+            .find_or_create_sso_user("sso-sub-no-email", None, "sso-ws", 1_000_002)
+            .await
+            .expect("provision with no email falls back to synthetic address");
+
+        let fallback_email: String =
+            sqlx::query_scalar("SELECT email FROM public.users WHERE id = 'sso-sub-no-email'")
+                .fetch_one(&pool)
+                .await
+                .expect("user row with synthetic email exists");
+        assert_eq!(fallback_email, "sso-sub-no-email@sso");
     }
 }
