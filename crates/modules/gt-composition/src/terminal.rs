@@ -879,6 +879,29 @@ fn build_command(target: &TerminalTarget) -> CommandBuilder {
     }
 }
 
+/// Capture the recent scrollback of a tmux session so a reconnecting browser can restore its
+/// visual state without interrupting the running process (`hq-terminal-persist.1`).
+///
+/// Runs `tmux -L <server> capture-pane -p -t <session> -S -<lines>` as a subprocess (not via
+/// PTY — this is a one-shot read). Returns raw bytes on success; empty vec if tmux is not
+/// running, the session does not exist, or the command fails — a missing scrollback is non-fatal.
+fn capture_tmux_scrollback(server: &str, session: &str, lines: u32) -> Vec<u8> {
+    std::process::Command::new("tmux")
+        .args([
+            "-L",
+            server,
+            "capture-pane",
+            "-p",
+            "-t",
+            session,
+            "-S",
+            &format!("-{lines}"),
+        ])
+        .output()
+        .map(|o| if o.status.success() { o.stdout } else { vec![] })
+        .unwrap_or_default()
+}
+
 /// Bridge an upgraded socket to a pty until either side closes. The pty runs a fresh `/bin/sh`
 /// ([`TerminalTarget::Shell`]) or a `tmux attach` to a running agent's session
 /// ([`TerminalTarget::Attach`], `hq-agent-observability.5`).
@@ -888,6 +911,25 @@ fn build_command(target: &TerminalTarget) -> CommandBuilder {
 /// frames into the pty writer. On socket close, pty EOF, or any I/O error the child is killed
 /// and every handle dropped.
 async fn run_pty(mut socket: WebSocket, target: TerminalTarget) {
+    // For tmux sessions, send the scrollback buffer before the live bridge starts so a
+    // reconnecting xterm.js restores its visual state without interrupting the process
+    // (hq-terminal-persist.1). Captured in a spawn_blocking to avoid stalling the executor.
+    if let TerminalTarget::Attach {
+        workspace, session, ..
+    } = &target
+    {
+        let server = tmux_server_name(workspace);
+        let sess = session.clone();
+        let scrollback = tokio::task::spawn_blocking(move || {
+            capture_tmux_scrollback(&server, &sess, 500)
+        })
+        .await
+        .unwrap_or_default();
+        if !scrollback.is_empty() {
+            let _ = socket.send(Message::Binary(scrollback)).await;
+        }
+    }
+
     let pair = match native_pty_system().openpty(PtySize {
         rows: 24,
         cols: 80,
@@ -1296,6 +1338,27 @@ mod tests {
         assert!(argv[..claude_at]
             .iter()
             .any(|a| a == "GT_CHANNEL_ROOT=/var/lib/gt-core/.channels"));
+    }
+
+    #[test]
+    fn capture_tmux_scrollback_returns_empty_for_nonexistent_server() {
+        // hq-terminal-persist.1: a server name that can never exist → tmux exits non-zero → empty
+        // vec, not a panic. The live bridge must not be blocked by a missing scrollback.
+        let result =
+            capture_tmux_scrollback("gt-no-such-server-ever-unit-test", "ghost-session", 100);
+        assert!(
+            result.is_empty(),
+            "non-existent tmux server must yield empty scrollback, got {} bytes",
+            result.len()
+        );
+    }
+
+    #[test]
+    fn capture_tmux_scrollback_returns_empty_for_zero_lines() {
+        // Edge case: zero lines requested — tmux returns nothing (or exits cleanly with empty
+        // output); either way the caller gets an empty vec.
+        let result = capture_tmux_scrollback("gt-no-such-server-ever-unit-test", "s", 0);
+        assert!(result.is_empty());
     }
 
     #[test]
