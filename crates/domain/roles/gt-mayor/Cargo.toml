@@ -16,3 +16,7 @@ schemars.workspace = true
 # is the upstream event-replay store ported up (hq-core-port.8; was `gt-audit`).
 gt-eventlog = { workspace = true }
 ulid.workspace = true
+# Convoy smoke gate (hq-mayor-platform-report-20260608.1): verify convoy.launch dispatch
+# path from the mayor role. The mayor spawns the convoy actor and exercises the
+# convoy.launch → convoy.info read-back path.
+gt-orchestration = { workspace = true }
