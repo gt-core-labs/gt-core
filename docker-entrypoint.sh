@@ -30,4 +30,17 @@ if [ "${GT_SKIP_UPDATE:-0}" != "1" ]; then
     rm -rf "$tmp"
 fi
 
+# Claude binary: mounted from the host at /home/nixos/.local/bin/claude but the container runs as
+# root ($HOME=/root), so claude's own /doctor and self-checks look in /root/.local/bin and report
+# "missing". Symlink it so $HOME-relative lookups find the same binary.
+if [ -f /home/nixos/.local/bin/claude ]; then
+    mkdir -p /root/.local/bin /root/.local/share
+    ln -sf /home/nixos/.local/bin/claude /root/.local/bin/claude
+    # claude stores config/plugins under .local/share/claude — share the same dir.
+    if [ -d /home/nixos/.local/share/claude ] && [ ! -e /root/.local/share/claude ]; then
+        ln -sf /home/nixos/.local/share/claude /root/.local/share/claude
+    fi
+    echo "[entrypoint] claude symlinked: /root/.local/bin/claude → /home/nixos/.local/bin/claude"
+fi
+
 exec "$@"
