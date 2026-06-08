@@ -124,6 +124,12 @@ pub struct PolecatSupervisorPlugin {
     /// a freshly-provisioned worktree is `chown`ed to it so the dropped-privilege polecat can use
     /// the (otherwise root-owned) tree. `None` ⇒ the polecat runs as the daemon's uid (legacy).
     run_as: Option<String>,
+    /// Base URL of the gt MCP server (`hq-polecat-rig-config.1`, `GT_SELF_URL`). When set, each
+    /// sling writes a fresh `.mcp.json` into the worktree using the per-session token — so the
+    /// agent's MCP auth survives rig changes and token rotation without the operator re-placing a
+    /// static file. `None` ⇒ falls back to copying the operator-placed `.mcp.json` from the base
+    /// checkout (legacy behaviour, the token in that file may be expired or rig-specific).
+    server_url: Option<String>,
 }
 
 impl PolecatSupervisorPlugin {
@@ -149,7 +155,17 @@ impl PolecatSupervisorPlugin {
             keychain: None,
             worktree_root: None,
             run_as: None,
+            server_url: None,
         }
+    }
+
+    /// Wire the daemon's base URL so each sling gets a fresh per-session `.mcp.json`
+    /// (`hq-polecat-rig-config.1`). Without it the plugin falls back to copying the
+    /// operator-placed static file from the base rig checkout.
+    pub fn with_server_url(mut self, url: impl Into<String>) -> Self {
+        let url = url.into();
+        self.server_url = if url.is_empty() { None } else { Some(url) };
+        self
     }
 
     /// Mint a least-privilege `GT_TOKEN` into each slung polecat's env (`hq-agent-provisioning.3`).
@@ -321,7 +337,19 @@ impl Plugin for PolecatSupervisorPlugin {
                             if let Err(e) = gt_polecat::install_polecat_hooks(&wt) {
                                 eprintln!("[polecat] hook install into worktree {} skipped: {e}", wt.display());
                             }
-                            crate::worktree::seed_mcp_config(&self.template.workdir, &wt);
+                            // Prefer a dynamic .mcp.json with the per-sling token when the daemon
+                            // has a server URL (hq-polecat-rig-config.1): the generated file is
+                            // always valid for THIS sling, surviving rig changes and token rotation
+                            // without the operator re-placing a static file. Fall back to copying
+                            // the operator-placed base-checkout file when no URL is available.
+                            let mcp_written = self.server_url.as_deref().zip(
+                                spec.env.iter().find(|(k, _)| k == "GT_TOKEN").map(|(_, v)| v.as_str())
+                            ).map(|(url, tok)| {
+                                crate::worktree::write_mcp_json(&wt, url, &self.workspace, tok)
+                            }).unwrap_or(false);
+                            if !mcp_written {
+                                crate::worktree::seed_mcp_config(&self.template.workdir, &wt);
+                            }
                             // Hand the tree to the non-root polecat user (hq-quota-accounts.6) so the
                             // dropped-privilege re-exec can read/write it. Best-effort.
                             if let Some(user) = &self.run_as {

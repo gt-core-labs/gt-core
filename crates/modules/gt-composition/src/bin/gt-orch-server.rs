@@ -380,6 +380,15 @@ async fn main() -> anyhow::Result<()> {
     } else {
         eprintln!("[gt-orch-server] GT_POLECAT_WORKTREE_ROOT unset — polecats share the rig checkout (single-polecat safe only)");
     }
+    // Dynamic .mcp.json per sling (hq-polecat-rig-config.1): when GT_SELF_URL is set the plugin
+    // writes a fresh `.mcp.json` using the per-session token rather than copying the static
+    // operator-placed file — so the agent's MCP auth survives rig changes and token rotation.
+    if let Some(url) = std::env::var("GT_SELF_URL").ok().filter(|v| !v.is_empty()) {
+        eprintln!("[gt-orch-server] dynamic .mcp.json per sling on (GT_SELF_URL={url})");
+        pol_plugin = pol_plugin.with_server_url(url);
+    } else {
+        eprintln!("[gt-orch-server] GT_SELF_URL unset — polecats copy static .mcp.json from base checkout (token may expire)");
+    }
     // Drop privileges per polecat (hq-quota-accounts.6): GT_POLECAT_RUN_AS re-execs the polecat as
     // a dedicated non-root user (the command wrap is in SpawnTemplate::from_env) and chowns its
     // worktree to that user here. The daemon stays root (for the eventlog volume); the polecat —

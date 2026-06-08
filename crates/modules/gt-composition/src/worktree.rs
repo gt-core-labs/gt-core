@@ -156,6 +156,9 @@ pub fn remove(base_repo: &Path, path: &Path) -> std::io::Result<()> {
 /// claude needs it to reach the `gt` MCP server. Copy it from the base rig checkout, which the
 /// operator configures once. Best-effort: a missing source (operator didn't place one) or an
 /// already-present target is a silent no-op — the caller treats MCP wiring as non-fatal.
+///
+/// Prefer [`write_mcp_json`] when the daemon has a live token: it writes a fresh, per-sling
+/// `.mcp.json` instead of copying a static one whose token may be expired or rig-specific.
 pub fn seed_mcp_config(base_repo: &Path, worktree: &Path) {
     let src = base_repo.join(".mcp.json");
     let dst = worktree.join(".mcp.json");
@@ -168,6 +171,37 @@ pub fn seed_mcp_config(base_repo: &Path, worktree: &Path) {
             src.display(),
             dst.display()
         );
+    }
+}
+
+/// Write a fresh per-sling `.mcp.json` into `worktree` pointing at `url/mcp` and carrying the
+/// per-session `token` in the `Authorization` header (`hq-polecat-rig-config.1`). Called instead
+/// of [`seed_mcp_config`] when the daemon has minted a live token — the generated file is always
+/// valid for THIS sling, regardless of what (if anything) the operator placed in the base checkout.
+/// Best-effort: any write failure is logged and the caller falls back to [`seed_mcp_config`].
+pub fn write_mcp_json(worktree: &Path, url: &str, workspace: &str, token: &str) -> bool {
+    let dst = worktree.join(".mcp.json");
+    let mcp_url = format!("{}/mcp", url.trim_end_matches('/'));
+    let body = serde_json::json!({
+        "mcpServers": {
+            "gt": {
+                "type": "http",
+                "url": mcp_url,
+                "headers": {
+                    "Authorization": format!("Bearer {token}"),
+                    "X-Workspace": workspace,
+                }
+            }
+        }
+    });
+    match serde_json::to_string_pretty(&body) {
+        Ok(s) => std::fs::write(&dst, s)
+            .map_err(|e| eprintln!("[polecat] .mcp.json write {} skipped: {e}", dst.display()))
+            .is_ok(),
+        Err(e) => {
+            eprintln!("[polecat] .mcp.json serialize skipped: {e}");
+            false
+        }
     }
 }
 
