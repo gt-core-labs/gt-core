@@ -40,13 +40,18 @@ pub struct GraphifyIndexer {
 
 impl Default for GraphifyIndexer {
     fn default() -> Self {
-        Self { fallback_python: "python3".to_string() }
+        // GT_GRAPHIFY_PYTHON overrides the default so deployments where the per-repo
+        // .graphify-venv is not accessible to the server process (e.g. running as root
+        // while the venv lives in a user home dir) can point at a usable interpreter.
+        let fallback_python = std::env::var("GT_GRAPHIFY_PYTHON")
+            .unwrap_or_else(|_| "python3".to_string());
+        Self { fallback_python }
     }
 }
 
 impl GraphifyIndexer {
     /// An indexer that prefers each repo's `.graphify-venv/bin/python` and falls
-    /// back to `python3` on `PATH`.
+    /// back to `GT_GRAPHIFY_PYTHON` (or `python3` on `PATH` if unset).
     pub fn new() -> Self {
         Self::default()
     }
