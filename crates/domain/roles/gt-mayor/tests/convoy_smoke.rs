@@ -12,7 +12,7 @@ use std::time::Duration;
 
 use tokio::sync::mpsc;
 
-use gt_events::Envelope;
+use gt_events::{Envelope, EventKind};
 use gt_orchestration::{
     actor as orch_actor, ConvoyState, InMemoryOrchRepo, LaunchConvoy, MemberState, OrchCommand,
     OrchEvent,
