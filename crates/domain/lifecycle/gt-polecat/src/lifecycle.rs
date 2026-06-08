@@ -344,10 +344,11 @@ pub fn wrap_run_as(
 pub fn polecat_prompt(workspace: &str, bead: &str, branch: &str) -> String {
     format!(
         "You are an autonomous gt polecat working in workspace `{workspace}`. Your assigned bead is \
-         `{bead}`. Read that bead and its acceptance criteria from the gt issue tracker (the `gt` MCP \
-         tools, authenticated by the GT_TOKEN in your environment), then implement it end-to-end in \
-         this checkout and commit your work on branch `{branch}`. Follow the repository conventions \
-         in CLAUDE.md. Work autonomously and do not ask for confirmation. \
+         `{bead}`. The `mcp__gt__*` tools are already authenticated and ready — start immediately by \
+         calling `mcp__gt__issues.read` to read the bead and its acceptance criteria, then implement \
+         it end-to-end in this checkout and commit your work on branch `{branch}`. Follow the \
+         repository conventions in CLAUDE.md. Work autonomously and do not ask for confirmation. \
+         Do not verify or invoke the `gt` CLI binary — use the MCP tools directly. \
          When the work is delivered and committed, signal completion yourself (this is how the \
          refinery learns to merge your branch — do not rely on any hook) by running EXACTLY this \
          Bash command once: \
