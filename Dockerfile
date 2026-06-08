@@ -24,7 +24,7 @@ FROM debian:bookworm-slim
 # only in a source repo (the upstream app) — the gap hq-gap-ready-set-has-no-unblocked-gt-core-work.
 # The operator wires GT_REPO_DIR + a read-only checkout via compose (out of this repo).
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends ca-certificates git \
+    && apt-get install -y --no-install-recommends ca-certificates git tmux \
     && rm -rf /var/lib/apt/lists/*
 COPY --from=build /build/target/release/gt-mcp-server /usr/local/bin/gt-mcp-server
 # Env (GT_DOLT_URL, GT_MCP_HTTP_BIND, GT_MCP_ACTOR, GT_MCP_SCOPE_CONFIG, and
