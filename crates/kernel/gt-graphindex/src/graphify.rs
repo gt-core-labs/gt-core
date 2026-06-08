@@ -116,8 +116,17 @@ impl GraphifyIndexer {
 
     /// Parse a `{nodes,edges,communities}` object; surfaces a tool-reported
     /// `{"error":"not_built"}` as [`GraphError::NotBuilt`].
+    ///
+    /// Graphify's `extract()` writes progress lines to stdout before the JSON
+    /// result, so we scan for the last `{`-prefixed line rather than parsing
+    /// the whole output.
     fn parse_stats(repo: &Path, raw: &str) -> Result<serde_json::Value, GraphError> {
-        let v: serde_json::Value = serde_json::from_str(raw)
+        let json_line = raw
+            .lines()
+            .filter(|l| l.trim_start().starts_with('{'))
+            .last()
+            .unwrap_or(raw);
+        let v: serde_json::Value = serde_json::from_str(json_line)
             .map_err(|e| GraphError::Tool(format!("bad json: {e}: {raw}")))?;
         if v.get("error").and_then(|e| e.as_str()) == Some("not_built") {
             return Err(GraphError::NotBuilt(repo.to_string_lossy().into_owned()));
@@ -173,7 +182,12 @@ impl GraphIndexer for GraphifyIndexer {
 
     async fn status(&self, repo: &Path) -> Result<IndexStatus, GraphError> {
         let raw = self.run(repo, STATUS_PY, &[]).await?;
-        let v: serde_json::Value = serde_json::from_str(&raw)
+        let json_line = raw
+            .lines()
+            .filter(|l| l.trim_start().starts_with('{'))
+            .last()
+            .unwrap_or(&raw);
+        let v: serde_json::Value = serde_json::from_str(json_line)
             .map_err(|e| GraphError::Tool(format!("bad json: {e}: {raw}")))?;
         let built = v.get("built").and_then(|b| b.as_bool()).unwrap_or(false);
         Ok(IndexStatus {
