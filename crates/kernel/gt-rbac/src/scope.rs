@@ -84,6 +84,10 @@ impl Scope {
             // tokens. The REST `/auth/tokens` surface gates on `tokens.read`/`tokens.write`, so the
             // curated member grant carries that whole namespace.
             "tokens.*",
+            // Operator notifications (hq-notifications): members read + dismiss their own
+            // notifications; agents write via notify.send.execute on MCP.
+            "notifications.*",
+            "notify.*",
             "workspace.info",
             "workspace.list",
         ]

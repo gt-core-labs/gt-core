@@ -25,6 +25,7 @@ pub mod documents;
 pub mod eventlog;
 pub mod graph;
 pub mod merge;
+pub mod notify;
 pub mod pools;
 pub mod quota;
 pub mod rest_backings;
@@ -39,6 +40,7 @@ pub use documents::{DocumentsHandler, PgDocumentsResource};
 pub use eventlog::{EventLog, EventLogIssueSink};
 pub use graph::GraphHandler;
 pub use merge::MergeHandler;
+pub use notify::NotifyHandler;
 pub use pools::WsPools;
 pub use quota::QuotaHandler;
 pub use rest_backings::{

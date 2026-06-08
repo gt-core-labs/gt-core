@@ -47,8 +47,8 @@ use gt_composition::mcp::{
     AgentHandler, AuditHandler, CompositionTenantProvisioner, ConvoyHandler, DocumentsHandler,
     EventLog, EventLogConvoy, EventLogFeed, EventLogHooks, EventLogIssueSink, EventLogMerges,
     EventLogQuota, EventLogSkills, FsAccountCatalog, GraphHandler, IdentityDoltMeStats,
-    MergeHandler, PgDocumentsResource, PgRigPrefixes, PgWorkspaceStatus, QuotaHandler, RigHandler,
-    WorkspaceHandler, WsPoolRigs, WsPools,
+    MergeHandler, NotifyHandler, PgDocumentsResource, PgRigPrefixes, PgWorkspaceStatus,
+    QuotaHandler, RigHandler, WorkspaceHandler, WsPoolRigs, WsPools,
 };
 use gt_composition::onboard::{onboard_router, OnboardState};
 use gt_composition::operator_resource::EventLogOperatorResource;
@@ -1298,6 +1298,9 @@ async fn build_domain_router(
         .register(Arc::new(convoy_handler))
         .register(Arc::new(AgentHandler::new(event_log.clone())))
         .register(Arc::new(QuotaHandler::new(event_log.clone())))
+        // notify.* — operator notification channel (hq-notifications): agents write
+        // via notify.send; the browser bell polls/streams the same PG table.
+        .register(Arc::new(NotifyHandler::new(pool.clone(), event_log.clone())))
         // graph.* read-only queries (hq-graphrig.10): graphify-backed indexer; the
         // warden state (replayed from event_log) resolves rig -> repo_dir.
         .register(Arc::new(GraphHandler::new(
