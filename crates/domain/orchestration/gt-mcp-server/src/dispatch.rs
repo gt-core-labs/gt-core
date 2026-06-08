@@ -13,8 +13,9 @@ use gt_issues::handlers::{
 };
 use gt_issues::{
     emit_issue_event, AdvancePhase, ClaimIssue, CloseIssue, CommitInspector, CreateIssue,
-    IssueEventSink, IssueVerb, TransitionIssue, UpdateIssue,
+    IssueEventSink, IssueVerb, ListIssues, ReadIssue, TransitionIssue, UpdateIssue,
 };
+use gt_issues::resources::{read_issue, read_issues_page, filter_ready, read_issues};
 use gt_meta::ReportGap;
 use gt_module::McpTool;
 use gt_store_dolt::{AppError, ClaimOutcome, DoltIssues, IssueFilter, NewIssue};
@@ -191,6 +192,45 @@ pub async fn dispatch(
             let a: AdvancePhase = parse_args(args)?;
             run_advance_phase(store, &a, false).await?;
             Ok(json!({ "ok": true, "open_phase": a.open_phase }))
+        }
+        "issues.list.execute" => {
+            let a: ListIssues = parse_args(args)?;
+            let mut filter = IssueFilter {
+                status: a.status.map(|s| s.split(',').filter(|v| !v.is_empty()).map(String::from).collect()).unwrap_or_default(),
+                priority_max: a.priority_max,
+                assignee: a.assignee,
+                external_ref: a.external_ref,
+                issue_type: a.issue_type,
+                limit: a.limit,
+                offset: a.offset,
+                full: a.full,
+                ready: a.ready,
+            };
+            if filter.ready {
+                // ready=true needs phase frontier + dep index + git tree (same as resource path)
+                let rows = read_issues(store, &filter).await?;
+                let open_phase = store.open_phase().await?;
+                let deps = store.dep_index().await?;
+                let tree = surface_tree(repo_dir);
+                let rows = filter_ready(rows, open_phase, &deps, tree.as_ref());
+                filter.ready = false; // consumed
+                return serde_json::to_value(&rows)
+                    .map_err(|e| AppError::Other(format!("encode issues: {e}")));
+            }
+            let page = read_issues_page(store, &filter).await?;
+            serde_json::to_value(&page)
+                .map_err(|e| AppError::Other(format!("encode issues: {e}")))
+        }
+        "issues.read.execute" => {
+            let a: ReadIssue = parse_args(args)?;
+            if a.id.is_empty() {
+                return Err(AppError::Validation("issue id is empty".into()));
+            }
+            match read_issue(store, &a.id).await? {
+                Some(detail) => serde_json::to_value(&detail)
+                    .map_err(|e| AppError::Other(format!("encode issue: {e}"))),
+                None => Err(AppError::NotFound(format!("issue `{}`", a.id))),
+            }
         }
         other => Err(AppError::Validation(format!("unknown tool `{other}`"))),
     }

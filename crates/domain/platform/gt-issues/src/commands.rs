@@ -547,6 +547,39 @@ impl AdvancePhase {
     }
 }
 
+/// Input for `issues.list` — list beads with optional filters.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
+pub struct ListIssues {
+    /// Filter by status (comma-separated: `open`, `working`, `closed`). Omit for all.
+    #[serde(default)]
+    pub status: Option<String>,
+    /// Include only beads with priority ≤ this value (0 = highest).
+    pub priority_max: Option<u8>,
+    /// Filter by exact assignee.
+    pub assignee: Option<String>,
+    /// Filter by exact external_ref (epic linkage).
+    pub external_ref: Option<String>,
+    /// Filter by issue type (`epic`, `task`, `spike`, …).
+    pub issue_type: Option<String>,
+    /// Page size (default and ceiling governed by server env vars).
+    pub limit: Option<u32>,
+    /// Zero-based row offset for less-style paging; advance to `next_offset` to walk forward.
+    pub offset: Option<u32>,
+    /// Include heavy text bodies (description/design/acceptance_criteria/notes) on every row.
+    #[serde(default)]
+    pub full: bool,
+    /// Narrow to actionable beads only (every readiness clause holds).
+    #[serde(default)]
+    pub ready: bool,
+}
+
+/// Input for `issues.read` — fetch a single bead with its full detail.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct ReadIssue {
+    /// Bead id to fetch, e.g. `hq-core-host.2`.
+    pub id: String,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -7,7 +7,7 @@ use gt_issues::IssuesModule;
 use gt_module::RootBuilder;
 use gt_module_mcp::meta_help;
 
-const EXPECTED: [&str; 11] = [
+const EXPECTED: [&str; 13] = [
     "issues.create.validate",
     "issues.create.execute",
     "issues.update.validate",
@@ -19,6 +19,8 @@ const EXPECTED: [&str; 11] = [
     "issues.claim.validate",
     "issues.claim.execute",
     "issues.phase.advance",
+    "issues.list.execute",
+    "issues.read.execute",
 ];
 
 #[test]

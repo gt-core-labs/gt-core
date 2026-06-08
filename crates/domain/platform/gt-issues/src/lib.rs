@@ -71,7 +71,8 @@ pub mod surface;
 pub mod taxonomy;
 
 pub use commands::{
-    AdvancePhase, ClaimIssue, CloseIssue, CreateIssue, TransitionIssue, UpdateIssue,
+    AdvancePhase, ClaimIssue, CloseIssue, CreateIssue, ListIssues, ReadIssue, TransitionIssue,
+    UpdateIssue,
 };
 pub use delivery::{CommitInfo, CommitInspector, InspectorProvider};
 pub use events::{emit_issue_event, IssueEvent, IssueEventSink, IssueVerb};

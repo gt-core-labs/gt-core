@@ -34,7 +34,8 @@ use gt_module_mcp::schema_for;
 use semver::Version;
 
 use crate::commands::{
-    AdvancePhase, ClaimIssue, CloseIssue, CreateIssue, TransitionIssue, UpdateIssue,
+    AdvancePhase, ClaimIssue, CloseIssue, CreateIssue, ListIssues, ReadIssue, TransitionIssue,
+    UpdateIssue,
 };
 
 /// The [`GtModule`] facade over the issues store.
@@ -190,6 +191,23 @@ impl GtModule for IssuesModule {
                  phase is an idempotent re-ratification. There is no per-bead id — the frontier \
                  is a singleton governing the whole tracker.",
                 schema_for::<AdvancePhase>(),
+            )
+            .tool_with_schema(
+                "issues.list.execute",
+                "List beads from the tracker with optional filters. Returns a paged snapshot \
+                 {rows, total, next_offset, has_more} — advance offset=next_offset until \
+                 has_more=false to walk the full corpus. Pass full=true to inline heavy bodies \
+                 (description/acceptance_criteria/notes). Pass ready=true to narrow to actionable \
+                 beads only (all readiness clauses satisfied). Read-only — no state change.",
+                schema_for::<ListIssues>(),
+            )
+            .tool_with_schema(
+                "issues.read.execute",
+                "Fetch a single bead by id with its full detail: title, status, priority, \
+                 description, design, acceptance_criteria, notes, assignee, owner, phase, \
+                 depends_on, domain, surface, external_ref, created_at, closed_at. \
+                 Returns NotFound when the id does not exist. Read-only — no state change.",
+                schema_for::<ReadIssue>(),
             );
     }
 
@@ -253,22 +271,22 @@ mod tests {
                 "issues.claim.execute",
                 // hq-core-mcp.7 — operator-only frontier advance (no validate/execute pair).
                 "issues.phase.advance",
+                "issues.list.execute",
+                "issues.read.execute",
             ]
         );
     }
 
     #[test]
     fn every_tool_name_is_well_formed_and_namespaced() {
-        // Each name is `<module-id>.<action>.<verb>` with module id == `issues`.
-        // The verb is `validate`/`execute` for the command pairs, plus `advance`
-        // for the operator-only `issues.phase.advance` (hq-core-mcp.7).
+        // All tools are 3-segment: `issues.<action>.<verb>`.
         let mut reg = McpRegistry::new();
         IssuesModule::default().register_mcp_tools(&mut reg);
         for tool in reg.tools() {
             let (module, _action, verb) = tool.parse_name().expect("well-formed tool name");
             assert_eq!(module, "issues", "tool {} not namespaced to issues", tool.name);
             assert!(
-                verb == "validate" || verb == "execute" || verb == "advance",
+                matches!(verb, "validate" | "execute" | "advance"),
                 "unexpected verb in {}",
                 tool.name
             );
