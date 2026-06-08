@@ -247,7 +247,13 @@ pub fn seed_claude_onboarding(config_dir: &Path, worktree: &Path) {
     );
     obj.entry("theme")
         .or_insert_with(|| serde_json::Value::String("dark".into()));
-    // Folder trust is per-project: mark THIS worktree path trusted + onboarded.
+    // Folder trust is per-project: mark THIS worktree path trusted + onboarded, and pre-enable the
+    // project `.mcp.json` `gt` server HERE. claude 2.1.x reads project-MCP enablement from this
+    // per-project entry in `.claude.json`, NOT from `<workdir>/.claude/settings.json`: without it the
+    // server connects (its resources surface) but its TOOLS are withheld behind the "Use this MCP
+    // server?" trust gate, so an autonomous session sees `gt://…` resources yet no `mcp__gt__*` tools
+    // and stalls (observed live for a mayor session). Mirrors the polecat `enabledMcpjsonServers`
+    // pre-trust (hq-polecat-provisioning-20260608.1), applied to the interactive role path too.
     let projects = obj
         .entry("projects")
         .or_insert_with(|| serde_json::json!({}));
@@ -256,7 +262,8 @@ pub fn seed_claude_onboarding(config_dir: &Path, worktree: &Path) {
             worktree.display().to_string(),
             serde_json::json!({
                 "hasTrustDialogAccepted": true,
-                "hasCompletedProjectOnboarding": true
+                "hasCompletedProjectOnboarding": true,
+                "enabledMcpjsonServers": ["gt"]
             }),
         );
     }
@@ -333,6 +340,12 @@ mod tests {
         assert_eq!(
             v["projects"]["/rig-wt/gt-hq-x.1"]["hasTrustDialogAccepted"],
             serde_json::json!(true)
+        );
+        // The project `gt` MCP server is pre-enabled HERE so its tools (not just resources) surface
+        // without the interactive trust prompt (hq-mcp-projtrust).
+        assert_eq!(
+            v["projects"]["/rig-wt/gt-hq-x.1"]["enabledMcpjsonServers"],
+            serde_json::json!(["gt"])
         );
     }
 
