@@ -1874,6 +1874,7 @@ dependencies = [
  "gt-channel",
  "gt-eventlog",
  "gt-events",
+ "gt-orchestration",
  "schemars 0.8.22",
  "serde",
  "serde_json",
