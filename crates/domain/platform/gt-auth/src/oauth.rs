@@ -506,7 +506,9 @@ impl DbOauthLogin {
 
     /// Resolve `provider_id` against the store into a handshake-ready [`OidcProvider`]: load the
     /// row (absent/disabled ⇒ [`AuthError::UnknownProvider`]), unseal its secret, and assemble the
-    /// [`OidcConfig`] scoped to this resolver's workspace + redirect URI.
+    /// [`OidcConfig`]. When the provider row carries a `workspace_id`, the resolved identity is
+    /// scoped to that workspace; otherwise the deploy-level default (`self.workspace`) is used —
+    /// so a global (NULL `workspace_id`) provider still works as before.
     async fn provider_for(&self, provider_id: &str) -> Result<OidcProvider, AuthError> {
         let record = self
             .repo
@@ -514,7 +516,11 @@ impl DbOauthLogin {
             .await?
             .filter(|r| r.enabled)
             .ok_or_else(|| AuthError::UnknownProvider(provider_id.to_owned()))?;
-        let config = record.into_oidc_config(self.workspace.clone(), self.redirect_uri.clone())?;
+        let workspace = record
+            .workspace_id
+            .clone()
+            .unwrap_or_else(|| self.workspace.clone());
+        let config = record.into_oidc_config(workspace, self.redirect_uri.clone())?;
         Ok(OidcProvider::with_client(config, self.http.clone()))
     }
 
@@ -1014,6 +1020,59 @@ mod tests {
         assert_eq!(err, Err(AuthError::UnknownProvider(String::new())));
     }
 
+    #[tokio::test]
+    async fn db_resolver_uses_provider_workspace_id_over_default() {
+        // A provider row with `workspace_id = Some("enterprise")` should produce an identity
+        // scoped to "enterprise" even though the resolver was built with default workspace "acme".
+        let idp = MockIdp {
+            codes: Arc::new(HashMap::from([("corp-code".into(), "tok-e".into())])),
+            tokens: Arc::new(HashMap::from([("tok-e".into(), "eve-sub".into())])),
+            ..Default::default()
+        };
+        let base = spawn_idp(idp).await;
+        let mut repo = MapRepo::default();
+        let mut rec = record_for(&base, "enterprise-sso", true, "s3cret");
+        rec.workspace_id = Some("enterprise".into());
+        repo.rows.insert("enterprise-sso".into(), rec);
+        let resolver =
+            DbOauthLogin::new(Arc::new(repo), "acme", "https://gt.test/cb").unwrap();
+
+        let identity = resolver
+            .login(&Credentials::OAuth {
+                provider: "enterprise-sso".into(),
+                code: "corp-code".into(),
+            })
+            .await
+            .unwrap();
+
+        // Provider row says workspace = "enterprise"; resolver default "acme" is NOT used.
+        assert_eq!(identity.workspace, "enterprise");
+        assert_eq!(identity.sub, "eve-sub");
+    }
+
+    #[tokio::test]
+    async fn db_resolver_falls_back_to_default_workspace_for_global_provider() {
+        // A global provider (workspace_id = None) falls back to the resolver's deploy-level default.
+        let idp = MockIdp {
+            codes: Arc::new(HashMap::from([("g-code".into(), "tok-g".into())])),
+            tokens: Arc::new(HashMap::from([("tok-g".into(), "grace-sub".into())])),
+            ..Default::default()
+        };
+        let base = spawn_idp(idp).await;
+        let mut repo = MapRepo::default();
+        repo.rows.insert("google".into(), record_for(&base, "google", true, "s3cret"));
+        let resolver =
+            DbOauthLogin::new(Arc::new(repo), "acme", "https://gt.test/cb").unwrap();
+
+        let identity = resolver
+            .login(&Credentials::OAuth { provider: "google".into(), code: "g-code".into() })
+            .await
+            .unwrap();
+
+        assert_eq!(identity.workspace, "acme");
+        assert_eq!(identity.sub, "grace-sub");
+    }
+
     // --- PG-gated: the full handshake against a real PgProviderRepo + mock IdP -----------------
     //
     // No-ops when `GT_PG_URL` is unset (same gate as provider_repo's contract tests). Run with
@@ -1073,6 +1132,7 @@ mod tests {
             let idp = MockIdp {
                 codes: Arc::new(HashMap::from([("good-code".into(), "tok-9".into())])),
                 tokens: Arc::new(HashMap::from([("tok-9".into(), "dave-sub".into())])),
+                ..Default::default()
             };
             let base = spawn_idp(idp).await;
 
@@ -1091,6 +1151,7 @@ mod tests {
                 userinfo_endpoint: format!("{base}/userinfo"),
                 scopes: "rig.read,rig.write".into(),
                 enabled: true,
+                workspace_id: None,
             };
             repo.create(new).await.unwrap();
 
