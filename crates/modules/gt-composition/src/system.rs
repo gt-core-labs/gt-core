@@ -53,9 +53,15 @@ pub struct ArchiveConfig {
     pub interval_minutes: u64,
 }
 
-fn default_true() -> bool { true }
-fn default_archive_days() -> u32 { 30 }
-fn default_interval_minutes() -> u64 { 60 }
+fn default_true() -> bool {
+    true
+}
+fn default_archive_days() -> u32 {
+    30
+}
+fn default_interval_minutes() -> u64 {
+    60
+}
 
 impl Default for ArchiveConfig {
     fn default() -> Self {
@@ -110,7 +116,13 @@ impl SystemApiState {
         config: SharedArchiveConfig,
         config_path: Option<PathBuf>,
     ) -> Self {
-        Self { authenticator, audit, store, config, config_path }
+        Self {
+            authenticator,
+            audit,
+            store,
+            config,
+            config_path,
+        }
     }
 }
 
@@ -160,7 +172,11 @@ fn authorize(
         return Err(reject(StatusCode::UNAUTHORIZED, "expired token", ANONYMOUS));
     }
     if !has_scope(&claims.scopes, scope) {
-        return Err(reject(StatusCode::FORBIDDEN, "missing system scope", &claims.sub));
+        return Err(reject(
+            StatusCode::FORBIDDEN,
+            "missing system scope",
+            &claims.sub,
+        ));
     }
     Ok(claims)
 }
@@ -191,10 +207,7 @@ fn cookie(headers: &axum::http::HeaderMap, name: &str) -> Option<String> {
         .filter(|v| !v.is_empty())
 }
 
-async fn get_config(
-    State(st): State<SystemApiState>,
-    headers: axum::http::HeaderMap,
-) -> Response {
+async fn get_config(State(st): State<SystemApiState>, headers: axum::http::HeaderMap) -> Response {
     if let Err(resp) = authorize(&st, &headers, READ_SCOPE, &Method::GET) {
         return resp;
     }

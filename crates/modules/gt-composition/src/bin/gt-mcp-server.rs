@@ -63,6 +63,7 @@ use sqlx::Row;
 // Domain REST modules + their `with_http` state (hq-fe-api-mount.1): the bin mounts each
 // crate's `register_routes` so the FE reaches every namespace over authenticated HTTP.
 use gt_agent::{AgentApiState, AgentModule};
+use gt_composition::system::{load_config, system_router, ArchiveDaemon, SystemApiState};
 use gt_documents::{DocumentsApiState, DocumentsModule};
 use gt_eventlog::DEFAULT_EVENTLOG_ROOT;
 use gt_feed::{FeedApiState, FeedModule};
@@ -81,7 +82,6 @@ use gt_rig::{RigApiState, RigsModule};
 use gt_skills::{SkillsApiState, SkillsModule};
 use gt_store_dolt::{DoltIssues, WorkspacePools};
 use gt_workspace::{PgWorkspaces, WorkspaceApiState, WorkspaceModule};
-use gt_composition::system::{system_router, ArchiveDaemon, SystemApiState, load_config};
 use tokio::sync::RwLock;
 
 /// Path the MCP endpoint mounts at (mirrors the upstream gt-mcp).

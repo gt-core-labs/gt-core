@@ -333,7 +333,10 @@ fn prepare_role_skills(
             let scopes = catalog.scopes_for_roles(&[role.clone()]);
             match mint_role_token(minter, session, workspace, &scopes) {
                 Some(token) if write_gt_config(&workdir, url, workspace, &rig, &role, &token) => {
-                    if write_mcp_json(&workdir) {
+                    // .mcp.json talks to /mcp over HTTP with this token (hq-mcp-http) — the stdio
+                    // proxy surfaced resources but not tools. .gt-config still rides for the `gt mcp
+                    // call|list` shell surface the agent may use.
+                    if write_mcp_json(&workdir, url, workspace, &token) {
                         wrote += 1;
                     }
                     true
@@ -432,17 +435,29 @@ fn write_gt_config(
         && std::fs::write(dir.join("role.toml"), named).is_ok()
 }
 
-/// Write `<workdir>/.mcp.json` registering the single `gt` MCP server — the proxy claude launches as
-/// a stdio server (`gt mcp`) to reach the orchestrator's tools (`hq-role-mcp`). The binary path is
-/// `GT_BIN` (default the host cargo-bin install). `false` on any write error.
-fn write_mcp_json(workdir: &Path) -> bool {
+/// Write `<workdir>/.mcp.json` registering the single `gt` MCP server over **HTTP** — the same
+/// streamable-HTTP `/mcp` transport the polecat config uses (`hq-role-mcp` / hq-mcp-http), NOT the
+/// stdio `gt mcp` proxy. The stdio proxy re-presents the upstream `ServerInfo` on initialize, and
+/// claude surfaced only its *resources* and never its *tools* (`mcp__gt__*`), so a role session could
+/// read `gt://…` but not call `issues.*`/`agent.*`/`merge.*`. Talking to `/mcp` directly — exactly
+/// what the proven polecat path does — makes the tools surface. The minted per-session token rides in
+/// the `Authorization` header and the tenant in `X-Workspace`. `false` on any write error.
+fn write_mcp_json(workdir: &Path, server_url: &str, workspace: &str, token: &str) -> bool {
     if std::fs::create_dir_all(workdir).is_err() {
         return false;
     }
-    let bin = std::env::var("GT_BIN")
-        .unwrap_or_else(|_| "/home/nixos/.local/share/cargo/bin/gt".to_string());
+    let url = format!("{}/mcp", server_url.trim_end_matches('/'));
     let body = serde_json::json!({
-        "mcpServers": { "gt": { "command": bin, "args": ["mcp"] } }
+        "mcpServers": {
+            "gt": {
+                "type": "http",
+                "url": url,
+                "headers": {
+                    "Authorization": format!("Bearer {token}"),
+                    "X-Workspace": workspace,
+                }
+            }
+        }
     });
     serde_json::to_string_pretty(&body)
         .ok()
@@ -1640,18 +1655,27 @@ mod tests {
     }
 
     #[test]
-    fn write_mcp_json_registers_the_single_gt_server() {
-        // hq-role-mcp: <workdir>/.mcp.json registers exactly the `gt` stdio server (`gt mcp`).
+    fn write_mcp_json_registers_the_gt_http_server() {
+        // hq-mcp-http: <workdir>/.mcp.json registers exactly the `gt` server over HTTP to /mcp, with
+        // the minted token + tenant in headers (the stdio proxy surfaced resources but not tools).
         use tempfile::TempDir;
         let dir = TempDir::new().unwrap();
-        std::env::set_var("GT_BIN", "/opt/gt");
-        assert!(write_mcp_json(dir.path()));
-        std::env::remove_var("GT_BIN");
+        assert!(write_mcp_json(
+            dir.path(),
+            "http://127.0.0.1:8765",
+            "default",
+            "header.payload.sig"
+        ));
         let v: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(dir.path().join(".mcp.json")).unwrap())
                 .unwrap();
-        assert_eq!(v["mcpServers"]["gt"]["command"], "/opt/gt");
-        assert_eq!(v["mcpServers"]["gt"]["args"], serde_json::json!(["mcp"]));
+        assert_eq!(v["mcpServers"]["gt"]["type"], "http");
+        assert_eq!(v["mcpServers"]["gt"]["url"], "http://127.0.0.1:8765/mcp");
+        assert_eq!(
+            v["mcpServers"]["gt"]["headers"]["Authorization"],
+            "Bearer header.payload.sig"
+        );
+        assert_eq!(v["mcpServers"]["gt"]["headers"]["X-Workspace"], "default");
         // Exactly one server registered.
         assert_eq!(v["mcpServers"].as_object().unwrap().len(), 1);
     }
