@@ -10,6 +10,16 @@ use serde::{Deserialize, Serialize};
 use crate::cost::{cost_units, ModelWeights};
 use crate::events::QuotaEvent;
 
+/// Rolling-5h window length (standard claude plan), in seconds.
+pub const ROLLING_5H_SECS: u64 = 5 * 3600;
+
+/// Default synthetic-window budget, in cost units, used when a `TokensSampled` arrives for an
+/// account with no window (the replay reducer has no provider headers + no env, so it cannot read
+/// the real limit). Mirrors the edge's `GT_QUOTA_PLAN_LIMIT` default so the REST `Usage` column
+/// renders a consumed/limit the same order of magnitude as the daemon's live predictor sees.
+/// Identity weights count a turn at ~10^5–10^6 units, so this is deliberately generous.
+pub const DEFAULT_PLAN_LIMIT: u64 = 50_000_000;
+
 /// Granularity of the window the provider counts usage over.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum WindowKind {
@@ -291,10 +301,52 @@ pub struct QuotaState {
 impl QuotaState {
     pub fn apply(&mut self, event: &QuotaEvent) {
         match event {
-            QuotaEvent::TokensSampled { .. } => {
-                // The sample feeds the rate (applied live by the actor; replay can rebuild
-                // it via EWMA if needed). What matters in `QuotaState` is the observable
-                // effect: the prediction and status changes.
+            QuotaEvent::TokensSampled {
+                account,
+                model,
+                input,
+                output,
+                cache_read,
+                cache_creation,
+                now_secs,
+                ..
+            } => {
+                // Fold the sample's cost into the account's window so the rebuilt state (hence the
+                // REST `Usage`/`Window`/`Resets` columns via `AccountRegistry::from_state`) renders
+                // real consumption (hq-quota-feed-display). Mirrors the edge `apply_feed`: seed a
+                // synthetic Rolling5h window on the first sample (no provider headers in replay),
+                // recycle it once its 5h reset has passed, then add the IDENTITY-weighted cost (the
+                // reducer carries no per-model calibration, same default the daemon uses uncalibrated).
+                let entry = self.accounts.entry(account.clone()).or_insert_with(|| Account {
+                    id: account.clone(),
+                    status: AccountQuotaStatus::Healthy,
+                    window: None,
+                });
+                if entry.window.is_none() {
+                    entry.window = Some(AccountWindow {
+                        kind: WindowKind::Rolling5h,
+                        limit: DEFAULT_PLAN_LIMIT,
+                        started_at_secs: *now_secs,
+                        resets_at_secs: now_secs + ROLLING_5H_SECS,
+                        consumed: 0.0,
+                    });
+                }
+                if let Some(w) = entry.window.as_mut() {
+                    if *now_secs >= w.resets_at_secs {
+                        w.started_at_secs = *now_secs;
+                        w.resets_at_secs = now_secs + ROLLING_5H_SECS;
+                        w.consumed = 0.0;
+                    }
+                    let cost = cost_units(
+                        model,
+                        *input,
+                        *output,
+                        *cache_read,
+                        *cache_creation,
+                        &HashMap::new(),
+                    );
+                    w.consumed += cost.0;
+                }
             }
             QuotaEvent::UsageProbed { account, remaining, resets_at_secs, .. } => {
                 let entry = self.accounts.entry(account.clone()).or_insert_with(|| {
@@ -439,5 +491,56 @@ mod tests {
             consumed: 1500.0,
         };
         assert_eq!(w.remaining(), 0);
+    }
+
+    #[test]
+    fn tokens_sampled_folds_consumption_into_a_synthetic_window() {
+        // hq-quota-feed-display: replaying a sample must render usage in QuotaState (→ REST), seeding
+        // a synthetic Rolling5h window on first sight and accumulating IDENTITY-weighted cost.
+        let mut s = QuotaState::default();
+        s.apply(&QuotaEvent::TokensSampled {
+            account: "acc-1".into(),
+            session: "sess".into(),
+            model: "opus".into(),
+            input: 1000,
+            output: 500,
+            cache_read: 200,
+            cache_creation: 100,
+            now_secs: 1_000,
+        });
+        let w = s.accounts["acc-1"].window.as_ref().expect("synthetic window seeded");
+        assert_eq!(w.kind, WindowKind::Rolling5h);
+        assert_eq!(w.limit, DEFAULT_PLAN_LIMIT);
+        assert_eq!(w.started_at_secs, 1_000);
+        assert_eq!(w.resets_at_secs, 1_000 + ROLLING_5H_SECS);
+        assert_eq!(w.consumed, 1800.0, "IDENTITY: sum of all token categories");
+
+        // A second sample in the same window accumulates.
+        s.apply(&QuotaEvent::TokensSampled {
+            account: "acc-1".into(),
+            session: "sess".into(),
+            model: "opus".into(),
+            input: 10,
+            output: 5,
+            cache_read: 0,
+            cache_creation: 0,
+            now_secs: 1_060,
+        });
+        assert_eq!(s.accounts["acc-1"].window.as_ref().unwrap().consumed, 1815.0);
+
+        // A sample past the window reset recycles it (fresh consumed).
+        s.apply(&QuotaEvent::TokensSampled {
+            account: "acc-1".into(),
+            session: "sess".into(),
+            model: "opus".into(),
+            input: 7,
+            output: 0,
+            cache_read: 0,
+            cache_creation: 0,
+            now_secs: 1_000 + ROLLING_5H_SECS + 1,
+        });
+        let w = s.accounts["acc-1"].window.as_ref().unwrap();
+        assert_eq!(w.consumed, 7.0, "recycled then folded the fresh sample");
+        assert!(w.resets_at_secs > 1_000 + ROLLING_5H_SECS);
     }
 }
