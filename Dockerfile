@@ -24,9 +24,19 @@ FROM debian:bookworm-slim
 # only in a source repo (the upstream app) — the gap hq-gap-ready-set-has-no-unblocked-gt-core-work.
 # The operator wires GT_REPO_DIR + a read-only checkout via compose (out of this repo).
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends ca-certificates git tmux \
+    && apt-get install -y --no-install-recommends ca-certificates curl git tmux \
     && rm -rf /var/lib/apt/lists/*
 COPY --from=build /build/target/release/gt-mcp-server /usr/local/bin/gt-mcp-server
+# Bake the `gt` CLI binary so role-session MCP proxies (`gt mcp`) work out of the box.
+# The entrypoint refreshes this over the network on every start so the container tracks
+# the `latest` release without a rebuild (hq-mcp-ready-probe.3).
+# MUSL not gnu: the runtime base is debian:bookworm (GLIBC 2.36) but the gnu release is
+# built on a newer GLIBC (ubuntu-latest), so the gnu binary aborts with `GLIBC_2.38 not
+# found`. The musl asset is statically linked and runs on any linux.
+RUN curl -fsSL https://github.com/gt-core-labs/gt/releases/download/latest/gt-x86_64-unknown-linux-musl.tar.gz \
+    | tar -xz -C /usr/local/bin gt
+COPY docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
+RUN chmod 0755 /usr/local/bin/docker-entrypoint.sh
 # Env (GT_DOLT_URL, GT_MCP_HTTP_BIND, GT_MCP_ACTOR, GT_MCP_SCOPE_CONFIG, and
 # optionally GT_REPO_DIR for S3 surface validation) is supplied by the compose
 # service; see docker-compose gt-mcp-server.
@@ -35,4 +45,5 @@ COPY --from=build /build/target/release/gt-mcp-server /usr/local/bin/gt-mcp-serv
 #   GT_ISSUES_DEFAULT_LIMIT  page size when ?limit is omitted (default 200)
 #   GT_ISSUES_MAX_LIMIT      hard ceiling a ?limit is clamped to (default 10000)
 # The operator retunes the page size here without recompiling.
-ENTRYPOINT ["gt-mcp-server"]
+ENTRYPOINT ["/usr/local/bin/docker-entrypoint.sh"]
+CMD ["gt-mcp-server"]

@@ -131,6 +131,18 @@ pub struct IssuesServer {
     issue_sink: Option<Arc<dyn IssueEventSink>>,
 }
 
+/// The auth-free readiness probe tool (hq-mcp-ready-probe.1). No input schema,
+/// no auth required — a caller invokes `ping` at startup; if the call resolves,
+/// the server is live and action tools are safe to invoke.
+fn ping_tool() -> McpTool {
+    McpTool::new(
+        "ping",
+        "Readiness probe. Returns {ok:true,version,ts} without auth — \
+         call this at startup to confirm the MCP server is live before \
+         invoking any action tool.",
+    )
+}
+
 impl IssuesServer {
     /// Build the service from the composed pieces. `tools` are the descriptors
     /// the built `Root` exposes (`root.mcp_tools()`), already namespaced + NN-16
@@ -145,6 +157,9 @@ impl IssuesServer {
         tools: Vec<McpTool>,
         repo_dir: Option<PathBuf>,
     ) -> Self {
+        // Prepend the auth-free ping probe so it is always first in tools/list.
+        let mut tools = tools;
+        tools.insert(0, ping_tool());
         let tool_aliases = tools
             .iter()
             .map(|t| (sanitize_tool_name(&t.name), t.name.clone()))
@@ -554,6 +569,19 @@ impl ServerHandler for IssuesServer {
             .cloned()
             .unwrap_or_else(|| request.name.to_string());
         let args = serde_json::Value::Object(request.arguments.clone().unwrap_or_default());
+
+        // Auth-free readiness probe (hq-mcp-ready-probe.1): short-circuit before
+        // authorize so the caller can confirm the server is live without a token.
+        if tool == "ping" {
+            let payload = serde_json::json!({
+                "ok": true,
+                "version": env!("CARGO_PKG_VERSION"),
+                "ts": now_secs(),
+            });
+            return Ok(CallToolResult::success(vec![Content::text(
+                payload.to_string(),
+            )]));
+        }
 
         // Per-connection scope (hq-core-mcp.6): the X-Actor header picks the
         // allow-list + the attribution actor, falling back to the boot default.
