@@ -42,6 +42,7 @@ use gt_claude_hooks::HooksStore;
 use gt_composition::auth::{authenticate, AuthState, PatVerifier, SharedAuthenticator};
 use gt_composition::denial_audit::audit_denials;
 use gt_composition::hooks::{hooks_router, HooksApiState};
+use gt_composition::notifications::{notifications_router, NotificationsApiState};
 use gt_composition::mcp::{
     AgentHandler, AuditHandler, CompositionTenantProvisioner, ConvoyHandler, DocumentsHandler,
     EventLog, EventLogConvoy, EventLogFeed, EventLogHooks, EventLogIssueSink, EventLogMerges,
@@ -519,6 +520,38 @@ async fn main() -> anyhow::Result<()> {
         hooks_router(HooksApiState::new(v.clone(), audit.clone(), store))
     });
 
+    // Notifications REST surface: GET/POST /api/v1/notifications + mark-read / delete.
+    // Agents (e.g. mayor) POST here to send notifications to the human operator; the web UI
+    // polls or streams these via the bell-icon panel. Gated on RS256 verifier + GT_PG_URL.
+    // GET = notifications.read, POST/DELETE = notifications.write (admin `*` satisfies both).
+    let notifications = match (verifier.as_ref(), std::env::var("GT_PG_URL").ok()) {
+        (Some(v), Some(pg_url)) => {
+            match sqlx::PgPool::connect(&pg_url).await {
+                Ok(notif_pool) => {
+                    eprintln!(
+                        "[gt-mcp-server] notifications REST on /api/v1/notifications (scope notifications.read/write)"
+                    );
+                    Some(notifications_router(NotificationsApiState::new(
+                        v.clone(),
+                        audit.clone(),
+                        notif_pool,
+                        event_log.clone(),
+                    )))
+                }
+                Err(e) => {
+                    eprintln!("[gt-mcp-server] notifications REST off (PG connect failed: {e})");
+                    None
+                }
+            }
+        }
+        _ => {
+            eprintln!(
+                "[gt-mcp-server] notifications REST off (needs RS256 verifier + GT_PG_URL)"
+            );
+            None
+        }
+    };
+
     // System config REST surface (hq-system-config): GET/PUT /api/v1/system/config and
     // POST /api/v1/system/archive/run. Scoped to system.read/system.write (admin `*` satisfies both).
     // Spawns the background archive daemon that sweeps old closed issues on a configurable interval.
@@ -619,6 +652,9 @@ async fn main() -> anyhow::Result<()> {
     }
     if let Some(hooks) = hooks {
         app = app.merge(hooks);
+    }
+    if let Some(notifications) = notifications {
+        app = app.merge(notifications);
     }
     if let Some(system) = system {
         app = app.merge(system);
@@ -1141,12 +1177,15 @@ async fn apply_pg_catalog(pool: &sqlx::PgPool) -> anyhow::Result<()> {
     let feature_id = ModuleId::new("feature").expect("`feature` is a valid module id");
     let rig_id = ModuleId::new("rig").expect("`rig` is a valid module id");
     let docs_id = ModuleId::new("docs").expect("`docs` is a valid module id");
+    let notifications_id = ModuleId::new("notifications").expect("`notifications` is a valid module id");
     let workspace_migs = gt_store_pg::workspace_migrations();
     let feature_migs = gt_store_pg::feature_flags_migrations();
     let rig_migs = RigsModule.migrations();
     // hq-docs-store.1: the per-workspace `documents` template tables (docs/11). Like `rig`,
     // they seed the `ws_default` template so `gt_create_workspace_schema` clones them per tenant.
     let docs_migs = gt_store_pg::docs_migrations();
+    // notifications: the public-schema `notifications` table agents write to via notify.send.execute.
+    let notifications_migs = gt_store_pg::notifications_migrations();
 
     let plan: Vec<_> = workspace_migs
         .iter()
@@ -1154,6 +1193,7 @@ async fn apply_pg_catalog(pool: &sqlx::PgPool) -> anyhow::Result<()> {
         .chain(feature_migs.iter().map(|m| (&feature_id, m)))
         .chain(rig_migs.iter().map(|m| (&rig_id, m)))
         .chain(docs_migs.iter().map(|m| (&docs_id, m)))
+        .chain(notifications_migs.iter().map(|m| (&notifications_id, m)))
         .collect();
 
     let report = gt_module_migrate::apply(pool, &plan)

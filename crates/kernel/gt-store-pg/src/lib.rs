@@ -107,6 +107,20 @@ pub fn docs_migrations() -> Vec<Migration> {
     ]
 }
 
+/// Initial migration: `notifications` table in the public schema.
+const NOTIFICATIONS_0001_SQL: &str =
+    include_str!("../migrations/notifications/0001_notifications.sql");
+
+/// Migrations for the `notifications` store.
+///
+/// The `notifications` table lives in the public schema (not per-workspace): a single
+/// table keyed by `workspace` column, like `mcp_audit`. Agents (e.g. `mayor`) write
+/// here via `notify.send.execute`; the web UI polls or streams these to render the
+/// bell icon panel for the human operator.
+pub fn notifications_migrations() -> Vec<Migration> {
+    vec![Migration::new(1, "0001_notifications", NOTIFICATIONS_0001_SQL)]
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
