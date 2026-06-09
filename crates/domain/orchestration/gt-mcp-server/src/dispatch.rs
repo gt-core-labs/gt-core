@@ -33,26 +33,25 @@ fn parse_args<T: serde::de::DeserializeOwned>(args: Value) -> Result<T, AppError
         .map_err(|e| AppError::Validation(format!("invalid arguments: {e}")))
 }
 
-/// Reject an `issues.create` whose bead-id prefix is not routable in the caller's
-/// workspace (hq-mt-rigs.6): the `<prefix>` of `<prefix>-<slug>` must be a
-/// registered rig prefix in `ws` or a reserved/infra prefix. A prefix registered
-/// only in another tenant does not satisfy the check (no global prefix
-/// uniqueness). No-op when no rig-prefix policy is wired or the request resolved no
-/// workspace, so single-tenant / no-Postgres builds keep accept-all create.
+/// Reject an `issues.create` whose rig is not routable in the caller's workspace
+/// (hq-mt-rigs.6, hq-bead-id-standard.2): the `rig` field (or the prefix derived
+/// from the provided `id`) must be a registered rig prefix in `ws` or a reserved/
+/// infra prefix. A prefix registered only in another tenant does not satisfy the
+/// check (no global prefix uniqueness). No-op when no rig-prefix policy is wired
+/// or the request resolved no workspace.
 async fn enforce_rig_prefix(
     prefixes: Option<&dyn WorkspaceRigPrefixes>,
     ws: Option<&str>,
-    id: &str,
+    rig: &str,
 ) -> Result<(), AppError> {
     let (Some(prefixes), Some(ws)) = (prefixes, ws) else {
         return Ok(());
     };
-    let prefix = bead_prefix(id);
-    if !prefixes.is_allowed(ws, prefix).await? {
+    if !prefixes.is_allowed(ws, rig).await? {
         return Err(AppError::Validation(format!(
-            "bead id `{id}`: prefix `{prefix}` is not a registered rig prefix in workspace `{ws}` \
-             — register a rig with this prefix in this workspace first (prefixes are per-workspace; \
-             one registered only in another workspace does not count)"
+            "rig `{rig}` is not a registered rig prefix in workspace `{ws}` \
+             — register a rig with this prefix/name in this workspace first \
+             (hq-bead-id-standard: pass rig=<canonical-name>)"
         )));
     }
     Ok(())
@@ -98,16 +97,20 @@ pub async fn dispatch(
     match tool {
         "issues.create.validate" => {
             let a: CreateIssue = parse_args(args)?;
-            enforce_rig_prefix(prefixes, ws, &a.id).await?;
+            // hq-bead-id-standard.2: validate against the canonical rig name/prefix
+            // (explicit `rig` field, or prefix derived from the provided `id`).
+            enforce_rig_prefix(prefixes, ws, a.effective_rig()).await?;
             run_create_issue(store, &a, surface_tree(repo_dir).as_ref(), true).await?;
-            Ok(json!({ "ok": true }))
+            // rig echoed so callers can confirm the resolved namespace.
+            Ok(json!({ "ok": true, "rig": a.effective_rig() }))
         }
         "issues.create.execute" => {
             let a: CreateIssue = parse_args(args)?;
-            enforce_rig_prefix(prefixes, ws, &a.id).await?;
-            run_create_issue(store, &a, surface_tree(repo_dir).as_ref(), false).await?;
-            emit_issue_event(sink, store, ws, IssueVerb::Created, &a.id, actor).await;
-            Ok(json!({ "ok": true }))
+            enforce_rig_prefix(prefixes, ws, a.effective_rig()).await?;
+            // run_create_issue returns the actual bead id (which may be server-generated).
+            let bead_id = run_create_issue(store, &a, surface_tree(repo_dir).as_ref(), false).await?;
+            emit_issue_event(sink, store, ws, IssueVerb::Created, &bead_id, actor).await;
+            Ok(json!({ "ok": true, "id": bead_id }))
         }
         "issues.update.validate" => {
             let a: UpdateIssue = parse_args(args.clone())?;

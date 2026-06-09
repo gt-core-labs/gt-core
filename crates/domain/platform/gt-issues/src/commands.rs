@@ -84,12 +84,32 @@ fn default_priority() -> u8 {
     2
 }
 
+/// Generate a server-side bead id in `{rig}-{6hex}` format (hq-bead-id-standard.1).
+/// The 6-hex hash comes from the lower 24 bits of the current nanosecond timestamp;
+/// the DB primary-key constraint catches the rare collision so the caller can retry.
+fn generate_bead_id(rig: &str) -> String {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u32)
+        .unwrap_or(0);
+    format!("{rig}-{:06x}", nanos & 0x00FF_FFFF)
+}
+
 /// Input for the `issues.create` tool (hq-mcp-issues.2). Mirrors the required
 /// columns of `hq.issues`; optional fields fall back to schema defaults.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct CreateIssue {
-    /// Bead id. Must be unique in `hq.issues`; non-empty.
-    pub id: String,
+    /// Bead id. When provided, used verbatim (backward-compat with the old
+    /// `{external_ref}.{n}` format and NN-16 validation still applies). When
+    /// absent, the server generates `{rig}-{6hex}` (hq-bead-id-standard.1).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
+    /// Canonical rig namespace for this bead (hq-bead-id-standard.1). Stored
+    /// directly as `issues.rig` and used as the id prefix for auto-generated ids.
+    /// When absent, derived from the leading token of the provided `id`
+    /// (backward-compat path so existing callers that pass `id` keep working).
+    #[serde(default)]
+    pub rig: String,
     /// Human-readable title. Required.
     pub title: String,
     /// Free-text description. Default empty.
@@ -147,12 +167,34 @@ pub struct CreateIssue {
 }
 
 impl CreateIssue {
+    /// The effective rig namespace: explicit `rig` field when provided, else the
+    /// leading token of the provided `id` (backward-compat for callers that pass
+    /// `id` without `rig`).
+    pub fn effective_rig(&self) -> &str {
+        if !self.rig.is_empty() {
+            return &self.rig;
+        }
+        self.id
+            .as_deref()
+            .and_then(|id| id.split('-').next())
+            .unwrap_or("")
+    }
+
     /// Shape-only validation. Uniqueness on `id` is enforced by the DB layer at
     /// `execute` time (the duplicate-key error surfaces as `Validation` there),
     /// so a stale `validate` over the empty key namespace never races.
     pub fn validate(&self) -> Result<(), AppError> {
-        if self.id.is_empty() {
-            return Err(AppError::Validation("issue id is empty".into()));
+        // id: when provided must be non-empty; when absent, will be server-generated.
+        if let Some(id) = &self.id {
+            if id.is_empty() {
+                return Err(AppError::Validation("issue id is empty (omit to auto-generate)".into()));
+            }
+        }
+        // At least one of id or rig must identify a namespace.
+        if self.effective_rig().is_empty() {
+            return Err(AppError::Validation(
+                "rig is required when id is absent (hq-bead-id-standard.1)".into(),
+            ));
         }
         if self.title.is_empty() {
             return Err(AppError::Validation("issue title is empty".into()));
@@ -170,25 +212,36 @@ impl CreateIssue {
             )));
         }
 
-        // NN-16: every non-epic bead carries external_ref = its sub-epic and an
-        // id of `<external_ref>.<n>`. Epics are exempt. Reuses the already-ported
-        // gt-module-mcp guard so the rule matches the upstream frontier exactly.
-        taxonomy_validate(&BeadTaxonomy {
-            id: &self.id,
-            issue_type: &self.issue_type,
-            external_ref: self.external_ref.as_deref().unwrap_or(""),
-        })
-        .map_err(taxonomy_err)?;
+        // NN-16: when a manual id is provided, enforce the full old-format rule
+        // (`<external_ref>.<n>`) for backward compat. When the id will be
+        // server-generated ({rig}-{6hex} format), only require external_ref for
+        // non-epics — the id no longer embeds the epic linkage.
+        if let Some(id) = &self.id {
+            taxonomy_validate(&BeadTaxonomy {
+                id,
+                issue_type: &self.issue_type,
+                external_ref: self.external_ref.as_deref().unwrap_or(""),
+            })
+            .map_err(taxonomy_err)?;
+            // Self-cycle check only makes sense with a known id.
+            check_depends_on(id, &self.depends_on)?;
+        } else {
+            // Auto-generated id: require external_ref for non-epics (NN-16 linkage
+            // is preserved; the id format constraint is relaxed).
+            if !self.issue_type.eq_ignore_ascii_case("epic")
+                && self.external_ref.as_deref().unwrap_or("").trim().is_empty()
+            {
+                return Err(AppError::Validation(
+                    "external_ref is required for non-epic beads (NN-16)".into(),
+                ));
+            }
+        }
 
-        // Taxonomy shape rules. A fresh bead id cannot already appear in any
-        // existing `depends_on`, so the only reachable cycle at create time is
-        // the self-edge guarded below; cross-bead cycles belong to `update`.
         if self.domain.is_empty() {
             return Err(AppError::Validation(
                 "issue must declare at least one domain (doc 14 §2)".into(),
             ));
         }
-        check_depends_on(&self.id, &self.depends_on)?;
         check_surface_shape(&self.surface)?;
         if let Some(phase) = &self.phase {
             check_phase(phase)?;
@@ -207,9 +260,15 @@ impl CreateIssue {
     /// Translate onto the store's insert payload. The taxonomy columns serialize
     /// to the JSON-array form the store persists; `surface` lands as the object
     /// form `[{"path":…,"planned":…}]`.
+    ///
+    /// When `id` is absent, generates `{rig}-{6hex}` (hq-bead-id-standard.1).
+    /// The `rig` column is set from the explicit `rig` field when provided, else
+    /// derived from the id's leading token for backward compat (hq-rig-isolation.1).
     pub fn to_new(&self) -> NewIssue {
+        let rig = self.effective_rig().to_string();
+        let id = self.id.clone().unwrap_or_else(|| generate_bead_id(&rig));
         NewIssue {
-            id: self.id.clone(),
+            id,
             title: self.title.clone(),
             description: self.description.clone(),
             design: self.design.clone(),
@@ -226,8 +285,7 @@ impl CreateIssue {
             depends_on_json: to_json_array(&self.depends_on),
             role_scope: self.role_scope.clone(),
             phase: self.phase.clone(),
-            // hq-rig-isolation.1: derive rig from the leading id token (the bead prefix).
-            rig: self.id.split('-').next().unwrap_or("").to_string(),
+            rig,
         }
     }
 }
@@ -591,7 +649,8 @@ mod tests {
 
     fn base_create() -> CreateIssue {
         CreateIssue {
-            id: "hq-core-host.2".into(),
+            id: Some("hq-core-host.2".into()),
+            rig: String::new(),
             title: "t".into(),
             description: String::new(),
             design: String::new(),
@@ -646,6 +705,10 @@ mod tests {
         let mut c = base_create();
         c.created_by = String::new();
         assert!(c.validate().is_err());
+        // Empty string id is also invalid.
+        let mut c = base_create();
+        c.id = Some(String::new());
+        assert!(c.validate().is_err());
     }
 
     #[test]
@@ -664,17 +727,36 @@ mod tests {
 
     #[test]
     fn create_enforces_nn16_external_ref() {
-        // Non-epic with a mismatched sub-epic is rejected.
+        // Non-epic with a mismatched sub-epic is rejected (old format, id provided).
         let mut c = base_create();
         c.external_ref = Some("hq-other".into());
         assert!(c.validate().is_err());
-        // Missing external_ref on a non-epic is rejected.
+        // Missing external_ref on a non-epic is rejected (old format).
         let mut c = base_create();
         c.external_ref = None;
         assert!(c.validate().is_err());
-        // An epic is exempt.
+        // An epic with provided id is exempt.
         let mut c = base_create();
-        c.id = "hq-core-host".into();
+        c.id = Some("hq-core-host".into());
+        c.issue_type = "epic".into();
+        c.external_ref = None;
+        assert!(c.validate().is_ok());
+        // Auto-generated id (id=None): non-epic requires external_ref.
+        let mut c = base_create();
+        c.id = None;
+        c.rig = "hq".into();
+        c.external_ref = None;
+        assert!(c.validate().is_err());
+        // Auto-generated id: non-epic with external_ref passes.
+        let mut c = base_create();
+        c.id = None;
+        c.rig = "hq".into();
+        c.external_ref = Some("hq-core-host".into());
+        assert!(c.validate().is_ok());
+        // Auto-generated id: epic is exempt.
+        let mut c = base_create();
+        c.id = None;
+        c.rig = "hq".into();
         c.issue_type = "epic".into();
         c.external_ref = None;
         assert!(c.validate().is_ok());
@@ -682,15 +764,44 @@ mod tests {
 
     #[test]
     fn create_rejects_self_cycle_dependency() {
+        // Self-cycle only checked when id is explicitly provided.
         let mut c = base_create();
         c.depends_on = vec!["hq-core-host.2".into()];
         assert!(c.validate().is_err());
     }
 
     #[test]
+    fn create_auto_id_requires_rig_or_id() {
+        // Neither id nor rig → error.
+        let mut c = base_create();
+        c.id = None;
+        c.rig = String::new();
+        assert!(c.validate().is_err());
+        // rig alone (no id) → ok for epic.
+        c.rig = "gtweb".into();
+        c.issue_type = "epic".into();
+        c.external_ref = None;
+        assert!(c.validate().is_ok());
+    }
+
+    #[test]
+    fn create_auto_id_to_new_generates_rig_prefix_id() {
+        let mut c = base_create();
+        c.id = None;
+        c.rig = "gtweb".into();
+        c.issue_type = "epic".into();
+        c.external_ref = None;
+        let n = c.to_new();
+        assert!(n.id.starts_with("gtweb-"), "id={}", n.id);
+        assert_eq!(n.rig, "gtweb");
+    }
+
+    #[test]
     fn create_to_new_serializes_taxonomy_columns() {
         let c = base_create();
         let n = c.to_new();
+        assert_eq!(n.id, "hq-core-host.2");
+        assert_eq!(n.rig, "hq"); // derived from id prefix (backward compat)
         assert_eq!(n.domain_json, "[\"store.dolt\"]");
         assert_eq!(n.surface_json, "[]");
         assert_eq!(n.depends_on_json, "[]");
@@ -921,6 +1032,8 @@ mod tests {
         assert!(c.validate().is_err());
         // Omitted phase round-trips as None (store applies the P1 default).
         assert_eq!(base_create().to_new().phase, None);
+        // to_new sets id from the explicit field when provided.
+        assert_eq!(base_create().to_new().id, "hq-core-host.2");
     }
 
     #[test]

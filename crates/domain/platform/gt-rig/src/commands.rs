@@ -30,6 +30,10 @@ fn default_workspace() -> String {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct AddRig {
     pub name: String,
+    /// Bead-id prefix for this rig's beads. When absent or empty, defaults to `name`
+    /// (hq-bead-id-standard.4: canonical names carry the prefix namespace directly).
+    /// Must be a valid prefix when explicitly provided (alphanumeric + hyphens, ≤20 chars).
+    #[serde(default)]
     pub prefix: String,
     pub git_url: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -49,9 +53,14 @@ pub struct AddRig {
 }
 
 impl AddRig {
+    /// Effective prefix: the caller-supplied value if non-empty, else the rig name.
+    fn effective_prefix(&self) -> &str {
+        if self.prefix.is_empty() { &self.name } else { &self.prefix }
+    }
+
     fn validate_structure(&self) -> Result<(), AppError> {
         validate_rig_name(&self.name).map_err(AppError::Validation)?;
-        validate_prefix(&self.prefix).map_err(AppError::Validation)?;
+        validate_prefix(self.effective_prefix()).map_err(AppError::Validation)?;
         if self.git_url.trim().is_empty() {
             return Err(AppError::Validation("git_url is empty".into()));
         }
@@ -68,10 +77,10 @@ impl AddRig {
                 self.name
             )));
         }
-        if let Some(owner) = state.prefix_owner(&self.prefix) {
+        if let Some(owner) = state.prefix_owner(self.effective_prefix()) {
             return Err(AppError::Validation(format!(
                 "prefix {:?} already used by rig {:?}",
-                self.prefix, owner
+                self.effective_prefix(), owner
             )));
         }
         Ok(())
@@ -80,7 +89,7 @@ impl AddRig {
     fn entry(&self) -> RigEntry {
         RigEntry {
             name: self.name.clone(),
-            prefix: self.prefix.clone(),
+            prefix: self.effective_prefix().to_string(),
             git_url: self.git_url.clone(),
             push_url: self.push_url.clone(),
             upstream_url: self.upstream_url.clone(),
@@ -105,7 +114,7 @@ impl Command for AddRig {
         state.apply_add(self.entry());
         Ok(RigEvent::Added {
             rig: self.name.clone(),
-            prefix: self.prefix.clone(),
+            prefix: self.effective_prefix().to_string(),
             git_url: self.git_url.clone(),
             push_url: self.push_url.clone(),
             upstream_url: self.upstream_url.clone(),
@@ -121,6 +130,8 @@ impl Command for AddRig {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct AdoptRig {
     pub name: String,
+    /// See [`AddRig::prefix`] — defaults to `name` when absent (hq-bead-id-standard.4).
+    #[serde(default)]
     pub prefix: String,
     pub git_url: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -161,10 +172,12 @@ impl Command for AdoptRig {
     fn execute(&self, state: &mut Self::State) -> Result<Self::Output, AppError> {
         let add = self.as_add();
         add.validate(state)?;
-        state.apply_add(add.entry());
+        let entry = add.entry();
+        let effective_prefix = entry.prefix.clone();
+        state.apply_add(entry);
         Ok(RigEvent::Adopted {
             rig: self.name.clone(),
-            prefix: self.prefix.clone(),
+            prefix: effective_prefix,
             git_url: self.git_url.clone(),
             push_url: self.push_url.clone(),
             upstream_url: self.upstream_url.clone(),
@@ -667,6 +680,25 @@ mod tests {
         assert_eq!(cmd.tool_name(), "rig.add");
         let ev = cmd.execute(&mut catalog).unwrap();
         assert!(matches!(ev, RigEvent::Added { .. }));
+    }
+
+    #[test]
+    fn add_defaults_prefix_to_name_when_absent(  ) {
+        // hq-bead-id-standard.4: omitting `prefix` in the payload makes it default to `name`.
+        let json_no_prefix = serde_json::json!({
+            "name": "gtweb", "git_url": "git@g:o/gtweb.git",
+            "default_branch": "main", "now_secs": 1
+        });
+        let cmd: AddRig = serde_json::from_value(json_no_prefix).unwrap();
+        assert!(cmd.prefix.is_empty(), "deserialized prefix should be empty string");
+        assert_eq!(cmd.effective_prefix(), "gtweb", "effective_prefix falls back to name");
+        let mut catalog = RigCatalog::default();
+        let ev = cmd.execute(&mut catalog).unwrap();
+        if let RigEvent::Added { prefix, .. } = ev {
+            assert_eq!(prefix, "gtweb");
+        } else {
+            panic!("expected Added event");
+        }
     }
 
     #[test]

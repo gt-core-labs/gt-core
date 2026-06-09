@@ -707,6 +707,45 @@ impl DoltIssues {
         .await
         .map_err(map_err)?;
 
+        // hq-bead-id-standard.3: one-time backfill — map old shorthand prefixes to
+        // canonical rig names now that prefix == name is the enforced standard.
+        // Idempotent: each row is only updated once (WHERE rig = '<old>').
+        let prefix_to_name: &[(&str, &str)] = &[
+            ("gw", "gtweb"),
+            ("gm", "gtmcp"),
+            ("gp", "gtproxy"),
+        ];
+        let mut canon_updated = false;
+        for (old, new) in prefix_to_name {
+            let res = conn
+                .exec_iter(
+                    "UPDATE issues SET rig = :new WHERE rig = :old",
+                    mysql_async::params! { "new" => *new, "old" => *old },
+                )
+                .await
+                .map_err(map_err)?;
+            let affected = res.affected_rows();
+            let _ = res.drop_result().await.map_err(map_err)?;
+            if affected > 0 {
+                canon_updated = true;
+            }
+        }
+        if canon_updated {
+            let commit_res = conn
+                .exec_drop(
+                    "CALL DOLT_COMMIT('-A', '-m', :msg)",
+                    mysql_async::params! {
+                        "msg" => "hq-bead-id-standard.3: canonicalize issues.rig (gw→gtweb, gm→gtmcp, gp→gtproxy)".to_string()
+                    },
+                )
+                .await;
+            if let Err(ref e) = commit_res {
+                if !e.to_string().contains("nothing to commit") {
+                    return Err(map_err(commit_res.unwrap_err()));
+                }
+            }
+        }
+
         // hq-core-mcp.7 (docs/10 S1) — the singleton `phase_frontier` row that
         // governs the highest phase currently claimable. Created + seeded
         // `open_phase = 'P3'` (ratified 2026-06-01) the first time `ensure_schema`

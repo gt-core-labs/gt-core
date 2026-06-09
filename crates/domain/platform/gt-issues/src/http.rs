@@ -494,19 +494,20 @@ async fn create_issue(
     // paths against the `main` tree the injected provider snapshots per call —
     // git-backed when a repo is wired, accept-all otherwise — exactly the MCP path.
     let tree = st.surfaces.surface_tree();
-    run_create_issue(&store, &args, tree.as_ref(), false).await?;
+    // run_create_issue returns the actual bead id (may be server-generated).
+    let bead_id = run_create_issue(&store, &args, tree.as_ref(), false).await?;
     emit_issue_event(
         st.event_sink.as_deref(),
         &store,
         Some(ctx.workspace().as_str()),
         IssueVerb::Created,
-        &args.id,
+        &bead_id,
         st.actor.as_ref(),
     )
     .await;
     Ok((
         StatusCode::CREATED,
-        Json(json!({ "ok": true, "id": args.id })),
+        Json(json!({ "ok": true, "id": bead_id })),
     )
         .into_response())
 }

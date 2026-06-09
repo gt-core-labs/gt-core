@@ -45,18 +45,25 @@ pub struct ClaimResult {
 /// the store's duplicate-key path. `tree` is the server's `main` git tree; a
 /// non-existent `planned:false` surface path is rejected before any write
 /// (docs/10 §S3).
+///
+/// Returns the actual bead id that was persisted (hq-bead-id-standard.1: may be
+/// server-generated from `{rig}-{6hex}` when `args.id` is absent). On
+/// `validate_only`, returns an empty string (no row written, no id assigned).
 pub async fn run_create_issue(
     issues: &DoltIssues,
     args: &CreateIssue,
     tree: &(dyn SurfaceTree + Sync),
     validate_only: bool,
-) -> Result<(), AppError> {
+) -> Result<String, AppError> {
     args.validate()?;
     args.validate_surface(tree)?;
     if validate_only {
-        return Ok(());
+        return Ok(String::new());
     }
-    issues.insert(&args.to_new()).await
+    let new = args.to_new();
+    let id = new.id.clone();
+    issues.insert(&new).await?;
+    Ok(id)
 }
 
 /// `issues.update`: validate, then (execute only) patch + atomic Dolt commit.
