@@ -532,6 +532,7 @@ impl Plugin for PolecatSupervisorPlugin {
                     crew: spec.crew.clone(),
                     skills: skills.clone(),
                     hooks: hooks.clone(),
+                    maintains_heartbeat: true,
                 });
                 // Mark the bead's operating agent on the issues channel (hq-agent-observability.2)
                 // so the FE shows who works it + what they loaded.

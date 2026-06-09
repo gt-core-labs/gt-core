@@ -87,6 +87,12 @@ impl SessionRole {
     pub fn is_dog(&self) -> bool {
         matches!(self, SessionRole::Dog(_))
     }
+
+    /// Whether this role actively maintains a heartbeat file while its session is alive.
+    /// Only polecats do; interactive sessions (mayor, dog) rely on tmux presence alone.
+    pub fn maintains_heartbeat(&self) -> bool {
+        matches!(self, SessionRole::Polecat)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -109,6 +115,11 @@ pub struct Session {
     /// Hook kinds loaded into the agent. Same provenance as `skills`.
     #[serde(default)]
     pub hooks: Vec<String>,
+    /// Mirrors `AgentEvent::Spawned::maintains_heartbeat`. The session reconciler reads this
+    /// to decide whether a stale heartbeat is evidence of death. Defaults to `false` for
+    /// sessions replayed from pre-flag log entries.
+    #[serde(default)]
+    pub maintains_heartbeat: bool,
 }
 
 impl Session {
@@ -123,6 +134,7 @@ impl Session {
             crew: None,
             skills: Vec::new(),
             hooks: Vec::new(),
+            maintains_heartbeat: true,
         }
     }
 
@@ -141,6 +153,7 @@ impl Session {
             crew,
             skills: Vec::new(),
             hooks: Vec::new(),
+            maintains_heartbeat: role.maintains_heartbeat(),
         }
     }
 
@@ -224,10 +237,11 @@ impl SessionRegistry {
     /// total → reconstrucción determinista del estado desde el log (gate del Paso 3).
     pub fn apply(&mut self, event: &AgentEvent) {
         match event {
-            AgentEvent::Spawned { session, rig, role, crew, skills, hooks } => {
+            AgentEvent::Spawned { session, rig, role, crew, skills, hooks, maintains_heartbeat } => {
                 let mut s = Session::with_role(session.clone(), rig.clone(), *role, crew.clone());
                 s.skills = skills.clone();
                 s.hooks = hooks.clone();
+                s.maintains_heartbeat = *maintains_heartbeat;
                 self.add(s);
             }
             AgentEvent::Heartbeat { .. } => {} // no cambia el registro

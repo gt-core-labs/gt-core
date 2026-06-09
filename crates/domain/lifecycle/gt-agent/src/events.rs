@@ -29,6 +29,13 @@ pub enum AgentEvent {
         /// as `skills`.
         #[serde(default)]
         hooks: Vec<String>,
+        /// Whether this session actively maintains a heartbeat file while alive. Polecats do;
+        /// interactive sessions (mayor, dog) do not. The session reconciler uses this flag to
+        /// decide whether a stale heartbeat is evidence of death. `#[serde(default)]` keeps
+        /// pre-flag log entries replayable — old events default to `false` (safe: the reconciler
+        /// cannot conclude death from a missing heartbeat it was never promised).
+        #[serde(default)]
+        maintains_heartbeat: bool,
     },
     Heartbeat { session: String },
     SessionEnd { session: String },

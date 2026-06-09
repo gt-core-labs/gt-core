@@ -1415,6 +1415,7 @@ mod tests {
                 crew: None,
                 skills: vec![],
                 hooks: vec![],
+                maintains_heartbeat: false,
             },
         )
         .unwrap();
@@ -1511,6 +1512,7 @@ mod tests {
                 crew: None,
                 skills: vec![],
                 hooks: vec![],
+                maintains_heartbeat: false,
             },
         )
         .unwrap();
@@ -1547,6 +1549,7 @@ mod tests {
                 crew: None,
                 skills: vec![],
                 hooks: vec![],
+                maintains_heartbeat: false,
             },
         )
         .unwrap();

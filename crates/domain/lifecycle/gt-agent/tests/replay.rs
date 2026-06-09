@@ -18,6 +18,7 @@ fn make_events() -> Vec<AgentEvent> {
             crew: None,
             skills: Vec::new(),
             hooks: Vec::new(),
+            maintains_heartbeat: true,
         });
     }
     for i in 0..30 {

@@ -91,6 +91,7 @@ impl SpawnSpec {
             // path (gt-composition) stamps skills/hooks (hq-orch-sessions.2).
             skills: Vec::new(),
             hooks: Vec::new(),
+            maintains_heartbeat: true,
         }
     }
 

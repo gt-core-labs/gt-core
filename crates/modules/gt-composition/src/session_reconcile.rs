@@ -10,15 +10,23 @@
 //!
 //! This is the reconciler for exactly that, modeled on the witness ([`crate::witness_sweep`]):
 //! each tick [`SessionReconciler::sweep`] replays the workspace `agent.*` log into a
-//! [`SessionRegistry`], and for every still-active session whose tmux session is gone AND whose
-//! heartbeat is stale (the polecat is provably not running) it emits `agent.killed.v1` onto the
-//! hub. The daemon's event-log sink persists it, so the next backend fold shows the session
-//! `killed` instead of a ghost `spawned`. Idempotent: once killed the session is terminal in the
-//! replay, so it is not active on the next sweep.
+//! [`SessionRegistry`], and for every still-active session whose process is provably gone it emits
+//! `agent.killed.v1` onto the hub. The daemon's event-log sink persists it, so the next backend
+//! fold shows the session `killed` instead of a ghost `spawned`. Idempotent: once killed the
+//! session is terminal in the replay, so it is not active on the next sweep.
 //!
-//! It only ever CLOSES a session that is demonstrably dead (no tmux session + stale heartbeat) —
-//! a live or recently-active polecat (tmux present or heartbeat fresh) is left untouched, so a
-//! healthy session is never prematurely reaped.
+//! ## Death signals per session kind
+//!
+//! Not all sessions maintain a heartbeat file. Polecats do; interactive sessions (mayor, dog) do
+//! not — their liveness is attested by tmux alone. The `maintains_heartbeat` flag in
+//! `AgentEvent::Spawned` declares this contract per session. The reconciler respects it:
+//!
+//! - `maintains_heartbeat = true` (polecats): orphan iff tmux gone AND heartbeat stale.
+//! - `maintains_heartbeat = false` (mayor/dog): orphan iff tmux gone — heartbeat is not checked
+//!   because it was never promised. If tmux is absent but the session didn't promise a heartbeat
+//!   we cannot distinguish "dead" from "tmux probe unavailable", so we leave it alone.
+//!
+//! The safe-by-default rule: a session can only be reaped by a signal it explicitly promised.
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -33,11 +41,22 @@ use gt_polecat::tmux::Tmux;
 
 use crate::mcp::eventlog::EventLog;
 
-/// Decide whether an active session is an orphan to reap: it is dead iff its tmux session is gone
-/// AND its heartbeat is stale. A single live signal (session present OR fresh heartbeat) keeps it.
+/// Decide whether an active session is an orphan to reap.
+///
+/// The combined C+D policy:
+/// - If tmux is alive → keep (positive liveness signal always wins).
+/// - If the session doesn't maintain a heartbeat → keep (we can't confirm death without it).
+/// - Otherwise (tmux gone + heartbeat promised) → orphan iff heartbeat is stale.
+///
 /// Pure, so the reap policy is unit-tested without tmux/fs.
-fn is_orphan(tmux_alive: bool, heartbeat_stale: bool) -> bool {
-    !tmux_alive && heartbeat_stale
+fn is_orphan(tmux_alive: bool, heartbeat_stale: bool, maintains_heartbeat: bool) -> bool {
+    if tmux_alive {
+        return false;
+    }
+    if !maintains_heartbeat {
+        return false;
+    }
+    heartbeat_stale
 }
 
 /// The session reconciler. Replays the workspace `agent.*` log to find still-open sessions, and
@@ -104,7 +123,7 @@ impl SessionReconciler {
             let hb = self.heartbeat_dir.join(format!("{}.heartbeat", session.id));
             let alive = self.tmux.has_session(&session.id);
             let stale = gt_polecat::lifecycle::heartbeat_is_stale(&hb, self.stale_after);
-            if !is_orphan(alive, stale) {
+            if !is_orphan(alive, stale, session.maintains_heartbeat) {
                 continue;
             }
             let event = AgentEvent::Killed {
@@ -136,15 +155,27 @@ mod tests {
     use super::*;
 
     #[test]
-    fn orphan_only_when_both_signals_dead() {
-        // Reap only when the tmux session is gone AND the heartbeat is stale.
+    fn polecat_orphan_requires_both_signals_dead() {
+        // A polecat (maintains_heartbeat=true) is only reaped when tmux is gone AND heartbeat stale.
         assert!(
-            is_orphan(false, true),
-            "no session + stale heartbeat ⇒ orphan"
+            is_orphan(false, true, true),
+            "polecat: no tmux + stale heartbeat ⇒ orphan"
         );
-        // Any single live signal keeps the session.
-        assert!(!is_orphan(true, true), "tmux session present ⇒ keep");
-        assert!(!is_orphan(false, false), "fresh heartbeat ⇒ keep");
-        assert!(!is_orphan(true, false), "alive on both ⇒ keep");
+        assert!(!is_orphan(true, true, true), "polecat: tmux present ⇒ keep");
+        assert!(!is_orphan(false, false, true), "polecat: fresh heartbeat ⇒ keep");
+        assert!(!is_orphan(true, false, true), "polecat: alive on both ⇒ keep");
+    }
+
+    #[test]
+    fn interactive_session_never_reaped_by_reconciler() {
+        // Mayor and dog (maintains_heartbeat=false) are never reaped by the reconciler regardless
+        // of heartbeat state — the absence of a heartbeat file is not evidence of death for them.
+        assert!(
+            !is_orphan(false, true, false),
+            "mayor/dog: no tmux + stale (or absent) heartbeat ⇒ keep (no heartbeat promised)"
+        );
+        assert!(!is_orphan(false, false, false), "mayor/dog: no tmux + fresh ⇒ keep");
+        assert!(!is_orphan(true, true, false), "mayor/dog: tmux present ⇒ keep");
+        assert!(!is_orphan(true, false, false), "mayor/dog: alive ⇒ keep");
     }
 }

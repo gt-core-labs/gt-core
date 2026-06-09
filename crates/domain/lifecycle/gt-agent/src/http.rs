@@ -257,6 +257,7 @@ async fn spawn_session(
             // A manual UI spawn has no worktree manifest (hq-orch-sessions.2).
             skills: Vec::new(),
             hooks: Vec::new(),
+            maintains_heartbeat: role.maintains_heartbeat(),
         },
         &session,
     )?;

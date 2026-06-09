@@ -789,6 +789,7 @@ mod session_minutes_tests {
                 crew: None,
                 skills: Vec::new(),
                 hooks: Vec::new(),
+                maintains_heartbeat: true,
             },
             "2026-06-03T12:00:00Z",
         ))
