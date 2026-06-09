@@ -6,10 +6,10 @@
 //! `AccountRegistry::apply_*` methods so the legacy actor messages and this path stay in
 //! lockstep) and **returns the `QuotaEvent` it produced** for the actor to emit on the relay.
 //!
-//! `validate` is deliberately lenient — it mirrors the actor's behaviour, which emits the
-//! event regardless of whether the account/window exists (the consumption math just no-ops on
-//! a missing window). It only rejects structurally invalid requests (empty ids, rotating an
-//! account to itself). The clock travels as `now_secs` data, keeping the path replay-able.
+//! `validate` rejects structurally invalid requests (empty ids, rotating an account to itself)
+//! and domain-invalid ones (`RotateAccount` also checks that the destination is registered and
+//! Healthy — rotating to a Cooldown/Limited/Blocked account leaves the workspace without
+//! capacity). The clock travels as `now_secs` data, keeping the path replay-able.
 
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -17,7 +17,7 @@ use serde::{Deserialize, Serialize};
 use gt_events::{AppError, Command};
 
 use crate::events::QuotaEvent;
-use crate::state::{Account, AccountRegistry};
+use crate::state::{Account, AccountQuotaStatus, AccountRegistry};
 
 /// A local usage sample (one model response), attributable to a session.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
@@ -129,7 +129,7 @@ impl Command for RotateAccount {
     type Output = QuotaEvent;
     type State = AccountRegistry;
 
-    fn validate(&self, _state: &Self::State) -> Result<(), AppError> {
+    fn validate(&self, state: &Self::State) -> Result<(), AppError> {
         if self.from_account.is_empty() || self.to_account.is_empty() {
             return Err(AppError::Validation("rotation account is empty".into()));
         }
@@ -137,6 +137,21 @@ impl Command for RotateAccount {
             return Err(AppError::Validation(
                 "cannot rotate an account onto itself".into(),
             ));
+        }
+        match state.get(&self.to_account) {
+            None => {
+                return Err(AppError::Validation(format!(
+                    "to_account '{}' is not registered — only known accounts can be rotation targets",
+                    self.to_account
+                )));
+            }
+            Some(acc) if acc.status != AccountQuotaStatus::Healthy => {
+                return Err(AppError::Validation(format!(
+                    "to_account '{}' is {:?} — rotation target must be Healthy",
+                    self.to_account, acc.status
+                )));
+            }
+            Some(_) => {}
         }
         Ok(())
     }
@@ -293,6 +308,8 @@ mod tests {
                 consumed: 0.0,
             }),
         });
+        // acc-2: a healthy standby used by rotate tests as a valid target.
+        r.upsert_account(Account::new("acc-2"));
         r
     }
 
@@ -456,5 +473,75 @@ mod tests {
         let w = r.get("acc-1").unwrap().window.as_ref().unwrap();
         assert_eq!(w.consumed, 750.0, "1000 limit - 250 remaining");
         assert_eq!(w.resets_at_secs, 20_000);
+    }
+
+    // --- hq-quota-refinement.2: RotateAccount::validate destination checks ---
+
+    #[test]
+    fn rotate_rejects_unregistered_destination() {
+        let r = registry_with_account(); // only acc-1 and acc-2
+        let cmd = RotateAccount {
+            from_account: "acc-1".into(),
+            to_account: "unknown".into(),
+            now_secs: 600,
+        };
+        let err = cmd.validate(&r).unwrap_err();
+        assert!(
+            matches!(err, AppError::Validation(ref msg) if msg.contains("not registered")),
+            "unregistered target must be rejected: {err:?}"
+        );
+    }
+
+    #[test]
+    fn rotate_rejects_cooldown_destination() {
+        let mut r = registry_with_account();
+        // Park acc-2 in Cooldown.
+        r.upsert_account(Account {
+            id: "acc-2".into(),
+            status: AccountQuotaStatus::Cooldown,
+            window: None,
+        });
+        let cmd = RotateAccount {
+            from_account: "acc-1".into(),
+            to_account: "acc-2".into(),
+            now_secs: 600,
+        };
+        let err = cmd.validate(&r).unwrap_err();
+        assert!(
+            matches!(err, AppError::Validation(ref msg) if msg.contains("Healthy")),
+            "Cooldown target must be rejected: {err:?}"
+        );
+    }
+
+    #[test]
+    fn rotate_rejects_limited_destination() {
+        let mut r = registry_with_account();
+        r.upsert_account(Account {
+            id: "acc-2".into(),
+            status: AccountQuotaStatus::Limited,
+            window: None,
+        });
+        let cmd = RotateAccount {
+            from_account: "acc-1".into(),
+            to_account: "acc-2".into(),
+            now_secs: 600,
+        };
+        assert!(matches!(cmd.validate(&r), Err(AppError::Validation(_))));
+    }
+
+    #[test]
+    fn rotate_accepts_healthy_destination() {
+        // acc-2 in registry_with_account() is Healthy — must pass.
+        let mut r = registry_with_account();
+        let cmd = RotateAccount {
+            from_account: "acc-1".into(),
+            to_account: "acc-2".into(),
+            now_secs: 600,
+        };
+        assert!(cmd.validate(&r).is_ok(), "Healthy target must be accepted");
+        // execute completes the rotation.
+        let ev = cmd.execute(&mut r).unwrap();
+        assert!(matches!(ev, QuotaEvent::Rotated { .. }));
+        assert_eq!(r.get("acc-1").unwrap().status, AccountQuotaStatus::Cooldown);
     }
 }
