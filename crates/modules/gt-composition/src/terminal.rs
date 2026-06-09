@@ -128,15 +128,24 @@ fn active_claude_account(log: &EventLog, workspace: &str) -> Option<(String, Str
     if state.registered.is_empty() {
         return None;
     }
-    // A registered account is healthy unless the log marked it Cooldown/Limited/Blocked. Every
-    // `AccountRegistered` also seeds an `accounts` entry (Healthy), so a missing entry ⇒ treat as
-    // healthy (defensive; should not happen).
+    // A registered account is operable unless the log marked it Cooldown/Limited/Blocked, OR its
+    // weekly quota is exhausted (consumed >= limit). Every `AccountRegistered` also seeds an
+    // `accounts` entry (Healthy), so a missing entry ⇒ treat as healthy (defensive).
+    // Weekly exhaustion: if `weekly_window` is present and consumed ≥ limit the account is
+    // blocked for the week even when its 5h status is Healthy — skip it (hq-quota-weekly.3).
     let is_healthy = |account: &str| {
-        state
-            .accounts
-            .get(account)
-            .map(|a| a.status == AccountQuotaStatus::Healthy)
-            .unwrap_or(true)
+        let Some(a) = state.accounts.get(account) else {
+            return true;
+        };
+        if a.status != AccountQuotaStatus::Healthy {
+            return false;
+        }
+        if let Some(ww) = &a.weekly_window {
+            if ww.consumed.ceil() as u64 >= ww.limit {
+                return false;
+            }
+        }
+        true
     };
     let active = state
         .rotations
@@ -1689,6 +1698,71 @@ mod tests {
         assert!(
             picked.is_some(),
             "a session still launches even when no account is healthy"
+        );
+    }
+
+    #[tokio::test]
+    async fn active_claude_account_excludes_weekly_exhausted_accounts() {
+        // hq-quota-weekly.3: an account whose weekly_window.consumed >= limit must be skipped even
+        // when its 5h status is Healthy. The selection falls through to a non-exhausted standby.
+        use gt_quota::{AccountWindow, QuotaEvent, WindowKind};
+        use tempfile::TempDir;
+        let dir = TempDir::new().unwrap();
+        let log = EventLog::new(Some(dir.path().to_path_buf()));
+
+        // Register two accounts.
+        for (a, d) in [("acct-a", "/dirs/a"), ("acct-b", "/dirs/b")] {
+            log.append(
+                Some("acme"),
+                QuotaEvent::AccountRegistered {
+                    account: a.into(),
+                    config_dir: d.into(),
+                    now_secs: 0,
+                },
+            )
+            .unwrap();
+        }
+        // Probe acct-a with weekly_remaining=0 → weekly window exhausted.
+        log.append(
+            Some("acme"),
+            QuotaEvent::UsageProbed {
+                account: "acct-a".into(),
+                remaining: 30_000_000, // 5h window still has capacity
+                resets_at_secs: 18_000,
+                weekly_remaining: Some(0), // weekly exhausted
+                weekly_resets_at_secs: Some(604_800),
+                now_secs: 1_000,
+            },
+        )
+        .unwrap();
+
+        // acct-a is weekly-exhausted; acct-b has no weekly window → still operable.
+        assert_eq!(
+            active_claude_account(&log, "acme")
+                .map(|(a, _)| a)
+                .as_deref(),
+            Some("acct-b"),
+            "weekly-exhausted account must be skipped in favour of operable standby"
+        );
+
+        // Probe acct-b as weekly-exhausted too. Now every account is weekly-exhausted;
+        // last-resort branch still returns one so the session can launch (same behaviour as
+        // all-Cooldown path).
+        log.append(
+            Some("acme"),
+            QuotaEvent::UsageProbed {
+                account: "acct-b".into(),
+                remaining: 20_000_000,
+                resets_at_secs: 18_000,
+                weekly_remaining: Some(0),
+                weekly_resets_at_secs: Some(604_800),
+                now_secs: 2_000,
+            },
+        )
+        .unwrap();
+        assert!(
+            active_claude_account(&log, "acme").is_some(),
+            "last-resort still yields an account when all are weekly-exhausted"
         );
     }
 
