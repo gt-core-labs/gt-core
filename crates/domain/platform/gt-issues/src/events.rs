@@ -77,6 +77,9 @@ pub struct IssueEvent {
     pub id: String,
     /// The server-attributed actor that drove the mutation.
     pub actor: String,
+    /// Rig prefix derived from the bead id (`<prefix>-<slug>`). Carried in the payload
+    /// so the SSE feed's `?rig=` filter can narrow delivery to one rig's events.
+    pub rig: String,
     /// The full row after the mutation, when it could be read back. `None` only on a
     /// best-effort read failure — the event still fires so the client knows to refresh.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -126,12 +129,14 @@ pub async fn emit_issue_event(
         .ok()
         .flatten()
         .and_then(|detail| serde_json::to_value(detail).ok());
+    let rig = id.split('-').next().unwrap_or("").to_string();
     sink.emit(
         workspace,
         &IssueEvent {
             verb,
             id: id.to_string(),
             actor: actor.to_string(),
+            rig,
             issue,
         },
     );
@@ -167,25 +172,28 @@ mod tests {
             verb: IssueVerb::Transitioned,
             id: "hq-x.1".into(),
             actor: "mcp-local".into(),
+            rig: "hq".into(),
             issue: None,
         };
         assert_eq!(ev.kind(), "issues.transitioned.v1");
     }
 
     #[test]
-    fn serialized_payload_carries_id_actor_and_row_and_omits_absent_row() {
+    fn serialized_payload_carries_id_actor_rig_and_row_and_omits_absent_row() {
         // The serialized form IS the SSE frame data; a missing row must be omitted, not
         // emitted as `null`, so a client can treat presence as "patch in place".
         let ev = IssueEvent {
             verb: IssueVerb::Claimed,
             id: "hq-x.1".into(),
             actor: "alice".into(),
+            rig: "hq".into(),
             issue: None,
         };
         let v = serde_json::to_value(&ev).unwrap();
         assert_eq!(v["verb"], "claimed");
         assert_eq!(v["id"], "hq-x.1");
         assert_eq!(v["actor"], "alice");
+        assert_eq!(v["rig"], "hq");
         assert!(v.get("issue").is_none(), "absent row must be omitted");
 
         let ev = IssueEvent {

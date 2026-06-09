@@ -181,6 +181,7 @@ mod issue_sink_tests {
                 verb: IssueVerb::Transitioned,
                 id: "hq-x.1".into(),
                 actor: "mcp-local".into(),
+                rig: "hq".into(),
                 issue: Some(serde_json::json!({ "id": "hq-x.1", "status": "working" })),
             },
         );

@@ -92,10 +92,12 @@ async fn stream_request(
 
 /// A transitioned-issue event carrying a representative row.
 fn transitioned(id: &str, status: &str) -> IssueEvent {
+    let rig = id.split('-').next().unwrap_or("").to_string();
     IssueEvent {
         verb: IssueVerb::Transitioned,
         id: id.to_string(),
         actor: "mcp-local".into(),
+        rig,
         issue: Some(serde_json::json!({ "id": id, "status": status, "version": 2 })),
     }
 }
@@ -188,4 +190,39 @@ async fn an_issue_event_is_isolated_to_its_tenant() {
         events.is_empty(),
         "another tenant's feed never carries acme's issue event"
     );
+}
+
+#[tokio::test]
+async fn rig_filter_delivers_only_matching_prefix_events() {
+    let dir = TempDir::new().unwrap();
+    let log = Arc::new(EventLog::new(Some(dir.path().to_path_buf())));
+    let sink = EventLogIssueSink::new(log.clone());
+
+    // Two rigs in the same workspace: "hq" and "gw".
+    sink.emit(Some("acme"), &transitioned("hq-x.1", "working"));
+    sink.emit(Some("acme"), &transitioned("gw-y.1", "working"));
+    sink.emit(Some("acme"), &transitioned("hq-x.2", "closed"));
+
+    // ?rig=hq must only deliver the two hq-* beads.
+    let resp =
+        stream_request(log.clone(), "?channel=issues&rig=hq", &[("x-workspace", "acme")]).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let events = collect_events(resp.into_body(), 2).await;
+    assert_eq!(events.len(), 2, "only hq-* events pass the rig filter");
+    assert!(
+        events.iter().all(|e| e.data["rig"] == "hq"),
+        "every delivered event belongs to the hq rig"
+    );
+
+    // ?rig=gw must only deliver the one gw-* bead.
+    let resp =
+        stream_request(log.clone(), "?channel=issues&rig=gw", &[("x-workspace", "acme")]).await;
+    let events = collect_events(resp.into_body(), 1).await;
+    assert_eq!(events.len(), 1, "only the gw-* event passes");
+    assert_eq!(events[0].data["id"], "gw-y.1");
+
+    // No ?rig= delivers all three.
+    let resp = stream_request(log, "?channel=issues", &[("x-workspace", "acme")]).await;
+    let events = collect_events(resp.into_body(), 3).await;
+    assert_eq!(events.len(), 3, "no rig filter = all events");
 }
