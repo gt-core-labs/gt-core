@@ -127,8 +127,9 @@ pub async fn run_transition_issue(
 /// [`set_delivered_sha`](DoltIssues::set_delivered_sha). A bead with no
 /// non-`planned` surface (wontfix / pure process) closes without a stamp, leaving
 /// `delivered_sha` NULL — correct, since no artifact was produced. With no
-/// `inspector` (no repo wired) verification is skipped and the close behaves as
-/// before, leaving `delivered_sha` NULL.
+/// `inspector` (no repo wired) verification is skipped but `delivered_sha` is
+/// still populated with the caller-supplied sha for code-surface beads, so
+/// consumers never see a NULL sha for beads that declare a surface and provide one.
 ///
 /// The note is appended **before** the close flips the status, so even a
 /// subsequently-rejected close (e.g. already-closed) leaves the sha breadcrumb.
@@ -198,6 +199,18 @@ pub async fn run_close_issue(
                 )));
             }
             delivered = Some(info.full_sha);
+        }
+    }
+
+    // When no inspector is wired (no repo configured) S2 is skipped entirely.
+    // Still stamp delivered_sha with the caller-supplied sha so code-surface
+    // beads never leave it NULL regardless of whether git verification ran.
+    // Metadata-only beads (non_planned empty) correctly keep delivered_sha NULL.
+    if delivered.is_none() {
+        if let Some(s) = sha {
+            if !non_planned.is_empty() {
+                delivered = Some(s.to_string());
+            }
         }
     }
 

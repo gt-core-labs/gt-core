@@ -525,3 +525,60 @@ async fn git_verification_rejects_bad_surface_and_unverified_close() {
 
     let _ = std::fs::remove_dir_all(&tmp);
 }
+
+/// Without a git inspector wired (no `GT_REPO_DIR`), closing a code-surface bead
+/// with a `commit_sha` must still populate `delivered_sha` — the sha is recorded
+/// as-provided rather than left NULL (hq-flow-validation-20260609.2).
+#[tokio::test]
+async fn close_without_inspector_populates_delivered_sha() {
+    let Ok(base) = std::env::var("GT_DOLT_URL") else {
+        eprintln!("GT_DOLT_URL unset — skipping http contract");
+        return;
+    };
+    let base = base.trim_end_matches('/').to_string();
+    let db = "gt_http_delivered_sha_fallback";
+    fresh_db(&base, db).await.expect("db");
+    // No git verification wired — this is the default router().
+    let app = router(&base, db).await;
+
+    // Parent epic required by the NN-16 taxonomy rule.
+    let (s, _) = send(
+        &app,
+        post_json("/", json!({ "id": "hq-ds", "title": "epic", "issue_type": "epic", "created_by": "test", "domain": ["platform.rig"] })),
+    )
+    .await;
+    assert_eq!(s, StatusCode::CREATED);
+
+    // A bead with a non-planned surface (code bead).
+    let sha = "a1b2c3d4e5f6789";
+    let (s, _) = send(
+        &app,
+        post_json("/", json!({
+            "id": "hq-ds.1", "title": "code bead", "issue_type": "bead",
+            "external_ref": "hq-ds", "created_by": "test", "domain": ["platform.rig"],
+            "surface": [{ "path": "gt-mcp-server", "planned": false }],
+        })),
+    )
+    .await;
+    assert_eq!(s, StatusCode::CREATED);
+
+    // Close with a sha — no inspector to verify, so S2 is skipped entirely.
+    let (status, body) = send(
+        &app,
+        post_json("/hq-ds.1/close", json!({ "commit_sha": sha, "closed_by_session": "test" })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "close accepted without inspector: {body}");
+
+    // The sha must appear in delivered_sha — not left NULL.
+    let (_, detail) = send(&app, get("/hq-ds.1")).await;
+    assert_eq!(detail["status"], "closed");
+    assert_eq!(
+        detail["delivered_sha"].as_str().unwrap_or(""),
+        sha,
+        "delivered_sha populated from caller-supplied sha when inspector absent"
+    );
+    // The notes breadcrumb is still present for human audit.
+    let notes = detail["notes"].as_str().unwrap_or("");
+    assert!(notes.contains(sha), "notes still contain sha breadcrumb: {notes}");
+}
