@@ -179,7 +179,7 @@ pub fn seed_mcp_config(base_repo: &Path, worktree: &Path) {
 /// of [`seed_mcp_config`] when the daemon has minted a live token — the generated file is always
 /// valid for THIS sling, regardless of what (if anything) the operator placed in the base checkout.
 /// Best-effort: any write failure is logged and the caller falls back to [`seed_mcp_config`].
-pub fn write_mcp_json(worktree: &Path, url: &str, workspace: &str, token: &str) -> bool {
+pub fn write_mcp_json(worktree: &Path, url: &str, workspace: &str, rig: &str, token: &str) -> bool {
     let dst = worktree.join(".mcp.json");
     let mcp_url = format!("{}/mcp", url.trim_end_matches('/'));
     let body = serde_json::json!({
@@ -190,6 +190,9 @@ pub fn write_mcp_json(worktree: &Path, url: &str, workspace: &str, token: &str) 
                 "headers": {
                     "Authorization": format!("Bearer {token}"),
                     "X-Workspace": workspace,
+                    // hq-rig-isolation.6: carry the rig so the server can apply it as
+                    // a default filter without the agent explicitly passing ?rig= each time.
+                    "X-Rig": rig,
                 }
             }
         }
@@ -203,6 +206,40 @@ pub fn write_mcp_json(worktree: &Path, url: &str, workspace: &str, token: &str) 
             false
         }
     }
+}
+
+/// Write a per-sling `.gt-config/` into `worktree` so the `gt` CLI running inside the polecat
+/// reads the correct `rig`, `workspace`, and `server_url` without manual setup
+/// (hq-rig-isolation.5). The config follows the same layout as `gt init` produces:
+/// `config.toml` names the active profile (`default`) and `default.toml` holds the fields.
+///
+/// Best-effort: any write failure is logged and the caller continues — MCP still works via
+/// `.mcp.json`; the rig just won't be auto-injected from the config.
+pub fn write_gt_config(
+    worktree: &Path,
+    server_url: &str,
+    workspace: &str,
+    rig: &str,
+    token: &str,
+) -> bool {
+    let dir = worktree.join(".gt-config");
+    if std::fs::create_dir_all(&dir).is_err() {
+        return false;
+    }
+    let profile = format!(
+        "server_url = \"{server_url}\"\n\
+         workspace = \"{workspace}\"\n\
+         rig = \"{rig}\"\n\
+         access_token = \"{token}\"\n\
+         refresh_token = \"\"\n"
+    );
+    let ok = std::fs::write(dir.join("config.toml"), "active = \"default\"\n")
+        .map_err(|e| eprintln!("[polecat] .gt-config/config.toml write skipped: {e}"))
+        .is_ok()
+        && std::fs::write(dir.join("default.toml"), profile)
+            .map_err(|e| eprintln!("[polecat] .gt-config/default.toml write skipped: {e}"))
+            .is_ok();
+    ok
 }
 
 /// Install the polecat reporting hooks at the account's USER settings

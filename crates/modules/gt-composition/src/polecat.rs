@@ -362,13 +362,23 @@ impl Plugin for PolecatSupervisorPlugin {
                             // always valid for THIS sling, surviving rig changes and token rotation
                             // without the operator re-placing a static file. Fall back to copying
                             // the operator-placed base-checkout file when no URL is available.
-                            let mcp_written = self.server_url.as_deref().zip(
+                            let url_and_tok = self.server_url.as_deref().zip(
                                 spec.env.iter().find(|(k, _)| k == "GT_TOKEN").map(|(_, v)| v.as_str())
-                            ).map(|(url, tok)| {
-                                crate::worktree::write_mcp_json(&wt, url, &self.workspace, tok)
+                            );
+                            let mcp_written = url_and_tok.map(|(url, tok)| {
+                                crate::worktree::write_mcp_json(&wt, url, &self.workspace, &spec.rig, tok)
                             }).unwrap_or(false);
                             if !mcp_written {
                                 crate::worktree::seed_mcp_config(&self.template.workdir, &wt);
+                            }
+                            // hq-rig-isolation.5: write .gt-config so `gt` CLI knows the rig.
+                            // Best-effort alongside write_mcp_json — same server_url + token.
+                            if let Some((url, tok)) = url_and_tok {
+                                if !crate::worktree::write_gt_config(
+                                    &wt, url, &self.workspace, &spec.rig, tok,
+                                ) {
+                                    eprintln!("[polecat] .gt-config write skipped for {bead}");
+                                }
                             }
                             // Hand the tree to the non-root polecat user (hq-quota-accounts.6) so the
                             // dropped-privilege re-exec can read/write it. Best-effort.

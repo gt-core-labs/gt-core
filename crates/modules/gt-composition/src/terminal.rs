@@ -336,7 +336,7 @@ fn prepare_role_skills(
                     // .mcp.json talks to /mcp over HTTP with this token (hq-mcp-http) — the stdio
                     // proxy surfaced resources but not tools. .gt-config still rides for the `gt mcp
                     // call|list` shell surface the agent may use.
-                    if write_mcp_json(&workdir, url, workspace, &token) {
+                    if write_mcp_json(&workdir, url, workspace, &rig, &token) {
                         wrote += 1;
                     }
                     true
@@ -442,7 +442,7 @@ fn write_gt_config(
 /// read `gt://…` but not call `issues.*`/`agent.*`/`merge.*`. Talking to `/mcp` directly — exactly
 /// what the proven polecat path does — makes the tools surface. The minted per-session token rides in
 /// the `Authorization` header and the tenant in `X-Workspace`. `false` on any write error.
-fn write_mcp_json(workdir: &Path, server_url: &str, workspace: &str, token: &str) -> bool {
+fn write_mcp_json(workdir: &Path, server_url: &str, workspace: &str, rig: &str, token: &str) -> bool {
     if std::fs::create_dir_all(workdir).is_err() {
         return false;
     }
@@ -455,6 +455,7 @@ fn write_mcp_json(workdir: &Path, server_url: &str, workspace: &str, token: &str
                 "headers": {
                     "Authorization": format!("Bearer {token}"),
                     "X-Workspace": workspace,
+                    "X-Rig": rig,
                 }
             }
         }
@@ -1728,6 +1729,7 @@ mod tests {
             dir.path(),
             "http://127.0.0.1:8765",
             "default",
+            "hq",
             "header.payload.sig"
         ));
         let v: serde_json::Value =

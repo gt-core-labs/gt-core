@@ -90,6 +90,8 @@ pub async fn dispatch(
     actor: &str,
     repo_dir: Option<&Path>,
     ws: Option<&str>,
+    // hq-rig-isolation.7: X-Rig header value; default rig when args.rig is absent.
+    request_rig: Option<&str>,
     prefixes: Option<&dyn WorkspaceRigPrefixes>,
     sink: Option<&dyn IssueEventSink>,
 ) -> Result<Value, AppError> {
@@ -205,7 +207,10 @@ pub async fn dispatch(
                 offset: a.offset,
                 full: a.full,
                 ready: a.ready,
-                rig: a.rig,
+                // hq-rig-isolation.7: if the agent didn't pass rig explicitly, fall back to
+                // the X-Rig header the polecat's .mcp.json injects on every call — so `list`
+                // is automatically scoped to the right rig without prompt engineering.
+                rig: a.rig.or_else(|| request_rig.map(str::to_string)),
             };
             if filter.ready {
                 // ready=true needs phase frontier + dep index + git tree (same as resource path)

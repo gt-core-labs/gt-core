@@ -113,6 +113,26 @@ pub fn workspace_from_ext(ext: &Extensions) -> Option<&str> {
         .filter(|s| !s.is_empty())
 }
 
+/// The HTTP header carrying the caller's active rig (hq-rig-isolation.6).
+///
+/// Written into `.mcp.json` at sling/terminal-session time so the polecat's MCP
+/// connection always carries the rig it was launched for, without the agent having
+/// to pass it in every tool invocation.
+pub const RIG_HEADER: &str = "x-rig";
+
+/// Extract the caller's rig from a request's extensions (hq-rig-isolation.7).
+///
+/// Mirrors [`workspace_from_ext`]: reads the [`RIG_HEADER`] value from the HTTP
+/// Parts stored in the call extensions. `None` when absent or empty — the dispatch
+/// layer then falls back to whatever the agent passed explicitly in the tool args.
+pub fn rig_from_ext(ext: &Extensions) -> Option<&str> {
+    ext.get::<axum::http::request::Parts>()
+        .and_then(|p| p.headers.get(RIG_HEADER))
+        .and_then(|v| v.to_str().ok())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

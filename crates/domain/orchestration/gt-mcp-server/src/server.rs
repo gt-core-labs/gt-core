@@ -32,7 +32,7 @@ use crate::dispatch::{dispatch, dispatch_meta, parse_issue_filter};
 use crate::documents::DocumentsResource;
 use crate::domain::{DomainCtx, DomainRouter};
 use crate::prefixes::WorkspaceRigPrefixes;
-use crate::workspace::{workspace_from_ext, WorkspaceStores};
+use crate::workspace::{rig_from_ext, workspace_from_ext, WorkspaceStores};
 use crate::ws_status::WorkspaceStatusGate;
 
 /// The async port that resolves an opaque Personal Access Token (`gtpat_…`) to verified
@@ -632,6 +632,9 @@ impl ServerHandler for IssuesServer {
                 }
                 "issues" => {
                     let repo_dir = self.repo_dir.as_deref().map(|p| p.as_path());
+                    // hq-rig-isolation.7: request-level rig from X-Rig header; used as
+                    // fallback in dispatch when the agent didn't pass rig in the args.
+                    let request_rig = rig_from_ext(&context.extensions);
                     dispatch(
                         &store,
                         &tool,
@@ -639,6 +642,7 @@ impl ServerHandler for IssuesServer {
                         &scope.actor,
                         repo_dir,
                         workspace.as_deref(),
+                        request_rig,
                         self.rig_prefixes.as_deref(),
                         self.issue_sink.as_deref(),
                     )
