@@ -539,7 +539,10 @@ impl ServerHandler for IssuesServer {
             .tools
             .iter()
             .map(|t| {
-                let schema = t.input_schema.as_object().cloned().unwrap_or_default();
+                let mut schema = t.input_schema.as_object().cloned().unwrap_or_default();
+                // MCP clients validate that inputSchema.type == "object" (strict).
+                // Tools with no arguments default to {} — inject the required field.
+                schema.entry("type").or_insert_with(|| serde_json::json!("object"));
                 // Advertise the sanitized name (dots → underscores) so an Anthropic
                 // client surfaces the tool; `call_tool` maps it back (hq-mcp-native.1).
                 Tool::new(
