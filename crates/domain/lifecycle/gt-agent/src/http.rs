@@ -72,6 +72,11 @@ pub struct AgentApiState {
     /// The event-log root the workspace partitions live under (`<root>/<ws>/`). The binary
     /// supplies the production volume; the contract test points it at a tempdir.
     root: Arc<PathBuf>,
+    /// Optional orchd dispatch channel dir. When `Some`, a polecat spawn with a crew bead drops a
+    /// `{bead,priority}` message here so the orchd scheduler actually slings the agent. `None` ⇒
+    /// the event is still recorded but orchd is not notified (GT_CHANNEL_ROOT unset, tests, or
+    /// the MCP server surface where the channel dir is not wired).
+    dispatch_channel: Option<Arc<PathBuf>>,
 }
 
 impl AgentApiState {
@@ -79,7 +84,14 @@ impl AgentApiState {
     /// uses). The binary calls this and hands the module the result via
     /// [`AgentModule::with_http`](crate::AgentModule::with_http).
     pub fn new(root: impl Into<PathBuf>) -> Self {
-        Self { root: Arc::new(root.into()) }
+        Self { root: Arc::new(root.into()), dispatch_channel: None }
+    }
+
+    /// Wire the orchd dispatch channel dir so a polecat spawn auto-drops a dispatch request
+    /// (hq-agent-auto-dispatch.1). Mirrors the `ConvoyHandler::with_dispatch_channel` pattern.
+    pub fn with_dispatch_channel(mut self, channel_dir: PathBuf) -> Self {
+        self.dispatch_channel = Some(Arc::new(channel_dir));
+        self
     }
 
     /// The workspace's append-only log (segments under `<root>/<ws>/`).
@@ -233,12 +245,14 @@ async fn spawn_session(
         return Err(ApiError(AppError::Validation(format!("session {} already exists", a.session))));
     }
     let session = a.session.clone();
+    let role = a.role;
+    let crew = a.crew.clone();
     let body = st.record(
         ws,
         AgentEvent::Spawned {
             session: a.session,
             rig: a.rig,
-            role: a.role,
+            role,
             crew: a.crew,
             // A manual UI spawn has no worktree manifest (hq-orch-sessions.2).
             skills: Vec::new(),
@@ -246,6 +260,14 @@ async fn spawn_session(
         },
         &session,
     )?;
+    // Auto-dispatch: a polecat spawn with a crew bead drops a dispatch request on the orchd
+    // channel so the scheduler actually slings the agent (hq-agent-auto-dispatch.1). Role
+    // defaults to Polecat; mayors and dogs are interactive and don't go through the queue.
+    if role == SessionRole::Polecat {
+        if let (Some(bead), Some(channel)) = (&crew, st.dispatch_channel.as_ref().map(|p| p.as_path())) {
+            drop_dispatch_event(channel, bead, 1);
+        }
+    }
     Ok((StatusCode::CREATED, Json(body)).into_response())
 }
 
@@ -328,6 +350,29 @@ async fn kill_session(
     kill_session,
 ))]
 pub struct ApiDoc;
+
+/// Drop a `{bead,priority}` dispatch request into the orchd channel dir (atomic write: tmp →
+/// rename so the watcher never sees a partial file). Best-effort — a failure is logged but
+/// never propagates to the caller (the spawn event is already durable at this point).
+fn drop_dispatch_event(channel: &std::path::Path, bead: &str, priority: u8) {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+    let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+    let id = format!("{ts:016x}{:08x}{seq:08x}", std::process::id());
+    let tmp = channel.join(format!(".{id}.tmp"));
+    let final_ = channel.join(format!("{id}.event"));
+    let payload = serde_json::json!({"bead": bead, "priority": priority}).to_string();
+    if let Err(e) = std::fs::create_dir_all(channel)
+        .and_then(|_| std::fs::write(&tmp, payload.as_bytes()))
+        .and_then(|_| std::fs::rename(&tmp, &final_))
+    {
+        eprintln!("[agent] dispatch bridge: write failed for {bead} — {e}");
+    }
+}
 
 /// Stable spelling of a session state (matches the MCP dispatch payload).
 fn state_str(state: SessionState) -> &'static str {

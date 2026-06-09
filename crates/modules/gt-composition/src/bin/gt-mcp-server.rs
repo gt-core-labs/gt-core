@@ -696,7 +696,29 @@ async fn main() -> anyhow::Result<()> {
             actor.clone(),
             meta_tools,
         )))
-        .module(AgentModule::with_http(AgentApiState::new(agent_root)))
+        // agent.*: wire the orchd dispatch channel (hq-agent-auto-dispatch.1) when GT_CHANNEL_ROOT
+        // is set so POST /api/v1/agent with role=polecat+crew drops a dispatch request on the
+        // channel the orchd scheduler consumes — making the spawn actually sling a polecat.
+        .module(AgentModule::with_http({
+            let agent_state = AgentApiState::new(agent_root);
+            match std::env::var("GT_CHANNEL_ROOT") {
+                Ok(root) => {
+                    let name = std::env::var("GT_DISPATCH_CHANNEL")
+                        .unwrap_or_else(|_| "dispatch".to_string());
+                    let channel_dir = std::path::PathBuf::from(&root).join(&name);
+                    eprintln!(
+                        "[gt-mcp-server] agent→scheduler bridge on — dispatch channel {root}/{name}"
+                    );
+                    agent_state.with_dispatch_channel(channel_dir)
+                }
+                Err(_) => {
+                    eprintln!(
+                        "[gt-mcp-server] agent→scheduler bridge off — GT_CHANNEL_ROOT unset"
+                    );
+                    agent_state
+                }
+            }
+        }))
         // quota.*: per-workspace assignment (EventLogQuota) PLUS the deploy-global account pool
         // (FsAccountCatalog over the accounts root) so `/api/v1/quota/catalog` lists onboarded
         // accounts and `/:account/assign` attaches one to the active workspace (hq-quota-ws-accounts).
