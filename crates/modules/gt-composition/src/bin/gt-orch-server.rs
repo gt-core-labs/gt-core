@@ -57,7 +57,7 @@ use gt_composition::polecat::{
     host_cap_from_metrics, AgentTokenMinter, PolecatSupervisorPlugin, ScopeResolver,
 };
 use gt_composition::quota_rotation::{self, QuotaRotationPlugin};
-use gt_composition::session_reconcile::SessionReconciler;
+use gt_composition::session_reconcile::{ReapScope, ReapSink, SessionReconciler};
 use gt_composition::witness_sweep::WitnessSweep;
 use gt_composition::{daemon_root, replay_quota_state, DaemonRoot};
 use gt_eventlog::DEFAULT_EVENTLOG_ROOT;
@@ -569,16 +569,21 @@ async fn main() -> anyhow::Result<()> {
     let reconcile_hb_dir = std::env::var("GT_HEARTBEAT_DIR")
         .map(PathBuf::from)
         .unwrap_or_else(|_| std::env::temp_dir());
+    // Scope = Heartbeat: this daemon owns polecats only — their tmux is on this container's default
+    // server. Interactive mayor/dog sessions live on the mcp-server's `gt-<ws>` socket (another
+    // container) and are reaped there; probing them from here always reports absent and would
+    // false-kill a live mayor (hq-flow-validation-20260609.5).
     let reconciler = SessionReconciler::new(
         event_root_for_reconcile,
         ws_slug.clone(),
         reconcile_hb_dir,
         Duration::from_secs(reconcile_stale_secs),
         tmux.clone(),
-        handle.events_sender(),
+        ReapScope::Heartbeat,
+        ReapSink::Hub(handle.events_sender()),
     );
     eprintln!(
-        "[gt-orch-server] session reconciler on — sweep {reconcile_tick_secs}s (stale {reconcile_stale_secs}s); closes orphaned 'spawned' sessions"
+        "[gt-orch-server] session reconciler on — sweep {reconcile_tick_secs}s (stale {reconcile_stale_secs}s); closes orphaned polecat sessions"
     );
     let reconcile_timer = tokio::spawn(async move {
         let mut tick = tokio::time::interval(Duration::from_secs(reconcile_tick_secs));

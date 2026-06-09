@@ -53,8 +53,10 @@ use gt_composition::mcp::{
 use gt_composition::onboard::{onboard_router, OnboardState};
 use gt_composition::operator_resource::EventLogOperatorResource;
 use gt_composition::scope_bridge::bridge_scopes;
+use gt_composition::session_reconcile::{ReapScope, ReapSink, SessionReconciler};
 use gt_composition::stream::{feed_router, FeedState};
 use gt_composition::terminal::{terminal_router, TerminalState};
+use gt_polecat::tmux::TmuxCli;
 use gt_docs_embed::Embedder;
 use gt_docs_extract::Extractor;
 use gt_graphindex::GraphifyIndexer;
@@ -145,6 +147,43 @@ async fn main() -> anyhow::Result<()> {
     // on `GET /stream?channel=issues`. One sink, shared by both surfaces, so REST and MCP emit the
     // identical event (parity).
     let issue_sink = Arc::new(EventLogIssueSink::new(event_log.clone()));
+
+    // Interactive session reaper (hq-flow-validation-20260609.5): the orchd reconciler cannot see
+    // the mayor/dog tmux — it lives on this process's per-workspace `gt-<ws>` socket, in a
+    // different container's $TMUX_TMPDIR (/tmp is not shared). So judging interactive liveness must
+    // run HERE, where the socket is reachable. Each tick replays the agent log and appends
+    // agent.killed for interactive sessions whose tmux is gone on the declared socket; the append
+    // lands in the shared log the SSE feed reads, so the Sessions view drops the dead mayor.
+    {
+        let reaper_root = std::env::var("GT_EVENTLOG_ROOT")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|_| std::path::PathBuf::from(DEFAULT_EVENTLOG_ROOT));
+        let reaper_ws = std::env::var("GT_WORKSPACE").unwrap_or_else(|_| "default".into());
+        let reaper_tick = env_u64("GT_RECONCILE_TICK_SECS", 120);
+        let reaper = SessionReconciler::new(
+            reaper_root,
+            reaper_ws,
+            std::env::temp_dir(), // heartbeat dir unused for the Interactive scope
+            std::time::Duration::from_secs(300), // stale_after unused for the Interactive scope
+            Arc::new(TmuxCli::new()), // default adapter unused — interactive probes its own socket
+            ReapScope::Interactive,
+            ReapSink::Log(event_log.clone()),
+        );
+        eprintln!(
+            "[gt-mcp-server] interactive session reaper on — sweep {reaper_tick}s; closes dead mayor/dog sessions on the gt-<ws> socket"
+        );
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(std::time::Duration::from_secs(reaper_tick));
+            tick.tick().await; // skip the immediate first fire
+            loop {
+                tick.tick().await;
+                let n = reaper.sweep().await;
+                if n > 0 {
+                    eprintln!("[gt-mcp-server] interactive reaper closed {n} dead session(s)");
+                }
+            }
+        });
+    }
 
     // Tools + routes: harvest the issues module's descriptors AND its REST router through the
     // kernel builder — the composition root never hand-lists tools or hand-wires a module's

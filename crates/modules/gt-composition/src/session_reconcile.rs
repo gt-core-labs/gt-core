@@ -11,9 +11,9 @@
 //! This is the reconciler for exactly that, modeled on the witness ([`crate::witness_sweep`]):
 //! each tick [`SessionReconciler::sweep`] replays the workspace `agent.*` log into a
 //! [`SessionRegistry`], and for every still-active session whose process is provably gone it emits
-//! `agent.killed.v1` onto the hub. The daemon's event-log sink persists it, so the next backend
-//! fold shows the session `killed` instead of a ghost `spawned`. Idempotent: once killed the
-//! session is terminal in the replay, so it is not active on the next sweep.
+//! `agent.killed.v1`. The emit is persisted (hub sink or direct log append, see [`ReapSink`]), so
+//! the next backend fold shows the session `killed` instead of a ghost `spawned`. Idempotent: once
+//! killed the session is terminal in the replay, so it is not active on the next sweep.
 //!
 //! ## Death signals per session kind
 //!
@@ -31,6 +31,23 @@
 //!   iff tmux gone — absence on the correct socket is a positive death signal.
 //! - `maintains_heartbeat = false, tmux_socket = None` (interactive, socket unknown — old events
 //!   before this fix): keep (cannot verify, safe fallback prevents false kills).
+//!
+//! ## Ownership: only judge a session whose tmux you can reach (`hq-flow-validation-20260609.5`)
+//!
+//! A reconciler can only conclude death from a tmux probe that actually reaches the session's
+//! server. The two session classes live on tmux servers in **different containers**:
+//!
+//! - **polecats** run on the default server inside the orchd container (`gt-app-orchd`).
+//! - **interactive** (mayor/dog) run on the per-workspace `gt-<ws>` socket inside the mcp-server
+//!   container (`gt-app-mcp-server`) — its terminal WS handler created them there.
+//!
+//! tmux `-L` sockets are files under each container's own `$TMUX_TMPDIR` (`/tmp` is not shared),
+//! so the orchd reconciler probing `gt-<ws>` always sees *absent* even for a live mayor — which
+//! would false-kill it. Therefore each [`SessionReconciler`] declares a [`ReapScope`]: it only
+//! judges the class whose server it can reach, and runs in that class's container. orchd runs
+//! `Heartbeat` (polecats); mcp-server runs `Interactive` (mayor/dog). The emit path differs per
+//! host too ([`ReapSink`]): orchd publishes onto its daemon hub; mcp-server, which has no daemon
+//! hub, appends straight to the shared per-workspace log (the SSE feed reads it immediately).
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -44,6 +61,43 @@ use gt_events::Envelope;
 use gt_polecat::tmux::{Tmux, TmuxCli};
 
 use crate::mcp::eventlog::EventLog;
+
+/// Which session class a reconciler instance owns — and therefore the only class it judges.
+///
+/// A reconciler must run in the container that can reach the class's tmux server (see the module
+/// doc): polecats live on the orchd default server, interactive mayor/dog on the mcp-server
+/// `gt-<ws>` socket. Probing a class you cannot reach reports it absent and false-kills a live
+/// session, so each instance filters [`SessionRegistry::active`] down to the class it owns.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ReapScope {
+    /// Heartbeat-bearing sessions (polecats), reachable from the orchd default server.
+    Heartbeat,
+    /// Interactive sessions (mayor/dog), reachable from the mcp-server per-workspace socket.
+    Interactive,
+}
+
+impl ReapScope {
+    /// Does this scope own a session with the given heartbeat promise? Polecats
+    /// (`maintains_heartbeat = true`) belong to `Heartbeat`; interactive sessions to `Interactive`.
+    fn owns(&self, maintains_heartbeat: bool) -> bool {
+        match self {
+            ReapScope::Heartbeat => maintains_heartbeat,
+            ReapScope::Interactive => !maintains_heartbeat,
+        }
+    }
+}
+
+/// Where a reaped `agent.killed.v1` is published so the backend fold and the SSE feed pick it up.
+///
+/// The two host processes persist events differently: the orchd daemon drains a broadcast hub into
+/// the durable per-workspace log, while the mcp-server has no such daemon hub and writes the log
+/// directly. Both ultimately land in the same per-workspace event log the Sessions view folds.
+pub enum ReapSink {
+    /// Publish onto the daemon hub; the orchd persistence sink writes it to the log.
+    Hub(broadcast::Sender<EventRecord>),
+    /// Append straight to the shared event log (immediately visible to the SSE feed).
+    Log(Arc<EventLog>),
+}
 
 /// Decide whether an active session is an orphan to reap.
 ///
@@ -71,8 +125,9 @@ fn is_orphan(
     tmux_socket_known
 }
 
-/// The session reconciler. Replays the workspace `agent.*` log to find still-open sessions, and
-/// emits `agent.killed.v1` for the ones whose process is provably gone.
+/// The session reconciler. Replays the workspace `agent.*` log to find still-open sessions of the
+/// class it [owns](ReapScope), and emits `agent.killed.v1` for the ones whose process is provably
+/// gone.
 pub struct SessionReconciler {
     /// Durable event-log root (`GT_EVENTLOG_ROOT`) — the same log the backend folds for its
     /// Sessions view.
@@ -80,24 +135,29 @@ pub struct SessionReconciler {
     /// Workspace slug whose `agent.*` log is reconciled.
     workspace: String,
     /// Heartbeat directory (`GT_HEARTBEAT_DIR`); a session's file is `<dir>/<session>.heartbeat`.
+    /// Only consulted for the `Heartbeat` scope.
     heartbeat_dir: PathBuf,
     /// A heartbeat older than this counts the session as dead (with a missing tmux session).
     stale_after: Duration,
-    /// tmux probe for sessions on the default server (polecats).
+    /// tmux probe for sessions on the default server (polecats). Interactive sessions are probed
+    /// per-session on their declared `gt-<ws>` socket, so this adapter is only used by `Heartbeat`.
     tmux: Arc<dyn Tmux>,
-    /// Hub sender — `agent.killed.v1` is published here and persisted by the event-log sink.
-    hub: broadcast::Sender<EventRecord>,
+    /// The session class this instance owns — the only one it judges (see [`ReapScope`]).
+    scope: ReapScope,
+    /// Where the reaped `agent.killed.v1` is published (see [`ReapSink`]).
+    sink: ReapSink,
 }
 
 impl SessionReconciler {
-    /// Wire the reconciler with every source it observes.
+    /// Wire the reconciler with every source it observes, the class it owns, and the emit sink.
     pub fn new(
         event_root: PathBuf,
         workspace: String,
         heartbeat_dir: PathBuf,
         stale_after: Duration,
         tmux: Arc<dyn Tmux>,
-        hub: broadcast::Sender<EventRecord>,
+        scope: ReapScope,
+        sink: ReapSink,
     ) -> Self {
         Self {
             event_root,
@@ -105,12 +165,14 @@ impl SessionReconciler {
             heartbeat_dir,
             stale_after,
             tmux,
-            hub,
+            scope,
+            sink,
         }
     }
 
-    /// Reconcile once: close every orphaned session. Returns the number of sessions reaped this
-    /// sweep. Best-effort: a log-replay failure logs and yields 0 rather than aborting the daemon.
+    /// Reconcile once: close every orphaned session of the owned class. Returns the number of
+    /// sessions reaped this sweep. Best-effort: a log-replay failure logs and yields 0 rather than
+    /// aborting the daemon.
     pub async fn sweep(&self) -> usize {
         let log = EventLog::new(Some(self.event_root.clone()));
         let registry = match log.replay_domain::<gt_agent::SessionRegistry, AgentEvent, _>(
@@ -130,6 +192,12 @@ impl SessionReconciler {
         for session in registry.active() {
             // `active()` already excludes Done/Killed; defensively skip anything terminal.
             if matches!(session.state, SessionState::Done | SessionState::Killed) {
+                continue;
+            }
+
+            // Only judge the class this instance can actually reach — probing the other class's
+            // tmux (in another container) reports it absent and would false-kill a live session.
+            if !self.scope.owns(session.maintains_heartbeat) {
                 continue;
             }
 
@@ -158,23 +226,35 @@ impl SessionReconciler {
                 session: session.id.clone(),
                 reason,
             };
-            match EventRecord::from_envelope(&Envelope::root(event)) {
-                Ok(record) => {
-                    if self.hub.send(record).is_ok() {
-                        eprintln!(
-                            "[session-reconcile] {} ({:?}) orphaned — emitted agent.killed",
-                            session.id, session.state
-                        );
-                        reaped += 1;
-                    }
-                }
-                Err(e) => eprintln!(
-                    "[session-reconcile] {} encode killed failed: {e}",
-                    session.id
-                ),
+            if self.emit(event) {
+                eprintln!(
+                    "[session-reconcile] {} ({:?}) orphaned — emitted agent.killed",
+                    session.id, session.state
+                );
+                reaped += 1;
             }
         }
         reaped
+    }
+
+    /// Publish one `agent.killed.v1` via the configured sink. Returns whether it was accepted.
+    fn emit(&self, event: AgentEvent) -> bool {
+        match &self.sink {
+            ReapSink::Hub(hub) => match EventRecord::from_envelope(&Envelope::root(event)) {
+                Ok(record) => hub.send(record).is_ok(),
+                Err(e) => {
+                    eprintln!("[session-reconcile] encode killed failed: {e}");
+                    false
+                }
+            },
+            ReapSink::Log(log) => match log.append(Some(&self.workspace), event) {
+                Ok(()) => true,
+                Err(e) => {
+                    eprintln!("[session-reconcile] append killed failed: {e}");
+                    false
+                }
+            },
+        }
     }
 }
 
@@ -218,5 +298,15 @@ mod tests {
         );
         assert!(!is_orphan(false, false, false, false), "old event ⇒ keep");
         assert!(!is_orphan(true, true, false, false), "old event: tmux present ⇒ keep");
+    }
+
+    #[test]
+    fn scope_owns_only_its_class() {
+        // Heartbeat scope owns polecats (maintains_heartbeat=true), not interactive sessions.
+        assert!(ReapScope::Heartbeat.owns(true), "heartbeat owns polecats");
+        assert!(!ReapScope::Heartbeat.owns(false), "heartbeat skips interactive");
+        // Interactive scope owns mayor/dog (maintains_heartbeat=false), not polecats.
+        assert!(ReapScope::Interactive.owns(false), "interactive owns mayor/dog");
+        assert!(!ReapScope::Interactive.owns(true), "interactive skips polecats");
     }
 }
