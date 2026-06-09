@@ -28,6 +28,20 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      # Free disk before anything writes to it: the GitHub-hosted ubuntu-latest runner ships
+      # ~14GB free, but this job compiles `--workspace --all-targets`, the test profile, the
+      # oauth/ocr/embeddings feature builds (fastembed pulls the ONNX runtime), AND clippy
+      # `--all-targets` — all accumulating in `target/`, which overflowed the disk (`No space
+      # left on device` in the build step, hq-flow-validation-20260609.7). Dropping the
+      # preinstalled toolchains this job never uses reclaims ~25-30GB. Inline (no third-party
+      # action) since this is the hard gate.
+      - name: free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+                      /opt/hostedtoolcache/CodeQL /usr/local/.ghcup \
+                      /usr/share/swift /usr/local/share/powershell
+          sudo docker image prune --all --force || true
+          df -h /
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
