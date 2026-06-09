@@ -331,6 +331,24 @@ impl PolecatSupervisor {
         self.state.lock().unwrap().watched.len()
     }
 
+    /// Session ids of every supervised polecat whose env carries `GT_HOOK_ACCOUNT == account`.
+    /// Used by the quota-rotation observer to detect in-flight polecats at risk when their account
+    /// is rotated (`hq-quota-refinement.3`). Returns an empty vec when none match.
+    pub fn sessions_for_account(&self, account: &str) -> Vec<String> {
+        self.state
+            .lock()
+            .unwrap()
+            .watched
+            .values()
+            .filter(|spec| {
+                spec.env
+                    .iter()
+                    .any(|(k, v)| k == crate::GT_HOOK_ACCOUNT && v == account)
+            })
+            .map(|spec| spec.session.clone())
+            .collect()
+    }
+
     /// One supervision pass. For each watched session: alive (tmux has-session) → reset its
     /// restart budget; dead → re-sling if budget + backoff allow, else drop. Returns how many
     /// were re-slung this pass. `now` is edge-stamped unix seconds (same discipline as the
@@ -471,5 +489,27 @@ mod polecat_supervisor_tests {
             }
         }
         assert_eq!(sup.watched_count(), 0, "exhausted polecat dropped");
+    }
+
+    fn spec_with_account(session: &str, member: &str, account: &str) -> SpawnSpec {
+        let mut s = spec(session, member);
+        s.env.push(("GT_HOOK_ACCOUNT".to_string(), account.to_string()));
+        s
+    }
+
+    #[test]
+    fn sessions_for_account_finds_matching_watched_polecats() {
+        // hq-quota-refinement.3: detects in-flight polecats on the rotated account.
+        let tmux = Arc::new(FakeTmux::default());
+        let sup = PolecatSupervisor::new(tmux, RestartConfig::default(), 3);
+        sup.watch(spec_with_account("sess-1", "hq-abc.1", "acct-a"));
+        sup.watch(spec_with_account("sess-2", "hq-abc.2", "acct-b"));
+        sup.watch(spec_with_account("sess-3", "hq-abc.3", "acct-a"));
+
+        let mut found = sup.sessions_for_account("acct-a");
+        found.sort();
+        assert_eq!(found, vec!["sess-1", "sess-3"], "both acct-a sessions returned");
+        assert!(sup.sessions_for_account("acct-b") == vec!["sess-2"]);
+        assert!(sup.sessions_for_account("acct-x").is_empty(), "unknown account → empty");
     }
 }

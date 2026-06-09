@@ -36,6 +36,7 @@ use gt_channel::Channel;
 use gt_eventlog::EventRecord;
 use gt_events::AppError;
 use gt_plugin::Plugin;
+use gt_polecat::PolecatSupervisor;
 use gt_quota::{
     parse_anthropic_ratelimit, Account, AccountQuotaStatus, AccountWindow, Keychain, QuotaEvent,
     QuotaHandle, RatelimitHeaders, WindowKind,
@@ -85,13 +86,24 @@ fn synthetic_window(now: u64) -> AccountWindow {
 pub struct QuotaRotationPlugin {
     quota: QuotaHandle,
     keychain: Arc<dyn Keychain>,
+    /// Optional polecat supervisor reference for in-flight session detection
+    /// (`hq-quota-refinement.3`). When wired, `rotate_away_from` emits a structured warning for
+    /// every supervised polecat that was backed by the rotated account so the operator can act.
+    supervisor: Option<Arc<PolecatSupervisor>>,
 }
 
 impl QuotaRotationPlugin {
     /// Wire the quota command handle (for the account snapshot + the `rotated` record) and the
     /// keychain (whose live pointer the rotation flips).
     pub fn new(quota: QuotaHandle, keychain: Arc<dyn Keychain>) -> Self {
-        Self { quota, keychain }
+        Self { quota, keychain, supervisor: None }
+    }
+
+    /// Wire the polecat supervisor so in-flight session risk is surfaced on rotation
+    /// (`hq-quota-refinement.3`).
+    pub fn with_supervisor(mut self, supervisor: Arc<PolecatSupervisor>) -> Self {
+        self.supervisor = Some(supervisor);
+        self
     }
 
     /// Pick a healthy rotation target `!= at_risk` from the registry snapshot. Deterministic:
@@ -130,6 +142,22 @@ impl QuotaRotationPlugin {
             .rotated(at_risk.to_string(), target.clone(), now_secs())
             .await;
         eprintln!("[quota-rotation] active claude account rotated {at_risk} → {target}");
+        // Signal risk for any polecat that was in-flight on the rotated account
+        // (hq-quota-refinement.3). These sessions were slung with the old credentials; they will
+        // continue consuming the exhausting account until they finish. The operator must decide
+        // whether to let them complete (they may succeed before the limit) or kill and re-sling.
+        // New slings after the keychain flip above will pick `target` automatically.
+        if let Some(sup) = &self.supervisor {
+            let at_risk_sessions = sup.sessions_for_account(at_risk);
+            for session in &at_risk_sessions {
+                eprintln!(
+                    "[quota-rotation] WARN kind=polecat.account_rotated_while_active \
+                     account={at_risk} session={session} new_account={target} \
+                     — polecat still in-flight on the rotated account; \
+                     new slings will use {target}; kill+re-sling to recover immediately"
+                );
+            }
+        }
         Ok(())
     }
 }

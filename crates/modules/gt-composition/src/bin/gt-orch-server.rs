@@ -415,7 +415,12 @@ async fn main() -> anyhow::Result<()> {
     // the keychain's active pointer so the NEXT sling lands on a healthy account.
     let mut pol_registry = PluginRegistry::new().register(pol_plugin);
     if let Some(kc) = &keychain {
-        pol_registry = pol_registry.register(QuotaRotationPlugin::new(quota.clone(), kc.clone()));
+        // Wire the supervisor so the rotation observer can detect and surface in-flight polecat
+        // risk when an account is rotated (hq-quota-refinement.3).
+        pol_registry = pol_registry.register(
+            QuotaRotationPlugin::new(quota.clone(), kc.clone())
+                .with_supervisor(supervisor.clone()),
+        );
         eprintln!("[gt-orch-server] predictive account rotation observer on");
     }
     // Git-merge edge effect (hq-orchd-deploy.12): land a polecat branch on main. On
