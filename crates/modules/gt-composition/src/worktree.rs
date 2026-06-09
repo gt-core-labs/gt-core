@@ -351,6 +351,32 @@ pub fn seed_claude_onboarding(config_dir: &Path, worktree: &Path) {
     }
 }
 
+/// Pre-accept the global claude onboarding flags (`bypassPermissionsModeAccepted` +
+/// `hasCompletedOnboarding`) for an account's `CLAUDE_CONFIG_DIR` without needing a worktree path.
+/// Called from the interactive terminal launch path when an active account is resolved, so a
+/// freshly-registered account that never had a polecat slung into it still skips the bypass-
+/// permissions confirmation prompt. Merges into the existing `.claude.json` — never overwrites
+/// keys claude owns (oauth creds, theme, etc.). Best-effort.
+pub fn seed_global_claude_flags(config_dir: &Path) {
+    let _ = std::fs::create_dir_all(config_dir);
+    let path = config_dir.join(".claude.json");
+    let mut root = std::fs::read_to_string(&path)
+        .ok()
+        .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
+        .unwrap_or_else(|| serde_json::json!({}));
+    let Some(obj) = root.as_object_mut() else {
+        return;
+    };
+    obj.insert("hasCompletedOnboarding".into(), serde_json::Value::Bool(true));
+    obj.insert(
+        "bypassPermissionsModeAccepted".into(),
+        serde_json::Value::Bool(true),
+    );
+    if let Ok(s) = serde_json::to_string(obj) {
+        let _ = std::fs::write(&path, s);
+    }
+}
+
 /// `chown -R <user> <path>` argv, as data so it can be asserted without shelling.
 fn chown_argv(path: &Path, user: &str) -> Vec<String> {
     vec![

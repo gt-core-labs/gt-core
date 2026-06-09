@@ -807,6 +807,12 @@ fn build_command(target: &TerminalTarget) -> CommandBuilder {
                 // profile, so the bare `claude` is enough. The config dir comes from the trusted
                 // quota log, not user input — no shell, exec args only.
                 if let Some(dir) = claude_config_dir {
+                    // Ensure bypassPermissionsModeAccepted is set for freshly-registered accounts
+                    // that have never had a polecat slung (seed_claude_onboarding in
+                    // prepare_role_skills only runs when skill files are written; this covers the
+                    // gap so the bypass-permissions confirmation prompt never blocks an interactive
+                    // session regardless of account state).
+                    crate::worktree::seed_global_claude_flags(std::path::Path::new(&dir));
                     cmd.arg("-e");
                     cmd.arg(format!("CLAUDE_CONFIG_DIR={dir}"));
                     // claude 2.x refuses its global bypass-permissions mode under root ("cannot be
