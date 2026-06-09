@@ -45,6 +45,8 @@ pub enum QuotaMsg {
         account: String,
         remaining: u64,
         resets_at_secs: u64,
+        weekly_remaining: Option<u64>,
+        weekly_resets_at_secs: Option<u64>,
         now_secs: u64,
     },
     /// Explicit window reset (the probe detects it when `resets_at` crossed `now`).
@@ -164,6 +166,8 @@ impl QuotaHandle {
         account: impl Into<String>,
         remaining: u64,
         resets_at_secs: u64,
+        weekly_remaining: Option<u64>,
+        weekly_resets_at_secs: Option<u64>,
         now_secs: u64,
     ) {
         let _ = self
@@ -172,6 +176,8 @@ impl QuotaHandle {
                 account: account.into(),
                 remaining,
                 resets_at_secs,
+                weekly_remaining,
+                weekly_resets_at_secs,
                 now_secs,
             })
             .await;
@@ -389,16 +395,23 @@ pub fn spawn_hydrated(
                     account,
                     remaining,
                     resets_at_secs,
+                    weekly_remaining,
+                    weekly_resets_at_secs,
                     now_secs,
                 } => {
                     registry.apply_probe(&account, remaining, resets_at_secs);
+                    if let (Some(w_rem), Some(w_reset)) =
+                        (weekly_remaining, weekly_resets_at_secs)
+                    {
+                        registry.apply_weekly_probe(&account, w_rem, w_reset, now_secs);
+                    }
                     let _ = events
                         .send(Envelope::root(QuotaEvent::UsageProbed {
                             account,
                             remaining,
                             resets_at_secs,
-                            weekly_remaining: None,
-                            weekly_resets_at_secs: None,
+                            weekly_remaining,
+                            weekly_resets_at_secs,
                             now_secs,
                         }))
                         .await;

@@ -83,10 +83,17 @@ impl Command for SampleTokens {
 pub struct ProbeWindow {
     /// Account being probed. Must be non-empty.
     pub account: String,
-    /// Provider-reported remaining budget in the live window.
+    /// Provider-reported remaining budget in the rolling-5h window.
     pub remaining: u64,
-    /// When the window resets (UTC epoch seconds).
+    /// When the rolling-5h window resets (UTC epoch seconds).
     pub resets_at_secs: u64,
+    /// Weekly budget remaining, when the provider exposes it (Claude Pro plans).
+    /// `None` means the response carried no `…-remaining-week` header.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub weekly_remaining: Option<u64>,
+    /// When the weekly window resets (UTC epoch seconds), paired with `weekly_remaining`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub weekly_resets_at_secs: Option<u64>,
     /// UTC epoch seconds, stamped at the edge.
     pub now_secs: u64,
 }
@@ -105,12 +112,15 @@ impl Command for ProbeWindow {
     fn execute(&self, state: &mut Self::State) -> Result<Self::Output, AppError> {
         self.validate(state)?;
         state.apply_probe(&self.account, self.remaining, self.resets_at_secs);
+        if let (Some(w_rem), Some(w_reset)) = (self.weekly_remaining, self.weekly_resets_at_secs) {
+            state.apply_weekly_probe(&self.account, w_rem, w_reset, self.now_secs);
+        }
         Ok(QuotaEvent::UsageProbed {
             account: self.account.clone(),
             remaining: self.remaining,
             resets_at_secs: self.resets_at_secs,
-            weekly_remaining: None,
-            weekly_resets_at_secs: None,
+            weekly_remaining: self.weekly_remaining,
+            weekly_resets_at_secs: self.weekly_resets_at_secs,
             now_secs: self.now_secs,
         })
     }
@@ -469,6 +479,8 @@ mod tests {
             account: "acc-1".into(),
             remaining: 250,
             resets_at_secs: 20_000,
+            weekly_remaining: None,
+            weekly_resets_at_secs: None,
             now_secs: 600,
         };
         let ev = cmd.execute(&mut r).unwrap();

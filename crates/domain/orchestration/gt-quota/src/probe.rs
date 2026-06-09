@@ -36,6 +36,11 @@ pub struct RatelimitHeaders {
     pub tokens_remaining: Option<u64>,
     /// `anthropic-ratelimit-tokens-reset` parsed to UTC epoch seconds.
     pub tokens_reset_secs: Option<u64>,
+    /// `anthropic-ratelimit-tokens-remaining-week` — weekly budget remaining (Claude Pro).
+    /// Absent on non-Pro plans or when the provider omits it.
+    pub weekly_tokens_remaining: Option<u64>,
+    /// `anthropic-ratelimit-tokens-reset-week` parsed to UTC epoch seconds.
+    pub weekly_tokens_reset_secs: Option<u64>,
 }
 
 impl RatelimitHeaders {
@@ -59,13 +64,22 @@ impl RatelimitHeaders {
             tokens_remaining: lookup("anthropic-ratelimit-tokens-remaining").and_then(parse_u64),
             tokens_reset_secs: lookup("anthropic-ratelimit-tokens-reset")
                 .and_then(parse_reset_secs),
+            weekly_tokens_remaining: lookup("anthropic-ratelimit-tokens-remaining-week")
+                .and_then(parse_u64),
+            weekly_tokens_reset_secs: lookup("anthropic-ratelimit-tokens-reset-week")
+                .and_then(parse_reset_secs),
         }
     }
 
     /// True when both `tokens-remaining` and `tokens-reset` are present and parseable — the
-    /// only shape the probe consumes.
+    /// only shape the rolling-5h probe consumes.
     pub fn has_tokens_window(&self) -> bool {
         self.tokens_remaining.is_some() && self.tokens_reset_secs.is_some()
+    }
+
+    /// True when both weekly fields are present and parseable.
+    pub fn has_weekly_window(&self) -> bool {
+        self.weekly_tokens_remaining.is_some() && self.weekly_tokens_reset_secs.is_some()
     }
 }
 
@@ -73,6 +87,7 @@ impl RatelimitHeaders {
 /// `anthropic-ratelimit-tokens-remaining` and `…-reset` are present. The caller stamps
 /// `now_secs` at the edge — the function is otherwise clock-free, so repeated calls on the
 /// same header set yield bit-identical commands (idempotent under retry).
+/// Weekly fields are populated when the provider exposes `…-remaining-week` / `…-reset-week`.
 pub fn parse_anthropic_ratelimit(
     headers: &[(String, String)],
     account: impl Into<String>,
@@ -85,6 +100,8 @@ pub fn parse_anthropic_ratelimit(
         account: account.into(),
         remaining,
         resets_at_secs,
+        weekly_remaining: snapshot.weekly_tokens_remaining,
+        weekly_resets_at_secs: snapshot.weekly_tokens_reset_secs,
         now_secs,
     })
 }
@@ -209,5 +226,62 @@ mod tests {
         let a = parse_anthropic_ratelimit(&headers, "acc-1", 42).unwrap();
         let b = parse_anthropic_ratelimit(&headers, "acc-1", 42).unwrap();
         assert_eq!(a, b);
+    }
+
+    // hq-quota-weekly.1 tests -----------------------------------------------------------
+
+    #[test]
+    fn weekly_headers_populate_probe_weekly_fields() {
+        let headers = h(&[
+            ("anthropic-ratelimit-tokens-remaining", "40000000"),
+            ("anthropic-ratelimit-tokens-reset", "2026-06-09T18:00:00Z"),
+            ("anthropic-ratelimit-tokens-remaining-week", "10000000"),
+            ("anthropic-ratelimit-tokens-reset-week", "2026-06-16T00:00:00Z"),
+        ]);
+        let probe = parse_anthropic_ratelimit(&headers, "pro-acct", 1_749_000_000).unwrap();
+        assert_eq!(probe.remaining, 40_000_000);
+        assert_eq!(probe.weekly_remaining, Some(10_000_000));
+        assert!(probe.weekly_resets_at_secs.is_some());
+        // Weekly reset must be after the rolling reset.
+        assert!(probe.weekly_resets_at_secs.unwrap() > probe.resets_at_secs);
+    }
+
+    #[test]
+    fn absent_weekly_headers_degrade_gracefully_to_none() {
+        // A response without weekly headers must not panic and must return None weekly fields.
+        let headers = h(&[
+            ("anthropic-ratelimit-tokens-remaining", "30000000"),
+            ("anthropic-ratelimit-tokens-reset", "2026-06-09T18:00:00Z"),
+        ]);
+        let probe = parse_anthropic_ratelimit(&headers, "classic-acct", 1_749_000_000).unwrap();
+        assert_eq!(probe.weekly_remaining, None);
+        assert_eq!(probe.weekly_resets_at_secs, None);
+    }
+
+    #[test]
+    fn malformed_weekly_headers_degrade_gracefully_to_none() {
+        let headers = h(&[
+            ("anthropic-ratelimit-tokens-remaining", "30000000"),
+            ("anthropic-ratelimit-tokens-reset", "2026-06-09T18:00:00Z"),
+            ("anthropic-ratelimit-tokens-remaining-week", "not-a-number"),
+            ("anthropic-ratelimit-tokens-reset-week", "not-a-date"),
+        ]);
+        let probe = parse_anthropic_ratelimit(&headers, "acct", 0).unwrap();
+        assert_eq!(probe.weekly_remaining, None);
+        assert_eq!(probe.weekly_resets_at_secs, None);
+    }
+
+    #[test]
+    fn snapshot_has_weekly_window_only_when_both_fields_present() {
+        let headers_full = h(&[
+            ("anthropic-ratelimit-tokens-remaining-week", "5000000"),
+            ("anthropic-ratelimit-tokens-reset-week", "1748430000"),
+        ]);
+        assert!(RatelimitHeaders::from_headers(&headers_full).has_weekly_window());
+
+        let headers_partial = h(&[("anthropic-ratelimit-tokens-remaining-week", "5000000")]);
+        assert!(!RatelimitHeaders::from_headers(&headers_partial).has_weekly_window());
+
+        assert!(!RatelimitHeaders::from_headers(&[]).has_weekly_window());
     }
 }

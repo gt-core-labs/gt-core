@@ -290,7 +290,14 @@ async fn apply_feed(quota: &QuotaHandle, p: QuotaFeedPayload) {
         // Authoritative reconciliation (also catches a window already seeded earlier).
         if let Some(pw) = parse_anthropic_ratelimit(&p.headers, &p.account, now) {
             quota
-                .probe(pw.account, pw.remaining, pw.resets_at_secs, pw.now_secs)
+                .probe(
+                    pw.account,
+                    pw.remaining,
+                    pw.resets_at_secs,
+                    pw.weekly_remaining,
+                    pw.weekly_resets_at_secs,
+                    pw.now_secs,
+                )
                 .await;
         }
     }
