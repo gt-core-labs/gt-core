@@ -88,6 +88,9 @@ impl Scope {
             // notifications; agents write via notify.send.execute on MCP.
             "notifications.*",
             "notify.*",
+            // Audit trail read (hq-flow-validation-20260609.1): members inspect their workspace's
+            // MCP call history; audit.tail is read-only by construction.
+            "audit.*",
             "workspace.info",
             "workspace.list",
         ]
@@ -257,6 +260,8 @@ mod tests {
         s.check("tokens.write").unwrap();
         s.check("workspace.info").unwrap();
         s.check("workspace.list").unwrap();
+        // Audit trail read is in the member grant (hq-flow-validation-20260609.1).
+        s.check("audit.tail").unwrap();
         // Provisioning a tenant is an admin act, outside the member grant.
         assert!(s.check("workspace.create").is_err());
     }
