@@ -51,6 +51,34 @@ fn now_secs() -> u64 {
         .unwrap_or(0)
 }
 
+/// Spawn a one-shot task that fires a synthetic probe at `until_secs + 5s` if the account is still
+/// `Blocked` at that point. The 5-second grace margin absorbs clock skew between our clock and the
+/// provider's `Retry-After` boundary. `apply_probe` already lifts `Blocked → Healthy` when
+/// `remaining > 0`; no actor changes are needed.
+fn schedule_unblock(quota: QuotaHandle, account: String, until_secs: u64) {
+    tokio::spawn(async move {
+        let delay = until_secs.saturating_sub(now_secs()) + 5;
+        tokio::time::sleep(tokio::time::Duration::from_secs(delay)).await;
+        let accounts = quota.accounts().await;
+        let Some(acc) = accounts.iter().find(|a| a.id == account) else {
+            return;
+        };
+        if acc.status != AccountQuotaStatus::Blocked {
+            return;
+        }
+        // Use the existing window's reset as the anchor so the synthetic probe doesn't push it
+        // further into the future than the real window. Fall back to 5h from now if no window.
+        let resets_at = acc
+            .window
+            .as_ref()
+            .map(|w| w.resets_at_secs)
+            .unwrap_or_else(|| now_secs() + ROLLING_5H_SECS);
+        quota
+            .probe(account, plan_limit(), resets_at, None, None, now_secs())
+            .await;
+    });
+}
+
 /// The rolling token window (standard claude plan).
 const ROLLING_5H_SECS: u64 = 5 * 3600;
 
@@ -169,20 +197,36 @@ impl Plugin for QuotaRotationPlugin {
     }
 
     async fn on_event(&self, record: &EventRecord) -> Result<(), AppError> {
-        let at_risk = match record.kind.as_str() {
+        match record.kind.as_str() {
             // Predictive: the window will exhaust before reset → rotate early.
-            "quota.block_predicted.v1" => match record.decode::<QuotaEvent>()? {
-                QuotaEvent::BlockPredicted { account, .. } => account,
-                _ => return Ok(()),
-            },
+            "quota.block_predicted.v1" => {
+                let at_risk = match record.decode::<QuotaEvent>()? {
+                    QuotaEvent::BlockPredicted { account, .. } => account,
+                    _ => return Ok(()),
+                };
+                self.rotate_away_from(&at_risk).await
+            }
             // Reactive: the provider already returned 429 → rotate now.
-            "quota.account_limited.v1" => match record.decode::<QuotaEvent>()? {
-                QuotaEvent::AccountLimited { account, .. } => account,
-                _ => return Ok(()),
-            },
-            _ => return Ok(()),
-        };
-        self.rotate_away_from(&at_risk).await
+            "quota.account_limited.v1" => {
+                let at_risk = match record.decode::<QuotaEvent>()? {
+                    QuotaEvent::AccountLimited { account, .. } => account,
+                    _ => return Ok(()),
+                };
+                self.rotate_away_from(&at_risk).await
+            }
+            // Hard block with a Retry-After timestamp → schedule a probe at until_secs + 5s so
+            // the account re-enters rotation as soon as the provider window closes, not on the
+            // next periodic poll (which could be minutes later).
+            "quota.blocked.v1" => {
+                if let QuotaEvent::Blocked { account, until_secs: Some(until), .. } =
+                    record.decode::<QuotaEvent>()?
+                {
+                    schedule_unblock(self.quota.clone(), account, until);
+                }
+                Ok(())
+            }
+            _ => Ok(()),
+        }
     }
 }
 
@@ -635,6 +679,87 @@ mod tests {
         assert!(p.headers.is_empty());
         assert!(p.sample.is_none());
         assert!(p.session.is_none());
+    }
+
+    // hq-quota-unblock-probe tests -----------------------------------------------------------
+
+    #[tokio::test(start_paused = true)]
+    async fn blocked_with_until_secs_probes_after_retry_after_expiry() {
+        // until_secs is in the past → delay = 5s (grace margin only), so advancing 6s is enough.
+        let (tx, _rx) = mpsc::channel::<Envelope<QuotaEvent>>(64);
+        let quota = gt_quota::actor::spawn(tx, std::collections::HashMap::new());
+        quota
+            .upsert_account(Account {
+                id: "a".into(),
+                status: AccountQuotaStatus::Healthy,
+                window: Some(AccountWindow {
+                    kind: WindowKind::Rolling5h,
+                    limit: plan_limit(),
+                    started_at_secs: 100,
+                    resets_at_secs: 20_000,
+                    consumed: plan_limit() as f64,
+                }),
+                weekly_window: None,
+            })
+            .await;
+        // Simulate the actor receiving a 429 (sets status = Blocked).
+        quota.blocked("a", Some(1u64), 100).await;
+        let _ = quota.snapshot().await; // sync: ensure actor processed the Blocked msg
+
+        let keychain = Arc::new(InMemoryKeychain::seeded([("a", "/cfg/a")]));
+        let plugin = QuotaRotationPlugin::new(quota.clone(), keychain);
+
+        // Feed the event through the plugin — this schedules the unblock timer.
+        plugin
+            .on_event(&record(QuotaEvent::Blocked {
+                account: "a".into(),
+                until_secs: Some(1u64),
+                now_secs: 100,
+            }))
+            .await
+            .unwrap();
+
+        // Before the timer fires the account is still Blocked.
+        let acc = quota.accounts().await.into_iter().find(|a| a.id == "a").unwrap();
+        assert_eq!(acc.status, AccountQuotaStatus::Blocked, "still blocked before timer");
+
+        // Advance tokio time past the 5-second grace delay and let the spawned task run.
+        tokio::time::advance(tokio::time::Duration::from_secs(6)).await;
+        let _ = quota.snapshot().await; // flush: spawned task's accounts() query
+        let _ = quota.snapshot().await; // flush: probe message reaches actor
+
+        let acc = quota.accounts().await.into_iter().find(|a| a.id == "a").unwrap();
+        assert_eq!(acc.status, AccountQuotaStatus::Healthy, "probe lifted Blocked → Healthy");
+    }
+
+    #[tokio::test]
+    async fn blocked_without_until_secs_does_not_schedule_unblock() {
+        // A Blocked event with no until_secs (provider sent no Retry-After) must not schedule
+        // a timer, and the account stays Blocked.
+        let (tx, _rx) = mpsc::channel::<Envelope<QuotaEvent>>(64);
+        let quota = gt_quota::actor::spawn(tx, std::collections::HashMap::new());
+        quota.upsert_account(Account::new("a")).await;
+        quota.blocked("a", None, 100).await;
+        let _ = quota.snapshot().await;
+
+        let keychain = Arc::new(InMemoryKeychain::seeded([("a", "/cfg/a")]));
+        let plugin = QuotaRotationPlugin::new(quota.clone(), keychain);
+
+        plugin
+            .on_event(&record(QuotaEvent::Blocked {
+                account: "a".into(),
+                until_secs: None,
+                now_secs: 100,
+            }))
+            .await
+            .unwrap();
+
+        let acc = quota.accounts().await.into_iter().find(|a| a.id == "a").unwrap();
+        assert_eq!(
+            acc.status,
+            AccountQuotaStatus::Blocked,
+            "no until_secs → no unblock scheduled, stays Blocked"
+        );
     }
 
     #[tokio::test]

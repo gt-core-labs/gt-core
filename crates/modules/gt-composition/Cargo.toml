@@ -141,7 +141,7 @@ name = "gt-orch-server"
 path = "src/bin/gt-orch-server.rs"
 
 [dev-dependencies]
-tokio = { workspace = true, features = ["macros", "rt-multi-thread", "sync", "time"] }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "sync", "time", "test-util"] }
 serde_json = { workspace = true }
 # Tempdir-rooted event logs for the event-sourced handler tests.
 tempfile = { workspace = true }
