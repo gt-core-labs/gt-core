@@ -452,25 +452,22 @@ mod tests {
 
     #[tokio::test]
     async fn enforce_accepts_registered_prefix_in_workspace() {
+        // Pass the rig name directly — enforce_rig_prefix no longer strips the trailing slug.
         let p = StubPrefixes;
-        assert!(enforce_rig_prefix(Some(&p), Some("acme"), "pl-new-bead")
-            .await
-            .is_ok());
+        assert!(enforce_rig_prefix(Some(&p), Some("acme"), "pl").await.is_ok());
     }
 
     #[tokio::test]
     async fn enforce_accepts_reserved_prefix() {
         // The adapter reports the reserved `hq` as allowed, so tracker beads survive.
         let p = StubPrefixes;
-        assert!(enforce_rig_prefix(Some(&p), Some("acme"), "hq-mod-x.1")
-            .await
-            .is_ok());
+        assert!(enforce_rig_prefix(Some(&p), Some("acme"), "hq").await.is_ok());
     }
 
     #[tokio::test]
     async fn enforce_rejects_unknown_prefix() {
         let p = StubPrefixes;
-        let err = enforce_rig_prefix(Some(&p), Some("acme"), "zz-stranger")
+        let err = enforce_rig_prefix(Some(&p), Some("acme"), "zz")
             .await
             .unwrap_err();
         assert!(matches!(err, AppError::Validation(_)), "got {err:?}");
@@ -480,9 +477,7 @@ mod tests {
     async fn enforce_rejects_prefix_registered_only_in_another_workspace() {
         // `pl` is allowed in `acme` but not in `other` — no global uniqueness.
         let p = StubPrefixes;
-        assert!(enforce_rig_prefix(Some(&p), Some("other"), "pl-foo")
-            .await
-            .is_err());
+        assert!(enforce_rig_prefix(Some(&p), Some("other"), "pl").await.is_err());
     }
 
     #[tokio::test]
