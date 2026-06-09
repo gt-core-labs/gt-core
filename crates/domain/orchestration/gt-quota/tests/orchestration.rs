@@ -37,6 +37,7 @@ fn account_with_window() -> Account {
             resets_at_secs: W_RESETS,
             consumed: 0.0,
         }),
+        weekly_window: None,
     }
 }
 

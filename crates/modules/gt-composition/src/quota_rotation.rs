@@ -283,6 +283,7 @@ async fn apply_feed(quota: &QuotaHandle, p: QuotaFeedPayload) {
                         resets_at_secs: resets_at,
                         consumed: limit.saturating_sub(remaining) as f64,
                     }),
+                    weekly_window: None,
                 })
                 .await;
         }
@@ -315,6 +316,7 @@ async fn apply_feed(quota: &QuotaHandle, p: QuotaFeedPayload) {
                         id: p.account.clone(),
                         status: AccountQuotaStatus::Healthy,
                         window: Some(synthetic_window(now)),
+                        weekly_window: None,
                     })
                     .await;
             }
@@ -480,6 +482,7 @@ mod tests {
                     resets_at_secs: 50_000, // reset far off → the block falls within the window
                     consumed: 900.0,        // remaining 100
                 }),
+                weekly_window: None,
             })
             .await;
         // A sample sets the burn-rate EWMA (0 tokens ⇒ consumed unchanged, rate = consumed/elapsed).
@@ -573,6 +576,7 @@ mod tests {
                     resets_at_secs: 2,  // already past → must recycle
                     consumed: 999_999.0,
                 }),
+                weekly_window: None,
             })
             .await;
         apply_feed(

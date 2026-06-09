@@ -109,6 +109,8 @@ impl Command for ProbeWindow {
             account: self.account.clone(),
             remaining: self.remaining,
             resets_at_secs: self.resets_at_secs,
+            weekly_remaining: None,
+            weekly_resets_at_secs: None,
             now_secs: self.now_secs,
         })
     }
@@ -307,6 +309,7 @@ mod tests {
                 resets_at_secs: 18_000,
                 consumed: 0.0,
             }),
+            weekly_window: None,
         });
         // acc-2: a healthy standby used by rotate tests as a valid target.
         r.upsert_account(Account::new("acc-2"));
@@ -500,6 +503,7 @@ mod tests {
             id: "acc-2".into(),
             status: AccountQuotaStatus::Cooldown,
             window: None,
+            weekly_window: None,
         });
         let cmd = RotateAccount {
             from_account: "acc-1".into(),
@@ -520,6 +524,7 @@ mod tests {
             id: "acc-2".into(),
             status: AccountQuotaStatus::Limited,
             window: None,
+            weekly_window: None,
         });
         let cmd = RotateAccount {
             from_account: "acc-1".into(),

@@ -397,6 +397,8 @@ pub fn spawn_hydrated(
                             account,
                             remaining,
                             resets_at_secs,
+                            weekly_remaining: None,
+                            weekly_resets_at_secs: None,
                             now_secs,
                         }))
                         .await;

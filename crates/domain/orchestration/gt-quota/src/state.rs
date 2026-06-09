@@ -65,7 +65,12 @@ impl AccountWindow {
 pub struct Account {
     pub id: String,
     pub status: AccountQuotaStatus,
+    /// Rolling-5h usage window (the primary rate-limit window for all Claude plans).
     pub window: Option<AccountWindow>,
+    /// Weekly usage window, present only for Claude Pro plans that surface weekly quota
+    /// headers. Tracks a separate budget alongside the rolling-5h window.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub weekly_window: Option<AccountWindow>,
 }
 
 impl Account {
@@ -74,6 +79,7 @@ impl Account {
             id: id.into(),
             status: AccountQuotaStatus::Healthy,
             window: None,
+            weekly_window: None,
         }
     }
 }
@@ -279,6 +285,36 @@ impl AccountRegistry {
         }
     }
 
+    /// Reconcile the weekly window against the provider's authoritative weekly
+    /// `remaining`/`resets_at`. Seeds the window when none exists yet. No-op on unknown account
+    /// or when `weekly_remaining`/`weekly_resets_at_secs` are `None` (headers absent).
+    /// Shared by the `UsageProbed` actor path and the reducer.
+    pub fn apply_weekly_probe(
+        &mut self,
+        account: &str,
+        weekly_remaining: u64,
+        weekly_resets_at_secs: u64,
+        now_secs: u64,
+    ) {
+        if let Some(acc) = self.get_mut(account) {
+            match acc.weekly_window.as_mut() {
+                Some(w) => {
+                    w.consumed = (w.limit.saturating_sub(weekly_remaining)) as f64;
+                    w.resets_at_secs = weekly_resets_at_secs;
+                }
+                None => {
+                    acc.weekly_window = Some(AccountWindow {
+                        kind: WindowKind::Weekly,
+                        limit: DEFAULT_PLAN_LIMIT,
+                        started_at_secs: now_secs,
+                        resets_at_secs: weekly_resets_at_secs,
+                        consumed: DEFAULT_PLAN_LIMIT.saturating_sub(weekly_remaining) as f64,
+                    });
+                }
+            }
+        }
+    }
+
     /// Park the rotated-off account in `Cooldown`. No-op if unknown. Shared by
     /// `QuotaMsg::Rotated` and `RotateAccount`.
     pub fn apply_rotation(&mut self, from_account: &str) {
@@ -342,6 +378,7 @@ impl QuotaState {
                     id: account.clone(),
                     status: AccountQuotaStatus::Healthy,
                     window: None,
+                    weekly_window: None,
                 });
                 if entry.window.is_none() {
                     entry.window = Some(AccountWindow {
@@ -369,13 +406,19 @@ impl QuotaState {
                     w.consumed += cost.0;
                 }
             }
-            QuotaEvent::UsageProbed { account, remaining, resets_at_secs, .. } => {
-                let entry = self.accounts.entry(account.clone()).or_insert_with(|| {
-                    Account {
-                        id: account.clone(),
-                        status: AccountQuotaStatus::Healthy,
-                        window: None,
-                    }
+            QuotaEvent::UsageProbed {
+                account,
+                remaining,
+                resets_at_secs,
+                weekly_remaining,
+                weekly_resets_at_secs,
+                now_secs,
+            } => {
+                let entry = self.accounts.entry(account.clone()).or_insert_with(|| Account {
+                    id: account.clone(),
+                    status: AccountQuotaStatus::Healthy,
+                    window: None,
+                    weekly_window: None,
                 });
                 match entry.window.as_mut() {
                     Some(w) => {
@@ -392,6 +435,25 @@ impl QuotaState {
                         });
                     }
                 }
+                if let (Some(w_rem), Some(w_reset)) =
+                    (weekly_remaining, weekly_resets_at_secs)
+                {
+                    match entry.weekly_window.as_mut() {
+                        Some(w) => {
+                            w.consumed = (w.limit.saturating_sub(*w_rem)) as f64;
+                            w.resets_at_secs = *w_reset;
+                        }
+                        None => {
+                            entry.weekly_window = Some(AccountWindow {
+                                kind: WindowKind::Weekly,
+                                limit: DEFAULT_PLAN_LIMIT,
+                                started_at_secs: *now_secs,
+                                resets_at_secs: *w_reset,
+                                consumed: DEFAULT_PLAN_LIMIT.saturating_sub(*w_rem) as f64,
+                            });
+                        }
+                    }
+                }
                 if *remaining > 0 {
                     entry.status = AccountQuotaStatus::Healthy;
                 }
@@ -402,6 +464,7 @@ impl QuotaState {
                         id: account.clone(),
                         status: AccountQuotaStatus::Healthy,
                         window: None,
+                        weekly_window: None,
                     }
                 });
                 if let Some(w) = entry.window.as_mut() {
@@ -441,6 +504,7 @@ impl QuotaState {
                     id: account.clone(),
                     status: AccountQuotaStatus::Healthy,
                     window: None,
+                    weekly_window: None,
                 });
             }
             QuotaEvent::AccountDeregistered { account, .. } => {
@@ -593,6 +657,7 @@ mod tests {
                 resets_at_secs: 18_000,
                 consumed: DEFAULT_PLAN_LIMIT as f64,
             }),
+            weekly_window: None,
         });
         r.apply_probe("acc-1", 50_000_000, 36_000);
         let acc = r.get("acc-1").unwrap();
@@ -616,6 +681,7 @@ mod tests {
                 resets_at_secs: 18_000,
                 consumed: DEFAULT_PLAN_LIMIT as f64,
             }),
+            weekly_window: None,
         });
         r.apply_probe("acc-1", 0, 18_000);
         assert_eq!(
@@ -654,12 +720,15 @@ mod tests {
                 id: "acc-1".into(),
                 status: AccountQuotaStatus::Cooldown,
                 window: None,
+                weekly_window: None,
             },
         );
         s.apply(&QuotaEvent::UsageProbed {
             account: "acc-1".into(),
             remaining: 30_000_000,
             resets_at_secs: 50_000,
+            weekly_remaining: None,
+            weekly_resets_at_secs: None,
             now_secs: 1_000,
         });
         let acc = &s.accounts["acc-1"];
@@ -667,5 +736,121 @@ mod tests {
         let w = acc.window.as_ref().expect("reducer seeds window");
         assert_eq!(w.resets_at_secs, 50_000);
         assert_eq!(w.consumed, (DEFAULT_PLAN_LIMIT - 30_000_000) as f64);
+        assert!(acc.weekly_window.is_none(), "no weekly data -> weekly_window stays None");
+    }
+
+    // hq-quota-weekly.2 tests -----------------------------------------------------------
+
+    #[test]
+    fn account_serde_roundtrip_with_weekly_window() {
+        // A Claude Pro account carries both windows; serde must round-trip cleanly.
+        let acc = Account {
+            id: "pro-acct".into(),
+            status: AccountQuotaStatus::Healthy,
+            window: Some(AccountWindow {
+                kind: WindowKind::Rolling5h,
+                limit: DEFAULT_PLAN_LIMIT,
+                started_at_secs: 1_000,
+                resets_at_secs: 19_000,
+                consumed: 100.0,
+            }),
+            weekly_window: Some(AccountWindow {
+                kind: WindowKind::Weekly,
+                limit: DEFAULT_PLAN_LIMIT,
+                started_at_secs: 0,
+                resets_at_secs: 604_800,
+                consumed: 5_000_000.0,
+            }),
+        };
+        let json = serde_json::to_string(&acc).unwrap();
+        let back: Account = serde_json::from_str(&json).unwrap();
+        assert_eq!(acc, back);
+        let ww = back.weekly_window.as_ref().unwrap();
+        assert_eq!(ww.kind, WindowKind::Weekly);
+        assert_eq!(ww.consumed, 5_000_000.0);
+    }
+
+    #[test]
+    fn account_without_weekly_window_serde_roundtrip() {
+        // Existing accounts without weekly data must deserialise fine (backwards compat).
+        let acc = Account::new("classic-acct");
+        let json = serde_json::to_string(&acc).unwrap();
+        // weekly_window must be absent from the wire (skip_serializing_if = None).
+        assert!(!json.contains("weekly_window"), "weekly_window absent when None");
+        let back: Account = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.weekly_window, None);
+    }
+
+    #[test]
+    fn usage_probed_event_with_weekly_fields_roundtrips() {
+        // The event schema must carry and round-trip weekly fields when present.
+        let ev = QuotaEvent::UsageProbed {
+            account: "pro-acct".into(),
+            remaining: 40_000_000,
+            resets_at_secs: 18_000,
+            weekly_remaining: Some(10_000_000),
+            weekly_resets_at_secs: Some(604_800),
+            now_secs: 1_000,
+        };
+        let json = serde_json::to_string(&ev).unwrap();
+        let back: QuotaEvent = serde_json::from_str(&json).unwrap();
+        assert_eq!(ev, back);
+    }
+
+    #[test]
+    fn usage_probed_event_without_weekly_fields_roundtrips() {
+        // An event without weekly fields must still deserialise (None for absent fields).
+        let ev = QuotaEvent::UsageProbed {
+            account: "classic".into(),
+            remaining: 30_000_000,
+            resets_at_secs: 18_000,
+            weekly_remaining: None,
+            weekly_resets_at_secs: None,
+            now_secs: 500,
+        };
+        let json = serde_json::to_string(&ev).unwrap();
+        assert!(!json.contains("weekly_remaining"), "absent fields skipped in wire");
+        let back: QuotaEvent = serde_json::from_str(&json).unwrap();
+        assert_eq!(ev, back);
+    }
+
+    #[test]
+    fn apply_weekly_probe_seeds_and_reconciles_weekly_window() {
+        let mut r = AccountRegistry::default();
+        r.upsert_account(Account::new("pro-acct"));
+
+        // First probe: seeds the weekly window.
+        r.apply_weekly_probe("pro-acct", 45_000_000, 604_800, 1_000);
+        let acc = r.get("pro-acct").unwrap();
+        let ww = acc.weekly_window.as_ref().expect("weekly_window seeded");
+        assert_eq!(ww.kind, WindowKind::Weekly);
+        assert_eq!(ww.resets_at_secs, 604_800);
+        assert_eq!(ww.consumed, (DEFAULT_PLAN_LIMIT - 45_000_000) as f64);
+        assert_eq!(ww.started_at_secs, 1_000);
+
+        // Second probe: reconciles consumed.
+        r.apply_weekly_probe("pro-acct", 30_000_000, 604_800, 2_000);
+        let ww2 = r.get("pro-acct").unwrap().weekly_window.as_ref().unwrap();
+        assert_eq!(ww2.consumed, (DEFAULT_PLAN_LIMIT - 30_000_000) as f64);
+    }
+
+    #[test]
+    fn reducer_populates_weekly_window_when_event_carries_weekly_fields() {
+        let mut s = QuotaState::default();
+        s.apply(&QuotaEvent::UsageProbed {
+            account: "pro-acct".into(),
+            remaining: 40_000_000,
+            resets_at_secs: 18_000,
+            weekly_remaining: Some(10_000_000),
+            weekly_resets_at_secs: Some(604_800),
+            now_secs: 1_000,
+        });
+        let acc = &s.accounts["pro-acct"];
+        let ww = acc.weekly_window.as_ref().expect("reducer sets weekly_window");
+        assert_eq!(ww.kind, WindowKind::Weekly);
+        assert_eq!(ww.resets_at_secs, 604_800);
+        assert_eq!(ww.consumed, (DEFAULT_PLAN_LIMIT - 10_000_000) as f64);
+        // Rolling5h window still populated independently.
+        assert!(acc.window.is_some());
     }
 }

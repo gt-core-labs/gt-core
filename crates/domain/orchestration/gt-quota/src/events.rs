@@ -30,6 +30,13 @@ pub enum QuotaEvent {
         account: String,
         remaining: u64,
         resets_at_secs: u64,
+        /// Weekly quota remaining, when the provider surfaces it (Claude Pro plans).
+        /// `None` means the response carried no weekly-window headers.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        weekly_remaining: Option<u64>,
+        /// Unix epoch at which the weekly quota window resets, paired with `weekly_remaining`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        weekly_resets_at_secs: Option<u64>,
         now_secs: u64,
     },
     /// Window reset (rolling-5h, weekly...): block prediction only applies within the live
