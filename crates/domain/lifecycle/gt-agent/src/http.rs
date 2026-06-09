@@ -334,7 +334,14 @@ async fn kill_session(
     let ws = workspace_of(&headers);
     let ws = ws.as_deref();
     st.require_session(ws, &id)?;
-    Ok(Json(st.record(ws, AgentEvent::Killed { session: id.clone(), reason: a.reason }, &id)?))
+    let body = st.record(ws, AgentEvent::Killed { session: id.clone(), reason: a.reason }, &id)?;
+    // Terminate the tmux session so the Claude process is cleaned up immediately.
+    // Only fires when the operator explicitly calls the kill endpoint — WS disconnect does not kill.
+    let server = format!("gt-{}", ws.unwrap_or("default"));
+    let _ = std::process::Command::new("tmux")
+        .args(["-L", &server, "kill-session", "-t", id.as_str()])
+        .status();
+    Ok(Json(body))
 }
 
 /// The combined OpenAPI document for the agent REST surface (`hq-fe-api-orch.1`). The builder

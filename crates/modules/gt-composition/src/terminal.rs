@@ -1031,17 +1031,6 @@ async fn run_pty(mut socket: WebSocket, target: TerminalTarget) {
     let _ = child.kill();
     drop(writer);
     drop(master);
-
-    // Kill the tmux session when a writable interactive session's WS closes. `child.kill()`
-    // above only terminates the tmux client (detaches), leaving the session alive and holding
-    // a Claude Pro session slot indefinitely. Read-only attaches and plain shells are left
-    // untouched — the operator may reconnect, and orchd polecat sessions are autonomous.
-    if let TerminalTarget::Attach { workspace, session, write: true, .. } = &target {
-        let server = tmux_server_name(workspace);
-        let _ = std::process::Command::new("tmux")
-            .args(["-L", &server, "kill-session", "-t", session.as_str()])
-            .status();
-    }
 }
 
 /// Parse a `{"resize":{"cols":N,"rows":M}}` control frame into a [`PtySize`]; `None` for any
