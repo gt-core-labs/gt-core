@@ -151,6 +151,7 @@ impl DomainHandler for AgentHandler {
                         skills: Vec::new(),
                         hooks: Vec::new(),
                         maintains_heartbeat: a.role.maintains_heartbeat(),
+                        tmux_socket: a.role.tmux_socket(ws.unwrap_or("default")),
                     },
                     &session,
                 )

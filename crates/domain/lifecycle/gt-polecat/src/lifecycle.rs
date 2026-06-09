@@ -92,6 +92,7 @@ impl SpawnSpec {
             skills: Vec::new(),
             hooks: Vec::new(),
             maintains_heartbeat: true,
+            tmux_socket: None,
         }
     }
 

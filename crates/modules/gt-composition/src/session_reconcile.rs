@@ -17,16 +17,20 @@
 //!
 //! ## Death signals per session kind
 //!
-//! Not all sessions maintain a heartbeat file. Polecats do; interactive sessions (mayor, dog) do
-//! not — their liveness is attested by tmux alone. The `maintains_heartbeat` flag in
-//! `AgentEvent::Spawned` declares this contract per session. The reconciler respects it:
+//! Sessions declare two pieces of liveness information at spawn time:
 //!
-//! - `maintains_heartbeat = true` (polecats): orphan iff tmux gone AND heartbeat stale.
-//! - `maintains_heartbeat = false` (mayor/dog): orphan iff tmux gone — heartbeat is not checked
-//!   because it was never promised. If tmux is absent but the session didn't promise a heartbeat
-//!   we cannot distinguish "dead" from "tmux probe unavailable", so we leave it alone.
+//! - `maintains_heartbeat`: polecats touch a file every tick; interactive sessions (mayor, dog)
+//!   do not. Only a session that promised a heartbeat can be declared dead by a stale one.
+//! - `tmux_socket`: the `-L <socket>` server where the session's tmux lives. Polecats use the
+//!   default server (`None`); interactive sessions use `Some("gt-<workspace>")`.
 //!
-//! The safe-by-default rule: a session can only be reaped by a signal it explicitly promised.
+//! Reap policy (`is_orphan`):
+//! - tmux alive on the declared socket → keep (positive liveness signal wins).
+//! - `maintains_heartbeat = true` (polecat): orphan iff tmux gone AND heartbeat stale.
+//! - `maintains_heartbeat = false, tmux_socket = Some(_)` (interactive, socket known): orphan
+//!   iff tmux gone — absence on the correct socket is a positive death signal.
+//! - `maintains_heartbeat = false, tmux_socket = None` (interactive, socket unknown — old events
+//!   before this fix): keep (cannot verify, safe fallback prevents false kills).
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -37,26 +41,34 @@ use tokio::sync::broadcast;
 use gt_agent::{AgentEvent, SessionState};
 use gt_eventlog::EventRecord;
 use gt_events::Envelope;
-use gt_polecat::tmux::Tmux;
+use gt_polecat::tmux::{Tmux, TmuxCli};
 
 use crate::mcp::eventlog::EventLog;
 
 /// Decide whether an active session is an orphan to reap.
 ///
-/// The combined C+D policy:
-/// - If tmux is alive → keep (positive liveness signal always wins).
-/// - If the session doesn't maintain a heartbeat → keep (we can't confirm death without it).
-/// - Otherwise (tmux gone + heartbeat promised) → orphan iff heartbeat is stale.
+/// - tmux alive → keep (positive liveness always wins).
+/// - polecat (`maintains_heartbeat`): orphan iff heartbeat stale (tmux already gone).
+/// - interactive with known socket (`!maintains_heartbeat, tmux_socket_known`): orphan —
+///   the tmux probe ran on the correct server and returned absent.
+/// - interactive without known socket (old events, `!maintains_heartbeat, !tmux_socket_known`):
+///   keep — we cannot verify, safe fallback prevents false kills.
 ///
 /// Pure, so the reap policy is unit-tested without tmux/fs.
-fn is_orphan(tmux_alive: bool, heartbeat_stale: bool, maintains_heartbeat: bool) -> bool {
+fn is_orphan(
+    tmux_alive: bool,
+    heartbeat_stale: bool,
+    maintains_heartbeat: bool,
+    tmux_socket_known: bool,
+) -> bool {
     if tmux_alive {
         return false;
     }
-    if !maintains_heartbeat {
-        return false;
+    if maintains_heartbeat {
+        return heartbeat_stale;
     }
-    heartbeat_stale
+    // Interactive: only conclude death if we queried the right socket.
+    tmux_socket_known
 }
 
 /// The session reconciler. Replays the workspace `agent.*` log to find still-open sessions, and
@@ -71,7 +83,7 @@ pub struct SessionReconciler {
     heartbeat_dir: PathBuf,
     /// A heartbeat older than this counts the session as dead (with a missing tmux session).
     stale_after: Duration,
-    /// tmux probe — `has_session(id)` ⇒ the polecat is still up.
+    /// tmux probe for sessions on the default server (polecats).
     tmux: Arc<dyn Tmux>,
     /// Hub sender — `agent.killed.v1` is published here and persisted by the event-log sink.
     hub: broadcast::Sender<EventRecord>,
@@ -120,15 +132,31 @@ impl SessionReconciler {
             if matches!(session.state, SessionState::Done | SessionState::Killed) {
                 continue;
             }
+
+            // Use the tmux adapter that targets the server where this session lives.
+            // Polecats (tmux_socket=None) → shared default adapter.
+            // Interactive (tmux_socket=Some(s)) → per-call TmuxCli pinned to that socket.
+            let alive = match &session.tmux_socket {
+                None => self.tmux.has_session(&session.id),
+                Some(socket) => TmuxCli::new().with_socket(socket.clone()).has_session(&session.id),
+            };
             let hb = self.heartbeat_dir.join(format!("{}.heartbeat", session.id));
-            let alive = self.tmux.has_session(&session.id);
             let stale = gt_polecat::lifecycle::heartbeat_is_stale(&hb, self.stale_after);
-            if !is_orphan(alive, stale, session.maintains_heartbeat) {
+            let socket_known = session.tmux_socket.is_some();
+            if !is_orphan(alive, stale, session.maintains_heartbeat, socket_known) {
                 continue;
             }
+            let reason = if session.maintains_heartbeat {
+                "orphaned: no tmux session, heartbeat stale".to_string()
+            } else {
+                format!(
+                    "orphaned: tmux session absent on {} (interactive, no heartbeat)",
+                    session.tmux_socket.as_deref().unwrap_or("default")
+                )
+            };
             let event = AgentEvent::Killed {
                 session: session.id.clone(),
-                reason: "orphaned: no tmux session, heartbeat stale".to_string(),
+                reason,
             };
             match EventRecord::from_envelope(&Envelope::root(event)) {
                 Ok(record) => {
@@ -156,26 +184,39 @@ mod tests {
 
     #[test]
     fn polecat_orphan_requires_both_signals_dead() {
-        // A polecat (maintains_heartbeat=true) is only reaped when tmux is gone AND heartbeat stale.
+        // Polecat (maintains_heartbeat=true, socket_known=false for default server sessions).
         assert!(
-            is_orphan(false, true, true),
+            is_orphan(false, true, true, false),
             "polecat: no tmux + stale heartbeat ⇒ orphan"
         );
-        assert!(!is_orphan(true, true, true), "polecat: tmux present ⇒ keep");
-        assert!(!is_orphan(false, false, true), "polecat: fresh heartbeat ⇒ keep");
-        assert!(!is_orphan(true, false, true), "polecat: alive on both ⇒ keep");
+        assert!(!is_orphan(true, true, true, false), "polecat: tmux present ⇒ keep");
+        assert!(!is_orphan(false, false, true, false), "polecat: fresh heartbeat ⇒ keep");
+        assert!(!is_orphan(true, false, true, false), "polecat: alive on both ⇒ keep");
     }
 
     #[test]
-    fn interactive_session_never_reaped_by_reconciler() {
-        // Mayor and dog (maintains_heartbeat=false) are never reaped by the reconciler regardless
-        // of heartbeat state — the absence of a heartbeat file is not evidence of death for them.
+    fn interactive_with_socket_reaped_when_tmux_gone() {
+        // Mayor/dog with known socket: tmux gone = orphan.
         assert!(
-            !is_orphan(false, true, false),
-            "mayor/dog: no tmux + stale (or absent) heartbeat ⇒ keep (no heartbeat promised)"
+            is_orphan(false, true, false, true),
+            "mayor: no tmux + socket known ⇒ orphan"
         );
-        assert!(!is_orphan(false, false, false), "mayor/dog: no tmux + fresh ⇒ keep");
-        assert!(!is_orphan(true, true, false), "mayor/dog: tmux present ⇒ keep");
-        assert!(!is_orphan(true, false, false), "mayor/dog: alive ⇒ keep");
+        assert!(
+            is_orphan(false, false, false, true),
+            "mayor: no tmux + socket known ⇒ orphan (heartbeat irrelevant)"
+        );
+        assert!(!is_orphan(true, true, false, true), "mayor: tmux present ⇒ keep");
+        assert!(!is_orphan(true, false, false, true), "mayor: tmux present ⇒ keep");
+    }
+
+    #[test]
+    fn interactive_without_socket_never_reaped() {
+        // Pre-flag events (tmux_socket=None, maintains_heartbeat=false): safe fallback.
+        assert!(
+            !is_orphan(false, true, false, false),
+            "old event: no socket known ⇒ keep (can't verify)"
+        );
+        assert!(!is_orphan(false, false, false, false), "old event ⇒ keep");
+        assert!(!is_orphan(true, true, false, false), "old event: tmux present ⇒ keep");
     }
 }

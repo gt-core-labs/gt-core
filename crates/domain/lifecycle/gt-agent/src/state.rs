@@ -93,6 +93,20 @@ impl SessionRole {
     pub fn maintains_heartbeat(&self) -> bool {
         matches!(self, SessionRole::Polecat)
     }
+
+    /// The tmux server socket (`-L <socket>`) for a session of this role in `workspace`, or
+    /// `None` when the role uses the default (socketless) server.
+    ///
+    /// Polecats run on the default server (spawned by `PolecatSupervisor` via `TmuxCli::new()`).
+    /// Interactive sessions (mayor, dog) are launched by the terminal WS handler with
+    /// `tmux -L gt-<workspace>` and must be probed on that socket.
+    /// Mirrors the `gt_polecat::tmux_server_name` convention without the cross-crate dep.
+    pub fn tmux_socket(&self, workspace: &str) -> Option<String> {
+        match self {
+            SessionRole::Polecat => None,
+            _ => Some(format!("gt-{workspace}")),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -120,6 +134,12 @@ pub struct Session {
     /// sessions replayed from pre-flag log entries.
     #[serde(default)]
     pub maintains_heartbeat: bool,
+    /// The tmux server socket (`-L <socket>`) where this session's tmux lives, or `None` for
+    /// the default server. Polecats → `None`; interactive sessions (mayor/dog) →
+    /// `Some("gt-<workspace>")`. The reconciler uses this to probe the correct server.
+    /// `#[serde(default)]` → `None` for pre-flag log entries (reconciler skips those safely).
+    #[serde(default)]
+    pub tmux_socket: Option<String>,
 }
 
 impl Session {
@@ -135,6 +155,7 @@ impl Session {
             skills: Vec::new(),
             hooks: Vec::new(),
             maintains_heartbeat: true,
+            tmux_socket: None,
         }
     }
 
@@ -154,6 +175,7 @@ impl Session {
             skills: Vec::new(),
             hooks: Vec::new(),
             maintains_heartbeat: role.maintains_heartbeat(),
+            tmux_socket: None,
         }
     }
 
@@ -237,11 +259,12 @@ impl SessionRegistry {
     /// total → reconstrucción determinista del estado desde el log (gate del Paso 3).
     pub fn apply(&mut self, event: &AgentEvent) {
         match event {
-            AgentEvent::Spawned { session, rig, role, crew, skills, hooks, maintains_heartbeat } => {
+            AgentEvent::Spawned { session, rig, role, crew, skills, hooks, maintains_heartbeat, tmux_socket } => {
                 let mut s = Session::with_role(session.clone(), rig.clone(), *role, crew.clone());
                 s.skills = skills.clone();
                 s.hooks = hooks.clone();
                 s.maintains_heartbeat = *maintains_heartbeat;
+                s.tmux_socket = tmux_socket.clone();
                 self.add(s);
             }
             AgentEvent::Heartbeat { .. } => {} // no cambia el registro

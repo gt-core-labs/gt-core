@@ -533,6 +533,7 @@ impl Plugin for PolecatSupervisorPlugin {
                     skills: skills.clone(),
                     hooks: hooks.clone(),
                     maintains_heartbeat: true,
+                    tmux_socket: None,
                 });
                 // Mark the bead's operating agent on the issues channel (hq-agent-observability.2)
                 // so the FE shows who works it + what they loaded.

@@ -258,6 +258,7 @@ async fn spawn_session(
             skills: Vec::new(),
             hooks: Vec::new(),
             maintains_heartbeat: role.maintains_heartbeat(),
+            tmux_socket: role.tmux_socket(ws.unwrap_or("default")),
         },
         &session,
     )?;

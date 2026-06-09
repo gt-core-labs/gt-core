@@ -36,6 +36,12 @@ pub enum AgentEvent {
         /// cannot conclude death from a missing heartbeat it was never promised).
         #[serde(default)]
         maintains_heartbeat: bool,
+        /// The tmux server socket (`-L <socket>`) where this session lives, or `None` for the
+        /// default server. Polecats → `None`; interactive sessions (mayor/dog) →
+        /// `Some("gt-<workspace>")`. The reconciler needs this to probe the right server.
+        /// `#[serde(default)]` → `None` for pre-flag events; the reconciler skips those safely.
+        #[serde(default)]
+        tmux_socket: Option<String>,
     },
     Heartbeat { session: String },
     SessionEnd { session: String },

@@ -1416,6 +1416,7 @@ mod tests {
                 skills: vec![],
                 hooks: vec![],
                 maintains_heartbeat: false,
+                tmux_socket: Some("gt-acme".into()),
             },
         )
         .unwrap();
@@ -1513,6 +1514,7 @@ mod tests {
                 skills: vec![],
                 hooks: vec![],
                 maintains_heartbeat: false,
+                tmux_socket: Some("gt-acme".into()),
             },
         )
         .unwrap();
@@ -1550,6 +1552,7 @@ mod tests {
                 skills: vec![],
                 hooks: vec![],
                 maintains_heartbeat: false,
+                tmux_socket: Some("gt-acme".into()),
             },
         )
         .unwrap();

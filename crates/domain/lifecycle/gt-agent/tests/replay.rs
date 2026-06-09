@@ -19,6 +19,7 @@ fn make_events() -> Vec<AgentEvent> {
             skills: Vec::new(),
             hooks: Vec::new(),
             maintains_heartbeat: true,
+            tmux_socket: None,
         });
     }
     for i in 0..30 {
