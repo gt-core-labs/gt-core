@@ -120,10 +120,14 @@ impl FeedState {
 
 /// `?channel=<namespace>` narrows the feed to one domain's events (`merge`,
 /// `convoy`, `quota`, …). Absent ⇒ the whole workspace feed.
+/// `?rig=<name>` further narrows to events whose payload carries `"rig"` equal to
+/// `name` (hq-rig-isolation.3). Absent ⇒ all rigs (back-compat).
 #[derive(Debug, Default, Deserialize)]
 pub struct FeedParams {
     #[serde(default)]
     channel: Option<String>,
+    #[serde(default)]
+    rig: Option<String>,
 }
 
 /// The SSE feed router (`GET /stream`), ready to `.merge()` into the server's app.
@@ -154,6 +158,7 @@ async fn feed_stream(
         Err(msg) => return (StatusCode::UNAUTHORIZED, msg).into_response(),
     };
     let channel = params.channel.filter(|c| !c.is_empty());
+    let rig_filter = params.rig.filter(|r| !r.is_empty());
     // EventSource resends the last event's id on reconnect; our id is the record ts.
     let resume_from = header(&headers, "last-event-id");
 
@@ -169,6 +174,13 @@ async fn feed_stream(
                 .unwrap_or_default();
             for record in batch {
                 last_ts = Some(record.ts.clone());
+                // hq-rig-isolation.3: skip records whose payload `rig` doesn't match.
+                if let Some(r) = &rig_filter {
+                    let payload_rig = record.payload.get("rig").and_then(|v| v.as_str());
+                    if payload_rig != Some(r.as_str()) {
+                        continue;
+                    }
+                }
                 // Annotate the error type: the handler now returns `Response`, so the stream's
                 // `Infallible` error is no longer inferred from a `Sse<…>` return type.
                 yield Ok::<Event, Infallible>(record_event(&record));

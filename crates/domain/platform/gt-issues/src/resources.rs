@@ -158,6 +158,7 @@ mod tsv_tests {
             version: 0,
             phase: "P1".to_string(),
             delivered_sha: None,
+            rig: String::new(),
             description: None,
             design: None,
             acceptance_criteria: None,

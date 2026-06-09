@@ -202,6 +202,7 @@ mod tests {
             version: 0,
             phase: "P1".into(),
             delivered_sha: None,
+            rig: String::new(),
             description: None,
             design: None,
             acceptance_criteria: None,

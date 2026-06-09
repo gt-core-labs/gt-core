@@ -560,6 +560,7 @@ impl MeStatsSource for IdentityDoltMeStats {
             offset: None,
             full: false,
             ready: false,
+            rig: None,
         };
         store.list(&filter).await
     }

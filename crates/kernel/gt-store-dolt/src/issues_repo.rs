@@ -131,6 +131,8 @@ pub struct IssueFilter {
     /// the query via `gt_issues::resources::filter_ready`. It rides on the filter
     /// purely so the querystring parser has one place to land `?ready=true`.
     pub ready: bool,
+    /// Narrow to a single rig (hq-rig-isolation.1). `None` = workspace-wide (back-compat).
+    pub rig: Option<String>,
 }
 
 /// Snapshot row returned by [`DoltIssues::list`]. Mirrors the columns dashboards
@@ -184,6 +186,10 @@ pub struct IssueRow {
     /// delivery signal dependency readiness (S4) evaluates against.
     #[serde(default)]
     pub delivered_sha: Option<String>,
+    /// The rig this bead belongs to (hq-rig-isolation.1). Derived from the bead id
+    /// prefix at create time and persisted for efficient filter-by-rig queries.
+    #[serde(default)]
+    pub rig: String,
     /// Heavy text bodies, populated only when [`IssueFilter::full`] is set
     /// (hq-gap-issues-list-full). `None` in the cheap default snapshot and
     /// skipped from the JSON entirely, so back-compat consumers see the exact
@@ -315,6 +321,9 @@ pub struct IssueDetail {
     /// [`IssueRow::delivered_sha`].
     #[serde(default)]
     pub delivered_sha: Option<String>,
+    /// The rig this bead belongs to (hq-rig-isolation.1). See [`IssueRow::rig`].
+    #[serde(default)]
+    pub rig: String,
 }
 
 fn default_phase() -> String {
@@ -454,6 +463,9 @@ pub struct NewIssue {
     /// column's `DEFAULT 'P1'` apply; `Some(_)` is a scalar overwrite the
     /// frontier validates against [`IssuePhase`] before insert.
     pub phase: Option<String>,
+    /// The rig this bead belongs to (hq-rig-isolation.1). Derived from the bead id
+    /// prefix by the composition layer before insert; defaults to `""`.
+    pub rig: String,
 }
 
 /// Read-only Dolt adapter for the `issues` table. The canonical bead table is
@@ -615,6 +627,10 @@ impl DoltIssues {
             // hq-system-config: archive sweep stamps this when a closed issue is
             // rotated out of the live tracker view. NULL = not yet archived.
             ("archived_at", "DATETIME NULL"),
+            // hq-rig-isolation.1 — rig a bead belongs to, derived from its id prefix at create
+            // time and persisted for efficient filter-by-rig queries. Default '' so existing rows
+            // backfill below; the backfill sets this to `SUBSTRING_INDEX(id, '-', 1)`.
+            ("rig", "VARCHAR(255) NOT NULL DEFAULT ''"),
         ];
 
         let mut added_any = false;
@@ -649,6 +665,39 @@ impl DoltIssues {
             .await
             .map_err(map_err)?;
         }
+
+        // hq-rig-isolation.1: backfill `rig` from the bead-id prefix for all rows
+        // where `rig` is still the empty-string default. `SUBSTRING_INDEX(id,'-',1)` is
+        // deterministic — the prefix IS the leading token, and prefix == rig name in every
+        // existing workspace. Index is created after backfill so it covers the full table
+        // immediately. Commits are suppressed when no rows changed (cold idempotent runs).
+        let rig_backfill: Option<u64> = conn
+            .query_first(
+                "SELECT COUNT(*) FROM issues WHERE rig = ''",
+            )
+            .await
+            .map_err(map_err)?;
+        if rig_backfill.unwrap_or(0) > 0 {
+            conn.query_drop(
+                "UPDATE issues SET rig = SUBSTRING_INDEX(id, '-', 1) WHERE rig = ''",
+            )
+            .await
+            .map_err(map_err)?;
+            conn.exec_drop(
+                "CALL DOLT_COMMIT('-A', '-m', :msg)",
+                mysql_async::params! {
+                    "msg" => "hq-rig-isolation.1: backfill rig from id prefix".to_string(),
+                },
+            )
+            .await
+            .map_err(map_err)?;
+        }
+        // Idempotent index on `rig` for filter-by-rig queries.
+        conn.query_drop(
+            "CREATE INDEX IF NOT EXISTS issues_rig_idx ON issues(rig)",
+        )
+        .await
+        .map_err(map_err)?;
 
         // hq-core-mcp.7 (docs/10 S1) — the singleton `phase_frontier` row that
         // governs the highest phase currently claimable. Created + seeded
@@ -796,11 +845,11 @@ impl DoltIssues {
             "INSERT INTO issues
                 (id, title, description, design, acceptance_criteria, notes,
                  status, priority, issue_type, assignee, owner, created_by, external_ref,
-                 domain_json, surface_json, depends_on_json, role_scope, phase)
+                 domain_json, surface_json, depends_on_json, role_scope, phase, rig)
              VALUES
                 (:id, :title, :description, :design, :acceptance_criteria, :notes,
                  'open', :priority, :issue_type, :assignee, :owner, :created_by, :external_ref,
-                 :domain_json, :surface_json, :depends_on_json, :role_scope, :phase)",
+                 :domain_json, :surface_json, :depends_on_json, :role_scope, :phase, :rig)",
             mysql_async::params! {
                 "id" => &row.id,
                 "title" => &row.title,
@@ -819,6 +868,7 @@ impl DoltIssues {
                 "depends_on_json" => depends_on_json,
                 "role_scope" => row.role_scope.clone(),
                 "phase" => phase,
+                "rig" => &row.rig,
             },
         )
         .await
@@ -1513,6 +1563,10 @@ impl DoltIssues {
             where_parts.push("issue_type = :issue_type".to_string());
             params_vec.push(("issue_type".to_string(), mysql_async::Value::from(t.clone())));
         }
+        if let Some(r) = &filter.rig {
+            where_parts.push("rig = :rig".to_string());
+            params_vec.push(("rig".to_string(), mysql_async::Value::from(r.clone())));
+        }
 
         let where_clause = if where_parts.is_empty() {
             String::new()
@@ -1601,7 +1655,7 @@ impl DoltIssues {
                     DATE_FORMAT(closed_at,  '%Y-%m-%dT%H:%i:%SZ') AS closed_at,
                     external_ref, spec_id,
                     domain_json, surface_json, depends_on_json, role_scope, version,
-                    phase, delivered_sha{body_cols}
+                    phase, delivered_sha, rig{body_cols}
              FROM issues
              {where_clause}
              ORDER BY created_at DESC, id ASC
@@ -1636,7 +1690,7 @@ impl DoltIssues {
                     external_ref, spec_id,
                     description, design, acceptance_criteria, notes,
                     domain_json, surface_json, depends_on_json, role_scope, version,
-                    phase, delivered_sha
+                    phase, delivered_sha, rig
              FROM issues
              WHERE id = :id
              LIMIT 1";
@@ -1686,6 +1740,7 @@ fn row_to_detail(row: mysql_async::Row) -> Result<IssueDetail, AppError> {
         // hq-core-mcp.8 — phase echoed at claim time so the agent sees the gate.
         phase: take_opt(&mut row, 21).unwrap_or_else(|| "P1".to_string()),
         delivered_sha: take_opt(&mut row, 22),
+        rig: take_opt(&mut row, 23).unwrap_or_default(),
     })
 }
 
@@ -1724,14 +1779,15 @@ fn row_to_issue(row: mysql_async::Row, full: bool) -> Result<IssueRow, AppError>
         depends_on_json: take_string(&mut row, 14)?,
         role_scope: take_opt(&mut row, 15),
         version: row.take::<i64, _>(16).unwrap_or(0),
-        // `phase` + `delivered_sha` always SELECTed (ordinals 17, 18 after version).
+        // `phase`, `delivered_sha`, `rig` always SELECTed (ordinals 17-19).
         phase: take_opt(&mut row, 17).unwrap_or_else(|| "P1".to_string()),
         delivered_sha: take_opt(&mut row, 18),
-        // Bodies are only SELECTed when `full` — ordinals 19-22 (after delivered_sha).
-        description: full.then(|| take_opt(&mut row, 19).unwrap_or_default()),
-        design: full.then(|| take_opt(&mut row, 20).unwrap_or_default()),
-        acceptance_criteria: full.then(|| take_opt(&mut row, 21).unwrap_or_default()),
-        notes: full.then(|| take_opt(&mut row, 22).unwrap_or_default()),
+        rig: take_opt(&mut row, 19).unwrap_or_default(),
+        // Bodies only SELECTed when `full` — ordinals 20-23.
+        description: full.then(|| take_opt(&mut row, 20).unwrap_or_default()),
+        design: full.then(|| take_opt(&mut row, 21).unwrap_or_default()),
+        acceptance_criteria: full.then(|| take_opt(&mut row, 22).unwrap_or_default()),
+        notes: full.then(|| take_opt(&mut row, 23).unwrap_or_default()),
     })
 }
 

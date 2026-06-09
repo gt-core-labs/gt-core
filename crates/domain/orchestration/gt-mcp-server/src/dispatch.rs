@@ -205,6 +205,7 @@ pub async fn dispatch(
                 offset: a.offset,
                 full: a.full,
                 ready: a.ready,
+                rig: a.rig,
             };
             if filter.ready {
                 // ready=true needs phase frontier + dep index + git tree (same as resource path)
@@ -282,6 +283,7 @@ pub async fn dispatch_meta(
                 domain_json: json_array(g.domain.as_deref()),
                 surface_json: json_array(g.surface.as_deref()),
                 depends_on_json: json_array(g.depends_on.as_deref()),
+                rig: bead_prefix(&id).to_string(),
                 ..Default::default()
             };
             store.insert(&new).await?;

@@ -269,6 +269,8 @@ struct ListQuery {
     /// usual truthy forms (`1`/`true`); unset/`0`/`false` ⇒ the normal page.
     #[serde(default, deserialize_with = "de_bool_flag")]
     ready: bool,
+    /// Narrow to a single rig (hq-rig-isolation.1). Absent ⇒ workspace-wide (back-compat).
+    rig: Option<String>,
 }
 
 impl ListQuery {
@@ -294,6 +296,7 @@ impl ListQuery {
             offset: self.offset,
             full: self.full,
             ready: self.ready,
+            rig: self.rig,
         }
     }
 }
@@ -437,6 +440,7 @@ async fn issue_stats(
         offset: None,
         full: false,
         ready: false,
+        rig: None,
     };
     let rows = read_issues(&store, &filter).await?;
     Ok(Json(aggregate(&rows, &dims)))

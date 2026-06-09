@@ -226,6 +226,8 @@ impl CreateIssue {
             depends_on_json: to_json_array(&self.depends_on),
             role_scope: self.role_scope.clone(),
             phase: self.phase.clone(),
+            // hq-rig-isolation.1: derive rig from the leading id token (the bead prefix).
+            rig: self.id.split('-').next().unwrap_or("").to_string(),
         }
     }
 }
@@ -571,6 +573,9 @@ pub struct ListIssues {
     /// Narrow to actionable beads only (every readiness clause holds).
     #[serde(default)]
     pub ready: bool,
+    /// Narrow to a single rig (hq-rig-isolation.1). Absent ⇒ workspace-wide (back-compat).
+    #[serde(default)]
+    pub rig: Option<String>,
 }
 
 /// Input for `issues.read` — fetch a single bead with its full detail.

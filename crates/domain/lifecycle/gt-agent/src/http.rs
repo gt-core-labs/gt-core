@@ -33,7 +33,7 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use axum::extract::{Path, State};
+use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
@@ -166,17 +166,31 @@ struct KillArgs {
     reason: String,
 }
 
+/// `?rig=` filter for `GET /` (hq-rig-isolation.2). Absent ⇒ workspace-wide (back-compat).
+#[derive(Debug, Default, Deserialize)]
+struct ListSessionsQuery {
+    rig: Option<String>,
+}
+
 /// `GET /` — every agent session in the workspace (`agent.list`).
 #[cfg_attr(feature = "axum", utoipa::path(
     get, path = "/",
-    responses((status = 200, description = "Every agent session in the workspace")),
+    params(("rig" = Option<String>, Query, description = "Narrow to sessions with this rig")),
+    responses((status = 200, description = "Agent sessions, optionally filtered by rig")),
 ))]
 async fn list_sessions(
     State(st): State<AgentApiState>,
     headers: HeaderMap,
+    Query(q): Query<ListSessionsQuery>,
 ) -> Result<Json<Value>, ApiError> {
     let reg = st.registry(workspace_of(&headers).as_deref())?;
-    Ok(Json(json!({ "sessions": reg.snapshot().iter().map(session_json).collect::<Vec<_>>() })))
+    let sessions: Vec<_> = reg
+        .snapshot()
+        .iter()
+        .filter(|s| q.rig.as_deref().map_or(true, |r| s.rig == r))
+        .map(session_json)
+        .collect();
+    Ok(Json(json!({ "sessions": sessions })))
 }
 
 /// `GET /:id` — one session's state (`agent.info`); `404` when no session matches.
