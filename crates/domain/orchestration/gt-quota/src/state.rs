@@ -248,12 +248,33 @@ impl AccountRegistry {
     }
 
     /// Reconcile the live window against the provider's authoritative `remaining`/`resets_at`.
-    /// No-op if the account has no live window. Shared by `QuotaMsg::Probe` and `ProbeWindow`.
+    /// Creates a synthetic Rolling5h window when none exists yet (first probe on a freshly
+    /// registered account). Transitions Cooldown/Limited/Blocked → Healthy when `remaining > 0`
+    /// (the account recovered capacity). Shared by `QuotaMsg::Probe` and `ProbeWindow`.
     pub fn apply_probe(&mut self, account: &str, remaining: u64, resets_at_secs: u64) {
         if let Some(acc) = self.get_mut(account) {
-            if let Some(w) = acc.window.as_mut() {
-                w.consumed = (w.limit.saturating_sub(remaining)) as f64;
-                w.resets_at_secs = resets_at_secs;
+            match acc.window.as_mut() {
+                Some(w) => {
+                    w.consumed = (w.limit.saturating_sub(remaining)) as f64;
+                    w.resets_at_secs = resets_at_secs;
+                }
+                None => {
+                    // First probe on a registered account: seed a Rolling5h window anchored
+                    // conservatively (started 5h before the reset so `consumed/elapsed` stays
+                    // sane until real samples arrive).
+                    acc.window = Some(AccountWindow {
+                        kind: WindowKind::Rolling5h,
+                        limit: DEFAULT_PLAN_LIMIT,
+                        started_at_secs: resets_at_secs.saturating_sub(ROLLING_5H_SECS),
+                        resets_at_secs,
+                        consumed: DEFAULT_PLAN_LIMIT.saturating_sub(remaining) as f64,
+                    });
+                }
+            }
+            // A probe with remaining > 0 means the account has real capacity: lift any
+            // non-Healthy status (Cooldown after rotation, Limited/Blocked after a 429).
+            if remaining > 0 {
+                acc.status = AccountQuotaStatus::Healthy;
             }
         }
     }
@@ -356,9 +377,23 @@ impl QuotaState {
                         window: None,
                     }
                 });
-                if let Some(w) = entry.window.as_mut() {
-                    w.consumed = (w.limit.saturating_sub(*remaining)) as f64;
-                    w.resets_at_secs = *resets_at_secs;
+                match entry.window.as_mut() {
+                    Some(w) => {
+                        w.consumed = (w.limit.saturating_sub(*remaining)) as f64;
+                        w.resets_at_secs = *resets_at_secs;
+                    }
+                    None => {
+                        entry.window = Some(AccountWindow {
+                            kind: WindowKind::Rolling5h,
+                            limit: DEFAULT_PLAN_LIMIT,
+                            started_at_secs: resets_at_secs.saturating_sub(ROLLING_5H_SECS),
+                            resets_at_secs: *resets_at_secs,
+                            consumed: DEFAULT_PLAN_LIMIT.saturating_sub(*remaining) as f64,
+                        });
+                    }
+                }
+                if *remaining > 0 {
+                    entry.status = AccountQuotaStatus::Healthy;
                 }
             }
             QuotaEvent::WindowReset { account, started_at_secs, resets_at_secs } => {
@@ -542,5 +577,95 @@ mod tests {
         let w = s.accounts["acc-1"].window.as_ref().unwrap();
         assert_eq!(w.consumed, 7.0, "recycled then folded the fresh sample");
         assert!(w.resets_at_secs > 1_000 + ROLLING_5H_SECS);
+    }
+
+    #[test]
+    fn probe_on_cooldown_account_with_window_recovers_to_healthy() {
+        // hq-quota-refinement.1 (AC1): a probe with remaining > 0 lifts Cooldown → Healthy.
+        let mut r = AccountRegistry::default();
+        r.upsert_account(Account {
+            id: "acc-1".into(),
+            status: AccountQuotaStatus::Cooldown,
+            window: Some(AccountWindow {
+                kind: WindowKind::Rolling5h,
+                limit: DEFAULT_PLAN_LIMIT,
+                started_at_secs: 0,
+                resets_at_secs: 18_000,
+                consumed: DEFAULT_PLAN_LIMIT as f64,
+            }),
+        });
+        r.apply_probe("acc-1", 50_000_000, 36_000);
+        let acc = r.get("acc-1").unwrap();
+        assert_eq!(acc.status, AccountQuotaStatus::Healthy, "Cooldown lifted on remaining>0");
+        let w = acc.window.as_ref().unwrap();
+        assert_eq!(w.consumed, 0.0, "consumed reconciled from DEFAULT_PLAN_LIMIT - remaining");
+        assert_eq!(w.resets_at_secs, 36_000);
+    }
+
+    #[test]
+    fn probe_on_cooldown_with_zero_remaining_stays_cooldown() {
+        // A probe with remaining=0 must NOT rehabilitate the account.
+        let mut r = AccountRegistry::default();
+        r.upsert_account(Account {
+            id: "acc-1".into(),
+            status: AccountQuotaStatus::Cooldown,
+            window: Some(AccountWindow {
+                kind: WindowKind::Rolling5h,
+                limit: DEFAULT_PLAN_LIMIT,
+                started_at_secs: 0,
+                resets_at_secs: 18_000,
+                consumed: DEFAULT_PLAN_LIMIT as f64,
+            }),
+        });
+        r.apply_probe("acc-1", 0, 18_000);
+        assert_eq!(
+            r.get("acc-1").unwrap().status,
+            AccountQuotaStatus::Cooldown,
+            "zero remaining must not lift Cooldown"
+        );
+    }
+
+    #[test]
+    fn probe_creates_window_when_none_exists() {
+        // hq-quota-refinement.1 (AC2): first probe on a freshly registered account seeds a window.
+        let mut r = AccountRegistry::default();
+        r.upsert_account(Account::new("acc-1")); // window = None
+        r.apply_probe("acc-1", 40_000_000, 18_000);
+        let acc = r.get("acc-1").unwrap();
+        assert_eq!(acc.status, AccountQuotaStatus::Healthy);
+        let w = acc.window.as_ref().expect("window created by probe");
+        assert_eq!(w.kind, WindowKind::Rolling5h);
+        assert_eq!(w.resets_at_secs, 18_000);
+        assert_eq!(
+            w.consumed,
+            (DEFAULT_PLAN_LIMIT - 40_000_000) as f64,
+            "consumed = limit - remaining"
+        );
+    }
+
+    #[test]
+    fn usage_probed_event_recovers_cooldown_and_creates_window_in_reducer() {
+        // hq-quota-refinement.1: QuotaState reducer mirrors actor behaviour for UsageProbed.
+        let mut s = QuotaState::default();
+        // Seed a Cooldown account with no window (e.g. registered, rotated, never probed).
+        s.accounts.insert(
+            "acc-1".into(),
+            Account {
+                id: "acc-1".into(),
+                status: AccountQuotaStatus::Cooldown,
+                window: None,
+            },
+        );
+        s.apply(&QuotaEvent::UsageProbed {
+            account: "acc-1".into(),
+            remaining: 30_000_000,
+            resets_at_secs: 50_000,
+            now_secs: 1_000,
+        });
+        let acc = &s.accounts["acc-1"];
+        assert_eq!(acc.status, AccountQuotaStatus::Healthy, "reducer lifts Cooldown");
+        let w = acc.window.as_ref().expect("reducer seeds window");
+        assert_eq!(w.resets_at_secs, 50_000);
+        assert_eq!(w.consumed, (DEFAULT_PLAN_LIMIT - 30_000_000) as f64);
     }
 }

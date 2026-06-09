@@ -221,10 +221,10 @@ pub async fn run(channel: Channel, quota: QuotaHandle) -> Result<(), gt_channel:
 /// half of the payload is absent or incomplete.
 async fn apply_feed(quota: &QuotaHandle, p: QuotaFeedPayload) {
     let now = now_secs();
-    // 1) Window from the headers. `apply_probe` is a no-op without a live window, and a fresh
-    //    account has none — so when the headers carry a full tokens window we seed it via
-    //    `upsert_account`, preserving the current status (a probe must not un-Cooldown a rotated
-    //    account). `started_at` is anchored on first sight and kept across refreshes.
+    // 1) Window from the headers. When the headers carry a full tokens window we seed/refresh it
+    //    via `upsert_account` (preserving `started_at` across refreshes), then the authoritative
+    //    `apply_probe` that follows will reconcile consumed and — if remaining > 0 — lift any
+    //    Cooldown/Limited/Blocked status back to Healthy.
     if !p.headers.is_empty() {
         let snap = RatelimitHeaders::from_headers(&p.headers);
         if let (Some(limit), Some(remaining), Some(resets_at)) = (
