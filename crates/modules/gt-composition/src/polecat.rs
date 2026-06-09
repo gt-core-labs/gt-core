@@ -428,6 +428,29 @@ impl Plugin for PolecatSupervisorPlugin {
                         SkillState::apply,
                     ) {
                         Ok(state) => {
+                            // SKILL.md bodies → <worktree>/.claude/skills/<id>/SKILL.md
+                            // (hq-polecat-skills.1): mirrors terminal.rs::prepare_role_skills so
+                            // the polecat loads the same skill bodies as an interactive role
+                            // session. Best-effort per skill — one write failure never skips the
+                            // rest.
+                            let skills_dir = spec.workdir.join(".claude").join("skills");
+                            for id in state.catalog.skills_for_role(role) {
+                                let Some(skill) = state.catalog.get(&id) else {
+                                    continue;
+                                };
+                                if skill.body.trim().is_empty() {
+                                    continue;
+                                }
+                                let dir = skills_dir.join(&id);
+                                if let Err(e) = std::fs::create_dir_all(&dir)
+                                    .and_then(|_| std::fs::write(dir.join("SKILL.md"), &skill.body))
+                                {
+                                    eprintln!(
+                                        "[polecat] skill {id} write for {bead} skipped: {e}"
+                                    );
+                                }
+                            }
+                            // Role prompt → CLAUDE.md (hq-polecat-knowledge.1)
                             if let Some(prompt) = state.catalog.role_prompt(role) {
                                 let rendered = crate::terminal::render_prompt(
                                     &prompt,
@@ -448,7 +471,7 @@ impl Plugin for PolecatSupervisorPlugin {
                             }
                         }
                         Err(e) => eprintln!(
-                            "[polecat] skills replay failed — no CLAUDE.md written for {bead}: {e}"
+                            "[polecat] skills replay failed — no skills/CLAUDE.md written for {bead}: {e}"
                         ),
                     }
                 }
