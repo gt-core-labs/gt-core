@@ -216,6 +216,15 @@ mod tests {
         assert_eq!(info["id"], "acc-1");
         assert_eq!(info["status"], "Healthy");
 
+        // Probe the rotation target first: RotateAccount only accepts a destination that is
+        // registered AND Healthy (a074fc5), and a probe with remaining>0 creates exactly that.
+        h.dispatch(
+            "quota.probe",
+            ctx(json!({ "account": "acc-2", "remaining": 250, "resets_at_secs": 20_000 })),
+        )
+        .await
+        .unwrap();
+
         // Rotate parks the source account in Cooldown (replayed onto the entry).
         let rotated = h
             .dispatch(
