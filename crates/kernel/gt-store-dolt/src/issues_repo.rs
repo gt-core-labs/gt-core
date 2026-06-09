@@ -683,14 +683,22 @@ impl DoltIssues {
             )
             .await
             .map_err(map_err)?;
-            conn.exec_drop(
+            // Suppress "nothing to commit": can occur when the net effect of the seed +
+            // backfill round-trips to the same state as HEAD (e.g. in tests that reseed
+            // the same rows the previous run already backfilled). The data is correct at
+            // this point so it is safe to continue.
+            let commit_res = conn.exec_drop(
                 "CALL DOLT_COMMIT('-A', '-m', :msg)",
                 mysql_async::params! {
                     "msg" => "hq-rig-isolation.1: backfill rig from id prefix".to_string(),
                 },
             )
-            .await
-            .map_err(map_err)?;
+            .await;
+            if let Err(ref e) = commit_res {
+                if !e.to_string().contains("nothing to commit") {
+                    return Err(map_err(commit_res.unwrap_err()));
+                }
+            }
         }
         // Idempotent index on `rig` for filter-by-rig queries.
         conn.query_drop(
