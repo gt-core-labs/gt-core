@@ -259,7 +259,7 @@ pub use http::{CreateProviderRequest, PatchProviderRequest, ProviderStore, Provi
 /// The composition root supplies the production adapters (`PgAuthzStateRepo` / `DbOauthLogin`) via
 /// [`AuthState::authz_state`] / [`AuthState::authz_flow`].
 #[cfg(feature = "oauth")]
-pub use http::{AuthzStateStore, CliCodeStore, OauthAuthzFlow, PublicProvider};
+pub use http::{AuthzStateStore, CliCodeStore, OauthAuthzFlow, PublicProvider, SsoProvisioner};
 
 #[cfg(all(feature = "oauth", feature = "pg"))]
 pub use provider_repo::PgProviderRepo;

@@ -1025,6 +1025,10 @@ async fn main() -> anyhow::Result<()> {
                 fe_redirect_url: std::env::var("GT_OAUTH_FE_REDIRECT_URL")
                     .ok()
                     .filter(|v| !v.trim().is_empty()),
+                // JIT SSO provisioner (hq-epic.auth-refactor.4): wire PgUsers as the
+                // SsoProvisioner so the /auth/callback auto-creates SSO user rows on first login.
+                #[cfg(feature = "oauth")]
+                sso_provisioner: Some(pg_users.clone() as Arc<dyn gt_auth::SsoProvisioner>),
                 minter: Arc::new(minter),
                 // Durable refresh store (hq-platform-hardening.1): PgRefreshStore over the same
                 // ws_default pool, so a refresh token survives a gt-mcp-server redeploy instead of

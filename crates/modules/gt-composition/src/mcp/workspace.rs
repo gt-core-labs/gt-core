@@ -408,6 +408,7 @@ fn new_provider_from_args(args: &Value) -> Result<gt_auth::NewProvider, AppError
         )?,
         scopes: need("scopes", preset.as_ref().map(|p| p.default_scopes))?,
         enabled: args.get("enabled").and_then(Value::as_bool).unwrap_or(true),
+        workspace_id: None,
     })
 }
 
@@ -427,6 +428,7 @@ fn patch_provider_from_args(args: &Value) -> gt_auth::PatchProvider {
         userinfo_endpoint: opt("userinfo_endpoint"),
         scopes: opt("scopes"),
         enabled: args.get("enabled").and_then(Value::as_bool),
+        workspace_id: None,
     }
 }
 
