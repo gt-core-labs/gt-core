@@ -136,6 +136,13 @@ async fn rotate_takes_from_account_from_path_and_parks_source() {
         post_in("acme", "/acc-1/probe", json!({ "remaining": 100, "resets_at_secs": 20_000 })),
     )
     .await;
+    // Materialize the rotation target too: RotateAccount only accepts a destination that is
+    // registered AND Healthy (a074fc5), which a probe with remaining>0 creates.
+    send(
+        &app,
+        post_in("acme", "/acc-2/probe", json!({ "remaining": 250, "resets_at_secs": 20_000 })),
+    )
+    .await;
 
     // The body names a DECOY from_account; the path must win (docs/03 Rule 6) — `acc-1` rotates.
     let (status, body) = send(
