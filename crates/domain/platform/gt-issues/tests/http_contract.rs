@@ -353,6 +353,57 @@ async fn ready_filter_matches_the_mcp_resource_sound_set() {
     assert!(rest_ids.iter().any(|i| i == "hq-ready-b"));
 }
 
+/// The claim-context custodian over the REST transition route (hq-context-custodian.1).
+/// The REST surface wires `quota_blocked=false` (no quota signal), so a `working` move
+/// WITHOUT context must be rejected (StopTheLine) and — critically — leave the bead
+/// untouched: the status stays `open`, proving no write happened on the rejected path.
+/// A move WITH a real context is accepted and records the breadcrumb note before the flip.
+#[tokio::test]
+async fn transition_to_working_requires_context_and_does_not_write_on_rejection() {
+    let Ok(base) = std::env::var("GT_DOLT_URL") else {
+        eprintln!("GT_DOLT_URL unset — skipping http contract");
+        return;
+    };
+    let base = base.trim_end_matches('/').to_string();
+    let db = "gt_http_custodian";
+    fresh_db(&base, db).await.expect("db");
+    let app = router(&base, db).await;
+
+    send(&app, post_json("/", json!({ "id": "hq-cust", "title": "c", "issue_type": "epic", "created_by": "test", "domain": ["platform.rig"] })))
+        .await;
+
+    // No context + healthy quota ⇒ 422 StopTheLine, and the bead must NOT move.
+    let (status, body) =
+        send(&app, post_json("/hq-cust/transition", json!({ "target": "working" }))).await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "missing context rejected: {body}");
+    let (_, detail) = send(&app, get("/hq-cust")).await;
+    assert_eq!(detail["status"], "open", "StopTheLine left the status untouched (no write)");
+
+    // A placeholder context is rejected at shape validation (still no write).
+    let (status, _) =
+        send(&app, post_json("/hq-cust/transition", json!({ "target": "working", "context": "wip" }))).await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "too-short context rejected");
+    let (_, detail) = send(&app, get("/hq-cust")).await;
+    assert_eq!(detail["status"], "open");
+
+    // A real breadcrumb is accepted: the bead flips to working and the note is recorded.
+    let ctx = "wiring run_transition_issue custodian; handlers.rs + policy.rs";
+    let (status, body) = send(
+        &app,
+        post_json("/hq-cust/transition", json!({ "target": "working", "context": ctx })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "transition with context accepted: {body}");
+    let (_, detail) = send(&app, get("/hq-cust")).await;
+    assert_eq!(detail["status"], "working", "context move flips status");
+    let notes = detail["notes"].as_str().unwrap_or("");
+    assert!(notes.contains("working context:"), "breadcrumb note recorded: {notes}");
+
+    // open/closed moves carry no context contract: a move back to open needs nothing.
+    let (status, _) = send(&app, post_json("/hq-cust/transition", json!({ "target": "open" }))).await;
+    assert_eq!(status, StatusCode::OK, "open move needs no context");
+}
+
 /// Run `git` in `dir` and assert success (test-repo setup helper).
 fn git(dir: &std::path::Path, args: &[&str]) {
     let out = std::process::Command::new("git")

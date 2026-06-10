@@ -132,12 +132,15 @@ pub async fn dispatch(
         }
         "issues.transition.validate" => {
             let a: TransitionIssue = parse_args(args)?;
-            run_transition_issue(store, &a, true).await?;
+            // Shape-only; the custodian (and its quota signal) runs on execute.
+            run_transition_issue(store, &a, false, true).await?;
             Ok(json!({ "ok": true }))
         }
         "issues.transition.execute" => {
             let a: TransitionIssue = parse_args(args)?;
-            run_transition_issue(store, &a, false).await?;
+            // quota_blocked=false for now: the real freshly-confirmed-block signal is
+            // threaded in from the composition root in hq-context-custodian.2.
+            run_transition_issue(store, &a, false, false).await?;
             emit_issue_event(sink, store, ws, IssueVerb::Transitioned, &a.id, actor).await;
             Ok(json!({ "ok": true }))
         }

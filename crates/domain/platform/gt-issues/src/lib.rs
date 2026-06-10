@@ -88,8 +88,8 @@ pub use park::{
     ParkedOp, Reversibility,
 };
 pub use policy::{
-    check_bead as check_bead_policy, invariant, BeadFacts, Enforcement, Invariant, PolicyVerdict,
-    Violation, INVARIANTS,
+    check_bead as check_bead_policy, guard_claim_context, invariant, BeadFacts, Enforcement,
+    Invariant, PolicyVerdict, Violation, INVARIANTS, MIN_CONTEXT_LEN,
 };
 pub use readiness::is_ready;
 pub use stats::{MeStatsResponse, WorkspaceStats};

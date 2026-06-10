@@ -11,12 +11,15 @@
 //! own; the binary supplies the live adapter. `validate_only` short-circuits
 //! before any state change, exactly as the `*.validate` tools do.
 
+use std::time::{SystemTime, UNIX_EPOCH};
+
 use gt_store_dolt::{AppError, ClaimOutcome, DoltIssues};
 
 use crate::commands::{
     AdvancePhase, ClaimIssue, CloseIssue, CreateIssue, TransitionIssue, UpdateIssue,
 };
 use crate::delivery::{path_touches_surface, CommitInspector};
+use crate::policy::{guard_claim_context, PolicyVerdict, Violation};
 use crate::surface::{parse_surface_json, SurfaceTree};
 
 /// Outcome of [`run_claim_issue`]. Carries the CAS result plus, on a won execute,
@@ -99,19 +102,74 @@ pub async fn run_update_issue(
     Ok(issues.current_version(&args.id).await.ok().flatten())
 }
 
-/// `issues.transition`: validate the target label, then (execute only) move the
-/// status across the state machine. Illegal moves are rejected by the store's
-/// status-guarded UPDATE and surface as `Validation`.
+/// `issues.transition`: validate the target label, consult the claim-context
+/// custodian for a `working` move, then (execute only) move the status across the
+/// state machine. Illegal moves are rejected by the store's status-guarded UPDATE
+/// and surface as `Validation`.
+///
+/// **Claim-context custodian (hq-context-custodian).** A transition to `working`
+/// must record the what/files/decisions another agent needs to resume (CLAUDE.md
+/// §2). The gate calques [`run_close_issue`]'s conditional `commit_sha`: the
+/// custodian ([`guard_claim_context`]) is consulted before any write, fed
+/// `quota_blocked` — a signal the caller cannot forge (wired to the quota subsystem
+/// in `hq-context-custodian.2`; `false` until then).
+///
+/// - **StopTheLine** (no context, capacity exists) → reject with the violations,
+///   leaving the status untouched.
+/// - **Pass** (context present) → record it as a note *before* the flip, the same
+///   breadcrumb-before-write order `run_close_issue` uses for the sha.
+/// - **Deferred** (no context, quota confirmed blocked) → flip, then stamp a
+///   `context-deferred: <reason> @ <ts>` debt note.
+///
+/// `open`/`closed` moves carry no context contract and pass straight through.
 pub async fn run_transition_issue(
     issues: &DoltIssues,
     args: &TransitionIssue,
+    quota_blocked: bool,
     validate_only: bool,
 ) -> Result<(), AppError> {
     args.validate()?;
     if validate_only {
         return Ok(());
     }
+    // Custodian: gate the `working` claim on context (or a quota-governed deferral).
+    // Runs before any state change so a StopTheLine never mutates the bead.
+    let context = args.context.as_deref().map(str::trim).filter(|c| !c.is_empty());
+    match guard_claim_context(args.target_status(), args.context.as_deref(), quota_blocked) {
+        PolicyVerdict::StopTheLine(violations) => {
+            return Err(AppError::Validation(format_violations(&violations)));
+        }
+        PolicyVerdict::Pass => {
+            // Record the breadcrumb BEFORE the flip (mirrors the sha note in close),
+            // so even a subsequently-rejected transition leaves the context trail.
+            if let Some(ctx) = context {
+                issues
+                    .append_notes(&args.id, &format!("working context: {ctx}"))
+                    .await?;
+            }
+        }
+        PolicyVerdict::Deferred(reason) => {
+            let ts = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            issues
+                .append_notes(&args.id, &format!("context-deferred: {reason} @ {ts}"))
+                .await?;
+        }
+    }
     issues.transition(&args.id, args.target_status()).await
+}
+
+/// Render a custodian stop-the-line into one `Validation` message: the detail of
+/// each violation, newline-joined, so the agent sees exactly why the claim was
+/// blocked.
+fn format_violations(violations: &[Violation]) -> String {
+    violations
+        .iter()
+        .map(|v| v.detail.clone())
+        .collect::<Vec<_>>()
+        .join("; ")
 }
 
 /// `issues.close`: validate (incl. the required `commit_sha`), then (execute

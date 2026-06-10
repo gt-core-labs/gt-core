@@ -27,7 +27,7 @@
 use std::collections::HashSet;
 
 use gt_module_mcp::taxonomy::{validate as taxonomy_validate, BeadTaxonomy};
-use gt_store_dolt::IssuePhase;
+use gt_store_dolt::{IssuePhase, IssueStatus};
 
 /// Where a non-negotiable is machine-enforced. The autonomous planner treats an
 /// invariant as a "known category" it may proceed on iff that category has an
@@ -139,6 +139,13 @@ pub enum PolicyVerdict {
     /// One or more invariants tripped — a stop-the-line event. The planner must
     /// not "just this once"; it escalates with these violations attached.
     StopTheLine(Vec<Violation>),
+    /// The action is allowed to proceed *despite* an unmet requirement, because a
+    /// subsystem signal (not the agent) authorizes deferring it — leaving a debt
+    /// breadcrumb to settle later. Carries the human-readable reason the deferral
+    /// was granted. Used by [`guard_claim_context`]: when there is no quota to feed
+    /// the work, demanding the claim context would only block a model that cannot
+    /// run anyway, so the custodian defers the requirement rather than stop the line.
+    Deferred(String),
 }
 
 impl PolicyVerdict {
@@ -146,6 +153,67 @@ impl PolicyVerdict {
     pub fn is_pass(&self) -> bool {
         matches!(self, PolicyVerdict::Pass)
     }
+}
+
+/// Minimum trimmed length of a claim context. Short enough to never reject a real
+/// "what/files/decisions" breadcrumb, long enough that a placeholder like `wip` or
+/// `.` cannot satisfy the requirement (CLAUDE.md §2: leave enough for another agent
+/// to resume). Only enforced on a *present* context; absence is the custodian's call.
+pub const MIN_CONTEXT_LEN: usize = 12;
+
+/// The custodian of the claim-context contract (docs/04 §13 / CLAUDE.md §2): a bead
+/// may not enter `working` without recording the "what/files/decisions" another agent
+/// would need to resume — UNLESS the quota subsystem confirms there is no capacity to
+/// feed the work, in which case the requirement is *deferred with debt*, never waived
+/// by the agent itself.
+///
+/// Mirrors the [`CloseIssue`](crate::CloseIssue) precedent: just as a close conditions
+/// the mandatory `commit_sha` on the bead's code surface, a working transition
+/// conditions the mandatory context on the actor's live quota — the gate lives in the
+/// handler, fed a signal the caller cannot forge.
+///
+/// Verdicts:
+/// - `target != Working` → [`Pass`](PolicyVerdict::Pass): only the claim transition is
+///   gated; `open`/`closed` moves carry no context contract.
+/// - context present (non-blank) → `Pass`: the breadcrumb is recorded, proceed.
+/// - context absent + `quota_blocked == false` → [`StopTheLine`](PolicyVerdict::StopTheLine):
+///   capacity exists, so the missing context is a real violation; reject before any write.
+/// - context absent + `quota_blocked == true` → [`Deferred`](PolicyVerdict::Deferred):
+///   no capacity to feed the work, so requiring context would only block a model that
+///   cannot run; allow the move and stamp the debt.
+///
+/// `quota_blocked` MUST originate from the quota subsystem's *freshly confirmed* block
+/// signal (`hq-context-custodian.3`), never from a field the agent sets — otherwise the
+/// deferral is a loophole. This function takes it as a plain `bool` so the domain stays
+/// free of the quota dependency; the composition root wires the real signal in `.2`.
+pub fn guard_claim_context(
+    target: IssueStatus,
+    context: Option<&str>,
+    quota_blocked: bool,
+) -> PolicyVerdict {
+    if target != IssueStatus::Working {
+        return PolicyVerdict::Pass;
+    }
+    let has_context = context
+        .map(str::trim)
+        .is_some_and(|c| !c.is_empty());
+    if has_context {
+        return PolicyVerdict::Pass;
+    }
+    if quota_blocked {
+        return PolicyVerdict::Deferred(
+            "quota blocked (no capacity to feed the work) — context requirement deferred as debt"
+                .to_string(),
+        );
+    }
+    PolicyVerdict::StopTheLine(vec![Violation {
+        invariant: Some(13),
+        rule: "claim-context-required",
+        detail: "transition to `working` requires a context recording the what/files/decisions \
+                 so another agent can resume (CLAUDE.md §2). Provide `context`, or — only when the \
+                 quota subsystem confirms no capacity — the move is deferred automatically."
+            .into(),
+    }])
 }
 
 /// Consult policy on a proposed bead: run every bead-checkable invariant and
@@ -292,7 +360,7 @@ mod tests {
             PolicyVerdict::StopTheLine(vs) => {
                 assert!(vs.iter().any(|x| x.invariant == Some(16)));
             }
-            PolicyVerdict::Pass => panic!("expected NN-16 violation"),
+            PolicyVerdict::Pass | PolicyVerdict::Deferred(_) => panic!("expected NN-16 violation"),
         }
     }
 
@@ -307,7 +375,7 @@ mod tests {
                 // One self-edge + one duplicate.
                 assert_eq!(acyclic, 2);
             }
-            PolicyVerdict::Pass => panic!("expected acyclic violations"),
+            PolicyVerdict::Pass | PolicyVerdict::Deferred(_) => panic!("expected acyclic violations"),
         }
     }
 
@@ -319,7 +387,7 @@ mod tests {
             PolicyVerdict::StopTheLine(vs) => {
                 assert!(vs.iter().any(|x| x.rule == "phase-closed-set"));
             }
-            PolicyVerdict::Pass => panic!("expected phase violation"),
+            PolicyVerdict::Pass | PolicyVerdict::Deferred(_) => panic!("expected phase violation"),
         }
         // Omitted phase is fine (store applies the P1 default).
         let mut f = good();
@@ -357,6 +425,48 @@ mod tests {
                 assert!(vs.iter().any(|x| x.rule == "phase-closed-set"));
             }
             PolicyVerdict::Pass => panic!("expected multiple violations"),
+            PolicyVerdict::Deferred(_) => panic!("bead policy never defers"),
         }
+    }
+
+    // --- guard_claim_context: the three custodian paths (hq-context-custodian.1) -------------
+
+    #[test]
+    fn claim_context_present_passes() {
+        let v = guard_claim_context(
+            IssueStatus::Working,
+            Some("rewiring run_transition_issue; touches handlers.rs + policy.rs"),
+            false,
+        );
+        assert_eq!(v, PolicyVerdict::Pass);
+        // A blocked pool with context present still passes (no deferral needed).
+        assert!(guard_claim_context(IssueStatus::Working, Some("real context here"), true).is_pass());
+    }
+
+    #[test]
+    fn claim_context_absent_with_healthy_quota_stops_the_line() {
+        for ctx in [None, Some(""), Some("   ")] {
+            match guard_claim_context(IssueStatus::Working, ctx, false) {
+                PolicyVerdict::StopTheLine(vs) => {
+                    assert!(vs.iter().any(|v| v.rule == "claim-context-required"));
+                }
+                other => panic!("expected stop-the-line for ctx={ctx:?}, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn claim_context_absent_with_blocked_quota_defers() {
+        match guard_claim_context(IssueStatus::Working, None, true) {
+            PolicyVerdict::Deferred(reason) => assert!(reason.contains("quota blocked")),
+            other => panic!("expected deferred, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn claim_context_only_gates_the_working_transition() {
+        // open/closed moves carry no context contract, even with healthy quota.
+        assert!(guard_claim_context(IssueStatus::Open, None, false).is_pass());
+        assert!(guard_claim_context(IssueStatus::Closed, None, false).is_pass());
     }
 }

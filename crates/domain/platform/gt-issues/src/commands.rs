@@ -474,10 +474,25 @@ pub struct TransitionIssue {
     /// Target status: one of `open`, `working`, `closed`. Validated at the
     /// frontier so a misspelled value never reaches Dolt.
     pub target: String,
+    /// The claim context recorded when entering `working` (CLAUDE.md §2): the
+    /// what/files/decisions another agent needs to resume. The custodian
+    /// ([`guard_claim_context`](crate::policy::guard_claim_context)) makes it
+    /// mandatory for a `working` move — unless the quota subsystem confirms there
+    /// is no capacity, in which case the move is deferred with a debt note. A
+    /// supplied context must clear [`MIN_CONTEXT_LEN`](crate::policy::MIN_CONTEXT_LEN)
+    /// so a placeholder like `wip` cannot satisfy the contract. Ignored for
+    /// `open`/`closed` targets.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context: Option<String>,
 }
 
 impl TransitionIssue {
-    /// Shape-only validation: non-empty id and a recognised target status.
+    /// Shape-only validation: non-empty id, a recognised target status, and — when
+    /// a `context` is supplied for any move — that it clears the minimum length (so
+    /// `wip` is rejected). Whether context is *required* depends on the actor's live
+    /// quota and is decided in the handler by the custodian, mirroring how
+    /// [`CloseIssue`] validates a supplied `commit_sha`'s shape here but defers the
+    /// *requirement* to `run_close_issue`.
     pub fn validate(&self) -> Result<(), AppError> {
         if self.id.is_empty() {
             return Err(AppError::Validation("issue id is empty".into()));
@@ -487,6 +502,15 @@ impl TransitionIssue {
                 "unknown target status `{}` (expected open/working/closed)",
                 self.target
             )));
+        }
+        if let Some(ctx) = self.context.as_deref().map(str::trim) {
+            if !ctx.is_empty() && ctx.len() < crate::policy::MIN_CONTEXT_LEN {
+                return Err(AppError::Validation(format!(
+                    "context is too short ({} chars); record the what/files/decisions so another \
+                     agent can resume (CLAUDE.md §2)",
+                    ctx.len()
+                )));
+            }
         }
         Ok(())
     }
@@ -968,9 +992,33 @@ mod tests {
 
     #[test]
     fn transition_parses_known_targets_only() {
-        assert!(TransitionIssue { id: "x".into(), target: "working".into() }.validate().is_ok());
-        assert!(TransitionIssue { id: "x".into(), target: "frozen".into() }.validate().is_err());
-        assert!(TransitionIssue { id: String::new(), target: "open".into() }.validate().is_err());
+        assert!(TransitionIssue { id: "x".into(), target: "working".into(), context: None }.validate().is_ok());
+        assert!(TransitionIssue { id: "x".into(), target: "frozen".into(), context: None }.validate().is_err());
+        assert!(TransitionIssue { id: String::new(), target: "open".into(), context: None }.validate().is_err());
+    }
+
+    #[test]
+    fn transition_rejects_too_short_context_but_accepts_a_real_one() {
+        // A placeholder context fails the shape check (whether or not it is required).
+        assert!(TransitionIssue {
+            id: "x".into(),
+            target: "working".into(),
+            context: Some("wip".into()),
+        }
+        .validate()
+        .is_err());
+        // A real breadcrumb passes shape validation.
+        assert!(TransitionIssue {
+            id: "x".into(),
+            target: "working".into(),
+            context: Some("rewiring run_transition_issue; handlers.rs + policy.rs".into()),
+        }
+        .validate()
+        .is_ok());
+        // Absent context is shape-valid (the custodian decides the requirement).
+        assert!(TransitionIssue { id: "x".into(), target: "working".into(), context: None }
+            .validate()
+            .is_ok());
     }
 
     #[test]

@@ -571,7 +571,9 @@ async fn transition_issue(
 ) -> Result<Json<Value>, ApiError> {
     let store = st.resolve(&ctx).await?;
     let args: TransitionIssue = with_path_id(body, id)?;
-    run_transition_issue(&store, &args, false).await?;
+    // quota_blocked=false: the REST surface has no quota signal wired; the
+    // composition root threads the real one into the MCP path (hq-context-custodian.2).
+    run_transition_issue(&store, &args, false, false).await?;
     emit_issue_event(
         st.event_sink.as_deref(),
         &store,
