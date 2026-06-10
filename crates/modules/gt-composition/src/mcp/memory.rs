@@ -177,6 +177,12 @@ impl DomainHandler for MemoryHandler {
                 &[opt("kind", "string")],
             ),
             descriptor(
+                "memory.get",
+                "Inspect a single memory BY EXACT `name` (no semantic search). Returns the \
+                 full row; errors if no memory with that name exists in the tenant.",
+                &[req("name", "string")],
+            ),
+            descriptor(
                 "memory.forget",
                 "Hard-delete a memory by `name`. Idempotent — forgetting an absent memory \
                  is a successful no-op.",
@@ -209,6 +215,20 @@ impl DomainHandler for MemoryHandler {
                     "count": rows.len(),
                     "memories": rows.iter().map(mem_json).collect::<Vec<_>>(),
                 }))
+            }
+            "memory.get" => {
+                // Exact-name lookup (no semantic search): resolve the tenant repo per-request
+                // like list/forget, then fetch the one row. An absent name is reported as a
+                // `NotFound` validation error — coherent with how `mem_err` maps the store's
+                // own `MemoryError::NotFound`, rather than a silent `null` a caller might miss.
+                let repo = self.repo(ctx.workspace).await?;
+                let name = str_arg(&ctx.args, "name")?;
+                let row = repo
+                    .get(name)
+                    .await
+                    .map_err(mem_err)?
+                    .ok_or_else(|| mem_err(MemoryError::NotFound(name.to_string())))?;
+                Ok(mem_json(&row))
             }
             "memory.forget" => {
                 let repo = self.repo(ctx.workspace).await?;
@@ -321,7 +341,7 @@ fn mem_json(m: &MemoryRow) -> Value {
 mod tests {
     //! Two test tiers, mirroring the multi-tenant `documents.*` shape:
     //!
-    //! 1. **Pure-validation tests** (always run): namespace, the four advertised tools in
+    //! 1. **Pure-validation tests** (always run): namespace, the five advertised tools in
     //!    `meta.help`, invalid-kind rejection, and unknown-tool routing. These short-circuit
     //!    *before* any pool is resolved (kind is parsed ahead of `self.repo(...)` on every
     //!    arm, and the unknown-tool arm never touches the pool), so a `WsPools` over a dummy
@@ -360,7 +380,7 @@ mod tests {
     }
 
     #[test]
-    fn advertises_four_tools_in_meta_help() {
+    fn advertises_five_tools_in_meta_help() {
         let names: Vec<String> = handler()
             .descriptors()
             .iter()
@@ -368,7 +388,13 @@ mod tests {
             .collect();
         assert_eq!(
             names,
-            vec!["memory.save", "memory.recall", "memory.list", "memory.forget"]
+            vec![
+                "memory.save",
+                "memory.recall",
+                "memory.list",
+                "memory.get",
+                "memory.forget"
+            ]
         );
     }
 
