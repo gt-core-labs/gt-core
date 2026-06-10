@@ -475,6 +475,12 @@ fn parse_rfc3339_to_unix(s: &str) -> Result<u64, AppError> {
 mod tests {
     use super::*;
 
+    /// Serializes the tests that mutate process-global `GT_GITHUB_APP_*` env vars, so a
+    /// concurrent setter can't make a hermetic reader observe a half-configured App (CI race
+    /// seen on `from_env_returns_none_when_unconfigured`). Poison-tolerant: a panicking test
+    /// must not wedge the others.
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     /// A throwaway 2048-bit RSA key (PKCS#8 PEM) for signing-path tests. Generated for tests only.
     const TEST_PRIV_PEM: &[u8] = include_bytes!("../tests/data/test_app_key.pem");
 
@@ -587,6 +593,7 @@ mod tests {
 
     #[test]
     fn from_env_returns_none_when_unconfigured() {
+        let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         // Clear any App env so the test is hermetic.
         for k in [
             ENV_APP_ID,
@@ -602,6 +609,7 @@ mod tests {
 
     #[test]
     fn from_env_half_configured_is_an_error() {
+        let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         for k in [
             ENV_APP_ID_FILE,
             ENV_APP_PRIVATE_KEY_FILE,
