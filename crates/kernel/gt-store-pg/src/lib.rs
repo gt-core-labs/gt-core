@@ -32,7 +32,7 @@ pub use documents::{
 pub mod memory_store;
 #[cfg(feature = "pg")]
 pub use memory_store::{
-    MemoryError, MemoryRepository, MemoryRow, NewMemory, PgMemory,
+    ConflictPair, MemoryError, MemoryRepository, MemoryRow, NewMemory, PgMemory,
 };
 
 #[cfg(feature = "pg")]

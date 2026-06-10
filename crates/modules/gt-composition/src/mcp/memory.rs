@@ -196,6 +196,15 @@ impl DomainHandler for MemoryHandler {
                  `confirm: true` — an unconfirmed call deletes nothing.",
                 &[req("confirm", "boolean"), opt("kind", "string")],
             ),
+            descriptor(
+                "memory.conflicts",
+                "Read-only redundancy scan: report pairs of memories whose embeddings are \
+                 near-duplicates (cosine similarity >= `threshold`, default 0.85), most-similar \
+                 first, capped at `limit` (default 50). Reports only — nothing is deleted; a human \
+                 or agent decides whether to merge/forget. High similarity = redundant, not \
+                 necessarily contradictory.",
+                &[opt("threshold", "number"), opt("limit", "integer")],
+            ),
         ]
     }
 
@@ -260,6 +269,30 @@ impl DomainHandler for MemoryHandler {
                 // EXCEPT feedback — the hard rules survive a blanket clear (store-side guard).
                 let deleted = repo.clear(kind.map(|k| k.as_str())).await.map_err(mem_err)?;
                 Ok(json!({ "ok": true, "kind": kind.map(|k| k.as_str()), "deleted": deleted }))
+            }
+            "memory.conflicts" => {
+                // Validate threshold ∈ [0,1] BEFORE touching the pool (pure validation error).
+                let threshold = match ctx.args.get("threshold") {
+                    None | Some(Value::Null) => 0.85_f64,
+                    Some(v) => v
+                        .as_f64()
+                        .filter(|t| (0.0..=1.0).contains(t))
+                        .ok_or_else(|| {
+                            AppError::Validation("`threshold` must be a number in [0, 1]".into())
+                        })?,
+                };
+                let limit = ctx.args.get("limit").and_then(Value::as_i64).unwrap_or(50).clamp(1, 500);
+                let repo = self.repo(ctx.workspace).await?;
+                let pairs = repo.conflicts(threshold, limit).await.map_err(mem_err)?;
+                Ok(json!({
+                    "count": pairs.len(),
+                    "threshold": threshold,
+                    "conflicts": pairs.iter().map(|p| json!({
+                        "a": p.a_name, "a_description": p.a_description, "a_kind": p.a_kind,
+                        "b": p.b_name, "b_description": p.b_description, "b_kind": p.b_kind,
+                        "similarity": p.similarity,
+                    })).collect::<Vec<_>>(),
+                }))
             }
             other => Err(AppError::Validation(format!("unknown memory tool `{other}`"))),
         }
@@ -366,7 +399,7 @@ fn mem_json(m: &MemoryRow) -> Value {
 mod tests {
     //! Two test tiers, mirroring the multi-tenant `documents.*` shape:
     //!
-    //! 1. **Pure-validation tests** (always run): namespace, the six advertised tools in
+    //! 1. **Pure-validation tests** (always run): namespace, the seven advertised tools in
     //!    `meta.help`, invalid-kind rejection, and unknown-tool routing. These short-circuit
     //!    *before* any pool is resolved (kind is parsed ahead of `self.repo(...)` on every
     //!    arm, and the unknown-tool arm never touches the pool), so a `WsPools` over a dummy
@@ -405,7 +438,7 @@ mod tests {
     }
 
     #[test]
-    fn advertises_six_tools_in_meta_help() {
+    fn advertises_seven_tools_in_meta_help() {
         let names: Vec<String> = handler()
             .descriptors()
             .iter()
@@ -419,9 +452,22 @@ mod tests {
                 "memory.list",
                 "memory.get",
                 "memory.forget",
-                "memory.clear"
+                "memory.clear",
+                "memory.conflicts"
             ]
         );
+    }
+
+    #[tokio::test]
+    async fn conflicts_threshold_is_validated() {
+        let h = handler();
+        // Out-of-range threshold → pure validation error (no pool touched).
+        for bad in [json!(1.5), json!(-0.1), json!("x")] {
+            let err = h
+                .dispatch("memory.conflicts", ctx(json!({ "threshold": bad })))
+                .await;
+            assert!(matches!(err, Err(AppError::Validation(_))), "threshold {bad} rejected");
+        }
     }
 
     #[tokio::test]

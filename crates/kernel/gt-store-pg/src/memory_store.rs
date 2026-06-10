@@ -83,6 +83,30 @@ impl MemoryRow {
     }
 }
 
+/// A pair of memories whose embeddings are near-duplicates — a redundancy candidate surfaced by
+/// [`MemoryRepository::conflicts`] (`hq-memory-admin.3`). `similarity` is cosine similarity in
+/// `[0, 1]` (1 = identical direction). Read-only signal: the store reports the pair, a human or
+/// agent decides whether to merge/forget — nothing is auto-deleted. High similarity means
+/// *redundant* (the same idea twice), NOT necessarily *contradictory*; telling those apart needs an
+/// LLM judgement over the pair, which is a deliberate opt-in phase, not this token-free vector scan.
+#[derive(Debug, Clone, FromRow)]
+pub struct ConflictPair {
+    /// Name of the first memory (the lexicographically smaller of the pair).
+    pub a_name: String,
+    /// First memory's description.
+    pub a_description: String,
+    /// First memory's recall class.
+    pub a_kind: String,
+    /// Name of the second memory.
+    pub b_name: String,
+    /// Second memory's description.
+    pub b_description: String,
+    /// Second memory's recall class.
+    pub b_kind: String,
+    /// Cosine similarity of the two embeddings in `[0, 1]`.
+    pub similarity: f64,
+}
+
 /// A memory to write (insert or replace-by-name). `version` starts at 0 on first insert
 /// and is incremented by the store on every subsequent rewrite.
 #[derive(Debug, Clone)]
@@ -160,6 +184,11 @@ pub trait MemoryRepository: Send + Sync {
     /// them is always a deliberate `clear(Some("feedback"))`. The structural guard against nuking
     /// the loop's binding constraints by accident.
     async fn clear(&self, kind: Option<&str>) -> Result<u64, MemoryError>;
+    /// **CONFLICTS**: redundancy scan. Self-join the embedded memories and return every pair whose
+    /// cosine similarity is `>= threshold`, most-similar first, capped at `limit`. Read-only — it
+    /// reports near-duplicates for a human/agent to reconcile, it never deletes. Token-free (pure
+    /// pgvector). Rows without an embedding are skipped (no vector to compare).
+    async fn conflicts(&self, threshold: f64, limit: i64) -> Result<Vec<ConflictPair>, MemoryError>;
 }
 
 /// Postgres adapter over a tenant-scoped [`WorkspacePool`]. Mirror of
@@ -323,5 +352,26 @@ impl MemoryRepository for PgMemory {
             }
         };
         Ok(res.rows_affected())
+    }
+
+    async fn conflicts(&self, threshold: f64, limit: i64) -> Result<Vec<ConflictPair>, MemoryError> {
+        // Self-join on a.name < b.name so each unordered pair is reported once (never a row with
+        // itself). `<=>` is cosine DISTANCE; 1 - distance is similarity. Both sides must be
+        // embedded. $1 threshold, $2 limit.
+        let sql = "SELECT \
+                a.name AS a_name, a.description AS a_description, a.kind AS a_kind, \
+                b.name AS b_name, b.description AS b_description, b.kind AS b_kind, \
+                (1 - (a.embedding <=> b.embedding))::float8 AS similarity \
+             FROM memories a JOIN memories b ON a.name < b.name \
+             WHERE a.embedding IS NOT NULL AND b.embedding IS NOT NULL \
+               AND (1 - (a.embedding <=> b.embedding)) >= $1 \
+             ORDER BY similarity DESC \
+             LIMIT $2";
+        let rows = sqlx::query_as(sql)
+            .bind(threshold)
+            .bind(limit)
+            .fetch_all(self.pool.pool())
+            .await?;
+        Ok(rows)
     }
 }

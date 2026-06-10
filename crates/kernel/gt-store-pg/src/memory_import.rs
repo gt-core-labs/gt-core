@@ -189,6 +189,15 @@ mod tests {
             }
             Ok((before - rows.len()) as u64)
         }
+
+        async fn conflicts(
+            &self,
+            _threshold: f64,
+            _limit: i64,
+        ) -> Result<Vec<crate::ConflictPair>, MemoryError> {
+            // The importer never calls this; the fake has no embeddings to compare.
+            Ok(Vec::new())
+        }
     }
 
     /// Write a corpus `.md` with frontmatter into `dir`.
