@@ -82,6 +82,30 @@ impl Account {
             weekly_window: None,
         }
     }
+
+    /// Whether this account is **confirmed-blocked right now** — the freshness gate the
+    /// context custodian consults before authorizing a deferral (`hq-context-custodian.3`).
+    ///
+    /// The quota subsystem is not yet fully reliable: a `Blocked` status can be *stale* —
+    /// the account's window already lapsed (`now >= resets_at_secs`), so the rate limit has
+    /// almost certainly cleared and the account is merely awaiting the re-probe that
+    /// [`AccountRegistry::apply_probe`] uses to lift it back to `Healthy`. A stale block
+    /// must NOT pass for a real one, or it would hand out a deferral on capacity that
+    /// actually recovered.
+    ///
+    /// Returns `true` only when the status is `Blocked` AND a live window confirms the block
+    /// has not yet expired (`now < resets_at_secs`). A non-`Blocked` status, a `Blocked`
+    /// whose window already reset (stale), or a `Blocked` with no window at all (nothing to
+    /// confirm freshness against) all return `false`.
+    pub fn is_genuinely_blocked(&self, now_secs: u64) -> bool {
+        if self.status != AccountQuotaStatus::Blocked {
+            return false;
+        }
+        match &self.window {
+            Some(w) => now_secs < w.resets_at_secs,
+            None => false,
+        }
+    }
 }
 
 /// EWMA (exponential weighted moving average). Reacts to a trend without a single spike
@@ -321,6 +345,46 @@ impl AccountRegistry {
         if let Some(a) = self.get_mut(from_account) {
             a.status = AccountQuotaStatus::Cooldown;
         }
+    }
+
+    /// The pool-level "no fresh capacity" signal the context custodian consults
+    /// (`hq-context-custodian.3` → wired in `.2`): `true` only when the account pool
+    /// offers no usable capacity AND that condition is **confirmed fresh**, so a model
+    /// genuinely cannot be fed and the claim-context requirement is safe to defer.
+    ///
+    /// Concretely, `true` requires ALL of:
+    /// - the pool is non-empty (no accounts ⇒ nothing to confirm ⇒ demand context),
+    /// - no account is `Healthy` (any healthy account means work *can* be fed),
+    /// - at least one account is [`genuinely blocked`](Account::is_genuinely_blocked), and
+    /// - no account is *stale*-blocked (a `Blocked` whose window already lapsed). A stale
+    ///   block is an unconfirmed state — the account likely recovered and is awaiting a
+    ///   re-probe — so its mere presence forces the safe default (require context) rather
+    ///   than grant a deferral on capacity that may be back. This is the anti-loophole:
+    ///   "un Blocked stale nunca otorga Deferred".
+    ///
+    /// Deliberately strict and clock-fed (`now_secs` enters as data; the domain reads no
+    /// clock): the deferral is the exception, so anything short of a freshly-confirmed,
+    /// fully-exhausted pool keeps the contract in force.
+    pub fn pool_genuinely_blocked(&self, now_secs: u64) -> bool {
+        let mut any = false;
+        let mut any_healthy = false;
+        let mut any_fresh_blocked = false;
+        let mut any_stale_blocked = false;
+        for acc in self.accounts() {
+            any = true;
+            match acc.status {
+                AccountQuotaStatus::Healthy => any_healthy = true,
+                AccountQuotaStatus::Blocked => {
+                    if acc.is_genuinely_blocked(now_secs) {
+                        any_fresh_blocked = true;
+                    } else {
+                        any_stale_blocked = true;
+                    }
+                }
+                AccountQuotaStatus::Limited | AccountQuotaStatus::Cooldown => {}
+            }
+        }
+        any && !any_healthy && any_fresh_blocked && !any_stale_blocked
     }
 
     /// Rebuild a live registry from the replay reducer (boot hydration, hq-8iur.1). The
@@ -737,6 +801,112 @@ mod tests {
         assert_eq!(w.resets_at_secs, 50_000);
         assert_eq!(w.consumed, (DEFAULT_PLAN_LIMIT - 30_000_000) as f64);
         assert!(acc.weekly_window.is_none(), "no weekly data -> weekly_window stays None");
+    }
+
+    // hq-context-custodian.3 — fresh-block signal -------------------------------------
+
+    /// A window helper anchored so `now < resets_at_secs` (fresh) or not (stale) is explicit.
+    fn window_resetting_at(resets_at_secs: u64) -> AccountWindow {
+        AccountWindow {
+            kind: WindowKind::Rolling5h,
+            limit: DEFAULT_PLAN_LIMIT,
+            started_at_secs: resets_at_secs.saturating_sub(ROLLING_5H_SECS),
+            resets_at_secs,
+            consumed: DEFAULT_PLAN_LIMIT as f64,
+        }
+    }
+
+    #[test]
+    fn blocked_account_recovers_to_healthy_when_window_reset_on_reprobe() {
+        // AC: a Blocked account whose window already reset (remaining > 0 on re-probe) returns
+        // to Healthy automatically via apply_probe — no bespoke unblock logic needed.
+        let mut r = AccountRegistry::default();
+        r.upsert_account(Account {
+            id: "acc-1".into(),
+            status: AccountQuotaStatus::Blocked,
+            window: Some(window_resetting_at(18_000)),
+            weekly_window: None,
+        });
+        r.apply_probe("acc-1", 40_000_000, 36_000);
+        assert_eq!(
+            r.get("acc-1").unwrap().status,
+            AccountQuotaStatus::Healthy,
+            "Blocked lifted to Healthy when the re-probe shows capacity"
+        );
+    }
+
+    #[test]
+    fn is_genuinely_blocked_distinguishes_fresh_real_from_stale() {
+        // Fresh block: status Blocked AND now < resets_at ⇒ genuinely blocked.
+        let fresh = Account {
+            id: "a".into(),
+            status: AccountQuotaStatus::Blocked,
+            window: Some(window_resetting_at(10_000)),
+            weekly_window: None,
+        };
+        assert!(fresh.is_genuinely_blocked(9_000), "fresh block confirmed");
+        // Stale block: the window already lapsed ⇒ NOT genuinely blocked (awaiting re-probe).
+        assert!(!fresh.is_genuinely_blocked(10_001), "stale block (window lapsed) not confirmed");
+        assert!(!fresh.is_genuinely_blocked(10_000), "at the boundary the window has reset");
+        // A Blocked account with no window can't confirm freshness ⇒ false.
+        let no_window = Account {
+            id: "a".into(),
+            status: AccountQuotaStatus::Blocked,
+            window: None,
+            weekly_window: None,
+        };
+        assert!(!no_window.is_genuinely_blocked(0));
+        // Any non-Blocked status is never genuinely blocked, regardless of window.
+        for status in [
+            AccountQuotaStatus::Healthy,
+            AccountQuotaStatus::Limited,
+            AccountQuotaStatus::Cooldown,
+        ] {
+            let acc = Account {
+                id: "a".into(),
+                status,
+                window: Some(window_resetting_at(10_000)),
+                weekly_window: None,
+            };
+            assert!(!acc.is_genuinely_blocked(9_000), "{status:?} is not a block");
+        }
+    }
+
+    #[test]
+    fn pool_genuinely_blocked_only_on_confirmed_fully_exhausted_pool() {
+        let blocked_fresh = |id: &str| Account {
+            id: id.into(),
+            status: AccountQuotaStatus::Blocked,
+            window: Some(window_resetting_at(10_000)),
+            weekly_window: None,
+        };
+        let now = 9_000; // before the 10_000 reset ⇒ fresh
+
+        // Empty pool ⇒ false (nothing to confirm; demand context).
+        assert!(!AccountRegistry::default().pool_genuinely_blocked(now));
+
+        // One freshly-blocked account, none healthy ⇒ true.
+        let mut r = AccountRegistry::default();
+        r.upsert_account(blocked_fresh("a"));
+        assert!(r.pool_genuinely_blocked(now), "fresh block, no healthy ⇒ defer authorized");
+
+        // A single Healthy account anywhere ⇒ capacity exists ⇒ false.
+        r.upsert_account(Account::new("b")); // Healthy
+        assert!(!r.pool_genuinely_blocked(now), "a healthy account means work can be fed");
+
+        // A STALE blocked account masquerading ⇒ false even with a fresh one present.
+        let mut r = AccountRegistry::default();
+        r.upsert_account(blocked_fresh("a"));
+        r.upsert_account(Account {
+            id: "stale".into(),
+            status: AccountQuotaStatus::Blocked,
+            window: Some(window_resetting_at(10_000)),
+            weekly_window: None,
+        });
+        assert!(
+            !r.pool_genuinely_blocked(10_500),
+            "a stale Blocked forces re-probe / context — never grants a deferral"
+        );
     }
 
     // hq-quota-weekly.2 tests -----------------------------------------------------------
