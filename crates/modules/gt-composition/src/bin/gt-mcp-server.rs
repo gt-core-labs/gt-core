@@ -909,11 +909,28 @@ async fn main() -> anyhow::Result<()> {
             // per-request scoping is the resolved workspace from the auth context). Mounted at
             // /api/v1/connection behind the connection.read/connection.write guard. The PAT is
             // AES-GCM-sealed at rest (GT_SECRET_KEY) via gt-auth's seal/unseal — never returned.
-            .module(gt_vcs::VcsModule::with_http(
-                gt_vcs::ConnectionApiState::new(Arc::new(gt_vcs::PgVcsConnections::new(
-                    pool.clone(),
-                ))),
-            ));
+            .module({
+                let connections =
+                    Arc::new(gt_vcs::PgVcsConnections::new(pool.clone()));
+                let mut vcs = gt_vcs::VcsModule::with_http(gt_vcs::ConnectionApiState::new(
+                    connections.clone(),
+                ));
+                // GitHub App install flow (hq-vcs-connections.2): mount the install/callback/repos
+                // routes under /api/v1/connection/github/* ONLY when a platform GitHub App is
+                // configured (App ID + private-key PEM file + slug, all from mounted files /
+                // GT_GITHUB_APP_*). A half-configured App fails loud; an absent one boots fine and
+                // leaves the connection CRUD + PAT fallback working. The minted installation tokens
+                // are JIT, in-memory, never persisted.
+                match gt_vcs::GithubAppConfig::from_env() {
+                    Ok(Some(cfg)) => {
+                        let client = gt_vcs::GithubAppClient::new(cfg);
+                        vcs = vcs.with_github(gt_vcs::GithubApiState::new(client, connections));
+                    }
+                    Ok(None) => {}
+                    Err(e) => panic!("GitHub App config is half-set: {e}"),
+                }
+                vcs
+            });
         let (blob, bucket) = build_blob_store();
         // Capture the PG url before it moves into the documents state — the cross-workspace
         // /me/stats surface (hq-web-extras.15) below opens its own ws_default pool for the

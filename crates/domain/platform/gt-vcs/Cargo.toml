@@ -46,13 +46,25 @@ utoipa = { workspace = true, optional = true }
 async-trait = { workspace = true, optional = true }
 serde_json = { workspace = true, optional = true }
 gt-workspace = { workspace = true, optional = true, features = ["axum"] }
+# The `github` feature (hq-vcs-connections.2) — the platform GitHub App client (`github.rs`):
+# mint an App JWT (RS256, signed with the mounted private key), exchange it for a 1h installation
+# token, and list installation repos. `reqwest` calls GitHub's REST API; `jsonwebtoken` signs the
+# App JWT (same crate gt-auth's minter uses); `chrono` parses GitHub's RFC3339 `expires_at`.
+reqwest = { workspace = true, optional = true }
+jsonwebtoken = { workspace = true, optional = true }
+chrono = { workspace = true, optional = true }
 
 [features]
 # Postgres adapter for the VcsConnectionRepo port (`PgVcsConnections`).
 pg = ["dep:sqlx"]
-# Compile the axum REST adapter + OpenAPI spec (`http.rs`) and the route/spec overrides on the
-# module. Off by default — the bin enables it to expose the REST surface.
-axum = ["dep:axum", "dep:utoipa", "dep:async-trait", "dep:serde_json", "dep:gt-workspace"]
+# The platform GitHub App client (`github.rs`): App-JWT minting + installation-token exchange +
+# repo listing. Pulled only when the binary wires the GitHub-App surface — keeps the core build
+# free of the HTTP/JWT stack (docs/03 Rule 4).
+github = ["dep:reqwest", "dep:jsonwebtoken", "dep:chrono", "dep:serde_json"]
+# Compile the axum REST adapter + OpenAPI spec (`http.rs` connection CRUD + `github_http.rs` install
+# flow) and the route/spec overrides on the module. Off by default — the bin enables it to expose
+# the REST surface. Implies `github` so the install-flow routes have the App client.
+axum = ["dep:axum", "dep:utoipa", "dep:async-trait", "dep:serde_json", "dep:gt-workspace", "github"]
 
 [dev-dependencies]
 serde_json = { workspace = true }
@@ -62,3 +74,5 @@ tokio = { workspace = true }
 axum = { workspace = true }
 tower = { workspace = true, features = ["util"] }
 async-trait = { workspace = true }
+# Verify the minted App JWT in the github.rs tests (decode side of `jsonwebtoken`).
+jsonwebtoken = { workspace = true }

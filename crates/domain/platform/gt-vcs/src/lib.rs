@@ -17,21 +17,40 @@ pub mod repo;
 #[cfg(feature = "axum")]
 pub mod http;
 
+/// The platform GitHub App client (hq-vcs-connections.2): App-JWT minting + JIT installation-token
+/// exchange + repo listing — the reusable engine `.4`/`.6`/`.7`/`.8` consume.
+#[cfg(feature = "github")]
+pub mod github;
+
+/// The GitHub App install-flow REST adapter (hq-vcs-connections.2): install redirect, callback that
+/// persists a `github_app` connection (no token stored), and a JIT repo-listing endpoint.
+#[cfg(feature = "axum")]
+pub mod github_http;
+
 pub mod module;
 
-pub use module::VcsModule;
 #[cfg(feature = "axum")]
 pub use module::VcsHttpModule;
+pub use module::VcsModule;
 
+#[cfg(feature = "pg")]
+pub use repo::PgVcsConnections;
 pub use repo::{
     ConnectionKind, ConnectionStatus, NewConnection, PatchConnection, VcsConnection,
     VcsConnectionRepo,
 };
-#[cfg(feature = "pg")]
-pub use repo::PgVcsConnections;
 
 #[cfg(feature = "axum")]
 pub use http::ConnectionApiState;
+
+#[cfg(feature = "github")]
+pub use github::{
+    GithubAppClient, GithubAppConfig, InstallationRepo, InstallationToken, ENV_APP_ID,
+    ENV_APP_ID_FILE, ENV_APP_PRIVATE_KEY_FILE, ENV_APP_SLUG, ENV_APP_WEBHOOK_SECRET_FILE,
+};
+
+#[cfg(feature = "axum")]
+pub use github_http::{github_router, GithubApiState};
 
 /// The module-owned migration SQL, carried inline with `include_str!` so the boot migration runner
 /// (`gt_module_migrate::apply`) seeds `public.vcs_connections`. A const is INERT until it is added

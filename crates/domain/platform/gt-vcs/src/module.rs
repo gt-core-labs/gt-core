@@ -38,7 +38,10 @@ impl VcsModule {
     /// [`register_routes`](GtModule::register_routes) returns.
     #[cfg(feature = "axum")]
     pub fn with_http(state: crate::http::ConnectionApiState) -> VcsHttpModule {
-        VcsHttpModule { http: state }
+        VcsHttpModule {
+            http: state,
+            github: None,
+        }
     }
 }
 
@@ -50,6 +53,23 @@ impl VcsModule {
 #[derive(Clone)]
 pub struct VcsHttpModule {
     http: crate::http::ConnectionApiState,
+    /// The optional GitHub App install-flow state (hq-vcs-connections.2). When present, the
+    /// install/callback/repos routes nest under `github/` (so they sit at
+    /// `/api/v1/connection/github/*`) sharing the `connection.*` scopes. `None` when no platform
+    /// GitHub App is configured (the connection CRUD + PAT fallback still work).
+    github: Option<crate::github_http::GithubApiState>,
+}
+
+#[cfg(feature = "axum")]
+impl VcsHttpModule {
+    /// Attach the GitHub App install-flow surface (hq-vcs-connections.2). The
+    /// install/callback/repos routes mount under `/api/v1/connection/github/*` behind the SAME
+    /// `connection.*` scope guard. Call it only when [`crate::github::GithubAppConfig::from_env`]
+    /// yielded a configured App.
+    pub fn with_github(mut self, github: crate::github_http::GithubApiState) -> Self {
+        self.github = Some(github);
+        self
+    }
 }
 
 #[cfg(feature = "axum")]
@@ -67,12 +87,22 @@ impl GtModule for VcsHttpModule {
     }
 
     fn register_routes(&self) -> axum::Router {
-        crate::http::connection_router(self.http.clone())
+        let mut router = crate::http::connection_router(self.http.clone());
+        if let Some(github) = &self.github {
+            // Nest the install flow under `github/` — relative to the module's `/api/v1/connection`
+            // mount, the routes become `/api/v1/connection/github/{install,callback,repos}`.
+            router = router.nest("/github", crate::github_http::github_router(github.clone()));
+        }
+        router
     }
 
     fn openapi(&self) -> Option<utoipa::openapi::OpenApi> {
         use utoipa::OpenApi;
-        Some(crate::http::ApiDoc::openapi())
+        let mut doc = crate::http::ApiDoc::openapi();
+        if self.github.is_some() {
+            doc.merge(crate::github_http::GithubApiDoc::openapi());
+        }
+        Some(doc)
     }
 }
 
