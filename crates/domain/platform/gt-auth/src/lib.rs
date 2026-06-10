@@ -102,7 +102,11 @@ mod http;
 #[cfg(feature = "oauth")]
 mod oauth;
 
-#[cfg(feature = "oauth")]
+// The AES-GCM secret-at-rest helper (hq-idp-db.1). Available whenever its own `secret-crypto`
+// feature is on (the `oauth` feature implies it), so a consumer that needs ONLY the seal/unseal
+// primitive — the VCS-connection PAT store (hq-vcs-connections.1) — reuses the exact helper rather
+// than re-implementing crypto.
+#[cfg(feature = "secret-crypto")]
 mod crypto;
 
 #[cfg(feature = "oauth")]
@@ -241,9 +245,12 @@ pub use provider_repo::{
     ProviderPreset, ProviderRecord, ProviderRepo,
 };
 
-/// The AES-GCM seal/unseal env contract for the provider-secret store (hq-idp-db.1).
-#[cfg(feature = "oauth")]
-pub use crypto::ENV_SECRET_KEY;
+/// The AES-GCM secret-at-rest primitives (hq-idp-db.1): the `GT_SECRET_KEY` env contract plus the
+/// [`seal`](crypto::seal) / [`unseal`](crypto::unseal) pair. Exported behind `secret-crypto` so any
+/// crate keeping a secret encrypted at rest — the OAuth provider store *and* the VCS-connection PAT
+/// store (hq-vcs-connections.1) — shares this ONE helper instead of forking the cipher.
+#[cfg(feature = "secret-crypto")]
+pub use crypto::{seal, unseal, ENV_SECRET_KEY};
 
 /// The system-admin OAuth/OIDC provider-administration surface (hq-idp-db.4): the abstract
 /// [`ProviderStore`] port the `/auth/providers` CRUD handlers depend on, the request DTOs, and the

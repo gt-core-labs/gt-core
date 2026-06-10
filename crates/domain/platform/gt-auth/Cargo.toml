@@ -90,14 +90,20 @@ pg = ["dep:sqlx", "dep:sha2", "password-hash"]
 # `jsonwebtoken`; the login port is abstract, so the DB-backed adapter is opted in separately
 # via `pg`.
 axum = ["dep:axum", "dep:async-trait", "dep:gt-rbac", "dep:utoipa", "jsonwebtoken"]
+# AES-GCM seal/unseal of secrets at rest (`crypto.rs`, hq-idp-db.1), carved out of `oauth` so a
+# consumer that needs ONLY the secret crypto — e.g. the VCS-connection PAT store
+# (hq-vcs-connections.1) — can reuse the EXACT helper without dragging in the OAuth HTTP client.
+# Pulls the cipher (`aes-gcm`) + the `GT_SECRET_KEY` master-key decoders (`base64`/`hex`). The
+# `oauth` feature implies this so the provider store still gets `crypto::{seal,unseal}`.
+secret-crypto = ["dep:aes-gcm", "dep:base64", "dep:hex"]
 # OAuth 2.0 / OpenID Connect login adapter (`oauth.rs`, hq-platform-hardening.3): the
 # authorization-code handshake against a configured IdP. Implements the async `LoginProvider` port
 # (defined with the `axum` HTTP surface), so it implies `axum`; pulls in `reqwest` as the HTTP
 # client. Kept a separate opt-in so a non-OAuth deploy carries no HTTP client. The DB-backed
-# provider store (hq-idp-db.1) folds in here too: `aes-gcm` seals the client secret at rest, with
-# `base64`/`hex` decoding the `GT_SECRET_KEY` master key. The Postgres adapter (`PgProviderRepo`)
-# additionally needs `pg`, which a deploy opts into separately.
-oauth = ["dep:reqwest", "dep:aes-gcm", "dep:base64", "dep:hex", "dep:sha2", "axum"]
+# provider store (hq-idp-db.1) folds in here too via `secret-crypto`: `aes-gcm` seals the client
+# secret at rest, with `base64`/`hex` decoding the `GT_SECRET_KEY` master key. The Postgres adapter
+# (`PgProviderRepo`) additionally needs `pg`, which a deploy opts into separately.
+oauth = ["dep:reqwest", "secret-crypto", "dep:sha2", "axum"]
 
 [dev-dependencies]
 serde_json = { workspace = true }

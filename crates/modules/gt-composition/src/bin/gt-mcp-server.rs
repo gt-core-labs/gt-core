@@ -896,14 +896,24 @@ async fn main() -> anyhow::Result<()> {
             .module(WorkspaceModule::with_http(
                 WorkspaceApiState::new(Arc::new(PgWorkspaces::new(pool.clone()))).with_provisioner(
                     Arc::new(CompositionTenantProvisioner::new(
-                        pool,
+                        pool.clone(),
                         issues_workspaces.clone(),
                     )),
                 ),
             ))
             .module(RigsModule::with_http(RigApiState::new(Arc::new(
                 WsPoolRigs::new(Arc::new(WsPools::new(pg_url.clone()))),
-            ))));
+            ))))
+            // connection.* (hq-vcs-connections.1): per-workspace VCS connections over the GLOBAL
+            // `public.vcs_connections` table (one PgVcsConnections serves every tenant; the
+            // per-request scoping is the resolved workspace from the auth context). Mounted at
+            // /api/v1/connection behind the connection.read/connection.write guard. The PAT is
+            // AES-GCM-sealed at rest (GT_SECRET_KEY) via gt-auth's seal/unseal — never returned.
+            .module(gt_vcs::VcsModule::with_http(
+                gt_vcs::ConnectionApiState::new(Arc::new(gt_vcs::PgVcsConnections::new(
+                    pool.clone(),
+                ))),
+            ));
         let (blob, bucket) = build_blob_store();
         // Capture the PG url before it moves into the documents state — the cross-workspace
         // /me/stats surface (hq-web-extras.15) below opens its own ws_default pool for the
@@ -1304,6 +1314,7 @@ async fn metrics_text() -> axum::response::Response {
 async fn apply_pg_catalog(pool: &sqlx::PgPool) -> anyhow::Result<()> {
     use gt_module::{GtModule, ModuleId};
     use gt_rig::RigsModule;
+    use gt_vcs::VcsModule;
 
     let workspace_id = ModuleId::new("workspace").expect("`workspace` is a valid module id");
     let feature_id = ModuleId::new("feature").expect("`feature` is a valid module id");
@@ -1311,9 +1322,14 @@ async fn apply_pg_catalog(pool: &sqlx::PgPool) -> anyhow::Result<()> {
     let docs_id = ModuleId::new("docs").expect("`docs` is a valid module id");
     let memory_id = ModuleId::new("memory").expect("`memory` is a valid module id");
     let notifications_id = ModuleId::new("notifications").expect("`notifications` is a valid module id");
+    // hq-vcs-connections.1: the GLOBAL `public.vcs_connections` store (mirrors public.oauth_providers
+    // + a workspace_id column). A `public` catalog like notifications — NOT a per-tenant template
+    // table — so it seeds here in the public-schema apply, never in the ws_default clone path.
+    let connection_id = VcsModule::id();
     let workspace_migs = gt_store_pg::workspace_migrations();
     let feature_migs = gt_store_pg::feature_flags_migrations();
     let rig_migs = RigsModule.migrations();
+    let connection_migs = VcsModule.migrations();
     // hq-docs-store.1: the per-workspace `documents` template tables (docs/11). Like `rig`,
     // they seed the `ws_default` template so `gt_create_workspace_schema` clones them per tenant.
     let docs_migs = gt_store_pg::docs_migrations();
@@ -1331,6 +1347,7 @@ async fn apply_pg_catalog(pool: &sqlx::PgPool) -> anyhow::Result<()> {
         .chain(docs_migs.iter().map(|m| (&docs_id, m)))
         .chain(memory_migs.iter().map(|m| (&memory_id, m)))
         .chain(notifications_migs.iter().map(|m| (&notifications_id, m)))
+        .chain(connection_migs.iter().map(|m| (&connection_id, m)))
         .collect();
 
     let report = gt_module_migrate::apply(pool, &plan)

@@ -84,6 +84,11 @@ impl Scope {
             // tokens. The REST `/auth/tokens` surface gates on `tokens.read`/`tokens.write`, so the
             // curated member grant carries that whole namespace.
             "tokens.*",
+            // Self-service VCS connections (hq-vcs-connections.1): a member registers/manages their
+            // workspace's GitHub App / PAT connections so the server can clone private repos. The
+            // REST `/api/v1/connection` surface gates on `connection.read`/`connection.write`, so —
+            // like `tokens.*` — the curated member grant carries that whole namespace.
+            "connection.*",
             // Operator notifications (hq-notifications): members read + dismiss their own
             // notifications; agents write via notify.send.execute on MCP.
             "notifications.*",

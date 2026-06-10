@@ -1,0 +1,64 @@
+[package]
+name = "gt-vcs"
+edition.workspace = true
+version.workspace = true
+
+# hq-vcs-connections.1 — per-workspace VCS connections (the foundation of hq-vcs-connections).
+#
+# A workspace connects GitHub (via a GitHub App, or a PAT as fallback) so the server can clone its
+# private repos JIT for the knowledge graph — no operator hand-clones on the host, no filesystem
+# paths in requests. This crate owns the CONNECTION facet: the `public.vcs_connections` store +
+# the REST CRUD over it.
+#
+# Storage MIRRORS `public.oauth_providers` (gt-auth auth/0006 + the `workspace_id` column from
+# auth/0011): a single GLOBAL table in `public` with an optional `workspace_id` (NULL = global,
+# non-NULL = scoped), NOT a schema-per-tenant table. For `kind = 'pat'` the token is sealed at rest
+# (AES-GCM `nonce || ciphertext`, GT_SECRET_KEY) by REUSING gt-auth's `seal`/`unseal` helper — no
+# new crypto — via gt-auth's carved-out `secret-crypto` feature (so this crate does NOT drag in the
+# OAuth HTTP client).
+#
+# Same module shape as gt-rig: a `GtModule` wrapper (`module.rs`) declaring the `connection.read` /
+# `connection.write` scopes + the `vcs_connections` migration, plus an off-by-default `axum` REST
+# adapter (`http.rs`) the composition bin mounts at `/api/v1/connection` behind the scope guard.
+[dependencies]
+# AppError + the kernel error contract the REST handlers surface.
+gt-events = { workspace = true }
+# The `GtModule` trait this crate is wrapped in (`module.rs`): scopes, migrations, MCP-tool decl,
+# and (with `axum`) route + OpenAPI registration.
+gt-module = { workspace = true }
+# Reuse gt-auth's AES-GCM seal/unseal of secrets at rest (`crypto::{seal,unseal}`) for the sealed
+# PAT — the EXACT helper the OAuth provider store uses, never a fork. `secret-crypto` is the
+# carve-out feature that exposes it without the heavy `oauth` HTTP stack.
+gt-auth = { workspace = true, features = ["secret-crypto"] }
+serde = { workspace = true }
+# `semver::Version` for the module's `ModuleMeta`.
+semver = { workspace = true }
+# JSON Schema derives are not needed (no MCP command args); kept minimal.
+# Postgres `VcsConnectionRepo` adapter (`PgVcsConnections`). Off-by-default so the core build stays
+# sqlx-free; the heavy stack is pulled only when the PG-backed surface is wired (docs/03 Rule 4).
+sqlx = { workspace = true, optional = true }
+# Off-by-default `axum` REST adapter (`http.rs`): `register_routes` maps the connection CRUD to REST
+# routes the builder mounts at `/api/v1/connection` behind the auth + scope guard, with a utoipa
+# OpenAPI spec. Same gating as gt-rig (docs/03 Rule 4). `gt-workspace` brings the `WorkspaceContext`
+# extractor so the tenant is resolved from the auth context, never the path.
+axum = { workspace = true, optional = true }
+utoipa = { workspace = true, optional = true }
+async-trait = { workspace = true, optional = true }
+serde_json = { workspace = true, optional = true }
+gt-workspace = { workspace = true, optional = true, features = ["axum"] }
+
+[features]
+# Postgres adapter for the VcsConnectionRepo port (`PgVcsConnections`).
+pg = ["dep:sqlx"]
+# Compile the axum REST adapter + OpenAPI spec (`http.rs`) and the route/spec overrides on the
+# module. Off by default — the bin enables it to expose the REST surface.
+axum = ["dep:axum", "dep:utoipa", "dep:async-trait", "dep:serde_json", "dep:gt-workspace"]
+
+[dev-dependencies]
+serde_json = { workspace = true }
+# Async harness for the `pg` adapter's GT_PG_URL-gated contract tests (`#[tokio::test]`).
+tokio = { workspace = true }
+# Drive the REST router in-process (oneshot) for the http.rs contract test.
+axum = { workspace = true }
+tower = { workspace = true, features = ["util"] }
+async-trait = { workspace = true }

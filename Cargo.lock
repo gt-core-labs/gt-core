@@ -1638,6 +1638,7 @@ dependencies = [
  "gt-store-dolt",
  "gt-store-pg",
  "gt-telemetry",
+ "gt-vcs",
  "gt-workspace",
  "http-body-util",
  "lopdf",
@@ -2313,6 +2314,25 @@ dependencies = [
  "serde",
  "serde_json",
  "thiserror 2.0.18",
+]
+
+[[package]]
+name = "gt-vcs"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "axum",
+ "gt-auth",
+ "gt-events",
+ "gt-module",
+ "gt-workspace",
+ "semver",
+ "serde",
+ "serde_json",
+ "sqlx",
+ "tokio",
+ "tower",
+ "utoipa",
 ]
 
 [[package]]

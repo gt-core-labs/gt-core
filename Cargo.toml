@@ -20,6 +20,7 @@ members = [
     "crates/domain/platform/gt-issues",
     "crates/domain/platform/gt-meta",
     "crates/domain/platform/gt-rig",
+    "crates/domain/platform/gt-vcs",
     "crates/domain/platform/gt-wisp",
     "crates/domain/platform/gt-notify",
     "crates/domain/platform/gt-terminal",
@@ -181,6 +182,7 @@ gt-auth          = { path = "crates/domain/platform/gt-auth" }
 gt-meta          = { path = "crates/domain/platform/gt-meta" }
 gt-issues        = { path = "crates/domain/platform/gt-issues" }
 gt-rig           = { path = "crates/domain/platform/gt-rig" }
+gt-vcs           = { path = "crates/domain/platform/gt-vcs" }
 gt-feed          = { path = "crates/domain/platform/gt-feed" }
 gt-skills        = { path = "crates/domain/platform/gt-skills" }
 gt-claude-hooks  = { path = "crates/domain/platform/gt-claude-hooks" }

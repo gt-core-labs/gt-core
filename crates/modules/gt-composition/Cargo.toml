@@ -70,6 +70,10 @@ gt-auth = { workspace = true, features = ["jsonwebtoken", "pg", "axum"] }
 # adds the REST surface + the WorkspaceRigs port the composition WsPools provider backs
 # (hq-fe-api-mount.1).
 gt-rig = { workspace = true, features = ["pg", "axum"] }
+# connection.* (hq-vcs-connections.1): the per-workspace VCS-connection store + REST CRUD. `pg`
+# wires PgVcsConnections over the shared pool; `axum` adds the `/api/v1/connection` surface mounted
+# behind the connection.read/connection.write guard. The sealed PAT reuses gt-auth's secret-crypto.
+gt-vcs = { workspace = true, features = ["pg", "axum"] }
 # graph.* read-only dispatch (hq-graphrig.10): GraphIndexer port (+ graphify adapter for
 # the live server) and the warden state replayed to resolve rig -> repo_dir.
 gt-graphindex = { workspace = true, features = ["graphify"] }
