@@ -17,6 +17,17 @@
 //! async would ripple `.await` across every event-sourced domain. So this is backed by the
 //! blocking [`postgres`] client behind an [`r2d2`] pool, NOT async sqlx — the same sync contract
 //! the file path satisfies, now with concurrent writers.
+//!
+//! **Runtime-safe under tokio (`hq-talos-migration.12`).** The blocking [`postgres`] client spins
+//! its OWN tokio `Runtime` internally and `block_on`s every call — invoking it on a tokio worker
+//! thread panics "Cannot start a runtime from within a runtime". These four operations are reached
+//! from `DomainHandler::dispatch` (async, on the server's tokio runtime), so each public method is
+//! a thin wrapper that runs its blocking `*_blocking` body on a SCOPED std thread (off the async
+//! runtime) and joins for the result — exactly the pattern `gt-channel::pg::PgQueue` (the sibling
+//! .11 dispatch queue) uses for the identical hazard. The join blocks the caller briefly, which is
+//! the same synchronous cost the file backend's locked file I/O already imposes; the public sync
+//! signatures are byte-for-byte unchanged so the ~30 consumers and the [`EventLog`](crate) wrapper
+//! see no difference.
 
 use postgres::types::Json;
 use postgres::NoTls;
@@ -37,6 +48,30 @@ type Pool = r2d2::Pool<PostgresConnectionManager<NoTls>>;
 /// shape (every file-backend failure is also `AppError::Other`).
 fn pg_err<E: std::fmt::Display>(ctx: &str, e: E) -> AppError {
     AppError::Other(format!("{ctx}: {e}"))
+}
+
+/// Run a blocking `postgres` closure OFF the caller's thread, on a scoped std thread.
+///
+/// The blocking [`postgres`] client owns its own tokio `Runtime` and `block_on`s internally;
+/// calling it on a tokio worker thread panics "Cannot start a runtime from within a runtime"
+/// (`hq-talos-migration.12`). Every `PgEventStore` operation is reached from the async
+/// `DomainHandler::dispatch`, so each routes its blocking body through here: [`std::thread::scope`]
+/// spawns a fresh std thread (never a tokio worker), runs the closure there, and joins for the
+/// result — so the `postgres` client's internal runtime is never nested inside the server's.
+/// Mirrors `gt-channel::pg::PgQueue`'s identical offload for the .11 dispatch queue.
+///
+/// `R: Send` because the closure's return value crosses the thread boundary back to the caller.
+/// A panic inside the closure surfaces as `AppError::Other` rather than tearing down the caller.
+fn off_runtime<R, F>(ctx: &str, f: F) -> Result<R, AppError>
+where
+    F: FnOnce() -> Result<R, AppError> + Send,
+    R: Send,
+{
+    std::thread::scope(|s| {
+        s.spawn(f)
+            .join()
+            .map_err(|_| pg_err(ctx, "blocking thread panicked"))?
+    })
 }
 
 /// A synchronous, pooled Postgres event store. Clone is cheap (the `r2d2` pool is `Arc`-internal),
@@ -73,6 +108,14 @@ impl PgEventStore {
     /// also applies the same DDL (see `events_migration_sql`), so this is a belt-and-suspenders
     /// self-heal for a backend constructed outside the boot path (e.g. orchd / tests).
     pub fn ensure_schema(&self) -> Result<(), AppError> {
+        // Called from the async boot path (`build_domain_router`); run the blocking DDL off the
+        // tokio runtime on a scoped std thread (see [`off_runtime`] for why the blocking client
+        // panics on a tokio worker).
+        off_runtime("ensure_schema thread", || self.ensure_schema_blocking())
+    }
+
+    /// The actual blocking DDL. MUST run off any tokio runtime thread (see [`Self::ensure_schema`]).
+    fn ensure_schema_blocking(&self) -> Result<(), AppError> {
         let mut conn = self.pool.get().map_err(|e| pg_err("events pool checkout", e))?;
         // Serialize the DDL under a transaction-scoped advisory lock: this self-heal runs on EVERY
         // backend construction (N mcp-server replicas + orchd at startup, plus parallel tests), and
@@ -92,6 +135,13 @@ impl PgEventStore {
     /// writers never interleave or collide (the file path's per-file exclusive lock, now done by
     /// the DB across processes/nodes).
     pub fn append(&self, workspace: &str, record: &EventRecord) -> Result<(), AppError> {
+        // The blocking `postgres` client panics on a tokio worker (see [`off_runtime`]); this is
+        // reached from the async `DomainHandler::dispatch`, so do the INSERT on a scoped std thread.
+        off_runtime("append thread", || self.append_blocking(workspace, record))
+    }
+
+    /// The actual blocking INSERT. MUST run off any tokio runtime thread (see [`Self::append`]).
+    fn append_blocking(&self, workspace: &str, record: &EventRecord) -> Result<(), AppError> {
         let mut conn = self.pool.get().map_err(|e| pg_err("events pool checkout", e))?;
         conn.execute(
             "INSERT INTO public.events (workspace, event_id, correlation_id, causation_id, kind, ts, payload) \
@@ -116,6 +166,13 @@ impl PgEventStore {
     /// are byte-for-byte the file path's (the prefix/channel/since/limit logic lives in one place,
     /// the wrapper, shared by both backends).
     pub fn read_all(&self, workspace: &str) -> Result<Vec<EventRecord>, AppError> {
+        // The blocking `postgres` client panics on a tokio worker (see [`off_runtime`]); reached
+        // from the async `DomainHandler::dispatch` (replay/SSE), so query on a scoped std thread.
+        off_runtime("read_all thread", || self.read_all_blocking(workspace))
+    }
+
+    /// The actual blocking SELECT. MUST run off any tokio runtime thread (see [`Self::read_all`]).
+    fn read_all_blocking(&self, workspace: &str) -> Result<Vec<EventRecord>, AppError> {
         let mut conn = self.pool.get().map_err(|e| pg_err("events pool checkout", e))?;
         let rows = conn
             .query(
@@ -144,6 +201,16 @@ impl PgEventStore {
     /// An unreachable DB yields an empty list (never an error) — the file path's `workspaces()` is
     /// likewise infallible so a best-effort daemon sweep never aborts on a momentary outage.
     pub fn workspaces(&self) -> Vec<String> {
+        // The blocking `postgres` client panics on a tokio worker (see [`off_runtime`]); the
+        // daemon sweep that calls this runs on the async runtime, so query on a scoped std thread.
+        // Infallible: a thread panic / DB error collapses to an empty list, like the file path's
+        // unreadable-root case — a best-effort sweep must never abort.
+        off_runtime("workspaces thread", || Ok(self.workspaces_blocking())).unwrap_or_default()
+    }
+
+    /// The actual blocking `SELECT DISTINCT`. MUST run off any tokio runtime thread (see
+    /// [`Self::workspaces`]). Infallible: an unreachable DB yields an empty list.
+    fn workspaces_blocking(&self) -> Vec<String> {
         let Ok(mut conn) = self.pool.get() else {
             return Vec::new();
         };
@@ -233,15 +300,24 @@ mod tests {
 
     /// A fresh store against the contract DB, with its `events` rows for the test's workspaces
     /// truncated so reruns are deterministic. `None` when GT_PG_URL is unset (skip the test).
+    ///
+    /// The cleanup `DELETE` is a blocking `postgres` call; run it on a scoped std thread (via
+    /// [`off_runtime`]) so this helper is safe to call from the async regression test
+    /// (`append_replay_round_trips_inside_a_tokio_runtime`) — off the tokio runtime, exactly like
+    /// the `.11` `fresh_queue` helper.
     fn fresh_store(workspaces: &[&str]) -> Option<PgEventStore> {
         let url = std::env::var("GT_PG_URL").ok()?;
         let store = PgEventStore::connect(&url).expect("connect contract PG");
         store.ensure_schema().expect("ensure events schema");
-        let mut conn = store.pool.get().expect("checkout");
-        for ws in workspaces {
-            conn.execute("DELETE FROM public.events WHERE workspace = $1", &[ws])
-                .expect("clean ws rows");
-        }
+        off_runtime("fresh_store cleanup", || {
+            let mut conn = store.pool.get().expect("checkout");
+            for ws in workspaces {
+                conn.execute("DELETE FROM public.events WHERE workspace = $1", &[ws])
+                    .expect("clean ws rows");
+            }
+            Ok(())
+        })
+        .expect("cleanup thread");
         Some(store)
     }
 
@@ -283,5 +359,40 @@ mod tests {
         assert!(ws.contains(&"pg-test-iso-b".to_string()));
         // DISTINCT: ws-a has two events but appears once.
         assert_eq!(ws.iter().filter(|w| *w == "pg-test-iso-a").count(), 1);
+    }
+
+    /// REGRESSION (`hq-talos-migration.12`): the same append/read_all/workspaces round-trip, but
+    /// driven FROM WITHIN a tokio runtime — the real context, since `DomainHandler::dispatch` is
+    /// async and runs every `EventLog` operation on a tokio worker thread.
+    ///
+    /// Before the fix, `append`/`read_all`/`workspaces` called the blocking `postgres` client
+    /// directly on the calling thread; the client spins its own tokio `Runtime` and `block_on`s,
+    /// so on a tokio worker it panicked "Cannot start a runtime from within a runtime" — making
+    /// the whole `GT_EVENTLOG_PG=1` path unusable under the async server. The `.10` tests are
+    /// plain `#[test]` (no tokio runtime), so they never exercised this and never caught it.
+    ///
+    /// Now each method offloads its blocking body to a scoped std thread ([`off_runtime`]), so the
+    /// `postgres` client's runtime is never nested inside tokio's: this test PASSES. (Run on a
+    /// multi-thread runtime — the panic reproduces on any tokio worker; `flavor` only documents
+    /// the realistic server topology.)
+    #[tokio::test(flavor = "multi_thread")]
+    async fn append_replay_round_trips_inside_a_tokio_runtime() {
+        let Some(store) = fresh_store(&["pg-test-tokio"]) else {
+            eprintln!("GT_PG_URL unset; skipping PgEventStore tokio-runtime regression test");
+            return;
+        };
+        // These calls land on a tokio worker thread (we are inside #[tokio::test]); pre-fix every
+        // one panicked at the blocking `postgres` call.
+        store.append("pg-test-tokio", &rec("c", "merge.merged.v1", "2026-06-03T00:00:00Z")).unwrap();
+        store.append("pg-test-tokio", &rec("a", "merge.ready.v1", "2026-06-01T00:00:00Z")).unwrap();
+        store.append("pg-test-tokio", &rec("b", "merge.started.v1", "2026-06-02T00:00:00Z")).unwrap();
+
+        let ids: Vec<_> =
+            store.read_all("pg-test-tokio").unwrap().into_iter().map(|r| r.event_id).collect();
+        assert_eq!(ids, vec!["c", "a", "b"], "append+read_all round-trips on a tokio worker");
+        assert!(
+            store.workspaces().contains(&"pg-test-tokio".to_string()),
+            "workspaces() also runs off-runtime without panicking",
+        );
     }
 }

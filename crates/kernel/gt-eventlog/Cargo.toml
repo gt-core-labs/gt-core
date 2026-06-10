@@ -29,3 +29,8 @@ pg = ["dep:postgres", "dep:r2d2", "dep:r2d2_postgres"]
 
 [dev-dependencies]
 tempfile = { workspace = true }
+# Dev-only (hq-talos-migration.12): the `#[tokio::test]` regression that drives the `pg` backend
+# from WITHIN a tokio runtime — proving the blocking `postgres` calls no longer panic
+# "runtime within a runtime" on a tokio worker. Kept out of `[dependencies]` so the crate's
+# default build stays sync/tokio-free (the file path), per the kernel-crate contract.
+tokio = { workspace = true }
