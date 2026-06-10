@@ -69,7 +69,9 @@ pub struct Account {
     pub window: Option<AccountWindow>,
     /// Weekly usage window, present only for Claude Pro plans that surface weekly quota
     /// headers. Tracks a separate budget alongside the rolling-5h window.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// Serializes as `null` (not absent) so consumers can distinguish "no weekly quota"
+    /// from "field not yet available" (`hq-quota-weekly.5`).
+    #[serde(default)]
     pub weekly_window: Option<AccountWindow>,
 }
 
@@ -943,10 +945,13 @@ mod tests {
     #[test]
     fn account_without_weekly_window_serde_roundtrip() {
         // Existing accounts without weekly data must deserialise fine (backwards compat).
+        // hq-quota-weekly.5: weekly_window must appear as null (not absent) so consumers
+        // can distinguish "no weekly quota" from a missing field.
         let acc = Account::new("classic-acct");
         let json = serde_json::to_string(&acc).unwrap();
-        // weekly_window must be absent from the wire (skip_serializing_if = None).
-        assert!(!json.contains("weekly_window"), "weekly_window absent when None");
+        assert!(json.contains("weekly_window"), "weekly_window must appear in wire even when None");
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(v["weekly_window"], serde_json::Value::Null, "weekly_window is null when None");
         let back: Account = serde_json::from_str(&json).unwrap();
         assert_eq!(back.weekly_window, None);
     }

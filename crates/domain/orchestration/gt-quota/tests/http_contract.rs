@@ -228,3 +228,78 @@ async fn missing_workspace_header_is_rejected() {
     let (status, _) = send(&app, req).await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
 }
+
+// hq-quota-weekly.5 ---------------------------------------------------------------
+
+/// AC2: a probe without weekly headers → `weekly_window` is `null` (not absent) in both
+/// `GET /:account` and `GET /`.
+#[tokio::test]
+async fn weekly_window_is_null_when_no_weekly_probe() {
+    let app = router();
+    send(
+        &app,
+        post_in("acme", "/acc-1/probe", json!({ "remaining": 250, "resets_at_secs": 20_000 })),
+    )
+    .await;
+
+    let (_, info) = send(&app, get_in("acme", "/acc-1")).await;
+    assert_eq!(
+        info["weekly_window"],
+        Value::Null,
+        "GET /:account: weekly_window must be null, not absent, when no weekly data"
+    );
+
+    let (_, list) = send(&app, get_in("acme", "/")).await;
+    let acc = list["accounts"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|a| a["id"] == "acc-1")
+        .expect("acc-1 in list");
+    assert_eq!(
+        acc["weekly_window"],
+        Value::Null,
+        "GET /: weekly_window must be null, not absent, when no weekly data"
+    );
+}
+
+/// AC1: a probe that includes weekly headers → `weekly_window` carries
+/// `{consumed, limit, resets_at_secs, started_at_secs, kind: \"Weekly\"}`.
+#[tokio::test]
+async fn weekly_window_populated_after_weekly_probe() {
+    let app = router();
+    send(
+        &app,
+        post_in(
+            "acme",
+            "/acc-1/probe",
+            json!({
+                "remaining": 250,
+                "resets_at_secs": 20_000,
+                "weekly_remaining": 10_000_000,
+                "weekly_resets_at_secs": 604_800,
+            }),
+        ),
+    )
+    .await;
+
+    let (_, info) = send(&app, get_in("acme", "/acc-1")).await;
+    let ww = &info["weekly_window"];
+    assert!(ww.is_object(), "GET /:account: weekly_window must be an object after weekly probe; got {ww}");
+    assert_eq!(ww["kind"], "Weekly", "kind must be Weekly");
+    assert!(ww["consumed"].as_f64().is_some(), "consumed present");
+    assert!(ww["limit"].as_u64().is_some(), "limit present");
+    assert!(ww["resets_at_secs"].as_u64().is_some(), "resets_at_secs present");
+    assert!(ww["started_at_secs"].as_u64().is_some(), "started_at_secs present");
+
+    // Also verify via GET /.
+    let (_, list) = send(&app, get_in("acme", "/")).await;
+    let list_ww = list["accounts"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|a| a["id"] == "acc-1")
+        .and_then(|a| a.get("weekly_window"))
+        .expect("acc-1.weekly_window in list");
+    assert_eq!(list_ww["kind"], "Weekly", "list: kind must be Weekly");
+}

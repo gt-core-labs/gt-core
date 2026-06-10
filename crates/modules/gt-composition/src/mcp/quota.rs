@@ -307,6 +307,75 @@ mod tests {
             .any(|a| a["id"] == "acc-1"));
     }
 
+    // hq-quota-weekly.5 -----------------------------------------------------------
+
+    /// AC2 (MCP path): `quota.list` and `quota.info` emit `weekly_window: null` when the
+    /// account has no weekly data, and a populated object after a weekly probe.
+    #[tokio::test]
+    async fn quota_list_and_info_emit_weekly_window_null_then_populated() {
+        let dir = TempDir::new().unwrap();
+        let h = handler(&dir);
+
+        // Probe with only rolling-5h fields (no weekly headers).
+        h.dispatch(
+            "quota.probe",
+            ctx(json!({ "account": "pro-acct", "remaining": 250, "resets_at_secs": 20_000 })),
+        )
+        .await
+        .unwrap();
+
+        // quota.info: weekly_window must be null (not absent).
+        let info = h
+            .dispatch("quota.info", ctx(json!({ "account": "pro-acct" })))
+            .await
+            .unwrap();
+        assert_eq!(
+            info["weekly_window"],
+            serde_json::Value::Null,
+            "quota.info: weekly_window null when no weekly data"
+        );
+
+        // quota.list: same.
+        let list = h.dispatch("quota.list", ctx(json!({}))).await.unwrap();
+        let acc = list["accounts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|a| a["id"] == "pro-acct")
+            .expect("pro-acct in list");
+        assert_eq!(
+            acc["weekly_window"],
+            serde_json::Value::Null,
+            "quota.list: weekly_window null when no weekly data"
+        );
+
+        // Now probe with weekly fields.
+        h.dispatch(
+            "quota.probe",
+            ctx(json!({
+                "account": "pro-acct",
+                "remaining": 250,
+                "resets_at_secs": 20_000,
+                "weekly_remaining": 10_000_000,
+                "weekly_resets_at_secs": 604_800,
+            })),
+        )
+        .await
+        .unwrap();
+
+        let info2 = h
+            .dispatch("quota.info", ctx(json!({ "account": "pro-acct" })))
+            .await
+            .unwrap();
+        let ww = &info2["weekly_window"];
+        assert!(ww.is_object(), "quota.info: weekly_window must be object after weekly probe; got {ww}");
+        assert_eq!(ww["kind"], "Weekly", "kind Weekly");
+        assert!(ww["consumed"].as_f64().is_some(), "consumed present");
+        assert!(ww["limit"].as_u64().is_some(), "limit present");
+        assert!(ww["resets_at_secs"].as_u64().is_some(), "resets_at_secs present");
+        assert!(ww["started_at_secs"].as_u64().is_some(), "started_at_secs present");
+    }
+
     /// The per-workspace consumed metric sums the four usage counters and treats a
     /// missing field as zero — the raw token volume fed to `gt_workspace_quota_consumed`.
     #[test]
