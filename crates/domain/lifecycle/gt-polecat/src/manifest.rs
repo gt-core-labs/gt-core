@@ -93,11 +93,13 @@ mod tests {
             hooks,
             vec![
                 "PostToolUse".to_string(),
+                "PreToolUse".to_string(),
                 "SessionStart".to_string(),
                 "Stop".to_string(),
                 "UserPromptSubmit".to_string(),
             ],
-            "the four hook kinds the polecat settings template installs, sorted"
+            "the hook kinds the polecat settings template installs, sorted \
+             (PreToolUse = memory guard hq-memory-mcp.6)"
         );
     }
 }

@@ -22,8 +22,8 @@ pub mod tmux;
 
 pub use hooks::{hook_bead_for_spawn, hook_env, resolve_env_hook_bead, GT_HOOK_ACCOUNT, GT_HOOK_BEAD};
 pub use install::{
-    costs_report_hook_entry, install_polecat_hooks, polecat_settings_json, COSTS_REPORT_CMD,
-    MANAGED_MARKER,
+    costs_report_hook_entry, install_polecat_hooks, memory_recall_args, polecat_settings_json,
+    COSTS_REPORT_CMD, MANAGED_MARKER, MEMORY_RECALL_LIMIT,
 };
 pub use manifest::{hooks_from_settings, skills_from_worktree};
 pub use pool::{AllocError, ExhaustedScope, PoolAllocator};

@@ -112,6 +112,48 @@ const MEMORY_GUARD_CMD: &str = concat!(
     r#"exit 0"#,
 );
 
+/// `SessionStart` hook that PUSHES relevant memory into a fresh agent's context so it is born
+/// warm instead of cold (`hq-memory-autorecall.1`) — the READ mirror of the [`MEMORY_GUARD_CMD`]
+/// write barrier (`hq-memory-mcp.6`). The context bottleneck is that every sling starts blank and
+/// must re-derive the hard operating rules + project lore from scratch; this hook front-loads them.
+///
+/// It runs `gtmcp call memory.recall '{"query":"<bead>","limit":8}'` once at session start. The
+/// `memory.recall` server tool ALWAYS returns every `feedback` rule (the hard rules a loop must
+/// obey) in full, fused with the top-k semantic matches for the query — so even when the query
+/// (the pinned `$GT_HOOK_BEAD`) is a weak signal, the unconditional feedback set still lands. The
+/// recall result's `content[0].text` is an inner JSON `{count, memories:[{name,kind,body,…}]}`;
+/// the hook renders it to a markdown block and emits it as the SessionStart
+/// `additionalContext` (the documented Claude Code channel that prepends a hook's text to the
+/// agent's context), so the agent reads its rules + lore before its first action.
+///
+/// Auth/transport: `gtmcp` (the rig MCP shell client) speaks the gt-core Streamable-HTTP handshake
+/// and reads its access JWT from `~/.config/gt-mcp/session.json`. It is invoked only when it is on
+/// PATH and a bead query is derivable. BEST-EFFORT: a missing `$GT_HOOK_BEAD`, an absent `gtmcp`, a
+/// failed recall, or absent `jq` is a silent `exit 0` WITHOUT extra context — the hook must NEVER
+/// break a polecat's launch (the same contract as every other hook here).
+const MEMORY_RECALL_CMD: &str = concat!(
+    // Gate: need a bead to query, the gtmcp client, and jq to shape the output. Any miss → no-op.
+    r#"q="${GT_HOOK_BEAD:-}"; "#,
+    r#"[ -n "$q" ] || exit 0; "#,
+    r#"command -v gtmcp >/dev/null 2>&1 || exit 0; "#,
+    r#"command -v jq >/dev/null 2>&1 || exit 0; "#,
+    // Recall (best-effort, short timeout so a slow/unreachable server never stalls the launch).
+    r#"req=$(jq -nc --arg q "$q" '{query:$q,limit:8}' 2>/dev/null) || exit 0; "#,
+    r#"raw=$(gtmcp --compact call memory.recall "$req" 2>/dev/null) || exit 0; "#,
+    r#"[ -n "$raw" ] || exit 0; "#,
+    // The MCP envelope wraps the tool payload as content[0].text (a JSON string); unwrap then parse.
+    r#"inner=$(printf '%s' "$raw" | jq -r '(.content[0].text // empty)' 2>/dev/null); "#,
+    r#"[ -n "$inner" ] || inner="$raw"; "#,
+    // Render memories -> a text block (jq `+` concatenation, no string interpolation, so the raw
+    // Rust literal stays free of escape hazards; plain `===` rules instead of markdown `#` headers
+    // to keep the literal free of any `"#` raw-string-terminator collision). A header then one
+    // section per memory; an empty memory list yields "" so the guard below injects nothing.
+    r#"md=$(printf '%s' "$inner" | jq -r '([(.memories // [])[] | "=== " + .name + " [" + .kind + "] ===\n" + (.description // "") + "\n\n" + (.body // "")] | sort) as $m | if ($m | length) == 0 then "" else "RECALLED MEMORY (auto-injected from prior work). Durable team memories below; treat any [feedback] item as a HARD operating rule.\n\n" + ($m | join("\n\n")) end' 2>/dev/null); "#,
+    // Nothing recalled (no memories / parse failed) → stay silent, never emit an empty block.
+    r#"[ -n "$md" ] && printf '%s' "$md" | jq -R -s '{hookSpecificOutput:{hookEventName:"SessionStart",additionalContext:.}}' 2>/dev/null; "#,
+    r#"exit 0"#,
+);
+
 /// One Claude hook entry running `cmd` for every event of its kind (`matcher: ""`).
 fn hook(cmd: &str) -> serde_json::Value {
     json!({ "matcher": "", "hooks": [ { "type": "command", "command": cmd } ] })
@@ -155,6 +197,25 @@ pub fn is_memory_corpus_write(path: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// Default cap on the relevance-ranked tail the SessionStart autorecall asks for
+/// (`hq-memory-autorecall.1`). The `feedback` rules return in full regardless; this only bounds the
+/// semantic top-k so the injected context stays a focused primer, not a full memory dump.
+pub const MEMORY_RECALL_LIMIT: u32 = 8;
+
+/// Decide whether SessionStart memory autorecall should fire for a given pinned bead, and if so
+/// build the `memory.recall` arguments — lifted into pure Rust so the gate + query construction are
+/// unit-tested without spawning the shell hook ([`MEMORY_RECALL_CMD`]).
+///
+/// Autorecall is active iff a non-blank bead is pinned (`$GT_HOOK_BEAD` at the edge): the bead id is
+/// the only universally-available query signal in a SessionStart shell, and it seeds the semantic
+/// tail. A blank/absent bead ⇒ `None` (the hook no-ops), mirroring the shell gate exactly so the two
+/// can't drift. The hard `feedback` rules land regardless of the query — the server returns them
+/// unconditionally — so even a weak query still warms the agent with its operating rules.
+pub fn memory_recall_args(bead: Option<&str>) -> Option<serde_json::Value> {
+    let bead = bead.map(str::trim).filter(|b| !b.is_empty())?;
+    Some(json!({ "query": bead, "limit": MEMORY_RECALL_LIMIT }))
+}
+
 /// The `Stop` hook entry that reports a turn's token usage into the quota-feed ([`COSTS_REPORT_CMD`]).
 /// Exported so an INTERACTIVE session (the terminal's role-session launch) can install the same
 /// predictive-rotation feed the polecats emit (`hq-quota-feed`) — the command is identical (it reads
@@ -183,7 +244,10 @@ pub fn polecat_settings_json() -> String {
             "deny": [ "Write(**/memory/**.md)", "Edit(**/memory/**.md)", "MultiEdit(**/memory/**.md)" ]
         },
         "hooks": {
-            "SessionStart": [ hook(HEARTBEAT_CMD) ],
+            // SessionStart: heartbeat touch + memory autorecall (hq-memory-autorecall.1) — the
+            // recall hook PUSHES the team's feedback rules + bead-relevant lore into the fresh
+            // agent's context so it is born warm, the read mirror of the PreToolUse memory guard.
+            "SessionStart": [ hook(HEARTBEAT_CMD), hook(MEMORY_RECALL_CMD) ],
             "UserPromptSubmit": [ hook(HEARTBEAT_CMD) ],
             "PostToolUse": [ hook(HEARTBEAT_CMD) ],
             // PreToolUse memory guard (hq-memory-mcp.6): DENY a write into the file-based memory
@@ -265,6 +329,40 @@ mod tests {
         let deny = v["permissions"]["deny"].as_array().unwrap();
         assert!(deny.iter().any(|r| r == "Write(**/memory/**.md)"));
         assert!(deny.iter().any(|r| r == "Edit(**/memory/**.md)"));
+        // SessionStart carries TWO hooks: the heartbeat touch and the memory autorecall
+        // (hq-memory-autorecall.1) that injects recalled memory as additionalContext.
+        let ss = v["hooks"]["SessionStart"].as_array().unwrap();
+        assert_eq!(ss.len(), 2, "heartbeat + memory autorecall");
+        assert!(ss[0]["hooks"][0]["command"]
+            .as_str()
+            .unwrap()
+            .contains("touch \"$GT_HEARTBEAT_FILE\""));
+        let recall = ss[1]["hooks"][0]["command"].as_str().unwrap();
+        assert!(recall.contains("gtmcp"), "invokes the rig MCP client");
+        assert!(recall.contains("memory.recall"), "calls the recall tool");
+        assert!(recall.contains("GT_HOOK_BEAD"), "queries by the pinned bead");
+        // Injects via the documented SessionStart additionalContext channel, and is best-effort:
+        // a missing bead / gtmcp / jq is a silent exit 0, never a launch failure.
+        assert!(recall.contains("additionalContext"));
+        assert!(recall.contains("SessionStart"));
+        assert!(recall.contains("exit 0"));
+    }
+
+    #[test]
+    fn memory_recall_args_gate_and_query() {
+        // hq-memory-autorecall.1: a pinned bead → recall args querying by that bead, limit capped.
+        let a = memory_recall_args(Some("hq-abc.1")).unwrap();
+        assert_eq!(a["query"], json!("hq-abc.1"));
+        assert_eq!(a["limit"], json!(MEMORY_RECALL_LIMIT));
+        // Whitespace is trimmed into the query.
+        assert_eq!(
+            memory_recall_args(Some("  hq-9  ")).unwrap()["query"],
+            json!("hq-9")
+        );
+        // No bead pinned → autorecall is OFF (the hook no-ops), mirroring the shell gate.
+        assert!(memory_recall_args(None).is_none());
+        assert!(memory_recall_args(Some("")).is_none());
+        assert!(memory_recall_args(Some("   ")).is_none());
     }
 
     #[test]
