@@ -54,6 +54,16 @@ RUN curl -fsSL https://github.com/gt-core-labs/gt/releases/download/latest/gt-x8
        | tar -xz -C /usr/local/bin gt \
     && chmod 0755 /usr/local/bin/gt
 ENV GT_BIN=/usr/local/bin/gt
+# `gtmcp` MCP client baked from its latest release (hq-memory-autorecall.4): the polecat
+# SessionStart memory-autorecall hook shells out to `gtmcp call memory.recall ...`, and the hook
+# is gated on `command -v gtmcp` — without the binary on PATH it silently no-ops, so the recall
+# never fires. The release asset is a RAW static-musl binary (not a tarball like `gt`), so curl it
+# straight to PATH. Auth: gtmcp targets GT_MCP_URL (pointed at the internal server) and reads its
+# token from ~/.config/gt-mcp/session.json — the per-sling token provisioning is wired separately
+# (see hq-memory-autorecall.4 follow-up); baking the binary is the prerequisite half.
+RUN curl -fsSL https://github.com/gt-core-labs/gt-mcp/releases/download/latest/gtmcp-x86_64-unknown-linux-musl \
+       -o /usr/local/bin/gtmcp \
+    && chmod 0755 /usr/local/bin/gtmcp
 COPY docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
 RUN chmod 0755 /usr/local/bin/docker-entrypoint.sh
 COPY --from=builder /build/target/release/gt-mcp-server /usr/local/bin/gt-mcp-server
