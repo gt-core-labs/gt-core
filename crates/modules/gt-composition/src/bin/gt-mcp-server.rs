@@ -993,6 +993,14 @@ async fn main() -> anyhow::Result<()> {
                 // ws_default template so gt_create_workspace_schema clones it into every tenant —
                 // the table the PAT verifier + the self-service /auth/tokens surface read.
                 gt_auth::migrations::CREATE_PERSONAL_ACCESS_TOKENS,
+                // hq-epic.auth-refactor.2: the optional `workspace_id` column on
+                // `public.oauth_providers`, so the per-workspace provider query (`COLS` includes
+                // `workspace_id`) has a column to read — without it `GET /auth/providers` 500s with
+                // "column workspace_id does not exist". ALTER ... ADD COLUMN IF NOT EXISTS, idempotent.
+                gt_auth::migrations::ADD_PROVIDER_WORKSPACE,
+                // hq-epic.auth-refactor.4: make `public.users.password_hash` nullable so JIT-provisioned
+                // SSO users (no password) can be inserted. ALTER ... DROP NOT NULL, idempotent.
+                gt_auth::migrations::SSO_USER_PASSWORD_NULLABLE,
             ] {
                 sqlx::raw_sql(sql)
                     .execute(&pool)
