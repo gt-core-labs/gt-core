@@ -35,6 +35,11 @@ pub use memory_store::{
     MemoryError, MemoryRepository, MemoryRow, NewMemory, PgMemory,
 };
 
+#[cfg(feature = "pg")]
+pub mod memory_import;
+#[cfg(feature = "pg")]
+pub use memory_import::{import_corpus, ImportError, ImportReport};
+
 /// Canonical id of the bootstrap default workspace.
 ///
 /// A single workspace is seeded by the initial migration so the platform is

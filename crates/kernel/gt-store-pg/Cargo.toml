@@ -21,11 +21,15 @@ pgvector = { workspace = true, optional = true }
 # rows to/from (hq-memory-mcp.2). Pure-std crate; gated under `pg` with the adapter so the
 # migration-SQL host stays dependency-light.
 gt-memory = { workspace = true, optional = true }
+# `Embedder` trait the corpus importer (hq-memory-mcp.5) uses to (re)embed each memory. Only
+# the decoupled trait is needed — no ML engine — so the default (non-fastembed) build is
+# dependency-light. Gated under `pg` with the importer.
+gt-docs-embed = { workspace = true, optional = true }
 
 [features]
-# `WorkspacePool` + the `DocumentsRepository` / `MemoryRepository` PG adapters:
-# per-workspace search_path-scoped Postgres access.
-pg = ["dep:sqlx", "dep:async-trait", "dep:thiserror", "dep:pgvector", "dep:gt-memory"]
+# `WorkspacePool` + the `DocumentsRepository` / `MemoryRepository` PG adapters + the corpus
+# `.md` → memories importer: per-workspace search_path-scoped Postgres access.
+pg = ["dep:sqlx", "dep:async-trait", "dep:thiserror", "dep:pgvector", "dep:gt-memory", "dep:gt-docs-embed"]
 
 [dev-dependencies]
 # Drives the `pg`-gated WorkspacePool contract test (GT_PG_URL).

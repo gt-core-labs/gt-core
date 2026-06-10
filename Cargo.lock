@@ -2271,6 +2271,7 @@ name = "gt-store-pg"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "gt-docs-embed",
  "gt-memory",
  "gt-module",
  "pgvector",
