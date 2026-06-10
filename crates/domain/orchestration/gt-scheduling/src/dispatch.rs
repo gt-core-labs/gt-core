@@ -17,7 +17,7 @@
 //! `Pending`).
 
 use gt_beads::{Bead, BeadStatus};
-use gt_channel::Channel;
+use gt_channel::DispatchConsumer;
 use serde::{Deserialize, Serialize};
 
 use crate::actor::SchedHandle;
@@ -43,7 +43,15 @@ fn default_priority() -> u8 {
 /// `Receiver` closes (canal abandonado), or `Err` si la suscripción inicial falla — esa forma lo
 /// hace usable bajo `gt_polecat::supervise_daemon`, que lo reinicia con backoff. Hermano de
 /// [`crate::dispatch::spawn`] (la forma fire-and-forget).
-pub async fn run(channel: Channel, sched: SchedHandle) -> Result<(), gt_channel::ChannelError> {
+///
+/// Generic over the channel backend (hq-talos-migration.11): the file-based `Channel` (default,
+/// shared volume) or the Postgres-backed `PgQueue` (concurrent consumers, no shared volume),
+/// selected at the composition root. Both satisfy the [`DispatchConsumer`] contract so this loop
+/// is backend-agnostic — the SKIP-LOCKED claim on the PG path makes N concurrent consumers safe.
+pub async fn run<C: DispatchConsumer>(
+    channel: C,
+    sched: SchedHandle,
+) -> Result<(), gt_channel::ChannelError> {
     let mut rx = channel.subscribe(64)?;
     while let Some(msg) = rx.recv().await {
         match serde_json::from_slice::<DispatchPayload>(&msg.payload) {
@@ -60,8 +68,12 @@ pub async fn run(channel: Channel, sched: SchedHandle) -> Result<(), gt_channel:
     Ok(())
 }
 
-/// Lanza el loop de dispatch como task fire-and-forget. Hermano de [`run`].
-pub fn spawn(channel: Channel, sched: SchedHandle) -> Result<(), gt_channel::ChannelError> {
+/// Lanza el loop de dispatch como task fire-and-forget. Hermano de [`run`]. Generic over the
+/// channel backend (hq-talos-migration.11), like [`run`].
+pub fn spawn<C: DispatchConsumer>(
+    channel: C,
+    sched: SchedHandle,
+) -> Result<(), gt_channel::ChannelError> {
     let mut rx = channel.subscribe(64)?;
     tokio::spawn(async move {
         while let Some(msg) = rx.recv().await {

@@ -14,6 +14,10 @@ pub enum ChannelError {
     Io(#[from] std::io::Error),
     #[error("channel watcher: {0}")]
     Watcher(String),
+    /// Postgres-backed dispatch queue failure (hq-talos-migration.11, `pg` feature). A `String` so
+    /// the file path drags in no `postgres`/`r2d2` error types when the feature is off.
+    #[error("channel pg: {0}")]
+    Pg(String),
 }
 
 /// Handle to a single named channel (one directory on disk). Cheap to clone — the

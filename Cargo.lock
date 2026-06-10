@@ -1632,6 +1632,10 @@ version = "0.1.0"
 dependencies = [
  "gt-events",
  "notify",
+ "postgres",
+ "r2d2",
+ "r2d2_postgres",
+ "serde_json",
  "thiserror 2.0.18",
  "tokio",
  "ulid",

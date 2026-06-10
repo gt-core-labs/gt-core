@@ -9,3 +9,16 @@ tokio.workspace = true
 notify.workspace = true
 ulid.workspace = true
 thiserror.workspace = true
+# SYNCHRONOUS Postgres-backed dispatch queue (hq-talos-migration.11), off by default behind `pg`.
+# The blocking `postgres` client + an `r2d2` pool give concurrent producers + a separate consumer
+# over a shared DB without the file-based shared-volume coupling — mirrors gt-eventlog's `pg`.
+postgres = { workspace = true, optional = true }
+r2d2 = { workspace = true, optional = true }
+r2d2_postgres = { workspace = true, optional = true }
+serde_json = { workspace = true, optional = true }
+
+[features]
+# Compile the synchronous Postgres-backed `PgQueue` (hq-talos-migration.11). Enabled by the
+# `modules` tier (gt-composition) so the bins can select the PG dispatch queue by env; the
+# file-based `Channel` stays the default with this feature off.
+pg = ["dep:postgres", "dep:r2d2", "dep:r2d2_postgres", "dep:serde_json"]

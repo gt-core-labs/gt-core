@@ -630,40 +630,89 @@ async fn main() -> anyhow::Result<()> {
         }
     };
 
-    // Dispatch live loop (hq-orchd-deploy.4): await dispatch requests on a gt-channel and seed +
+    // Dispatch live loop (hq-orchd-deploy.4): await dispatch requests on a channel and seed +
     // enqueue each onto the scheduler, which auto-dispatches (emits scheduling.dispatched.v1) when
     // capacity allows — the event the polecat supervisor observes to sling an agent. This is the
-    // concrete trigger for "a bead becomes dispatched": an operator (or the control plane) drops a
-    // {"bead","priority"} JSON message in the channel. Sibling of the Refinery loop, same
+    // concrete trigger for "a bead becomes dispatched": the convoy→scheduler bridge (mcp-server)
+    // drops a {"bead","priority"} message in the channel. Sibling of the Refinery loop, same
     // restart+backoff supervisor. Absent/unopenable channel ⇒ disabled, the daemon still boots.
+    //
+    // hq-talos-migration.11 — REVERSIBLE BY ENV (same opt-in as the event log, .10): when
+    // GT_EVENTLOG_PG is truthy AND GT_PG_URL is set, the loop consumes the Postgres queue
+    // (`public.dispatch_jobs`, FOR UPDATE SKIP LOCKED claim — concurrency-safe across consumers) so
+    // mcp-server and orchd share NO filesystem for dispatch. Otherwise it consumes the file-based
+    // channel under GT_CHANNEL_ROOT, EXACTLY as before. Both feed the SAME `dispatch::run` (generic
+    // over the backend); flipping GT_EVENTLOG_PG off restores the file path.
     let dispatch_channel =
         std::env::var("GT_DISPATCH_CHANNEL").unwrap_or_else(|_| "dispatch".to_string());
-    let dispatch_task = match Channel::open(&channel_root, &dispatch_channel) {
-        Ok(channel) => {
-            eprintln!(
-                "[gt-orch-server] dispatch: request channel {} — drop {{\"bead\",\"priority\"}} to dispatch",
-                channel.dir().display()
-            );
-            Some(tokio::spawn(async move {
-                let mut tracker = RestartTracker::new(RestartConfig::default());
-                let make = || {
-                    let channel = channel.clone();
-                    let sched = sched.clone();
-                    async move {
-                        if let Err(e) = gt_scheduling::dispatch::run(channel, sched).await {
-                            eprintln!("[gt-orch-server] dispatch channel error: {e} — supervisor will restart");
-                        }
-                    }
-                };
-                gt_polecat::supervise_daemon("dispatch", make, &mut tracker, u32::MAX, now_secs)
-                    .await;
-            }))
+    let want_pg_dispatch = std::env::var("GT_EVENTLOG_PG")
+        .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"))
+        .unwrap_or(false);
+    let pg_dispatch_queue = match (want_pg_dispatch, std::env::var("GT_PG_URL").ok()) {
+        (true, Some(pg_url)) => {
+            match gt_channel::PgQueue::connect(&pg_url, &dispatch_channel)
+                .and_then(|q| q.ensure_schema().map(|()| q))
+            {
+                Ok(q) => Some(q),
+                Err(e) => {
+                    eprintln!("[gt-orch-server] dispatch PG queue init failed: {e} — falling back to file channel");
+                    None
+                }
+            }
         }
-        Err(e) => {
-            eprintln!(
-                "[gt-orch-server] dispatch disabled — channel open failed at {channel_root}/{dispatch_channel}: {e}"
-            );
+        (true, None) => {
+            eprintln!("[gt-orch-server] dispatch: GT_EVENTLOG_PG set but GT_PG_URL unset — using file channel");
             None
+        }
+        (false, _) => None,
+    };
+    let dispatch_task = if let Some(queue) = pg_dispatch_queue {
+        eprintln!(
+            "[gt-orch-server] dispatch: Postgres queue public.dispatch_jobs (channel {dispatch_channel}, FOR UPDATE SKIP LOCKED) — GT_EVENTLOG_PG"
+        );
+        let sched = sched.clone();
+        Some(tokio::spawn(async move {
+            let mut tracker = RestartTracker::new(RestartConfig::default());
+            let make = || {
+                let queue = queue.clone();
+                let sched = sched.clone();
+                async move {
+                    if let Err(e) = gt_scheduling::dispatch::run(queue, sched).await {
+                        eprintln!("[gt-orch-server] dispatch PG queue error: {e} — supervisor will restart");
+                    }
+                }
+            };
+            gt_polecat::supervise_daemon("dispatch", make, &mut tracker, u32::MAX, now_secs).await;
+        }))
+    } else {
+        match Channel::open(&channel_root, &dispatch_channel) {
+            Ok(channel) => {
+                eprintln!(
+                    "[gt-orch-server] dispatch: file channel {} — drop {{\"bead\",\"priority\"}} to dispatch (set GT_EVENTLOG_PG=1 + GT_PG_URL for the Postgres queue)",
+                    channel.dir().display()
+                );
+                let sched = sched.clone();
+                Some(tokio::spawn(async move {
+                    let mut tracker = RestartTracker::new(RestartConfig::default());
+                    let make = || {
+                        let channel = channel.clone();
+                        let sched = sched.clone();
+                        async move {
+                            if let Err(e) = gt_scheduling::dispatch::run(channel, sched).await {
+                                eprintln!("[gt-orch-server] dispatch channel error: {e} — supervisor will restart");
+                            }
+                        }
+                    };
+                    gt_polecat::supervise_daemon("dispatch", make, &mut tracker, u32::MAX, now_secs)
+                        .await;
+                }))
+            }
+            Err(e) => {
+                eprintln!(
+                    "[gt-orch-server] dispatch disabled — channel open failed at {channel_root}/{dispatch_channel}: {e}"
+                );
+                None
+            }
         }
     };
 

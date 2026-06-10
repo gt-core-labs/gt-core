@@ -51,7 +51,9 @@ gt-feed = { workspace = true, features = ["axum"] }
 gt-telemetry = { workspace = true }
 gt-patrol = { workspace = true }
 # Refinery MERGE_READY loop (hq-orchd.4): the daemon awaits MERGE_READY on a gt-channel.
-gt-channel = { workspace = true }
+# `pg` (hq-talos-migration.11): the Postgres-backed dispatch queue so the convoy→scheduler bridge
+# can run without the shared-volume coupling, selected by GT_EVENTLOG_PG like the event log.
+gt-channel = { workspace = true, features = ["pg"] }
 # Polecat supervision (hq-orchd.3): the daemon slings spawn_tmux polecats on dispatch +
 # re-slings dead ones via PolecatSupervisor, bounded by the PoolAllocator admission core.
 gt-polecat = { workspace = true }

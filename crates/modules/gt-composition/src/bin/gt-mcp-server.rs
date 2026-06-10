@@ -1430,6 +1430,10 @@ async fn apply_pg_catalog(pool: &sqlx::PgPool) -> anyhow::Result<()> {
     // `workspace` column partitions it), NOT a per-tenant template table, so it seeds here in the
     // public-schema apply, never in the ws_default clone path — exactly like notifications.
     let events_id = ModuleId::new("events").expect("`events` is a valid module id");
+    // hq-talos-migration.11: the GLOBAL `public.dispatch_jobs` queue — the Postgres-backed dispatch
+    // channel that decouples mcp-server/orchd from the shared GT_CHANNEL_ROOT volume. A `public`
+    // catalog (the `channel` column keys it), NOT a per-tenant template, so it seeds here.
+    let dispatch_id = ModuleId::new("dispatch").expect("`dispatch` is a valid module id");
     // hq-vcs-connections.1: the GLOBAL `public.vcs_connections` store (mirrors public.oauth_providers
     // + a workspace_id column). A `public` catalog like notifications — NOT a per-tenant template
     // table — so it seeds here in the public-schema apply, never in the ws_default clone path.
@@ -1454,6 +1458,15 @@ async fn apply_pg_catalog(pool: &sqlx::PgPool) -> anyhow::Result<()> {
         "0001_events",
         gt_eventlog::events_migration_sql(),
     )];
+    // hq-talos-migration.11: the public-schema `dispatch_jobs` queue backing the PG dispatch
+    // channel (convoy→scheduler). One idempotent migration (CREATE TABLE/INDEX IF NOT EXISTS); the
+    // same DDL `PgQueue::ensure_schema` self-heals with, registered here so a fresh deploy needs no
+    // operator step. A `public` catalog (the `channel` column keys it) like `events`/notifications.
+    let dispatch_migs = vec![gt_module::Migration::new(
+        1,
+        "0001_dispatch_jobs",
+        gt_channel::dispatch_migration_sql(),
+    )];
 
     let plan: Vec<_> = workspace_migs
         .iter()
@@ -1464,6 +1477,7 @@ async fn apply_pg_catalog(pool: &sqlx::PgPool) -> anyhow::Result<()> {
         .chain(memory_migs.iter().map(|m| (&memory_id, m)))
         .chain(notifications_migs.iter().map(|m| (&notifications_id, m)))
         .chain(events_migs.iter().map(|m| (&events_id, m)))
+        .chain(dispatch_migs.iter().map(|m| (&dispatch_id, m)))
         .chain(connection_migs.iter().map(|m| (&connection_id, m)))
         .collect();
 
@@ -1660,6 +1674,8 @@ async fn build_domain_router(
     // (observed for ws=confiar). Heal that drift on every boot, idempotently, so a deploy is the
     // fix — generic over any future per-tenant template change, not a one-off ALTER.
     reconcile_tenant_schemas(&pool).await?;
+    // Clone the URL before it moves into WsPools — the convoy→scheduler PG queue (below) reuses it.
+    let dispatch_pg_url = pg_url.clone();
     let ws_pools = Arc::new(WsPools::new(pg_url));
     // Per-workspace Dolt pools for `workspace.create`'s tenant provisioning
     // (hq-gap-workspace-provision-full): when multi-tenant Dolt routing is on
@@ -1678,34 +1694,64 @@ async fn build_domain_router(
     };
     // Convoy → scheduler bridge (hq-daemons-health-20260607.2): a convoy.launch runs in THIS
     // process, but the polecat sling lives in the orchd daemon and there is no cross-process
-    // event bus — the dispatch gt-channel is the IPC. Wire the ConvoyHandler to drop a
+    // event bus — the dispatch channel is the IPC. Wire the ConvoyHandler to drop a
     // {bead,priority} request onto the same channel the orchd dispatch loop consumes, so a
-    // convoy.launch actually slings a polecat. Gated on GT_CHANNEL_ROOT (the shared channel
-    // root both processes mount): unset ⇒ bridge off, convoy events are still recorded.
+    // convoy.launch actually slings a polecat.
+    //
+    // hq-talos-migration.11 — REVERSIBLE BY ENV (same opt-in as the event log, .10): the PG-backed
+    // queue (`public.dispatch_jobs`) is selected ONLY when GT_EVENTLOG_PG is truthy (1/true/yes/on);
+    // it is deliberately NOT triggered by GT_PG_URL alone (prod sets GT_PG_URL for the domain
+    // handlers but must stay on the file channel). Otherwise the existing file-based channel under
+    // GT_CHANNEL_ROOT is used, EXACTLY as before — flipping GT_EVENTLOG_PG off restores it. With the
+    // PG queue, mcp-server and orchd share NO filesystem for dispatch (the .11 decoupling).
     let convoy_handler = {
         let handler = ConvoyHandler::new(event_log.clone());
-        match std::env::var("GT_CHANNEL_ROOT") {
-            Ok(root) => {
-                let name =
-                    std::env::var("GT_DISPATCH_CHANNEL").unwrap_or_else(|_| "dispatch".to_string());
-                match gt_channel::Channel::open(&root, &name) {
+        let dispatch_name =
+            std::env::var("GT_DISPATCH_CHANNEL").unwrap_or_else(|_| "dispatch".to_string());
+        let want_pg = std::env::var("GT_EVENTLOG_PG")
+            .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"))
+            .unwrap_or(false);
+        if want_pg {
+            // PG queue over the SAME GT_PG_URL the domain handlers already use (in scope here).
+            match gt_channel::PgQueue::connect(&dispatch_pg_url, &dispatch_name)
+                .and_then(|q| q.ensure_schema().map(|()| q))
+            {
+                Ok(queue) => {
+                    eprintln!(
+                        "[gt-mcp-server] convoy→scheduler bridge on (Postgres queue public.dispatch_jobs, channel {dispatch_name}) — GT_EVENTLOG_PG"
+                    );
+                    handler.with_dispatch_channel(Arc::new(gt_channel::DispatchSink::Pg(queue)))
+                }
+                Err(e) => {
+                    eprintln!(
+                        "[gt-mcp-server] convoy→scheduler bridge off — PG queue init failed: {e}"
+                    );
+                    handler
+                }
+            }
+        } else {
+            match std::env::var("GT_CHANNEL_ROOT") {
+                Ok(root) => match gt_channel::Channel::open(&root, &dispatch_name) {
                     Ok(channel) => {
                         eprintln!(
-                            "[gt-mcp-server] convoy→scheduler bridge on — dispatch channel {root}/{name}"
+                            "[gt-mcp-server] convoy→scheduler bridge on (file channel {root}/{dispatch_name}; set GT_EVENTLOG_PG=1 for the Postgres queue)"
                         );
-                        handler.with_dispatch_channel(Arc::new(channel))
+                        handler
+                            .with_dispatch_channel(Arc::new(gt_channel::DispatchSink::File(channel)))
                     }
                     Err(e) => {
                         eprintln!(
-                            "[gt-mcp-server] convoy→scheduler bridge off — channel open failed at {root}/{name}: {e}"
+                            "[gt-mcp-server] convoy→scheduler bridge off — channel open failed at {root}/{dispatch_name}: {e}"
                         );
                         handler
                     }
+                },
+                Err(_) => {
+                    eprintln!(
+                        "[gt-mcp-server] convoy→scheduler bridge off — GT_CHANNEL_ROOT unset"
+                    );
+                    handler
                 }
-            }
-            Err(_) => {
-                eprintln!("[gt-mcp-server] convoy→scheduler bridge off — GT_CHANNEL_ROOT unset");
-                handler
             }
         }
     };

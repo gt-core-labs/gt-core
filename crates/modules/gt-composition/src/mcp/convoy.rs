@@ -15,7 +15,7 @@ use async_trait::async_trait;
 use serde::de::DeserializeOwned;
 use serde_json::{json, Value};
 
-use gt_channel::Channel;
+use gt_channel::DispatchSink;
 use gt_events::{Command, EventKind};
 use gt_mcp_server::{DomainCtx, DomainHandler};
 use gt_module::McpTool;
@@ -40,12 +40,16 @@ pub struct ConvoyHandler {
     log: Arc<EventLog>,
     /// Optional bridge to the orchd scheduler. A `MemberDispatched` runs in THIS process
     /// (the MCP server), but the polecat sling lives in the orchd daemon and there is no
-    /// cross-process event bus — the dispatch gt-channel is the IPC. When wired, each
-    /// dispatched member is dropped as a `{bead,priority}` request onto the same channel the
-    /// orchd dispatch loop consumes, so a `convoy.launch` actually slings a polecat. `None`
-    /// ⇒ events are still recorded but no sling fires (in-memory tests, GT_CHANNEL_ROOT
-    /// unset). (hq-daemons-health-20260607.2)
-    dispatch: Option<Arc<Channel>>,
+    /// cross-process event bus — the dispatch channel is the IPC. When wired, each dispatched
+    /// member is dropped as a `{bead,priority}` request onto the same channel the orchd dispatch
+    /// loop consumes, so a `convoy.launch` actually slings a polecat. `None` ⇒ events are still
+    /// recorded but no sling fires (in-memory tests, GT_CHANNEL_ROOT unset).
+    /// (hq-daemons-health-20260607.2)
+    ///
+    /// The sink is a [`DispatchSink`] (hq-talos-migration.11): the file-based channel on the shared
+    /// volume (default) or the Postgres-backed queue (no shared volume), selected at the boot path
+    /// by `GT_EVENTLOG_PG` — the producer here is identical on both.
+    dispatch: Option<Arc<DispatchSink>>,
 }
 
 impl ConvoyHandler {
@@ -57,9 +61,9 @@ impl ConvoyHandler {
         }
     }
 
-    /// Wire the dispatch gt-channel so each `MemberDispatched` is bridged to the orchd
+    /// Wire the dispatch sink so each `MemberDispatched` is bridged to the orchd
     /// scheduler. Without it the handler only records convoy events (no sling).
-    pub fn with_dispatch_channel(mut self, channel: Arc<Channel>) -> Self {
+    pub fn with_dispatch_channel(mut self, channel: Arc<DispatchSink>) -> Self {
         self.dispatch = Some(channel);
         self
     }
@@ -67,7 +71,7 @@ impl ConvoyHandler {
     /// Drop a `{bead,priority}` dispatch request onto the channel for one convoy member —
     /// the same shape the orchd dispatch loop already consumes. Best-effort: a failure logs
     /// but never fails the convoy call (the member is recorded; an operator can re-dispatch).
-    fn bridge_to_scheduler(&self, channel: &Channel, member: String) {
+    fn bridge_to_scheduler(&self, channel: &DispatchSink, member: String) {
         let payload = DispatchPayload {
             bead: member,
             title: None,
@@ -300,9 +304,9 @@ mod tests {
     async fn launch_and_handoff_bridge_members_to_the_dispatch_channel() {
         let dir = TempDir::new().unwrap();
         let chan_dir = TempDir::new().unwrap();
-        let channel = Channel::open(chan_dir.path(), "dispatch").unwrap();
+        let channel = gt_channel::Channel::open(chan_dir.path(), "dispatch").unwrap();
         let h = ConvoyHandler::new(Arc::new(EventLog::new(Some(dir.path().to_path_buf()))))
-            .with_dispatch_channel(Arc::new(channel));
+            .with_dispatch_channel(Arc::new(DispatchSink::File(channel)));
 
         h.dispatch(
             "convoy.launch",
