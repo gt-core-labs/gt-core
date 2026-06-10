@@ -1425,6 +1425,148 @@ async fn apply_pg_catalog(pool: &sqlx::PgPool) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Heal per-tenant schema drift on boot (hq-vcs-connections.13).
+///
+/// The per-workspace template tables (`rig`, `documents`, `memories`, …) are migrated ONLY into
+/// the `ws_default` template by [`apply_pg_catalog`]. `gt_create_workspace_schema` clones that
+/// template into a tenant's `ws_<slug>` schema, but ONLY when the tenant is first provisioned —
+/// so any template migration added AFTER a tenant was created never reaches that tenant. The
+/// concrete failure: rig/0003 added `git_connection_ref` to `ws_default.rigs`, but the existing
+/// `ws_confiar.rigs` never got the column, so `rig.list` for ws=confiar errored with
+/// `column "git_connection_ref" does not exist`.
+///
+/// This reconciles every existing tenant schema against the `ws_default` template, generically:
+///   1. `gt_create_workspace_schema(slug)` — re-run the cloner, which is `CREATE TABLE IF NOT
+///      EXISTS ... LIKE`, so it adds any NEW template TABLE the tenant lacks (and is a no-op for
+///      tables it already has).
+///   2. For every template table the tenant also has, diff `information_schema.columns` and
+///      `ALTER TABLE ... ADD COLUMN` each column present in the template but missing in the
+///      tenant, copying the template column's type, nullability, and default. `LIKE` cannot add a
+///      column to an already-existing table, so this closes the column-level drift.
+///
+/// Idempotent — it only adds what is missing, so a second boot against a reconciled DB is a no-op.
+/// Automatic so a deploy heals drift, mirroring how the `ws_default` migrations already
+/// auto-apply. We deliberately do NOT drop or alter columns the tenant has but the template lacks:
+/// reconcile only adds, never destroys, so an in-flight schema is never truncated.
+async fn reconcile_tenant_schemas(pool: &sqlx::PgPool) -> anyhow::Result<()> {
+    // Drive off the workspace catalog (same source of truth as `migrate_users_to_global`). On a
+    // brand-new DB the catalog may not exist yet — but then there are no tenants to reconcile.
+    let has_catalog: bool = sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM information_schema.tables \
+         WHERE table_schema = 'public' AND table_name = 'workspaces')",
+    )
+    .fetch_one(pool)
+    .await
+    .context("reconcile: probe workspace catalog")?;
+    if !has_catalog {
+        return Ok(());
+    }
+
+    const TEMPLATE: &str = "ws_default";
+    let slugs: Vec<String> = sqlx::query_scalar("SELECT slug FROM public.workspaces ORDER BY slug")
+        .fetch_all(pool)
+        .await
+        .context("reconcile: list workspaces")?;
+
+    let mut columns_added = 0usize;
+    for slug in slugs {
+        let schema = schema_for(&slug);
+        // The schema name is interpolated into DDL below; catalog slugs are system-minted, but
+        // prove it is a plain `ws_*` identifier first (same guard as the user migration).
+        if !is_safe_schema_ident(&schema) {
+            continue;
+        }
+        // `ws_default` IS the template — it is migrated directly by `apply_pg_catalog`, so
+        // reconciling it against itself is pointless (and the `default` workspace maps to it).
+        if schema == TEMPLATE {
+            continue;
+        }
+
+        // Step 1: pick up any NEW template tables (no-op for tables the tenant already has).
+        sqlx::query("SELECT gt_create_workspace_schema($1)")
+            .bind(&slug)
+            .execute(pool)
+            .await
+            .with_context(|| format!("reconcile: clone template into {schema}"))?;
+
+        // Step 2: add columns present in the template table but missing from the tenant's copy.
+        // `format_type(atttypid, atttypmod)` renders the canonical type (incl. precision/length),
+        // and `pg_get_expr(adbin, adrelid)` the default expression, both straight from the
+        // template's catalog so the tenant column matches byte-for-byte.
+        let missing = sqlx::query(MISSING_COLUMNS_SQL)
+            .bind(TEMPLATE)
+            .bind(&schema)
+            .fetch_all(pool)
+            .await
+            .with_context(|| format!("reconcile: diff columns for {schema}"))?;
+        for row in &missing {
+            let table: String = row.try_get("table_name").context("reconcile: table_name")?;
+            let column: String = row.try_get("column_name").context("reconcile: column_name")?;
+            let coltype: String = row.try_get("coltype").context("reconcile: coltype")?;
+            let not_null: bool = row.try_get("not_null").context("reconcile: not_null")?;
+            let default: Option<String> = row.try_get("default_expr").context("reconcile: default")?;
+
+            // Identifiers come from the catalog (already validated for the schema); table/column
+            // names are quoted, the type/default are catalog-rendered SQL fragments. A NOT NULL
+            // column with no default cannot be added to a table that may hold rows, so we only
+            // enforce NOT NULL when the template also supplies a default to backfill with.
+            let mut ddl = format!(
+                "ALTER TABLE {schema}.\"{table}\" ADD COLUMN IF NOT EXISTS \"{column}\" {coltype}"
+            );
+            if let Some(expr) = &default {
+                ddl.push_str(" DEFAULT ");
+                ddl.push_str(expr);
+            }
+            if not_null && default.is_some() {
+                ddl.push_str(" NOT NULL");
+            }
+            sqlx::query(&ddl)
+                .execute(pool)
+                .await
+                .with_context(|| format!("reconcile: add {schema}.{table}.{column}"))?;
+            columns_added += 1;
+        }
+    }
+    if columns_added > 0 {
+        eprintln!(
+            "[gt-mcp-server] tenant schema reconcile: {columns_added} column(s) backfilled from {TEMPLATE}"
+        );
+    }
+    Ok(())
+}
+
+/// Columns that exist in a template table (`$1`) but are missing from the same table in a tenant
+/// schema (`$2`), with the canonical type, NOT NULL flag, and default expression read straight
+/// from the template's catalog so a re-added column matches the template exactly. Only considers
+/// tables that exist in BOTH schemas — new tables are handled by `gt_create_workspace_schema`.
+const MISSING_COLUMNS_SQL: &str = "\
+SELECT c.relname AS table_name, \
+       a.attname AS column_name, \
+       format_type(a.atttypid, a.atttypmod) AS coltype, \
+       a.attnotnull AS not_null, \
+       pg_get_expr(ad.adbin, ad.adrelid) AS default_expr \
+FROM pg_attribute a \
+JOIN pg_class c ON c.oid = a.attrelid \
+JOIN pg_namespace n ON n.oid = c.relnamespace \
+LEFT JOIN pg_attrdef ad ON ad.adrelid = a.attrelid AND ad.adnum = a.attnum \
+WHERE n.nspname = $1 \
+  AND c.relkind = 'r' \
+  AND a.attnum > 0 \
+  AND NOT a.attisdropped \
+  AND EXISTS ( \
+      SELECT 1 FROM pg_class tc \
+      JOIN pg_namespace tn ON tn.oid = tc.relnamespace \
+      WHERE tn.nspname = $2 AND tc.relname = c.relname AND tc.relkind = 'r' \
+  ) \
+  AND NOT EXISTS ( \
+      SELECT 1 FROM pg_attribute ta \
+      JOIN pg_class tc ON tc.oid = ta.attrelid \
+      JOIN pg_namespace tn ON tn.oid = tc.relnamespace \
+      WHERE tn.nspname = $2 AND tc.relname = c.relname \
+        AND ta.attname = a.attname AND ta.attnum > 0 AND NOT ta.attisdropped \
+  ) \
+ORDER BY c.relname, a.attnum";
+
 /// Build the domain dispatch router from `GT_PG_URL`. Unset ⇒ an empty router
 /// (issues + meta only). The per-domain `DomainHandler`s (`hq-mcp-dispatch.2..7`)
 /// are registered here as they land. `event_log` (the shared, path-partitioned
@@ -1457,6 +1599,14 @@ async fn build_domain_router(
     // depending on an operator step. Idempotent — `apply` skips already-recorded
     // migrations, so a restart against a seeded DB is a no-op.
     apply_pg_catalog(&pool).await?;
+    // hq-vcs-connections.13: `apply_pg_catalog` migrates the `ws_default` TEMPLATE, but
+    // `gt_create_workspace_schema` only clones it into a tenant when that tenant is FIRST
+    // provisioned — so a template migration landed after a tenant was created (e.g. rig/0003's
+    // `git_connection_ref`) never reaches the already-existing `ws_<slug>` schemas, and
+    // `rig.list` against that tenant 500s with `column git_connection_ref does not exist`
+    // (observed for ws=confiar). Heal that drift on every boot, idempotently, so a deploy is the
+    // fix — generic over any future per-tenant template change, not a one-off ALTER.
+    reconcile_tenant_schemas(&pool).await?;
     let ws_pools = Arc::new(WsPools::new(pg_url));
     // Per-workspace Dolt pools for `workspace.create`'s tenant provisioning
     // (hq-gap-workspace-provision-full): when multi-tenant Dolt routing is on
@@ -2253,5 +2403,106 @@ mod tests {
                 .scopes,
             vec!["rig.read".to_string()]
         );
+    }
+
+    /// hq-vcs-connections.13 (GT_PG_URL-gated): `reconcile_tenant_schemas` heals per-tenant drift.
+    /// Plant a tenant schema that pre-dates a template column (the exact `git_connection_ref` /
+    /// ws=confiar shape), then prove reconcile (1) adds a NEW template table the tenant lacks,
+    /// (2) backfills the missing column with the template's type/default, and (3) is idempotent.
+    /// A no-op without GT_PG_URL (same gate as the migration e2e). Uses a private `ws_recon`
+    /// schema so it never collides with the real `ws_default` template.
+    #[tokio::test]
+    async fn reconcile_backfills_drifted_tenant_columns_and_tables() {
+        let Ok(url) = std::env::var("GT_PG_URL") else {
+            eprintln!("GT_PG_URL unset; skipping tenant-reconcile e2e");
+            return;
+        };
+        let pool = sqlx::PgPool::connect(&url).await.expect("connect GT_PG_URL");
+
+        // Clean slate for a deterministic re-run.
+        sqlx::raw_sql(
+            "DROP SCHEMA IF EXISTS ws_recon CASCADE; \
+             DROP SCHEMA IF EXISTS ws_default CASCADE;",
+        )
+        .execute(&pool)
+        .await
+        .expect("drop prior recon schemas");
+
+        // The TEMPLATE: a `rigs` table WITH the post-migration column + a NEW table absent from the
+        // (older) tenant, plus the provisioning function the reconcile re-runs.
+        sqlx::raw_sql(
+            "CREATE SCHEMA ws_default; \
+             CREATE TABLE ws_default.rigs ( \
+                 name TEXT PRIMARY KEY, \
+                 default_branch TEXT NOT NULL DEFAULT 'main', \
+                 git_connection_ref TEXT NULL ); \
+             CREATE TABLE ws_default.newtable ( id TEXT PRIMARY KEY );",
+        )
+        .execute(&pool)
+        .await
+        .expect("seed template");
+        // The real provisioning function (clones template tables into ws_<slug>).
+        for mig in gt_store_pg::workspace_migrations() {
+            sqlx::raw_sql(&mig.sql).execute(&pool).await.expect("apply ws migration");
+        }
+
+        // Catalog with a `recon` tenant; plant its schema as a STALE clone: `rigs` WITHOUT
+        // `git_connection_ref`, and missing `newtable` entirely (the drift the bug describes).
+        sqlx::raw_sql(
+            "INSERT INTO public.workspaces (id, slug, name, status) \
+             VALUES ('recon', 'recon', 'Recon', 'active') ON CONFLICT (id) DO NOTHING; \
+             CREATE SCHEMA ws_recon; \
+             CREATE TABLE ws_recon.rigs ( \
+                 name TEXT PRIMARY KEY, \
+                 default_branch TEXT NOT NULL DEFAULT 'main' );",
+        )
+        .execute(&pool)
+        .await
+        .expect("seed stale tenant");
+
+        // Pre-condition: the column is genuinely absent (the production failure).
+        let had_col: bool = sqlx::query_scalar(
+            "SELECT EXISTS (SELECT 1 FROM information_schema.columns \
+             WHERE table_schema='ws_recon' AND table_name='rigs' AND column_name='git_connection_ref')",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert!(!had_col, "precondition: stale tenant must lack git_connection_ref");
+
+        reconcile_tenant_schemas(&pool).await.expect("reconcile");
+
+        // (1) the new template table was cloned in.
+        let has_table: bool = sqlx::query_scalar(
+            "SELECT EXISTS (SELECT 1 FROM information_schema.tables \
+             WHERE table_schema='ws_recon' AND table_name='newtable')",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert!(has_table, "reconcile must clone the new template table into the tenant");
+
+        // (2) the missing column was backfilled with the template's type.
+        let coltype: Option<String> = sqlx::query_scalar(
+            "SELECT data_type FROM information_schema.columns \
+             WHERE table_schema='ws_recon' AND table_name='rigs' AND column_name='git_connection_ref'",
+        )
+        .fetch_optional(&pool)
+        .await
+        .unwrap();
+        assert_eq!(coltype.as_deref(), Some("text"), "git_connection_ref must be added as text");
+
+        // (3) idempotent: a second pass does not error and changes nothing.
+        reconcile_tenant_schemas(&pool).await.expect("reconcile again");
+
+        // Cleanup.
+        sqlx::raw_sql(
+            "DROP SCHEMA IF EXISTS ws_recon CASCADE; \
+             DROP SCHEMA IF EXISTS ws_default CASCADE; \
+             DELETE FROM public.workspaces WHERE slug='recon';",
+        )
+        .execute(&pool)
+        .await
+        .ok();
     }
 }
