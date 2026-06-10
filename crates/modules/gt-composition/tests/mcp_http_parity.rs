@@ -104,6 +104,7 @@ fn parity_map(ns: &str) -> Vec<Route> {
         ],
         "meta" => vec![
             rt("GET", "/help", Some("meta.help.execute")),
+            rt("GET", "/scopes", None), // REST-only grantable-scope catalog (hq-scope-catalog)
             rt("POST", "/report-gap", Some("meta.report-gap.execute")),
         ],
         "workspace" => vec![
