@@ -25,9 +25,10 @@ use serde_json::Value;
 use tower::ServiceExt; // oneshot
 
 use gt_graphindex::{
-    graph_router, GraphApiState, GraphError, GraphIndexer, InMemoryGraphIndexer, RigCustody,
-    WorkspaceGraph,
+    graph_router, GraphApiState, GraphError, GraphIndexer, GraphRefresher, InMemoryGraphIndexer,
+    RigCustody, WorkspaceGraph,
 };
+use serde_json::json;
 
 /// The `X-Workspace` header the adapter reads the tenant from (kept in sync with `http.rs`).
 const WORKSPACE_HEADER: &str = "x-workspace";
@@ -55,8 +56,24 @@ impl WorkspaceGraph for MemCustody {
     }
 }
 
+/// An in-memory [`GraphRefresher`]: a known rig returns a canned refresh result, any other rig is a
+/// `NotBuilt` (→ 404), proving the `POST /:rig/refresh` route is wired to the write seam.
+struct MemRefresher;
+
+#[async_trait]
+impl GraphRefresher for MemRefresher {
+    async fn refresh(&self, _workspace: &str, rig: &str) -> Result<Value, GraphError> {
+        if rig == "alpha" {
+            Ok(json!({ "ok": true, "rig": rig, "commit": "def5678", "nodes": 3 }))
+        } else {
+            Err(GraphError::NotBuilt(rig.to_string()))
+        }
+    }
+}
+
 /// Build the REST router with `acme` holding custody of rig `alpha` at `/repo/alpha`, the indexer
-/// pre-built for that repo so queries answer.
+/// pre-built for that repo so queries answer. A [`MemRefresher`] is wired so `POST /:rig/refresh`
+/// is mounted.
 async fn router() -> axum::Router {
     let mut by_ws: HashMap<String, Vec<RigCustody>> = HashMap::new();
     by_ws.insert(
@@ -73,7 +90,10 @@ async fn router() -> axum::Router {
     // InMemory needs a built graph for that repo to answer.
     indexer.build(std::path::Path::new("/repo/alpha")).await.unwrap();
 
-    graph_router(GraphApiState::new(Arc::new(MemCustody { by_ws }), indexer))
+    graph_router(
+        GraphApiState::new(Arc::new(MemCustody { by_ws }), indexer)
+            .with_refresher(Arc::new(MemRefresher)),
+    )
 }
 
 /// Send a request and return `(status, parsed-json-or-null)`.
@@ -87,6 +107,15 @@ async fn send(app: &axum::Router, req: Request<Body>) -> (StatusCode, Value) {
 
 fn get_in(ws: &str, uri: &str) -> Request<Body> {
     Request::builder()
+        .uri(uri)
+        .header(WORKSPACE_HEADER, ws)
+        .body(Body::empty())
+        .unwrap()
+}
+
+fn post_in(ws: &str, uri: &str) -> Request<Body> {
+    Request::builder()
+        .method("POST")
         .uri(uri)
         .header(WORKSPACE_HEADER, ws)
         .body(Body::empty())
@@ -112,6 +141,25 @@ async fn status_reports_freshness_for_a_rig_under_custody() {
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body["built"], true);
     assert_eq!(body["tool"], "inmemory");
+    // Freshness comes from the warden custody (not the always-null indexer metadata): the rig is
+    // not stale and was indexed at abc1234 → state `built`, commit echoed in both fields.
+    assert_eq!(body["state"], "built");
+    assert_eq!(body["stale"], false);
+    assert_eq!(body["last_indexed_commit"], "abc1234");
+    assert_eq!(body["built_at_commit"], "abc1234", "back-compat alias");
+}
+
+#[tokio::test]
+async fn refresh_dispatches_to_the_write_seam() {
+    let app = router().await;
+    let (status, body) = send(&app, post_in("acme", "/alpha/refresh")).await;
+    assert_eq!(status, StatusCode::OK, "refresh ok: {body}");
+    assert_eq!(body["ok"], true);
+    assert_eq!(body["rig"], "alpha");
+    assert_eq!(body["commit"], "def5678");
+    // A rig the refresher doesn't know maps NotBuilt → 404.
+    let (status, _) = send(&app, post_in("acme", "/ghost/refresh")).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
 }
 
 #[tokio::test]

@@ -33,7 +33,7 @@ use async_trait::async_trait;
 use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
-use axum::routing::get;
+use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -80,6 +80,21 @@ pub trait WorkspaceGraph: Send + Sync {
     async fn repo_dir(&self, workspace: &str, rig: &str) -> Result<Option<PathBuf>, GraphError>;
 }
 
+/// The graph-refresh write seam for the REST adapter (`hq-vcs-connections.9`): triggers a
+/// `graph.refresh` for one rig (the warden's clone/fetch+index custodian write). The reads above
+/// stay in this kernel crate, but the refresh execution (provision from the rig's VCS connection,
+/// shell out to `git`, append warden events) is a composition-tier concern, so it is supplied as a
+/// trait the binary implements over the MCP `GraphHandler`. Mounted only when the binary wires a
+/// refresher — without one the route is absent (the read-only surface stands alone). The FE
+/// complemento's per-repo "Refresh" button posts here.
+#[async_trait]
+pub trait GraphRefresher: Send + Sync {
+    /// Refresh `rig`'s graph for `workspace` (clone/fetch the default branch at the server-derived
+    /// path, re-index, MarkRefreshed). `404` when the rig is not in the catalog/custody, the
+    /// indexer error otherwise.
+    async fn refresh(&self, workspace: &str, rig: &str) -> Result<Value, GraphError>;
+}
+
 /// Everything the graph REST handlers need, baked into the router with [`Router::with_state`]
 /// before it leaves [`graph_router`] so the merged application router carries no outstanding state
 /// type (the kernel's state-erased `Router<()>` contract).
@@ -90,12 +105,27 @@ pub struct GraphApiState {
     /// The active tool-neutral indexer — workspace-neutral (one indexer serves every rig), so it
     /// rides in the state directly rather than the per-workspace provider.
     indexer: Arc<dyn GraphIndexer>,
+    /// The custodian-write seam for the `POST /:rig/refresh` route (`hq-vcs-connections.9`).
+    /// `None` ⇒ the refresh route is not mounted (read-only surface). The binary wires this over
+    /// the composition `GraphHandler`; tests leave it absent unless they exercise refresh.
+    refresher: Option<Arc<dyn GraphRefresher>>,
 }
 
 impl GraphApiState {
-    /// Build the REST state over a per-workspace custody provider and the active indexer.
+    /// Build the REST state over a per-workspace custody provider and the active indexer. No
+    /// refresher ⇒ the read-only surface; opt into refresh via [`with_refresher`](Self::with_refresher).
     pub fn new(custody: Arc<dyn WorkspaceGraph>, indexer: Arc<dyn GraphIndexer>) -> Self {
-        Self { custody, indexer }
+        Self {
+            custody,
+            indexer,
+            refresher: None,
+        }
+    }
+
+    /// Attach the custodian-write seam so `POST /:rig/refresh` is mounted (`hq-vcs-connections.9`).
+    pub fn with_refresher(mut self, refresher: Arc<dyn GraphRefresher>) -> Self {
+        self.refresher = Some(refresher);
+        self
     }
 
     /// Resolve `rig`'s checkout for `workspace`, mapping no-custody onto a `404`.
@@ -112,19 +142,27 @@ impl GraphApiState {
 /// The paths are **relative**: the builder nests them under `/api/v1/graph` and applies the scope
 /// guard. `register_routes` on the HTTP-enabled graph module returns exactly this router.
 ///
-/// | Method + path        | Maps to MCP tool |
-/// |----------------------|------------------|
-/// | `GET /`              | `graph.list`     |
-/// | `GET /:rig`          | `graph.status`   |
-/// | `GET /:rig/query`    | `graph.query`    |
-/// | `GET /:rig/explain`  | `graph.explain`  |
+/// | Method + path           | Maps to MCP tool |
+/// |-------------------------|------------------|
+/// | `GET /`                 | `graph.list`     |
+/// | `GET /:rig`             | `graph.status`   |
+/// | `GET /:rig/query`       | `graph.query`    |
+/// | `GET /:rig/explain`     | `graph.explain`  |
+/// | `POST /:rig/refresh`    | `graph.refresh`  (only when a refresher is wired) |
+///
+/// The four reads need `graph.read`; the refresh write needs `graph.write` (the builder's
+/// capability-derived scope guard reads the method). The refresh route is mounted only when the
+/// state carries a [`GraphRefresher`] — without one it is absent and a POST 404s.
 pub fn graph_router(state: GraphApiState) -> Router {
-    Router::new()
+    let mut router = Router::new()
         .route("/", get(list_rigs))
         .route("/:rig/query", get(query_rig))
         .route("/:rig/explain", get(explain_rig))
-        .route("/:rig", get(rig_status))
-        .with_state(state)
+        .route("/:rig", get(rig_status));
+    if state.refresher.is_some() {
+        router = router.route("/:rig/refresh", post(refresh_rig));
+    }
+    router.with_state(state)
 }
 
 /// Querystring for `GET /:rig/query` — the free-text question.
@@ -157,6 +195,12 @@ async fn list_rigs(
 
 /// `GET /:rig` — a rig's graph freshness + index stats (`graph.status`); `404` when the warden has
 /// no custody of the rig.
+///
+/// Freshness (the indexed commit + the `state`) is sourced from the WARDEN CUSTODY (the same
+/// record `GET /` lists), NOT from `indexer.status().built_at_commit` — the graphify build never
+/// stamps the commit into its artifacts, so that field is always null (live finding,
+/// hq-vcs-connections.9). The MCP `graph.status` was fixed in lockstep. Index size still comes from
+/// the indexer (it owns the artifacts); the commit + freshness state are the warden's.
 #[cfg_attr(feature = "axum", utoipa::path(
     get, path = "/{rig}",
     params(("rig" = String, Path, description = "Rig id")),
@@ -171,16 +215,76 @@ async fn rig_status(
     Path(rig): Path<String>,
 ) -> Result<Json<Value>, ApiError> {
     let ws = workspace_of(&headers);
-    let repo = st.repo(ws.as_deref().unwrap_or(DEFAULT_WORKSPACE), &rig).await?;
-    let status = st.indexer.status(&repo).await?;
+    let ws = ws.as_deref().unwrap_or(DEFAULT_WORKSPACE);
+    // Resolve the rig's custody record (the source of truth for freshness) from the per-workspace
+    // provider — a missing rig is a 404, mirroring the MCP handler.
+    let custody = st
+        .custody
+        .list(ws)
+        .await?
+        .into_iter()
+        .find(|c| c.rig == rig)
+        .ok_or_else(|| ApiError::NotFound(format!("no graph custody for rig `{rig}`")))?;
+    let status = st
+        .indexer
+        .status(std::path::Path::new(&custody.repo_dir))
+        .await?;
     Ok(Json(json!({
         "built": status.built,
         "tool": status.tool,
         "nodes": status.stats.map(|s| s.nodes),
         "edges": status.stats.map(|s| s.edges),
         "communities": status.stats.map(|s| s.communities),
-        "built_at_commit": status.built_at_commit,
+        // Indexed commit + freshness come from the warden custody, not the always-null indexer
+        // metadata. `built_at_commit` kept as a back-compat alias for `last_indexed_commit`.
+        "last_indexed_commit": custody.last_indexed_commit,
+        "built_at_commit": custody.last_indexed_commit,
+        "stale": custody.stale,
+        "pending_changes": custody.pending_changes,
+        // built — not stale; behind — stale + indexed before; stale — stale + never indexed.
+        "state": freshness_state(custody.stale, custody.last_indexed_commit.is_some()),
     })))
+}
+
+/// Map the warden custody's `(stale, ever_indexed)` onto the freshness state the FE chip renders —
+/// the REST mirror of the MCP handler's `freshness_state` (kept identical so the two never drift):
+/// `built` (not stale), `behind` (stale + indexed before), `stale` (stale + never indexed).
+fn freshness_state(stale: bool, ever_indexed: bool) -> &'static str {
+    match (stale, ever_indexed) {
+        (false, _) => "built",
+        (true, true) => "behind",
+        (true, false) => "stale",
+    }
+}
+
+/// `POST /:rig/refresh` — trigger a `graph.refresh` for one rig (`hq-vcs-connections.9`): the FE
+/// complemento's per-repo "Refresh" button. Delegates to the wired [`GraphRefresher`] (the
+/// composition `GraphHandler`), which clones/fetches the rig's default branch at the server-derived
+/// path, re-indexes, and records the refresh — then a follow-up `GET /:rig` reports the new
+/// freshness. `404` when the rig is not in the catalog/custody; `500` on a tool/IO failure. Mounted
+/// only when a refresher is wired (else this handler is unreachable — the route is not registered).
+#[cfg_attr(feature = "axum", utoipa::path(
+    post, path = "/{rig}/refresh",
+    params(("rig" = String, Path, description = "Rig id")),
+    responses(
+        (status = 200, description = "The refresh result (rig, commit, node/edge counts)"),
+        (status = 404, description = "No catalog/custody for that rig"),
+    ),
+))]
+async fn refresh_rig(
+    State(st): State<GraphApiState>,
+    headers: HeaderMap,
+    Path(rig): Path<String>,
+) -> Result<Json<Value>, ApiError> {
+    let ws = workspace_of(&headers);
+    let refresher = st
+        .refresher
+        .as_ref()
+        .ok_or_else(|| ApiError::NotFound("graph refresh is not enabled on this server".into()))?;
+    let out = refresher
+        .refresh(ws.as_deref().unwrap_or(DEFAULT_WORKSPACE), &rig)
+        .await?;
+    Ok(Json(out))
 }
 
 /// `GET /:rig/query?q=` — answer a free-text question against a rig's graph (`graph.query`); `404`
@@ -237,7 +341,7 @@ async fn explain_rig(
 /// builder mounts it under the module prefix and rewrites its relative paths to `/api/v1/graph/...`,
 /// so the `#[utoipa::path]` annotations stay prefix-free.
 #[derive(utoipa::OpenApi)]
-#[openapi(paths(list_rigs, rig_status, query_rig, explain_rig))]
+#[openapi(paths(list_rigs, rig_status, query_rig, explain_rig, refresh_rig))]
 pub struct ApiDoc;
 
 /// Read the request's tenant from the `X-Workspace` header, or `None` when it is absent/empty (the
@@ -294,7 +398,7 @@ mod tests {
     fn openapi_lists_every_relative_route_prefix_free() {
         let doc = ApiDoc::openapi();
         let paths: Vec<&str> = doc.paths.paths.keys().map(String::as_str).collect();
-        for expected in ["/", "/{rig}", "/{rig}/query", "/{rig}/explain"] {
+        for expected in ["/", "/{rig}", "/{rig}/query", "/{rig}/explain", "/{rig}/refresh"] {
             assert!(paths.contains(&expected), "missing {expected} in {paths:?}");
         }
         assert!(paths.iter().all(|p| !p.contains("/api/v1")), "{paths:?}");

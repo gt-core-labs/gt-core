@@ -46,8 +46,8 @@ pub use notify::NotifyHandler;
 pub use pools::WsPools;
 pub use quota::{QuotaBlockGuard, QuotaHandler};
 pub use rest_backings::{
-    EventLogConvoy, EventLogFeed, EventLogHooks, EventLogMerges, EventLogQuota, EventLogSkills,
-    FsAccountCatalog, IdentityDoltMeStats, WsPoolRigs,
+    EventLogConvoy, EventLogFeed, EventLogGraph, EventLogHooks, EventLogMerges, EventLogQuota,
+    EventLogSkills, FsAccountCatalog, GraphHandlerRefresher, IdentityDoltMeStats, WsPoolRigs,
 };
 pub use rig::{PgRigPrefixes, RigHandler};
 pub use workspace::{CompositionTenantProvisioner, PgWorkspaceStatus, WorkspaceHandler};

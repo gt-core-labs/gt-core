@@ -303,6 +303,20 @@ impl GraphHandler {
     }
 }
 
+/// Map the warden custody's `(stale, ever_indexed)` onto the freshness state the FE chip renders.
+/// Derived purely from custody so it is replay-deterministic (no network call on a status read):
+///   - `built`  — not stale: the indexed commit is current.
+///   - `behind` — stale AND a graph was indexed before: it has fallen behind origin (a known newer
+///     tip exists — the merge queue, push webhook, or drift-reconcile flipped `stale`).
+///   - `stale`  — stale AND never indexed: the initial build is still owed.
+fn freshness_state(stale: bool, ever_indexed: bool) -> &'static str {
+    match (stale, ever_indexed) {
+        (false, _) => "built",
+        (true, true) => "behind",
+        (true, false) => "stale",
+    }
+}
+
 /// `git -C <repo> rev-parse --short HEAD`, or `"unknown"` if it cannot be read — the warden
 /// requires a non-empty commit and an unknown checkout still refreshes the graph.
 fn head_commit(repo: &std::path::Path) -> String {
@@ -491,8 +505,19 @@ impl DomainHandler for GraphHandler {
                 Ok(json!({ "text": ans.text, "nodes": ans.nodes }))
             }
             "graph.status" => {
+                // Freshness is sourced from the WARDEN CUSTODY (the event-sourced record
+                // `graph.list` reads), NOT from `indexer.status().built_at_commit` — the graphify
+                // build never stamps the commit into its artifacts, so that field is always null
+                // (live finding, hq-vcs-connections.9). The custody's `last_indexed_commit` is the
+                // commit MarkRefreshed recorded; its `stale` flag is flipped by the three freshness
+                // sources (merge queue, push webhook, drift-reconcile). Index size still comes from
+                // the indexer (it owns the artifacts), but the commit + freshness are the warden's.
                 let rig = str_arg(&ctx.args, "rig")?;
-                let repo = self.repo_dir(ws, rig)?;
+                let state = self.warden(ws)?;
+                let g = state.rigs.get(rig).ok_or_else(|| {
+                    AppError::NotFound(format!("no graph custody for rig `{rig}`"))
+                })?;
+                let repo = PathBuf::from(&g.repo_dir);
                 let st = self.indexer.status(&repo).await.map_err(graph_err)?;
                 Ok(json!({
                     "built": st.built,
@@ -500,7 +525,19 @@ impl DomainHandler for GraphHandler {
                     "nodes": st.stats.map(|s| s.nodes),
                     "edges": st.stats.map(|s| s.edges),
                     "communities": st.stats.map(|s| s.communities),
-                    "built_at_commit": st.built_at_commit,
+                    // The indexed commit comes from the warden custody (`graph.list`'s source), not
+                    // the always-null indexer metadata. `built_at_commit` kept as an alias for
+                    // back-compat with any existing reader.
+                    "last_indexed_commit": g.last_indexed_commit,
+                    "built_at_commit": g.last_indexed_commit,
+                    "stale": g.stale,
+                    "pending_changes": g.pending_changes,
+                    // Freshness state, derived purely from custody (replay-deterministic, no network):
+                    //   built  — not stale: the indexed commit is current.
+                    //   behind — stale AND a graph was indexed before: it has fallen behind origin
+                    //            (a known newer tip exists; the merge/webhook/drift source flipped it).
+                    //   stale  — stale AND never indexed: the initial build is owed.
+                    "state": freshness_state(g.stale, g.last_indexed_commit.is_some()),
                 }))
             }
             "graph.refresh" => {
@@ -595,13 +632,20 @@ mod tests {
         }
     }
 
-    /// Pin `GT_GRAPH_ROOT` at a temp dir so the derived path is writable in tests (the production
-    /// default `/var/lib/gt-graph` is not). Returns the guard dir; the env var is process-global so
-    /// these tests share the one root and key by rig name.
-    fn pin_graph_root() -> TempDir {
+    /// Serializes the tests that mutate the process-global `GT_GRAPH_ROOT` env var, so two of them
+    /// running concurrently (cargo runs tests in parallel) cannot clobber each other's pinned root.
+    static GRAPH_ROOT_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Pin `GT_GRAPH_ROOT` at a fresh temp dir so the derived path is writable in tests (the
+    /// production default `/var/lib/gt-graph` is not). Returns `(dir, guard)`: the dir keeps the
+    /// checkout alive and the [`GRAPH_ROOT_LOCK`] guard serializes against the other env-mutating
+    /// tests — hold both for the test body. Recovers from a poisoned lock (a prior test panic) so a
+    /// single failure does not cascade.
+    fn pin_graph_root() -> (TempDir, std::sync::MutexGuard<'static, ()>) {
+        let guard = GRAPH_ROOT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let dir = TempDir::new().unwrap();
         std::env::set_var("GT_GRAPH_ROOT", dir.path());
-        dir
+        (dir, guard)
     }
 
     #[test]
@@ -678,13 +722,93 @@ mod tests {
             .unwrap();
         assert_eq!(st["built"], true);
         assert_eq!(st["tool"], "inmemory");
+        // Freshness is sourced from the warden custody, not the (null) indexer metadata. This rig
+        // was registered but never MarkRefreshed, so custody is stale + never-indexed → `stale`,
+        // and `last_indexed_commit` is null (NOT the indexer's always-null `built_at_commit`).
+        assert_eq!(st["state"], "stale");
+        assert_eq!(st["stale"], true);
+        assert!(st["last_indexed_commit"].is_null());
+    }
+
+    /// `graph.status` reads the indexed commit + freshness from the WARDEN CUSTODY (the source
+    /// `graph.list` uses), not from the always-null `indexer.status().built_at_commit`. After a
+    /// refresh the state is `built` and the commit is the one MarkRefreshed recorded; a later
+    /// MarkStale (webhook/merge/drift) flips it to `behind` while keeping the last indexed commit.
+    #[tokio::test]
+    async fn status_sources_commit_and_freshness_from_warden() {
+        let _root = pin_graph_root();
+        let dir = TempDir::new().unwrap();
+        let log = Arc::new(EventLog::new(Some(dir.path().to_path_buf())));
+        let h = GraphHandler::new(log.clone(), Arc::new(InMemoryGraphIndexer::new()));
+
+        // Refresh registers + builds + MarkRefreshed → custody carries a real commit, not stale.
+        h.dispatch("graph.refresh", ctx(json!({ "rig": "alpha" })))
+            .await
+            .unwrap();
+        let commit = h
+            .dispatch("graph.list", ctx(json!({})))
+            .await
+            .unwrap()["rigs"][0]["last_indexed_commit"]
+            .clone();
+        assert!(commit.is_string(), "list must carry the indexed commit");
+
+        let st = h
+            .dispatch("graph.status", ctx(json!({ "rig": "alpha" })))
+            .await
+            .unwrap();
+        assert_eq!(st["state"], "built");
+        assert_eq!(st["stale"], false);
+        // The commit matches what graph.list reports — both from the warden custody.
+        assert_eq!(st["last_indexed_commit"], commit);
+        assert_eq!(st["built_at_commit"], commit, "back-compat alias");
+
+        // A push webhook / merge / drift marks the rig stale: it has been indexed before, so the
+        // freshness state is `behind` (not `stale`), and the last indexed commit is retained.
+        log.append(
+            None,
+            WardenEvent::MarkedStale {
+                rig: "alpha".into(),
+                changed: 3,
+                now_secs: 2,
+            },
+        )
+        .unwrap();
+        let behind = h
+            .dispatch("graph.status", ctx(json!({ "rig": "alpha" })))
+            .await
+            .unwrap();
+        assert_eq!(behind["state"], "behind");
+        assert_eq!(behind["stale"], true);
+        assert_eq!(behind["pending_changes"], 3);
+        assert_eq!(behind["last_indexed_commit"], commit, "commit retained while behind");
+    }
+
+    #[test]
+    fn freshness_state_maps_custody_to_chip() {
+        assert_eq!(freshness_state(false, false), "built");
+        assert_eq!(freshness_state(false, true), "built");
+        assert_eq!(freshness_state(true, false), "stale");
+        assert_eq!(freshness_state(true, true), "behind");
+    }
+
+    /// `graph.status` for a rig the warden never registered is `NotFound` (custody is the source).
+    #[tokio::test]
+    async fn status_unknown_rig_is_not_found() {
+        let dir = TempDir::new().unwrap();
+        let log = Arc::new(EventLog::new(Some(dir.path().to_path_buf())));
+        let h = GraphHandler::new(log, Arc::new(InMemoryGraphIndexer::new()));
+        let err = h
+            .dispatch("graph.status", ctx(json!({ "rig": "ghost" })))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, AppError::NotFound(_)));
     }
 
     /// `graph.refresh` (no provisioner, no repo_dir arg) derives the path, registers the rig at it,
     /// builds, marks it fresh — then it is queryable and listed as not-stale at the derived path.
     #[tokio::test]
     async fn refresh_derives_path_registers_builds_and_marks_fresh() {
-        let root = pin_graph_root();
+        let (root, _guard) = pin_graph_root();
         let dir = TempDir::new().unwrap();
         let log = Arc::new(EventLog::new(Some(dir.path().to_path_buf())));
         let h = GraphHandler::new(log, Arc::new(InMemoryGraphIndexer::new()));
@@ -729,7 +853,7 @@ mod tests {
     /// to the server-derived path on the next refresh — custody and build never diverge again.
     #[tokio::test]
     async fn refresh_repoints_poisoned_custody_to_derived_path() {
-        let root = pin_graph_root();
+        let (root, _guard) = pin_graph_root();
         let dir = TempDir::new().unwrap();
         let log = Arc::new(EventLog::new(Some(dir.path().to_path_buf())));
         // Pre-existing poisoned custody: a path from someone's host that does not exist here.

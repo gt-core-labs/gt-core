@@ -28,6 +28,9 @@ use gt_events::AppError;
 use gt_auth::MembershipDirectory;
 use gt_claude_hooks::{HookEvent, HooksRegistry, HooksState, HooksStore};
 use gt_feed::{FeedItem, FeedPage, WorkspaceFeed};
+use gt_graphindex::{GraphError, GraphRefresher, RigCustody, WorkspaceGraph};
+use gt_graphwarden::WardenState;
+use gt_mcp_server::{DomainCtx, DomainHandler};
 use gt_issues::{MeMembership, MeStatsSource};
 use gt_mcp_server::WorkspaceStores;
 use gt_merge::{
@@ -56,6 +59,11 @@ const MERGE_NS: &str = "merge.";
 /// The event-log kind prefix every skill event carries (`skills.*.v1`); the read-only REST
 /// surface replays exactly this stream into the catalog the dashboard hydrates from.
 const SKILLS_NS: &str = "skills.";
+
+/// The event-log kind prefix every warden event carries (`graphwarden.*.v1`); matches the MCP
+/// [`GraphHandler`](super::graph::GraphHandler)'s replay filter so the REST graph surface folds the
+/// identical per-workspace custody stream.
+const GRAPHWARDEN_NS: &str = "graphwarden.";
 
 /// The event-log kind prefix every hook event carries (`hooks.*.v1`). The hook registry is GLOBAL
 /// (replayed at the `None` event scope, not per-workspace), so this stream is folded once and
@@ -583,6 +591,104 @@ impl MeStatsSource for IdentityDoltMeStats {
             rig: None,
         };
         store.list(&filter).await
+    }
+}
+
+// ── graph.* REST backings (hq-vcs-connections.9) ─────────────────────────────────────────────
+//
+// The read-only graph REST adapter (`gt_graphindex::http`, the `axum` feature) delegates to a
+// per-workspace [`WorkspaceGraph`] custody provider + a [`GraphRefresher`] write seam. Both are the
+// REST mirrors of the MCP [`GraphHandler`](super::graph::GraphHandler): they fold the SAME
+// `graphwarden.*` event stream the handler replays, so a `graph.list`/`graph.status` over MCP and a
+// `GET /api/v1/graph[/:rig]` see one custody, and a `graph.refresh` over either edge clones/indexes
+// at the one server-derived path and appends to the one warden log. Freshness is sourced from this
+// custody (the event-sourced `last_indexed_commit` + `stale`), never the always-null indexer
+// metadata — the hq-vcs-connections.9 finding.
+
+/// REST backing for the graph read surface (`gt_graphindex::WorkspaceGraph`): replays the caller's
+/// `graphwarden.*` stream into a [`WardenState`] and projects each rig's custody onto the kernel's
+/// [`RigCustody`] DTO — the exact projection the MCP `graph.list` returns.
+pub struct EventLogGraph {
+    log: Arc<EventLog>,
+}
+
+impl EventLogGraph {
+    /// Wrap the per-workspace event log (the binary's single shared instance).
+    pub fn new(log: Arc<EventLog>) -> Self {
+        Self { log }
+    }
+
+    /// Rehydrate `workspace`'s warden custody from its `graphwarden.*` events — the same replay the
+    /// MCP [`GraphHandler`](super::graph::GraphHandler) runs.
+    fn warden(&self, workspace: &str) -> Result<WardenState, GraphError> {
+        self.log
+            .replay_domain(Some(workspace), GRAPHWARDEN_NS, WardenState::default(), |s, e| {
+                let _ = s.apply(e);
+            })
+            .map_err(|e| GraphError::Io(e.to_string()))
+    }
+}
+
+#[async_trait]
+impl WorkspaceGraph for EventLogGraph {
+    async fn list(&self, workspace: &str) -> Result<Vec<RigCustody>, GraphError> {
+        let state = self.warden(workspace)?;
+        Ok(state
+            .rigs
+            .values()
+            .map(|g| RigCustody {
+                rig: g.rig.clone(),
+                repo_dir: g.repo_dir.clone(),
+                stale: g.stale,
+                pending_changes: g.pending_changes as usize,
+                last_indexed_commit: g.last_indexed_commit.clone(),
+            })
+            .collect())
+    }
+
+    async fn repo_dir(
+        &self,
+        workspace: &str,
+        rig: &str,
+    ) -> Result<Option<std::path::PathBuf>, GraphError> {
+        let state = self.warden(workspace)?;
+        Ok(state.rigs.get(rig).map(|g| std::path::PathBuf::from(&g.repo_dir)))
+    }
+}
+
+/// REST backing for the graph refresh write seam (`gt_graphindex::GraphRefresher`): delegates to the
+/// MCP [`GraphHandler`](super::graph::GraphHandler) so a `POST /api/v1/graph/:rig/refresh` runs the
+/// IDENTICAL custodian write (server-derived path, JIT clone/fetch from the rig's VCS connection,
+/// re-index, MarkRefreshed) as the MCP `graph.refresh` tool — one code path, two transports.
+pub struct GraphHandlerRefresher {
+    handler: Arc<super::graph::GraphHandler>,
+}
+
+impl GraphHandlerRefresher {
+    /// Wrap the shared MCP graph handler (built once in the binary with the provisioner).
+    pub fn new(handler: Arc<super::graph::GraphHandler>) -> Self {
+        Self { handler }
+    }
+}
+
+#[async_trait]
+impl GraphRefresher for GraphHandlerRefresher {
+    async fn refresh(&self, workspace: &str, rig: &str) -> Result<serde_json::Value, GraphError> {
+        let ctx = DomainCtx {
+            workspace: Some(workspace),
+            actor: "graph-rest",
+            args: serde_json::json!({ "rig": rig }),
+        };
+        self.handler
+            .dispatch("graph.refresh", ctx)
+            .await
+            // The kernel REST adapter only distinguishes not-found (→404) from everything else
+            // (→500). A missing rig/custody is the handler's `NotFound`; map it to `NotBuilt` so the
+            // adapter answers 404, and fold the rest into a `Tool` error (→500).
+            .map_err(|e| match e {
+                DoltError::NotFound(m) => GraphError::NotBuilt(m),
+                other => GraphError::Tool(other.to_string()),
+            })
     }
 }
 

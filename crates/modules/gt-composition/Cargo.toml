@@ -74,9 +74,11 @@ gt-rig = { workspace = true, features = ["pg", "axum"] }
 # wires PgVcsConnections over the shared pool; `axum` adds the `/api/v1/connection` surface mounted
 # behind the connection.read/connection.write guard. The sealed PAT reuses gt-auth's secret-crypto.
 gt-vcs = { workspace = true, features = ["pg", "axum"] }
-# graph.* read-only dispatch (hq-graphrig.10): GraphIndexer port (+ graphify adapter for
-# the live server) and the warden state replayed to resolve rig -> repo_dir.
-gt-graphindex = { workspace = true, features = ["graphify"] }
+# graph.* dispatch (hq-graphrig.10): GraphIndexer port (+ graphify adapter for the live
+# server) and the warden state replayed to resolve rig -> repo_dir. The `axum` feature
+# (hq-vcs-connections.9) mounts the read-only graph REST surface + the refresh route so the FE
+# complemento reaches graph.status/refresh over the same authenticated HTTP path.
+gt-graphindex = { workspace = true, features = ["graphify", "axum"] }
 gt-graphwarden = { workspace = true }
 # Inbound webhook verify (hq-vcs-connections.7): reuse `GitHubSource`'s constant-time HMAC-SHA256
 # verification of `X-Hub-Signature-256` for the GitHub App push webhook, rather than re-rolling the

@@ -1042,6 +1042,52 @@ async fn main() -> anyhow::Result<()> {
                     Err(e) => panic!("GitHub App config is half-set: {e}"),
                 }
                 vcs
+            })
+            // graph.* read-only REST + refresh (hq-vcs-connections.9): mount the graph module's
+            // HTTP surface so the FE complemento reaches graph.status (per-repo freshness chip) and
+            // graph.refresh (the "Refresh" button) over the same authenticated path as the other
+            // domains. The read provider (EventLogGraph) folds the SAME `graphwarden.*` custody the
+            // MCP graph.list does — freshness is sourced from the warden's last_indexed_commit/stale,
+            // not the always-null indexer metadata. The refresher delegates to a GraphHandler wired
+            // with the same server-side provisioner as the MCP dispatch (derived path + JIT clone
+            // from the rig's VCS connection), so both transports run one custodian write path. Reads
+            // need graph.read; the refresh POST needs graph.write (the builder's method→scope guard).
+            .module({
+                let read_custody: Arc<dyn gt_graphindex::WorkspaceGraph> =
+                    Arc::new(gt_composition::mcp::EventLogGraph::new(event_log.clone()));
+                // The REST refresher's own GraphHandler — the MCP one is moved into the DomainRouter,
+                // so build a second over the same shared parts (event log + graphify indexer +
+                // server-side provisioner). Both fold the one warden log + clone to the one derived path.
+                let graph_provisioner = {
+                    let conns: Arc<dyn gt_vcs::VcsConnectionRepo> =
+                        Arc::new(gt_vcs::PgVcsConnections::new(pool.clone()));
+                    let github = match gt_vcs::GithubAppConfig::from_env() {
+                        Ok(Some(cfg)) => Some(gt_vcs::GithubAppClient::new(cfg)),
+                        Ok(None) => None,
+                        Err(e) => panic!("GitHub App config is half-set: {e}"),
+                    };
+                    gt_composition::mcp::RigProvisioner::new(
+                        Arc::new(WsPools::new(pg_url.clone())),
+                        conns,
+                        github,
+                    )
+                };
+                let refresh_handler = Arc::new(
+                    gt_composition::mcp::GraphHandler::new(
+                        event_log.clone(),
+                        Arc::new(GraphifyIndexer::new()),
+                    )
+                    .with_provisioner(graph_provisioner),
+                );
+                let refresher: Arc<dyn gt_graphindex::GraphRefresher> = Arc::new(
+                    gt_composition::mcp::GraphHandlerRefresher::new(refresh_handler),
+                );
+                let graph_state = gt_graphindex::GraphApiState::new(
+                    read_custody,
+                    Arc::new(GraphifyIndexer::new()),
+                )
+                .with_refresher(refresher);
+                gt_graphindex::GraphModule::with_http(graph_state)
             });
         let (blob, bucket) = build_blob_store();
         // Capture the PG url before it moves into the documents state — the cross-workspace
@@ -1079,11 +1125,11 @@ async fn main() -> anyhow::Result<()> {
                 let me_source = Arc::new(IdentityDoltMeStats::new(memberships, stores));
                 rest = rest.module(MeModule::with_http(MeApiState::new(me_source)));
                 eprintln!(
-                    "[gt-mcp-server] REST domain modules: meta + workspace + rig + documents + memory + agent + quota + merge + skills + feed + convoy + me (cross-workspace stats)"
+                    "[gt-mcp-server] REST domain modules: meta + workspace + rig + connection + graph + documents + memory + agent + quota + merge + skills + feed + convoy + me (cross-workspace stats)"
                 );
             }
             Err(_) => eprintln!(
-                "[gt-mcp-server] REST domain modules: meta + workspace + rig + documents + memory + agent + quota + merge + skills + feed + convoy (GT_DOLT_BASE_URL unset → no /me/stats cross-workspace surface)"
+                "[gt-mcp-server] REST domain modules: meta + workspace + rig + connection + graph + documents + memory + agent + quota + merge + skills + feed + convoy (GT_DOLT_BASE_URL unset → no /me/stats cross-workspace surface)"
             ),
         }
     } else {

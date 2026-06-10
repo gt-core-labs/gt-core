@@ -53,7 +53,9 @@ pub use artifacts::{ensure_ignored, patterns_for, NEUTRAL_UMBRELLA};
 #[cfg(feature = "graphify")]
 pub use graphify::GraphifyIndexer;
 #[cfg(feature = "axum")]
-pub use http::{graph_router, ApiDoc, GraphApiState, RigCustody, WorkspaceGraph};
+pub use http::{
+    graph_router, ApiDoc, GraphApiState, GraphRefresher, RigCustody, WorkspaceGraph,
+};
 pub use memory::InMemoryGraphIndexer;
 #[cfg(feature = "axum")]
 pub use module::GraphHttpModule;
