@@ -115,6 +115,14 @@ pub struct RoleBinding {
     /// role. `#[serde(default)]` keeps pre-`hq-role-model` bindings replayable.
     #[serde(default)]
     pub model_config: ModelConfig,
+    /// The role's gt-rbac scope grants (`hq-role-scopes`): a first-class, per-role permission set,
+    /// symmetric to [`prompt`](Self::prompt) and [`model_config`](Self::model_config). This is the
+    /// SINGLE source of a role's scopes — [`SkillCatalog::scopes_for_roles`] reads it directly, so a
+    /// skill is now pure *knowledge* (its `SKILL.md` body), never a permission bucket. Empty until a
+    /// `RoleScopesSet` lands (or the one-shot migration seeds it from the role's enabled-skill
+    /// `default_scopes`). `#[serde(default)]` keeps pre-`hq-role-scopes` bindings replayable.
+    #[serde(default)]
+    pub scopes: Vec<String>,
 }
 
 impl RoleBinding {
@@ -124,6 +132,7 @@ impl RoleBinding {
             enabled_skills: BTreeSet::new(),
             prompt: String::new(),
             model_config: ModelConfig::default(),
+            scopes: Vec::new(),
         }
     }
 }
@@ -191,6 +200,17 @@ impl SkillCatalog {
             .filter(|m| !m.is_unset())
     }
 
+    /// The role's gt-rbac scopes (`hq-role-scopes`): the binding's `scopes` verbatim, in registered
+    /// order. Empty when the role has no binding or no scopes set. This is the accessor the role
+    /// editor reads and the symmetric sibling of [`role_prompt`](Self::role_prompt) /
+    /// [`role_model`](Self::role_model).
+    pub fn role_scopes(&self, role: &str) -> Vec<String> {
+        self.bindings
+            .get(role)
+            .map(|b| b.scopes.clone())
+            .unwrap_or_default()
+    }
+
     /// All skills enabled for `role`, in stable order. Empty when the role has no
     /// bindings yet.
     pub fn skills_for_role(&self, role: &str) -> Vec<String> {
@@ -200,11 +220,15 @@ impl SkillCatalog {
             .unwrap_or_default()
     }
 
-    /// Flattened scope set for every role in `roles` (`hq-fe-skills.4`). For each role,
-    /// walks its enabled skills (BTreeSet → alphabetical), then each skill's
-    /// `default_scopes` (registered ordering), dedup'd first-seen so the gateway can
-    /// union this with the static `gt_rbac::WebGrant.scopes` without changing the
+    /// Flattened scope set for every role in `roles` (`hq-role-scopes`). For each role, reads its
+    /// binding's `scopes` **directly** (registered order), dedup'd first-seen across roles so the
+    /// gateway can union this with the static `gt_rbac::WebGrant.scopes` without changing the
     /// existing scope ordering posture. Roles with no binding contribute nothing.
+    ///
+    /// This is the decoupling pivot: scopes are now the role's OWN `scopes` field, no longer derived
+    /// by unioning its enabled skills' `default_scopes`. The one-shot [`role_scopes_migration`]
+    /// (Self::role_scopes_migration) seeds that field from the legacy union at cutover so this
+    /// direct read resolves the same grants it always did.
     pub fn scopes_for_roles(&self, roles: &[String]) -> Vec<String> {
         let mut out: Vec<String> = Vec::new();
         let mut seen: BTreeSet<String> = BTreeSet::new();
@@ -212,18 +236,62 @@ impl SkillCatalog {
             let Some(binding) = self.bindings.get(role) else {
                 continue;
             };
-            for skill_id in &binding.enabled_skills {
-                let Some(skill) = self.skills.get(skill_id) else {
-                    continue;
-                };
-                for scope in &skill.default_scopes {
-                    if seen.insert(scope.clone()) {
-                        out.push(scope.clone());
-                    }
+            for scope in &binding.scopes {
+                if seen.insert(scope.clone()) {
+                    out.push(scope.clone());
                 }
             }
         }
         out
+    }
+
+    /// The legacy union of a binding's enabled-skill `default_scopes` — the pre-`hq-role-scopes`
+    /// derivation `scopes_for_roles` used to run inline. Retained ONLY as the source the one-shot
+    /// migration seeds `RoleBinding::scopes` from; not on any live read path. Walks the enabled
+    /// skills (BTreeSet → alphabetical), then each skill's `default_scopes` (registered order),
+    /// dedup'd first-seen.
+    fn legacy_skill_scope_union(&self, binding: &RoleBinding) -> Vec<String> {
+        let mut out: Vec<String> = Vec::new();
+        let mut seen: BTreeSet<String> = BTreeSet::new();
+        for skill_id in &binding.enabled_skills {
+            let Some(skill) = self.skills.get(skill_id) else {
+                continue;
+            };
+            for scope in &skill.default_scopes {
+                if seen.insert(scope.clone()) {
+                    out.push(scope.clone());
+                }
+            }
+        }
+        out
+    }
+
+    /// One-shot, idempotent migration to `RoleBinding::scopes` (`hq-role-scopes`): for every role
+    /// whose `scopes` are still empty, emit a `RoleScopesSet` seeding them with the union of its
+    /// enabled skills' `default_scopes` (the legacy derivation) — so a `scopes_for_roles` direct read
+    /// keeps resolving the same grants after the decouple, with zero loss of access.
+    ///
+    /// Idempotent by construction: a role with a non-empty `scopes` (already migrated, or explicitly
+    /// set by an operator) is skipped, and a role with no enabled skills contributes nothing. Applying
+    /// the returned events twice is a no-op on the second pass. The caller persists the events into
+    /// the workspace `skills.*` log and applies them, so replay reconstructs the seeded state.
+    pub fn role_scopes_migration(&self, now_secs: u64) -> Vec<SkillEvent> {
+        let mut events = Vec::new();
+        for binding in self.bindings.values() {
+            if !binding.scopes.is_empty() {
+                continue; // already migrated or operator-set — never clobber
+            }
+            let scopes = self.legacy_skill_scope_union(binding);
+            if scopes.is_empty() {
+                continue; // a role with no scope-bearing skills has nothing to seed
+            }
+            events.push(SkillEvent::RoleScopesSet {
+                role: binding.role.clone(),
+                scopes,
+                now_secs,
+            });
+        }
+        events
     }
 
     // -- mutation helpers (the only writers, consulted by both `commands::execute`
@@ -265,6 +333,16 @@ impl SkillCatalog {
             .entry(role.to_string())
             .or_insert_with(|| RoleBinding::new(role))
             .model_config = config;
+    }
+
+    pub(crate) fn apply_set_role_scopes(&mut self, role: &str, scopes: &[String]) {
+        // Materialise the binding on first scopes-set so a role can carry scopes before any skill —
+        // symmetric with `apply_set_role_prompt` / `apply_set_role_model`. A scalar overwrite: the
+        // event carries the full intended set (the editor PUTs the whole list), not a delta.
+        self.bindings
+            .entry(role.to_string())
+            .or_insert_with(|| RoleBinding::new(role))
+            .scopes = scopes.to_vec();
     }
 
     pub(crate) fn apply_disable(&mut self, role: &str, skill: &str) {
@@ -339,6 +417,9 @@ impl SkillState {
                         effort: effort.clone(),
                     },
                 );
+            }
+            SkillEvent::RoleScopesSet { role, scopes, .. } => {
+                self.catalog.apply_set_role_scopes(role, scopes);
             }
         }
     }
@@ -527,6 +608,13 @@ mod tests {
             now_secs: 4,
         });
 
+        // hq-role-scopes: `scopes_for_roles` now reads `RoleBinding::scopes` directly, so the legacy
+        // skill-union must be seeded onto each binding first — exactly what the boot/migration seam
+        // does. Replaying the emitted `RoleScopesSet` events lands the same grants on the bindings.
+        for ev in s.catalog.role_scopes_migration(5) {
+            s.apply(&ev);
+        }
+
         // Single-role lookup hits alpha only.
         assert_eq!(
             s.catalog.scopes_for_roles(&["deacon".into()]),
@@ -545,6 +633,84 @@ mod tests {
         );
         // Unknown role → empty contribution.
         assert!(s.catalog.scopes_for_roles(&["ghost".into()]).is_empty());
+    }
+
+    fn registered(skill: &str, scopes: &[&str], now: u64) -> SkillEvent {
+        SkillEvent::Registered {
+            skill: skill.into(),
+            label: skill.into(),
+            description: String::new(),
+            default_scopes: scopes.iter().map(|s| (*s).to_string()).collect(),
+            body: String::new(),
+            group: String::new(),
+            now_secs: now,
+        }
+    }
+
+    fn enabled(role: &str, skill: &str, now: u64) -> SkillEvent {
+        SkillEvent::EnabledForRole {
+            role: role.into(),
+            skill: skill.into(),
+            now_secs: now,
+        }
+    }
+
+    #[test]
+    fn role_scopes_migration_seeds_legacy_union_idempotently_with_no_access_loss() {
+        // hq-role-scopes: the one-shot migration seeds `RoleBinding::scopes` from each role's
+        // enabled-skill `default_scopes` union, so the now-direct `scopes_for_roles` read keeps the
+        // exact pre-decouple grants. The two trigger cases: the polecat's phantom `memory-access`
+        // permission-bucket skill, and the mayor's operator-enabled skills.
+        let mut s = SkillState::default();
+        s.apply(&registered(
+            "memory-access",
+            &["memory.read", "memory.write"],
+            1,
+        ));
+        s.apply(&registered("graph-view", &["graph.read"], 2));
+        s.apply(&registered("notify", &["notifications.write"], 3));
+        s.apply(&registered("ws-member", &["workspace.member"], 4));
+        s.apply(&enabled("polecat", "memory-access", 5));
+        s.apply(&enabled("mayor", "graph-view", 6));
+        s.apply(&enabled("mayor", "notify", 7));
+        s.apply(&enabled("mayor", "ws-member", 8));
+
+        // Pre-migration: scopes are decoupled from skills, so a direct read is empty until seeded.
+        assert!(s.catalog.scopes_for_roles(&["polecat".into()]).is_empty());
+
+        let events = s.catalog.role_scopes_migration(10);
+        assert_eq!(events.len(), 2, "one RoleScopesSet per role with scope-bearing skills");
+        for ev in &events {
+            s.apply(ev);
+        }
+
+        // No access loss: the polecat keeps memory.read/write; the mayor keeps its three scopes
+        // (enabled_skills is a BTreeSet → graph-view, notify, ws-member alphabetical).
+        assert_eq!(
+            s.catalog.scopes_for_roles(&["polecat".into()]),
+            vec!["memory.read".to_string(), "memory.write".to_string()]
+        );
+        assert_eq!(
+            s.catalog.role_scopes("mayor"),
+            vec![
+                "graph.read".to_string(),
+                "notifications.write".to_string(),
+                "workspace.member".to_string(),
+            ]
+        );
+
+        // Idempotent: a second pass emits nothing — already-set scopes are never clobbered.
+        assert!(s.catalog.role_scopes_migration(11).is_empty());
+
+        // Decoupled: enabling a NEW scope-bearing skill no longer widens the role's scopes, and the
+        // already-migrated role is not reseeded. Knowledge ⊥ permission.
+        s.apply(&registered("extra", &["merge.write"], 12));
+        s.apply(&enabled("polecat", "extra", 13));
+        assert!(s.catalog.role_scopes_migration(14).is_empty());
+        assert_eq!(
+            s.catalog.scopes_for_roles(&["polecat".into()]),
+            vec!["memory.read".to_string(), "memory.write".to_string()]
+        );
     }
 
     #[test]

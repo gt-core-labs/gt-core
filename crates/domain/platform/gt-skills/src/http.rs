@@ -42,7 +42,7 @@ use gt_workspace::WorkspaceContext;
 
 use crate::commands::{
     DisableSkillForRole, EnableSkillForRole, RegisterSkill, RetireSkill, SetRoleModel,
-    SetRolePrompt, UpdateSkill,
+    SetRolePrompt, SetRoleScopes, UpdateSkill,
 };
 use crate::events::SkillEvent;
 
@@ -137,6 +137,9 @@ pub fn skills_router(state: SkillsApiState) -> Router {
         // A role's model config (hq-role-model.1): the claude launch levers the terminal stamps for
         // a session of that role. PUT ⇒ skills.write.
         .route("/roles/:role/model", axum::routing::put(set_role_model))
+        // A role's gt-rbac scopes (hq-role-scopes): the role's first-class permission set, the third
+        // per-role attribute. PUT ⇒ skills.write; validated against the closed gt_rbac vocabulary.
+        .route("/roles/:role/scopes", axum::routing::put(set_role_scopes))
         .with_state(state)
 }
 
@@ -447,6 +450,47 @@ async fn set_role_model(
     Ok((StatusCode::OK, Json(json!({ "role": cmd.role }))).into_response())
 }
 
+/// `PUT /roles/{role}/scopes` body — the role's gt-rbac scope grants (`hq-role-scopes`). The full
+/// intended set (a scalar overwrite); an empty list clears the grant.
+#[derive(Debug, Deserialize)]
+struct RoleScopesBody {
+    #[serde(default)]
+    scopes: Vec<String>,
+}
+
+/// `PUT /roles/{role}/scopes` — set (or clear) a role's gt-rbac scopes (`skills.write`,
+/// `hq-role-scopes`): the role's first-class permission set, decoupled from its skills (which are now
+/// pure knowledge). Every scope is validated against the closed `gt_rbac` vocabulary, so a typo'd
+/// verb is rejected here rather than discovered as a silent permission hole. Persists
+/// `skills.role-scopes-set.v1`. `422` on a bad role name or an out-of-vocabulary scope.
+#[cfg_attr(feature = "axum", utoipa::path(
+    put, path = "/roles/{role}/scopes",
+    params(("role" = String, Path, description = "Role name")),
+    responses(
+        (status = 200, description = "Role scopes set"),
+        (status = 422, description = "Bad role name or a scope outside the closed gt_rbac vocabulary"),
+        (status = 501, description = "Write surface not enabled"),
+    ),
+))]
+async fn set_role_scopes(
+    State(st): State<SkillsApiState>,
+    ctx: WorkspaceContext,
+    Path(role): Path<String>,
+    Json(body): Json<RoleScopesBody>,
+) -> Result<Response, ApiError> {
+    let writer = st.writer.as_ref().ok_or(ApiError::NotImplemented)?;
+    let ws = ctx.workspace();
+    let mut catalog = st.skills.catalog(ws.as_str()).await?;
+    let cmd = SetRoleScopes {
+        role,
+        scopes: body.scopes,
+        now_secs: now_secs(),
+    };
+    let event = cmd.execute(&mut catalog).map_err(ApiError::from)?;
+    writer.append(ws.as_str(), event).await?;
+    Ok((StatusCode::OK, Json(json!({ "role": cmd.role }))).into_response())
+}
+
 /// `GET /` — every registered skill in the caller's workspace, in sorted order, with the per-role
 /// bindings the dashboard hydrates from.
 #[cfg_attr(feature = "axum", utoipa::path(
@@ -508,7 +552,8 @@ async fn get_skill(
     enable_skill_for_role,
     disable_skill_for_role,
     set_role_prompt,
-    set_role_model
+    set_role_model,
+    set_role_scopes
 ))]
 pub struct ApiDoc;
 

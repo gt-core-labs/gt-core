@@ -2230,6 +2230,7 @@ dependencies = [
  "axum",
  "gt-events",
  "gt-module",
+ "gt-rbac",
  "gt-workspace",
  "schemars 0.8.22",
  "semver",

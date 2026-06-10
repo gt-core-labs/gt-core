@@ -87,6 +87,15 @@ fn lift(e: gt_store_dolt::AppError) -> AppError {
     }
 }
 
+/// Wall-clock seconds for a server-stamped migration event (`hq-role-scopes`). Best-effort: a clock
+/// before the epoch stamps `0`, which is harmless for a one-shot seed.
+fn now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
 /// REST backing for `rig.*` (`gt_rig::WorkspaceRigs`): resolves the caller's workspace
 /// schema through the shared [`WsPools`] cache and hands back a [`PgRigs`] over it — the
 /// same pool + adapter [`RigHandler`](super::rig::RigHandler) dispatches through.
@@ -386,7 +395,7 @@ impl EventLogSkills {
 #[async_trait]
 impl WorkspaceSkills for EventLogSkills {
     async fn catalog(&self, workspace: &str) -> Result<SkillCatalog, AppError> {
-        let state = self
+        let mut state = self
             .log
             .replay_domain(
                 Some(workspace),
@@ -395,6 +404,17 @@ impl WorkspaceSkills for EventLogSkills {
                 SkillState::apply,
             )
             .map_err(lift)?;
+        // hq-role-scopes one-shot migration: seed each role's `scopes` from its enabled-skill
+        // `default_scopes` union, so the now-direct `scopes_for_roles` read keeps the pre-decouple
+        // grants. Durable + idempotent — the events are appended to this tenant's `skills.*` log
+        // exactly once (a migrated binding has non-empty `scopes`, so a later replay's
+        // `role_scopes_migration` yields nothing) and applied here so the returned snapshot is
+        // already seeded. This is the boot/read seam for the operator catalog; the daemon preset and
+        // the terminal mint path seed their own catalogs the same way.
+        for ev in state.catalog.role_scopes_migration(now_secs()) {
+            self.log.append(Some(workspace), ev.clone()).map_err(lift)?;
+            state.apply(&ev);
+        }
         Ok(state.catalog)
     }
 }
@@ -763,6 +783,59 @@ mod tests {
                 .get("graphify")
                 .is_none(),
             "retired skill is gone after replay"
+        );
+    }
+
+    #[tokio::test]
+    async fn skills_catalog_migrates_role_scopes_durably() {
+        // hq-role-scopes: the read seam seeds a role's scopes from its enabled-skill default_scopes
+        // once and DURABLY (the migration appends RoleScopesSet to the log), so scopes_for_roles'
+        // direct read keeps the pre-decouple grants with no access loss — even across a restart.
+        let dir = TempDir::new().unwrap();
+        let log = || Arc::new(EventLog::new(Some(dir.path().to_path_buf())));
+
+        // The phantom permission-bucket skill enabled for the polecat (the trigger case).
+        let writer = EventLogSkills::new(log());
+        writer
+            .append(
+                "acme",
+                SkillEvent::Registered {
+                    skill: "memory-access".into(),
+                    label: "Memory access".into(),
+                    description: String::new(),
+                    default_scopes: vec!["memory.read".into(), "memory.write".into()],
+                    body: String::new(),
+                    group: String::new(),
+                    now_secs: 1,
+                },
+            )
+            .await
+            .unwrap();
+        writer
+            .append(
+                "acme",
+                SkillEvent::EnabledForRole {
+                    role: "polecat".into(),
+                    skill: "memory-access".into(),
+                    now_secs: 2,
+                },
+            )
+            .await
+            .unwrap();
+
+        // First read migrates: the polecat resolves its memory grants via the direct read.
+        let cat = EventLogSkills::new(log()).catalog("acme").await.unwrap();
+        assert_eq!(
+            cat.scopes_for_roles(&["polecat".into()]),
+            vec!["memory.read".to_string(), "memory.write".to_string()]
+        );
+
+        // Durable across a restart: a brand-new provider over the same on-disk log still resolves the
+        // seeded scopes (the RoleScopesSet was persisted, not just applied in memory).
+        let cat2 = EventLogSkills::new(log()).catalog("acme").await.unwrap();
+        assert_eq!(
+            cat2.role_scopes("polecat"),
+            vec!["memory.read".to_string(), "memory.write".to_string()]
         );
     }
 }

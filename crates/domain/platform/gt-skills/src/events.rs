@@ -64,6 +64,17 @@ pub enum SkillEvent {
         effort: String,
         now_secs: u64,
     },
+    /// A role's gt-rbac scope grants were set (`hq-role-scopes`): the role's first-class permission
+    /// set, the third per-role attribute alongside [`RolePromptSet`](Self::RolePromptSet) /
+    /// [`RoleModelSet`](Self::RoleModelSet). `scopes` is the FULL intended set (a scalar overwrite,
+    /// not a delta); an empty `scopes` clears the grant. The write edge validates every entry against
+    /// the closed `gt_rbac` vocabulary before this is emitted. Also the carrier of the one-shot
+    /// migration that seeds a role's scopes from its enabled-skill `default_scopes` at cutover.
+    RoleScopesSet {
+        role: String,
+        scopes: Vec<String>,
+        now_secs: u64,
+    },
 }
 
 impl EventKind for SkillEvent {
@@ -75,6 +86,7 @@ impl EventKind for SkillEvent {
             SkillEvent::DisabledForRole { .. } => "skills.disabled-for-role.v1",
             SkillEvent::RolePromptSet { .. } => "skills.role-prompt-set.v1",
             SkillEvent::RoleModelSet { .. } => "skills.role-model-set.v1",
+            SkillEvent::RoleScopesSet { .. } => "skills.role-scopes-set.v1",
         }
     }
 }

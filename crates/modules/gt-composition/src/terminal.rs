@@ -248,7 +248,7 @@ fn prepare_role_skills(
     // The kickoff fires the role's work on session open (hq-role-kickoff); known once the role is
     // resolved, it rides every return below so claude never opens idle.
     let kickoff = Some(role_kickoff_prompt(&role, workspace));
-    let Ok(state) = log.replay_domain(
+    let Ok(mut state) = log.replay_domain(
         Some(workspace),
         "skills.",
         SkillState::default(),
@@ -260,6 +260,19 @@ fn prepare_role_skills(
             kickoff,
         };
     };
+    // hq-role-scopes one-shot migration: seed each role's `scopes` from its enabled-skill
+    // `default_scopes` union so the per-session token mint below (`scopes_for_roles`) keeps the
+    // role's pre-decouple grants on this direct-replay path (the operator catalog is replayed here,
+    // not through `EventLogSkills`). Durable + idempotent; best-effort — a log append failure just
+    // falls through to the un-seeded snapshot rather than blocking the launch.
+    let migrate_now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    for ev in state.catalog.role_scopes_migration(migrate_now) {
+        let _ = log.append(Some(workspace), ev.clone());
+        state.apply(&ev);
+    }
     let catalog = state.catalog;
     let model = catalog.role_model(&role); // hq-role-model.1 — applies regardless of skills/prompt
     let skill_ids = catalog.skills_for_role(&role);

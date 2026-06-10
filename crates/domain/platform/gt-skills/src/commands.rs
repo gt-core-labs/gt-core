@@ -399,6 +399,46 @@ impl Command for SetRoleModel {
     }
 }
 
+/// Set (or clear) a role's gt-rbac scope grants (`hq-role-scopes`): the role's first-class permission
+/// set, the third per-role attribute alongside [`SetRolePrompt`] / [`SetRoleModel`]. `scopes` is the
+/// FULL intended set (the editor PUTs the whole list); an empty list clears the grant. Like the
+/// sibling setters, the role need not pre-exist — the reducer materialises the binding on first set.
+///
+/// Validation rejects any scope outside the closed `gt_rbac` vocabulary *before* the event is emitted
+/// (`gt_rbac::validate_scopes`), so a typo'd verb never becomes a silent permission hole — the same
+/// write-time gate role CRUD runs.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct SetRoleScopes {
+    pub role: String,
+    /// The gt-rbac scopes (`<resource>.<verb>` or `*`) to grant the role. Order-preserving.
+    #[serde(default)]
+    pub scopes: Vec<String>,
+    pub now_secs: u64,
+}
+
+impl Command for SetRoleScopes {
+    type Output = SkillEvent;
+    type State = SkillCatalog;
+
+    fn validate(&self, _state: &Self::State) -> Result<(), AppError> {
+        validate_role_name(&self.role).map_err(AppError::Validation)?;
+        // Closed-vocabulary gate (mirrors `/auth/roles`): an unknown verb / malformed scope is a
+        // client error, surfaced verbatim so the editor can name the offending entry.
+        gt_rbac::validate_scopes(&self.scopes).map_err(|e| AppError::Validation(e.to_string()))?;
+        Ok(())
+    }
+
+    fn execute(&self, state: &mut Self::State) -> Result<Self::Output, AppError> {
+        self.validate(state)?;
+        state.apply_set_role_scopes(&self.role, &self.scopes);
+        Ok(SkillEvent::RoleScopesSet {
+            role: self.role.clone(),
+            scopes: self.scopes.clone(),
+            now_secs: self.now_secs,
+        })
+    }
+}
+
 /// Tagged union of every command. The HTTP / MCP edge passes one of these into
 /// [`crate::actor::SkillHandle::exec`] without a per-variant fan-out.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -624,6 +664,60 @@ mod tests {
             now_secs: 5,
         };
         assert!(bad_model.validate(&state).is_err());
+    }
+
+    #[test]
+    fn set_role_scopes_stores_clears_and_validates_vocabulary() {
+        // hq-role-scopes: a role's scopes are stored on its binding (materialised on first set), an
+        // empty list clears them, and a scope outside the closed gt_rbac vocabulary is a client error
+        // that never mutates state.
+        let mut state = SkillCatalog::default();
+        let set = SetRoleScopes {
+            role: "polecat".into(),
+            scopes: vec!["memory.read".into(), "memory.write".into()],
+            now_secs: 1,
+        };
+        let ev = set.execute(&mut state).unwrap();
+        assert!(matches!(ev, SkillEvent::RoleScopesSet { .. }));
+        assert_eq!(
+            state.role_scopes("polecat"),
+            vec!["memory.read".to_string(), "memory.write".to_string()]
+        );
+
+        // The wildcard superuser grant is vocabulary-valid.
+        SetRoleScopes {
+            role: "mayor".into(),
+            scopes: vec!["*".into()],
+            now_secs: 2,
+        }
+        .execute(&mut state)
+        .unwrap();
+        assert_eq!(state.role_scopes("mayor"), vec!["*".to_string()]);
+
+        // Clear it: an empty list collapses the grant to none.
+        SetRoleScopes {
+            role: "polecat".into(),
+            scopes: vec![],
+            now_secs: 3,
+        }
+        .execute(&mut state)
+        .unwrap();
+        assert!(state.role_scopes("polecat").is_empty());
+
+        // An unknown verb rejects at validate without mutating.
+        let bad_verb = SetRoleScopes {
+            role: "polecat".into(),
+            scopes: vec!["memory.frobnicate".into()],
+            now_secs: 4,
+        };
+        assert!(bad_verb.validate(&state).is_err());
+        // A bad role name rejects too.
+        let bad_role = SetRoleScopes {
+            role: "has space".into(),
+            scopes: vec!["memory.read".into()],
+            now_secs: 5,
+        };
+        assert!(bad_role.validate(&state).is_err());
     }
 
     #[test]

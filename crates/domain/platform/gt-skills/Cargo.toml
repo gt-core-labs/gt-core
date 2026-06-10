@@ -11,6 +11,9 @@ gt-events = { workspace = true }
 # gt-core module foundation (hq-mod-refactor.14): the `GtModule` trait the skills catalog is
 # wrapped in (`module.rs`).
 gt-module = { workspace = true }
+# Closed-vocabulary scope validation (hq-role-scopes): `SetRoleScopes` rejects any scope outside
+# `gt_rbac`'s vocabulary at write time, the same gate role CRUD runs. Kernel-tier, dependency-light.
+gt-rbac = { workspace = true }
 tokio.workspace = true
 serde.workspace = true
 schemars.workspace = true

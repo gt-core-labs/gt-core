@@ -55,6 +55,14 @@ pub fn agent_least_privilege_catalog() -> SkillCatalog {
     enable(&mut s, "witness", "observe");
     enable(&mut s, "deacon", "observe");
 
+    // hq-role-scopes: a role's scopes are now read from `RoleBinding::scopes`, not derived from its
+    // skills. Seed each role's scopes from its enabled-skill `default_scopes` via the one-shot
+    // migration so the daemon's per-agent token minter (`scopes_for_roles`) resolves the same
+    // least-privilege set it always did.
+    for ev in s.catalog.role_scopes_migration(0) {
+        s.apply(&ev);
+    }
+
     s.catalog
 }
 
@@ -111,6 +119,15 @@ pub fn workspace_seed_events(now: u64) -> Vec<SkillEvent> {
             now_secs: now,
         });
     }
+    // hq-role-scopes: scopes are read from `RoleBinding::scopes`, not derived from skills — so a
+    // fresh workspace must also seed each role's scopes, else a seeded role would have skills but an
+    // empty grant. Replay the register/enable events and append the one-shot migration's
+    // `RoleScopesSet` per role, so the seeded catalog grants each role a working set out of the box.
+    let mut s = SkillState::default();
+    for ev in &events {
+        s.apply(ev);
+    }
+    events.extend(s.catalog.role_scopes_migration(now));
     events
 }
 
