@@ -81,12 +81,45 @@ A clean deploy will come up **missing** these until they are made code/config-dr
 
 | Gap | Today | Bead |
 |---|---|---|
-| **Role prompts + skill bodies + role.scopes** | rewritten via REST in prod (memory `knowledge-prompts-degastown`). Catalog seeds, but the *content/bindings* do not → roles boot with empty/default prompts | hq-greenfield-seeds.2 |
+| ~~Role prompts + skill bodies + role.scopes~~ → **DONE (§4.1)** | was rewritten via REST in prod (memory `knowledge-prompts-degastown`); now a versioned seed | hq-greenfield-seeds.2 |
 | **OAuth/IdP providers** (Google, …) | configured by hand in `/admin/providers` | hq-greenfield-seeds.3 |
 | **GitHub App** | App creation + org installation are manual | hq-greenfield-seeds.3 |
 | **Quota Claude accounts** | onboarded live (per-account `CLAUDE_CONFIG_DIR`) | hq-greenfield-seeds.4 |
 | **Rig catalog** (gt, gt_core, gtweb, gtproxy, gtmcp) | `rig_add` run manually | hq-greenfield-seeds.5 |
 | **Migrations don't reach existing tenants** | rig/0003 altered only `ws_default`; `hq_confiar` lacked `git_connection_ref` → drift-reconcile errored in prod | hq-vcs-connections.13 |
+
+### 4.1 Knowledge seed (hq-greenfield-seeds.2) — DELIVERED
+
+The interactive-role Knowledge — each role's **system prompt**, **model config**, and the
+**`SKILL.md` bodies** its bound skills carry — was curated live in prod (memory
+`knowledge-prompts-degastown`) and did not reproduce on a clean cluster: the catalog seeded only
+empty scope-carriers, so greenfield roles came up with blank prompts and bodyless skills.
+
+It is now a **versioned, idempotent boot seed**:
+
+- **`crates/domain/platform/gt-skills/seeds/knowledge.json`** — the extract, vendored in-repo
+  (role-functional subset: the 14 skills bound to ≥1 role + the 8 roles). Embedded into the binary
+  via `include_str!`, so the seed is orchestrator-agnostic (no external file under k8s).
+- **`presets::workspace_seed_events`** parses it and emits `Registered` (with `body` +
+  `default_scopes` + `group`) + `EnabledForRole` + `RolePromptSet` + `RoleModelSet`, then runs
+  `role_scopes_migration` so each role's scopes **derive** from its bound skills' `default_scopes`
+  (the same values prod resolved — e.g. mayor: `notify-ops`→`notifications.write`,
+  `tracker-ops`→`workspace.member`+`graph.read`). Role scopes are therefore *not* stored per-role.
+- **Idempotent:** the caller (`rest_modules.rs`) seeds only when the workspace catalog `is_empty()`,
+  so it never clobbers a human-curated catalog (no effect on the already-populated prod `default`).
+
+**Regenerate from a live deploy** (when prod's curated Knowledge moves on):
+
+```bash
+# Copy the source workspace's event log out of the running container (compose example):
+docker cp gt-app-mcp-server:/var/lib/gt-core/default /tmp/knowledge-src
+python3 scripts/extract-knowledge-seed.py /tmp/knowledge-src   # rewrites seeds/knowledge.json
+cargo test -p gt-skills --lib presets                          # replay-asserts the seed
+```
+
+**Out of scope for .2:** the 12 unbound `taste-skill`/design-library skills (`brandkit`,
+`design-taste-frontend`, `imagegen-*`, …, ~287 KB) are a curated UI-design catalog bound to no
+role, so they don't affect "functional roles." Seed them separately if a deploy wants that library.
 
 ---
 

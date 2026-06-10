@@ -16,6 +16,11 @@ gt-module = { workspace = true }
 gt-rbac = { workspace = true }
 tokio.workspace = true
 serde.workspace = true
+# Parse the versioned greenfield knowledge seed (`presets::workspace_seed_events`,
+# hq-greenfield-seeds.2) embedded as `seeds/knowledge.json`. On the DEFAULT build path —
+# the daemon's `agent_least_privilege_catalog` and the boot seed both live in `presets` —
+# so it cannot hide behind the `axum` feature.
+serde_json.workspace = true
 schemars.workspace = true
 # `semver::Version` for the module's `ModuleMeta`.
 semver = { workspace = true }
@@ -28,17 +33,15 @@ semver = { workspace = true }
 axum = { workspace = true, optional = true }
 utoipa = { workspace = true, optional = true }
 async-trait = { workspace = true, optional = true }
-serde_json = { workspace = true, optional = true }
 gt-workspace = { workspace = true, optional = true, features = ["axum"] }
 
 [features]
 # Compile the axum REST adapter + OpenAPI spec (`http.rs`) and the route/spec overrides on
 # `SkillsModule`. Off by default — the MCP-only build pulls no HTTP stack; the composition bin
 # enables it to expose the REST surface.
-axum = ["dep:axum", "dep:utoipa", "dep:async-trait", "dep:serde_json", "dep:gt-workspace"]
+axum = ["dep:axum", "dep:utoipa", "dep:async-trait", "dep:gt-workspace"]
 
 [dev-dependencies]
-serde_json.workspace = true
 # Exercise the REST router in-process (hq-web-extras.13): `oneshot` a request and read the
 # response without a live socket. Run with `--features axum` so the adapter + these helpers
 # compile for the contract test.

@@ -12,7 +12,58 @@
 //! `issues.write` authorizes the issues namespace, not literally "only its own bead" — bounding a
 //! polecat to a single bead is a server-side claim check, not expressible in the JWT.
 
+use serde::Deserialize;
+
 use crate::{SkillCatalog, SkillEvent, SkillState};
+
+/// The curated interactive-role Knowledge, extracted from a live workspace's `skills.*` log and
+/// versioned here (`hq-greenfield-seeds.2`). On a greenfield deploy there is no prior state, so this
+/// is what makes the seeded roles *functional* — real `SKILL.md` bodies, per-role system prompts and
+/// model configs — instead of empty scope-carriers. See `docs/ops/greenfield-seeds.md` for how to
+/// regenerate it from a running deploy (replay the workspace's `skills.*` events, role-functional
+/// subset = skills bound to ≥1 role). Embedded as bytes so the seed travels with the binary
+/// (orchestrator-agnostic — no external file under k8s).
+const KNOWLEDGE_SEED_JSON: &str = include_str!("../seeds/knowledge.json");
+
+/// A skill in the versioned seed: the catalog row plus its `SKILL.md` body and scope grant.
+#[derive(Deserialize)]
+struct SeedSkill {
+    id: String,
+    #[serde(default)]
+    label: String,
+    #[serde(default)]
+    description: String,
+    #[serde(default)]
+    group: String,
+    #[serde(default)]
+    default_scopes: Vec<String>,
+    #[serde(default)]
+    body: String,
+}
+
+/// A role in the versioned seed: its system prompt, model config, and enabled-skill bindings. Scopes
+/// are intentionally absent — they derive from the enabled skills' `default_scopes` via
+/// [`SkillCatalog::role_scopes_migration`] at seed time, exactly as the live deploy resolved them.
+#[derive(Deserialize)]
+struct SeedRole {
+    role: String,
+    #[serde(default)]
+    prompt: String,
+    #[serde(default)]
+    model: String,
+    #[serde(default)]
+    permission_mode: String,
+    #[serde(default)]
+    effort: String,
+    #[serde(default)]
+    enabled: Vec<String>,
+}
+
+#[derive(Deserialize)]
+struct KnowledgeSeed {
+    skills: Vec<SeedSkill>,
+    roles: Vec<SeedRole>,
+}
 
 fn register(s: &mut SkillState, id: &str, scopes: &[&str]) {
     s.apply(&SkillEvent::Registered {
@@ -66,63 +117,73 @@ pub fn agent_least_privilege_catalog() -> SkillCatalog {
     s.catalog
 }
 
-/// The canonical INTERACTIVE-session role catalog, as `skills.*` events to seed a fresh workspace's
-/// log at boot (`hq-role-mcp`). Unlike [`agent_least_privilege_catalog`] (the daemon's in-memory
-/// polecat policy), this is event-sourced and operator-overridable via the Knowledge REST surface —
-/// it just guarantees a clean deploy on a new machine gives each role a WORKING least-privilege MCP
-/// grant out of the box, instead of an empty token. The per-role token minter (`terminal.rs`) folds
-/// a role's enabled skills' `default_scopes` into the session's `.gt-config`, which `gt mcp` reads.
+/// The canonical INTERACTIVE-session role Knowledge, as `skills.*` events to seed a fresh workspace's
+/// log at boot (`hq-role-mcp`, `hq-greenfield-seeds.2`). Unlike [`agent_least_privilege_catalog`]
+/// (the daemon's in-memory polecat policy), this is event-sourced and operator-overridable via the
+/// Knowledge REST surface — it just guarantees a clean deploy on a new machine comes up with
+/// *functional* roles out of the box instead of empty tokens and blank prompts.
 ///
-/// Seeded ONLY when the workspace catalog is empty, so it never clobbers a human-curated catalog.
-/// Pure scope-carrier skills (no `SKILL.md` body); a role's grant is the union of its skills' scopes:
-/// - `tracker-ops` → `workspace.member` + `graph.read` — full operate (file + dispatch + graph).
-/// - `merge-ops`   → `merge.read` + `merge.write`.
-/// - `bead-work`   → `issues.read` + `issues.write`.
-/// - `observe`     → `issues.read`.
+/// The content is the versioned extract in [`KNOWLEDGE_SEED_JSON`] (`seeds/knowledge.json`), pulled
+/// from a live deploy — NOT invented here. Each role gets:
+/// - its real `SKILL.md`-bearing skills ([`SkillEvent::Registered`] carries `body` + `default_scopes`),
+/// - its enabled-skill bindings ([`SkillEvent::EnabledForRole`]),
+/// - its system prompt ([`SkillEvent::RolePromptSet`] — the terminal writes it as `<workdir>/CLAUDE.md`),
+/// - its model config ([`SkillEvent::RoleModelSet`] — model + permission-mode + effort the launch stamps).
 ///
-/// Bindings: mayor/sheriff/overseer operate; refinery merges; polecat/dog code beads; witness/deacon
-/// observe. `workspace.member` expands to the operational namespace on MCP (`Scope::from_workspace_
-/// claim`) but never to `workspace.create`, so no seeded role is an admin.
+/// Role scopes are NOT stored per-role: they derive from the enabled skills' `default_scopes` via
+/// [`SkillCatalog::role_scopes_migration`], exactly as the live deploy resolved them (e.g. mayor's
+/// `notify-ops` → `notifications.write`, `tracker-ops` → `workspace.member` + `graph.read`).
+/// `workspace.member` expands to the operational namespace on MCP (`Scope::from_workspace_claim`) but
+/// never to `workspace.create`, so no seeded role is an admin.
+///
+/// Seeded ONLY when the workspace catalog is empty, so it never clobbers a human-curated catalog
+/// (the caller in `rest_modules.rs` gates on `catalog.is_empty()`).
 pub fn workspace_seed_events(now: u64) -> Vec<SkillEvent> {
-    const SKILLS: &[(&str, &[&str])] = &[
-        ("tracker-ops", &["workspace.member", "graph.read"]),
-        ("merge-ops", &["merge.read", "merge.write"]),
-        ("bead-work", &["issues.read", "issues.write"]),
-        ("observe", &["issues.read"]),
-    ];
-    const BINDINGS: &[(&str, &str)] = &[
-        ("mayor", "tracker-ops"),
-        ("sheriff", "tracker-ops"),
-        ("overseer", "tracker-ops"),
-        ("refinery", "merge-ops"),
-        ("polecat", "bead-work"),
-        ("dog", "bead-work"),
-        ("witness", "observe"),
-        ("deacon", "observe"),
-    ];
-    let mut events = Vec::with_capacity(SKILLS.len() + BINDINGS.len());
-    for (id, scopes) in SKILLS {
+    let seed: KnowledgeSeed = serde_json::from_str(KNOWLEDGE_SEED_JSON)
+        .expect("seeds/knowledge.json is a versioned, build-time-checked artifact");
+
+    let mut events = Vec::new();
+    for sk in &seed.skills {
         events.push(SkillEvent::Registered {
-            skill: (*id).to_string(),
-            label: (*id).to_string(),
-            description: String::new(),
-            default_scopes: scopes.iter().map(|x| (*x).to_string()).collect(),
-            body: String::new(),
-            group: String::new(),
+            skill: sk.id.clone(),
+            label: sk.label.clone(),
+            description: sk.description.clone(),
+            default_scopes: sk.default_scopes.clone(),
+            body: sk.body.clone(),
+            group: sk.group.clone(),
             now_secs: now,
         });
     }
-    for (role, skill) in BINDINGS {
-        events.push(SkillEvent::EnabledForRole {
-            role: (*role).to_string(),
-            skill: (*skill).to_string(),
-            now_secs: now,
-        });
+    for r in &seed.roles {
+        for skill in &r.enabled {
+            events.push(SkillEvent::EnabledForRole {
+                role: r.role.clone(),
+                skill: skill.clone(),
+                now_secs: now,
+            });
+        }
+        if !r.prompt.is_empty() {
+            events.push(SkillEvent::RolePromptSet {
+                role: r.role.clone(),
+                prompt: r.prompt.clone(),
+                now_secs: now,
+            });
+        }
+        if !(r.model.is_empty() && r.permission_mode.is_empty() && r.effort.is_empty()) {
+            events.push(SkillEvent::RoleModelSet {
+                role: r.role.clone(),
+                model: r.model.clone(),
+                permission_mode: r.permission_mode.clone(),
+                effort: r.effort.clone(),
+                now_secs: now,
+            });
+        }
     }
-    // hq-role-scopes: scopes are read from `RoleBinding::scopes`, not derived from skills — so a
-    // fresh workspace must also seed each role's scopes, else a seeded role would have skills but an
-    // empty grant. Replay the register/enable events and append the one-shot migration's
-    // `RoleScopesSet` per role, so the seeded catalog grants each role a working set out of the box.
+    // hq-role-scopes: scopes are read from `RoleBinding::scopes`, not derived from skills on the live
+    // read path — so a fresh workspace must also seed each role's scopes, else a seeded role would
+    // have skills but an empty grant. Replay the register/enable events and append the one-shot
+    // migration's `RoleScopesSet` per role (the union of its enabled skills' `default_scopes`), so the
+    // seeded catalog resolves the same grants the live deploy did.
     let mut s = SkillState::default();
     for ev in &events {
         s.apply(ev);
@@ -166,33 +227,64 @@ mod tests {
     }
 
     #[test]
-    fn workspace_seed_grants_each_role_a_working_least_privilege_set() {
-        // Replaying the seed events yields a catalog where every role resolves to a non-empty,
-        // non-wildcard scope set — a fresh deploy operates out of the box (hq-role-mcp).
+    fn workspace_seed_replays_the_curated_knowledge_extract() {
+        // Replaying the versioned seed (`seeds/knowledge.json`) yields a catalog matching the live
+        // deploy it was extracted from: real skill bodies, per-role prompts + models, and scopes that
+        // derive from the bound skills — a greenfield deploy comes up with FUNCTIONAL roles
+        // (hq-greenfield-seeds.2), not empty scope-carriers.
         let mut s = SkillState::default();
         for ev in workspace_seed_events(0) {
             s.apply(&ev);
         }
         let c = s.catalog;
-        // mayor/sheriff/overseer operate via the member grant; never the wildcard.
-        for role in ["mayor", "sheriff", "overseer"] {
-            assert_eq!(
-                scopes(&c, role),
-                vec!["workspace.member", "graph.read"],
-                "{role}"
-            );
-        }
-        assert_eq!(scopes(&c, "refinery"), vec!["merge.read", "merge.write"]);
-        assert_eq!(scopes(&c, "polecat"), vec!["issues.read", "issues.write"]);
-        assert_eq!(scopes(&c, "dog"), vec!["issues.read", "issues.write"]);
-        assert_eq!(scopes(&c, "witness"), vec!["issues.read"]);
-        assert_eq!(scopes(&c, "deacon"), vec!["issues.read"]);
+        let binding = |role: &str| {
+            c.bindings()
+                .into_iter()
+                .find(|b| b.role == role)
+                .unwrap_or_else(|| panic!("seed must bind role `{role}`"))
+        };
+
+        // Scopes derive from the enabled skills' `default_scopes`, exactly as the live deploy resolved
+        // them: notify-ops → notifications.write, tracker-ops → workspace.member + graph.read,
+        // crew-commit → workspace.member, memory-access → memory.{read,write}.
+        assert_eq!(
+            scopes(&c, "mayor"),
+            vec!["notifications.write", "workspace.member", "graph.read"],
+        );
+        assert_eq!(
+            scopes(&c, "polecat"),
+            vec!["workspace.member", "memory.read", "memory.write"],
+        );
+        assert_eq!(scopes(&c, "dog"), vec!["workspace.member"]);
+        assert_eq!(scopes(&c, "refinery"), vec!["workspace.member"]);
+
+        // Every role carries a non-empty system prompt + model config — the functional payload a
+        // greenfield deploy was missing — and a real skill body travels with the catalog.
         for role in [
             "mayor", "sheriff", "overseer", "refinery", "polecat", "dog", "witness", "deacon",
         ] {
-            let sc = scopes(&c, role);
-            assert!(!sc.is_empty(), "{role} must have a grant");
-            assert!(!sc.iter().any(|s| s == "*"), "{role} must not carry '*'");
+            let b = binding(role);
+            assert!(!b.prompt.trim().is_empty(), "{role} must have a prompt");
+            assert!(
+                !b.model_config.is_unset(),
+                "{role} must have a model config"
+            );
+            assert!(
+                !b.enabled_skills.is_empty(),
+                "{role} must have enabled skills"
+            );
+            assert!(
+                !scopes(&c, role).iter().any(|s| s == "*"),
+                "{role} must not carry '*'"
+            );
         }
+        // The bodies are the point of the seed: a known role-bound skill carries its `SKILL.md`.
+        let mayor = binding("mayor");
+        assert!(mayor.enabled_skills.contains("tracker-ops"));
+        let tracker_ops = c.get("tracker-ops").expect("tracker-ops registered");
+        assert!(
+            !tracker_ops.body.trim().is_empty(),
+            "skill bodies must be seeded, not blank"
+        );
     }
 }
