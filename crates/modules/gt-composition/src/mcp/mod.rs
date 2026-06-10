@@ -39,7 +39,7 @@ pub use audit::AuditHandler;
 pub use convoy::ConvoyHandler;
 pub use documents::{DocumentsHandler, PgDocumentsResource};
 pub use eventlog::{EventLog, EventLogIssueSink};
-pub use graph::GraphHandler;
+pub use graph::{GraphHandler, RigProvisioner};
 pub use memory::MemoryHandler;
 pub use merge::MergeHandler;
 pub use notify::NotifyHandler;

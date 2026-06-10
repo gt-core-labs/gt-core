@@ -26,16 +26,17 @@ fn ctx(args: serde_json::Value) -> DomainCtx<'static> {
 
 #[tokio::test]
 async fn full_per_rig_loop_register_stale_refresh_query() {
+    // graph.refresh derives <GT_GRAPH_ROOT>/<ws>/<rig> server-side (no caller repo_dir anymore);
+    // pin the root at a writable temp dir so the no-provisioner path can `create_dir_all` it.
+    let graph_root = TempDir::new().unwrap();
+    std::env::set_var("GT_GRAPH_ROOT", graph_root.path());
     let dir = TempDir::new().unwrap();
     let log = Arc::new(EventLog::new(Some(dir.path().to_path_buf())));
     let h = GraphHandler::new(log.clone(), Arc::new(InMemoryGraphIndexer::new()));
 
-    // 1. ATTACH — deploy edge calls graph.refresh with the fresh checkout.
+    // 1. ATTACH — the deploy edge calls graph.refresh {rig}; the server derives the checkout path.
     let reg = h
-        .dispatch(
-            "graph.refresh",
-            ctx(json!({ "rig": "alpha", "repo_dir": "/repo/alpha" })),
-        )
+        .dispatch("graph.refresh", ctx(json!({ "rig": "alpha" })))
         .await
         .unwrap();
     assert_eq!(reg["ok"], true);

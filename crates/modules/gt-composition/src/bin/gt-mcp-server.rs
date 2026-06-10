@@ -1518,6 +1518,23 @@ async fn build_domain_router(
             }
         }
     };
+    // graph.* server-side provisioner (hq-vcs-connections.4): graph.refresh no longer trusts a
+    // caller `repo_dir`. The handler derives <GT_GRAPH_ROOT>/<ws>/<rig>, resolves the rig's
+    // git_connection_ref → public.vcs_connections, mints a JIT GitHub App installation token, and
+    // clones/fetches the default branch into that managed-volume path before indexing. The vcs
+    // connections live in the GLOBAL public table (the same PgVcsConnections the REST CRUD uses);
+    // the GitHub App client is built only when GT_GITHUB_APP_* is configured (else the provisioner
+    // degrades to indexing whatever already sits at the derived path — the legacy mounted rigs).
+    let graph_provisioner = {
+        let connections: Arc<dyn VcsConnectionRepo> =
+            Arc::new(gt_vcs::PgVcsConnections::new(pool.clone()));
+        let github = match gt_vcs::GithubAppConfig::from_env() {
+            Ok(Some(cfg)) => Some(gt_vcs::GithubAppClient::new(cfg)),
+            Ok(None) => None,
+            Err(e) => panic!("GitHub App config is half-set: {e}"),
+        };
+        gt_composition::mcp::RigProvisioner::new(ws_pools.clone(), connections, github)
+    };
     let router = DomainRouter::new()
         .register(Arc::new(workspace_handler))
         .register(Arc::new(RigHandler::new(ws_pools.clone())))
@@ -1531,12 +1548,13 @@ async fn build_domain_router(
         // notify.* — operator notification channel (hq-notifications): agents write
         // via notify.send; the browser bell polls/streams the same PG table.
         .register(Arc::new(NotifyHandler::new(pool.clone(), event_log.clone())))
-        // graph.* read-only queries (hq-graphrig.10): graphify-backed indexer; the
-        // warden state (replayed from event_log) resolves rig -> repo_dir.
-        .register(Arc::new(GraphHandler::new(
-            event_log.clone(),
-            Arc::new(GraphifyIndexer::new()),
-        )));
+        // graph.* read-only queries (hq-graphrig.10) + server-side refresh (hq-vcs-connections.4):
+        // graphify-backed indexer; the warden state (replayed from event_log) resolves rig ->
+        // repo_dir, and the provisioner clones/fetches from the rig's VCS connection on refresh.
+        .register(Arc::new(
+            GraphHandler::new(event_log.clone(), Arc::new(GraphifyIndexer::new()))
+                .with_provisioner(graph_provisioner),
+        ));
 
     // documents.* dispatch (hq-docs-api.2, docs/11): .md content + binary attachments a model
     // reads as context. The blob store is wired from GT_BLOB_* when set; unset ⇒ md-only

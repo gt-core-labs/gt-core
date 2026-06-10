@@ -11,36 +11,194 @@
 //! rig's `repo_dir`. So a `graph.query` only works for a rig the warden has under
 //! custody (`graphwarden.rig-registered.v1`) — exactly the rigs whose graphs exist.
 //!
+//! Server-side provisioning ([`RigProvisioner`], hq-vcs-connections.4): `graph.refresh`
+//! no longer trusts a caller-supplied `repo_dir` (the footgun behind the inactivas-chain
+//! incident — a caller passed a path from *their* host that did not exist in the container,
+//! so the refresh "succeeded" over an empty/absent checkout with commit `unknown`). The
+//! server now DERIVES the path (`<root>/<ws>/<rig>/`, root = `GT_GRAPH_ROOT` ||
+//! `/var/lib/gt-graph`) and, when a rig is bound to a VCS connection, mints a JIT GitHub App
+//! installation token, clones (or fetches+resets) the rig's `default_branch` into that path,
+//! then indexes — discarding the token. Custody stays keyed by `rig` (default-branch-only; no
+//! `(rig, branch)` dimension). For a rig already under custody whose stored path is dead/stale
+//! (the inactivas-chain case), the handler Unregisters + re-registers it at the derived path so
+//! custody and the build never diverge again.
+//!
 //! Tools (read-only): `graph.query`, `graph.explain`, `graph.status`, `graph.list`.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use async_trait::async_trait;
 use serde_json::{json, Value};
 
 use gt_graphindex::{ensure_ignored, GraphError, GraphIndexer, IndexStats};
-use gt_graphwarden::{MarkRefreshed, RegisterRig, WardenCommand, WardenState};
+use gt_graphwarden::{MarkRefreshed, RegisterRig, Unregister, WardenCommand, WardenState};
 use gt_mcp_server::{DomainCtx, DomainHandler};
 use gt_module::McpTool;
+use gt_rig::{PgRigs, RigEntry, RigRepository};
 use gt_store_dolt::AppError;
+use gt_vcs::{ConnectionStatus, GithubAppClient, VcsConnectionRepo};
 
 use super::eventlog::EventLog;
-use super::util::{descriptor, now_secs, opt, req, str_arg};
+use super::pools::WsPools;
+use super::util::{descriptor, now_secs, req, str_arg};
 
 /// The warden event-log kind prefix the handler replays to resolve rigs.
 const NS: &str = "graphwarden.";
+
+/// The workspace a refresh resolves to for the derived path when the request carries no
+/// workspace — the single-tenant default (mirrors `WsPools`' `DEFAULT_WORKSPACE`).
+const DEFAULT_WORKSPACE: &str = "default";
+
+/// Default root the server clones rig checkouts under. A managed Docker volume
+/// (`gt-graph-rigs:/var/lib/gt-graph`) is mounted here on the gt-mcp-server — NEVER a host
+/// bind-mount (epic decision). Overridable via `GT_GRAPH_ROOT` for tests / alternate deploys.
+const GRAPH_ROOT_DEFAULT: &str = "/var/lib/gt-graph";
+
+/// The configured graph-checkout root: `GT_GRAPH_ROOT` if set, else [`GRAPH_ROOT_DEFAULT`].
+fn graph_root() -> PathBuf {
+    std::env::var("GT_GRAPH_ROOT")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| PathBuf::from(GRAPH_ROOT_DEFAULT))
+}
+
+/// Server-side rig checkout provisioner (hq-vcs-connections.4).
+///
+/// Resolves a rig to its VCS connection, mints a JIT installation token, and clones/fetches the
+/// rig's default branch into the server-derived path — so the warden indexes a real checkout the
+/// server controls, never a caller-named path. Optional on [`GraphHandler`]: without it (or
+/// without a GitHub App configured / a rig bound to a connection) the handler falls back to
+/// indexing whatever already exists at the derived path (the legacy operator-mounted rigs).
+#[derive(Clone)]
+pub struct RigProvisioner {
+    /// Per-workspace pool cache — the rig catalog (`ws_<slug>.rigs`) is per-tenant.
+    pools: Arc<WsPools>,
+    /// The GLOBAL `public.vcs_connections` store (one repo serves every tenant; rows carry
+    /// `workspace_id`).
+    connections: Arc<dyn VcsConnectionRepo>,
+    /// The platform GitHub App client used to mint installation tokens. `None` when no App is
+    /// configured — provisioning then degrades to "index whatever is on disk".
+    github: Option<GithubAppClient>,
+}
+
+impl RigProvisioner {
+    /// Wire the provisioner from the same parts the binary already holds.
+    pub fn new(
+        pools: Arc<WsPools>,
+        connections: Arc<dyn VcsConnectionRepo>,
+        github: Option<GithubAppClient>,
+    ) -> Self {
+        Self {
+            pools,
+            connections,
+            github,
+        }
+    }
+
+    /// Fetch the rig catalog entry for `rig` in `ws`.
+    async fn rig_entry(&self, ws: Option<&str>, rig: &str) -> Result<RigEntry, AppError> {
+        let pool = self.pools.get(ws).await?;
+        let repo = PgRigs::new(pool.pool().clone());
+        repo.get(rig)
+            .await
+            .map_err(domain_err)?
+            .ok_or_else(|| AppError::NotFound(format!("rig `{rig}` not in the catalog")))
+    }
+
+    /// Provision the on-disk checkout for `rig` at the derived `path`: if the rig is bound to an
+    /// active GitHub App connection, mint a JIT token and clone (absent) or fetch+reset (present)
+    /// its `default_branch`. The token lives only for the duration of the git command and is
+    /// dropped. A rig without a connection (legacy / public) is left to whatever is already on disk.
+    async fn provision(&self, ws: Option<&str>, rig: &str, path: &Path) -> Result<(), AppError> {
+        let entry = self.rig_entry(ws, rig).await?;
+        let Some(conn_ref) = entry.git_connection_ref.as_deref() else {
+            // No VCS connection bound — legacy operator-mounted / public-repo path. Index in place.
+            return Ok(());
+        };
+        let Some(github) = &self.github else {
+            return Err(AppError::Validation(format!(
+                "rig `{rig}` is bound to a VCS connection but no GitHub App is configured \
+                 (set GT_GITHUB_APP_* on the server)"
+            )));
+        };
+        let conn = self
+            .connections
+            .get_for_workspace(ws.unwrap_or(DEFAULT_WORKSPACE), conn_ref)
+            .await
+            .map_err(domain_err)?
+            .ok_or_else(|| {
+                AppError::NotFound(format!(
+                    "rig `{rig}` references VCS connection `{conn_ref}` not visible to this workspace"
+                ))
+            })?;
+        if conn.status != ConnectionStatus::Active {
+            return Err(AppError::Validation(format!(
+                "VCS connection `{conn_ref}` for rig `{rig}` is not active ({})",
+                conn.status.as_str()
+            )));
+        }
+        let installation_id = conn.installation_id.clone().ok_or_else(|| {
+            AppError::Validation(format!(
+                "VCS connection `{conn_ref}` has no installation_id (PAT fallback not yet \
+                 supported in the clone path)"
+            ))
+        })?;
+        let (owner, repo_name) = split_git_url(&entry.git_url).ok_or_else(|| {
+            AppError::Validation(format!(
+                "cannot derive owner/repo from rig `{rig}` git_url `{}`",
+                entry.git_url
+            ))
+        })?;
+
+        // Mint the JIT token, run the git command with it embedded, then drop it — never stored.
+        let token = github
+            .installation_token(&installation_id)
+            .await
+            .map_err(domain_err)?;
+        let clone_url = token.clone_url(&owner, &repo_name);
+        let branch = &entry.default_branch;
+        let has_checkout = path.join(".git").is_dir();
+        if has_checkout {
+            fetch_reset(path, &clone_url, branch)?;
+        } else {
+            clone_branch(&clone_url, branch, path)?;
+        }
+        drop(token);
+        Ok(())
+    }
+}
 
 /// Read-only handler for the `graph.*` tool namespace.
 pub struct GraphHandler {
     log: Arc<EventLog>,
     indexer: Arc<dyn GraphIndexer>,
+    /// Server-side checkout provisioner. `None` in tests / minimal deploys; the handler then
+    /// indexes whatever sits at the derived path.
+    provisioner: Option<RigProvisioner>,
 }
 
 impl GraphHandler {
-    /// Wrap the per-workspace event log + the active graph indexer.
+    /// Wrap the per-workspace event log + the active graph indexer, with no provisioner (the
+    /// derived path is indexed as-is). Used by tests and minimal deploys.
     pub fn new(log: Arc<EventLog>, indexer: Arc<dyn GraphIndexer>) -> Self {
-        Self { log, indexer }
+        Self {
+            log,
+            indexer,
+            provisioner: None,
+        }
+    }
+
+    /// Attach the server-side [`RigProvisioner`] so `graph.refresh` clones/fetches from the rig's
+    /// VCS connection before indexing.
+    pub fn with_provisioner(mut self, provisioner: RigProvisioner) -> Self {
+        self.provisioner = Some(provisioner);
+        self
+    }
+
+    /// The server-DERIVED checkout path for `rig` in `ws`: `<GRAPH_ROOT>/<ws>/<rig>`. This is the
+    /// single source of truth for both custody and the build — never a caller-supplied path.
+    fn derived_path(ws: Option<&str>, rig: &str) -> PathBuf {
+        graph_root().join(ws.unwrap_or(DEFAULT_WORKSPACE)).join(rig)
     }
 
     /// Replay the warden events for `ws` into a fresh [`WardenState`].
@@ -70,6 +228,46 @@ impl GraphHandler {
             self.log.append(ws, ev)?;
         }
         Ok(())
+    }
+
+    /// Bring custody for `rig` into agreement with the server-derived `path` and register it if
+    /// absent. The custody record (used by `graph.query`/`status`/`list`) and the build MUST point
+    /// at the SAME derived path — the inactivas-chain incident left a rig under custody at a dead
+    /// caller path while a later build wrote elsewhere. If the stored `repo_dir` diverges from
+    /// `path`, Unregister + re-register cleanly at the derived path (custody stays keyed by `rig`).
+    fn ensure_custody(&self, ws: Option<&str>, rig: &str, path: &Path) -> Result<(), AppError> {
+        let derived = path.to_string_lossy().into_owned();
+        let state = self.warden(ws)?;
+        match state.rigs.get(rig) {
+            Some(g) if g.repo_dir == derived => Ok(()),
+            Some(_) => {
+                // Poisoned custody (a dead/old path from the caller-repo_dir era): drop it and
+                // re-register at the derived path so the next read resolves the real checkout.
+                self.warden_apply(
+                    ws,
+                    WardenCommand::Unregister(Unregister {
+                        rig: rig.to_string(),
+                        now_secs: now_secs(),
+                    }),
+                )?;
+                self.warden_apply(
+                    ws,
+                    WardenCommand::Register(RegisterRig {
+                        rig: rig.to_string(),
+                        repo_dir: derived,
+                        now_secs: now_secs(),
+                    }),
+                )
+            }
+            None => self.warden_apply(
+                ws,
+                WardenCommand::Register(RegisterRig {
+                    rig: rig.to_string(),
+                    repo_dir: derived,
+                    now_secs: now_secs(),
+                }),
+            ),
+        }
     }
 
     /// Ensure-ignore, build-or-update `repo`'s graph, and record the refresh on the warden
@@ -120,9 +318,105 @@ fn head_commit(repo: &std::path::Path) -> String {
         .unwrap_or_else(|| "unknown".to_string())
 }
 
+/// Derive `(owner, repo)` from a rig's `git_url`, accepting both the SSH (`git@github.com:owner/
+/// repo.git`) and HTTPS (`https://github.com/owner/repo.git`) spellings. `.git` and a trailing
+/// slash are trimmed. `None` when no `owner/repo` pair can be read.
+fn split_git_url(git_url: &str) -> Option<(String, String)> {
+    let url = git_url.trim();
+    // Strip the scheme/host prefix down to the `owner/repo[.git]` tail.
+    let tail = if let Some(rest) = url.strip_prefix("git@") {
+        // git@github.com:owner/repo.git -> owner/repo.git
+        rest.split_once(':').map(|(_, p)| p)?
+    } else if let Some(rest) = url.strip_prefix("https://") {
+        // https://github.com/owner/repo.git -> owner/repo.git
+        rest.split_once('/').map(|(_, p)| p)?
+    } else if let Some(rest) = url.strip_prefix("http://") {
+        rest.split_once('/').map(|(_, p)| p)?
+    } else if let Some(rest) = url.strip_prefix("ssh://") {
+        // ssh://git@github.com/owner/repo.git -> owner/repo.git
+        let after_host = rest.split_once('/').map(|(_, p)| p)?;
+        after_host
+    } else {
+        url
+    };
+    let tail = tail.trim_end_matches('/').trim_end_matches(".git");
+    let (owner, repo) = tail.rsplit_once('/')?;
+    // owner may itself carry a leading host segment for ssh:// (host/owner/repo) — keep the last.
+    let owner = owner.rsplit('/').next().unwrap_or(owner);
+    if owner.is_empty() || repo.is_empty() {
+        return None;
+    }
+    Some((owner.to_string(), repo.to_string()))
+}
+
+/// `git clone --branch <branch> --single-branch <url> <path>` (the token is embedded in `url`).
+/// The parent dir is created first so a fresh managed volume works on the first refresh.
+fn clone_branch(url: &str, branch: &str, path: &Path) -> Result<(), AppError> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| AppError::Other(format!("create graph checkout root {parent:?}: {e}")))?;
+    }
+    let out = std::process::Command::new("git")
+        .args(["clone", "--branch", branch, "--single-branch"])
+        .arg(url)
+        .arg(path)
+        .output()
+        .map_err(|e| AppError::Other(format!("git clone spawn failed: {e}")))?;
+    if !out.status.success() {
+        // Never echo the URL (it carries the token); only git's stderr.
+        return Err(AppError::Other(format!(
+            "git clone of branch `{branch}` failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        )));
+    }
+    Ok(())
+}
+
+/// Refresh an existing checkout to `origin/<branch>`: set the remote (token-bearing URL), fetch,
+/// then `reset --hard`. Idempotent — discards any local drift so the graph reflects the remote.
+fn fetch_reset(path: &Path, url: &str, branch: &str) -> Result<(), AppError> {
+    // Point `origin` at the freshly-minted token URL (a stale token from a prior clone would be
+    // baked into the remote otherwise).
+    run_git(path, &["remote", "set-url", "origin", url])?;
+    run_git(path, &["fetch", "--prune", "origin", branch])?;
+    run_git(path, &["reset", "--hard", &format!("origin/{branch}")])?;
+    Ok(())
+}
+
+/// Run `git -C <path> <args>`; map a non-zero exit to [`AppError::Other`] (without echoing the
+/// arguments, which may carry the token URL).
+fn run_git(path: &Path, args: &[&str]) -> Result<(), AppError> {
+    let out = std::process::Command::new("git")
+        .arg("-C")
+        .arg(path)
+        .args(args)
+        .output()
+        .map_err(|e| AppError::Other(format!("git spawn failed: {e}")))?;
+    if !out.status.success() {
+        let verb = args.first().copied().unwrap_or("git");
+        return Err(AppError::Other(format!(
+            "git {verb} failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        )));
+    }
+    Ok(())
+}
+
 /// Map a `gt_events::AppError` (warden command path) onto the server error type.
 fn ev_err(e: gt_events::AppError) -> AppError {
     AppError::Validation(e.to_string())
+}
+
+/// Map a `gt_events::AppError` from a domain port (rig catalog / vcs connections / GitHub client)
+/// onto the server error type, PRESERVING the variant so a missing rig stays `NotFound`, a bad
+/// connection stays `Validation`, and a backend fault stays `Other`.
+fn domain_err(e: gt_events::AppError) -> AppError {
+    match e {
+        gt_events::AppError::NotFound(m) => AppError::NotFound(m),
+        gt_events::AppError::Validation(m) => AppError::Validation(m),
+        gt_events::AppError::InvalidTransition(m) => AppError::InvalidTransition(m),
+        other => AppError::Other(other.to_string()),
+    }
 }
 
 /// Map an indexer failure onto the MCP-server error type.
@@ -158,8 +452,9 @@ impl DomainHandler for GraphHandler {
             ),
             descriptor(
                 "graph.refresh",
-                "Rebuild a rig's knowledge graph; optionally over an explicit repo_dir.",
-                &[req("rig", "string"), opt("repo_dir", "string")],
+                "Clone/fetch a rig from its VCS connection (server-derived path) and rebuild its \
+                 knowledge graph.",
+                &[req("rig", "string")],
             ),
             descriptor(
                 "graph.refresh-stale",
@@ -209,38 +504,29 @@ impl DomainHandler for GraphHandler {
                 }))
             }
             "graph.refresh" => {
-                // The custodian's write trigger: register the rig (first time, given a
-                // repo_dir), ensure its artifacts are ignored, build-or-update the graph,
-                // and record the refresh. Idempotent — re-running updates in place.
+                // The custodian's write trigger. The server DERIVES the checkout path (no caller
+                // repo_dir — that footgun caused the inactivas-chain incident): provision the
+                // checkout from the rig's VCS connection (clone/fetch+reset the default branch),
+                // align custody with the derived path, build-or-update the graph, record the
+                // refresh. Idempotent — re-running fetch+resets and updates in place.
                 let rig = str_arg(&ctx.args, "rig")?;
-                let state = self.warden(ws)?;
-                // repo_dir from the arg (first registration) or the existing custody record.
-                let repo: PathBuf = match ctx.args.get("repo_dir").and_then(|v| v.as_str()) {
-                    Some(d) => PathBuf::from(d),
-                    None => state
-                        .rigs
-                        .get(rig)
-                        .map(|g| PathBuf::from(&g.repo_dir))
-                        .ok_or_else(|| {
-                            AppError::Validation(format!(
-                                "rig `{rig}` not under custody — pass repo_dir to register it"
-                            ))
-                        })?,
-                };
-                if !state.rigs.contains_key(rig) {
-                    self.warden_apply(
-                        ws,
-                        WardenCommand::Register(RegisterRig {
-                            rig: rig.to_string(),
-                            repo_dir: repo.to_string_lossy().into_owned(),
-                            now_secs: now_secs(),
-                        }),
-                    )?;
+                let repo = Self::derived_path(ws, rig);
+                if let Some(provisioner) = &self.provisioner {
+                    provisioner.provision(ws, rig, &repo).await?;
+                } else {
+                    // No provisioner (tests / minimal deploy): still create the dir so a build over
+                    // an empty checkout does not fail spuriously, then index in place.
+                    std::fs::create_dir_all(&repo).map_err(|e| {
+                        AppError::Other(format!("create derived checkout {repo:?}: {e}"))
+                    })?;
                 }
+                // Custody + build point at the SAME derived path (poisoned custody is re-pointed).
+                self.ensure_custody(ws, rig, &repo)?;
                 let (commit, stats) = self.refresh_one(ws, rig, &repo).await?;
                 Ok(json!({
                     "ok": true,
                     "rig": rig,
+                    "repo_dir": repo.to_string_lossy(),
                     "commit": commit,
                     "nodes": stats.nodes,
                     "edges": stats.edges,
@@ -249,16 +535,24 @@ impl DomainHandler for GraphHandler {
             }
             "graph.refresh-stale" => {
                 // The custodian's batch tick: refresh every rig currently marked stale. A
-                // loop/cron invokes this; `graph.agent.backend` is who runs the loop.
+                // loop/cron invokes this; `graph.agent.backend` is who runs the loop. Each stale
+                // rig is re-provisioned from its connection at the server-derived path (the stored
+                // repo_dir is authoritative — it already equals the derived path after a prior
+                // refresh).
                 let state = self.warden(ws)?;
-                let stale: Vec<(String, PathBuf)> = state
+                let stale: Vec<String> = state
                     .rigs
                     .values()
                     .filter(|g| g.stale)
-                    .map(|g| (g.rig.clone(), PathBuf::from(&g.repo_dir)))
+                    .map(|g| g.rig.clone())
                     .collect();
                 let mut refreshed = Vec::new();
-                for (rig, repo) in stale {
+                for rig in stale {
+                    let repo = Self::derived_path(ws, &rig);
+                    if let Some(provisioner) = &self.provisioner {
+                        provisioner.provision(ws, &rig, &repo).await?;
+                    }
+                    self.ensure_custody(ws, &rig, &repo)?;
                     let (commit, stats) = self.refresh_one(ws, &rig, &repo).await?;
                     refreshed.push(json!({ "rig": rig, "commit": commit, "nodes": stats.nodes }));
                 }
@@ -299,6 +593,45 @@ mod tests {
             actor: "tester",
             args,
         }
+    }
+
+    /// Pin `GT_GRAPH_ROOT` at a temp dir so the derived path is writable in tests (the production
+    /// default `/var/lib/gt-graph` is not). Returns the guard dir; the env var is process-global so
+    /// these tests share the one root and key by rig name.
+    fn pin_graph_root() -> TempDir {
+        let dir = TempDir::new().unwrap();
+        std::env::set_var("GT_GRAPH_ROOT", dir.path());
+        dir
+    }
+
+    #[test]
+    fn split_git_url_ssh_and_https() {
+        assert_eq!(
+            split_git_url("git@github.com:codecsrayo/inactivas-chain.git"),
+            Some(("codecsrayo".into(), "inactivas-chain".into()))
+        );
+        assert_eq!(
+            split_git_url("https://github.com/codecsrayo/inactivas-chain.git"),
+            Some(("codecsrayo".into(), "inactivas-chain".into()))
+        );
+        assert_eq!(
+            split_git_url("https://github.com/acme/repo"),
+            Some(("acme".into(), "repo".into()))
+        );
+        assert_eq!(
+            split_git_url("ssh://git@github.com/acme/repo.git"),
+            Some(("acme".into(), "repo".into()))
+        );
+        assert_eq!(split_git_url("not-a-url"), None);
+    }
+
+    #[test]
+    fn derived_path_is_root_ws_rig() {
+        let _g = pin_graph_root();
+        let p = GraphHandler::derived_path(Some("confiar"), "inactivas-chain");
+        assert!(p.ends_with("confiar/inactivas-chain"));
+        let d = GraphHandler::derived_path(None, "hq");
+        assert!(d.ends_with("default/hq"));
     }
 
     /// Seed the workspace log with a rig under custody, then query/list/status it.
@@ -347,28 +680,32 @@ mod tests {
         assert_eq!(st["tool"], "inmemory");
     }
 
-    /// `graph.refresh` registers a fresh rig, builds it, marks it fresh — then it is
-    /// queryable and listed as not-stale.
+    /// `graph.refresh` (no provisioner, no repo_dir arg) derives the path, registers the rig at it,
+    /// builds, marks it fresh — then it is queryable and listed as not-stale at the derived path.
     #[tokio::test]
-    async fn refresh_registers_builds_and_marks_fresh() {
+    async fn refresh_derives_path_registers_builds_and_marks_fresh() {
+        let root = pin_graph_root();
         let dir = TempDir::new().unwrap();
         let log = Arc::new(EventLog::new(Some(dir.path().to_path_buf())));
         let h = GraphHandler::new(log, Arc::new(InMemoryGraphIndexer::new()));
 
-        // First refresh registers the rig (needs repo_dir) and builds the graph.
         let out = h
-            .dispatch(
-                "graph.refresh",
-                ctx(json!({ "rig": "alpha", "repo_dir": "/repo/alpha" })),
-            )
+            .dispatch("graph.refresh", ctx(json!({ "rig": "alpha" })))
             .await
             .unwrap();
         assert_eq!(out["ok"], true);
         assert_eq!(out["rig"], "alpha");
+        // The custody/build path is the server-derived one under the pinned root.
+        let expected = root.path().join("default").join("alpha");
+        assert_eq!(out["repo_dir"], expected.to_string_lossy().as_ref());
 
-        // Now listed, not stale (just refreshed).
+        // Now listed, not stale (just refreshed), at the derived path.
         let list = h.dispatch("graph.list", ctx(json!({}))).await.unwrap();
         assert_eq!(list["rigs"][0]["stale"], false);
+        assert_eq!(
+            list["rigs"][0]["repo_dir"],
+            expected.to_string_lossy().as_ref()
+        );
 
         // And queryable (the graph now exists).
         let q = h
@@ -380,7 +717,7 @@ mod tests {
             .unwrap();
         assert!(q["text"].is_string());
 
-        // Second refresh without repo_dir resolves it from custody and updates in place.
+        // Second refresh resolves the derived path again and updates in place.
         let again = h
             .dispatch("graph.refresh", ctx(json!({ "rig": "alpha" })))
             .await
@@ -388,20 +725,42 @@ mod tests {
         assert_eq!(again["ok"], true);
     }
 
-    /// Refreshing an unregistered rig without a repo_dir is rejected.
+    /// A rig already under custody at a DEAD path (the inactivas-chain case) is re-pointed cleanly
+    /// to the server-derived path on the next refresh — custody and build never diverge again.
     #[tokio::test]
-    async fn refresh_unregistered_without_repo_dir_is_rejected() {
+    async fn refresh_repoints_poisoned_custody_to_derived_path() {
+        let root = pin_graph_root();
         let dir = TempDir::new().unwrap();
         let log = Arc::new(EventLog::new(Some(dir.path().to_path_buf())));
+        // Pre-existing poisoned custody: a path from someone's host that does not exist here.
+        log.append(
+            None,
+            WardenEvent::RigRegistered {
+                rig: "inactivas-chain".into(),
+                repo_dir: "/home/brayan.rayo/compose/inactivas-chain".into(),
+                now_secs: 1,
+            },
+        )
+        .unwrap();
         let h = GraphHandler::new(log, Arc::new(InMemoryGraphIndexer::new()));
-        let err = h
-            .dispatch("graph.refresh", ctx(json!({ "rig": "ghost" })))
+
+        let out = h
+            .dispatch("graph.refresh", ctx(json!({ "rig": "inactivas-chain" })))
             .await
-            .unwrap_err();
-        assert!(matches!(err, AppError::Validation(_)));
+            .unwrap();
+        let expected = root.path().join("default").join("inactivas-chain");
+        assert_eq!(out["repo_dir"], expected.to_string_lossy().as_ref());
+
+        // Custody now points at the derived path, not the dead one.
+        let list = h.dispatch("graph.list", ctx(json!({}))).await.unwrap();
+        assert_eq!(list["rigs"].as_array().unwrap().len(), 1);
+        assert_eq!(
+            list["rigs"][0]["repo_dir"],
+            expected.to_string_lossy().as_ref()
+        );
     }
 
-    /// A rig the warden never registered has no custody → NotFound.
+    /// A rig the warden never registered has no custody → NotFound on read.
     #[tokio::test]
     async fn query_unknown_rig_is_not_found() {
         let dir = TempDir::new().unwrap();
