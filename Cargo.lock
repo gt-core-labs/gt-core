@@ -1940,6 +1940,7 @@ dependencies = [
  "axum",
  "gt-module",
  "gt-module-mcp",
+ "gt-rbac",
  "gt-store-dolt",
  "mysql_async",
  "schemars 0.8.22",

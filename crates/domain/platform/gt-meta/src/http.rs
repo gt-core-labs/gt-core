@@ -84,6 +84,7 @@ impl MetaApiState {
 pub fn meta_router(state: MetaApiState) -> Router {
     Router::new()
         .route("/help", get(help))
+        .route("/scopes", get(scopes))
         .route("/report-gap", post(report_gap))
         .with_state(state)
 }
@@ -97,6 +98,28 @@ pub fn meta_router(state: MetaApiState) -> Router {
 ))]
 async fn help(State(st): State<MetaApiState>) -> Json<Value> {
     Json(json!({ "tools": st.tools.as_ref() }))
+}
+
+/// `GET /scopes` — the **grantable scope catalog** (`hq-scope-catalog`): every `<namespace>.<verb>`
+/// scope a token may be granted, derived from the closed `gt_rbac::SCOPE_VERBS` vocabulary crossed
+/// with the namespaces the server advertises. The namespaces come from the SAME carried tool
+/// descriptors `meta.help` serves (`name.split('.').next()`), so a newly-registered MCP namespace
+/// (e.g. `memory`) appears here with no code change — the token-permission UI reads `{ scope, label,
+/// namespace }` instead of hardcoding a `SCOPE_LABELS` map. A pure read, no state change.
+#[cfg_attr(feature = "axum", utoipa::path(
+    get, path = "/scopes",
+    responses((status = 200, description = "The grantable scope catalog: [{ scope, label, namespace }] over SCOPE_VERBS × registered namespaces")),
+))]
+async fn scopes(State(st): State<MetaApiState>) -> Json<Value> {
+    // Namespace = the resource segment of each advertised tool name (the part before the first `.`).
+    // A name with no `.` (e.g. the unauthenticated `ping`) carries no namespace and is skipped.
+    let namespaces = st.tools.iter().filter_map(|t| {
+        let ns = t.name.split('.').next().unwrap_or("");
+        (t.name.contains('.') && !ns.is_empty()).then_some(ns)
+    });
+    // gt_rbac sorts + de-duplicates the namespaces and crosses them with the closed verb set.
+    let catalog = gt_rbac::grantable_scopes(namespaces);
+    Json(json!({ "scopes": catalog }))
 }
 
 /// `POST /report-gap` — surface a missing operation (`meta.report-gap.execute`):
@@ -122,7 +145,7 @@ async fn report_gap(
 /// The builder mounts it under the module prefix and rewrites its relative paths to
 /// `/api/v1/meta/...`, so the `#[utoipa::path]` annotations stay prefix-free.
 #[derive(utoipa::OpenApi)]
-#[openapi(paths(help, report_gap))]
+#[openapi(paths(help, scopes, report_gap))]
 pub struct ApiDoc;
 
 /// HTTP wrapper over the domain [`AppError`] so a handler can `?`-propagate it and
@@ -160,7 +183,7 @@ mod tests {
         // nesting can rewrite them. Every declared route must be present.
         let doc = ApiDoc::openapi();
         let paths: Vec<&str> = doc.paths.paths.keys().map(String::as_str).collect();
-        for expected in ["/help", "/report-gap"] {
+        for expected in ["/help", "/scopes", "/report-gap"] {
             assert!(paths.contains(&expected), "missing {expected} in {paths:?}");
         }
         // Prefix-free: the module builder, not the annotation, owns `/api/v1/meta`.

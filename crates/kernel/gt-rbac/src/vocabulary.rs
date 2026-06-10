@@ -18,6 +18,8 @@
 //! role's scopes, so a typo is rejected at write time rather than discovered as a silent
 //! permission hole at request time.
 
+use serde::Serialize;
+
 use crate::error::AppError;
 
 /// The wildcard superuser grant — every scope, every tool. Accepted by [`validate_scope`]
@@ -42,6 +44,59 @@ pub const SCOPE_VERBS: &[&str] = &[
 /// True when `verb` is in the closed [`SCOPE_VERBS`] set.
 pub fn is_known_verb(verb: &str) -> bool {
     SCOPE_VERBS.contains(&verb)
+}
+
+/// One grantable scope in the discovery catalog (`hq-scope-catalog`): a `<namespace>.<verb>` scope
+/// with a human label and its owning namespace. Serializes to `{ "scope", "label", "namespace" }` —
+/// the wire shape the token-permission UI consumes so it stops hardcoding a `SCOPE_LABELS` map.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ScopeCatalogEntry {
+    /// The grantable scope string, `<namespace>.<verb>` (always [`validate_scope`]-valid).
+    pub scope: String,
+    /// A human-readable label. Default-derived `<Verb> <namespace>` (e.g. `"Read memory"`); the
+    /// backend is the single source, so a new namespace gets a label with no UI edit.
+    pub label: String,
+    /// The owning namespace (the scope's resource segment).
+    pub namespace: String,
+}
+
+/// Capitalize the first ASCII letter of a verb for the default label (`"read"` → `"Read"`). Verbs
+/// are lowercase ASCII slugs by construction, so this is a single-byte uppercase.
+fn capitalize_verb(verb: &str) -> String {
+    let mut chars = verb.chars();
+    match chars.next() {
+        Some(first) => first.to_ascii_uppercase().to_string() + chars.as_str(),
+        None => String::new(),
+    }
+}
+
+/// Build the **grantable scope catalog** (`hq-scope-catalog`): the cross product of the closed
+/// [`SCOPE_VERBS`] vocabulary with the given registered `namespaces`, one [`ScopeCatalogEntry`] per
+/// `<namespace>.<verb>`. This is the catalog the `GET /meta/scopes` endpoint serves, derived from the
+/// SOURCE OF TRUTH (the verb set here × the namespaces the router advertises) so a newly-registered
+/// MCP namespace appears with no code change at the endpoint and no duplicated label map downstream.
+///
+/// `namespaces` is sorted + de-duplicated (empties dropped) first, so the catalog is deterministic
+/// regardless of input order. Each entry's label is the default `<Verb> <namespace>`; a caller that
+/// has a richer per-scope description (e.g. a tool descriptor) may overwrite `label` afterward.
+pub fn grantable_scopes<'a, I>(namespaces: I) -> Vec<ScopeCatalogEntry>
+where
+    I: IntoIterator<Item = &'a str>,
+{
+    let mut ns: Vec<&str> = namespaces.into_iter().filter(|n| !n.is_empty()).collect();
+    ns.sort_unstable();
+    ns.dedup();
+    let mut out = Vec::with_capacity(ns.len() * SCOPE_VERBS.len());
+    for namespace in ns {
+        for verb in SCOPE_VERBS {
+            out.push(ScopeCatalogEntry {
+                scope: format!("{namespace}.{verb}"),
+                label: format!("{} {namespace}", capitalize_verb(verb)),
+                namespace: namespace.to_string(),
+            });
+        }
+    }
+    out
 }
 
 /// A non-empty lowercase kebab-case slug: `[a-z0-9]+` groups joined by single `-`, with no
@@ -177,5 +232,28 @@ mod tests {
     fn bulk_validation_short_circuits_on_the_first_bad_scope() {
         validate_scopes(["beads.read", "merge.submit", "*"]).unwrap();
         assert!(validate_scopes(["beads.read", "beads.nope"]).is_err());
+    }
+
+    #[test]
+    fn grantable_scopes_crosses_verbs_with_namespaces_sorted_deduped() {
+        // hq-scope-catalog: the catalog is the cross product of SCOPE_VERBS × namespaces, derived —
+        // not hand-enumerated. Input order/dups don't matter (sorted + deduped).
+        let cat = grantable_scopes(["memory", "issues", "memory", ""]);
+        // The empty namespace is dropped; the two real ones each get every verb.
+        assert_eq!(cat.len(), 2 * SCOPE_VERBS.len());
+        // Every produced scope is vocabulary-valid by construction.
+        for e in &cat {
+            validate_scope(&e.scope).unwrap();
+        }
+        // A domain namespace (memory) appears with a backend-derived default label — the exact
+        // failure that left `memory.read` out of the FE until someone hand-edited SCOPE_LABELS.
+        let mem_read = cat
+            .iter()
+            .find(|e| e.scope == "memory.read")
+            .expect("memory.read in the catalog");
+        assert_eq!(mem_read.label, "Read memory");
+        assert_eq!(mem_read.namespace, "memory");
+        // Deterministic order: issues (sorted first) before memory.
+        assert_eq!(cat.first().unwrap().namespace, "issues");
     }
 }

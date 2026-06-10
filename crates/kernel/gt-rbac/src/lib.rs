@@ -16,5 +16,6 @@ pub use config::{ActorSpec, Reach, RbacConfig, RoleSpec, WebGrant};
 pub use error::AppError;
 pub use scope::{ResolveScope, Scope, WORKSPACE_ADMIN, WORKSPACE_MEMBER};
 pub use vocabulary::{
-    is_known_verb, validate_scope, validate_scopes, SCOPE_VERBS, SCOPE_WILDCARD,
+    grantable_scopes, is_known_verb, validate_scope, validate_scopes, ScopeCatalogEntry,
+    SCOPE_VERBS, SCOPE_WILDCARD,
 };

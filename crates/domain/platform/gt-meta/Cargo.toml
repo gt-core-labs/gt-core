@@ -24,13 +24,16 @@ schemars = { workspace = true }
 axum = { workspace = true, optional = true }
 utoipa = { workspace = true, optional = true }
 gt-store-dolt = { workspace = true, optional = true }
+# Closed scope vocabulary (hq-scope-catalog): `GET /meta/scopes` derives the grantable scope catalog
+# from `gt_rbac::SCOPE_VERBS` × the registered namespaces. Pulled only with the REST adapter.
+gt-rbac = { workspace = true, optional = true }
 
 [features]
 # Compile the axum REST adapter + OpenAPI spec (`http.rs`), the transport-free
 # gap-minting handler (`handlers.rs`), and the route/spec-bearing `MetaHttpModule`.
 # Off by default — the descriptor-only build pulls no HTTP stack and no store; the
 # composition bin enables it to expose the REST surface.
-axum = ["dep:axum", "dep:utoipa", "dep:gt-store-dolt"]
+axum = ["dep:axum", "dep:utoipa", "dep:gt-store-dolt", "dep:gt-rbac"]
 
 [dev-dependencies]
 # Exercise the REST router in-process (hq-fe-api-platform.4): `oneshot` a request

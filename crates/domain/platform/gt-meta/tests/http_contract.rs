@@ -78,6 +78,45 @@ async fn help_echoes_the_carried_tools_in_mcp_shape() {
     assert_eq!(listed[1]["inputSchema"]["properties"]["id"]["type"], "string");
 }
 
+#[tokio::test]
+async fn scopes_derives_the_grantable_catalog_from_advertised_tool_namespaces() {
+    // hq-scope-catalog: GET /scopes derives the grantable catalog from SCOPE_VERBS × the namespaces
+    // of the SAME carried tool descriptors meta.help serves — via the real router. A domain namespace
+    // (memory) appears without anyone hand-enumerating it; the unauthenticated `ping` (no namespace)
+    // is skipped.
+    let tools = vec![
+        McpTool::new("meta.help.execute", "self-description"),
+        McpTool::new("memory.save.execute", "save a memory"),
+        McpTool::new("issues.create.execute", "create a bead"),
+        McpTool::new("ping", "readiness probe"),
+    ];
+    let app = meta_router(MetaApiState::new(unconnected_store(), "test-actor", tools));
+
+    let (status, body) = send(&app, get("/scopes")).await;
+    assert_eq!(status, StatusCode::OK);
+    let listed = body["scopes"].as_array().expect("scopes array");
+
+    let scope_strings: Vec<&str> = listed
+        .iter()
+        .map(|e| e["scope"].as_str().expect("scope string"))
+        .collect();
+    // The memory namespace surfaces read+write (the regression case) without a hand-written map.
+    assert!(scope_strings.contains(&"memory.read"), "{scope_strings:?}");
+    assert!(scope_strings.contains(&"memory.write"), "{scope_strings:?}");
+    // issues + meta natives are in too; the dot-less `ping` is not a namespace.
+    assert!(scope_strings.contains(&"issues.read"));
+    assert!(scope_strings.contains(&"meta.read"));
+    assert!(!scope_strings.iter().any(|s| s.starts_with("ping.")), "ping has no namespace");
+
+    // Each entry carries the backend-derived label + namespace the UI consumes.
+    let mem_read = listed
+        .iter()
+        .find(|e| e["scope"] == "memory.read")
+        .expect("memory.read entry");
+    assert_eq!(mem_read["label"], "Read memory");
+    assert_eq!(mem_read["namespace"], "memory");
+}
+
 /// Create a throwaway DB so a `report-gap` roundtrip never shares a table with a
 /// parallel run, then return a router over a freshly-schema'd store on it.
 async fn router_on_fresh_db(base: &str, db: &str) -> axum::Router {
