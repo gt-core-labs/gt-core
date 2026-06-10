@@ -62,7 +62,7 @@ use gt_docs_embed::Embedder;
 use gt_docs_extract::Extractor;
 use gt_graphindex::GraphifyIndexer;
 use gt_store_blob::BlobStore;
-use gt_store_pg::{schema_for, PgMemory, WorkspacePool};
+use gt_store_pg::{schema_for, WorkspacePool};
 use sqlx::Row;
 // Domain REST modules + their `with_http` state (hq-fe-api-mount.1): the bin mounts each
 // crate's `register_routes` so the FE reaches every namespace over authenticated HTTP.
@@ -1413,16 +1413,10 @@ async fn build_domain_router(
     // memory.* dispatch (hq-memory-mcp.4): the durable, named semantic-memory store an
     // agent writes once and recalls BY MEANING. Mirror of documents.* — PG-backed,
     // gated on GT_PG_URL, and riding the SAME shared embedder so a `memory.save` embeds
-    // over the one fastembed engine documents already loaded. The repo binds the default
-    // tenant pool (`ws_default.memories`), the single-tenant default this server serves.
-    let memory_pool = ws_pools
-        .get(None)
-        .await
-        .context("connect default workspace pool for memory.*")?;
-    let router = router.register(Arc::new(MemoryHandler::new(
-        Arc::new(PgMemory::new(memory_pool)),
-        embedder,
-    )));
+    // over the one fastembed engine documents already loaded. It HOLDS the per-workspace
+    // pool cache and resolves `ws_<slug>.memories` per-request from the caller's tenant
+    // (hq-memory-admin.4), exactly like documents.* — no longer bound to `ws_default`.
+    let router = router.register(Arc::new(MemoryHandler::new(ws_pools.clone(), embedder)));
     eprintln!(
         "[gt-mcp-server] domain namespaces: {:?}",
         router.namespaces()

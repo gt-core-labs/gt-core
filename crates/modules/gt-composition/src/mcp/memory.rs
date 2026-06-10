@@ -31,8 +31,9 @@ use gt_mcp_server::{DomainCtx, DomainHandler};
 use gt_memory::MemoryKind;
 use gt_module::McpTool;
 use gt_store_dolt::AppError;
-use gt_store_pg::{MemoryError, MemoryRepository, MemoryRow, NewMemory};
+use gt_store_pg::{MemoryError, MemoryRepository, MemoryRow, NewMemory, PgMemory};
 
+use super::pools::WsPools;
 use super::util::{descriptor, opt, req, str_arg};
 
 /// The `feedback` recall class: the hard operating rules `recall` always returns in full.
@@ -41,9 +42,15 @@ const FEEDBACK: &str = "feedback";
 /// Default `recall` window for the relevance-ranked (non-feedback) tail.
 const DEFAULT_LIMIT: i64 = 10;
 
-/// Repository- (+ optional embedder-) backed handler for the `memory.*` tool namespace.
+/// PG-backed handler for the `memory.*` tool namespace.
+///
+/// Mirror of [`DocumentsHandler`](super::documents::DocumentsHandler): it HOLDS the
+/// per-workspace pool cache and resolves the tenant's [`PgMemory`] repository
+/// **per-request** from `ctx.workspace`, rather than binding a single pre-resolved repo.
+/// Without this, every `memory.*` call would hit `ws_default.memories` regardless of the
+/// caller's tenant (hq-memory-admin.4).
 pub struct MemoryHandler {
-    repo: Arc<dyn MemoryRepository>,
+    pools: Arc<WsPools>,
     /// Optional semantic-search engine. `Some` ⇒ memories are embedded on `save` and
     /// `recall` uses the hybrid (text + vector) path; `None` ⇒ full-text only. An embed
     /// failure degrades to full-text rather than erroring (mirror of `documents`).
@@ -51,14 +58,22 @@ pub struct MemoryHandler {
 }
 
 impl MemoryHandler {
-    /// Wire the per-workspace memory repository and the optional embedding engine.
-    pub fn new(repo: Arc<dyn MemoryRepository>, embedder: Option<Arc<dyn Embedder>>) -> Self {
-        Self { repo, embedder }
+    /// Wire the per-workspace pool cache and the optional embedding engine. The repository
+    /// is resolved per-request in [`dispatch`](Self::dispatch) from the caller's workspace.
+    pub fn new(pools: Arc<WsPools>, embedder: Option<Arc<dyn Embedder>>) -> Self {
+        Self { pools, embedder }
+    }
+
+    /// Resolve the tenant-scoped memory repository for the caller's workspace (mirror of
+    /// `DocumentsHandler::repo`). The pool's `search_path` targets `ws_<slug>.memories`.
+    async fn repo(&self, ws: Option<&str>) -> Result<PgMemory, AppError> {
+        Ok(PgMemory::new(self.pools.get(ws).await?))
     }
 
     /// `memory.save`: upsert by name, then best-effort embed. The embed never gates the
     /// write — a missing/failing embedder just leaves this row out of the vector index.
-    async fn save(&self, cmd: SaveArgs) -> Result<Value, AppError> {
+    async fn save(&self, ws: Option<&str>, cmd: SaveArgs) -> Result<Value, AppError> {
+        let repo = self.repo(ws).await?;
         let new = NewMemory {
             name: cmd.name.clone(),
             description: cmd.description.clone(),
@@ -66,7 +81,7 @@ impl MemoryHandler {
             body: cmd.body.clone(),
             created_by: cmd.created_by,
         };
-        let row = self.repo.upsert(new).await.map_err(mem_err)?;
+        let row = repo.upsert(new).await.map_err(mem_err)?;
         // Best-effort embedding over name + description + body (mirror of
         // `DocumentsHandler::embed_doc`): a missing embedder or an embed/store failure is
         // silently skipped; the save already succeeded.
@@ -74,7 +89,7 @@ impl MemoryHandler {
             let text = format!("{} {} {}", cmd.name, cmd.description, cmd.body);
             if !text.trim().is_empty() {
                 if let Ok(vec) = emb.embed(&text).await {
-                    let _ = self.repo.set_embedding(&cmd.name, vec).await;
+                    let _ = repo.set_embedding(&cmd.name, vec).await;
                 }
             }
         }
@@ -84,28 +99,26 @@ impl MemoryHandler {
     /// `memory.recall`: the full `feedback` rule set fused with the relevance-ranked top-k
     /// of everything else (or of the requested `kind`), deduplicated by `name`. See the
     /// module docs for why feedback is unconditional.
-    async fn recall(&self, cmd: RecallArgs) -> Result<Value, AppError> {
+    async fn recall(&self, ws: Option<&str>, cmd: RecallArgs) -> Result<Value, AppError> {
+        let repo = self.repo(ws).await?;
         // The hard operating rules — always returned in full, regardless of the query.
-        let mut out = self.repo.by_kind(FEEDBACK).await.map_err(mem_err)?;
+        let mut out = repo.by_kind(FEEDBACK).await.map_err(mem_err)?;
 
         // The relevance-ranked tail: hybrid when an embedder is wired and the embed
         // succeeds, else full-text. An embed failure degrades to full-text, never errors.
         let kind = cmd.kind.as_deref();
         let ranked = match &self.embedder {
             Some(emb) => match emb.embed(&cmd.query).await {
-                Ok(vec) => self
-                    .repo
+                Ok(vec) => repo
                     .recall_hybrid(&cmd.query, &vec, kind, cmd.limit)
                     .await
                     .map_err(mem_err)?,
-                Err(_) => self
-                    .repo
+                Err(_) => repo
                     .recall(&cmd.query, kind, cmd.limit)
                     .await
                     .map_err(mem_err)?,
             },
-            None => self
-                .repo
+            None => repo
                 .recall(&cmd.query, kind, cmd.limit)
                 .await
                 .map_err(mem_err)?,
@@ -176,17 +189,21 @@ impl DomainHandler for MemoryHandler {
         match tool {
             "memory.save" => {
                 let cmd = SaveArgs::parse(&ctx)?;
-                self.save(cmd).await
+                self.save(ctx.workspace, cmd).await
             }
             "memory.recall" => {
                 let cmd = RecallArgs::parse(&ctx)?;
-                self.recall(cmd).await
+                self.recall(ctx.workspace, cmd).await
             }
             "memory.list" => {
+                // Validate the optional kind BEFORE touching the pool so a bad `kind` is a
+                // pure validation error (no tenant connection needed).
+                let kind = parse_opt_kind(&ctx)?;
+                let repo = self.repo(ctx.workspace).await?;
                 // `by_kind` when a (validated) kind is given, else the whole tenant.
-                let rows = match parse_opt_kind(&ctx)? {
-                    Some(kind) => self.repo.by_kind(kind.as_str()).await.map_err(mem_err)?,
-                    None => self.repo.list().await.map_err(mem_err)?,
+                let rows = match kind {
+                    Some(kind) => repo.by_kind(kind.as_str()).await.map_err(mem_err)?,
+                    None => repo.list().await.map_err(mem_err)?,
                 };
                 Ok(json!({
                     "count": rows.len(),
@@ -194,8 +211,9 @@ impl DomainHandler for MemoryHandler {
                 }))
             }
             "memory.forget" => {
+                let repo = self.repo(ctx.workspace).await?;
                 let name = str_arg(&ctx.args, "name")?;
-                self.repo.forget(name).await.map_err(mem_err)?;
+                repo.forget(name).await.map_err(mem_err)?;
                 Ok(json!({ "ok": true, "name": name, "forgotten": true }))
             }
             other => Err(AppError::Validation(format!("unknown memory tool `{other}`"))),
@@ -301,133 +319,36 @@ fn mem_json(m: &MemoryRow) -> Value {
 
 #[cfg(test)]
 mod tests {
+    //! Two test tiers, mirroring the multi-tenant `documents.*` shape:
+    //!
+    //! 1. **Pure-validation tests** (always run): namespace, the four advertised tools in
+    //!    `meta.help`, invalid-kind rejection, and unknown-tool routing. These short-circuit
+    //!    *before* any pool is resolved (kind is parsed ahead of `self.repo(...)` on every
+    //!    arm, and the unknown-tool arm never touches the pool), so a `WsPools` over a dummy
+    //!    URL that is never dialed suffices.
+    //!
+    //! 2. **PG-backed behavioral tests** (gated on `GT_PG_URL`, skipped otherwise): the
+    //!    end-to-end save→recall, feedback-union+dedup, list-by-kind, and idempotent-forget
+    //!    semantics — the part that needs a real `ws_<slug>.memories` table. The handler now
+    //!    HOLDS `WsPools` and resolves `PgMemory` per-request, so (exactly like
+    //!    `DocumentsHandler`, which has no unit tests for the same reason) these can no longer
+    //!    inject an in-memory fake repo; they run against the same Postgres the
+    //!    `memory_contract.rs` adapter test uses. Each test namespaces its rows by a nonce so
+    //!    parallel/repeat runs don't collide.
     use super::*;
-    use std::collections::HashMap;
-    use std::sync::Mutex;
 
-    use sqlx::types::chrono::Utc;
+    /// The default workspace slug the per-request pool resolves to in tests.
+    const WS: Option<&str> = Some("default");
 
-    /// An in-memory `MemoryRepository` fake — no Postgres. Keyed by `name`; `recall`/
-    /// `recall_hybrid` do a naive substring match over name+description+body so the
-    /// dispatch logic (the feedback union, dedup, kind filter) is exercised end to end.
-    #[derive(Default)]
-    struct FakeMemory {
-        rows: Mutex<HashMap<String, MemoryRow>>,
-        embeddings: Mutex<HashMap<String, Vec<f32>>>,
-    }
-
-    impl FakeMemory {
-        fn seed(&self, name: &str, kind: &str, text: &str) {
-            self.rows.lock().unwrap().insert(
-                name.to_string(),
-                MemoryRow {
-                    name: name.to_string(),
-                    description: text.to_string(),
-                    kind: kind.to_string(),
-                    body: text.to_string(),
-                    version: 0,
-                    created_by: "seed".into(),
-                    updated_at: Utc::now(),
-                },
-            );
-        }
-
-        fn matches(&self, query: &str, kind: Option<&str>, limit: i64) -> Vec<MemoryRow> {
-            let rows = self.rows.lock().unwrap();
-            let mut hits: Vec<MemoryRow> = rows
-                .values()
-                .filter(|r| kind.is_none_or(|k| r.kind == k))
-                .filter(|r| {
-                    let hay = format!("{} {} {}", r.name, r.description, r.body).to_lowercase();
-                    hay.contains(&query.to_lowercase())
-                })
-                .cloned()
-                .collect();
-            hits.sort_by(|a, b| a.name.cmp(&b.name));
-            hits.truncate(limit as usize);
-            hits
-        }
-    }
-
-    #[async_trait]
-    impl MemoryRepository for FakeMemory {
-        async fn upsert(&self, mem: NewMemory) -> Result<MemoryRow, MemoryError> {
-            let mut rows = self.rows.lock().unwrap();
-            let version = rows.get(&mem.name).map(|r| r.version + 1).unwrap_or(0);
-            let row = MemoryRow {
-                name: mem.name.clone(),
-                description: mem.description,
-                kind: mem.kind,
-                body: mem.body,
-                version,
-                created_by: mem.created_by,
-                updated_at: Utc::now(),
-            };
-            rows.insert(mem.name, row.clone());
-            Ok(row)
-        }
-        async fn get(&self, name: &str) -> Result<Option<MemoryRow>, MemoryError> {
-            Ok(self.rows.lock().unwrap().get(name).cloned())
-        }
-        async fn by_kind(&self, kind: &str) -> Result<Vec<MemoryRow>, MemoryError> {
-            let mut v: Vec<MemoryRow> = self
-                .rows
-                .lock()
-                .unwrap()
-                .values()
-                .filter(|r| r.kind == kind)
-                .cloned()
-                .collect();
-            v.sort_by(|a, b| a.name.cmp(&b.name));
-            Ok(v)
-        }
-        async fn list(&self) -> Result<Vec<MemoryRow>, MemoryError> {
-            let mut v: Vec<MemoryRow> =
-                self.rows.lock().unwrap().values().cloned().collect();
-            v.sort_by(|a, b| a.name.cmp(&b.name));
-            Ok(v)
-        }
-        async fn recall(
-            &self,
-            query: &str,
-            kind: Option<&str>,
-            limit: i64,
-        ) -> Result<Vec<MemoryRow>, MemoryError> {
-            Ok(self.matches(query, kind, limit))
-        }
-        async fn set_embedding(
-            &self,
-            name: &str,
-            embedding: Vec<f32>,
-        ) -> Result<(), MemoryError> {
-            self.embeddings
-                .lock()
-                .unwrap()
-                .insert(name.to_string(), embedding);
-            Ok(())
-        }
-        async fn recall_hybrid(
-            &self,
-            query: &str,
-            _query_embedding: &[f32],
-            kind: Option<&str>,
-            limit: i64,
-        ) -> Result<Vec<MemoryRow>, MemoryError> {
-            Ok(self.matches(query, kind, limit))
-        }
-        async fn forget(&self, name: &str) -> Result<(), MemoryError> {
-            self.rows.lock().unwrap().remove(name);
-            Ok(())
-        }
-    }
-
+    /// A handler over a pool cache that is never dialed — for the validation tests that
+    /// short-circuit before resolving a pool. The URL is intentionally bogus.
     fn handler() -> MemoryHandler {
-        MemoryHandler::new(Arc::new(FakeMemory::default()), None)
+        MemoryHandler::new(Arc::new(WsPools::new("postgres://unused")), None)
     }
 
     fn ctx(args: Value) -> DomainCtx<'static> {
         DomainCtx {
-            workspace: Some("default"),
+            workspace: WS,
             actor: "tester",
             args,
         }
@@ -452,97 +373,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn save_then_recall_returns_the_row() {
-        let h = handler();
-        h.dispatch(
-            "memory.save",
-            ctx(json!({
-                "name": "use-https",
-                "description": "always prefer https",
-                "kind": "project",
-                "body": "never call plain http endpoints",
-            })),
-        )
-        .await
-        .unwrap();
-        let out = h
-            .dispatch("memory.recall", ctx(json!({ "query": "https" })))
-            .await
-            .unwrap();
-        assert_eq!(out["count"], 1);
-        assert_eq!(out["memories"][0]["name"], "use-https");
-        assert_eq!(out["memories"][0]["version"], 0);
-    }
-
-    #[tokio::test]
-    async fn recall_always_includes_feedback_rules_and_dedups() {
-        let repo = Arc::new(FakeMemory::default());
-        repo.seed("verify-build", "feedback", "run cargo test before commit");
-        repo.seed("naming", "project", "use kebab-case for slugs");
-        let h = MemoryHandler::new(repo, None);
-
-        // A query that only matches the `project` note must STILL return the feedback rule.
-        let out = h
-            .dispatch("memory.recall", ctx(json!({ "query": "kebab" })))
-            .await
-            .unwrap();
-        let names: Vec<&str> = out["memories"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .map(|m| m["name"].as_str().unwrap())
-            .collect();
-        assert!(names.contains(&"verify-build"), "feedback rule must always surface");
-        assert!(names.contains(&"naming"));
-        assert_eq!(out["count"], 2);
-
-        // And a query that ALSO matches the feedback rule must not duplicate it.
-        let out = h
-            .dispatch("memory.recall", ctx(json!({ "query": "cargo" })))
-            .await
-            .unwrap();
-        assert_eq!(out["count"], 1, "feedback row must appear exactly once");
-    }
-
-    #[tokio::test]
-    async fn list_filters_by_kind() {
-        let repo = Arc::new(FakeMemory::default());
-        repo.seed("a", "feedback", "x");
-        repo.seed("b", "project", "y");
-        let h = MemoryHandler::new(repo, None);
-        let out = h
-            .dispatch("memory.list", ctx(json!({ "kind": "project" })))
-            .await
-            .unwrap();
-        assert_eq!(out["count"], 1);
-        assert_eq!(out["memories"][0]["name"], "b");
-        // No kind ⇒ everything.
-        let out = h.dispatch("memory.list", ctx(json!({}))).await.unwrap();
-        assert_eq!(out["count"], 2);
-    }
-
-    #[tokio::test]
-    async fn forget_is_idempotent() {
-        let repo = Arc::new(FakeMemory::default());
-        repo.seed("gone", "project", "x");
-        let h = MemoryHandler::new(repo, None);
-        let out = h
-            .dispatch("memory.forget", ctx(json!({ "name": "gone" })))
-            .await
-            .unwrap();
-        assert_eq!(out["forgotten"], true);
-        // Deleting an absent memory still succeeds.
-        let out = h
-            .dispatch("memory.forget", ctx(json!({ "name": "missing" })))
-            .await
-            .unwrap();
-        assert_eq!(out["forgotten"], true);
-    }
-
-    #[tokio::test]
     async fn invalid_kind_is_rejected() {
         let h = handler();
-        // On save.
+        // On save — `SaveArgs::parse` validates before any pool is touched.
         let err = h
             .dispatch(
                 "memory.save",
@@ -552,12 +385,12 @@ mod tests {
             )
             .await;
         assert!(matches!(err, Err(AppError::Validation(_))));
-        // On recall's optional kind.
+        // On recall's optional kind — likewise validated in `RecallArgs::parse`.
         let err = h
             .dispatch("memory.recall", ctx(json!({ "query": "q", "kind": "nope" })))
             .await;
         assert!(matches!(err, Err(AppError::Validation(_))));
-        // On list's optional kind.
+        // On list's optional kind — `parse_opt_kind` runs ahead of `self.repo(...)`.
         let err = h
             .dispatch("memory.list", ctx(json!({ "kind": "nope" })))
             .await;
@@ -571,5 +404,182 @@ mod tests {
             h.dispatch("memory.bogus", ctx(json!({}))).await,
             Err(AppError::Validation(_))
         ));
+    }
+
+    // ----- PG-backed behavioral tier (gated on GT_PG_URL) ---------------------------------
+
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    use gt_store_pg::{memory_migrations, WorkspacePool};
+
+    /// Unique suffix so parallel/repeat runs against the same ephemeral DB never collide.
+    fn nonce() -> u128 {
+        SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos()
+    }
+
+    /// Provision the `ws_default` `memories` table (idempotent migrations, serialized by an
+    /// advisory lock) and hand back a multi-tenant handler over a real `WsPools`, or `None`
+    /// when `GT_PG_URL` is unset (skip the gated test). Mirrors `memory_contract.rs`'
+    /// `repo_or_skip`.
+    async fn pg_handler_or_skip(test: &str) -> Option<MemoryHandler> {
+        let Ok(url) = std::env::var("GT_PG_URL") else {
+            eprintln!("GT_PG_URL unset; skipping {test}");
+            return None;
+        };
+        let admin = sqlx::PgPool::connect(&url).await.expect("connect admin pool");
+        let mut conn = admin.acquire().await.expect("acquire admin conn");
+        sqlx::query("SELECT pg_advisory_lock(4915623002)")
+            .execute(&mut *conn)
+            .await
+            .expect("take migration lock");
+        for m in memory_migrations() {
+            sqlx::raw_sql(&m.sql)
+                .execute(&mut *conn)
+                .await
+                .expect("apply memory migration");
+        }
+        sqlx::query("SELECT pg_advisory_unlock(4915623002)")
+            .execute(&mut *conn)
+            .await
+            .expect("release migration lock");
+        // Prove the per-request pool resolution path: connect once to confirm the slug is
+        // reachable, then hand the handler the cache itself (it resolves per dispatch).
+        WorkspacePool::connect(&url, "default")
+            .await
+            .expect("connect ws pool");
+        Some(MemoryHandler::new(Arc::new(WsPools::new(url)), None))
+    }
+
+    /// Save a memory through the handler, returning the name actually written (nonce-tagged).
+    async fn save(h: &MemoryHandler, name: &str, kind: &str, text: &str) {
+        h.dispatch(
+            "memory.save",
+            ctx(json!({
+                "name": name,
+                "description": text,
+                "kind": kind,
+                "body": text,
+            })),
+        )
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn save_then_recall_returns_the_row() {
+        let Some(h) = pg_handler_or_skip("save_then_recall_returns_the_row").await else {
+            return;
+        };
+        let n = nonce();
+        let name = format!("use-https-{n}");
+        save(&h, &name, "project", &format!("always-prefer-https-{n} term")).await;
+        let out = h
+            .dispatch("memory.recall", ctx(json!({ "query": format!("https-{n}") })))
+            .await
+            .unwrap();
+        let names: Vec<&str> = out["memories"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|m| m["name"].as_str().unwrap())
+            .collect();
+        assert!(names.contains(&name.as_str()), "the saved row must recall");
+        // forget it so the shared default schema doesn't accrete across runs.
+        h.dispatch("memory.forget", ctx(json!({ "name": name })))
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn recall_always_includes_feedback_rules_and_dedups() {
+        let Some(h) =
+            pg_handler_or_skip("recall_always_includes_feedback_rules_and_dedups").await
+        else {
+            return;
+        };
+        let n = nonce();
+        let fb = format!("verify-build-{n}");
+        let proj = format!("naming-{n}");
+        save(&h, &fb, "feedback", &format!("run-cargo-test-{n} before commit")).await;
+        save(&h, &proj, "project", &format!("use-kebab-{n} for slugs")).await;
+
+        // A query that only matches the `project` note must STILL return the feedback rule.
+        let out = h
+            .dispatch("memory.recall", ctx(json!({ "query": format!("kebab-{n}") })))
+            .await
+            .unwrap();
+        let names: Vec<&str> = out["memories"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|m| m["name"].as_str().unwrap())
+            .collect();
+        assert!(names.contains(&fb.as_str()), "feedback rule must always surface");
+        assert!(names.contains(&proj.as_str()));
+
+        // And a query that ALSO matches the feedback rule must not duplicate it.
+        let out = h
+            .dispatch("memory.recall", ctx(json!({ "query": format!("cargo-test-{n}") })))
+            .await
+            .unwrap();
+        let fb_hits = out["memories"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|m| m["name"].as_str() == Some(fb.as_str()))
+            .count();
+        assert_eq!(fb_hits, 1, "feedback row must appear exactly once");
+
+        h.dispatch("memory.forget", ctx(json!({ "name": fb }))).await.unwrap();
+        h.dispatch("memory.forget", ctx(json!({ "name": proj }))).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn list_filters_by_kind() {
+        let Some(h) = pg_handler_or_skip("list_filters_by_kind").await else {
+            return;
+        };
+        let n = nonce();
+        let a = format!("a-{n}");
+        let b = format!("b-{n}");
+        save(&h, &a, "feedback", "x").await;
+        save(&h, &b, "project", "y").await;
+
+        let out = h
+            .dispatch("memory.list", ctx(json!({ "kind": "project" })))
+            .await
+            .unwrap();
+        let proj_names: Vec<&str> = out["memories"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|m| m["name"].as_str().unwrap())
+            .collect();
+        assert!(proj_names.contains(&b.as_str()));
+        assert!(!proj_names.contains(&a.as_str()), "feedback row must not show under project");
+
+        h.dispatch("memory.forget", ctx(json!({ "name": a }))).await.unwrap();
+        h.dispatch("memory.forget", ctx(json!({ "name": b }))).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn forget_is_idempotent() {
+        let Some(h) = pg_handler_or_skip("forget_is_idempotent").await else {
+            return;
+        };
+        let n = nonce();
+        let gone = format!("gone-{n}");
+        save(&h, &gone, "project", "x").await;
+        let out = h
+            .dispatch("memory.forget", ctx(json!({ "name": gone })))
+            .await
+            .unwrap();
+        assert_eq!(out["forgotten"], true);
+        // Deleting an absent memory still succeeds (idempotent no-op).
+        let out = h
+            .dispatch("memory.forget", ctx(json!({ "name": format!("missing-{n}") })))
+            .await
+            .unwrap();
+        assert_eq!(out["forgotten"], true);
     }
 }
