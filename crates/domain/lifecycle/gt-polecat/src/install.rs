@@ -77,9 +77,82 @@ pub const COSTS_REPORT_CMD: &str = concat!(
     r#"printf '%s' "$end" > "$off"; fi; fi; fi"#,
 );
 
+/// `PreToolUse` guard that DENIES a file write into the memory corpus, redirecting the agent to the
+/// `mcp__gt__memory_save` tool (`hq-memory-mcp.6`).
+///
+/// A `gt` MCP server cannot force its client: the `memory.*` namespace exists, but nothing stops an
+/// agent from `Write`ing a `…/memory/*.md` file the old human-assisted way. This hook closes that
+/// hole at the HARNESS level — it is seeded into every polecat's settings (and, via
+/// `seed_user_hooks`, into the interactive account settings too), so the barrier travels with the
+/// config the rig hands each agent.
+///
+/// The matcher (`Write|Edit|MultiEdit`) scopes it to the file-mutating tools; the command then reads
+/// the `PreToolUse` event JSON on stdin (`{tool_name, tool_input:{file_path|filePath}}`, the
+/// `COSTS_REPORT_CMD` pattern) and, when the target path contains a `/memory/` segment and ends in
+/// `.md`, exits 2 — claude treats a `PreToolUse` exit 2 as "deny the tool call" and surfaces the
+/// stderr message to the agent. Anything else passes (`exit 0`). `jq`-free: the path is sniffed with
+/// `grep` so the guard fires even on a minimal image. Best-effort *toward denial*: if `tool_input`
+/// can't be parsed the guard does not block (it never wedges a legitimate write), the
+/// permissions `deny` rule below being the declarative backstop.
+const MEMORY_GUARD_CMD: &str = concat!(
+    r#"ev=$(cat); "#,
+    // Pull the target path from either `file_path` (Write/Edit) or `filePath`, tolerating both
+    // jq-present and jq-absent images.
+    r#"if command -v jq >/dev/null 2>&1; then "#,
+    r#"p=$(printf '%s' "$ev" | jq -r '.tool_input.file_path // .tool_input.filePath // empty' 2>/dev/null); "#,
+    r#"else "#,
+    r#"p=$(printf '%s' "$ev" | grep -oE '"file_?[Pp]ath"[[:space:]]*:[[:space:]]*"[^"]*"' | head -n1 | sed -E 's/.*:[[:space:]]*"([^"]*)"/\1/'); "#,
+    r#"fi; "#,
+    // Deny only a memory-corpus markdown file: a `/memory/` path segment + `.md` suffix.
+    r#"case "$p" in "#,
+    r#"*/memory/*.md) "#,
+    r#"echo "❌ BLOCKED: local memory files are read-only — write memories via the gt MCP tool mcp__gt__memory_save (memory.save), not by editing $p" >&2; "#,
+    r#"exit 2 ;; "#,
+    r#"esac; "#,
+    r#"exit 0"#,
+);
+
 /// One Claude hook entry running `cmd` for every event of its kind (`matcher: ""`).
 fn hook(cmd: &str) -> serde_json::Value {
     json!({ "matcher": "", "hooks": [ { "type": "command", "command": cmd } ] })
+}
+
+/// One Claude hook entry running `cmd` only for tools matching `matcher` (a `|`-joined tool list).
+fn hook_for(matcher: &str, cmd: &str) -> serde_json::Value {
+    json!({ "matcher": matcher, "hooks": [ { "type": "command", "command": cmd } ] })
+}
+
+/// Decide whether a write to `path` must be DENIED because it targets the file-based memory corpus
+/// (`…/memory/*.md`) — the source-of-truth the [`MEMORY_GUARD_CMD`] hook enforces, lifted into pure
+/// Rust so the rule is unit-tested without spawning a shell.
+///
+/// A path is a memory write iff it has a `memory` path component AND a `.md` extension. This matches
+/// the corpus convention (`gt-memory`: `…/memory/{feedback,project,reference,user}*.md` + the
+/// `MEMORY.md` index) while leaving unrelated paths (a `src/memory_store.rs`, a `notes.md` outside a
+/// `memory/` dir) free to be written.
+pub fn is_memory_corpus_write(path: &str) -> bool {
+    let p = std::path::Path::new(path);
+    let is_md = p
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.eq_ignore_ascii_case("md"))
+        .unwrap_or(false);
+    if !is_md {
+        return false;
+    }
+    // A `memory` directory component anywhere ABOVE the file (not the file's own stem), so
+    // `…/memory/x.md` denies but `…/memory.md` does not.
+    p.parent()
+        .map(|parent| {
+            parent
+                .components()
+                .filter_map(|c| match c {
+                    std::path::Component::Normal(s) => s.to_str(),
+                    _ => None,
+                })
+                .any(|s| s == "memory")
+        })
+        .unwrap_or(false)
 }
 
 /// The `Stop` hook entry that reports a turn's token usage into the quota-feed ([`COSTS_REPORT_CMD`]).
@@ -102,11 +175,21 @@ pub fn polecat_settings_json() -> String {
         MANAGED_MARKER: MANAGED_VALUE,
         "hasCompletedOnboarding": true,
         "enabledMcpjsonServers": ["gt"],
-        "permissions": { "defaultMode": "bypassPermissions" },
+        // bypassPermissions still skips the interactive prompt, but the `deny` rule is honoured even
+        // under it: a declarative backstop to the PreToolUse memory guard (hq-memory-mcp.6). The agent
+        // must save memories via the `mcp__gt__memory_save` MCP tool, never by writing the corpus.
+        "permissions": {
+            "defaultMode": "bypassPermissions",
+            "deny": [ "Write(**/memory/**.md)", "Edit(**/memory/**.md)", "MultiEdit(**/memory/**.md)" ]
+        },
         "hooks": {
             "SessionStart": [ hook(HEARTBEAT_CMD) ],
             "UserPromptSubmit": [ hook(HEARTBEAT_CMD) ],
             "PostToolUse": [ hook(HEARTBEAT_CMD) ],
+            // PreToolUse memory guard (hq-memory-mcp.6): DENY a write into the file-based memory
+            // corpus, redirecting the agent to mcp__gt__memory_save. The deterministic harness-level
+            // half of the enforcement; the `permissions.deny` above is its declarative twin.
+            "PreToolUse": [ hook_for("Write|Edit|MultiEdit", MEMORY_GUARD_CMD) ],
             "Stop": [ hook(MERGE_READY_CMD), hook(COSTS_REPORT_CMD) ],
         }
     });
@@ -170,6 +253,35 @@ mod tests {
         assert!(costs.contains("$GT_HOOK_ACCOUNT"));
         assert!(costs.contains(r#""sample":%s"#));
         assert!(costs.contains("transcript_path"));
+        // PreToolUse memory guard (hq-memory-mcp.6): scoped to the file-mutating tools, denies a
+        // `…/memory/*.md` write (exit 2) and redirects to mcp__gt__memory_save.
+        let pre = &v["hooks"]["PreToolUse"][0];
+        assert_eq!(pre["matcher"], json!("Write|Edit|MultiEdit"));
+        let guard = pre["hooks"][0]["command"].as_str().unwrap();
+        assert!(guard.contains("*/memory/*.md)"), "matches the memory corpus path");
+        assert!(guard.contains("exit 2"), "denies the tool call");
+        assert!(guard.contains("mcp__gt__memory_save"), "redirects to the MCP tool");
+        // Declarative backstop: deny rules under the bypassPermissions mode.
+        let deny = v["permissions"]["deny"].as_array().unwrap();
+        assert!(deny.iter().any(|r| r == "Write(**/memory/**.md)"));
+        assert!(deny.iter().any(|r| r == "Edit(**/memory/**.md)"));
+    }
+
+    #[test]
+    fn memory_corpus_writes_are_denied_others_pass() {
+        // hq-memory-mcp.6: a markdown file under a `memory/` dir is a corpus write → DENY.
+        assert!(is_memory_corpus_write("/home/nixos/gt-web/memory/feedback.md"));
+        assert!(is_memory_corpus_write(
+            "/home/nixos/.claude/projects/x/memory/MEMORY.md"
+        ));
+        assert!(is_memory_corpus_write("memory/project.md"));
+        assert!(is_memory_corpus_write("/a/b/memory/c/d.md")); // nested under memory/
+        // Not the corpus → ALLOW.
+        assert!(!is_memory_corpus_write("/home/nixos/gt-web/src/memory_store.rs"));
+        assert!(!is_memory_corpus_write("/home/nixos/notes.md")); // .md but no memory/ dir
+        assert!(!is_memory_corpus_write("/home/nixos/memory.md")); // file named memory, not a dir
+        assert!(!is_memory_corpus_write("/home/nixos/memory/data.json")); // memory/ but not .md
+        assert!(!is_memory_corpus_write("")); // empty path
     }
 
     #[test]
