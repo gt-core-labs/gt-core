@@ -62,12 +62,13 @@ the `ws_default` template — **existing tenant schemas are NOT re-migrated** (s
 > Under k8s these become a `Secret` (sensitive) + `ConfigMap` (non-sensitive); under compose, `./secrets` + `.env`.
 
 **Sensitive (Secret):**
-- `GT_SECRET_KEY` — AES-256-GCM master key sealing OAuth/PAT secrets at rest. Required if the `oauth` feature is built.
+- `GT_SECRET_KEY` — AES-256-GCM master key sealing OAuth/PAT/VCS secrets at rest. Required if the `oauth` feature is built; the OAuth provider seed (§4.2) is short-circuited without it.
 - `GT_JWT_RS256_PRIVATE_KEY_FILE` / `…_KEYS` / `…_SIGNING_KID` — RS256 login signing + verification.
 - `GT_ADMIN_EMAIL` / `GT_ADMIN_PASSWORD` — the seed admin (argon2 upsert).
-- `GT_GITHUB_APP_ID` / `GT_GITHUB_APP_PRIVATE_KEY_FILE` / `GT_GITHUB_APP_WEBHOOK_SECRET_FILE` / `GT_GITHUB_APP_SLUG` — GitHub App (private-repo clone + webhooks; unset ⇒ App surface disabled).
+- `GT_OAUTH_SEED_SECRET_<ID>` — the cleartext OAuth `client_secret` for a seeded provider, read by the provider seed at boot (§4.2). `<ID>` = the provider id upper-cased (e.g. `GT_OAUTH_SEED_SECRET_GOOGLE`). Unset ⇒ that provider is skipped (clean, never fatal). Never vendored — the seed JSON holds only the non-secret config + the env var name.
+- `GT_GITHUB_APP_ID` *(or `GT_GITHUB_APP_ID_FILE`)* / `GT_GITHUB_APP_PRIVATE_KEY_FILE` / `GT_GITHUB_APP_WEBHOOK_SECRET_FILE` / `GT_GITHUB_APP_SLUG` — GitHub App (private-repo clone + webhooks; the App is OPTIONAL — neither ID var set ⇒ App surface disabled, the PAT fallback still works). App ID + slug are public identifiers; the private-key PEM + webhook secret are the actual secrets, read from MOUNTED FILES (mirroring `GT_JWT_RS256_PRIVATE_KEY_FILE`). Registering the App on GitHub is an irreducible human action (§4.2).
 - DB creds: `POSTGRES_*`, `DOLT_USER`, `MINIO_ROOT_*`.
-- `GT_OIDC_REDIRECT_URI` / `GT_OAUTH_FE_REDIRECT_URL` — required when the `oauth` feature is built.
+- `GT_OIDC_REDIRECT_URI` — required when the `oauth` feature is built (the app's own callback URL; `db_oauth_resolver` panics at boot if unset). `GT_OAUTH_FE_REDIRECT_URL` — where `/auth/callback` hands the token off (optional; absent ⇒ returns token JSON for a non-browser client). `GT_OIDC_WORKSPACE` — tenant the OAuth login resolves to (optional, default `default`).
 
 **Non-sensitive (ConfigMap):**
 - `GT_PG_URL`, `GT_PG_AUDIT_URL`, `GT_DOLT_URL`, `GT_DOLT_BASE_URL` (multi-tenant routing), `GT_BLOB_*`, `GT_EVENTLOG_ROOT`, `GT_SELF_URL`, `GT_MCP_ALLOWED_HOSTS`, `GT_MCP_SCOPE_PROFILE`, `GT_GRAPHIFY_PYTHON`, `GT_TERMINAL_ENABLE`.
@@ -82,8 +83,8 @@ A clean deploy will come up **missing** these until they are made code/config-dr
 | Gap | Today | Bead |
 |---|---|---|
 | ~~Role prompts + skill bodies + role.scopes~~ → **DONE (§4.1)** | was rewritten via REST in prod (memory `knowledge-prompts-degastown`); now a versioned seed | hq-greenfield-seeds.2 |
-| **OAuth/IdP providers** (Google, …) | configured by hand in `/admin/providers` | hq-greenfield-seeds.3 |
-| **GitHub App** | App creation + org installation are manual | hq-greenfield-seeds.3 |
+| ~~OAuth/IdP providers~~ → **DONE (§4.2)** (Google, …) | was configured by hand in `/admin/providers`; now a versioned non-secret seed (secret via env) | hq-greenfield-seeds.3 |
+| **GitHub App** | App registration + org installation are an irreducible human action (§4.2); the in-repo config (env wiring) is reproducible | hq-greenfield-seeds.3 |
 | **Quota Claude accounts** | onboarded live (per-account `CLAUDE_CONFIG_DIR`) | hq-greenfield-seeds.4 |
 | **Rig catalog** (gt, gt_core, gtweb, gtproxy, gtmcp) | `rig_add` run manually | hq-greenfield-seeds.5 |
 | **Migrations don't reach existing tenants** | rig/0003 altered only `ws_default`; `hq_confiar` lacked `git_connection_ref` → drift-reconcile errored in prod | hq-vcs-connections.13 |
@@ -121,14 +122,79 @@ cargo test -p gt-skills --lib presets                          # replay-asserts 
 `design-taste-frontend`, `imagegen-*`, …, ~287 KB) are a curated UI-design catalog bound to no
 role, so they don't affect "functional roles." Seed them separately if a deploy wants that library.
 
+### 4.2 IdP/OAuth providers + GitHub App (hq-greenfield-seeds.3) — DELIVERED
+
+The login providers (Google, …) were configured by hand in `/admin/providers` and lived ONLY in
+prod's `public.oauth_providers` table — a clean cluster came up with a blank login page. The GitHub
+App is reachable only after a human registers it on GitHub. This bead makes both **reproducible**
+(the in-repo, code/config-driven parts) and documents the **irreducible human action** (GitHub's
+App-registration UI), and lands the full secrets matrix above (§3).
+
+**OAuth/IdP provider config — now a versioned, idempotent, secret-gated boot seed:**
+
+The NON-SECRET provider config was extracted read-only from the live deploy (one provider: `google`,
+the baked Google endpoints, `scopes=openid,email,profile`, global, currently `enabled=false`) and is
+now:
+
+- **`crates/domain/platform/gt-auth/seeds/oauth-providers.json`** — the extract, vendored in-repo
+  (id / kind / client_id / issuer / endpoints / scopes / enabled / workspace_id + the **name** of the
+  env var each provider's secret is read from). Embedded into the binary via `include_str!`
+  (orchestrator-agnostic — no external file under k8s).
+- **`gt_auth::provider_seed`** (`SeedProvider::resolve` / `seed_providers`) parses it and builds a
+  `NewProvider`, reading the cleartext `client_secret` from the named env var
+  (`GT_OAUTH_SEED_SECRET_<ID>`); the repo then AES-256-GCM seals it under `GT_SECRET_KEY`.
+- **`gt-mcp-server.rs::seed_oauth_providers`** (wired right after `seed_admin`, `#[cfg(oauth)]`)
+  replays it. **Idempotent + non-clobbering:** seeds ONLY when `oauth_providers` is EMPTY — a curated
+  prod (already populated) is untouched, so this has **no effect on the live `default`**. **Secret-
+  gated** like `seed_admin`: with `GT_SECRET_KEY` unset the whole step is skipped (logged, never
+  fatal); a provider whose `GT_OAUTH_SEED_SECRET_<ID>` is unset is skipped individually.
+
+> **The `client_secret` is NEVER vendored.** A DB leak yields no usable secret (sealed at rest), and
+> the repo carries only the non-secret config + the env var name. The cleartext is supplied per-deploy
+> as a k8s `Secret` key / compose `./secrets` value bound to `GT_OAUTH_SEED_SECRET_<ID>`.
+
+> **Note — the seeded `google` provider is `enabled=false`** (mirroring the live row). A greenfield
+> deploy that wants it as a login button supplies the secret AND flips `enabled` (in the seed JSON, or
+> via `/admin/providers` after boot). This is faithful to prod, not a bug.
+
+**GitHub App — the in-repo config is reproducible; App registration is the irreducible human action:**
+
+The App's identity + secrets are loaded from env/mounted files (`gt_vcs::github`,
+`GT_GITHUB_APP_*`, §3), so wiring an App into a greenfield deploy is fully declarative. What is NOT
+automatable — and is therefore the **one manual step** — is:
+
+1. A human **registers the GitHub App** on GitHub (App name, permissions, webhook URL) — GitHub's UI,
+   no API to create an org-owned App unattended. This yields the App ID, slug, a generated private-key
+   PEM, and a webhook secret → mount them as `GT_GITHUB_APP_*` (§3).
+2. A human **installs the App** on each org/repo. This is per-org and creates the *installation*; the
+   resulting `vcs_connections` row is written at runtime by the install/callback flow, **not** seeded.
+
+> `public.vcs_connections` is EMPTY in prod (verified read-only) — connections are runtime install
+> artifacts (one per org installation), not declarative config, so there is nothing to seed there. The
+> reproducible part is the env wiring above + the migration (`gt-vcs/0001`); the irreducible part is
+> the two human steps.
+
+**Regenerate the OAuth seed from a live deploy** (when prod's providers change):
+
+```bash
+# Export the NON-SECRET provider config from the running deploy (the secret is never read):
+docker exec gt-app-pg psql "postgres://gtapp:gtapp@localhost:5432/gtapp" -tAc \
+  "SELECT json_agg(row_to_json(t)) FROM (
+     SELECT id, kind, display_name, client_id, issuer, authorize_endpoint,
+            token_endpoint, userinfo_endpoint, scopes, enabled, workspace_id
+     FROM public.oauth_providers ORDER BY created_at) t;" \
+  | python3 scripts/extract-oauth-seed.py            # rewrites seeds/oauth-providers.json
+cargo test -p gt-auth --features oauth provider_seed # replay-asserts the seed
+```
+
 ---
 
 ## 5. Bring-up order (greenfield)
 
 1. Provision infra: Postgres, Dolt, MinIO + the event-log volume.
 2. Provide the secret/env matrix (§3).
-3. Start `gt-mcp-server` → it runs PG + Dolt migrations, seeds admin (if `GT_ADMIN_*` set), default workspace, role/skills catalog, hook guards, blob bucket.
-4. Apply the **gap seeds** (§4) — knowledge content, IdP, GitHub App, quota accounts, rig catalog — via their reproducible seed mechanisms (the beads above).
+3. Start `gt-mcp-server` → it runs PG + Dolt migrations, seeds admin (if `GT_ADMIN_*` set), default workspace, role/skills catalog (§4.1), **OAuth/IdP providers** (§4.2 — when `oauth` is built, `GT_SECRET_KEY` + the per-provider `GT_OAUTH_SEED_SECRET_*` are set, and the table is empty), hook guards, blob bucket.
+4. Apply the remaining **gap seeds** (§4) — quota accounts, rig catalog — via their reproducible seed mechanisms (the beads above), and complete the GitHub-App manual steps (§4.2) if the deploy uses one.
 5. Verify (§6).
 
 The detailed step-by-step runbook (with the exact apply commands per orchestrator) is **hq-greenfield-seeds.6**.

@@ -1,0 +1,18 @@
+{
+  "providers": [
+    {
+      "id": "google",
+      "kind": "google",
+      "display_name": "google",
+      "client_id": "316720335116-frh7e1mnmdprmesgqmftjvs37rg4648r.apps.googleusercontent.com",
+      "issuer": "https://accounts.google.com",
+      "authorize_endpoint": "https://accounts.google.com/o/oauth2/v2/auth",
+      "token_endpoint": "https://oauth2.googleapis.com/token",
+      "userinfo_endpoint": "https://openidconnect.googleapis.com/v1/userinfo",
+      "scopes": "openid,email,profile",
+      "enabled": false,
+      "workspace_id": null,
+      "secret_env": "GT_OAUTH_SEED_SECRET_GOOGLE"
+    }
+  ]
+}

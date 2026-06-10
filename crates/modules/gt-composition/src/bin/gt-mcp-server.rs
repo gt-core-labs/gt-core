@@ -1184,6 +1184,15 @@ async fn main() -> anyhow::Result<()> {
             // authority for admin, so it runs last and wins. Both are idempotent.
             migrate_users_to_global(&pool).await?;
             seed_admin(&pool).await?;
+            // hq-greenfield-seeds.3: replay the versioned, NON-SECRET OAuth/IdP provider config
+            // (extracted from live prod, `seeds/oauth-providers.json`) into an EMPTY oauth_providers
+            // table, so a greenfield deploy comes up with its login providers instead of a blank
+            // login page. Idempotent (skips when the table is non-empty, never clobbers a curated
+            // prod) and secret-gated (each provider's client_secret is read from its named env var;
+            // unset => that provider is skipped). Only with the `oauth` feature (the provider store
+            // + AES-GCM crypto that seals the secret at rest).
+            #[cfg(feature = "oauth")]
+            seed_oauth_providers(pool.clone()).await?;
             let jwks = Arc::new(
                 JwtAuthenticator::from_env()
                     .context("auth: build JWKS from the public verifier keys")?
@@ -2000,6 +2009,93 @@ async fn seed_admin(pool: &sqlx::PgPool) -> anyhow::Result<()> {
     .await
     .context("seed admin membership")?;
     eprintln!("[gt-mcp-server] global admin ensured: {email} (default/admin → [*])");
+    Ok(())
+}
+
+/// Seed the GLOBAL `public.oauth_providers` table from the versioned, NON-SECRET provider extract
+/// (`gt-auth`'s `seeds/oauth-providers.json`, `hq-greenfield-seeds.3`), so a greenfield deploy comes
+/// up with the login providers prod had — Google, … — instead of a blank login page. Mirrors
+/// [`seed_admin`]'s discipline:
+///
+/// - **Idempotent / non-clobbering:** seeds ONLY when the table is EMPTY. A populated table (the
+///   already-curated prod `default`, or any deploy where an admin has registered a provider) is left
+///   exactly as-is — the live `/admin/providers` surface remains the source of truth there.
+/// - **Secret-gated, never vendored:** the OAuth `client_secret` is NOT in the seed. Each entry names
+///   the env var its cleartext secret is read from (`GT_OAUTH_SEED_SECRET_<ID>`); a provider whose env
+///   is unset is SKIPPED cleanly (a log line, never fatal), exactly like `seed_admin` skips without
+///   `GT_ADMIN_*`. The secret is then AES-256-GCM sealed at rest via `GT_SECRET_KEY` ([`crypto`]),
+///   so it never reaches the database in clear — and is required: with `GT_SECRET_KEY` unset the seal
+///   fails, so the whole step is short-circuited (logged, never fatal) rather than erroring boot.
+///
+/// `pool` is the ws_default pool; the table is `public`-qualified, so the global store is reached
+/// regardless of search_path (the same handle `PgProviderRepo` uses elsewhere).
+#[cfg(feature = "oauth")]
+async fn seed_oauth_providers(pool: sqlx::PgPool) -> anyhow::Result<()> {
+    use gt_auth::ProviderRepo;
+
+    // The seal needs the master key; without it every provider would fail to seal. Short-circuit the
+    // whole step (a log line, never fatal) so a deploy that has not provided GT_SECRET_KEY still boots
+    // — it just has no seeded login providers, mirroring `seed_admin`'s skip.
+    if std::env::var(gt_auth::ENV_SECRET_KEY)
+        .ok()
+        .filter(|v| !v.trim().is_empty())
+        .is_none()
+    {
+        eprintln!(
+            "[gt-mcp-server] oauth provider seed skipped (set {} to seal the client secret at rest)",
+            gt_auth::ENV_SECRET_KEY
+        );
+        return Ok(());
+    }
+
+    let repo = gt_auth::PgProviderRepo::new(pool);
+
+    // Idempotency gate: never touch a non-empty table. A curated prod (or any deploy where an admin
+    // already registered a provider) is left untouched — the live surface owns it there.
+    let existing = repo
+        .list()
+        .await
+        .context("oauth provider seed: list existing providers")?;
+    if !existing.is_empty() {
+        eprintln!(
+            "[gt-mcp-server] oauth provider seed skipped ({} provider(s) already registered)",
+            existing.len()
+        );
+        return Ok(());
+    }
+
+    let seed = gt_auth::seed_providers().context("oauth provider seed: parse embedded seed")?;
+    let mut created = 0usize;
+    for sp in &seed {
+        // Resolve the cleartext secret from the entry's named env var; unset => clean skip.
+        let np = match sp.resolve() {
+            Ok(Some(np)) => np,
+            Ok(None) => {
+                eprintln!(
+                    "[gt-mcp-server] oauth provider '{}' seed skipped (set {} to enable it)",
+                    sp.id, sp.secret_env
+                );
+                continue;
+            }
+            Err(e) => {
+                return Err(anyhow::anyhow!(
+                    "oauth provider seed: resolve '{}': {e}",
+                    sp.id
+                ));
+            }
+        };
+        let id = np.id.clone();
+        repo.create(np)
+            .await
+            .with_context(|| format!("oauth provider seed: create '{id}'"))?;
+        created += 1;
+        eprintln!("[gt-mcp-server] oauth provider seeded: {id}");
+    }
+    if created == 0 {
+        eprintln!(
+            "[gt-mcp-server] oauth provider seed: no provider secrets present (set GT_OAUTH_SEED_SECRET_* to seed)"
+        );
+    }
     Ok(())
 }
 

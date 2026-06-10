@@ -113,6 +113,9 @@ mod crypto;
 mod provider_repo;
 
 #[cfg(feature = "oauth")]
+mod provider_seed;
+
+#[cfg(feature = "oauth")]
 mod authz_state;
 
 #[cfg(feature = "oauth")]
@@ -244,6 +247,14 @@ pub use provider_repo::{
     preset_for, presets, NewProvider, PatchProvider, ProviderKind as OauthProviderKind,
     ProviderPreset, ProviderRecord, ProviderRepo,
 };
+
+/// The versioned, reproducible OAuth/IdP provider seed (`hq-greenfield-seeds.3`): the live-extracted
+/// NON-SECRET provider config (`seeds/oauth-providers.json`, embedded), with each entry naming the
+/// env var its cleartext `client_secret` is read from at boot ([`SeedProvider::resolve`]). The
+/// composition root replays this into an EMPTY `oauth_providers` table so a greenfield deploy comes
+/// up with the login providers it had instead of a blank login page — without vendoring any secret.
+#[cfg(feature = "oauth")]
+pub use provider_seed::{seed_providers, SeedProvider};
 
 /// The AES-GCM secret-at-rest primitives (hq-idp-db.1): the `GT_SECRET_KEY` env contract plus the
 /// [`seal`](crypto::seal) / [`unseal`](crypto::unseal) pair. Exported behind `secret-crypto` so any

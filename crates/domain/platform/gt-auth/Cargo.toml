@@ -77,6 +77,11 @@ aes-gcm = { workspace = true, optional = true }
 # hex decode of the `GT_SECRET_KEY` master key (`crypto.rs`, hq-idp-db.1) — base64 is already an
 # optional dep above (shared with the `jsonwebtoken` JWKS adapter). Gated with `oauth`.
 hex = { workspace = true, optional = true }
+# Parse the versioned, embedded OAuth/IdP provider seed (`provider_seed.rs`,
+# `seeds/oauth-providers.json`, hq-greenfield-seeds.3) at boot. Off-by-default — pulled only with the
+# `oauth` provider store (the same gating as `aes-gcm`/`reqwest` above); the seed is a non-secret
+# extract the composition root replays into an empty `oauth_providers` table.
+serde_json = { workspace = true, optional = true }
 
 [features]
 # Production email+password provider — argon2 hash + verify.
@@ -103,7 +108,7 @@ secret-crypto = ["dep:aes-gcm", "dep:base64", "dep:hex"]
 # provider store (hq-idp-db.1) folds in here too via `secret-crypto`: `aes-gcm` seals the client
 # secret at rest, with `base64`/`hex` decoding the `GT_SECRET_KEY` master key. The Postgres adapter
 # (`PgProviderRepo`) additionally needs `pg`, which a deploy opts into separately.
-oauth = ["dep:reqwest", "secret-crypto", "dep:sha2", "axum"]
+oauth = ["dep:reqwest", "dep:serde_json", "secret-crypto", "dep:sha2", "axum"]
 
 [dev-dependencies]
 serde_json = { workspace = true }
