@@ -785,6 +785,59 @@ async fn main() -> anyhow::Result<()> {
         }
     };
 
+    // Graph drift-reconcile daemon (hq-vcs-connections.8): the BACKSTOP for the deliveries the push
+    // webhook (.7) misses (App downtime, a dropped delivery, the App reinstalled, a network blip). On
+    // a low cadence it sweeps every workspace partition, and for each rig under graph custody runs a
+    // cheap `git ls-remote <git_url> refs/heads/<default_branch>` (private repos via a JIT
+    // installation token minted from the rig's connection, public repos anonymously) and compares the
+    // remote tip to the warden's last-indexed commit — on divergence it marks the rig stale so
+    // `graph.refresh-stale` reindexes it. It NEVER clones or indexes, only flips the freshness flag.
+    // Opt-in + configurable: off unless GT_GRAPH_DRIFT_TICK_SECS > 0 (default 3600 = hourly), and
+    // gated on GT_PG_URL (the per-workspace rig catalog + connection store). The GitHub App is
+    // optional — without one, only connectionless (public) rigs are reconciled.
+    let drift_tick = env_u64("GT_GRAPH_DRIFT_TICK_SECS", 3600);
+    match (drift_tick > 0).then_some(()).and(std::env::var("GT_PG_URL").ok()) {
+        Some(pg_url) => match sqlx::PgPool::connect(&pg_url).await {
+            Ok(conn_pool) => {
+                let connections: Arc<dyn VcsConnectionRepo> =
+                    Arc::new(gt_vcs::PgVcsConnections::new(conn_pool));
+                // The App client mints JIT installation tokens for private rigs; absent → public-only.
+                let github = match gt_vcs::GithubAppConfig::from_env() {
+                    Ok(cfg) => cfg.map(gt_vcs::GithubAppClient::new),
+                    Err(e) => {
+                        eprintln!(
+                            "[gt-mcp-server] graph drift-reconcile: GitHub App config error \
+                             ({e}); private rigs will be skipped"
+                        );
+                        None
+                    }
+                };
+                eprintln!(
+                    "[gt-mcp-server] graph drift-reconcile daemon on (every {drift_tick}s; \
+                     ls-remote vs indexed commit; GitHub App {})",
+                    if github.is_some() { "wired" } else { "absent (public rigs only)" }
+                );
+                tokio::spawn(gt_composition::drift_reconcile::run(
+                    std::time::Duration::from_secs(drift_tick),
+                    event_log.clone(),
+                    Arc::new(WsPools::new(pg_url)),
+                    connections,
+                    github,
+                ));
+            }
+            Err(e) => {
+                eprintln!("[gt-mcp-server] graph drift-reconcile off (PG connect failed: {e})");
+            }
+        },
+        None => {
+            if drift_tick == 0 {
+                eprintln!("[gt-mcp-server] graph drift-reconcile off (GT_GRAPH_DRIFT_TICK_SECS=0)");
+            } else {
+                eprintln!("[gt-mcp-server] graph drift-reconcile off (GT_PG_URL unset)");
+            }
+        }
+    }
+
     let mut app = Router::new()
         .route("/health", get(health::health))
         .route("/readyz", get(health::readyz))

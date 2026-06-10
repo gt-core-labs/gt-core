@@ -38,6 +38,7 @@
 pub mod account_dirs;
 pub mod auth;
 pub mod denial_audit;
+pub mod drift_reconcile;
 pub mod git_merge;
 pub mod hooks;
 pub mod mcp;

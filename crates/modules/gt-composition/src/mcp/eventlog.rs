@@ -125,6 +125,28 @@ impl EventLog {
         let start = records.len().saturating_sub(limit);
         Ok(records[start..].to_vec())
     }
+
+    /// Every workspace partition currently on disk: the names of the immediate subdirectories of the
+    /// log root, each being one tenant's append-only log (`<root>/<ws>/`). A daemon that must sweep
+    /// across tenants (e.g. the graph drift-reconcile, hq-vcs-connections.8) enumerates the workspaces
+    /// this way — the log is path-partitioned per workspace, with no central registry of partitions.
+    ///
+    /// Non-directory entries and the sibling `accounts/` credential root (not a workspace) are
+    /// skipped. An unreadable root yields an empty list (nothing to sweep), never an error — a
+    /// best-effort daemon must not abort because the volume is momentarily unavailable.
+    pub fn workspaces(&self) -> Vec<String> {
+        let Ok(entries) = std::fs::read_dir(&self.root) else {
+            return Vec::new();
+        };
+        entries
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_type().map(|t| t.is_dir()).unwrap_or(false))
+            .filter_map(|e| e.file_name().into_string().ok())
+            // The orphan-credential GC roots claude account dirs under `accounts/` (a sibling of the
+            // workspace dirs), which is not a tenant — skip it.
+            .filter(|name| name != "accounts")
+            .collect()
+    }
 }
 
 /// The composition-root [`IssueEventSink`] for the issues tracker (`hq-issues-sse`).
@@ -200,5 +222,37 @@ mod issue_sink_tests {
             .read_since(Some("beta"), Some("issues"), None, 256)
             .unwrap();
         assert!(other.is_empty());
+    }
+
+    /// `workspaces()` enumerates the on-disk tenant partitions (the immediate subdirs created lazily
+    /// on first append), skipping the `accounts/` credential root. This is the seam the graph
+    /// drift-reconcile daemon sweeps across (hq-vcs-connections.8).
+    #[test]
+    fn workspaces_lists_tenant_partitions_and_skips_accounts() {
+        let dir = TempDir::new().unwrap();
+        let log = EventLog::new(Some(dir.path().to_path_buf()));
+        // No partitions yet.
+        assert!(log.workspaces().is_empty());
+
+        // Two tenants get a partition the first time something is appended for them.
+        for ws in ["acme", "beta"] {
+            log.append(
+                Some(ws),
+                IssueEvent {
+                    verb: IssueVerb::Transitioned,
+                    id: "hq-x.1".into(),
+                    actor: "t".into(),
+                    rig: "hq".into(),
+                    issue: None,
+                },
+            )
+            .unwrap();
+        }
+        // A sibling `accounts/` dir (the credential GC root) is NOT a tenant.
+        std::fs::create_dir_all(dir.path().join("accounts")).unwrap();
+
+        let mut found = log.workspaces();
+        found.sort();
+        assert_eq!(found, vec!["acme".to_string(), "beta".to_string()]);
     }
 }
