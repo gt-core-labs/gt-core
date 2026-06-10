@@ -28,6 +28,13 @@ pub use documents::{
     PgDocuments, SharesRepository,
 };
 
+#[cfg(feature = "pg")]
+pub mod memory_store;
+#[cfg(feature = "pg")]
+pub use memory_store::{
+    MemoryError, MemoryRepository, MemoryRow, NewMemory, PgMemory,
+};
+
 /// Canonical id of the bootstrap default workspace.
 ///
 /// A single workspace is seeded by the initial migration so the platform is

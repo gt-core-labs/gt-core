@@ -2270,6 +2270,7 @@ name = "gt-store-pg"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "gt-memory",
  "gt-module",
  "pgvector",
  "sqlx",

@@ -17,11 +17,15 @@ thiserror = { workspace = true, optional = true }
 # column (hq-docs-search.2). Pure-Rust binding; the DB-side extension is installed by
 # migration 0003.
 pgvector = { workspace = true, optional = true }
+# `gt-memory` domain types (`Memory`/`MemoryKind`) the `MemoryRepository` adapter maps
+# rows to/from (hq-memory-mcp.2). Pure-std crate; gated under `pg` with the adapter so the
+# migration-SQL host stays dependency-light.
+gt-memory = { workspace = true, optional = true }
 
 [features]
-# `WorkspacePool` + the `DocumentsRepository` PG adapter: per-workspace
-# search_path-scoped Postgres access.
-pg = ["dep:sqlx", "dep:async-trait", "dep:thiserror", "dep:pgvector"]
+# `WorkspacePool` + the `DocumentsRepository` / `MemoryRepository` PG adapters:
+# per-workspace search_path-scoped Postgres access.
+pg = ["dep:sqlx", "dep:async-trait", "dep:thiserror", "dep:pgvector", "dep:gt-memory"]
 
 [dev-dependencies]
 # Drives the `pg`-gated WorkspacePool contract test (GT_PG_URL).
