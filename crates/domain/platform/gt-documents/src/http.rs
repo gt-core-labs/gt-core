@@ -41,7 +41,7 @@ use gt_store_blob::{sha256_hex, BlobStore};
 use chrono::{DateTime, Duration, Utc};
 use gt_store_pg::{
     DocError, Document, DocumentPatch, DocumentShare, DocumentsRepository, NewDocument,
-    PgDocuments, SharesRepository, WorkspacePool,
+    PgDocuments, SharesRepository, VectorStore, WorkspacePool,
 };
 
 use crate::commands::{
@@ -198,8 +198,10 @@ impl DocumentsApiState {
 
     /// Best-effort: embed a document's text and store the vector (hq-docs-search.2). A missing
     /// embedder, empty text, or an embed/store failure is silently skipped — semantic search then
-    /// just misses this row; attach/update never fail on it.
-    async fn embed_doc(&self, repo: &PgDocuments, doc: &Document) {
+    /// just misses this row; attach/update never fail on it. Generic over [`VectorStore`]
+    /// (hq-vectorstore-abstraction) rather than the concrete [`PgDocuments`], so a future
+    /// non-Postgres vector backend is a swap at the call site, not here.
+    async fn embed_doc(&self, repo: &impl VectorStore, doc: &Document) {
         let Some(emb) = &self.inner.embedder else { return };
         let text = doc.body_md.as_deref().or(doc.extracted_text.as_deref()).unwrap_or("");
         if text.trim().is_empty() {

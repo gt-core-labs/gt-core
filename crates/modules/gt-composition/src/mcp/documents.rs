@@ -25,7 +25,7 @@ use gt_module::{GtModule, McpRegistry, McpTool};
 use gt_store_blob::{sha256_hex, BlobStore};
 use gt_store_dolt::AppError;
 use gt_store_pg::{
-    DocError, Document, DocumentPatch, DocumentsRepository, NewDocument, PgDocuments,
+    DocError, Document, DocumentPatch, DocumentsRepository, NewDocument, PgDocuments, VectorStore,
 };
 
 use super::pools::WsPools;
@@ -283,8 +283,10 @@ impl DocumentsHandler {
 
     /// Best-effort: embed a document's text and store the vector (hq-docs-search.2). A missing
     /// embedder, empty text, or an embed/store failure is silently skipped — semantic search
-    /// then just misses this row; attach/update never fail on it.
-    async fn embed_doc(&self, repo: &PgDocuments, doc: &Document) {
+    /// then just misses this row; attach/update never fail on it. Generic over [`VectorStore`]
+    /// (hq-vectorstore-abstraction) rather than the concrete [`PgDocuments`], so a future
+    /// non-Postgres vector backend is a swap at the call site, not here.
+    async fn embed_doc(&self, repo: &impl VectorStore, doc: &Document) {
         let Some(emb) = &self.embedder else { return };
         let text = doc
             .body_md

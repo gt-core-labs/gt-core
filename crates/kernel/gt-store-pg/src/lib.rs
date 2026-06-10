@@ -25,7 +25,7 @@ pub mod documents;
 #[cfg(feature = "pg")]
 pub use documents::{
     DocError, Document, DocumentPatch, DocumentShare, DocumentsRepository, NewDocument,
-    PgDocuments, SharesRepository,
+    PgDocuments, SharesRepository, VectorStore,
 };
 
 #[cfg(feature = "pg")]

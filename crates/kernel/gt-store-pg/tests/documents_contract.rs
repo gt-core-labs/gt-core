@@ -14,6 +14,8 @@
 //! - `hq-docs-test-search.1` — phase-1 full-text hit/miss + owner narrowing.
 //! - `hq-docs-test-search.2` — hybrid ranks a semantically-close (lexically-distant) doc first.
 //! - `hq-docs-test-search.3` — a row with no embedding still surfaces on the text side of `search_hybrid`.
+//! - `hq-vectorstore-abstraction.1` — `VectorStore::delete_embedding` clears a row's embedding
+//!   (idempotent on a row with none), and the row drops out of the vector side of `search_hybrid`.
 //!
 //! Requires the `pg` feature (the adapter is gated on it); CI runs
 //! `cargo test -p gt-store-pg --features pg`.
@@ -22,7 +24,7 @@
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use gt_store_pg::{docs_migrations, DocError, DocumentPatch, DocumentsRepository, NewDocument, PgDocuments, WorkspacePool};
+use gt_store_pg::{docs_migrations, DocError, DocumentPatch, DocumentsRepository, NewDocument, PgDocuments, VectorStore, WorkspacePool};
 
 /// Unique suffix so repeated runs against the same ephemeral DB never collide.
 fn nonce() -> u128 {
@@ -320,5 +322,58 @@ async fn hybrid_search_surfaces_rows_without_embedding() {
     assert!(
         hits.iter().any(|d| d.id == doc.id),
         "a row with no embedding must still surface on the text side of hybrid search"
+    );
+}
+
+/// hq-vectorstore-abstraction.1 — `VectorStore::delete_embedding` clears a row's embedding:
+/// idempotent on a row with none, and once cleared the row drops out of the vector side of
+/// `search_hybrid` (it no longer matches `embedding IS NOT NULL`, and its text doesn't match
+/// either).
+#[tokio::test]
+async fn delete_embedding_clears_vector_and_is_idempotent() {
+    let Some(repo) = repo_or_skip("delete_embedding_clears_vector_and_is_idempotent").await
+    else {
+        return;
+    };
+    let n = nonce();
+    let owner = format!("epic-{n}");
+    let unrelated_query = format!("zz{n}nomatch");
+
+    let doc = repo
+        .create(new_md(
+            &format!("doc-del-{n}"),
+            "epic",
+            &owner,
+            &format!("{n:064x}"),
+            "content with no relation to the query keyword",
+        ))
+        .await
+        .expect("create doc");
+
+    // delete_embedding on a row with no embedding yet is a no-op success.
+    repo.delete_embedding(&doc.id)
+        .await
+        .expect("delete_embedding on absent embedding");
+
+    // Embed it, then confirm it surfaces via the vector side of hybrid search (text doesn't match).
+    repo.set_embedding(&doc.id, unit_vec(2)).await.expect("embed doc");
+    let hits = repo
+        .search_hybrid(&unrelated_query, &unit_vec(2), Some(("epic", &owner)), 10)
+        .await
+        .expect("hybrid search before delete");
+    assert!(
+        hits.iter().any(|d| d.id == doc.id),
+        "embedded doc must surface via the vector side of hybrid search"
+    );
+
+    // Clear the embedding: the row drops out of hybrid search entirely (no text or vector match).
+    repo.delete_embedding(&doc.id).await.expect("delete_embedding");
+    let hits = repo
+        .search_hybrid(&unrelated_query, &unit_vec(2), Some(("epic", &owner)), 10)
+        .await
+        .expect("hybrid search after delete");
+    assert!(
+        !hits.iter().any(|d| d.id == doc.id),
+        "doc with cleared embedding and no text match must not surface"
     );
 }
