@@ -303,6 +303,9 @@ async fn main() -> anyhow::Result<()> {
     // POST /api/v1/system/archive/run need the same Dolt store the MCP server uses.
     let system_store = store.clone();
     let meta_base_tools = tools.clone();
+    // Keep a handle to the loaded RBAC config for the post-router reachability self-check
+    // (hq-rbac-reachability.1) — `rbac` itself moves into the server just below. Cheap `Arc` clone.
+    let rbac_for_reach = rbac.clone();
     // `with_issue_sink` (hq-issues-sse): an `issues.*.execute` over MCP — the agent-driven
     // movement the REST surface alone would miss — publishes its event into the same per-workspace
     // log the SSE feed fans out, so the tracker moves on `GET /stream?channel=issues`.
@@ -334,6 +337,44 @@ async fn main() -> anyhow::Result<()> {
         t.extend(domains.descriptors());
         t
     };
+    // Reachability self-check (hq-rbac-reachability.1). A namespace can be REGISTERED in the
+    // router yet UNREACHABLE because no least-privilege actor grant references it — exactly how
+    // `memory.*` shipped live but was denied to every non-`*` actor (admin reached issues.*/merge.*
+    // but not memory.*), the failure invisible because the autorecall hook swallowed the denial.
+    // Cross every advertised tool against the loaded RBAC actors and shout per orphan; under the
+    // strict env the boot refuses. Meaningful ONLY when a real least-privilege policy is in force —
+    // a pure `*` dev profile intends blanket access, so the audit is skipped there. This validates
+    // the actor allow-surface in THIS config; a JWT client's claim scopes (e.g. a polecat's
+    // catalog-derived role) ride a separate store the server does not hold, so they are out of scope.
+    if let Some(cfg) = &rbac_for_reach {
+        if cfg.has_least_privilege_actor() {
+            let orphans = cfg.least_privilege_orphans(meta_tools.iter().map(|t| t.name.as_str()));
+            if orphans.is_empty() {
+                eprintln!(
+                    "[gt-mcp-server] RBAC reachability OK: all {} advertised tool(s) have a least-privilege grant",
+                    meta_tools.len()
+                );
+            } else {
+                let mut namespaces: Vec<&str> =
+                    orphans.iter().map(|t| t.split('.').next().unwrap_or(t)).collect();
+                namespaces.sort_unstable();
+                namespaces.dedup();
+                eprintln!(
+                    "[gt-mcp-server] ⚠ RBAC reachability: {} tool(s) in namespace(s) {namespaces:?} are reachable ONLY by a `*` superuser — no least-privilege actor grants them. Add a grant in GT_MCP_SCOPE_CONFIG (e.g. `allow = [..., \"{}.*\"]`).",
+                    orphans.len(),
+                    namespaces.first().copied().unwrap_or("<ns>"),
+                );
+                let strict = std::env::var("GT_MCP_REQUIRE_REACHABLE")
+                    .ok()
+                    .is_some_and(|v| matches!(v.as_str(), "1" | "true" | "TRUE" | "on" | "ON" | "yes" | "YES"));
+                if strict {
+                    anyhow::bail!(
+                        "GT_MCP_REQUIRE_REACHABLE: registered namespace(s) {namespaces:?} have no least-privilege grant — refusing to boot"
+                    );
+                }
+            }
+        }
+    }
     service = service.with_domains(Arc::new(domains));
     // Wire issues.create rig-prefix routing (hq-mt-rigs.6) when the PG rig catalog
     // is present; without it the server accepts any bead-id prefix as before.

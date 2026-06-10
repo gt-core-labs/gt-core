@@ -144,8 +144,17 @@ const MEMORY_RECALL_CMD: &str = concat!(
     r#"lim="${GT_MEMORY_AUTORECALL_LIMIT:-8}"; case "$lim" in ''|*[!0-9]*) lim=8 ;; esac; "#,
     // Recall (best-effort, short timeout so a slow/unreachable server never stalls the launch).
     r#"req=$(jq -nc --arg q "$q" --argjson l "$lim" '{query:$q,limit:$l}' 2>/dev/null) || exit 0; "#,
-    r#"raw=$(gtmcp --compact call memory.recall "$req" 2>/dev/null) || exit 0; "#,
+    // Capture stdout+stderr and the exit code instead of discarding them (hq-rbac-reachability.3):
+    // a swallowed `|| exit 0` is exactly what kept a scope-denied recall (memory.* ungranted) looking
+    // like "no memories" for weeks. Still best-effort — every failure path exits 0 and never breaks the
+    // launch — but now it LOGS to stderr (the polecat log) so a dead autorecall is diagnosable.
+    r#"raw=$(gtmcp --compact call memory.recall "$req" 2>&1); rc=$?; "#,
+    r#"if [ "$rc" -ne 0 ]; then printf '[autorecall] SessionStart recall failed (rc=%s): %s\n' "$rc" "$(printf '%s' "$raw" | tr '\n' ' ' | cut -c1-200)" >&2; exit 0; fi; "#,
     r#"[ -n "$raw" ] || exit 0; "#,
+    // A 0-exit JSON-RPC error envelope (e.g. `memory.recall not in scope`) carries no memories; surface
+    // it loudly instead of silently rendering an empty block.
+    r#"derr=$(printf '%s' "$raw" | jq -r '.error.message // empty' 2>/dev/null); "#,
+    r#"if [ -n "$derr" ]; then printf '[autorecall] SessionStart recall denied: %s\n' "$derr" >&2; exit 0; fi; "#,
     // The MCP envelope wraps the tool payload as content[0].text (a JSON string); unwrap then parse.
     r#"inner=$(printf '%s' "$raw" | jq -r '(.content[0].text // empty)' 2>/dev/null); "#,
     r#"[ -n "$inner" ] || inner="$raw"; "#,
@@ -206,8 +215,13 @@ const MEMORY_RECALL_TURN_CMD: &str = concat!(
     r#"[ -n "$q" ] || exit 0; "#,
     // Recall (best-effort, conservative limit so the per-turn injection stays a focused nudge).
     r#"req=$(jq -nc --arg q "$q" '{query:$q,limit:3}' 2>/dev/null) || exit 0; "#,
-    r#"raw=$(gtmcp --compact call memory.recall "$req" 2>/dev/null) || exit 0; "#,
+    // Same un-swallow as the SessionStart hook (hq-rbac-reachability.3): capture rc + output and log a
+    // failure/denial to stderr instead of a silent `|| exit 0`. Best-effort preserved (always exit 0).
+    r#"raw=$(gtmcp --compact call memory.recall "$req" 2>&1); rc=$?; "#,
+    r#"if [ "$rc" -ne 0 ]; then printf '[autorecall] turn recall failed (rc=%s): %s\n' "$rc" "$(printf '%s' "$raw" | tr '\n' ' ' | cut -c1-200)" >&2; exit 0; fi; "#,
     r#"[ -n "$raw" ] || exit 0; "#,
+    r#"derr=$(printf '%s' "$raw" | jq -r '.error.message // empty' 2>/dev/null); "#,
+    r#"if [ -n "$derr" ]; then printf '[autorecall] turn recall denied: %s\n' "$derr" >&2; exit 0; fi; "#,
     // Unwrap the MCP envelope (content[0].text is the tool payload JSON string) then render.
     r#"inner=$(printf '%s' "$raw" | jq -r '(.content[0].text // empty)' 2>/dev/null); "#,
     r#"[ -n "$inner" ] || inner="$raw"; "#,
@@ -481,6 +495,10 @@ mod tests {
         assert!(recall.contains("GT_MEMORY_AUTORECALL"), "on/off knob");
         assert!(recall.contains("GT_MEMORY_AUTORECALL_LIMIT"), "tunable top-k");
         assert!(recall.contains("[autorecall] SessionStart injected"), "observability log");
+        // hq-rbac-reachability.3: a recall failure/denial is LOGGED to stderr, not swallowed by a
+        // silent `|| exit 0` — the gap that hid the memory.* scope denial for weeks.
+        assert!(recall.contains("recall failed"), "logs a transport failure");
+        assert!(recall.contains("recall denied"), "logs a scope/JSON-RPC error");
         // UserPromptSubmit carries the heartbeat + the per-turn memory autorecall
         // (hq-memory-autorecall.2): opt-in, queries by the prompt, injects per-turn context.
         let ups = v["hooks"]["UserPromptSubmit"].as_array().unwrap();
@@ -490,6 +508,7 @@ mod tests {
         assert!(turn.contains("memory.recall"), "calls the recall tool");
         assert!(turn.contains("UserPromptSubmit"), "per-turn additionalContext channel");
         assert!(turn.contains("exit 0"), "best-effort: never breaks the turn");
+        assert!(turn.contains("recall denied"), "per-turn recall also logs a denial (hq-rbac-reachability.3)");
     }
 
     #[test]

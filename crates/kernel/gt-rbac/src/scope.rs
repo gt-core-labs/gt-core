@@ -187,7 +187,7 @@ impl Scope {
     }
 }
 
-fn matches_pattern(pattern: &str, name: &str) -> bool {
+pub(crate) fn matches_pattern(pattern: &str, name: &str) -> bool {
     if pattern == "*" {
         return true;
     }

@@ -12,7 +12,7 @@ mod error;
 mod scope;
 mod vocabulary;
 
-pub use config::{ActorSpec, RbacConfig, RoleSpec, WebGrant};
+pub use config::{ActorSpec, Reach, RbacConfig, RoleSpec, WebGrant};
 pub use error::AppError;
 pub use scope::{ResolveScope, Scope, WORKSPACE_ADMIN, WORKSPACE_MEMBER};
 pub use vocabulary::{

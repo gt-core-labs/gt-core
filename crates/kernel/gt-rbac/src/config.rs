@@ -29,6 +29,8 @@ use std::path::Path;
 use serde::{Deserialize, Serialize};
 
 use crate::error::AppError;
+use crate::scope::matches_pattern;
+use crate::vocabulary::SCOPE_WILDCARD;
 
 /// One actor's entry. `allow` and `validate_only` mirror the original
 /// `mcp-scope.toml` shape; `roles` is consumed by gt-web.
@@ -146,6 +148,75 @@ impl RbacConfig {
         }
         WebGrant { roles, scopes }
     }
+
+    /// True when at least one actor declares a non-`*` allow pattern — i.e. a real
+    /// least-privilege policy is in force, not a pure dev config where one actor holds
+    /// `*`. The reachability audit ([`reach`](Self::reach)) is only meaningful then: a
+    /// `*`-only config intends blanket access, so flagging every namespace as "superuser
+    /// only" would be pure noise.
+    pub fn has_least_privilege_actor(&self) -> bool {
+        self.actors
+            .values()
+            .any(|s| s.allow.iter().any(|p| p != SCOPE_WILDCARD))
+    }
+
+    /// Classify how `tool` is reachable under the per-actor MCP allow-lists
+    /// (hq-rbac-reachability). The same `matches_pattern` the live dispatch gate
+    /// ([`Scope::check`]) uses, but asked across every actor at once — so the boot can tell
+    /// a tool no least-privilege grant references (the failure that shipped `memory.*` live
+    /// yet denied to every non-`*` actor) from one a real grant covers.
+    ///
+    /// A bare `*` actor matches everything, but that is *superuser* reach, not least-privilege:
+    /// it is tracked separately so [`Reach::SuperuserOnly`] surfaces "callable, but only by a
+    /// god-mode actor". `validate_only` is not modelled — this audits the allow *surface*, not
+    /// the execute/validate split.
+    pub fn reach(&self, tool: &str) -> Reach {
+        let mut superuser = false;
+        for spec in self.actors.values() {
+            for pat in &spec.allow {
+                if pat == SCOPE_WILDCARD {
+                    superuser = true;
+                    continue;
+                }
+                if matches_pattern(pat, tool) {
+                    return Reach::Explicit;
+                }
+            }
+        }
+        if superuser {
+            Reach::SuperuserOnly
+        } else {
+            Reach::Unreachable
+        }
+    }
+
+    /// The subset of `advertised` tools no least-privilege actor can reach (i.e. [`reach`] is
+    /// not [`Reach::Explicit`]) — the boot self-check and CI coverage test both fold this into
+    /// a "namespace registered but ungranted" alarm. Input order is preserved.
+    ///
+    /// [`reach`]: Self::reach
+    pub fn least_privilege_orphans<'a, I>(&self, advertised: I) -> Vec<&'a str>
+    where
+        I: IntoIterator<Item = &'a str>,
+    {
+        advertised
+            .into_iter()
+            .filter(|t| self.reach(t) != Reach::Explicit)
+            .collect()
+    }
+}
+
+/// How an MCP tool is reachable under an [`RbacConfig`]'s per-actor allow-lists
+/// (hq-rbac-reachability). The boot self-check treats anything other than [`Explicit`](Self::Explicit)
+/// as an orphan: a registered tool no least-privilege client can actually call.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Reach {
+    /// A non-`*` actor grant matches the tool — a least-privilege client can call it.
+    Explicit,
+    /// Only a bare `*` superuser actor matches — no least-privilege grant references it.
+    SuperuserOnly,
+    /// No actor grant matches at all — the tool is callable by nobody.
+    Unreachable,
 }
 
 #[cfg(test)]
@@ -286,5 +357,65 @@ scopes = ["beads.write"]
             toml_cfg.web_grant("claude-host"),
             json_cfg.web_grant("claude-host")
         );
+    }
+
+    // ----- reachability audit (hq-rbac-reachability) --------------------------------------
+
+    /// The prod shape that shipped the bug: a least-privilege `admin` reaches issues/merge but
+    /// NOT memory, plus a `*` superuser. `memory.*` is therefore reachable only by the superuser.
+    const PROD_LIKE: &str = r#"
+[actors.admin]
+allow = ["issues.*", "merge.*"]
+
+[actors.mcp-local]
+allow = ["*"]
+"#;
+
+    #[test]
+    fn reach_distinguishes_explicit_superuser_and_unreachable() {
+        let cfg = RbacConfig::from_toml(PROD_LIKE).unwrap();
+        // A least-privilege grant covers it (admin.allow `issues.*` matches the 3-seg tool).
+        assert_eq!(cfg.reach("issues.list.execute"), Reach::Explicit);
+        // No non-`*` actor grants memory — only the `*` superuser reaches it. THE BUG.
+        assert_eq!(cfg.reach("memory.recall"), Reach::SuperuserOnly);
+        assert_eq!(cfg.reach("memory.save"), Reach::SuperuserOnly);
+    }
+
+    #[test]
+    fn unreachable_when_no_actor_and_no_wildcard() {
+        // admin alone (no `*` actor): a namespace it does not grant is reachable by NOBODY.
+        let cfg = RbacConfig::from_toml("[actors.admin]\nallow = [\"issues.*\"]\n").unwrap();
+        assert_eq!(cfg.reach("memory.recall"), Reach::Unreachable);
+        assert_eq!(cfg.reach("issues.list.execute"), Reach::Explicit);
+    }
+
+    #[test]
+    fn least_privilege_orphans_flags_only_the_ungranted() {
+        let cfg = RbacConfig::from_toml(PROD_LIKE).unwrap();
+        let advertised = ["issues.list.execute", "merge.start", "memory.recall", "memory.save"];
+        let orphans = cfg.least_privilege_orphans(advertised);
+        // issues/merge are explicitly granted; both memory tools are orphans.
+        assert_eq!(orphans, vec!["memory.recall", "memory.save"]);
+    }
+
+    #[test]
+    fn granting_the_namespace_clears_the_orphan() {
+        // Add `memory.*` to admin — the deploy-time fix the contract forces.
+        let cfg = RbacConfig::from_toml(
+            "[actors.admin]\nallow = [\"issues.*\", \"memory.*\"]\n[actors.mcp-local]\nallow = [\"*\"]\n",
+        )
+        .unwrap();
+        assert_eq!(cfg.reach("memory.recall"), Reach::Explicit);
+        let orphans = cfg.least_privilege_orphans(["memory.recall", "issues.list.execute"]);
+        assert!(orphans.is_empty(), "a granted namespace is no longer an orphan");
+    }
+
+    #[test]
+    fn has_least_privilege_actor_is_false_for_pure_wildcard_config() {
+        // The `dev` profile is `*`-only: the audit must SKIP it (blanket access is intended).
+        let dev = RbacConfig::from_profile("dev").unwrap().unwrap();
+        assert!(!dev.has_least_privilege_actor(), "a `*`-only config is not least-privilege");
+        // PROD_LIKE has admin with explicit globs → least-privilege policy in force.
+        assert!(RbacConfig::from_toml(PROD_LIKE).unwrap().has_least_privilege_actor());
     }
 }
