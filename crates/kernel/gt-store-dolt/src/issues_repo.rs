@@ -279,6 +279,17 @@ pub struct DepFact {
     pub delivered: bool,
 }
 
+/// One issue stamped by [`DoltIssues::archive_old_closed`]: its id and `issue_type`. The type lets
+/// the caller drive type-specific cleanup off the archived set (e.g. an `epic` archive soft-deletes
+/// that epic's `documents`/embeddings, hq-docs-archive-sync) without a second round-trip to Dolt.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ArchivedIssue {
+    /// The archived bead id.
+    pub id: String,
+    /// Its `issue_type` (`epic`, `task`, …).
+    pub issue_type: String,
+}
+
 /// Full single-issue row returned by [`DoltIssues::get_detail`]. Superset of
 /// [`IssueRow`] that also carries the heavy text bodies (`description`,
 /// `design`, `acceptance_criteria`, `notes`) the list snapshot omits to stay
@@ -1501,17 +1512,27 @@ impl DoltIssues {
 
     /// Archive closed issues that have been closed for longer than `older_than_days` (hq-system-config).
     /// Sets `archived_at = NOW()` on matching rows; already-archived rows are skipped via
-    /// `archived_at IS NULL`. Returns the number of rows archived. Commits to Dolt only when
-    /// at least one row changed so idle ticks leave no noise in the branch history.
-    pub async fn archive_old_closed(&self, older_than_days: u32) -> Result<u64, AppError> {
+    /// `archived_at IS NULL`. Commits to Dolt only when at least one row changed so idle ticks
+    /// leave no noise in the branch history.
+    ///
+    /// Returns the [`ArchivedIssue`]s it stamped (id + `issue_type`) rather than a bare count, so a
+    /// caller can drive type-specific cleanup off the archived set — e.g. soft-deleting an archived
+    /// epic's `documents`/embeddings so it stops surfacing in `documents.search` (hq-docs-archive-sync).
+    /// Dolt/MySQL has no reliable `UPDATE ... RETURNING`, so this selects the eligible rows first and
+    /// re-applies the same predicate in the `UPDATE`: nothing un-closes a row between the two steps,
+    /// so every selected id is archived; a row that races in afterwards is archived too and simply
+    /// reported on the next sweep.
+    pub async fn archive_old_closed(
+        &self,
+        older_than_days: u32,
+    ) -> Result<Vec<ArchivedIssue>, AppError> {
         if older_than_days == 0 {
-            return Ok(0);
+            return Ok(Vec::new());
         }
         let mut conn = self.pool.get_conn().await.map_err(map_err)?;
-        let result = conn
-            .exec_iter(
-                "UPDATE issues
-                 SET archived_at = NOW(), updated_at = NOW(), version = version + 1
+        let eligible: Vec<(String, String)> = conn
+            .exec(
+                "SELECT id, issue_type FROM issues
                  WHERE status = 'closed'
                    AND archived_at IS NULL
                    AND closed_at < DATE_SUB(NOW(), INTERVAL :days DAY)",
@@ -1519,19 +1540,32 @@ impl DoltIssues {
             )
             .await
             .map_err(map_err)?;
-        let archived = result.affected_rows();
-        let _ = result.drop_result().await.map_err(map_err)?;
-        if archived > 0 {
-            conn.exec_drop(
-                "CALL DOLT_COMMIT('-A', '-m', :msg)",
-                mysql_async::params! {
-                    "msg" => format!("archive-sweep: archived {archived} closed issues (>{older_than_days}d)")
-                },
-            )
-            .await
-            .map_err(map_err)?;
+        if eligible.is_empty() {
+            return Ok(Vec::new());
         }
-        Ok(archived)
+        let count = eligible.len();
+        conn.exec_drop(
+            "UPDATE issues
+             SET archived_at = NOW(), updated_at = NOW(), version = version + 1
+             WHERE status = 'closed'
+               AND archived_at IS NULL
+               AND closed_at < DATE_SUB(NOW(), INTERVAL :days DAY)",
+            mysql_async::params! { "days" => older_than_days },
+        )
+        .await
+        .map_err(map_err)?;
+        conn.exec_drop(
+            "CALL DOLT_COMMIT('-A', '-m', :msg)",
+            mysql_async::params! {
+                "msg" => format!("archive-sweep: archived {count} closed issues (>{older_than_days}d)")
+            },
+        )
+        .await
+        .map_err(map_err)?;
+        Ok(eligible
+            .into_iter()
+            .map(|(id, issue_type)| ArchivedIssue { id, issue_type })
+            .collect())
     }
 
     /// Map every bead id to the [`DepFact`] readiness needs to judge whether it

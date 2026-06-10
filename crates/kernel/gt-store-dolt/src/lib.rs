@@ -28,6 +28,6 @@ pub use lock::WorkspaceLock;
 pub use pool::{WorkspacePools, DEFAULT_MAX_CONNS_PER_WS};
 pub use workspace::{create_workspace_dolt, dolt_db_name};
 pub use issues_repo::{
-    issues_default_limit, issues_max_limit, ClaimOutcome, DepFact, DoltIssues, IssueDetail,
-    IssueFilter, IssuePage, IssuePatch, IssuePhase, IssueRow, IssueStatus, NewIssue,
+    issues_default_limit, issues_max_limit, ArchivedIssue, ClaimOutcome, DepFact, DoltIssues,
+    IssueDetail, IssueFilter, IssuePage, IssuePatch, IssuePhase, IssueRow, IssueStatus, NewIssue,
 };

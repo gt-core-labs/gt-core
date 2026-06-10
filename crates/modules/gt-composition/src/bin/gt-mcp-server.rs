@@ -597,6 +597,15 @@ async fn main() -> anyhow::Result<()> {
         }
     };
 
+    // Per-workspace pool cache for the archive interceptor (hq-docs-archive-sync): when the sweep
+    // archives an epic, its `documents`/embeddings are soft-deleted so it drops out of
+    // `documents.search`. Built from GT_PG_URL — `None` when unset (no docs store, nothing to clean).
+    // A dedicated cache (the domain router holds its own); both are lazy Arc-over-pool handles over
+    // the same Postgres, and the hourly sweep is low-frequency, so the extra cache is negligible.
+    let archive_pools: Option<Arc<WsPools>> = std::env::var("GT_PG_URL")
+        .ok()
+        .map(|pg_url| Arc::new(WsPools::new(pg_url)));
+
     // System config REST surface (hq-system-config): GET/PUT /api/v1/system/config and
     // POST /api/v1/system/archive/run. Scoped to system.read/system.write (admin `*` satisfies both).
     // Spawns the background archive daemon that sweeps old closed issues on a configurable interval.
@@ -611,7 +620,9 @@ async fn main() -> anyhow::Result<()> {
             });
         let initial_cfg = config_path.as_ref().map(load_config).unwrap_or_default();
         let config = std::sync::Arc::new(RwLock::new(initial_cfg.clone()));
-        tokio::spawn(ArchiveDaemon::new(system_store.clone(), config.clone()).run());
+        tokio::spawn(
+            ArchiveDaemon::new(system_store.clone(), config.clone(), archive_pools.clone()).run(),
+        );
         eprintln!(
             "[gt-mcp-server] archive daemon on (interval {}min, archive_after {}d)",
             initial_cfg.interval_minutes,
@@ -626,6 +637,7 @@ async fn main() -> anyhow::Result<()> {
             system_store.clone(),
             config,
             config_path,
+            archive_pools.clone(),
         ))
     });
 

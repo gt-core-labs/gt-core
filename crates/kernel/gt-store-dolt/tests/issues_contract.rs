@@ -17,7 +17,8 @@ use std::collections::BTreeSet;
 use mysql_async::prelude::Queryable;
 
 use gt_store_dolt::{
-    ClaimOutcome, DoltIssues, IssueFilter, IssuePatch, IssuePhase, IssueStatus, NewIssue,
+    ArchivedIssue, ClaimOutcome, DoltIssues, IssueFilter, IssuePatch, IssuePhase, IssueStatus,
+    NewIssue,
 };
 
 const TEST_DB: &str = "gt_rs_issues_test";
@@ -874,4 +875,71 @@ async fn create_workspace_dolt_provisions_hq_db_and_issues_schema() {
 
     // Cleanup.
     conn.query_drop("DROP DATABASE IF EXISTS `hq_f3-prov`").await.expect("cleanup");
+}
+
+/// hq-docs-archive-sync: `archive_old_closed` returns the archived set (id + issue_type), not a
+/// bare count — the shape the archive interceptor reads to soft-delete an archived epic's docs.
+#[tokio::test]
+async fn archive_old_closed_returns_id_and_issue_type() {
+    let Ok(base) = std::env::var("GT_DOLT_URL") else {
+        eprintln!("GT_DOLT_URL unset — skipping DoltIssues.archive contract");
+        return;
+    };
+    let base = base.trim_end_matches('/').to_string();
+    seed(&base).await.expect("seed");
+
+    use mysql_async::prelude::*;
+    let db = format!("{base}/{TEST_DB}");
+    let repo = DoltIssues::connect(&db).expect("connect");
+    repo.ensure_schema().await.expect("schema present"); // adds the `archived_at` column
+
+    // One epic + one task, both closed and backdated past the cutoff so the sweep catches them.
+    let epic_id = format!("hq-arc-epic-{}", ulid::Ulid::new());
+    let task_id = format!("hq-arc-task-{}", ulid::Ulid::new());
+    for (id, issue_type) in [(&epic_id, "epic"), (&task_id, "task")] {
+        repo.insert(&NewIssue {
+            id: id.clone(),
+            title: "archive subject".into(),
+            issue_type: issue_type.into(),
+            priority: 2,
+            created_by: "test".into(),
+            ..Default::default()
+        })
+        .await
+        .expect("seed insert");
+        repo.close(id, "claude-host").await.expect("close ok");
+    }
+
+    let pool = gt_store_dolt::connect(&db).expect("pool");
+    let mut conn = pool.get_conn().await.expect("conn");
+    // Backdate closed_at well past any sane cutoff so a 1-day sweep is eligible.
+    conn.exec_drop(
+        "UPDATE issues SET closed_at = DATE_SUB(NOW(), INTERVAL 10 DAY) WHERE id IN (:e, :t)",
+        mysql_async::params! { "e" => &epic_id, "t" => &task_id },
+    )
+    .await
+    .expect("backdate closed_at");
+
+    let mut archived = repo.archive_old_closed(1).await.expect("archive sweep");
+    archived.sort_by(|a, b| a.id.cmp(&b.id));
+    let mut expected = vec![
+        ArchivedIssue { id: epic_id.clone(), issue_type: "epic".into() },
+        ArchivedIssue { id: task_id.clone(), issue_type: "task".into() },
+    ];
+    expected.sort_by(|a, b| a.id.cmp(&b.id));
+    assert_eq!(archived, expected, "returns each archived id with its issue_type");
+
+    // Idempotent: the rows are now stamped, so a second sweep finds nothing.
+    let again = repo.archive_old_closed(1).await.expect("second sweep");
+    assert!(again.is_empty(), "already-archived rows are not re-returned");
+
+    // The stamp really landed (CAST yields the value as text; NULL would be `None`).
+    let stamped: Option<String> = conn
+        .exec_first(
+            "SELECT CAST(archived_at AS CHAR) FROM issues WHERE id = :id",
+            mysql_async::params! { "id" => &epic_id },
+        )
+        .await
+        .expect("read archived_at");
+    assert!(stamped.is_some(), "archived_at is non-NULL after the sweep");
 }

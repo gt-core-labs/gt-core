@@ -28,10 +28,12 @@ use time::OffsetDateTime;
 use tokio::sync::RwLock;
 
 use gt_auth::JwtClaims;
-use gt_store_dolt::DoltIssues;
+use gt_store_dolt::{ArchivedIssue, DoltIssues};
+use gt_store_pg::{DocumentsRepository, PgDocuments};
 
 use crate::auth::SharedAuthenticator;
 use crate::denial_audit::{record_denial, SharedAudit, ANONYMOUS};
+use crate::mcp::WsPools;
 
 const TOKEN_COOKIE: &str = "gt_web_token";
 const READ_SCOPE: &str = "system.read";
@@ -106,6 +108,10 @@ pub struct SystemApiState {
     store: Arc<DoltIssues>,
     config: SharedArchiveConfig,
     config_path: Option<PathBuf>,
+    /// Per-workspace Postgres pool cache for the archive interceptor (hq-docs-archive-sync):
+    /// soft-deleting an archived epic's `documents`. `None` when `GT_PG_URL` is unset — no
+    /// documents store, so nothing to clean up.
+    pools: Option<Arc<WsPools>>,
 }
 
 impl SystemApiState {
@@ -115,6 +121,7 @@ impl SystemApiState {
         store: Arc<DoltIssues>,
         config: SharedArchiveConfig,
         config_path: Option<PathBuf>,
+        pools: Option<Arc<WsPools>>,
     ) -> Self {
         Self {
             authenticator,
@@ -122,6 +129,7 @@ impl SystemApiState {
             store,
             config,
             config_path,
+            pools,
         }
     }
 }
@@ -250,8 +258,56 @@ async fn run_archive_now(
     }
     let days = st.config.read().await.archive_after_days;
     match st.store.archive_old_closed(days).await {
-        Ok(n) => (StatusCode::OK, Json(serde_json::json!({ "archived": n }))).into_response(),
+        Ok(archived) => {
+            if let Some(pools) = &st.pools {
+                purge_archived_epic_documents(pools, &archived).await;
+            }
+            let n = archived.len();
+            (StatusCode::OK, Json(serde_json::json!({ "archived": n }))).into_response()
+        }
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+    }
+}
+
+/// The archive interceptor (hq-docs-archive-sync, Phase B): for every archived **epic**, soft-delete
+/// its `documents` rows so the epic stops surfacing in `documents.search` once it leaves the tracker.
+///
+/// Best-effort by design — a docs-store hiccup is logged (`eprintln!`) and swallowed so it can never
+/// fail the archive sweep itself, mirroring `embed_doc`'s best-effort contract. Scoped to the default
+/// workspace (the current single-tenant deployment); multi-workspace rigs are a follow-up. A no-op
+/// when no epic was archived.
+pub async fn purge_archived_epic_documents(pools: &WsPools, archived: &[ArchivedIssue]) {
+    let epics: Vec<&ArchivedIssue> = archived
+        .iter()
+        .filter(|a| a.issue_type == "epic")
+        .collect();
+    if epics.is_empty() {
+        return;
+    }
+    let pool = match pools.get(None).await {
+        Ok(pool) => pool,
+        Err(e) => {
+            eprintln!("[archive] epic-docs cleanup skipped — workspace pool: {e}");
+            return;
+        }
+    };
+    let repo = PgDocuments::new(pool);
+    for epic in epics {
+        let docs = match repo.list_by_owner_id(&epic.id).await {
+            Ok(docs) => docs,
+            Err(e) => {
+                eprintln!("[archive] list documents for epic {}: {e}", epic.id);
+                continue;
+            }
+        };
+        for doc in docs {
+            if let Err(e) = repo.soft_delete(&doc.id, doc.version).await {
+                eprintln!(
+                    "[archive] soft-delete doc {} of archived epic {}: {e}",
+                    doc.id, epic.id
+                );
+            }
+        }
     }
 }
 
@@ -260,11 +316,22 @@ async fn run_archive_now(
 pub struct ArchiveDaemon {
     store: Arc<DoltIssues>,
     config: SharedArchiveConfig,
+    /// Same per-workspace pool cache as [`SystemApiState`] — drives the epic-docs cleanup
+    /// (hq-docs-archive-sync) after each sweep. `None` when `GT_PG_URL` is unset.
+    pools: Option<Arc<WsPools>>,
 }
 
 impl ArchiveDaemon {
-    pub fn new(store: Arc<DoltIssues>, config: SharedArchiveConfig) -> Self {
-        Self { store, config }
+    pub fn new(
+        store: Arc<DoltIssues>,
+        config: SharedArchiveConfig,
+        pools: Option<Arc<WsPools>>,
+    ) -> Self {
+        Self {
+            store,
+            config,
+            pools,
+        }
     }
 
     pub async fn run(self) {
@@ -275,8 +342,14 @@ impl ArchiveDaemon {
             };
             if enabled {
                 match self.store.archive_old_closed(days).await {
-                    Ok(0) => {}
-                    Ok(n) => eprintln!("[archive-daemon] archived {n} closed issues (>{days}d)"),
+                    Ok(archived) if archived.is_empty() => {}
+                    Ok(archived) => {
+                        let n = archived.len();
+                        if let Some(pools) = &self.pools {
+                            purge_archived_epic_documents(pools, &archived).await;
+                        }
+                        eprintln!("[archive-daemon] archived {n} closed issues (>{days}d)");
+                    }
                     Err(e) => eprintln!("[archive-daemon] sweep error: {e}"),
                 }
             }
