@@ -331,6 +331,12 @@ mod tests {
         async fn delete(&self, _workspace: &str, _id: &str) -> Result<bool, AppError> {
             Ok(true)
         }
+        async fn find_by_installation(
+            &self,
+            _installation_id: &str,
+        ) -> Result<Option<VcsConnection>, AppError> {
+            Ok(None)
+        }
     }
 
     #[test]

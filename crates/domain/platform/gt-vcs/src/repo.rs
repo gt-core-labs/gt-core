@@ -249,6 +249,16 @@ pub trait VcsConnectionRepo: Send + Sync {
     /// Remove connection `id` scoped to `workspace`; `true` if a row was deleted, `false` if none
     /// matched (or it belonged to another tenant).
     async fn delete(&self, workspace: &str, id: &str) -> Result<bool, AppError>;
+    /// The `github_app` connection bound to GitHub installation `installation_id`, looked up GLOBALLY
+    /// (across every tenant), with NO workspace predicate. This is the inbound-webhook seam
+    /// (hq-vcs-connections.7): a GitHub `push` delivery names only the `installation.id`, so the
+    /// receiver resolves which workspace/connection it belongs to here — the one place a connection
+    /// is addressed by installation rather than by the caller's workspace. `None` when no connection
+    /// carries that installation id. Most recent (highest `created_at`) wins if more than one matches.
+    async fn find_by_installation(
+        &self,
+        installation_id: &str,
+    ) -> Result<Option<VcsConnection>, AppError>;
 }
 
 #[cfg(feature = "pg")]
@@ -444,6 +454,24 @@ mod pg_impl {
             .map_err(|e| AppError::Other(format!("vcs_connections delete: {e}")))?;
             Ok(res.rows_affected() > 0)
         }
+
+        async fn find_by_installation(
+            &self,
+            installation_id: &str,
+        ) -> Result<Option<VcsConnection>, AppError> {
+            // GLOBAL lookup — no workspace predicate. The webhook receiver has only the
+            // installation id, so the workspace falls out of the matched row's `workspace_id`.
+            // Newest first so a re-install (a fresh row for the same installation) wins.
+            let row = sqlx::query(&format!(
+                "SELECT {COLS} FROM public.vcs_connections \
+                 WHERE installation_id = $1 ORDER BY created_at DESC LIMIT 1"
+            ))
+            .bind(installation_id)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|e| AppError::Other(format!("vcs_connections find_by_installation: {e}")))?;
+            row.as_ref().map(row_to_record).transpose()
+        }
     }
 }
 
@@ -621,6 +649,22 @@ mod tests {
                 })
                 .await;
             assert!(matches!(bad, Err(AppError::Validation(_))));
+
+            // The webhook seam resolves the workspace from the installation id GLOBALLY (no ws
+            // predicate): the matched row carries `workspace_id = acme`.
+            let by_inst = repo
+                .find_by_installation("12345")
+                .await
+                .unwrap()
+                .expect("installation 12345 resolves to its connection");
+            assert_eq!(by_inst.workspace_id.as_deref(), Some("acme"));
+            assert_eq!(by_inst.id, id);
+            // An unknown installation resolves to nothing.
+            assert!(repo
+                .find_by_installation("no-such-install")
+                .await
+                .unwrap()
+                .is_none());
 
             repo.delete("acme", &id).await.unwrap();
         }

@@ -52,6 +52,7 @@ pub mod session_reconcile;
 pub mod stream;
 pub mod system;
 pub mod terminal;
+pub mod webhook;
 pub mod witness_sweep;
 pub mod worktree;
 

@@ -78,6 +78,10 @@ gt-vcs = { workspace = true, features = ["pg", "axum"] }
 # the live server) and the warden state replayed to resolve rig -> repo_dir.
 gt-graphindex = { workspace = true, features = ["graphify"] }
 gt-graphwarden = { workspace = true }
+# Inbound webhook verify (hq-vcs-connections.7): reuse `GitHubSource`'s constant-time HMAC-SHA256
+# verification of `X-Hub-Signature-256` for the GitHub App push webhook, rather than re-rolling the
+# MAC compare. Sync + pure, behind the REST receiver in `webhook.rs`.
+gt-webhooks = { workspace = true }
 # Per-workspace schema isolation: WorkspacePool sets search_path per connection.
 gt-store-pg = { workspace = true, features = ["pg"] }
 # Document subsystem dispatch (hq-docs-api.2): the GtModule contract (gt-documents),
@@ -164,3 +168,7 @@ lopdf = "0.34"
 # Read each module's utoipa ApiDoc (the served REST spec) in the MCP↔HTTP parity
 # contract (hq-fe-api-spec.2): harvest its declared (method, path) set offline.
 utoipa = { workspace = true }
+# Mint a valid X-Hub-Signature-256 in the webhook tests (hq-vcs-connections.7) to drive the
+# signature-verify path; sha2 is already a runtime dep, hmac/hex are test-only here.
+hmac = { workspace = true }
+hex = { workspace = true }

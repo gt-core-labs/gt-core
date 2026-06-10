@@ -63,6 +63,7 @@ use gt_docs_extract::Extractor;
 use gt_graphindex::GraphifyIndexer;
 use gt_store_blob::BlobStore;
 use gt_store_pg::{schema_for, WorkspacePool};
+use gt_vcs::VcsConnectionRepo;
 use sqlx::Row;
 // Domain REST modules + their `with_http` state (hq-fe-api-mount.1): the bin mounts each
 // crate's `register_routes` so the FE reaches every namespace over authenticated HTTP.
@@ -732,6 +733,58 @@ async fn main() -> anyhow::Result<()> {
         });
     }
 
+    // GitHub App push webhook (hq-vcs-connections.7): POST /api/v1/connection/github/webhook. The
+    // answer to "does the custodian hear an EXTERNAL push to origin?" — a signed `push` delivery
+    // verifies its HMAC-SHA256 (X-Hub-Signature-256) against the App's webhook secret, maps
+    // installation.id → workspace and repository.full_name → rig, and marks that rig's graph stale
+    // (default-branch + head-moved only) so `graph.refresh-stale` reindexes it. Mounted OUTSIDE the
+    // /api/v1/* RBAC chain — a webhook authenticates by its signature, not a workspace JWT — gated on
+    // BOTH a configured App webhook secret (GT_GITHUB_APP_WEBHOOK_SECRET_FILE) AND GT_PG_URL (the
+    // connection store + per-workspace rig catalog). Without either, no route is mounted.
+    let github_webhook = match (gt_vcs::GithubAppConfig::from_env(), std::env::var("GT_PG_URL")) {
+        (Ok(Some(cfg)), Ok(pg_url)) => match cfg.webhook_secret() {
+            Some(secret) => match sqlx::PgPool::connect(&pg_url).await {
+                Ok(conn_pool) => {
+                    eprintln!(
+                        "[gt-mcp-server] GitHub push webhook on POST /api/v1/connection/github/webhook (HMAC-SHA256 verified; marks rig stale)"
+                    );
+                    let connections: Arc<dyn VcsConnectionRepo> =
+                        Arc::new(gt_vcs::PgVcsConnections::new(conn_pool));
+                    Some(gt_composition::webhook::github_webhook_router(
+                        gt_composition::webhook::GithubWebhookState::new(
+                            secret.as_bytes().to_vec(),
+                            Arc::new(WsPools::new(pg_url.clone())),
+                            connections,
+                            event_log.clone(),
+                        ),
+                    ))
+                }
+                Err(e) => {
+                    eprintln!("[gt-mcp-server] GitHub push webhook off (PG connect failed: {e})");
+                    None
+                }
+            },
+            None => {
+                eprintln!(
+                    "[gt-mcp-server] GitHub push webhook off (GitHub App configured but GT_GITHUB_APP_WEBHOOK_SECRET_FILE unset)"
+                );
+                None
+            }
+        },
+        (Ok(None), _) => {
+            eprintln!("[gt-mcp-server] GitHub push webhook off (no GitHub App configured)");
+            None
+        }
+        (Err(e), _) => {
+            eprintln!("[gt-mcp-server] GitHub push webhook off (GitHub App config error: {e})");
+            None
+        }
+        (_, Err(_)) => {
+            eprintln!("[gt-mcp-server] GitHub push webhook off (GT_PG_URL unset)");
+            None
+        }
+    };
+
     let mut app = Router::new()
         .route("/health", get(health::health))
         .route("/readyz", get(health::readyz))
@@ -742,6 +795,12 @@ async fn main() -> anyhow::Result<()> {
         .with_state(health_state)
         .merge(feed)
         .nest_service(MCP_PATH, http);
+    if let Some(webhook) = github_webhook {
+        // Nest under /api/v1/connection so the absolute path is
+        // /api/v1/connection/github/webhook (the route inside is /github/webhook). Outside the
+        // auth chain merged below — the HMAC signature is the credential.
+        app = app.nest("/api/v1/connection", webhook);
+    }
     if let Some(terminal) = terminal {
         app = app.merge(terminal);
     }
