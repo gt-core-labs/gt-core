@@ -47,8 +47,9 @@ use gt_composition::mcp::{
     AgentHandler, AuditHandler, CompositionTenantProvisioner, ConvoyHandler, DocumentsHandler,
     EventLog, EventLogConvoy, EventLogFeed, EventLogHooks, EventLogIssueSink, EventLogMerges,
     EventLogQuota, EventLogSkills, FsAccountCatalog, GraphHandler, IdentityDoltMeStats,
-    MergeHandler, NotifyHandler, PgDocumentsResource, PgRigPrefixes, PgWorkspaceStatus,
-    QuotaBlockGuard, QuotaHandler, RigHandler, WorkspaceHandler, WsPoolRigs, WsPools,
+    MemoryHandler, MergeHandler, NotifyHandler, PgDocumentsResource, PgRigPrefixes,
+    PgWorkspaceStatus, QuotaBlockGuard, QuotaHandler, RigHandler, WorkspaceHandler, WsPoolRigs,
+    WsPools,
 };
 use gt_composition::onboard::{onboard_router, OnboardState};
 use gt_composition::operator_resource::EventLogOperatorResource;
@@ -61,7 +62,7 @@ use gt_docs_embed::Embedder;
 use gt_docs_extract::Extractor;
 use gt_graphindex::GraphifyIndexer;
 use gt_store_blob::BlobStore;
-use gt_store_pg::{schema_for, WorkspacePool};
+use gt_store_pg::{schema_for, PgMemory, WorkspacePool};
 use sqlx::Row;
 // Domain REST modules + their `with_http` state (hq-fe-api-mount.1): the bin mounts each
 // crate's `register_routes` so the FE reaches every namespace over authenticated HTTP.
@@ -886,11 +887,11 @@ async fn main() -> anyhow::Result<()> {
                 let me_source = Arc::new(IdentityDoltMeStats::new(memberships, stores));
                 rest = rest.module(MeModule::with_http(MeApiState::new(me_source)));
                 eprintln!(
-                    "[gt-mcp-server] REST domain modules: meta + workspace + rig + documents + agent + quota + merge + skills + feed + convoy + me (cross-workspace stats)"
+                    "[gt-mcp-server] REST domain modules: meta + workspace + rig + documents + memory + agent + quota + merge + skills + feed + convoy + me (cross-workspace stats)"
                 );
             }
             Err(_) => eprintln!(
-                "[gt-mcp-server] REST domain modules: meta + workspace + rig + documents + agent + quota + merge + skills + feed + convoy (GT_DOLT_BASE_URL unset → no /me/stats cross-workspace surface)"
+                "[gt-mcp-server] REST domain modules: meta + workspace + rig + documents + memory + agent + quota + merge + skills + feed + convoy (GT_DOLT_BASE_URL unset → no /me/stats cross-workspace surface)"
             ),
         }
     } else {
@@ -1396,12 +1397,31 @@ async fn build_domain_router(
     // (blob attach errors, .md still works). Extraction runs without OCR in the default build
     // (the tesseract OcrEngine is behind the `ocr-tesseract` feature, docs/11).
     let (blob, bucket) = build_blob_store();
+    // Build the embedder ONCE and share it across documents.* and memory.*: the
+    // fastembed model is heavy (an ONNX load), so loading it twice would double the
+    // memory + startup cost for no benefit. `Option<Arc<dyn Embedder>>` is cheap to
+    // clone (a refcount bump), so both handlers ride the same engine.
+    let embedder = build_embedder();
     let router = router.register(Arc::new(DocumentsHandler::new(
         ws_pools.clone(),
         blob,
         bucket,
         Extractor::without_ocr(),
-        build_embedder(),
+        embedder.clone(),
+    )));
+
+    // memory.* dispatch (hq-memory-mcp.4): the durable, named semantic-memory store an
+    // agent writes once and recalls BY MEANING. Mirror of documents.* — PG-backed,
+    // gated on GT_PG_URL, and riding the SAME shared embedder so a `memory.save` embeds
+    // over the one fastembed engine documents already loaded. The repo binds the default
+    // tenant pool (`ws_default.memories`), the single-tenant default this server serves.
+    let memory_pool = ws_pools
+        .get(None)
+        .await
+        .context("connect default workspace pool for memory.*")?;
+    let router = router.register(Arc::new(MemoryHandler::new(
+        Arc::new(PgMemory::new(memory_pool)),
+        embedder,
     )));
     eprintln!(
         "[gt-mcp-server] domain namespaces: {:?}",
