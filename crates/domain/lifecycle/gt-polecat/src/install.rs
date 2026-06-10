@@ -154,6 +154,60 @@ const MEMORY_RECALL_CMD: &str = concat!(
     r#"exit 0"#,
 );
 
+/// Per-turn variant of [`MEMORY_RECALL_CMD`]: a `UserPromptSubmit` hook that does a SEMANTIC recall
+/// against THIS turn's user prompt (not the global pinned bead) and injects the result as the turn's
+/// `additionalContext` (`hq-memory-autorecall.2`). Where the SessionStart recall warms the agent
+/// once with bead-relevant lore, this refines per-step: a prompt like "fix the merge-queue race"
+/// pulls the memories that prompt is actually about, even mid-session.
+///
+/// COST GOVERNANCE — this fires on EVERY turn, so it adds a recall round-trip (tokens + latency) to
+/// every prompt. It is therefore gated behind [`MEMORY_AUTORECALL_TURN_ENV`]
+/// (`GT_MEMORY_AUTORECALL_TURN`) and is OFF unless that env is set to a truthy value (`1`/`true`/
+/// `on`/`yes`). The default is OFF because the SessionStart recall (.1) already delivers the bulk of
+/// the benefit (the agent is born warm with its hard `feedback` rules + bead lore); the per-turn
+/// refinement is opt-in so an operator pays the per-turn cost only where the workload warrants it.
+/// When ON, the recall `limit` is a conservative [`MEMORY_RECALL_TURN_LIMIT`] (3) — a tight top-k so
+/// the per-turn injection stays a nudge, not a context flood. The env NAME + default are shared with
+/// the `.3` knobs bead (the `GT_MEMORY_AUTORECALL*` family).
+///
+/// The Claude Code `UserPromptSubmit` event arrives on stdin as JSON carrying the typed prompt in a
+/// `prompt` field (e.g. `{"hook_event_name":"UserPromptSubmit","prompt":"<text>","session_id":…}`);
+/// the hook extracts it the same jq-with-grep-fallback way [`MEMORY_GUARD_CMD`] reads `tool_input`,
+/// uses it as the recall `query`, unwraps the MCP `content[0].text` envelope, renders the memories to
+/// the same text block, and emits it under `hookSpecificOutput.hookEventName == "UserPromptSubmit"`
+/// (the documented per-turn additionalContext channel). BEST-EFFORT: the env unset, an empty prompt,
+/// an absent `gtmcp`/`jq`, or a failed recall is a silent `exit 0` WITHOUT extra context — the hook
+/// must NEVER break the turn (the same contract as every other hook here).
+const MEMORY_RECALL_TURN_CMD: &str = concat!(
+    // Gate 1: opt-in env. Default OFF — only a truthy GT_MEMORY_AUTORECALL_TURN enables per-turn
+    // recall, because it costs a round-trip every turn and the SessionStart recall already warms.
+    r#"case "${GT_MEMORY_AUTORECALL_TURN:-}" in 1|true|TRUE|on|ON|yes|YES) ;; *) exit 0 ;; esac; "#,
+    // Need the gtmcp client and jq to query + shape the output. Any miss → no-op.
+    r#"command -v gtmcp >/dev/null 2>&1 || exit 0; "#,
+    r#"command -v jq >/dev/null 2>&1 || exit 0; "#,
+    // Read the UserPromptSubmit event and extract the typed prompt, tolerating jq-present and
+    // jq-absent images (the MEMORY_GUARD_CMD pattern, here against `.prompt`).
+    r#"ev=$(cat); "#,
+    r#"if command -v jq >/dev/null 2>&1; then "#,
+    r#"q=$(printf '%s' "$ev" | jq -r '.prompt // .user_input // empty' 2>/dev/null); "#,
+    r#"else "#,
+    r#"q=$(printf '%s' "$ev" | grep -oE '"prompt"[[:space:]]*:[[:space:]]*"[^"]*"' | head -n1 | sed -E 's/.*:[[:space:]]*"([^"]*)"/\1/'); "#,
+    r#"fi; "#,
+    // No prompt text to query with → stay silent.
+    r#"[ -n "$q" ] || exit 0; "#,
+    // Recall (best-effort, conservative limit so the per-turn injection stays a focused nudge).
+    r#"req=$(jq -nc --arg q "$q" '{query:$q,limit:3}' 2>/dev/null) || exit 0; "#,
+    r#"raw=$(gtmcp --compact call memory.recall "$req" 2>/dev/null) || exit 0; "#,
+    r#"[ -n "$raw" ] || exit 0; "#,
+    // Unwrap the MCP envelope (content[0].text is the tool payload JSON string) then render.
+    r#"inner=$(printf '%s' "$raw" | jq -r '(.content[0].text // empty)' 2>/dev/null); "#,
+    r#"[ -n "$inner" ] || inner="$raw"; "#,
+    r#"md=$(printf '%s' "$inner" | jq -r '([(.memories // [])[] | "=== " + .name + " [" + .kind + "] ===\n" + (.description // "") + "\n\n" + (.body // "")] | sort) as $m | if ($m | length) == 0 then "" else "RECALLED MEMORY (auto-injected for this turn). Durable team memories relevant to your prompt below; treat any [feedback] item as a HARD operating rule.\n\n" + ($m | join("\n\n")) end' 2>/dev/null); "#,
+    // Nothing recalled → stay silent, never emit an empty block.
+    r#"[ -n "$md" ] && printf '%s' "$md" | jq -R -s '{hookSpecificOutput:{hookEventName:"UserPromptSubmit",additionalContext:.}}' 2>/dev/null; "#,
+    r#"exit 0"#,
+);
+
 /// One Claude hook entry running `cmd` for every event of its kind (`matcher: ""`).
 fn hook(cmd: &str) -> serde_json::Value {
     json!({ "matcher": "", "hooks": [ { "type": "command", "command": cmd } ] })
@@ -216,6 +270,41 @@ pub fn memory_recall_args(bead: Option<&str>) -> Option<serde_json::Value> {
     Some(json!({ "query": bead, "limit": MEMORY_RECALL_LIMIT }))
 }
 
+/// Env an operator sets to opt into per-turn memory recall (`hq-memory-autorecall.2`). The per-turn
+/// hook ([`MEMORY_RECALL_TURN_CMD`]) fires on EVERY prompt, so it is OFF unless this env is truthy —
+/// the SessionStart recall (.1) already warms the agent; the per-turn refinement is opt-in cost.
+/// Shared name with the `.3` knobs bead (the `GT_MEMORY_AUTORECALL*` family).
+pub const MEMORY_AUTORECALL_TURN_ENV: &str = "GT_MEMORY_AUTORECALL_TURN";
+
+/// Conservative per-turn recall top-k (`hq-memory-autorecall.2`): tighter than the SessionStart
+/// [`MEMORY_RECALL_LIMIT`] so a mid-turn injection stays a focused nudge, not a context flood.
+pub const MEMORY_RECALL_TURN_LIMIT: u32 = 3;
+
+/// Whether a value read from [`MEMORY_AUTORECALL_TURN_ENV`] enables per-turn recall — the truthy set
+/// the shell `case` gate accepts (`1`/`true`/`on`/`yes`, case-insensitive). Lifted into pure Rust so
+/// the Rust mirror and the shell gate cannot drift, and unit-tested.
+pub fn memory_autorecall_turn_enabled(env_value: Option<&str>) -> bool {
+    matches!(
+        env_value.map(|v| v.trim().to_ascii_lowercase()).as_deref(),
+        Some("1" | "true" | "on" | "yes")
+    )
+}
+
+/// Build the per-turn `memory.recall` arguments for a user prompt — the pure-Rust mirror of
+/// [`MEMORY_RECALL_TURN_CMD`]'s gate + query. `None` when per-turn recall is disabled
+/// ([`memory_autorecall_turn_enabled`]) or the prompt is blank (the hook no-ops); else the prompt
+/// seeds the semantic query at the conservative [`MEMORY_RECALL_TURN_LIMIT`].
+pub fn memory_recall_turn_args(env_value: Option<&str>, prompt: &str) -> Option<serde_json::Value> {
+    if !memory_autorecall_turn_enabled(env_value) {
+        return None;
+    }
+    let prompt = prompt.trim();
+    if prompt.is_empty() {
+        return None;
+    }
+    Some(json!({ "query": prompt, "limit": MEMORY_RECALL_TURN_LIMIT }))
+}
+
 /// The `Stop` hook entry that reports a turn's token usage into the quota-feed ([`COSTS_REPORT_CMD`]).
 /// Exported so an INTERACTIVE session (the terminal's role-session launch) can install the same
 /// predictive-rotation feed the polecats emit (`hq-quota-feed`) — the command is identical (it reads
@@ -248,7 +337,10 @@ pub fn polecat_settings_json() -> String {
             // recall hook PUSHES the team's feedback rules + bead-relevant lore into the fresh
             // agent's context so it is born warm, the read mirror of the PreToolUse memory guard.
             "SessionStart": [ hook(HEARTBEAT_CMD), hook(MEMORY_RECALL_CMD) ],
-            "UserPromptSubmit": [ hook(HEARTBEAT_CMD) ],
+            // UserPromptSubmit: heartbeat touch + per-turn memory autorecall (hq-memory-autorecall.2).
+            // The per-turn recall is OPT-IN (GT_MEMORY_AUTORECALL_TURN) and no-ops by default — it
+            // refines context against THIS prompt, on top of the SessionStart warm-up.
+            "UserPromptSubmit": [ hook(HEARTBEAT_CMD), hook(MEMORY_RECALL_TURN_CMD) ],
             "PostToolUse": [ hook(HEARTBEAT_CMD) ],
             // PreToolUse memory guard (hq-memory-mcp.6): DENY a write into the file-based memory
             // corpus, redirecting the agent to mcp__gt__memory_save. The deterministic harness-level
@@ -346,6 +438,15 @@ mod tests {
         assert!(recall.contains("additionalContext"));
         assert!(recall.contains("SessionStart"));
         assert!(recall.contains("exit 0"));
+        // UserPromptSubmit carries the heartbeat + the per-turn memory autorecall
+        // (hq-memory-autorecall.2): opt-in, queries by the prompt, injects per-turn context.
+        let ups = v["hooks"]["UserPromptSubmit"].as_array().unwrap();
+        assert_eq!(ups.len(), 2, "heartbeat + per-turn autorecall");
+        let turn = ups[1]["hooks"][0]["command"].as_str().unwrap();
+        assert!(turn.contains("GT_MEMORY_AUTORECALL_TURN"), "opt-in env gate");
+        assert!(turn.contains("memory.recall"), "calls the recall tool");
+        assert!(turn.contains("UserPromptSubmit"), "per-turn additionalContext channel");
+        assert!(turn.contains("exit 0"), "best-effort: never breaks the turn");
     }
 
     #[test]
@@ -363,6 +464,26 @@ mod tests {
         assert!(memory_recall_args(None).is_none());
         assert!(memory_recall_args(Some("")).is_none());
         assert!(memory_recall_args(Some("   ")).is_none());
+    }
+
+    #[test]
+    fn memory_recall_turn_gate_and_query() {
+        // hq-memory-autorecall.2: OFF by default — without the opt-in env, no per-turn recall.
+        assert!(!memory_autorecall_turn_enabled(None));
+        assert!(!memory_autorecall_turn_enabled(Some("0")));
+        assert!(!memory_autorecall_turn_enabled(Some("off")));
+        assert!(memory_recall_turn_args(None, "fix the merge race").is_none());
+        // The truthy set (case-insensitive) enables it.
+        for v in ["1", "true", "TRUE", "on", "ON", "yes", "  Yes  "] {
+            assert!(memory_autorecall_turn_enabled(Some(v)), "{v} should enable");
+        }
+        // Enabled + a prompt → recall args querying by the prompt at the conservative turn limit.
+        let a = memory_recall_turn_args(Some("on"), "  fix the merge-queue race  ").unwrap();
+        assert_eq!(a["query"], json!("fix the merge-queue race"));
+        assert_eq!(a["limit"], json!(MEMORY_RECALL_TURN_LIMIT));
+        assert!(MEMORY_RECALL_TURN_LIMIT < MEMORY_RECALL_LIMIT, "turn top-k is tighter");
+        // Enabled but a blank prompt → no-op, mirroring the shell gate.
+        assert!(memory_recall_turn_args(Some("1"), "   ").is_none());
     }
 
     #[test]
