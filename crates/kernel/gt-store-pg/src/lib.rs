@@ -107,6 +107,21 @@ pub fn docs_migrations() -> Vec<Migration> {
     ]
 }
 
+/// Migration #1: per-workspace `memories` table in the `ws_default` template.
+const MEMORY_0001_SQL: &str = include_str!("../migrations/gt-memory/0001_memories.sql");
+
+/// Migrations for the `gt-memory` per-workspace semantic memory store (hq-memory-mcp.1),
+/// in ascending apply order.
+///
+/// Like `gt-docs`' `documents`, the `memories` table is per-workspace projection data
+/// defined ONCE in the `ws_default` template schema; the catalog runner applies it on
+/// boot and `gt_create_workspace_schema` clones it into every tenant (docs/11, docs/04
+/// §15). It ships its `tsv` full-text + `embedding` pgvector columns in the same
+/// migration (no phase split), so a memory is recallable by meaning from row zero.
+pub fn memory_migrations() -> Vec<Migration> {
+    vec![Migration::new(1, "0001_memories", MEMORY_0001_SQL)]
+}
+
 /// Initial migration: `notifications` table in the public schema.
 const NOTIFICATIONS_0001_SQL: &str =
     include_str!("../migrations/notifications/0001_notifications.sql");
@@ -255,5 +270,37 @@ mod tests {
         let sql = feature_flags_migrations()[0].sql.to_uppercase();
         assert!(sql.contains("REFERENCES WORKSPACES (ID)"), "FK to workspaces.id");
         assert!(sql.contains("ON DELETE CASCADE"), "cascade on workspace removal");
+    }
+
+    #[test]
+    fn memory_migration_defines_template_table_with_semantic_columns() {
+        let migs = memory_migrations();
+        assert_eq!(migs.len(), 1);
+        assert_eq!(migs[0].version, 1);
+        assert_eq!(migs[0].name, "0001_memories");
+
+        let sql = &migs[0].sql;
+        // Per-workspace projection: defined in the ws_default template, idempotent.
+        assert!(sql.contains("CREATE SCHEMA IF NOT EXISTS ws_default"), "bootstraps template");
+        assert!(sql.contains("ws_default.memories"), "table in template schema");
+        assert!(sql.to_uppercase().contains("CREATE TABLE IF NOT EXISTS"), "idempotent");
+        // Structural isolation: no workspace_id column / FK (the prose may name it).
+        assert!(!sql.contains("workspace_id TEXT"), "no workspace_id column");
+        assert!(!sql.to_uppercase().contains("REFERENCES WORKSPACES"), "no FK to workspaces");
+        // Upsert-by-name natural key + the four recall classes.
+        assert!(sql.contains("name        TEXT        PRIMARY KEY"), "name is the natural key");
+        assert!(
+            sql.contains("kind IN ('feedback', 'project', 'reference', 'user')"),
+            "four recall classes",
+        );
+        // Hybrid retrieval: generated full-text vector + pgvector embedding (mirrors documents).
+        assert!(sql.contains("tsv"), "generated full-text column");
+        assert!(sql.contains("GENERATED ALWAYS AS"), "tsv is generated, not a trigger");
+        assert!(sql.contains("CREATE EXTENSION IF NOT EXISTS vector"), "enables pgvector");
+        assert!(sql.contains("embedding   vector(384)"), "384-dim embedding column");
+        assert!(sql.to_lowercase().contains("hnsw"), "ANN index");
+        assert!(sql.contains("memories_kind_idx"), "per-kind index for list/operating_rules");
+        // Locked decisions realized in the schema.
+        assert!(sql.contains("version"), "optimistic-concurrency token");
     }
 }
