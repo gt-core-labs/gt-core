@@ -28,6 +28,7 @@ pub mod server;
 pub mod workspace;
 pub mod ws_status;
 
+pub use dispatch::QuotaBlockSignal;
 pub use documents::DocumentsResource;
 pub use domain::{DomainCtx, DomainHandler, DomainRouter};
 pub use health::HealthState;

@@ -48,7 +48,7 @@ use gt_composition::mcp::{
     EventLog, EventLogConvoy, EventLogFeed, EventLogHooks, EventLogIssueSink, EventLogMerges,
     EventLogQuota, EventLogSkills, FsAccountCatalog, GraphHandler, IdentityDoltMeStats,
     MergeHandler, NotifyHandler, PgDocumentsResource, PgRigPrefixes, PgWorkspaceStatus,
-    QuotaHandler, RigHandler, WorkspaceHandler, WsPoolRigs, WsPools,
+    QuotaBlockGuard, QuotaHandler, RigHandler, WorkspaceHandler, WsPoolRigs, WsPools,
 };
 use gt_composition::onboard::{onboard_router, OnboardState};
 use gt_composition::operator_resource::EventLogOperatorResource;
@@ -306,7 +306,12 @@ async fn main() -> anyhow::Result<()> {
     // movement the REST surface alone would miss — publishes its event into the same per-workspace
     // log the SSE feed fans out, so the tracker moves on `GET /stream?channel=issues`.
     let mut service = IssuesServer::new(store, default_scope, rbac, audit.clone(), tools, repo_dir)
-        .with_issue_sink(issue_sink.clone());
+        .with_issue_sink(issue_sink.clone())
+        // Claim-context custodian's quota signal (hq-context-custodian.2): a `working`
+        // transition with no context is deferred (debt note) instead of stop-the-line ONLY
+        // when the workspace pool is freshly out of capacity — read from the same per-workspace
+        // quota event log the quota.* handler replays. Always on (the log is always present).
+        .with_quota_signal(Arc::new(QuotaBlockGuard::new(event_log.clone())));
 
     // Domain dispatch (hq-mcp-dispatch): tool namespaces beyond issues.*/meta.*
     // (workspace.*, rig.*, …) route to PG-backed handlers. Wired only when

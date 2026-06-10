@@ -42,7 +42,7 @@ pub use graph::GraphHandler;
 pub use merge::MergeHandler;
 pub use notify::NotifyHandler;
 pub use pools::WsPools;
-pub use quota::QuotaHandler;
+pub use quota::{QuotaBlockGuard, QuotaHandler};
 pub use rest_backings::{
     EventLogConvoy, EventLogFeed, EventLogHooks, EventLogMerges, EventLogQuota, EventLogSkills,
     FsAccountCatalog, IdentityDoltMeStats, WsPoolRigs,

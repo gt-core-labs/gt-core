@@ -33,6 +33,25 @@ fn parse_args<T: serde::de::DeserializeOwned>(args: Value) -> Result<T, AppError
         .map_err(|e| AppError::Validation(format!("invalid arguments: {e}")))
 }
 
+/// The freshly-confirmed-block signal the claim-context custodian consults
+/// (`hq-context-custodian.2`). A transition to `working` without context is normally
+/// a stop-the-line; the custodian only *defers* it (rather than reject) when the
+/// quota subsystem confirms there is genuinely no capacity to feed the work. That
+/// authorization MUST come from the subsystem, never from a field the agent sets —
+/// otherwise the deferral is a loophole.
+///
+/// The composition root implements this over the workspace's quota event log:
+/// replay it into an [`AccountRegistry`](gt_quota::AccountRegistry) and return
+/// [`pool_genuinely_blocked`](gt_quota::AccountRegistry::pool_genuinely_blocked),
+/// which is `true` only on a non-empty, no-Healthy, freshly-blocked pool. `None`
+/// wired (no quota log) ⇒ the custodian sees `false`, so context stays mandatory.
+#[async_trait::async_trait]
+pub trait QuotaBlockSignal: Send + Sync {
+    /// `true` when `workspace`'s account pool offers no fresh capacity — the only
+    /// condition under which a context-less `working` claim may be deferred.
+    async fn pool_blocked(&self, workspace: Option<&str>) -> bool;
+}
+
 /// Reject an `issues.create` whose rig is not routable in the caller's workspace
 /// (hq-mt-rigs.6, hq-bead-id-standard.2): the `rig` field (or the prefix derived
 /// from the provided `id`) must be a registered rig prefix in `ws` or a reserved/
@@ -93,6 +112,9 @@ pub async fn dispatch(
     request_rig: Option<&str>,
     prefixes: Option<&dyn WorkspaceRigPrefixes>,
     sink: Option<&dyn IssueEventSink>,
+    // hq-context-custodian.2: the freshly-confirmed-block signal the claim-context
+    // custodian consults on a `working` transition. `None` ⇒ context stays mandatory.
+    quota_signal: Option<&dyn QuotaBlockSignal>,
 ) -> Result<Value, AppError> {
     match tool {
         "issues.create.validate" => {
@@ -138,9 +160,16 @@ pub async fn dispatch(
         }
         "issues.transition.execute" => {
             let a: TransitionIssue = parse_args(args)?;
-            // quota_blocked=false for now: the real freshly-confirmed-block signal is
-            // threaded in from the composition root in hq-context-custodian.2.
-            run_transition_issue(store, &a, false, false).await?;
+            // Consult the quota subsystem ONLY for a `working` claim — the one move the
+            // custodian gates — and only when a signal is wired; otherwise context stays
+            // mandatory. The signal (not the agent) is what may authorize a deferral.
+            // Parse (don't `target_status()`, which panics on a malformed label) so a bad
+            // target falls through to run_transition_issue's validate, not a panic here.
+            let quota_blocked = match (gt_store_dolt::IssueStatus::parse(&a.target), quota_signal) {
+                (Some(gt_store_dolt::IssueStatus::Working), Some(sig)) => sig.pool_blocked(ws).await,
+                _ => false,
+            };
+            run_transition_issue(store, &a, quota_blocked, false).await?;
             emit_issue_event(sink, store, ws, IssueVerb::Transitioned, &a.id, actor).await;
             Ok(json!({ "ok": true }))
         }

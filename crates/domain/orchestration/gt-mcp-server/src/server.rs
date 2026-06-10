@@ -28,7 +28,7 @@ use rmcp::service::{NotificationContext, RequestContext, RoleServer};
 use rmcp::{ErrorData as McpError, ServerHandler};
 use tracing::Instrument;
 
-use crate::dispatch::{dispatch, dispatch_meta, parse_issue_filter};
+use crate::dispatch::{dispatch, dispatch_meta, parse_issue_filter, QuotaBlockSignal};
 use crate::documents::DocumentsResource;
 use crate::domain::{DomainCtx, DomainRouter};
 use crate::prefixes::WorkspaceRigPrefixes;
@@ -129,6 +129,12 @@ pub struct IssuesServer {
     /// natural-movement source the REST surface alone would miss. `None` emits nothing,
     /// so the issues-only build is unchanged.
     issue_sink: Option<Arc<dyn IssueEventSink>>,
+    /// Freshly-confirmed quota-block signal for the claim-context custodian
+    /// (`hq-context-custodian.2`). `Some` when the composition root wires the workspace
+    /// quota log: a `working` transition with no context is then *deferred* (not rejected)
+    /// only when the pool is confirmed out of capacity. `None` keeps context mandatory,
+    /// so the issues-only build is unchanged.
+    quota_signal: Option<Arc<dyn QuotaBlockSignal>>,
 }
 
 /// The auth-free readiness probe tool (hq-mcp-ready-probe.1). No input schema,
@@ -180,6 +186,7 @@ impl IssuesServer {
             workspace_status: None,
             documents: None,
             issue_sink: None,
+            quota_signal: None,
         }
     }
 
@@ -189,6 +196,15 @@ impl IssuesServer {
     /// `GET /stream?channel=issues`. Additive — without it the MCP path emits nothing.
     pub fn with_issue_sink(mut self, sink: Arc<dyn IssueEventSink>) -> Self {
         self.issue_sink = Some(sink);
+        self
+    }
+
+    /// Wire the claim-context custodian's quota-block signal (`hq-context-custodian.2`):
+    /// a `working` transition with no context is then deferred (with a debt note) instead
+    /// of stop-the-line ONLY when `signal` confirms the workspace pool is freshly out of
+    /// capacity. Additive — without it, context stays mandatory for every `working` claim.
+    pub fn with_quota_signal(mut self, signal: Arc<dyn QuotaBlockSignal>) -> Self {
+        self.quota_signal = Some(signal);
         self
     }
 
@@ -648,6 +664,7 @@ impl ServerHandler for IssuesServer {
                         request_rig,
                         self.rig_prefixes.as_deref(),
                         self.issue_sink.as_deref(),
+                        self.quota_signal.as_deref(),
                     )
                     .await
                 }

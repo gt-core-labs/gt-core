@@ -15,13 +15,14 @@
 //! mutations), plus `quota.list` / `quota.info` reads.
 
 use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
 use serde::de::DeserializeOwned;
 use serde_json::{json, Value};
 
 use gt_events::{Command, EventKind};
-use gt_mcp_server::{DomainCtx, DomainHandler};
+use gt_mcp_server::{DomainCtx, DomainHandler, QuotaBlockSignal};
 use gt_module::McpTool;
 use gt_quota::{
     Account, AccountRegistry, ProbeWindow, QuotaEvent, QuotaState, RegisterAccount, RetireAccount,
@@ -34,6 +35,49 @@ use super::util::{descriptor, ev_err, parse_cmd, req, str_arg};
 
 /// The event-log kind prefix for every quota event (`quota.*.v1`).
 const NS: &str = "quota.";
+
+/// The claim-context custodian's quota-block signal (`hq-context-custodian.2`),
+/// backed by the same per-workspace quota event log the [`QuotaHandler`] replays.
+///
+/// On each `working` transition the issues server asks whether the caller's workspace
+/// pool is freshly out of capacity; this guard replays that tenant's quota log into an
+/// [`AccountRegistry`] and answers with
+/// [`pool_genuinely_blocked`](AccountRegistry::pool_genuinely_blocked) — `true` only on
+/// a non-empty, no-`Healthy`, freshly-blocked pool. A replay error answers `false`
+/// (keep context mandatory): the deferral is the exception, never the failure mode.
+///
+/// The signal is the *only* thing that can authorize a context-less claim, and it comes
+/// from the subsystem, never from the agent — closing the loophole the custodian guards.
+pub struct QuotaBlockGuard {
+    log: Arc<EventLog>,
+}
+
+impl QuotaBlockGuard {
+    /// Wrap the shared per-workspace event log (the same one [`QuotaHandler`] uses).
+    pub fn new(log: Arc<EventLog>) -> Self {
+        Self { log }
+    }
+}
+
+#[async_trait]
+impl QuotaBlockSignal for QuotaBlockGuard {
+    async fn pool_blocked(&self, workspace: Option<&str>) -> bool {
+        // Edge clock: the domain reads no clock, so the freshness comparison is fed
+        // `now` from here (mirrors the quota REST/feed edges).
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        match self
+            .log
+            .replay_domain(workspace, NS, QuotaState::default(), QuotaState::apply)
+        {
+            Ok(state) => AccountRegistry::from_state(&state).pool_genuinely_blocked(now),
+            // Can't confirm a block ⇒ keep the context requirement in force.
+            Err(_) => false,
+        }
+    }
+}
 
 /// Event-sourced handler for the `quota.*` tool namespace.
 pub struct QuotaHandler {
@@ -302,5 +346,64 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(bad, AppError::Validation(_)));
+    }
+
+    /// The custodian's quota signal end-to-end (hq-context-custodian.2): the guard reads
+    /// the SAME per-workspace quota log the `quota.*` handler writes, replays it into the
+    /// registry, and answers `pool_genuinely_blocked`. It authorizes a context deferral
+    /// ONLY on a non-empty, no-Healthy, freshly-blocked pool — and withdraws it the moment
+    /// a probe shows recovered capacity. This is the transition→custodian→quota seam minus
+    /// the Dolt store (the store leg is covered by the gated issues http_contract test).
+    #[tokio::test]
+    async fn quota_block_guard_defers_only_on_a_fresh_fully_blocked_pool() {
+        let dir = TempDir::new().unwrap();
+        let log = Arc::new(EventLog::new(Some(dir.path().to_path_buf())));
+        let guard = QuotaBlockGuard::new(log.clone());
+
+        // No accounts ⇒ nothing to confirm ⇒ context stays mandatory.
+        assert!(!guard.pool_blocked(None).await, "empty pool never authorizes a deferral");
+
+        // A single account, freshly blocked: a probe at remaining=0 with a far-future reset
+        // seeds the window, then a Blocked event flips the status. now < resets_at ⇒ fresh.
+        let future = 9_000_000_000u64;
+        log.append(
+            None,
+            QuotaEvent::UsageProbed {
+                account: "acc-1".into(),
+                remaining: 0,
+                resets_at_secs: future,
+                weekly_remaining: None,
+                weekly_resets_at_secs: None,
+                now_secs: 1_000,
+            },
+        )
+        .unwrap();
+        log.append(
+            None,
+            QuotaEvent::Blocked { account: "acc-1".into(), until_secs: Some(future), now_secs: 1_000 },
+        )
+        .unwrap();
+        assert!(
+            guard.pool_blocked(None).await,
+            "a fresh, fully-exhausted pool authorizes the context deferral"
+        );
+
+        // A probe showing recovered capacity lifts the account to Healthy ⇒ no deferral.
+        log.append(
+            None,
+            QuotaEvent::UsageProbed {
+                account: "acc-1".into(),
+                remaining: 40_000_000,
+                resets_at_secs: future,
+                weekly_remaining: None,
+                weekly_resets_at_secs: None,
+                now_secs: 2_000,
+            },
+        )
+        .unwrap();
+        assert!(
+            !guard.pool_blocked(None).await,
+            "recovered capacity withdraws the deferral — context mandatory again"
+        );
     }
 }
