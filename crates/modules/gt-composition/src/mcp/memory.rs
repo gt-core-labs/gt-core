@@ -188,6 +188,14 @@ impl DomainHandler for MemoryHandler {
                  is a successful no-op.",
                 &[req("name", "string")],
             ),
+            descriptor(
+                "memory.clear",
+                "Bulk hard-delete, returning the count removed. With `kind`, deletes exactly \
+                 that class (including feedback when named explicitly); without `kind`, deletes \
+                 everything EXCEPT feedback so the hard operating rules survive. Requires \
+                 `confirm: true` — an unconfirmed call deletes nothing.",
+                &[req("confirm", "boolean"), opt("kind", "string")],
+            ),
         ]
     }
 
@@ -235,6 +243,23 @@ impl DomainHandler for MemoryHandler {
                 let name = str_arg(&ctx.args, "name")?;
                 repo.forget(name).await.map_err(mem_err)?;
                 Ok(json!({ "ok": true, "name": name, "forgotten": true }))
+            }
+            "memory.clear" => {
+                // Guard: a bulk delete must be explicitly confirmed. Validate confirm + kind
+                // BEFORE touching the pool so an unconfirmed/bad call is a pure validation error
+                // that deletes nothing.
+                let confirm = ctx.args.get("confirm").and_then(Value::as_bool).unwrap_or(false);
+                if !confirm {
+                    return Err(AppError::Validation(
+                        "memory.clear is a bulk delete — pass confirm:true to proceed".into(),
+                    ));
+                }
+                let kind = parse_opt_kind(&ctx)?;
+                let repo = self.repo(ctx.workspace).await?;
+                // `Some(kind)` clears that class (feedback only when named); `None` clears all
+                // EXCEPT feedback — the hard rules survive a blanket clear (store-side guard).
+                let deleted = repo.clear(kind.map(|k| k.as_str())).await.map_err(mem_err)?;
+                Ok(json!({ "ok": true, "kind": kind.map(|k| k.as_str()), "deleted": deleted }))
             }
             other => Err(AppError::Validation(format!("unknown memory tool `{other}`"))),
         }
@@ -341,7 +366,7 @@ fn mem_json(m: &MemoryRow) -> Value {
 mod tests {
     //! Two test tiers, mirroring the multi-tenant `documents.*` shape:
     //!
-    //! 1. **Pure-validation tests** (always run): namespace, the five advertised tools in
+    //! 1. **Pure-validation tests** (always run): namespace, the six advertised tools in
     //!    `meta.help`, invalid-kind rejection, and unknown-tool routing. These short-circuit
     //!    *before* any pool is resolved (kind is parsed ahead of `self.repo(...)` on every
     //!    arm, and the unknown-tool arm never touches the pool), so a `WsPools` over a dummy
@@ -380,7 +405,7 @@ mod tests {
     }
 
     #[test]
-    fn advertises_five_tools_in_meta_help() {
+    fn advertises_six_tools_in_meta_help() {
         let names: Vec<String> = handler()
             .descriptors()
             .iter()
@@ -393,9 +418,27 @@ mod tests {
                 "memory.recall",
                 "memory.list",
                 "memory.get",
-                "memory.forget"
+                "memory.forget",
+                "memory.clear"
             ]
         );
+    }
+
+    #[tokio::test]
+    async fn clear_requires_confirmation() {
+        let h = handler();
+        // No confirm → pure validation error (no pool touched), deletes nothing.
+        let err = h.dispatch("memory.clear", ctx(json!({}))).await;
+        assert!(matches!(err, Err(AppError::Validation(_))), "unconfirmed clear is rejected");
+        let err = h
+            .dispatch("memory.clear", ctx(json!({ "confirm": false, "kind": "project" })))
+            .await;
+        assert!(matches!(err, Err(AppError::Validation(_))), "confirm:false is rejected");
+        // A bad kind is still a pure validation error even with confirm:true.
+        let err = h
+            .dispatch("memory.clear", ctx(json!({ "confirm": true, "kind": "bogus" })))
+            .await;
+        assert!(matches!(err, Err(AppError::Validation(_))), "invalid kind rejected");
     }
 
     #[tokio::test]

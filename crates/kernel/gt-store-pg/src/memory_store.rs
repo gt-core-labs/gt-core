@@ -154,6 +154,12 @@ pub trait MemoryRepository: Send + Sync {
     /// is a successful no-op (the store has no soft-delete; upsert-by-name means a name is
     /// either present or gone).
     async fn forget(&self, name: &str) -> Result<(), MemoryError>;
+    /// **CLEAR**: bulk hard-delete, returning the number of rows removed. `Some(kind)` deletes
+    /// exactly that recall class (including `feedback` when named explicitly); `None` deletes
+    /// everything EXCEPT `feedback` — the hard operating rules survive a blanket clear, so wiping
+    /// them is always a deliberate `clear(Some("feedback"))`. The structural guard against nuking
+    /// the loop's binding constraints by accident.
+    async fn clear(&self, kind: Option<&str>) -> Result<u64, MemoryError>;
 }
 
 /// Postgres adapter over a tenant-scoped [`WorkspacePool`]. Mirror of
@@ -297,5 +303,25 @@ impl MemoryRepository for PgMemory {
             .execute(self.pool.pool())
             .await?;
         Ok(())
+    }
+
+    async fn clear(&self, kind: Option<&str>) -> Result<u64, MemoryError> {
+        // Some(kind): delete exactly that class (feedback only when named explicitly).
+        // None: delete everything EXCEPT feedback, so a blanket clear can never wipe the
+        // hard operating rules — removing those stays a deliberate clear(Some("feedback")).
+        let res = match kind {
+            Some(k) => {
+                sqlx::query("DELETE FROM memories WHERE kind = $1")
+                    .bind(k)
+                    .execute(self.pool.pool())
+                    .await?
+            }
+            None => {
+                sqlx::query("DELETE FROM memories WHERE kind <> 'feedback'")
+                    .execute(self.pool.pool())
+                    .await?
+            }
+        };
+        Ok(res.rows_affected())
     }
 }

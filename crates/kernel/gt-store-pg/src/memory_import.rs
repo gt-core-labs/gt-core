@@ -179,6 +179,16 @@ mod tests {
             self.rows.lock().unwrap().remove(name);
             Ok(())
         }
+
+        async fn clear(&self, kind: Option<&str>) -> Result<u64, MemoryError> {
+            let mut rows = self.rows.lock().unwrap();
+            let before = rows.len();
+            match kind {
+                Some(k) => rows.retain(|_, r| r.kind != k),
+                None => rows.retain(|_, r| r.kind == "feedback"),
+            }
+            Ok((before - rows.len()) as u64)
+        }
     }
 
     /// Write a corpus `.md` with frontmatter into `dir`.
