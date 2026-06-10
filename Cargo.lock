@@ -1618,6 +1618,7 @@ dependencies = [
  "gt-graphwarden",
  "gt-issues",
  "gt-mcp-server",
+ "gt-memory",
  "gt-merge",
  "gt-meta",
  "gt-module",

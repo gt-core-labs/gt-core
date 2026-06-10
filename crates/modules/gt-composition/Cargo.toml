@@ -83,6 +83,9 @@ gt-documents = { workspace = true, features = ["axum"] }
 gt-store-blob = { workspace = true }
 gt-docs-extract = { workspace = true }
 gt-docs-embed = { workspace = true }
+# Semantic memory dispatch (hq-memory-mcp.3): the MemoryKind domain enum (for kind
+# validation) backed by the per-workspace MemoryRepository (gt-store-pg `pg`).
+gt-memory = { workspace = true }
 base64 = { workspace = true }
 ulid = { workspace = true }
 sha2 = { workspace = true }
