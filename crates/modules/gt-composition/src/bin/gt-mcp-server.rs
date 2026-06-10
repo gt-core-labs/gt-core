@@ -115,6 +115,21 @@ async fn main() -> anyhow::Result<()> {
         .ok()
         .map(std::path::PathBuf::from);
 
+    // Singleton-daemon master switch (hq-talos-migration.4): the API surface (/mcp, REST,
+    // /auth/*, SSE feed, webhook) is stateless and scales to N replicas, but the background
+    // loops below (session reaper, archive sweep, account-dir GC, graph drift-reconcile) are
+    // SINGLETONs — running them on every replica duplicates ticks and races. A multi-replica
+    // k8s deploy runs the API tier with GT_RUN_DAEMONS=0 and a single-replica daemons tier with
+    // the default. DEFAULT = ON, so the existing single-instance compose deploy (which sets
+    // nothing) runs every daemon exactly as before — back-compat. The per-daemon cadence/off
+    // envs still apply on top; this is the one master flag the API tier flips off. Read ONCE here.
+    let run_daemons = should_run_daemons(|k| std::env::var(k).ok());
+    if run_daemons {
+        eprintln!("[gt-mcp-server] daemons: ON (singleton tier)");
+    } else {
+        eprintln!("[gt-mcp-server] daemons: OFF (API tier, GT_RUN_DAEMONS=0)");
+    }
+
     // Store: the lifted Dolt issues adapter (hq-core-host.1), on the shared Dolt. gt-core owns
     // the bootstrap (hq-docs follow-up): ensure the target database exists before the pool
     // binds to it (a fresh Dolt volume ships none), so the deploy needs no dolt-init.sql.
@@ -145,7 +160,8 @@ async fn main() -> anyhow::Result<()> {
     // run HERE, where the socket is reachable. Each tick replays the agent log and appends
     // agent.killed for interactive sessions whose tmux is gone on the declared socket; the append
     // lands in the shared log the SSE feed reads, so the Sessions view drops the dead mayor.
-    {
+    // Gated on the singleton master switch (hq-talos-migration.4): the API tier never reaps.
+    if run_daemons {
         let reaper_root = std::env::var("GT_EVENTLOG_ROOT")
             .map(std::path::PathBuf::from)
             .unwrap_or_else(|_| std::path::PathBuf::from(DEFAULT_EVENTLOG_ROOT));
@@ -651,14 +667,19 @@ async fn main() -> anyhow::Result<()> {
             });
         let initial_cfg = config_path.as_ref().map(load_config).unwrap_or_default();
         let config = std::sync::Arc::new(RwLock::new(initial_cfg.clone()));
-        tokio::spawn(
-            ArchiveDaemon::new(system_store.clone(), config.clone(), archive_pools.clone()).run(),
-        );
-        eprintln!(
-            "[gt-mcp-server] archive daemon on (interval {}min, archive_after {}d)",
-            initial_cfg.interval_minutes,
-            initial_cfg.archive_after_days,
-        );
+        // The background sweep is a SINGLETON (hq-talos-migration.4): gate the spawn on the master
+        // switch so the API tier never sweeps, but ALWAYS build the system_router below — GET/PUT
+        // /api/v1/system/* + the on-demand POST /archive/run stay served on every replica.
+        if run_daemons {
+            tokio::spawn(
+                ArchiveDaemon::new(system_store.clone(), config.clone(), archive_pools.clone())
+                    .run(),
+            );
+            eprintln!(
+                "[gt-mcp-server] archive daemon on (interval {}min, archive_after {}d)",
+                initial_cfg.interval_minutes, initial_cfg.archive_after_days,
+            );
+        }
         eprintln!(
             "[gt-mcp-server] system config REST on /api/v1/system/* (scope system.read/write)"
         );
@@ -676,8 +697,10 @@ async fn main() -> anyhow::Result<()> {
     // process, so it sweeps the accounts root on a timer and reaps dirs no live account points at
     // (a re-onboarded email replaces its dir, a retire drops one, an abandoned /start leaves an
     // empty one). Off when GT_ACCOUNTS_GC_TICK_SECS=0. The grace window spares onboards in flight.
+    // Singleton sweep (hq-talos-migration.4): gated on the master switch on top of its own
+    // GT_ACCOUNTS_GC_TICK_SECS off-switch, so the API tier never reaps credential dirs.
     let gc_tick = env_u64("GT_ACCOUNTS_GC_TICK_SECS", 21_600); // 6h
-    if gc_tick > 0 {
+    if run_daemons && gc_tick > 0 {
         let gc_grace = std::time::Duration::from_secs(env_u64("GT_ACCOUNTS_GC_GRACE_SECS", 7_200));
         let gc_root = std::env::var("GT_EVENTLOG_ROOT")
             .map(std::path::PathBuf::from)
@@ -784,8 +807,13 @@ async fn main() -> anyhow::Result<()> {
     // Opt-in + configurable: off unless GT_GRAPH_DRIFT_TICK_SECS > 0 (default 3600 = hourly), and
     // gated on GT_PG_URL (the per-workspace rig catalog + connection store). The GitHub App is
     // optional — without one, only connectionless (public) rigs are reconciled.
+    // Singleton backstop (hq-talos-migration.4): the master switch is ANDed on top of the daemon's
+    // own GT_GRAPH_DRIFT_TICK_SECS off-switch, so the API tier never ls-remotes / flips freshness.
     let drift_tick = env_u64("GT_GRAPH_DRIFT_TICK_SECS", 3600);
-    match (drift_tick > 0).then_some(()).and(std::env::var("GT_PG_URL").ok()) {
+    match (run_daemons && drift_tick > 0)
+        .then_some(())
+        .and(std::env::var("GT_PG_URL").ok())
+    {
         Some(pg_url) => match sqlx::PgPool::connect(&pg_url).await {
             Ok(conn_pool) => {
                 let connections: Arc<dyn VcsConnectionRepo> =
@@ -819,7 +847,9 @@ async fn main() -> anyhow::Result<()> {
             }
         },
         None => {
-            if drift_tick == 0 {
+            if !run_daemons {
+                eprintln!("[gt-mcp-server] graph drift-reconcile off (API tier, GT_RUN_DAEMONS=0)");
+            } else if drift_tick == 0 {
                 eprintln!("[gt-mcp-server] graph drift-reconcile off (GT_GRAPH_DRIFT_TICK_SECS=0)");
             } else {
                 eprintln!("[gt-mcp-server] graph drift-reconcile off (GT_PG_URL unset)");
@@ -1879,6 +1909,26 @@ fn env_u64(key: &str, default: u64) -> u64 {
         .unwrap_or(default)
 }
 
+/// The master switch for the singleton background daemons (hq-talos-migration.4).
+///
+/// The API surface (`/mcp`, REST, `/auth/*`, the SSE feed, the GitHub webhook) is stateless and
+/// scales to N replicas under k8s; the background loops (session reaper, archive sweep,
+/// account-dir GC, graph drift-reconcile) are SINGLETONs — running them on every replica
+/// duplicates ticks and races. So a multi-replica deploy splits the platform into an API
+/// Deployment (`GT_RUN_DAEMONS=0`) and a single-replica daemons Deployment (the default).
+///
+/// DEFAULT = ON: only an explicit `GT_RUN_DAEMONS=0` turns them off, so the existing
+/// single-instance compose deploy — which sets nothing — keeps running every daemon exactly as
+/// before. The per-daemon cadence/off envs (`GT_RECONCILE_TICK_SECS`, `GT_ACCOUNTS_GC_TICK_SECS`,
+/// `GT_GRAPH_DRIFT_TICK_SECS`, …) still apply on top; this is the one master flag the API tier
+/// flips off.
+///
+/// Pure over its `(key) -> Option<value>` lookup, so it is unit-testable without mutating the
+/// process environment.
+fn should_run_daemons(lookup: impl Fn(&str) -> Option<String>) -> bool {
+    !matches!(lookup("GT_RUN_DAEMONS").as_deref(), Some("0"))
+}
+
 /// The `Secure` flag for the auth cookies (hq-web-extras.1). Defaults to `true` (HTTPS deploy);
 /// `GT_AUTH_COOKIE_SECURE=false` opts a plain-http local dev out. `SameSite=None` forces it on
 /// regardless, since browsers drop a `None` cookie that is not also `Secure`.
@@ -2039,6 +2089,23 @@ mod tests {
         // `*` alongside other scopes is NOT the wildcard-only case → per-user role.
         let (name, _) = migrated_role("u-mixed", &["*".to_string(), "rig.read".to_string()]);
         assert_eq!(name, "migrated-u-mixed");
+    }
+
+    /// hq-talos-migration.4: the singleton-daemon master switch is ON by default (single-instance
+    /// compose sets nothing) and turns OFF only on an explicit `GT_RUN_DAEMONS=0`. Anything else
+    /// (unset, "1", "true", empty, "00") is treated as ON, so a fat-fingered value never silently
+    /// disables the daemon tier.
+    #[test]
+    fn should_run_daemons_defaults_on_and_off_only_on_zero() {
+        let on = |_: &str| None; // unset ⇒ ON
+        assert!(should_run_daemons(on));
+        assert!(!should_run_daemons(|_| Some("0".to_string())));
+        for v in ["1", "true", "TRUE", "on", "", " ", "00", "no", "false"] {
+            assert!(
+                should_run_daemons(|_| Some(v.to_string())),
+                "GT_RUN_DAEMONS={v:?} must run daemons (only \"0\" turns them off)"
+            );
+        }
     }
 
     /// hq-identity.4: only plain `ws_*` identifiers are safe to interpolate as a schema name.
