@@ -48,6 +48,7 @@ pub mod operator_event;
 pub mod operator_resource;
 pub mod polecat;
 pub mod quota_rotation;
+pub mod rest_modules;
 pub mod scope_bridge;
 pub mod session_reconcile;
 pub mod stream;

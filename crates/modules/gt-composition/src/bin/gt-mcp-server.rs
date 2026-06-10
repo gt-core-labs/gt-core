@@ -44,12 +44,10 @@ use gt_composition::denial_audit::audit_denials;
 use gt_composition::hooks::{hooks_router, HooksApiState};
 use gt_composition::notifications::{notifications_router, NotificationsApiState};
 use gt_composition::mcp::{
-    AgentHandler, AuditHandler, CompositionTenantProvisioner, ConvoyHandler, DocumentsHandler,
-    EventLog, EventLogConvoy, EventLogFeed, EventLogHooks, EventLogIssueSink, EventLogMerges,
-    EventLogQuota, EventLogSkills, FsAccountCatalog, GraphHandler, IdentityDoltMeStats,
-    MemoryHandler, MergeHandler, NotifyHandler, PgDocumentsResource, PgRigPrefixes,
-    PgWorkspaceStatus, QuotaBlockGuard, QuotaHandler, RigHandler, WorkspaceHandler, WsPoolRigs,
-    WsPools,
+    AgentHandler, AuditHandler, ConvoyHandler, DocumentsHandler, EventLog, EventLogHooks,
+    EventLogIssueSink, GraphHandler, IdentityDoltMeStats, MemoryHandler, MergeHandler, NotifyHandler,
+    PgDocumentsResource, PgRigPrefixes, PgWorkspaceStatus, QuotaBlockGuard, QuotaHandler, RigHandler,
+    WorkspaceHandler, WsPools,
 };
 use gt_composition::onboard::{onboard_router, OnboardState};
 use gt_composition::operator_resource::EventLogOperatorResource;
@@ -67,26 +65,17 @@ use gt_vcs::VcsConnectionRepo;
 use sqlx::Row;
 // Domain REST modules + their `with_http` state (hq-fe-api-mount.1): the bin mounts each
 // crate's `register_routes` so the FE reaches every namespace over authenticated HTTP.
-use gt_agent::{AgentApiState, AgentModule};
 use gt_composition::system::{load_config, system_router, ArchiveDaemon, SystemApiState};
-use gt_documents::{DocumentsApiState, DocumentsModule};
 use gt_eventlog::DEFAULT_EVENTLOG_ROOT;
-use gt_feed::{FeedApiState, FeedModule};
 use gt_issues::{IssuesApiState, IssuesModule, MeApiState, MeModule};
 use gt_mcp_server::{
     health, DocumentsResource, DomainRouter, HealthState, IssuesServer, PatAuthenticator,
     PgAuditSink, WorkspaceRigPrefixes, WorkspaceStatusGate, WorkspaceStores,
 };
-use gt_merge::{MergeApiState, MergeModule};
-use gt_meta::{MetaApiState, MetaModule};
+use gt_meta::MetaModule;
 use gt_module::RootBuilder;
-use gt_orchestration::{ConvoyApiState, ConvoyModule};
-use gt_quota::{QuotaApiState, QuotaModule};
 use gt_rbac::{RbacConfig, Scope};
-use gt_rig::{RigApiState, RigsModule};
-use gt_skills::{SkillsApiState, SkillsModule};
 use gt_store_dolt::{DoltIssues, WorkspacePools};
-use gt_workspace::{PgWorkspaces, WorkspaceApiState, WorkspaceModule};
 use tokio::sync::RwLock;
 
 /// Path the MCP endpoint mounts at (mirrors the upstream gt-mcp).
@@ -897,220 +886,94 @@ async fn main() -> anyhow::Result<()> {
     let agent_root = std::env::var("GT_EVENTLOG_ROOT")
         .map(std::path::PathBuf::from)
         .unwrap_or_else(|_| std::path::PathBuf::from(DEFAULT_EVENTLOG_ROOT));
-    let mut rest = RootBuilder::new()
-        // meta REST (hq-fe-api-mount.2): GET /help (full tools/list) + POST /report-gap, both
-        // backed by the Dolt store + server actor — always on, like agent/quota, since they need
-        // no Postgres. Mounted under /api/v1/meta behind the meta.read/meta.write guard.
-        .module(MetaModule::with_http(MetaApiState::new(
-            meta_store,
-            actor.clone(),
-            meta_tools,
-        )))
-        // agent.*: wire the orchd dispatch channel (hq-agent-auto-dispatch.1) when GT_CHANNEL_ROOT
-        // is set so POST /api/v1/agent with role=polecat+crew drops a dispatch request on the
-        // channel the orchd scheduler consumes — making the spawn actually sling a polecat.
-        .module(AgentModule::with_http({
-            let agent_state = AgentApiState::new(agent_root);
-            match std::env::var("GT_CHANNEL_ROOT") {
-                Ok(root) => {
-                    let name = std::env::var("GT_DISPATCH_CHANNEL")
-                        .unwrap_or_else(|_| "dispatch".to_string());
-                    let channel_dir = std::path::PathBuf::from(&root).join(&name);
-                    eprintln!(
-                        "[gt-mcp-server] agent→scheduler bridge on — dispatch channel {root}/{name}"
-                    );
-                    agent_state.with_dispatch_channel(channel_dir)
-                }
-                Err(_) => {
-                    eprintln!(
-                        "[gt-mcp-server] agent→scheduler bridge off — GT_CHANNEL_ROOT unset"
-                    );
-                    agent_state
-                }
-            }
-        }))
-        // quota.*: per-workspace assignment (EventLogQuota) PLUS the deploy-global account pool
-        // (FsAccountCatalog over the accounts root) so `/api/v1/quota/catalog` lists onboarded
-        // accounts and `/:account/assign` attaches one to the active workspace (hq-quota-ws-accounts).
-        .module(QuotaModule::with_http(
-            QuotaApiState::new(Arc::new(EventLogQuota::new(event_log.clone()))).with_catalog(
-                Arc::new(FsAccountCatalog::new(
-                    gt_composition::account_dirs::accounts_root(
-                        &std::env::var("GT_EVENTLOG_ROOT")
-                            .map(std::path::PathBuf::from)
-                            .unwrap_or_else(|_| std::path::PathBuf::from(DEFAULT_EVENTLOG_ROOT)),
-                    ),
-                )),
-            ),
-        ))
-        // merge.* (hq-fe-api-mount.3): the durable backing replays + appends the caller's
-        // `merge.*` stream — the same event-sourced board the MCP MergeHandler folds into, so the
-        // board survives restart (the actor's in-memory projection does not).
-        .module(MergeModule::with_http(MergeApiState::new(Arc::new(
-            EventLogMerges::new(event_log.clone()),
-        ))))
-        // skills.read + skills.write (hq-web-extras.13 + hq-agent-observability.7): the catalog the
-        // FE hydrates, replayed from the caller's `skills.*` stream; with a writer wired, POST /
-        // DELETE register/retire skills (skills.write), appending events into that same log so the
-        // Knowledge skills tab can be populated. One backing serves both read + write.
-        .module({
-            let skills = Arc::new(EventLogSkills::new(event_log.clone()));
-            // Seed the canonical role catalog into the default workspace's `skills.*` log when it is
-            // empty (hq-role-mcp), so a clean deploy on a new machine gives each role a working
-            // least-privilege MCP grant out of the box — without it every minted per-role token is
-            // scopeless. Empty-check makes it idempotent and never clobbers an operator-curated
-            // catalog (the prod machine, already populated via the Knowledge REST surface, is a
-            // no-op). See `gt_skills::presets::workspace_seed_events`.
-            {
-                use gt_skills::{SkillWriter, WorkspaceSkills};
-                let ws = std::env::var("GT_WORKSPACE").unwrap_or_else(|_| "default".to_string());
-                if let Ok(cat) = skills.catalog(&ws).await {
-                    if cat.is_empty() {
-                        let now = std::time::SystemTime::now()
-                            .duration_since(std::time::UNIX_EPOCH)
-                            .map(|d| d.as_secs())
-                            .unwrap_or(0);
-                        let mut seeded = 0usize;
-                        for ev in gt_skills::presets::workspace_seed_events(now) {
-                            if skills.append(&ws, ev).await.is_ok() {
-                                seeded += 1;
-                            }
-                        }
-                        eprintln!("[gt-mcp-server] skills: seeded {seeded} role-catalog event(s) into empty `{ws}` catalog");
-                    }
-                }
-            }
-            SkillsModule::with_http(SkillsApiState::new(skills.clone()).with_writer(skills))
-        })
-        // feed.read (hq-web-extras.14): read-only activity feed, folded from the caller's whole
-        // workspace log. Mounted at /api/v1/feed behind the feed.read guard.
-        .module(FeedModule::with_http(FeedApiState::new(Arc::new(
-            EventLogFeed::new(event_log.clone()),
-        ))))
-        // convoy.* (hq-web-extras.16): read + mutate REST surface — the durable backing replays +
-        // appends the caller's `convoy.*` stream, the same event-sourced board the MCP
-        // ConvoyHandler folds into. Mounted at /api/v1/convoy behind the convoy.read/convoy.write
-        // guard (board read + complete-member/fail-member mutations).
-        .module(ConvoyModule::with_http(ConvoyApiState::new(Arc::new(
-            EventLogConvoy::new(event_log.clone()),
-        ))));
-    // The public, unauthenticated share-read surface (hq-web-extras.9): set when documents mount,
-    // mounted OUTSIDE the /api/v1 auth chain (like /openapi.json). `None` without Postgres.
-    let mut public_share: Option<axum::Router> = None;
-    if let Ok(pg_url) = std::env::var("GT_PG_URL") {
+    // The orchd dispatch channel dir (hq-agent-auto-dispatch.1): a POST /api/v1/agent with
+    // role=polecat+crew drops a dispatch request on the channel the orchd scheduler consumes —
+    // making the spawn actually sling a polecat. Resolved here (env), threaded into the assembly.
+    let agent_dispatch_channel = match std::env::var("GT_CHANNEL_ROOT") {
+        Ok(root) => {
+            let name =
+                std::env::var("GT_DISPATCH_CHANNEL").unwrap_or_else(|_| "dispatch".to_string());
+            eprintln!("[gt-mcp-server] agent→scheduler bridge on — dispatch channel {root}/{name}");
+            Some(std::path::PathBuf::from(&root).join(&name))
+        }
+        Err(_) => {
+            eprintln!("[gt-mcp-server] agent→scheduler bridge off — GT_CHANNEL_ROOT unset");
+            None
+        }
+    };
+    let accounts_root = gt_composition::account_dirs::accounts_root(&agent_root);
+    let skills_seed_workspace =
+        std::env::var("GT_WORKSPACE").unwrap_or_else(|_| "default".to_string());
+
+    // The Postgres-gated module slice (workspace/rig/connection/graph/documents). Resolve the
+    // eager pool + the env-derived GitHub App / blob store / embedder HERE (the bin owns the env),
+    // then hand the pre-built parts to `build_rest_modules`. `None` ⇒ the GT_PG_URL-unset branch.
+    // The eager `pool` (kept for parity with the prior behaviour) also backs the /me/stats membership
+    // pool below. `pg_url_for_me` is captured before `pg_url` moves into the parts.
+    //
+    // The public, unauthenticated share-read surface (hq-web-extras.9) rides back from the assembly;
+    // `me_pg` carries the eager PG url+pool the /me/stats surface needs (its connect is eager, so it
+    // is mounted by main() after the pure assembly returns).
+    let public_share: Option<axum::Router>;
+    let mut me_pg_url: Option<String> = None;
+    let rest_pg = if let Ok(pg_url) = std::env::var("GT_PG_URL") {
         let pool = sqlx::PgPool::connect(&pg_url)
             .await
             .context("GT_PG_URL must point at a reachable Postgres (REST backings)")?;
-        rest = rest
-            // The REST `POST /api/v1/workspace` provisions a fully-usable tenant — PG schema/RBAC
-            // + Dolt — exactly as the MCP `workspace.create` tool, via the shared provisioner over
-            // the same PG pool + per-workspace Dolt pools (hq-gap-workspace-rest-create-provision).
-            .module(WorkspaceModule::with_http(
-                WorkspaceApiState::new(Arc::new(PgWorkspaces::new(pool.clone()))).with_provisioner(
-                    Arc::new(CompositionTenantProvisioner::new(
-                        pool.clone(),
-                        issues_workspaces.clone(),
-                    )),
-                ),
-            ))
-            .module(RigsModule::with_http(RigApiState::new(Arc::new(
-                WsPoolRigs::new(Arc::new(WsPools::new(pg_url.clone()))),
-            ))))
-            // connection.* (hq-vcs-connections.1): per-workspace VCS connections over the GLOBAL
-            // `public.vcs_connections` table (one PgVcsConnections serves every tenant; the
-            // per-request scoping is the resolved workspace from the auth context). Mounted at
-            // /api/v1/connection behind the connection.read/connection.write guard. The PAT is
-            // AES-GCM-sealed at rest (GT_SECRET_KEY) via gt-auth's seal/unseal — never returned.
-            .module({
-                let connections =
-                    Arc::new(gt_vcs::PgVcsConnections::new(pool.clone()));
-                let mut vcs = gt_vcs::VcsModule::with_http(gt_vcs::ConnectionApiState::new(
-                    connections.clone(),
-                ));
-                // GitHub App install flow (hq-vcs-connections.2): mount the install/callback/repos
-                // routes under /api/v1/connection/github/* ONLY when a platform GitHub App is
-                // configured (App ID + private-key PEM file + slug, all from mounted files /
-                // GT_GITHUB_APP_*). A half-configured App fails loud; an absent one boots fine and
-                // leaves the connection CRUD + PAT fallback working. The minted installation tokens
-                // are JIT, in-memory, never persisted.
-                match gt_vcs::GithubAppConfig::from_env() {
-                    Ok(Some(cfg)) => {
-                        let client = gt_vcs::GithubAppClient::new(cfg);
-                        vcs = vcs.with_github(gt_vcs::GithubApiState::new(client, connections));
-                    }
-                    Ok(None) => {}
-                    Err(e) => panic!("GitHub App config is half-set: {e}"),
-                }
-                vcs
-            })
-            // graph.* read-only REST + refresh (hq-vcs-connections.9): mount the graph module's
-            // HTTP surface so the FE complemento reaches graph.status (per-repo freshness chip) and
-            // graph.refresh (the "Refresh" button) over the same authenticated path as the other
-            // domains. The read provider (EventLogGraph) folds the SAME `graphwarden.*` custody the
-            // MCP graph.list does — freshness is sourced from the warden's last_indexed_commit/stale,
-            // not the always-null indexer metadata. The refresher delegates to a GraphHandler wired
-            // with the same server-side provisioner as the MCP dispatch (derived path + JIT clone
-            // from the rig's VCS connection), so both transports run one custodian write path. Reads
-            // need graph.read; the refresh POST needs graph.write (the builder's method→scope guard).
-            .module({
-                let read_custody: Arc<dyn gt_graphindex::WorkspaceGraph> =
-                    Arc::new(gt_composition::mcp::EventLogGraph::new(event_log.clone()));
-                // The REST refresher's own GraphHandler — the MCP one is moved into the DomainRouter,
-                // so build a second over the same shared parts (event log + graphify indexer +
-                // server-side provisioner). Both fold the one warden log + clone to the one derived path.
-                let graph_provisioner = {
-                    let conns: Arc<dyn gt_vcs::VcsConnectionRepo> =
-                        Arc::new(gt_vcs::PgVcsConnections::new(pool.clone()));
-                    let github = match gt_vcs::GithubAppConfig::from_env() {
-                        Ok(Some(cfg)) => Some(gt_vcs::GithubAppClient::new(cfg)),
-                        Ok(None) => None,
-                        Err(e) => panic!("GitHub App config is half-set: {e}"),
-                    };
-                    gt_composition::mcp::RigProvisioner::new(
-                        Arc::new(WsPools::new(pg_url.clone())),
-                        conns,
-                        github,
-                    )
-                };
-                let refresh_handler = Arc::new(
-                    gt_composition::mcp::GraphHandler::new(
-                        event_log.clone(),
-                        Arc::new(GraphifyIndexer::new()),
-                    )
-                    .with_provisioner(graph_provisioner),
-                );
-                let refresher: Arc<dyn gt_graphindex::GraphRefresher> = Arc::new(
-                    gt_composition::mcp::GraphHandlerRefresher::new(refresh_handler),
-                );
-                let graph_state = gt_graphindex::GraphApiState::new(
-                    read_custody,
-                    Arc::new(GraphifyIndexer::new()),
-                )
-                .with_refresher(refresher);
-                gt_graphindex::GraphModule::with_http(graph_state)
-            });
+        // The platform GitHub App, resolved once (env). A half-configured App fails loud; an
+        // absent one leaves the connection CRUD + PAT fallback + public-rig graph path working.
+        let github = match gt_vcs::GithubAppConfig::from_env() {
+            Ok(Some(cfg)) => Some(gt_vcs::GithubAppClient::new(cfg)),
+            Ok(None) => None,
+            Err(e) => panic!("GitHub App config is half-set: {e}"),
+        };
         let (blob, bucket) = build_blob_store();
-        // Capture the PG url before it moves into the documents state — the cross-workspace
-        // /me/stats surface (hq-web-extras.15) below opens its own ws_default pool for the
-        // membership directory.
-        let pg_url_for_me = pg_url.clone();
-        // Build the documents REST state once; the authenticated module router and the public
-        // share-read router (hq-web-extras.9) share the same store handles.
-        let docs_state = DocumentsApiState::new(
+        // Capture the PG url for the cross-workspace /me/stats membership pool (built below), which
+        // needs an EAGER connect and so is mounted by main() after the assembly returns.
+        me_pg_url = Some(pg_url.clone());
+        Some(gt_composition::rest_modules::RestPgParts {
+            pool,
             pg_url,
+            issues_workspaces: issues_workspaces.clone(),
+            github,
             blob,
             bucket,
-            Extractor::without_ocr(),
-            build_embedder(),
+            extractor: Extractor::without_ocr(),
+            embedder: build_embedder(),
+        })
+    } else {
+        eprintln!(
+            "[gt-mcp-server] REST domain modules: meta + agent + quota + merge + skills + feed + convoy (GT_PG_URL unset → no workspace/rig/documents)"
         );
-        public_share = Some(gt_documents::public_share_router(docs_state.clone()));
-        rest = rest.module(DocumentsModule::with_http(docs_state));
-        // Cross-workspace self-view (hq-web-extras.15): GET /api/v1/me/stats rolls up issue progress
-        // across every workspace the caller is a member of. It needs BOTH the global identity
-        // directory (`public.user_workspaces`, the membership N:N from hq-identity) over the PG pool
-        // here, AND each tenant's own `hq_<ws>` tracker via the per-workspace Dolt store cache. The
-        // latter only exists when GT_DOLT_BASE_URL configures multi-tenant routing, so the surface
-        // mounts only then; without it, single-tenant Dolt has no per-workspace stores to aggregate.
+        None
+    };
+
+    // Assemble the SAME REST module set the boot-smoke test pins (hq-vcs-connections.12): one
+    // `build_rest_modules` call, shared by main() and `tests/boot_smoke.rs`, so the test exercises
+    // the exact wiring — the seam that would have caught the `.9` `graph.query` MalformedToolName
+    // crash before it left CI. `public_share` rides back for the public ops router.
+    let (mut rest, share) = gt_composition::rest_modules::build_rest_modules(
+        gt_composition::rest_modules::RestModuleParts {
+            meta_store,
+            actor: actor.clone(),
+            meta_tools,
+            agent_root,
+            dispatch_channel: agent_dispatch_channel,
+            event_log: event_log.clone(),
+            accounts_root,
+            skills_seed_workspace,
+            pg: rest_pg,
+        },
+    )
+    .await;
+    public_share = share;
+
+    // Cross-workspace self-view (hq-web-extras.15): GET /api/v1/me/stats rolls up issue progress
+    // across every workspace the caller is a member of. It needs an EAGER `WorkspacePool::connect`,
+    // so it is mounted here (not inside the pure `build_rest_modules`), only with GT_PG_URL +
+    // GT_DOLT_BASE_URL — without the latter, single-tenant Dolt has no per-workspace stores to
+    // aggregate.
+    if let Some(pg_url_for_me) = me_pg_url {
         match std::env::var("GT_DOLT_BASE_URL") {
             Ok(base) => {
                 let me_pool = WorkspacePool::connect(&pg_url_for_me, "default")
@@ -1132,10 +995,6 @@ async fn main() -> anyhow::Result<()> {
                 "[gt-mcp-server] REST domain modules: meta + workspace + rig + connection + graph + documents + memory + agent + quota + merge + skills + feed + convoy (GT_DOLT_BASE_URL unset → no /me/stats cross-workspace surface)"
             ),
         }
-    } else {
-        eprintln!(
-            "[gt-mcp-server] REST domain modules: meta + agent + quota + merge + skills + feed + convoy (GT_PG_URL unset → no workspace/rig/documents)"
-        );
     }
     let rest_root = rest
         .build()
