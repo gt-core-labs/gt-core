@@ -5,12 +5,16 @@
 //! forma byte-idéntica (ver `docs/06-observability.md`). Este crate es **sync, sin tokio**:
 //! el drenado async del `mpsc` al log vive en los bins.
 
+#[cfg(feature = "pg")]
+mod pg;
 mod reader;
 mod record;
 mod replay;
 mod store;
 mod writer;
 
+#[cfg(feature = "pg")]
+pub use pg::{events_migration_sql, PgEventStore, EVENTS_TABLE};
 pub use reader::{read_all, since, tail};
 pub use record::EventRecord;
 pub use replay::{replay, replay_dispatch};

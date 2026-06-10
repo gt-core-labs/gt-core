@@ -137,6 +137,14 @@ thiserror = "2"
 ulid = "1"
 # Cross-platform advisory file lock for the gt-eventlog jsonl writer (hq-core-port.8).
 fs2 = "0.4"
+# SYNCHRONOUS Postgres client + blocking connection pool for the PG-backed EventStore
+# (hq-talos-migration.10). The EventLog public API is sync and called by ~30 consumers from many
+# contexts, so the PG backend is backed by the blocking `postgres` crate behind an `r2d2` pool —
+# NOT async sqlx, which would ripple `.await` across every event-sourced domain. Off-by-default in
+# gt-eventlog (the `pg` feature) so the kernel crate stays sync/tokio-free for the file path.
+postgres = { version = "0.19", features = ["with-serde_json-1"] }
+r2d2 = "0.8"
+r2d2_postgres = "0.18"
 # Temp dirs/files — gt-plugin descriptor scanner + its tests (hq-core-port.11).
 tempfile = "3"
 # Filesystem watch for the gt-channel mailbox (hq-core-port.14).

@@ -146,7 +146,46 @@ async fn main() -> anyhow::Result<()> {
     let event_root = std::env::var("GT_EVENTLOG_ROOT")
         .ok()
         .map(std::path::PathBuf::from);
-    let event_log = Arc::new(EventLog::new(event_root));
+    // Backend selection (hq-talos-migration.10): the event log uses Postgres ONLY on an EXPLICIT
+    // opt-in — GT_EVENTLOG_PG truthy (1/true/yes/on), connecting via GT_PG_URL. It is deliberately
+    // NOT triggered by GT_PG_URL alone: prod already sets GT_PG_URL for the domain handlers, and
+    // silently switching the event log to an empty `public.events` would RESET every event-sourced
+    // domain (graph custody, merge board, agent sessions, …) — there is no file→PG backfill yet
+    // (that is the cutover/data-migration item, hq-talos-migration.7/.10 ACs). Unset/falsy ⇒ the
+    // path-partitioned file log under GT_EVENTLOG_ROOT, exactly as before (the prod-safe default).
+    // PG backs N mcp-server replicas + a separate orchd concurrently with no shared volume (the
+    // horizontal-scale unlock); flipping GT_EVENTLOG_PG off is reversible. Sync API on BOTH backends.
+    let want_pg = std::env::var("GT_EVENTLOG_PG")
+        .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"))
+        .unwrap_or(false);
+    let event_log = match want_pg.then(|| std::env::var("GT_PG_URL").ok()).flatten() {
+        Some(pg_url) => match EventLog::new_pg(&pg_url) {
+            Ok(log) => {
+                eprintln!(
+                    "[gt-mcp-server] event log: Postgres-backed (public.events; concurrent writers, no shared volume)"
+                );
+                Arc::new(log)
+            }
+            Err(e) => {
+                eprintln!(
+                    "[gt-mcp-server] event log: PG backend init failed ({e}); falling back to file log under GT_EVENTLOG_ROOT"
+                );
+                Arc::new(EventLog::new(event_root))
+            }
+        },
+        None => {
+            if want_pg {
+                eprintln!(
+                    "[gt-mcp-server] event log: GT_EVENTLOG_PG set but GT_PG_URL unset — using file log under GT_EVENTLOG_ROOT"
+                );
+            } else {
+                eprintln!(
+                    "[gt-mcp-server] event log: file-backed (GT_EVENTLOG_ROOT; set GT_EVENTLOG_PG=1 + GT_PG_URL for the Postgres backend)"
+                );
+            }
+            Arc::new(EventLog::new(event_root))
+        }
+    };
     // The issues tracker is Dolt-backed, not event-sourced, so its mutations never reached the
     // event log — the SSE feed never carried issue movement. This sink closes that gap: it
     // appends every `issues.*` mutation (REST or MCP) to the workspace log, so the tracker moves
@@ -1386,6 +1425,11 @@ async fn apply_pg_catalog(pool: &sqlx::PgPool) -> anyhow::Result<()> {
     let docs_id = ModuleId::new("docs").expect("`docs` is a valid module id");
     let memory_id = ModuleId::new("memory").expect("`memory` is a valid module id");
     let notifications_id = ModuleId::new("notifications").expect("`notifications` is a valid module id");
+    // hq-talos-migration.10: the GLOBAL `public.events` table — the Postgres-backed EventStore that
+    // decouples mcp-server/orchd from the shared event-log volume. A `public` catalog (the
+    // `workspace` column partitions it), NOT a per-tenant template table, so it seeds here in the
+    // public-schema apply, never in the ws_default clone path — exactly like notifications.
+    let events_id = ModuleId::new("events").expect("`events` is a valid module id");
     // hq-vcs-connections.1: the GLOBAL `public.vcs_connections` store (mirrors public.oauth_providers
     // + a workspace_id column). A `public` catalog like notifications — NOT a per-tenant template
     // table — so it seeds here in the public-schema apply, never in the ws_default clone path.
@@ -1402,6 +1446,14 @@ async fn apply_pg_catalog(pool: &sqlx::PgPool) -> anyhow::Result<()> {
     let memory_migs = gt_store_pg::memory_migrations();
     // notifications: the public-schema `notifications` table agents write to via notify.send.execute.
     let notifications_migs = gt_store_pg::notifications_migrations();
+    // hq-talos-migration.10: the public-schema `events` table backing the PG EventStore. One
+    // idempotent migration (CREATE TABLE/INDEX IF NOT EXISTS); the same DDL `PgEventStore::
+    // ensure_schema` self-heals with, registered here so a fresh deploy needs no operator step.
+    let events_migs = vec![gt_module::Migration::new(
+        1,
+        "0001_events",
+        gt_eventlog::events_migration_sql(),
+    )];
 
     let plan: Vec<_> = workspace_migs
         .iter()
@@ -1411,6 +1463,7 @@ async fn apply_pg_catalog(pool: &sqlx::PgPool) -> anyhow::Result<()> {
         .chain(docs_migs.iter().map(|m| (&docs_id, m)))
         .chain(memory_migs.iter().map(|m| (&memory_id, m)))
         .chain(notifications_migs.iter().map(|m| (&notifications_id, m)))
+        .chain(events_migs.iter().map(|m| (&events_id, m)))
         .chain(connection_migs.iter().map(|m| (&connection_id, m)))
         .collect();
 

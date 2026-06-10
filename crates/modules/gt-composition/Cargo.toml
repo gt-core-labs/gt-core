@@ -13,7 +13,10 @@ description = "Composition root: per-workspace assembly of the module Root + rol
 # needs a Rule-2 tier approval (still open under refactor.13).
 [dependencies]
 gt-plugin = { workspace = true }
-gt-eventlog = { workspace = true }
+# `pg` compiles the SYNCHRONOUS Postgres-backed EventStore (hq-talos-migration.10): the bin selects
+# it by env (GT_EVENTLOG_PG / GT_PG_URL) so N mcp-server replicas + a separate orchd write the event
+# log over one Postgres — no shared volume. The file backend (JsonlWriter) stays the default fallback.
+gt-eventlog = { workspace = true, features = ["pg"] }
 gt-events = { workspace = true }
 gt-scheduling = { workspace = true }
 # merge.* dispatch (hq-mcp-dispatch.5): event-sourced MergeBoard. `axum` adds the REST surface
@@ -174,3 +177,8 @@ utoipa = { workspace = true }
 # signature-verify path; sha2 is already a runtime dep, hmac/hex are test-only here.
 hmac = { workspace = true }
 hex = { workspace = true }
+# A bare sync `postgres::Client` for the PG-backed EventLog contract tests (hq-talos-migration.10):
+# truncate the test workspaces + insert raw `public.events` rows with controlled `kind`/`ts` to
+# exercise the prefix/channel/since/limit filters. Test-only; the runtime PG backend pools through
+# gt-eventlog's `pg` feature.
+postgres = { workspace = true }

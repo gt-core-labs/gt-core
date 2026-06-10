@@ -13,6 +13,19 @@ serde_json.workspace = true
 # `parsing` para extraer la fecha UTC del `ts` RFC3339 y rotar a un segmento por día (hq-mt-data.8).
 time = { workspace = true, features = ["parsing"] }
 fs2.workspace = true
+# SYNCHRONOUS Postgres-backed EventStore (hq-talos-migration.10), off by default behind `pg`. The
+# blocking `postgres` client + an `r2d2` connection pool give concurrent writers (N mcp-server
+# replicas + orchd) over a shared DB without the file-based shared-volume coupling — while keeping
+# the EventLog public API sync (no tokio/sqlx pulled into the kernel crate's default build).
+postgres = { workspace = true, optional = true }
+r2d2 = { workspace = true, optional = true }
+r2d2_postgres = { workspace = true, optional = true }
+
+[features]
+# Compile the synchronous Postgres-backed `PgEventStore` (hq-talos-migration.10). Enabled by the
+# `modules` tier (gt-composition) so the bin can select the PG backend by env; the file backend
+# (`JsonlWriter`) stays the default with this feature off.
+pg = ["dep:postgres", "dep:r2d2", "dep:r2d2_postgres"]
 
 [dev-dependencies]
 tempfile = { workspace = true }
