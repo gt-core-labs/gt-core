@@ -132,13 +132,18 @@ const MEMORY_GUARD_CMD: &str = concat!(
 /// failed recall, or absent `jq` is a silent `exit 0` WITHOUT extra context — the hook must NEVER
 /// break a polecat's launch (the same contract as every other hook here).
 const MEMORY_RECALL_CMD: &str = concat!(
+    // Knob (hq-memory-autorecall.3): SessionStart autorecall is ON by default; an explicit falsy
+    // GT_MEMORY_AUTORECALL turns it off — an operator escape hatch / A-B measure of its value.
+    r#"case "${GT_MEMORY_AUTORECALL:-on}" in 0|false|FALSE|off|OFF|no|NO) exit 0 ;; esac; "#,
     // Gate: need a bead to query, the gtmcp client, and jq to shape the output. Any miss → no-op.
     r#"q="${GT_HOOK_BEAD:-}"; "#,
     r#"[ -n "$q" ] || exit 0; "#,
     r#"command -v gtmcp >/dev/null 2>&1 || exit 0; "#,
     r#"command -v jq >/dev/null 2>&1 || exit 0; "#,
+    // Top-k is tunable via GT_MEMORY_AUTORECALL_LIMIT (digits only; any non-numeric falls back to 8).
+    r#"lim="${GT_MEMORY_AUTORECALL_LIMIT:-8}"; case "$lim" in ''|*[!0-9]*) lim=8 ;; esac; "#,
     // Recall (best-effort, short timeout so a slow/unreachable server never stalls the launch).
-    r#"req=$(jq -nc --arg q "$q" '{query:$q,limit:8}' 2>/dev/null) || exit 0; "#,
+    r#"req=$(jq -nc --arg q "$q" --argjson l "$lim" '{query:$q,limit:$l}' 2>/dev/null) || exit 0; "#,
     r#"raw=$(gtmcp --compact call memory.recall "$req" 2>/dev/null) || exit 0; "#,
     r#"[ -n "$raw" ] || exit 0; "#,
     // The MCP envelope wraps the tool payload as content[0].text (a JSON string); unwrap then parse.
@@ -151,6 +156,10 @@ const MEMORY_RECALL_CMD: &str = concat!(
     r#"md=$(printf '%s' "$inner" | jq -r '([(.memories // [])[] | "=== " + .name + " [" + .kind + "] ===\n" + (.description // "") + "\n\n" + (.body // "")] | sort) as $m | if ($m | length) == 0 then "" else "RECALLED MEMORY (auto-injected from prior work). Durable team memories below; treat any [feedback] item as a HARD operating rule.\n\n" + ($m | join("\n\n")) end' 2>/dev/null); "#,
     // Nothing recalled (no memories / parse failed) → stay silent, never emit an empty block.
     r#"[ -n "$md" ] && printf '%s' "$md" | jq -R -s '{hookSpecificOutput:{hookEventName:"SessionStart",additionalContext:.}}' 2>/dev/null; "#,
+    // Observability (hq-memory-autorecall.3): when something was injected, log the recalled memory
+    // names to STDERR (the polecat log), so an operator can audit WHAT was recalled per sling
+    // without it polluting the agent's context (stdout is the context channel; stderr is the log).
+    r#"if [ -n "$md" ]; then names=$(printf '%s' "$inner" | jq -r '[(.memories // [])[].name] | join(", ")' 2>/dev/null); [ -n "$names" ] && printf '[autorecall] SessionStart injected: %s\n' "$names" >&2; fi; "#,
     r#"exit 0"#,
 );
 
@@ -268,6 +277,35 @@ pub const MEMORY_RECALL_LIMIT: u32 = 8;
 pub fn memory_recall_args(bead: Option<&str>) -> Option<serde_json::Value> {
     let bead = bead.map(str::trim).filter(|b| !b.is_empty())?;
     Some(json!({ "query": bead, "limit": MEMORY_RECALL_LIMIT }))
+}
+
+/// Env that toggles the SessionStart autorecall (`hq-memory-autorecall.3`). Unlike the per-turn
+/// [`MEMORY_AUTORECALL_TURN_ENV`], SessionStart recall is ON by default (it is the primary
+/// bottleneck-reliever); this env is the operator escape hatch / A-B switch.
+pub const MEMORY_AUTORECALL_ENV: &str = "GT_MEMORY_AUTORECALL";
+
+/// Env that overrides the SessionStart recall top-k (`hq-memory-autorecall.3`). Absent/non-numeric
+/// falls back to [`MEMORY_RECALL_LIMIT`].
+pub const MEMORY_AUTORECALL_LIMIT_ENV: &str = "GT_MEMORY_AUTORECALL_LIMIT";
+
+/// Whether SessionStart autorecall is enabled given [`MEMORY_AUTORECALL_ENV`] — ON unless the value
+/// is explicitly falsy (`0`/`false`/`off`/`no`, case-insensitive). Pure-Rust mirror of the shell
+/// `case` gate in [`MEMORY_RECALL_CMD`] so the two cannot drift, unit-tested.
+pub fn memory_autorecall_enabled(env_value: Option<&str>) -> bool {
+    !matches!(
+        env_value.map(|v| v.trim().to_ascii_lowercase()).as_deref(),
+        Some("0" | "false" | "off" | "no")
+    )
+}
+
+/// Resolve the SessionStart recall top-k from [`MEMORY_AUTORECALL_LIMIT_ENV`]: a positive integer,
+/// else [`MEMORY_RECALL_LIMIT`]. Mirror of the shell digit-guard, unit-tested.
+pub fn memory_recall_limit(env_value: Option<&str>) -> u32 {
+    env_value
+        .map(str::trim)
+        .and_then(|v| v.parse::<u32>().ok())
+        .filter(|n| *n > 0)
+        .unwrap_or(MEMORY_RECALL_LIMIT)
 }
 
 /// Env an operator sets to opt into per-turn memory recall (`hq-memory-autorecall.2`). The per-turn
@@ -438,6 +476,11 @@ mod tests {
         assert!(recall.contains("additionalContext"));
         assert!(recall.contains("SessionStart"));
         assert!(recall.contains("exit 0"));
+        // Knobs + observability (hq-memory-autorecall.3): on/off gate, tunable limit, and a
+        // stderr log of what was injected.
+        assert!(recall.contains("GT_MEMORY_AUTORECALL"), "on/off knob");
+        assert!(recall.contains("GT_MEMORY_AUTORECALL_LIMIT"), "tunable top-k");
+        assert!(recall.contains("[autorecall] SessionStart injected"), "observability log");
         // UserPromptSubmit carries the heartbeat + the per-turn memory autorecall
         // (hq-memory-autorecall.2): opt-in, queries by the prompt, injects per-turn context.
         let ups = v["hooks"]["UserPromptSubmit"].as_array().unwrap();
@@ -484,6 +527,24 @@ mod tests {
         assert!(MEMORY_RECALL_TURN_LIMIT < MEMORY_RECALL_LIMIT, "turn top-k is tighter");
         // Enabled but a blank prompt → no-op, mirroring the shell gate.
         assert!(memory_recall_turn_args(Some("1"), "   ").is_none());
+    }
+
+    #[test]
+    fn sessionstart_autorecall_knobs() {
+        // hq-memory-autorecall.3: SessionStart recall is ON by default; only an explicit falsy
+        // value disables it (the inverse default of the per-turn knob).
+        assert!(memory_autorecall_enabled(None), "ON by default");
+        assert!(memory_autorecall_enabled(Some("on")));
+        assert!(memory_autorecall_enabled(Some("anything")));
+        for off in ["0", "false", "FALSE", "off", "OFF", "no", "  No  "] {
+            assert!(!memory_autorecall_enabled(Some(off)), "{off} disables");
+        }
+        // Limit override: a positive integer wins; absent / non-numeric / zero falls back.
+        assert_eq!(memory_recall_limit(Some("3")), 3);
+        assert_eq!(memory_recall_limit(Some("  20 ")), 20);
+        assert_eq!(memory_recall_limit(None), MEMORY_RECALL_LIMIT);
+        assert_eq!(memory_recall_limit(Some("abc")), MEMORY_RECALL_LIMIT);
+        assert_eq!(memory_recall_limit(Some("0")), MEMORY_RECALL_LIMIT);
     }
 
     #[test]
