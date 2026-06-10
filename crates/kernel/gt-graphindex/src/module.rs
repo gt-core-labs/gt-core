@@ -127,9 +127,14 @@ impl GtModule for GraphHttpModule {
         GraphModule.capability()
     }
 
-    fn register_mcp_tools(&self, registry: &mut McpRegistry) {
-        GraphModule.register_mcp_tools(registry);
-    }
+    /// REST-only surface: registers NO MCP tools. The `graph.*` MCP tools (2-segment names like
+    /// `graph.query`) are served by the composition-tier `GraphHandler` (the `DomainHandler` path,
+    /// which does NOT run the module-builder's 3-segment tool-name validation). Declaring them here
+    /// too would (a) crash the boot with `MalformedToolName { tool: "graph.query", NotThreeSegments }`
+    /// when the REST builder validates them (the hq-vcs-connections.9 incident) and (b) double-list
+    /// them on the MCP surface. Mirrors `VcsHttpModule`. Scopes still come from `capability()`,
+    /// routes from `register_routes` — neither needs a registered tool.
+    fn register_mcp_tools(&self, _registry: &mut McpRegistry) {}
 
     /// The read-only graph REST routes (`hq-fe-api-kernel.1`), relative — the builder nests them
     /// under `/api/v1/graph` and applies the `graph.read` scope guard (every route is a GET).
