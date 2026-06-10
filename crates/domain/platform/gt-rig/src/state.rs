@@ -42,6 +42,14 @@ pub struct RigEntry {
     /// `Some(path)` pins an absolute root set via [`crate::SetRigWorktreeRoot`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub worktree_root: Option<PathBuf>,
+    /// Soft reference to the `public.vcs_connections.id` (hq-vcs-connections.1) the
+    /// server-side provisioner mints a clone token from. `None` means the rig has no VCS
+    /// connection bound yet (legacy operator-mounted / public-repo path); `Some(id)` is the
+    /// connection the refresh path resolves to clone/fetch this rig. NOT a DB FK — the
+    /// connection lives in `public` while a rig is a per-tenant `ws_<slug>` row, so the link is
+    /// validated at the application layer (hq-vcs-connections.3).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub git_connection_ref: Option<String>,
 }
 
 impl RigEntry {
@@ -61,6 +69,7 @@ impl RigEntry {
             default_branch: default_branch.into(),
             registered_at_secs,
             worktree_root: None,
+            git_connection_ref: None,
         }
     }
 
@@ -217,6 +226,7 @@ impl RigState {
                 push_url,
                 upstream_url,
                 default_branch,
+                git_connection_ref,
                 now_secs,
             }
             | RigEvent::Adopted {
@@ -226,6 +236,7 @@ impl RigState {
                 push_url,
                 upstream_url,
                 default_branch,
+                git_connection_ref,
                 now_secs,
             } => {
                 self.rigs.insert(
@@ -239,6 +250,7 @@ impl RigState {
                         default_branch: default_branch.clone(),
                         registered_at_secs: *now_secs,
                         worktree_root: None,
+                        git_connection_ref: git_connection_ref.clone(),
                     },
                 );
             }
@@ -410,6 +422,7 @@ mod tests {
             push_url: None,
             upstream_url: None,
             default_branch: "main".into(),
+            git_connection_ref: None,
             now_secs: 1,
         });
         state.apply(&RigEvent::Added {
@@ -419,6 +432,7 @@ mod tests {
             push_url: None,
             upstream_url: None,
             default_branch: "main".into(),
+            git_connection_ref: None,
             now_secs: 2,
         });
 
@@ -506,6 +520,7 @@ mod tests {
             push_url: None,
             upstream_url: None,
             default_branch: "main".into(),
+            git_connection_ref: None,
             now_secs: 1,
         });
         state.apply(&RigEvent::WorktreeRootChanged {

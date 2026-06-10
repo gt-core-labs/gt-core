@@ -63,6 +63,7 @@ fn row_to_entry(row: &PgRow) -> Result<RigEntry, AppError> {
         default_branch: row.try_get("default_branch").map_err(backend)?,
         registered_at_secs: registered_at as u64,
         worktree_root: worktree_root.map(PathBuf::from),
+        git_connection_ref: row.try_get("git_connection_ref").map_err(backend)?,
     })
 }
 
@@ -83,15 +84,16 @@ impl RigRepository for PgRigs {
             sqlx::query(
                 "INSERT INTO rigs \
                    (name, prefix, git_url, push_url, upstream_url, default_branch, registered_at, \
-                    worktree_root) \
-                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8) \
+                    worktree_root, git_connection_ref) \
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) \
                  ON CONFLICT (name) DO UPDATE SET \
                    prefix = EXCLUDED.prefix, \
                    git_url = EXCLUDED.git_url, \
                    push_url = EXCLUDED.push_url, \
                    upstream_url = EXCLUDED.upstream_url, \
                    default_branch = EXCLUDED.default_branch, \
-                   worktree_root = EXCLUDED.worktree_root",
+                   worktree_root = EXCLUDED.worktree_root, \
+                   git_connection_ref = EXCLUDED.git_connection_ref",
             )
             .bind(&entry.name)
             .bind(&entry.prefix)
@@ -101,6 +103,7 @@ impl RigRepository for PgRigs {
             .bind(&entry.default_branch)
             .bind(entry.registered_at_secs as i64)
             .bind(&worktree_root)
+            .bind(&entry.git_connection_ref)
             .execute(&pool)
             .await
             .map_err(backend)?;
@@ -127,7 +130,7 @@ impl RigRepository for PgRigs {
         async move {
             let row = sqlx::query(
                 "SELECT name, prefix, git_url, push_url, upstream_url, default_branch, \
-                        registered_at, worktree_root \
+                        registered_at, worktree_root, git_connection_ref \
                  FROM rigs WHERE name = $1",
             )
             .bind(&name)
@@ -160,7 +163,7 @@ impl RigRepository for PgRigs {
         async move {
             let rows = sqlx::query(
                 "SELECT name, prefix, git_url, push_url, upstream_url, default_branch, \
-                        registered_at, worktree_root \
+                        registered_at, worktree_root, git_connection_ref \
                  FROM rigs ORDER BY name",
             )
             .fetch_all(&pool)

@@ -446,6 +446,7 @@ fn entry_json(entry: &RigEntry) -> Value {
         "default_branch": entry.default_branch,
         "registered_at_secs": entry.registered_at_secs,
         "worktree_root": entry.worktree_root,
+        "git_connection_ref": entry.git_connection_ref,
     })
 }
 

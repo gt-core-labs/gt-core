@@ -22,6 +22,11 @@ pub enum RigEvent {
         push_url: Option<String>,
         upstream_url: Option<String>,
         default_branch: String,
+        /// Soft reference to the `public.vcs_connections.id` this rig clones with
+        /// (hq-vcs-connections.3). `#[serde(default)]` so events logged before this field
+        /// existed replay as `None` (the log is append-only; old payloads stay valid).
+        #[serde(default)]
+        git_connection_ref: Option<String>,
         now_secs: u64,
     },
     /// An existing on-disk rig directory was adopted into the catalog without re-cloning.
@@ -34,6 +39,10 @@ pub enum RigEvent {
         push_url: Option<String>,
         upstream_url: Option<String>,
         default_branch: String,
+        /// See [`RigEvent::Added::git_connection_ref`]. `#[serde(default)]` for the same
+        /// backward-compatible-replay reason.
+        #[serde(default)]
+        git_connection_ref: Option<String>,
         now_secs: u64,
     },
     /// A rig was removed from the catalog. The on-disk directory teardown is a deploy-edge

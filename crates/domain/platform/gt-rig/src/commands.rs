@@ -41,6 +41,11 @@ pub struct AddRig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub upstream_url: Option<String>,
     pub default_branch: String,
+    /// Optional soft reference to the `public.vcs_connections.id` (hq-vcs-connections.1) this
+    /// rig clones with. Caller-supplied (unlike `workspace_id`); `None` registers a rig with no
+    /// VCS connection bound yet (hq-vcs-connections.3).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub git_connection_ref: Option<String>,
     /// UTC epoch seconds, stamped at the edge.
     pub now_secs: u64,
     /// Server-injected tenant. NOT read from the tool payload (`skip_deserializing`) and
@@ -96,6 +101,7 @@ impl AddRig {
             default_branch: self.default_branch.clone(),
             registered_at_secs: self.now_secs,
             worktree_root: None,
+            git_connection_ref: self.git_connection_ref.clone(),
         }
     }
 }
@@ -119,6 +125,7 @@ impl Command for AddRig {
             push_url: self.push_url.clone(),
             upstream_url: self.upstream_url.clone(),
             default_branch: self.default_branch.clone(),
+            git_connection_ref: self.git_connection_ref.clone(),
             now_secs: self.now_secs,
         })
     }
@@ -139,6 +146,9 @@ pub struct AdoptRig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub upstream_url: Option<String>,
     pub default_branch: String,
+    /// See [`AddRig::git_connection_ref`] — optional soft ref to the VCS connection.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub git_connection_ref: Option<String>,
     pub now_secs: u64,
     /// Server-injected tenant — see [`AddRig::workspace_id`].
     #[serde(skip_deserializing, default = "default_workspace")]
@@ -155,6 +165,7 @@ impl AdoptRig {
             push_url: self.push_url.clone(),
             upstream_url: self.upstream_url.clone(),
             default_branch: self.default_branch.clone(),
+            git_connection_ref: self.git_connection_ref.clone(),
             now_secs: self.now_secs,
             workspace_id: self.workspace_id.clone(),
         }
@@ -182,6 +193,7 @@ impl Command for AdoptRig {
             push_url: self.push_url.clone(),
             upstream_url: self.upstream_url.clone(),
             default_branch: self.default_branch.clone(),
+            git_connection_ref: self.git_connection_ref.clone(),
             now_secs: self.now_secs,
         })
     }
@@ -477,6 +489,7 @@ mod tests {
             push_url: None,
             upstream_url: None,
             default_branch: "main".into(),
+            git_connection_ref: None,
             now_secs: now,
             workspace_id: "default".into(),
         }
@@ -534,6 +547,7 @@ mod tests {
             push_url: None,
             upstream_url: None,
             default_branch: "main".into(),
+            git_connection_ref: None,
             now_secs: 10,
             workspace_id: "default".into(),
         };

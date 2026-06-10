@@ -155,6 +155,7 @@ mod tests {
             push_url: None,
             upstream_url: None,
             default_branch: "main".into(),
+            git_connection_ref: None,
             now_secs: now,
             workspace_id: "default".into(),
         })

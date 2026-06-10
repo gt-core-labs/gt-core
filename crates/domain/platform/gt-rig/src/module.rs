@@ -242,6 +242,11 @@ impl GtModule for RigsModule {
                 "add_worktree_root",
                 include_str!("../migrations/rig/0002__add_worktree_root.sql"),
             ),
+            Migration::new(
+                3,
+                "add_git_connection_ref",
+                include_str!("../migrations/rig/0003__add_git_connection_ref.sql"),
+            ),
         ]
     }
 }
@@ -309,7 +314,7 @@ mod tests {
     #[test]
     fn owns_the_rigs_table_migration() {
         let migs = RigsModule.migrations();
-        assert_eq!(migs.len(), 2);
+        assert_eq!(migs.len(), 3);
         assert_eq!(migs[0].version, 1);
         assert_eq!(migs[0].name, "create_rigs");
         // The worktree_root column override (hq-mt-rigs.5) is a follow-on migration, never
@@ -319,6 +324,13 @@ mod tests {
         assert!(migs[1]
             .sql
             .contains("ADD COLUMN IF NOT EXISTS worktree_root"));
+        // The git_connection_ref column (hq-vcs-connections.3) links a rig to the VCS
+        // connection it clones with — another follow-on migration on the same template.
+        assert_eq!(migs[2].version, 3);
+        assert_eq!(migs[2].name, "add_git_connection_ref");
+        assert!(migs[2]
+            .sql
+            .contains("ADD COLUMN IF NOT EXISTS git_connection_ref"));
         // Schema-per-ws (hq-mt-data.3, docs/04 §15): the table is created in the
         // `ws_default` template schema so `gt_create_workspace_schema` clones it per
         // tenant — not in `public` (which holds only cross-tenant catalogs).
