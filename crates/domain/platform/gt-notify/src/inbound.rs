@@ -7,7 +7,7 @@
 //! server lands, an Imap/Webhook impl replaces the file source and nothing in
 //! the mailbox daemon changes.
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 

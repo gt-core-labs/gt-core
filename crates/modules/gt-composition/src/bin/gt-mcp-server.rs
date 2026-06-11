@@ -720,8 +720,11 @@ async fn main() -> anyhow::Result<()> {
     // through the SAME domain router, and fans subscription events out via the
     // outbox. Opt-in: needs GT_INBOUND_MAIL_DIR + GT_PG_URL + the daemons
     // master switch; tick via GT_MAILBOX_TICK_SECS (default 30).
+    // Like the outbox drain, NOT gated by the singleton switch: the inbound
+    // dir is a per-pod mount (consume-by-rename keeps a poll idempotent), and
+    // the daemons pod runs a different binary. Opt-in by GT_INBOUND_MAIL_DIR.
     match (
-        run_daemons.then_some(()).and(std::env::var("GT_INBOUND_MAIL_DIR").ok()),
+        std::env::var("GT_INBOUND_MAIL_DIR").ok(),
         std::env::var("GT_PG_URL").ok(),
     ) {
         (Some(dir), Some(pg_url)) => match sqlx::PgPool::connect(&pg_url).await {
@@ -747,7 +750,7 @@ async fn main() -> anyhow::Result<()> {
             Err(e) => eprintln!("[gt-mcp-server] command mailbox off (PG connect failed: {e})"),
         },
         _ => eprintln!(
-            "[gt-mcp-server] command mailbox off (set GT_INBOUND_MAIL_DIR + GT_PG_URL; daemons on)"
+            "[gt-mcp-server] command mailbox off (set GT_INBOUND_MAIL_DIR + GT_PG_URL)"
         ),
     }
 
@@ -898,10 +901,14 @@ async fn main() -> anyhow::Result<()> {
     // Email-outbox drain daemon (hq-f24599): claims due email_outbox rows
     // (pending|retry, send_at <= now) and delivers them through the configured
     // EmailTransport (GT_EMAIL_TRANSPORT: log default; smtp once the server
-    // exists). Gated like the other daemons (singleton master switch) + on
-    // GT_PG_URL; tick via GT_EMAIL_DRAIN_TICK_SECS (default 30, 0 = off).
+    // exists). NOT gated by the singleton daemons switch: claim_due runs
+    // FOR UPDATE SKIP LOCKED, so concurrent drainers (API replicas) are
+    // disjoint by construction — and the daemons pod runs gt-orch-server, a
+    // different binary, so gating here would leave the outbox undrained
+    // (observed on gt-dev, hq-562fbd). Tick via GT_EMAIL_DRAIN_TICK_SECS
+    // (default 30, 0 = off).
     let email_tick = env_u64("GT_EMAIL_DRAIN_TICK_SECS", 30);
-    match (run_daemons && email_tick > 0)
+    match (email_tick > 0)
         .then_some(())
         .and(std::env::var("GT_PG_URL").ok())
     {
