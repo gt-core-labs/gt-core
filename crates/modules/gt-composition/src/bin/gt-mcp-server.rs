@@ -45,7 +45,7 @@ use gt_composition::hooks::{hooks_router, HooksApiState};
 use gt_composition::notifications::{notifications_router, NotificationsApiState};
 use gt_composition::mcp::{
     AgentHandler, AuditHandler, CommentsHandler, ConvoyHandler, DocumentsHandler, EmailHandler, EventLog, EventLogHooks,
-    EventLogIssueSink, GraphHandler, IdentityDoltMeStats, InvitesHandler, MemoryHandler, MergeHandler, NotifyHandler,
+    EventLogIssueSink, GraphHandler, IdentityDoltMeStats, InvitesHandler, MemoryHandler, MergeHandler, NotifyHandler, ReportHandler,
     PgDocumentsResource, PgRigPrefixes, PgWorkspaceStatus, QuotaBlockGuard, QuotaHandler, RigHandler,
     WorkspaceHandler, WsPools,
 };
@@ -1903,6 +1903,32 @@ async fn build_domain_router(
         ))),
         None => {
             eprintln!("[gt-mcp-server] comments.* off — GT_DOLT_URL unset (card targets unverifiable)");
+            router
+        }
+    };
+
+    // report.* — the operator-report export engine (hq-fc7d6a): projects the
+    // (rig, workspace) board into the tracker mockup, attaches it as a document
+    // (xlsx via the blob store, csv as text), optionally announcing via the
+    // email outbox. Needs the Dolt tracker for the row source.
+    let router = match std::env::var("GT_DOLT_URL")
+        .ok()
+        .and_then(|url| DoltIssues::connect(&url).ok())
+    {
+        Some(report_dolt) => {
+            let (report_blob, report_bucket) = build_blob_store();
+            router.register(Arc::new(ReportHandler::new(
+                ws_pools.clone(),
+                Arc::new(report_dolt),
+                dolt_pools.clone(),
+                report_blob,
+                report_bucket,
+                pool.clone(),
+                std::env::var("GT_PUBLIC_URL").ok(),
+            )))
+        }
+        None => {
+            eprintln!("[gt-mcp-server] report.* off — GT_DOLT_URL unset (no row source)");
             router
         }
     };

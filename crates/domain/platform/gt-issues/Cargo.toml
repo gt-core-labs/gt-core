@@ -22,6 +22,8 @@ gt-events = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
 schemars = { workspace = true }
+# Operator-report XLSX serializer (hq-fc7d6a).
+rust_xlsxwriter = { workspace = true }
 semver = { workspace = true }
 # RFC3339 parsing for the stats lead-time roll-up (hq-web-extras.12), mirroring
 # gt-feed's `time`-based timestamp parsing — parse-only, no clock.

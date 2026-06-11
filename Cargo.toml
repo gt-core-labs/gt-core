@@ -134,6 +134,8 @@ mysql_async = { version = "0.34", default-features = false, features = ["minimal
 # and tests with no running object store. Backend swaps without touching callers.
 opendal = { version = "0.51", default-features = false, features = ["services-s3", "services-fs"] }
 thiserror = "2"
+# XLSX serializer for the operator report (hq-fc7d6a). Pure Rust, no system deps.
+rust_xlsxwriter = "0.79"
 # Event kernel (hq-core-port.10) — ulid for Envelope event ids, time for RFC3339 stamps.
 ulid = "1"
 # Cross-platform advisory file lock for the gt-eventlog jsonl writer (hq-core-port.8).
