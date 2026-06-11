@@ -139,8 +139,9 @@ docker compose -f docker-compose.yml -f compose.embeddings.yml logs -f gt-mcp-se
 ```
 
 **k8s:** `helm install gt chart/gt -f values-secret.yaml --set storageClass=<csi-class>`. The
-API Deployment rolls only once its pods pass `/healthz` (probes gate the rollout —
-`maxUnavailable: 0`), so a boot panic never receives traffic.
+API Deployment rolls only once its pods pass `/health` (probes gate the rollout —
+`maxUnavailable: 0`), so a boot panic never receives traffic. (The binary serves
+`/health` only — there is no `/healthz`.)
 
 ### Boot order (ground truth: `crates/modules/gt-composition/src/bin/gt-mcp-server.rs`)
 
@@ -278,9 +279,11 @@ test -n "$GT_TOKEN" && echo "OK: admin login"
 curl -fsS "${AUTH[@]}" "$GT_URL/api/v1/workspace" | jq -e '.[]|select(.slug=="default")' >/dev/null \
   && echo "OK: default workspace"
 
-# 3. A role resolves a NON-EMPTY prompt + scopes (the §4.1 Knowledge seed, not just the catalog):
-curl -fsS "${AUTH[@]}" "$GT_URL/api/v1/roles/mayor" \
-  | jq -e '(.prompt|length>0) and (.scopes|length>0)' >/dev/null \
+# 3. A role resolves a NON-EMPTY prompt + scopes (the §4.1 Knowledge seed, not just the catalog).
+#    There is NO `GET /api/v1/roles/{role}` route — role prompt+scopes live in the per-role
+#    *bindings* returned by `GET /api/v1/skills` ({count, skills, bindings:[{role,prompt,scopes,…}]}).
+curl -fsS "${AUTH[@]}" "$GT_URL/api/v1/skills" \
+  | jq -e '.bindings[]|select(.role=="mayor")|(.prompt|length>0) and (.scopes|length>0)' >/dev/null \
   && echo "OK: role prompt+scopes non-empty"
 
 # 4. ≥1 IdP on the (public) login page (the §4.2 OAuth seed + enabled flag):
@@ -290,19 +293,38 @@ curl -fsS "$GT_URL/auth/providers" | jq -e 'length>=1' >/dev/null \
 # 5. Rig catalog populated; graph.refresh clones + indexes a real commit:
 curl -fsS "${AUTH[@]}" "$GT_URL/api/v1/rig" | jq -e 'length>=1' >/dev/null \
   && echo "OK: rig catalog populated"
-#   (then graph.refresh {rig:"hq"} via /mcp and confirm a real commit sha, not "unknown")
+#   (then call the `graph_refresh` MCP tool with {rig:"hq"} via a /mcp session — see check 7 —
+#    and confirm a real commit sha, not "unknown")
 
 # 6. Quota has >=1 Healthy account (the §4.4 procedure + hydrated daemon):
 curl -fsS "${AUTH[@]}" "$GT_URL/api/v1/quota/" | jq -e '[.[]|select(.health=="Healthy")]|length>=1' >/dev/null \
   && echo "OK: >=1 healthy quota account"
 #   and the orchd daemon log shows: "claude keychain seeded with N account(s)"
 
-# 7. /mcp authenticated + issues.* operational (handshake then a tool call):
-curl -fsS "${AUTH[@]}" -X POST "$GT_URL/mcp" \
-  -H 'content-type: application/json' \
-  -d '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"issues.list.execute","arguments":{}}}' \
-  | jq -e '.result' >/dev/null && echo "OK: /mcp issues.* works"
+# 7. /mcp authenticated + the issues tracker operational.
+#    The /mcp transport is rmcp streamable-HTTP: a bare `tools/call` 422s with
+#    "Unexpected message, expect initialize request". A real call needs the full session
+#    lifecycle — initialize (capture the `mcp-session-id` response header) → notifications/initialized
+#    → tools/call — and the client MUST accept SSE (`Accept: application/json, text/event-stream`);
+#    replies come back as `text/event-stream` events. Note the wire tool id uses UNDERSCORES
+#    (`issues_list_execute`), NOT the dotted `issues.list.execute` prose form.
+ACC=(-H 'content-type: application/json' -H 'accept: application/json, text/event-stream')
+# initialize → grab the session id from the response header
+SID="$(curl -fsS -D - -o /dev/null "${AUTH[@]}" "${ACC[@]}" -X POST "$GT_URL/mcp" \
+  -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26","capabilities":{},"clientInfo":{"name":"smoke","version":"0"}}}' \
+  | tr -d '\r' | awk -F': ' 'tolower($1)=="mcp-session-id"{print $2}')"
+SES=(-H "mcp-session-id: $SID")
+# notifications/initialized (no id) then the actual tool call
+curl -fsS "${AUTH[@]}" "${ACC[@]}" "${SES[@]}" -X POST "$GT_URL/mcp" \
+  -d '{"jsonrpc":"2.0","method":"notifications/initialized"}' >/dev/null
+curl -fsS "${AUTH[@]}" "${ACC[@]}" "${SES[@]}" -X POST "$GT_URL/mcp" \
+  -d '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"issues_list_execute","arguments":{}}}' \
+  | grep -q '"result"' && echo "OK: /mcp issues tracker works"
 ```
+
+> The `curl ... | grep '"result"'` is a minimal check — the body arrives as SSE
+> (`data: {…}` lines), so parse the JSON out of the `data:` frame if you need the rows. The
+> reference smoke harness (`hq-greenfield-seeds.7`) implements this minimal MCP client end-to-end.
 
 All seven green = **functional from zero**, no manual step outside this runbook.
 
@@ -321,7 +343,7 @@ C="docker compose -f docker-compose.yml -f compose.embeddings.yml"
 
 $C up -d postgres dolt minio minio-createbucket    # 1. stores + bucket
 $C up -d gt-mcp-server gt-web gt-docs proxy         # 2. API boots → auto-seeds (this §3)
-$C logs -f gt-mcp-server                            # 3. watch seed lines; wait for /healthz
+$C logs -f gt-mcp-server                            # 3. watch seed lines; wait for /health
 # 4. post-boot operator steps (this §4): enable OAuth provider, GitHub App (if private rig),
 #    onboard quota account:
 scripts/onboard-quota-account.sh --url "$GT_URL" --token "$GT_TOKEN" --email me@example.com
@@ -341,7 +363,7 @@ talosctl cluster create
 # 2. secrets — NEVER committed:
 cp chart/gt/values-secret.yaml.example values-secret.yaml      # edit
 # 3. install — post-install hooks (hook-weight: minio-init then seed-job) run BEFORE the API rolls;
-#    the API Deployment rolls only once pods pass /healthz (maxUnavailable: 0).
+#    the API Deployment rolls only once pods pass /health (maxUnavailable: 0).
 helm install gt chart/gt -f values-secret.yaml --set storageClass=<csi-class>
 # 4. post-boot operator steps (this §4): provide GT_OAUTH_SEED_SECRET_GOOGLE + enable the provider;
 #    register/install the GitHub App + rebind a private rig's git_connection_ref; onboard a quota
@@ -352,17 +374,15 @@ helm install gt chart/gt -f values-secret.yaml --set storageClass=<csi-class>
 ```
 
 > **Mapping note:** compose service → k8s object table is in `chart/gt/README.md` ("How the
-> compose assembly maps to k8s"). The chart's `seed-job` currently only does a **store-readiness
-> wait** — its inline comment still says live seeds are "pending hq-greenfield-seeds". That
-> comment is now **stale**: the knowledge/IdP/rig seeds are performed by the **API binary on
-> boot** (this §3), not by the seed Job. The Job stays useful as the GitOps seam that orders
-> store-readiness before the API rolls; no live-seed command needs to be added to it.
+> compose assembly maps to k8s"). The chart's `seed-job` is a **store-readiness wait** only — the
+> knowledge/IdP/rig seeds are performed by the **API binary on boot** (this §3), not by the Job
+> (the Job stays useful as the GitOps seam that orders store-readiness before the API rolls). The
+> chart + `gt-app-proxy/DEPLOY.md` were reconciled to this reality in `hq-talos-migration.13`.
 
-> **`GT_RUN_DAEMONS` note:** `chart/gt/README.md` ("API vs daemon split") states the binary has
-> no single `GT_RUN_DAEMONS` gate and approximates the split with per-loop off-switches. That is
-> now **stale** — the binary honours `GT_RUN_DAEMONS` (default ON; `0` turns every daemon loop
-> off; `gt-mcp-server.rs::run_daemons`). On the scaled API tier set `GT_RUN_DAEMONS=0`; leave it
-> ON (default) on the singleton.
+> **`GT_RUN_DAEMONS`:** the binary honours a single `GT_RUN_DAEMONS` gate (default ON; `0` turns
+> every daemon loop off; `gt-mcp-server.rs::should_run_daemons`). On the scaled API tier set
+> `GT_RUN_DAEMONS=0`; leave it ON (default) on the singleton. The chart already wires this
+> (`=0` API / `=1` orchd).
 
 ---
 
@@ -371,6 +391,7 @@ helm install gt chart/gt -f values-secret.yaml --set storageClass=<csi-class>
 - **[`greenfield-seeds.md`](./greenfield-seeds.md)** — the seed inventory + gap analysis +
   secrets matrix (§3) + per-seed regeneration recipes (§4.1–§4.4) + verification (§6).
 - `gt-app-proxy/chart/gt/README.md` — the Helm chart, compose→k8s mapping, secrets handling.
-- `gt-app-proxy/DEPLOY.md` — the live compose deploy runbook for this host.
+- `gt-app-proxy/DEPLOY.md` — the master Talos install + bring-up + cutover runbook
+  (`hq-talos-migration.8`); this doc is its detail reference for the API-boot seeds.
 - `scripts/onboard-quota-account.sh`, `scripts/extract-{knowledge,oauth,rigs}-seed.py` — the
   helper + regeneration scripts referenced above.
