@@ -133,46 +133,54 @@ pub struct InstalledConnection {
 ))]
 async fn install_callback(
     State(st): State<GithubApiState>,
-    ctx: WorkspaceContext,
+    _ctx: WorkspaceContext,
     Query(params): Query<CallbackParams>,
 ) -> Result<Response, ApiError> {
-    let workspace = ctx.workspace().as_str().to_owned();
-    let client = st.client().await?;
-    // Resolve the org/account login the installation lives under by minting an installation token
-    // and reading the first repo's owner. The token is used ONLY here and dropped — never stored.
-    let account_login = match client.installation_token(&params.installation_id).await {
-        Ok(token) => client
-            .list_installation_repos(&token)
-            .await
-            .ok()
-            .and_then(|repos| repos.first().map(|r| owner_of(&r.full_name))),
-        // A token mint failure (e.g. GitHub transiently unreachable) does not block recording the
-        // installation: the login is best-effort metadata, not a credential. The connection is
-        // still usable (we mint fresh tokens per clone).
-        Err(_) => None,
-    };
-
     let id = format!("gh-{}", params.installation_id);
-    let stored = st
+
+    // Idempotent: GitHub re-hits this on every re-install / repo-selection `update`, so a row that
+    // already exists for this installation is a no-op (re-inserting the PK would 500). The
+    // connection is GLOBAL (looked up across tenants), so we never create a duplicate per workspace.
+    if st
         .connections
-        .create(NewConnection {
-            id: id.clone(),
-            workspace_id: Some(workspace),
-            kind: ConnectionKind::GithubApp,
-            installation_id: Some(params.installation_id.clone()),
-            account_login: account_login.clone(),
-            // github_app stores NO secret — tokens are minted JIT.
-            secret: None,
-            status: ConnectionStatus::Active,
-        })
-        .await?;
+        .find_by_installation(&params.installation_id)
+        .await?
+        .is_none()
+    {
+        let client = st.client().await?;
+        // Resolve the org/account login the installation lives under by minting an installation token
+        // and reading the first repo's owner. The token is used ONLY here and dropped — never stored.
+        let account_login = match client.installation_token(&params.installation_id).await {
+            Ok(token) => client
+                .list_installation_repos(&token)
+                .await
+                .ok()
+                .and_then(|repos| repos.first().map(|r| owner_of(&r.full_name))),
+            Err(_) => None,
+        };
+        st.connections
+            .create(NewConnection {
+                id: id.clone(),
+                // GLOBAL (hq-61ea43): the platform GitHub App is shared across workspaces — a global
+                // connection (workspace_id NULL) shows in every workspace's Repos picker, so each
+                // workspace registers its own rigs against the same installation. The token is minted
+                // JIT from the global App config; nothing tenant-specific is stored.
+                workspace_id: None,
+                kind: ConnectionKind::GithubApp,
+                installation_id: Some(params.installation_id.clone()),
+                account_login,
+                // github_app stores NO secret — tokens are minted JIT.
+                secret: None,
+                status: ConnectionStatus::Active,
+            })
+            .await?;
+    }
 
     // Redirect the browser back to the complemento page (instead of dumping JSON): the install flow
     // is a top-level navigation / popup, so a 303 lands the user on the app, which then refreshes its
     // connection list. `gh_connected` lets the page close the popup + reload the opener.
     Ok(axum::response::Redirect::to(&format!(
-        "/complementos/github?gh_connected={}",
-        stored.id
+        "/complementos/github?gh_connected={id}"
     ))
     .into_response())
 }
@@ -510,7 +518,8 @@ mod tests {
         assert_eq!(row.kind, ConnectionKind::GithubApp);
         assert_eq!(row.installation_id.as_deref(), Some("987654"));
         assert!(row.secret_sealed.is_none(), "github_app stores no token");
-        assert_eq!(row.workspace_id.as_deref(), Some("acme"));
+        // Global (hq-61ea43): the platform App connection is shared across workspaces.
+        assert_eq!(row.workspace_id, None);
     }
 
     /// `GET /repos` for an unknown connection is a 404.
