@@ -98,6 +98,7 @@ fn generate_bead_id(rig: &str) -> String {
 /// Input for the `issues.create` tool (hq-mcp-issues.2). Mirrors the required
 /// columns of `hq.issues`; optional fields fall back to schema defaults.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[cfg_attr(feature = "axum", derive(utoipa::ToSchema))]
 pub struct CreateIssue {
     /// Bead id. When provided, used verbatim (backward-compat with the old
     /// `{external_ref}.{n}` format and NN-16 validation still applies). When
@@ -295,6 +296,7 @@ impl CreateIssue {
 /// grants stay separable. All fields except `id` are `Option`: `None` leaves the
 /// column untouched, `Some(_)` overwrites. At least one field must be set.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[cfg_attr(feature = "axum", derive(utoipa::ToSchema))]
 pub struct UpdateIssue {
     /// Target bead id. Non-empty; the row is matched by primary key.
     pub id: String,

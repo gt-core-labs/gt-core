@@ -28,6 +28,7 @@ use serde::{Deserialize, Deserializer, Serialize};
 /// OR a bare string (read as `planned:false`) for back-compat with the legacy
 /// `["path", …]` shape.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, JsonSchema)]
+#[cfg_attr(feature = "axum", derive(utoipa::ToSchema))]
 pub struct SurfaceEntry {
     /// Crate name or repo path the bead touches. Non-empty.
     pub path: String,

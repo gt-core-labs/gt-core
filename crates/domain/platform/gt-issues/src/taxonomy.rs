@@ -21,6 +21,7 @@ use serde::{Deserialize, Serialize};
 /// per-variant doc is intentionally omitted as redundant.
 #[allow(missing_docs)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
+#[cfg_attr(feature = "axum", derive(utoipa::ToSchema))]
 pub enum Domain {
     #[serde(rename = "kernel.events")]
     KernelEvents,
@@ -125,6 +126,10 @@ pub enum Domain {
     DeployCompose,
     #[serde(rename = "deploy.dolt")]
     DeployDolt,
+    #[serde(rename = "deploy.k8s")]
+    DeployK8s,
+    #[serde(rename = "deploy.talos")]
+    DeployTalos,
     #[serde(rename = "docs.spec")]
     DocsSpec,
     #[serde(rename = "meta.gap")]

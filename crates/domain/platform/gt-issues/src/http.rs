@@ -479,6 +479,7 @@ async fn get_issue(
 /// new resource, not an existing path), uniqueness is enforced by the store. `201` on success.
 #[cfg_attr(feature = "axum", utoipa::path(
     post, path = "/",
+    request_body = CreateIssue,
     responses(
         (status = 201, description = "Issue created"),
         (status = 422, description = "Validation failed (shape / NN-16 taxonomy)"),
@@ -518,6 +519,7 @@ async fn create_issue(
 #[cfg_attr(feature = "axum", utoipa::path(
     patch, path = "/{id}",
     params(("id" = String, Path, description = "Bead id")),
+    request_body = UpdateIssue,
     responses(
         (status = 200, description = "Patched; returns the post-bump version"),
         (status = 422, description = "Validation failed (incl. version conflict)"),
@@ -705,6 +707,10 @@ async fn claim_issue(
         crate::stats::StatBucket,
         crate::stats::LeadTime,
         GroupDim,
+        crate::commands::CreateIssue,
+        crate::commands::UpdateIssue,
+        crate::taxonomy::Domain,
+        crate::surface::SurfaceEntry,
     ))
 )]
 pub struct ApiDoc;
