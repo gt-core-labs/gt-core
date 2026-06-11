@@ -34,11 +34,11 @@ use axum::{Json, Router};
 use serde_json::{json, Value};
 use time::OffsetDateTime;
 
-use gt_auth::JwtClaims;
+use gt_auth::{has_pat_prefix, JwtClaims};
 use gt_mcp_server::{DomainCtx, DomainRouter};
 use gt_store_dolt::AppError;
 
-use crate::auth::SharedAuthenticator;
+use crate::auth::{SharedAuthenticator, SharedPatVerifier};
 use crate::denial_audit::{record_denial, SharedAudit, ANONYMOUS};
 
 const TOKEN_COOKIE: &str = "gt_web_token";
@@ -49,6 +49,8 @@ const SCOPE_WILDCARD: &str = "*";
 #[derive(Clone)]
 pub struct KanbanRestState {
     authenticator: SharedAuthenticator,
+    /// PAT port (gtpat_… bearers — agents/CLIs); `None` denies PATs.
+    pat: Option<SharedPatVerifier>,
     audit: SharedAudit,
     domains: Arc<DomainRouter>,
 }
@@ -60,7 +62,14 @@ impl KanbanRestState {
         audit: SharedAudit,
         domains: Arc<DomainRouter>,
     ) -> Self {
-        Self { authenticator, audit, domains }
+        Self { authenticator, pat: None, audit, domains }
+    }
+
+    /// Accept `gtpat_…` bearers through the PAT port too (the same chain the
+    /// global REST middleware runs) — without it a PAT is a hard 401 here.
+    pub fn with_pat(mut self, pat: SharedPatVerifier) -> Self {
+        self.pat = Some(pat);
+        self
     }
 }
 
@@ -81,8 +90,10 @@ pub fn kanban_rest_router(state: KanbanRestState) -> Router {
 }
 
 /// Authorize one bridge call: cookie/bearer → verified claims → scope check
-/// (`""` = any authenticated session). Mirrors the notifications REST.
-fn authorize(
+/// (`""` = any authenticated session). Mirrors the global REST chain: a
+/// `gtpat_…` bearer goes through the PAT port, anything else the RS256
+/// verifier — a PAT is never tried as a JWT.
+async fn authorize(
     st: &KanbanRestState,
     headers: &HeaderMap,
     scope: &'static str,
@@ -104,14 +115,24 @@ fn authorize(
     let token = bearer(headers)
         .or_else(|| cookie(headers, TOKEN_COOKIE))
         .ok_or_else(|| reject(StatusCode::UNAUTHORIZED, "missing gt_web_token cookie or bearer"))?;
-    let claims = st
-        .authenticator
-        .authenticate(&token)
-        .map_err(|_| reject(StatusCode::UNAUTHORIZED, "invalid token"))?;
     let now = OffsetDateTime::now_utc().unix_timestamp().max(0) as u64;
-    if claims.validate(now, JwtClaims::workspace_optional_from_env()).is_err() {
-        return Err(reject(StatusCode::UNAUTHORIZED, "expired or incomplete token"));
-    }
+    let claims = if has_pat_prefix(&token) {
+        let Some(pat) = &st.pat else {
+            return Err(reject(StatusCode::UNAUTHORIZED, "personal access tokens are not configured"));
+        };
+        pat.verify(&token, now)
+            .await
+            .map_err(|_| reject(StatusCode::UNAUTHORIZED, "invalid personal access token"))?
+    } else {
+        let claims = st
+            .authenticator
+            .authenticate(&token)
+            .map_err(|_| reject(StatusCode::UNAUTHORIZED, "invalid token"))?;
+        if claims.validate(now, JwtClaims::workspace_optional_from_env()).is_err() {
+            return Err(reject(StatusCode::UNAUTHORIZED, "expired or incomplete token"));
+        }
+        claims
+    };
     if !scope.is_empty()
         && !claims.scopes.iter().any(|s| s == SCOPE_WILDCARD || s == scope)
     {
@@ -144,7 +165,9 @@ async fn comments_list(
     headers: HeaderMap,
     Query(q): Query<Value>,
 ) -> Response {
-    let claims = match authorize(&st, &headers, "comments.read", &Method::GET, "/api/v1/comments") {
+    let claims = match authorize(&st, &headers, "comments.read", &Method::GET, "/api/v1/comments")
+    .await
+    {
         Ok(c) => c,
         Err(r) => return r,
     };
@@ -156,7 +179,9 @@ async fn comments_create(
     headers: HeaderMap,
     Json(body): Json<Value>,
 ) -> Response {
-    let claims = match authorize(&st, &headers, "comments.write", &Method::POST, "/api/v1/comments") {
+    let claims = match authorize(&st, &headers, "comments.write", &Method::POST, "/api/v1/comments")
+    .await
+    {
         Ok(c) => c,
         Err(r) => return r,
     };
@@ -169,7 +194,9 @@ async fn comments_update(
     Path(id): Path<String>,
     Json(mut body): Json<Value>,
 ) -> Response {
-    let claims = match authorize(&st, &headers, "comments.write", &Method::PATCH, "/api/v1/comments") {
+    let claims = match authorize(&st, &headers, "comments.write", &Method::PATCH, "/api/v1/comments")
+    .await
+    {
         Ok(c) => c,
         Err(r) => return r,
     };
@@ -185,7 +212,9 @@ async fn comments_delete(
     headers: HeaderMap,
     Path(id): Path<String>,
 ) -> Response {
-    let claims = match authorize(&st, &headers, "comments.write", &Method::DELETE, "/api/v1/comments") {
+    let claims = match authorize(&st, &headers, "comments.write", &Method::DELETE, "/api/v1/comments")
+    .await
+    {
         Ok(c) => c,
         Err(r) => return r,
     };
@@ -205,7 +234,9 @@ async fn report_generate(
         "documents.write",
         &Method::POST,
         "/api/v1/report/generate",
-    ) {
+    )
+    .await
+    {
         Ok(c) => c,
         Err(r) => return r,
     };
@@ -219,7 +250,9 @@ async fn analytics_summary(
     headers: HeaderMap,
     Query(q): Query<Value>,
 ) -> Response {
-    let claims = match authorize(&st, &headers, "issues.read", &Method::GET, "/api/v1/analytics/summary") {
+    let claims = match authorize(&st, &headers, "issues.read", &Method::GET, "/api/v1/analytics/summary")
+    .await
+    {
         Ok(c) => c,
         Err(r) => return r,
     };
@@ -229,7 +262,9 @@ async fn analytics_summary(
 // ─── invites ─────────────────────────────────────────────────────────────────
 
 async fn invites_list(State(st): State<KanbanRestState>, headers: HeaderMap) -> Response {
-    let claims = match authorize(&st, &headers, "invites.read", &Method::GET, "/api/v1/invites") {
+    let claims = match authorize(&st, &headers, "invites.read", &Method::GET, "/api/v1/invites")
+    .await
+    {
         Ok(c) => c,
         Err(r) => return r,
     };
@@ -241,7 +276,9 @@ async fn invites_create(
     headers: HeaderMap,
     Json(body): Json<Value>,
 ) -> Response {
-    let claims = match authorize(&st, &headers, "invites.write", &Method::POST, "/api/v1/invites") {
+    let claims = match authorize(&st, &headers, "invites.write", &Method::POST, "/api/v1/invites")
+    .await
+    {
         Ok(c) => c,
         Err(r) => return r,
     };
@@ -253,7 +290,9 @@ async fn invites_revoke(
     headers: HeaderMap,
     Path(id): Path<String>,
 ) -> Response {
-    let claims = match authorize(&st, &headers, "invites.write", &Method::DELETE, "/api/v1/invites") {
+    let claims = match authorize(&st, &headers, "invites.write", &Method::DELETE, "/api/v1/invites")
+    .await
+    {
         Ok(c) => c,
         Err(r) => return r,
     };
@@ -268,7 +307,9 @@ async fn invites_accept(
     headers: HeaderMap,
     Json(body): Json<Value>,
 ) -> Response {
-    let claims = match authorize(&st, &headers, "", &Method::POST, "/api/v1/invites/accept") {
+    let claims = match authorize(&st, &headers, "", &Method::POST, "/api/v1/invites/accept")
+    .await
+    {
         Ok(c) => c,
         Err(r) => return r,
     };

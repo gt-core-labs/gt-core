@@ -703,16 +703,24 @@ async fn main() -> anyhow::Result<()> {
     // Kanban bridge REST (hq-95c2bb): comments + report + invites for the web
     // Kanban, dispatched through the SAME domain router as MCP (zero logic
     // forks). Gated on the RS256 verifier (cookie/bearer auth like notifications).
-    let kanban = verifier.as_ref().map(|v| {
-        eprintln!(
-            "[gt-mcp-server] kanban bridge REST on /api/v1/{{comments,report,invites}} (domain-router dispatch)"
-        );
-        kanban_rest_router(KanbanRestState::new(
-            v.clone(),
-            audit.clone(),
-            kanban_domains.clone(),
-        ))
-    });
+    let kanban = match verifier.as_ref() {
+        Some(v) => {
+            let mut state =
+                KanbanRestState::new(v.clone(), audit.clone(), kanban_domains.clone());
+            // gtpat_… bearers (agents/CLIs) authenticate here exactly like the
+            // global REST chain — through the PG-backed PAT port.
+            if let Ok(pg_url) = std::env::var("GT_PG_URL") {
+                if let Ok(pat_pool) = WorkspacePool::connect(&pg_url, "default").await {
+                    state = state.with_pat(Arc::new(PgPatStore::new(pat_pool.pool().clone())));
+                }
+            }
+            eprintln!(
+                "[gt-mcp-server] kanban bridge REST on /api/v1/{{comments,report,invites,analytics}} (domain-router dispatch)"
+            );
+            Some(kanban_rest_router(state))
+        }
+        None => None,
+    };
 
     // Command mailbox + seguimiento subscriptions daemon (hq-8a521a): polls the
     // inbound-mail seam (GT_INBOUND_MAIL_DIR file source until the IMAP server
