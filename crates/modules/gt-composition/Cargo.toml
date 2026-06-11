@@ -100,6 +100,8 @@ gt-comments = { workspace = true }
 # Email transport seam (hq-f24599): LogTransport now, SMTP later by config.
 gt-notify = { workspace = true }
 chrono = { workspace = true }
+# Unguessable invite tokens (hq-4231c1).
+getrandom = { workspace = true }
 gt-store-blob = { workspace = true }
 gt-docs-extract = { workspace = true }
 gt-docs-embed = { workspace = true }

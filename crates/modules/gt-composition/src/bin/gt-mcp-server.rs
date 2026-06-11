@@ -45,7 +45,7 @@ use gt_composition::hooks::{hooks_router, HooksApiState};
 use gt_composition::notifications::{notifications_router, NotificationsApiState};
 use gt_composition::mcp::{
     AgentHandler, AuditHandler, CommentsHandler, ConvoyHandler, DocumentsHandler, EmailHandler, EventLog, EventLogHooks,
-    EventLogIssueSink, GraphHandler, IdentityDoltMeStats, MemoryHandler, MergeHandler, NotifyHandler,
+    EventLogIssueSink, GraphHandler, IdentityDoltMeStats, InvitesHandler, MemoryHandler, MergeHandler, NotifyHandler,
     PgDocumentsResource, PgRigPrefixes, PgWorkspaceStatus, QuotaBlockGuard, QuotaHandler, RigHandler,
     WorkspaceHandler, WsPools,
 };
@@ -1453,6 +1453,7 @@ async fn apply_pg_catalog(pool: &sqlx::PgPool) -> anyhow::Result<()> {
     let docs_id = ModuleId::new("docs").expect("`docs` is a valid module id");
     let comments_id = ModuleId::new("comments").expect("`comments` is a valid module id");
     let email_id = ModuleId::new("email").expect("`email` is a valid module id");
+    let invites_id = ModuleId::new("invites").expect("`invites` is a valid module id");
     let memory_id = ModuleId::new("memory").expect("`memory` is a valid module id");
     let notifications_id = ModuleId::new("notifications").expect("`notifications` is a valid module id");
     // hq-talos-migration.10: the GLOBAL `public.events` table — the Postgres-backed EventStore that
@@ -1479,6 +1480,8 @@ async fn apply_pg_catalog(pool: &sqlx::PgPool) -> anyhow::Result<()> {
     let comments_migs = gt_store_pg::comments_migrations();
     // hq-f24599: the public-schema email_outbox the programmed-send pipeline drains.
     let email_migs = gt_store_pg::email_migrations();
+    // hq-4231c1: the public-schema workspace_invites the collaborator flow consumes.
+    let invites_migs = gt_store_pg::invites_migrations();
     // hq-memory-mcp.1: the per-workspace `memories` template table (semantic agent memory).
     // Like `documents`, it seeds the `ws_default` template so it is cloned per tenant.
     let memory_migs = gt_store_pg::memory_migrations();
@@ -1510,6 +1513,7 @@ async fn apply_pg_catalog(pool: &sqlx::PgPool) -> anyhow::Result<()> {
         .chain(docs_migs.iter().map(|m| (&docs_id, m)))
         .chain(comments_migs.iter().map(|m| (&comments_id, m)))
         .chain(email_migs.iter().map(|m| (&email_id, m)))
+        .chain(invites_migs.iter().map(|m| (&invites_id, m)))
         .chain(memory_migs.iter().map(|m| (&memory_id, m)))
         .chain(notifications_migs.iter().map(|m| (&notifications_id, m)))
         .chain(events_migs.iter().map(|m| (&events_id, m)))
@@ -1836,6 +1840,13 @@ async fn build_domain_router(
         // the drain daemon (spawned in main, gated like the other daemons) delivers
         // through the gt-notify EmailTransport seam.
         .register(Arc::new(EmailHandler::new(pool.clone())))
+        // invite.* — collaborator invites (hq-4231c1): mint/list/revoke/accept;
+        // the token mails via the outbox, the accept binds the gt-login identity
+        // to the membership (workspace_member-add under the hood).
+        .register(Arc::new(InvitesHandler::new(
+            pool.clone(),
+            std::env::var("GT_PUBLIC_URL").ok(),
+        )))
         // graph.* read-only queries (hq-graphrig.10) + server-side refresh (hq-vcs-connections.4):
         // graphify-backed indexer; the warden state (replayed from event_log) resolves rig ->
         // repo_dir, and the provisioner clones/fetches from the rig's VCS connection on refresh.

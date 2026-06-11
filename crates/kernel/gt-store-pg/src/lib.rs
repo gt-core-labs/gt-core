@@ -39,6 +39,11 @@ pub mod email_outbox;
 pub use email_outbox::{EmailOutboxRepository, NewEmail, OutboxEntry, OutboxError, PgEmailOutbox};
 
 #[cfg(feature = "pg")]
+pub mod invites;
+#[cfg(feature = "pg")]
+pub use invites::{Invite, InviteError, InvitesRepository, NewInvite, PgInvites};
+
+#[cfg(feature = "pg")]
 pub mod memory_store;
 #[cfg(feature = "pg")]
 pub use memory_store::{
@@ -169,6 +174,18 @@ const EMAIL_0001_SQL: &str = include_str!("../migrations/email/0001_email_outbox
 /// `gt_notify::EmailTransport` seam — the SMTP server stays pluggable.
 pub fn email_migrations() -> Vec<Migration> {
     vec![Migration::new(1, "0001_email_outbox", EMAIL_0001_SQL)]
+}
+
+/// Initial migration: `workspace_invites` table in the public schema.
+const INVITES_0001_SQL: &str = include_str!("../migrations/invites/0001_workspace_invites.sql");
+
+/// Migrations for the collaborator-invite store (hq-4231c1).
+///
+/// Public schema: the invite is a one-shot capability token an admin mints and
+/// the gt-login-authenticated accept consumes; the membership itself lives in
+/// gt-auth's `user_workspaces` + `ws_<slug>.users` mirror, never here.
+pub fn invites_migrations() -> Vec<Migration> {
+    vec![Migration::new(1, "0001_workspace_invites", INVITES_0001_SQL)]
 }
 
 /// Initial migration: `notifications` table in the public schema.
