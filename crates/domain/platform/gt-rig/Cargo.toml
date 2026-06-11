@@ -39,7 +39,10 @@ sqlx = { workspace = true, optional = true }
 axum = { workspace = true, optional = true }
 utoipa = { workspace = true, optional = true }
 async-trait = { workspace = true, optional = true }
-serde_json = { workspace = true, optional = true }
+# Parse the embedded, versioned rig-catalog seed (`rig_seed.rs`, hq-greenfield-seeds.5). Always
+# on — the seed module is part of the default build so the boot path can replay it without pulling
+# the whole `axum` feature.
+serde_json = { workspace = true }
 gt-workspace = { workspace = true, optional = true, features = ["axum"] }
 
 [features]
@@ -48,10 +51,9 @@ pg = ["dep:sqlx"]
 # Compile the axum REST adapter + OpenAPI spec (`http.rs`) and the route/spec overrides on
 # `RigsModule`. Off by default — the MCP-only build pulls no HTTP stack; the composition bin
 # enables it to expose the REST surface.
-axum = ["dep:axum", "dep:utoipa", "dep:async-trait", "dep:serde_json", "dep:gt-workspace"]
+axum = ["dep:axum", "dep:utoipa", "dep:async-trait", "dep:gt-workspace"]
 
 [dev-dependencies]
-serde_json.workspace = true
 # Exercise the REST router in-process (hq-fe-api-platform.2): `oneshot` a request and read the
 # response without a live socket. Run with `--features axum` so the adapter + these helpers
 # compile for the contract test.

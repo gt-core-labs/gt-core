@@ -28,6 +28,7 @@ pub mod module;
 #[cfg(feature = "pg")]
 mod pg;
 pub mod repo;
+pub mod rig_seed;
 
 mod events;
 mod state;
@@ -46,6 +47,7 @@ pub use http::{rig_router, ApiDoc, DynRigRepository, RigApiState, WorkspaceRigs}
 pub use module::RigsHttpModule;
 pub use module::RigsModule;
 pub use repo::{InMemoryRigs, RigRepository};
+pub use rig_seed::{seed_rigs, SeedRig, SEED_JSON as RIGS_SEED_JSON};
 pub use state::{
     validate_prefix, validate_rig_name, validate_worktree_root, RigCatalog, RigEntry, RigState,
     MAX_PREFIX_LEN, MAX_WORKTREE_ROOT_LEN, RESERVED_RIG_NAMES,

@@ -1683,6 +1683,14 @@ async fn build_domain_router(
     // (observed for ws=confiar). Heal that drift on every boot, idempotently, so a deploy is the
     // fix — generic over any future per-tenant template change, not a one-off ALTER.
     reconcile_tenant_schemas(&pool).await?;
+    // hq-greenfield-seeds.5: replay the versioned, declarative rig catalog (extracted from live
+    // prod, `seeds/rigs.json`) into an EMPTY per-workspace `rigs` table, so a greenfield deploy
+    // comes up with its rigs (gt/gt_core/gtmcp/gtproxy/gtweb) instead of an empty catalog that
+    // needs a manual `rig.add` per rig. Idempotent (skips when the table is non-empty, never
+    // clobbers a curated prod) and connectionless (the live extract binds no vcs_connections ref —
+    // SSH clone — so it depends on no runtime GitHub-App artifact). Scoped to the `ws_default`
+    // template schema, exactly where the prod rigs live; a clean skip if its pool can't connect.
+    seed_rigs(&pg_url).await?;
     // Clone the URL before it moves into WsPools — the convoy→scheduler PG queue (below) reuses it.
     let dispatch_pg_url = pg_url.clone();
     let ws_pools = Arc::new(WsPools::new(pg_url));
@@ -2096,6 +2104,75 @@ async fn seed_oauth_providers(pool: sqlx::PgPool) -> anyhow::Result<()> {
             "[gt-mcp-server] oauth provider seed: no provider secrets present (set GT_OAUTH_SEED_SECRET_* to seed)"
         );
     }
+    Ok(())
+}
+
+/// Seed the versioned, declarative rig catalog into an EMPTY `rigs` table (hq-greenfield-seeds.5).
+///
+/// The rigs (`gt`/`gt_core`/`gtmcp`/`gtproxy`/`gtweb`) were registered by hand with `rig.add` and
+/// lived ONLY in prod's per-tenant `ws_default.rigs` table, so a greenfield cluster came up with an
+/// empty catalog — no prefix routing, no dispatch — until an operator re-ran every `rig.add`. This
+/// replays the live-extracted, embedded seed (`gt-rig/seeds/rigs.json`) so a clean deploy brings its
+/// rigs with no manual step. It follows the same discipline as [`seed_oauth_providers`]:
+///
+/// - **Idempotent / non-clobbering:** seeds ONLY when the table is EMPTY. A populated table (the
+///   already-curated prod `default`, or any deploy where an operator has registered a rig) is left
+///   exactly as-is — `rig.*` remains the source of truth there.
+/// - **No runtime artifact vendored:** `registered_at_secs` is stamped from the boot clock (the seed
+///   never copies prod's epochs), and `git_connection_ref` is carried only if the live extract had
+///   it (in prod all five are `null` = SSH clone). A rig needing a private-repo token still depends
+///   on its `vcs_connections` row (hq-greenfield-seeds.3) existing first; the seed binds none.
+///
+/// Scoped to the `ws_default` template schema — exactly where the prod rigs live, and the schema
+/// `gt_create_workspace_schema` clones per tenant. A `WorkspacePool` connect failure is a clean skip
+/// (a log line, never fatal), so a deploy whose tenant schema is not yet provisioned still boots.
+async fn seed_rigs(pg_url: &str) -> anyhow::Result<()> {
+    use gt_rig::RigRepository;
+
+    // The rigs table lives in the per-workspace `ws_default` schema (not `public`), so it needs a
+    // search_path-scoped pool — the same handle `PgRigs` uses elsewhere. A connect failure here is
+    // non-fatal: the rest of the boot still runs, the catalog just stays whatever it already is.
+    let ws_pool = match WorkspacePool::connect(pg_url, "default").await {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!(
+                "[gt-mcp-server] rig catalog seed skipped (ws_default pool connect failed: {e})"
+            );
+            return Ok(());
+        }
+    };
+    let repo = gt_rig::PgRigs::new(ws_pool.pool().clone());
+
+    // Idempotency gate: never touch a non-empty catalog. A curated prod (or any deploy where an
+    // operator already registered a rig) is left untouched — the live `rig.*` surface owns it there.
+    let existing = repo
+        .list()
+        .await
+        .context("rig catalog seed: list existing rigs")?;
+    if !existing.is_empty() {
+        eprintln!(
+            "[gt-mcp-server] rig catalog seed skipped ({} rig(s) already registered)",
+            existing.len()
+        );
+        return Ok(());
+    }
+
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let seed = gt_rig::seed_rigs().context("rig catalog seed: parse embedded seed")?;
+    let mut created = 0usize;
+    for sr in seed {
+        let entry = sr.into_entry(now);
+        let name = entry.name.clone();
+        repo.upsert(&entry)
+            .await
+            .with_context(|| format!("rig catalog seed: upsert '{name}'"))?;
+        created += 1;
+        eprintln!("[gt-mcp-server] rig seeded: {name}");
+    }
+    eprintln!("[gt-mcp-server] rig catalog seeded: {created} rig(s)");
     Ok(())
 }
 

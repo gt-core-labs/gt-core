@@ -86,7 +86,7 @@ A clean deploy will come up **missing** these until they are made code/config-dr
 | ~~OAuth/IdP providers~~ → **DONE (§4.2)** (Google, …) | was configured by hand in `/admin/providers`; now a versioned non-secret seed (secret via env) | hq-greenfield-seeds.3 |
 | **GitHub App** | App registration + org installation are an irreducible human action (§4.2); the in-repo config (env wiring) is reproducible | hq-greenfield-seeds.3 |
 | ~~Quota Claude accounts~~ → **DOCUMENTED + SCRIPTED (§4.4)** | onboarded live (per-account `CLAUDE_CONFIG_DIR`); creds are per-account secrets, so the *procedure* is reproduced (doc + helper script), not the creds | hq-greenfield-seeds.4 |
-| **Rig catalog** (gt, gt_core, gtweb, gtproxy, gtmcp) | `rig_add` run manually | hq-greenfield-seeds.5 |
+| ~~Rig catalog~~ → **DONE (§4.3)** (gt, gt_core, gtweb, gtproxy, gtmcp) | was `rig.add` run manually; now a versioned declarative seed replayed into an empty `rigs` table | hq-greenfield-seeds.5 |
 | **Migrations don't reach existing tenants** | rig/0003 altered only `ws_default`; `hq_confiar` lacked `git_connection_ref` → drift-reconcile errored in prod | hq-vcs-connections.13 |
 
 ### 4.1 Knowledge seed (hq-greenfield-seeds.2) — DELIVERED
@@ -185,6 +185,49 @@ docker exec gt-app-pg psql "postgres://gtapp:gtapp@localhost:5432/gtapp" -tAc \
      FROM public.oauth_providers ORDER BY created_at) t;" \
   | python3 scripts/extract-oauth-seed.py            # rewrites seeds/oauth-providers.json
 cargo test -p gt-auth --features oauth provider_seed # replay-asserts the seed
+```
+
+### 4.3 Rig catalog (hq-greenfield-seeds.5) — DELIVERED
+
+**Was:** the five rigs — `gt` (prefix `gt`), `gt_core` (`hq`), `gtmcp` (`gtmcp`), `gtproxy`
+(`gtproxy`), `gtweb` (`gtweb`) — were registered by hand with `rig.add` and lived ONLY in prod's
+per-tenant `ws_default.rigs` table. A greenfield cluster came up with an empty catalog: no beads
+prefix routing (`issues.create` rejects an unregistered prefix), no dispatch, no `graph.refresh`
+target — until an operator re-ran every `rig.add`.
+
+**Now:** the catalog is a versioned, declarative seed, mirroring §4.2:
+
+- **Extract (read-only):** `crates/domain/platform/gt-rig/seeds/rigs.json` is the live extract of
+  `ws_default.rigs` — name / prefix / git_url / push_url / upstream_url / default_branch /
+  worktree_root / git_connection_ref. Regenerate from a running deploy with
+  `scripts/extract-rigs-seed.py` (round-trip byte-identical to the committed seed) — **do NOT
+  invent the content.**
+- **Embed:** `rig_seed::SEED_JSON` (`gt-rig/src/rig_seed.rs`) `include_str!`s it, so the seed
+  travels inside the binary (orchestrator-agnostic — no external file under k8s).
+- **Replay:** `gt-mcp-server.rs::seed_rigs` runs on boot right after `reconcile_tenant_schemas`,
+  over a `ws_default`-scoped `WorkspacePool` (the rigs table is per-tenant, NOT `public`). It seeds
+  ONLY when the `rigs` table is **empty** — a populated table (curated prod, or any deploy where an
+  operator registered a rig) is left exactly as-is, so it is **idempotent with zero effect on
+  populated prod**. `registered_at_secs` is stamped from the boot clock (the seed never vendors
+  prod's epochs). A `WorkspacePool` connect failure is a clean skip (logged, never fatal).
+
+**No secrets, no runtime artifacts:** the seed carries only declarative identity. `git_connection_ref`
+— a soft reference to a `public.vcs_connections` row, which is a runtime GitHub-App install artifact
+(§4.2) — is `null` for all five prod rigs (plain SSH clone), so the seed binds no connection. **A rig
+that needs a private-repo clone token still depends on its VCS connection existing first** (§4.2's
+GitHub App + an install): re-bind the ref out of band (`rig.*` / a future connection-bind path) on a
+deploy that uses one — the seed does not, and cannot, recreate the runtime install.
+
+Regenerate + verify:
+
+```bash
+docker exec gt-app-pg psql "postgres://gtapp:gtapp@localhost:5432/gtapp" -tAc \
+  "SELECT json_agg(row_to_json(t)) FROM (
+     SELECT name, prefix, git_url, push_url, upstream_url, default_branch,
+            worktree_root, git_connection_ref
+     FROM ws_default.rigs ORDER BY name) t;" \
+  | python3 scripts/extract-rigs-seed.py   # rewrites seeds/rigs.json
+cargo test -p gt-rig rig_seed              # replay-asserts the embedded seed
 ```
 
 ### 4.4 Quota Claude accounts (hq-greenfield-seeds.4) — DOCUMENTED + SCRIPTED
@@ -294,8 +337,8 @@ moves), so it is unaffected; this caveat is specific to interactive sessions and
 
 1. Provision infra: Postgres, Dolt, MinIO + the event-log volume.
 2. Provide the secret/env matrix (§3).
-3. Start `gt-mcp-server` → it runs PG + Dolt migrations, seeds admin (if `GT_ADMIN_*` set), default workspace, role/skills catalog (§4.1), **OAuth/IdP providers** (§4.2 — when `oauth` is built, `GT_SECRET_KEY` + the per-provider `GT_OAUTH_SEED_SECRET_*` are set, and the table is empty), hook guards, blob bucket.
-4. Apply the remaining **gap seeds** (§4) — rig catalog — via their reproducible seed mechanisms, onboard ≥1 **quota Claude account** (§4.4 — `scripts/onboard-quota-account.sh`, one human OAuth step per account) and (re)start the `orchd` daemon to hydrate the keychain, and complete the GitHub-App manual steps (§4.2) if the deploy uses one.
+3. Start `gt-mcp-server` → it runs PG + Dolt migrations, seeds admin (if `GT_ADMIN_*` set), default workspace, role/skills catalog (§4.1), **OAuth/IdP providers** (§4.2 — when `oauth` is built, `GT_SECRET_KEY` + the per-provider `GT_OAUTH_SEED_SECRET_*` are set, and the table is empty), **rig catalog** (§4.3 — when the `rigs` table is empty), hook guards, blob bucket.
+4. Apply the remaining **gap seeds** (§4) — onboard ≥1 **quota Claude account** (§4.4 — `scripts/onboard-quota-account.sh`, one human OAuth step per account) and (re)start the `orchd` daemon to hydrate the keychain, and complete the GitHub-App manual steps (§4.2) if the deploy uses one (also re-binds any rig's `git_connection_ref` for private-repo clones, §4.3).
 5. Verify (§6).
 
 The detailed step-by-step runbook (with the exact apply commands per orchestrator) is **hq-greenfield-seeds.6**.
