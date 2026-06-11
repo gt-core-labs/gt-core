@@ -22,6 +22,12 @@ pub mod http;
 #[cfg(feature = "github")]
 pub mod github;
 
+/// DB-backed platform GitHub App config (hq-61ea43): the `public.github_app_config` row + the
+/// [`GithubAppSource`](github_config::GithubAppSource) that resolves a [`github::GithubAppConfig`]
+/// from the DB (falling back to env), so the App is configured from the UI rather than mounted files.
+#[cfg(feature = "github")]
+pub mod github_config;
+
 /// The GitHub App install-flow REST adapter (hq-vcs-connections.2): install redirect, callback that
 /// persists a `github_app` connection (no token stored), and a JIT repo-listing endpoint.
 #[cfg(feature = "axum")]
@@ -49,6 +55,11 @@ pub use github::{
     ENV_APP_ID_FILE, ENV_APP_PRIVATE_KEY_FILE, ENV_APP_SLUG, ENV_APP_WEBHOOK_SECRET_FILE,
 };
 
+#[cfg(feature = "github")]
+pub use github_config::{GithubAppConfigInput, GithubAppConfigView, GithubAppSource};
+#[cfg(all(feature = "github", feature = "pg"))]
+pub use github_config::PgGithubAppConfig;
+
 #[cfg(feature = "axum")]
 pub use github_http::{github_router, GithubApiState};
 
@@ -60,4 +71,9 @@ pub mod migrations {
     /// column, mirroring `public.oauth_providers`.
     pub const CREATE_VCS_CONNECTIONS: &str =
         include_str!("../migrations/vcs/0001__create_vcs_connections.sql");
+    /// `public.github_app_config` (hq-61ea43): the single global row holding the platform GitHub App
+    /// identity (App ID, slug) + the AES-GCM-sealed private key + webhook secret, so the App is
+    /// configured from the UI/DB instead of mounted files.
+    pub const CREATE_GITHUB_APP_CONFIG: &str =
+        include_str!("../migrations/vcs/0002__create_github_app_config.sql");
 }

@@ -30,23 +30,36 @@ use gt_events::AppError;
 use gt_workspace::WorkspaceContext;
 
 use crate::github::{GithubAppClient, InstallationRepo};
+use crate::github_config::{GithubAppConfigInput, GithubAppConfigView, GithubAppSource};
 use crate::repo::{ConnectionKind, ConnectionStatus, NewConnection, VcsConnectionRepo};
 
-/// State for the GitHub install-flow routes: the platform App client + the connection store (to
-/// persist the `github_app` row on callback). Cheap to clone (both are `Arc`-backed).
+/// State for the GitHub install-flow routes: the DB-backed App config source (hq-61ea43) + the
+/// connection store (to persist the `github_app` row on callback). Each request resolves the live
+/// config from the source, so a UI change takes effect with no restart. Cheap to clone.
 #[derive(Clone)]
 pub struct GithubApiState {
-    client: GithubAppClient,
+    source: GithubAppSource,
     connections: Arc<dyn VcsConnectionRepo>,
 }
 
 impl GithubApiState {
-    /// Wrap the App `client` + the connection `store`.
-    pub fn new(client: GithubAppClient, connections: Arc<dyn VcsConnectionRepo>) -> Self {
+    /// Wrap the App config `source` + the connection `store`.
+    pub fn new(source: GithubAppSource, connections: Arc<dyn VcsConnectionRepo>) -> Self {
         GithubApiState {
-            client,
+            source,
             connections,
         }
+    }
+
+    /// Resolve the live App client from the config source, or `503` when no App is configured.
+    async fn client(&self) -> Result<GithubAppClient, ApiError> {
+        let cfg = self
+            .source
+            .load()
+            .await
+            .map_err(ApiError::App)?
+            .ok_or(ApiError::NotConfigured)?;
+        Ok(GithubAppClient::new(cfg))
     }
 }
 
@@ -57,6 +70,9 @@ pub fn github_router(state: GithubApiState) -> Router {
         .route("/install", get(install_redirect))
         .route("/callback", get(install_callback))
         .route("/repos", get(list_repos))
+        // hq-61ea43: admin read/write of the DB-backed App config (secret-free read; write-only
+        // secrets). Shares the `connection.*` scope guard the module mounts this router behind.
+        .route("/config", get(get_config).put(put_config))
         .with_state(state)
 }
 
@@ -69,12 +85,12 @@ async fn install_redirect(
     State(st): State<GithubApiState>,
     _ctx: WorkspaceContext,
 ) -> Result<Response, ApiError> {
-    let url = st.client.config().install_url();
+    let url = st.client().await?.config().install_url();
     let mut headers = HeaderMap::new();
     headers.insert(
         axum::http::header::LOCATION,
         HeaderValue::from_str(&url)
-            .map_err(|e| ApiError(AppError::Other(format!("bad install url: {e}"))))?,
+            .map_err(|e| ApiError::App(AppError::Other(format!("bad install url: {e}"))))?,
     );
     Ok((StatusCode::FOUND, headers).into_response())
 }
@@ -121,11 +137,11 @@ async fn install_callback(
     Query(params): Query<CallbackParams>,
 ) -> Result<Json<InstalledConnection>, ApiError> {
     let workspace = ctx.workspace().as_str().to_owned();
+    let client = st.client().await?;
     // Resolve the org/account login the installation lives under by minting an installation token
     // and reading the first repo's owner. The token is used ONLY here and dropped — never stored.
-    let account_login = match st.client.installation_token(&params.installation_id).await {
-        Ok(token) => st
-            .client
+    let account_login = match client.installation_token(&params.installation_id).await {
+        Ok(token) => client
             .list_installation_repos(&token)
             .await
             .ok()
@@ -187,25 +203,67 @@ async fn list_repos(
         .get_for_workspace(ctx.workspace().as_str(), &params.connection)
         .await?
         .ok_or_else(|| {
-            ApiError(AppError::NotFound(format!(
+            ApiError::App(AppError::NotFound(format!(
                 "connection {}",
                 params.connection
             )))
         })?;
     if conn.kind != ConnectionKind::GithubApp {
-        return Err(ApiError(AppError::Validation(
+        return Err(ApiError::App(AppError::Validation(
             "connection is not a github_app — repo listing needs an App installation".into(),
         )));
     }
     let installation_id = conn.installation_id.ok_or_else(|| {
-        ApiError(AppError::Validation(
+        ApiError::App(AppError::Validation(
             "github_app connection has no installation_id".into(),
         ))
     })?;
-    let token = st.client.installation_token(&installation_id).await?;
-    let repos = st.client.list_installation_repos(&token).await?;
+    let client = st.client().await?;
+    let token = client.installation_token(&installation_id).await?;
+    let repos = client.list_installation_repos(&token).await?;
     // `token` drops here — never persisted, never logged.
     Ok(Json(repos))
+}
+
+/// `GET /config` — the secret-free view of the stored App config (hq-61ea43), or `404` when unset.
+#[cfg_attr(feature = "axum", utoipa::path(
+    get, path = "/config",
+    responses(
+        (status = 200, description = "The configured App (secret-free)", body = GithubAppConfigView),
+        (status = 404, description = "No GitHub App configured"),
+    ),
+))]
+async fn get_config(
+    State(st): State<GithubApiState>,
+    _ctx: WorkspaceContext,
+) -> Result<Json<GithubAppConfigView>, ApiError> {
+    st.source
+        .view()
+        .await
+        .map_err(ApiError::App)?
+        .map(Json)
+        .ok_or(ApiError::App(AppError::NotFound(
+            "no GitHub App configured".into(),
+        )))
+}
+
+/// `PUT /config` — upsert the App config (hq-61ea43). Secrets are write-only (omit to keep). The
+/// private key is required on first configure.
+#[cfg_attr(feature = "axum", utoipa::path(
+    put, path = "/config",
+    request_body = GithubAppConfigInput,
+    responses(
+        (status = 204, description = "Config saved"),
+        (status = 422, description = "Missing private key on first configure"),
+    ),
+))]
+async fn put_config(
+    State(st): State<GithubApiState>,
+    _ctx: WorkspaceContext,
+    Json(input): Json<GithubAppConfigInput>,
+) -> Result<StatusCode, ApiError> {
+    st.source.upsert(input).await.map_err(ApiError::App)?;
+    Ok(StatusCode::NO_CONTENT)
 }
 
 /// `owner` from an `owner/name` full name (`acme/repo` -> `acme`).
@@ -220,29 +278,51 @@ fn owner_of(full_name: &str) -> String {
 /// `/api/v1/connection/github`.
 #[derive(utoipa::OpenApi)]
 #[openapi(
-    paths(install_redirect, install_callback, list_repos),
-    components(schemas(InstalledConnection, InstallationRepo))
+    paths(install_redirect, install_callback, list_repos, get_config, put_config),
+    components(schemas(
+        InstalledConnection,
+        InstallationRepo,
+        GithubAppConfigView,
+        GithubAppConfigInput
+    ))
 )]
 pub struct GithubApiDoc;
 
-/// Newtype mapping [`AppError`] to an HTTP status, mirroring [`crate::http::ApiError`].
-struct ApiError(AppError);
+/// Maps an [`AppError`] (or a not-configured App) to an HTTP status, mirroring [`crate::http::ApiError`].
+enum ApiError {
+    /// A wrapped [`AppError`] (the usual store/validation faults).
+    App(AppError),
+    /// No GitHub App is configured (hq-61ea43) — the install/callback/repos surface answers `503`
+    /// so a caller (or the FE) can tell "set up the App" apart from a real failure.
+    NotConfigured,
+}
 
 impl From<AppError> for ApiError {
     fn from(e: AppError) -> Self {
-        ApiError(e)
+        ApiError::App(e)
     }
 }
 
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
-        let status = match &self.0 {
-            AppError::NotFound(_) => StatusCode::NOT_FOUND,
-            AppError::Validation(_) => StatusCode::UNPROCESSABLE_ENTITY,
-            AppError::InvalidTransition(_) => StatusCode::CONFLICT,
-            AppError::Handler(_) | AppError::Other(_) => StatusCode::INTERNAL_SERVER_ERROR,
-        };
-        (status, self.0.to_string()).into_response()
+        match self {
+            ApiError::NotConfigured => (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "no GitHub App configured — set it under connection/github/config",
+            )
+                .into_response(),
+            ApiError::App(e) => {
+                let status = match &e {
+                    AppError::NotFound(_) => StatusCode::NOT_FOUND,
+                    AppError::Validation(_) => StatusCode::UNPROCESSABLE_ENTITY,
+                    AppError::InvalidTransition(_) => StatusCode::CONFLICT,
+                    AppError::Handler(_) | AppError::Other(_) => {
+                        StatusCode::INTERNAL_SERVER_ERROR
+                    }
+                };
+                (status, e.to_string()).into_response()
+            }
+        }
     }
 }
 
@@ -250,6 +330,7 @@ impl IntoResponse for ApiError {
 mod tests {
     use super::*;
     use crate::github::GithubAppConfig;
+    use crate::github_config::GithubAppSource;
     use crate::repo::{PatchConnection, VcsConnection};
     use async_trait::async_trait;
     use std::sync::Mutex;
@@ -258,13 +339,14 @@ mod tests {
 
     const TEST_PRIV_PEM: &[u8] = include_bytes!("../tests/data/test_app_key.pem");
 
-    fn test_client() -> GithubAppClient {
-        GithubAppClient::new(GithubAppConfig::new(
+    /// A fixed-config source standing in for the DB-backed one in the router tests.
+    fn test_source() -> GithubAppSource {
+        GithubAppSource::Fixed(Some(GithubAppConfig::new(
             "123456",
             TEST_PRIV_PEM.to_vec(),
             "gt-test-app",
             None,
-        ))
+        )))
     }
 
     #[derive(Default)]
@@ -358,7 +440,7 @@ mod tests {
     /// `GET /install` 302s to the App's installations/new URL.
     #[tokio::test]
     async fn install_redirects_to_github() {
-        let st = GithubApiState::new(test_client(), Arc::new(MemConns::default()));
+        let st = GithubApiState::new(test_source(), Arc::new(MemConns::default()));
         let app = github_router(st);
         let res = app
             .oneshot(
@@ -381,7 +463,7 @@ mod tests {
     /// The install routes require a resolvable workspace (self-auth, not the query).
     #[tokio::test]
     async fn install_requires_workspace_context() {
-        let st = GithubApiState::new(test_client(), Arc::new(MemConns::default()));
+        let st = GithubApiState::new(test_source(), Arc::new(MemConns::default()));
         let app = github_router(st);
         let res = app
             .oneshot(
@@ -401,7 +483,7 @@ mod tests {
     #[tokio::test]
     async fn callback_persists_github_app_connection_without_token() {
         let store = Arc::new(MemConns::default());
-        let st = GithubApiState::new(test_client(), store.clone());
+        let st = GithubApiState::new(test_source(), store.clone());
         let app = github_router(st);
         let res = app
             .oneshot(
@@ -428,7 +510,7 @@ mod tests {
     /// `GET /repos` for an unknown connection is a 404.
     #[tokio::test]
     async fn repos_unknown_connection_is_404() {
-        let st = GithubApiState::new(test_client(), Arc::new(MemConns::default()));
+        let st = GithubApiState::new(test_source(), Arc::new(MemConns::default()));
         let app = github_router(st);
         let res = app
             .oneshot(

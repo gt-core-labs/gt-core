@@ -130,11 +130,19 @@ impl GtModule for VcsModule {
     fn migrations(&self) -> Vec<Migration> {
         // The `public.vcs_connections` table backing `VcsConnectionRepo`. The module owns its
         // schema (the SQL lives in `migrations/vcs/`).
-        vec![Migration::new(
-            1,
-            "create_vcs_connections",
-            crate::migrations::CREATE_VCS_CONNECTIONS,
-        )]
+        vec![
+            Migration::new(
+                1,
+                "create_vcs_connections",
+                crate::migrations::CREATE_VCS_CONNECTIONS,
+            ),
+            // hq-61ea43: the global `public.github_app_config` row (DB-backed App config).
+            Migration::new(
+                2,
+                "create_github_app_config",
+                crate::migrations::CREATE_GITHUB_APP_CONFIG,
+            ),
+        ]
     }
 }
 
@@ -160,7 +168,7 @@ mod tests {
     #[test]
     fn owns_the_vcs_connections_table_migration() {
         let migs = VcsModule.migrations();
-        assert_eq!(migs.len(), 1);
+        assert_eq!(migs.len(), 2);
         assert_eq!(migs[0].version, 1);
         assert_eq!(migs[0].name, "create_vcs_connections");
         assert!(migs[0]
@@ -168,5 +176,11 @@ mod tests {
             .contains("CREATE TABLE IF NOT EXISTS public.vcs_connections"));
         // Mirrors oauth_providers: a `public` table with a `workspace_id` column, NOT schema-per-tenant.
         assert!(migs[0].sql.contains("workspace_id"));
+        // hq-61ea43: the DB-backed GitHub App config table.
+        assert_eq!(migs[1].version, 2);
+        assert_eq!(migs[1].name, "create_github_app_config");
+        assert!(migs[1]
+            .sql
+            .contains("CREATE TABLE IF NOT EXISTS public.github_app_config"));
     }
 }
