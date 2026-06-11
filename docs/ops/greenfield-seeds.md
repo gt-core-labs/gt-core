@@ -85,7 +85,7 @@ A clean deploy will come up **missing** these until they are made code/config-dr
 | ~~Role prompts + skill bodies + role.scopes~~ → **DONE (§4.1)** | was rewritten via REST in prod (memory `knowledge-prompts-degastown`); now a versioned seed | hq-greenfield-seeds.2 |
 | ~~OAuth/IdP providers~~ → **DONE (§4.2)** (Google, …) | was configured by hand in `/admin/providers`; now a versioned non-secret seed (secret via env) | hq-greenfield-seeds.3 |
 | **GitHub App** | App registration + org installation are an irreducible human action (§4.2); the in-repo config (env wiring) is reproducible | hq-greenfield-seeds.3 |
-| **Quota Claude accounts** | onboarded live (per-account `CLAUDE_CONFIG_DIR`) | hq-greenfield-seeds.4 |
+| ~~Quota Claude accounts~~ → **DOCUMENTED + SCRIPTED (§4.4)** | onboarded live (per-account `CLAUDE_CONFIG_DIR`); creds are per-account secrets, so the *procedure* is reproduced (doc + helper script), not the creds | hq-greenfield-seeds.4 |
 | **Rig catalog** (gt, gt_core, gtweb, gtproxy, gtmcp) | `rig_add` run manually | hq-greenfield-seeds.5 |
 | **Migrations don't reach existing tenants** | rig/0003 altered only `ws_default`; `hq_confiar` lacked `git_connection_ref` → drift-reconcile errored in prod | hq-vcs-connections.13 |
 
@@ -187,6 +187,107 @@ docker exec gt-app-pg psql "postgres://gtapp:gtapp@localhost:5432/gtapp" -tAc \
 cargo test -p gt-auth --features oauth provider_seed # replay-asserts the seed
 ```
 
+### 4.4 Quota Claude accounts (hq-greenfield-seeds.4) — DOCUMENTED + SCRIPTED
+
+The platform rotates across **multiple Claude accounts** so a polecat that hits a rate limit
+fails over to a healthy account instead of stalling (`gt-quota`, the predictive rotation in
+`gt-composition/src/quota_rotation.rs`). Each account is a logged-in `CLAUDE_CONFIG_DIR`; the
+registry of `(account, config_dir)` is **event-sourced** (`quota.account_registered.v1` in the
+workspace quota log), and the orchestration daemon hydrates its rotation keychain by replaying it.
+
+These accounts were onboarded **live** in prod (memory `quota-accounts-epic`) and cannot be
+fully reproduced from the repo: an account's credentials are a **per-account OAuth secret** that
+is NEVER vendored. So — like the GitHub App (§4.2) — what this bead makes reproducible is the
+*procedure* (a doc + a helper script), with one **irreducible human step**: completing the
+`claude auth login` OAuth handshake for each account.
+
+**The real mechanism (ground truth):** the live web "Add account" flow
+(`gt-composition/src/onboard.rs`), driven by two authenticated REST calls because the OAuth
+handshake has a human in the middle:
+
+1. **`POST /api/v1/quota/onboard/start`** — the backend (claude is baked into the
+   `mcp-server` image) allocates a generic `CLAUDE_CONFIG_DIR` under the **accounts root**
+   (`account_dirs::accounts_root`: `GT_CLAUDE_ACCOUNTS_ROOT`, else `<GT_EVENTLOG_ROOT>/accounts`),
+   spawns `claude auth login` into it (stdin held open), and returns `{session_id, url}`. The dir
+   is named by an opaque session ULID; the real account id comes from the handshake.
+2. *(human)* open `url`, authenticate **as the account to add** (`prompt=select_account` is
+   appended so the browser shows the chooser), copy the OOB **code**.
+3. **`POST /api/v1/quota/onboard/complete {session_id, code}`** — the backend writes the code to
+   the live login process's stdin, waits for exit, reads the account **email** via
+   `claude auth status --json`, and registers it event-sourced: `RegisterAccount { account=email,
+   config_dir }` → `quota.account_registered.v1`, appended to the **workspace quota log** (the
+   same read-modify-append the `quota.register` MCP tool and `POST /api/v1/quota/account` REST
+   route run).
+
+**Confirmed live (read-only):** the accounts root (`/var/lib/gt-core/accounts/<ULID>/`) holds the
+per-account dirs; the `default` workspace log carries the registry events, e.g.
+`quota.account_registered.v1 → {account:"<email>", config_dir:"/var/lib/gt-core/accounts/<ULID>", now_secs}`.
+The deploy-global catalog (`FsAccountCatalog`) reports each account by the **email** read from its
+`<dir>/.claude.json` (`oauthAccount.emailAddress`) — the email is the account's identity across the
+system.
+
+**How the daemon picks it up:** `gt-orch-server` (the rotation daemon, compose service
+`gt-app-orchd`, profile `orchd`, gated by `GT_RUN_DAEMONS`) rebuilds its keychain on (re)start from
+TWO merged sources (`seed_claude_accounts`):
+
+- **The quota log** (durable source of truth) — every registered `(account → config_dir)`. Because
+  onboarding writes the dir from INSIDE the backend container, the stored path is container-absolute;
+  the daemon (on the HOST) resolves it to the host mount of the same shared volume by basename
+  (`resolve_host_account_dir`).
+- **`GT_CLAUDE_ACCOUNTS` env** (bootstrap) — a comma list of `account=CLAUDE_CONFIG_DIR` pairs; an
+  env account not yet in the log is promoted to a durable `AccountRegistered` **once** (so the first
+  account(s) can be seeded by env and then persist as events). The first account is the boot-active
+  one; a prior rotation target in the log wins if present.
+
+So a newly onboarded account is picked up by **replaying the log** — no env edit needed; restart the
+daemon (or wait for next boot) for it to enter the live rotation pool.
+
+**Reproducible procedure (per account, greenfield):** the helper script
+**`scripts/onboard-quota-account.sh`** drives the two REST calls and pauses at the human OAuth step.
+It is idempotent (skips when `--email` is already registered, via `GET /api/v1/quota/`) and embeds
+**no secret** (no credential material is read or echoed):
+
+```bash
+# Token must carry quota.write (or *) — the seeded admin's PAT/JWT does.
+scripts/onboard-quota-account.sh \
+  --url https://gt.example.com \
+  --token "$GT_TOKEN" \
+  --email account-to-add@example.com      # --email optional; enables the idempotent skip
+# → opens a login URL, prompts for the OOB code, registers the account, prints next steps.
+
+# Then let the rotation daemon hydrate the new account (restart if it was already running):
+docker compose --profile orchd restart gt-app-orchd
+```
+
+For a **fully scripted bootstrap of the FIRST account** (no daemon restart needed — the env path
+promotes it on boot), pre-create a `CLAUDE_CONFIG_DIR` on the accounts-root volume, run
+`CLAUDE_CONFIG_DIR=<dir> claude auth login` (the OOB handshake — still the one human step), and set:
+
+```
+GT_CLAUDE_ACCOUNTS=account@example.com=/var/lib/gt-core/accounts/<dir>
+```
+
+before the daemon boots. `seed_claude_accounts` then registers it as a durable event on first start.
+
+**Secrets/env matrix (§3) additions:** all **non-sensitive (ConfigMap)** — the credentials never
+enter env, they live as files on the accounts-root volume:
+
+- `GT_CLAUDE_ACCOUNTS_ROOT` — accounts-root path (default `<GT_EVENTLOG_ROOT>/accounts`); the
+  backend (writer) and the daemon (reader) must resolve it to the **same shared volume**.
+- `GT_CLAUDE_ACCOUNTS` — *(optional bootstrap)* comma list of `email=CLAUDE_CONFIG_DIR`; promoted to
+  durable events on first daemon boot. Live onboarding (script/web) supersedes it.
+- `GT_CLAUDE_BIN` — *(optional)* path to the `claude` binary if off the default PATH (it is baked
+  into the `mcp-server` image at `/usr/bin/claude`).
+- `GT_RUN_DAEMONS` / compose profile `orchd` — must be ON for the rotation daemon (and thus the
+  keychain hydration) to run; the credential dirs themselves are not secrets-matrix entries.
+
+**Known caveat (documented, NOT fixed here):** an **interactive terminal session** bakes the
+**alphabetically-first** account at launch, not the *healthiest* one — so an interactive mayor can
+land on an exhausted account even when a healthy one exists (memory `quota-rotation-dormant-prod`).
+The autonomous polecat path uses the keychain's live active pointer (which predictive rotation
+moves), so it is unaffected; this caveat is specific to interactive sessions and is a follow-up
+(healthiest-account selection at launch), not part of greenfield bring-up.
+
 ---
 
 ## 5. Bring-up order (greenfield)
@@ -194,7 +295,7 @@ cargo test -p gt-auth --features oauth provider_seed # replay-asserts the seed
 1. Provision infra: Postgres, Dolt, MinIO + the event-log volume.
 2. Provide the secret/env matrix (§3).
 3. Start `gt-mcp-server` → it runs PG + Dolt migrations, seeds admin (if `GT_ADMIN_*` set), default workspace, role/skills catalog (§4.1), **OAuth/IdP providers** (§4.2 — when `oauth` is built, `GT_SECRET_KEY` + the per-provider `GT_OAUTH_SEED_SECRET_*` are set, and the table is empty), hook guards, blob bucket.
-4. Apply the remaining **gap seeds** (§4) — quota accounts, rig catalog — via their reproducible seed mechanisms (the beads above), and complete the GitHub-App manual steps (§4.2) if the deploy uses one.
+4. Apply the remaining **gap seeds** (§4) — rig catalog — via their reproducible seed mechanisms, onboard ≥1 **quota Claude account** (§4.4 — `scripts/onboard-quota-account.sh`, one human OAuth step per account) and (re)start the `orchd` daemon to hydrate the keychain, and complete the GitHub-App manual steps (§4.2) if the deploy uses one.
 5. Verify (§6).
 
 The detailed step-by-step runbook (with the exact apply commands per orchestrator) is **hq-greenfield-seeds.6**.
@@ -209,7 +310,7 @@ The detailed step-by-step runbook (with the exact apply commands per orchestrato
 - Roles resolve a **non-empty prompt + scopes** (not just the catalog).
 - At least one IdP provider available on the login page.
 - Rig catalog populated; `graph.refresh {rig}` clones + indexes (real commit, not `unknown`).
-- Quota has ≥1 healthy account.
+- Quota has ≥1 healthy account (§4.4: `GET /api/v1/quota/` / `quota.list` shows it `Healthy`; the `orchd` daemon logs `claude keychain seeded with N account(s)`).
 - MCP `/mcp` reachable + authenticated; tracker (`issues.*`) operational.
 
 No manual step outside the runbook (§5 / .6).
