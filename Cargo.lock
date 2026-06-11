@@ -2092,6 +2092,7 @@ version = "0.1.0"
 dependencies = [
  "gt-events",
  "serde",
+ "serde_json",
 ]
 
 [[package]]
@@ -2368,6 +2369,7 @@ dependencies = [
  "sqlx",
  "thiserror 2.0.18",
  "tokio",
+ "ulid",
 ]
 
 [[package]]

@@ -11,3 +11,5 @@ version.workspace = true
 [dependencies]
 gt-events = { workspace = true }
 serde = { workspace = true }
+# FileInbox message files are JSON (hq-8a521a inbound seam).
+serde_json = { workspace = true }

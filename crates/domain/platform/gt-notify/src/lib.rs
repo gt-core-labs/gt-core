@@ -23,6 +23,9 @@
 /// the log/smtp implementations + env selection. Producers enqueue to the
 /// `email_outbox`; only the drain daemon touches a transport.
 pub mod email;
+/// The inbound-email seam (hq-8a521a): [`inbound::InboundMail`] + the file
+/// source shipping today (IMAP/webhook later). The command mailbox polls it.
+pub mod inbound;
 mod fake;
 mod notification;
 mod route;
@@ -30,6 +33,7 @@ mod route;
 pub use email::{
     transport_from_env, EmailMessage, EmailTransport, LogTransport, SmtpConfig, SmtpTransport,
 };
+pub use inbound::{FileInbox, InboundEmail, InboundMail};
 pub use fake::FakeNotifier;
 pub use notification::{Notification, Severity, Signal};
 pub use route::{route, Channel};

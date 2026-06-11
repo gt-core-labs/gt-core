@@ -43,6 +43,7 @@ pub mod email_outbox_drain;
 pub mod git_merge;
 pub mod hooks;
 pub mod kanban_rest;
+pub mod mailbox;
 pub mod mcp;
 pub mod notifications;
 pub mod onboard;

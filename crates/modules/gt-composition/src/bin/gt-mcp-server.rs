@@ -714,6 +714,43 @@ async fn main() -> anyhow::Result<()> {
         ))
     });
 
+    // Command mailbox + seguimiento subscriptions daemon (hq-8a521a): polls the
+    // inbound-mail seam (GT_INBOUND_MAIL_DIR file source until the IMAP server
+    // exists), verifies senders against the member mirror, executes orders
+    // through the SAME domain router, and fans subscription events out via the
+    // outbox. Opt-in: needs GT_INBOUND_MAIL_DIR + GT_PG_URL + the daemons
+    // master switch; tick via GT_MAILBOX_TICK_SECS (default 30).
+    match (
+        run_daemons.then_some(()).and(std::env::var("GT_INBOUND_MAIL_DIR").ok()),
+        std::env::var("GT_PG_URL").ok(),
+    ) {
+        (Some(dir), Some(pg_url)) => match sqlx::PgPool::connect(&pg_url).await {
+            Ok(mailbox_pool) => {
+                let tick = env_u64("GT_MAILBOX_TICK_SECS", 30).max(1);
+                let inbox: Arc<dyn gt_notify::InboundMail> =
+                    Arc::new(gt_notify::FileInbox::new(&dir));
+                eprintln!(
+                    "[gt-mcp-server] command mailbox on (every {tick}s; inbound {} @ {dir})",
+                    inbox.label()
+                );
+                let mailbox = Arc::new(gt_composition::mailbox::Mailbox::new(
+                    inbox,
+                    kanban_domains.clone(),
+                    mailbox_pool,
+                    Arc::new(WsPools::new(pg_url)),
+                    audit.clone(),
+                    event_log.clone(),
+                    "default".to_string(),
+                ));
+                tokio::spawn(mailbox.run(std::time::Duration::from_secs(tick)));
+            }
+            Err(e) => eprintln!("[gt-mcp-server] command mailbox off (PG connect failed: {e})"),
+        },
+        _ => eprintln!(
+            "[gt-mcp-server] command mailbox off (set GT_INBOUND_MAIL_DIR + GT_PG_URL; daemons on)"
+        ),
+    }
+
     // Per-workspace pool cache for the archive interceptor (hq-docs-archive-sync): when the sweep
     // archives an epic, its `documents`/embeddings are soft-deleted so it drops out of
     // `documents.search`. Built from GT_PG_URL — `None` when unset (no docs store, nothing to clean).

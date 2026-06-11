@@ -41,6 +41,10 @@ pub use doc_chunks::{ChunkError, DocChunksRepository, NewChunk, PgDocChunks, Ret
 #[cfg(feature = "pg")]
 pub mod email_outbox;
 #[cfg(feature = "pg")]
+pub mod email_subscriptions;
+#[cfg(feature = "pg")]
+pub use email_subscriptions::{PgSubscriptions, SubscriptionError, SubscriptionsRepository};
+#[cfg(feature = "pg")]
 pub use email_outbox::{EmailOutboxRepository, NewEmail, OutboxEntry, OutboxError, PgEmailOutbox};
 
 #[cfg(feature = "pg")]
@@ -181,8 +185,14 @@ const EMAIL_0001_SQL: &str = include_str!("../migrations/email/0001_email_outbox
 /// Public schema (like `notifications`): one table keyed by a `workspace`
 /// column. Producers enqueue; the drain daemon delivers through the
 /// `gt_notify::EmailTransport` seam — the SMTP server stays pluggable.
+/// Migration #2: `email_subscriptions` — seguimiento subscriptions (hq-8a521a).
+const EMAIL_0002_SQL: &str = include_str!("../migrations/email/0002_email_subscriptions.sql");
+
 pub fn email_migrations() -> Vec<Migration> {
-    vec![Migration::new(1, "0001_email_outbox", EMAIL_0001_SQL)]
+    vec![
+        Migration::new(1, "0001_email_outbox", EMAIL_0001_SQL),
+        Migration::new(2, "0002_email_subscriptions", EMAIL_0002_SQL),
+    ]
 }
 
 /// Initial migration: `workspace_invites` table in the public schema.
