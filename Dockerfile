@@ -35,6 +35,19 @@ RUN apt-get update \
     && apt-get purge -y gnupg \
     && apt-get autoremove -y \
     && rm -rf /var/lib/apt/lists/*
+# graphify backs the gt:// graph tool (gt-graphindex): the Rust indexer drives the
+# `graphifyy` python package through an interpreter, falling back to GT_GRAPHIFY_PYTHON
+# when a rig carries no `.graphify-venv`. The runtime base has no python, so without this
+# the graph driver dies on `import networkx` (networkx ships as a graphifyy dependency).
+# A dedicated venv keeps these deps off the system interpreter; GT_GRAPHIFY_PYTHON pins it
+# as the repo-agnostic fallback so every freshly-cloned rig resolves a working interpreter.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends python3 python3-venv \
+    && python3 -m venv /opt/graphify-venv \
+    && /opt/graphify-venv/bin/pip install --no-cache-dir graphifyy \
+    && apt-get autoremove -y \
+    && rm -rf /var/lib/apt/lists/*
+ENV GT_GRAPHIFY_PYTHON=/opt/graphify-venv/bin/python
 COPY --from=builder /build/target/release/gt-mcp-server /usr/local/bin/gt-mcp-server
 # Bake the `gt` CLI binary so role-session MCP proxies (`gt mcp`) work out of the box.
 # The entrypoint refreshes this over the network on every start so the container tracks
