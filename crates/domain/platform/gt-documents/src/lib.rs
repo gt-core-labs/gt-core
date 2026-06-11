@@ -20,7 +20,7 @@ pub mod http;
 mod module;
 
 pub use commands::{
-    AttachDoc, CreateShare, ListDocs, PatchShare, RemoveDoc, SearchDocs, UpdateDoc,
+    AttachDoc, CreateShare, ListDocs, PatchShare, RemoveDoc, RetrieveDocs, SearchDocs, UpdateDoc,
     ValidationError,
 };
 #[cfg(feature = "axum")]

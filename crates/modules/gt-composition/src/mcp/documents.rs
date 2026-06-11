@@ -19,13 +19,14 @@ use serde_json::{json, Value};
 
 use gt_docs_embed::Embedder;
 use gt_docs_extract::Extractor;
-use gt_documents::{AttachDoc, DocumentsModule, ListDocs, RemoveDoc, SearchDocs, UpdateDoc};
+use gt_documents::{AttachDoc, DocumentsModule, ListDocs, RemoveDoc, RetrieveDocs, SearchDocs, UpdateDoc};
 use gt_mcp_server::{DocumentsResource, DomainCtx, DomainHandler};
 use gt_module::{GtModule, McpRegistry, McpTool};
 use gt_store_blob::{sha256_hex, BlobStore};
 use gt_store_dolt::AppError;
 use gt_store_pg::{
-    DocError, Document, DocumentPatch, DocumentsRepository, NewDocument, PgDocuments, VectorStore,
+    DocChunksRepository, DocError, Document, DocumentPatch, DocumentsRepository, NewChunk,
+    NewDocument, PgDocChunks, PgDocuments, VectorStore,
 };
 
 use gt_events::EventKind;
@@ -181,6 +182,7 @@ impl DomainHandler for DocumentsHandler {
                     .map_err(doc_err)?;
                 // Re-embed: the body may have changed (hq-docs-search.2). Best-effort.
                 self.embed_doc(&repo, &doc).await;
+                self.index_chunks(ctx.workspace, &doc).await;
                 self.emit_doc_event(ctx.workspace, "updated", &doc);
                 Ok(doc_json(&doc))
             }
@@ -196,6 +198,7 @@ impl DomainHandler for DocumentsHandler {
                 repo.soft_delete(&cmd.id, cmd.expected_version)
                     .await
                     .map_err(doc_err)?;
+                self.purge_chunks(ctx.workspace, &cmd.id).await;
                 if let Some(doc) = removed {
                     self.emit_doc_event(ctx.workspace, "removed", &doc);
                 }
@@ -263,6 +266,44 @@ impl DomainHandler for DocumentsHandler {
                         .map_err(doc_err)?,
                 };
                 Ok(json!({ "documents": docs.iter().map(doc_json).collect::<Vec<_>>() }))
+            }
+            "documents.retrieve.validate" => {
+                parse::<RetrieveDocs>(ctx.args)?.validate().map_err(val)?;
+                Ok(json!({ "ok": true }))
+            }
+            "documents.retrieve.execute" => {
+                let cmd = parse::<RetrieveDocs>(ctx.args)?;
+                cmd.validate().map_err(val)?;
+                let Some(emb) = &self.embedder else {
+                    return Err(AppError::Validation(
+                        "semantic retrieval needs the embeddings build (deploy the \
+                         Dockerfile.embeddings image / embeddings-fastembed feature)"
+                            .into(),
+                    ));
+                };
+                let vec = emb
+                    .embed(&cmd.query)
+                    .await
+                    .map_err(|e| AppError::Other(format!("query embed: {e}")))?;
+                let pool = self.pools.get(ctx.workspace).await?;
+                let k = cmd.k.unwrap_or(6).clamp(1, 50);
+                let chunks = PgDocChunks::new(pool)
+                    .retrieve(&vec, k, cmd.rig.as_deref())
+                    .await
+                    .map_err(|e| AppError::Other(format!("chunk retrieve: {e}")))?;
+                Ok(json!({
+                    "query": cmd.query,
+                    "k": k,
+                    "chunks": chunks.iter().map(|c| json!({
+                        "doc_id": c.doc_id,
+                        "chunk_idx": c.chunk_idx,
+                        "owner_type": c.owner_type,
+                        "owner_id": c.owner_id,
+                        "filename": c.filename,
+                        "content": c.content,
+                        "similarity": c.similarity,
+                    })).collect::<Vec<_>>(),
+                }))
             }
             other => Err(AppError::Validation(format!(
                 "unknown documents tool `{other}`"
@@ -340,6 +381,7 @@ impl DocumentsHandler {
 
         let doc = repo.create(new).await.map_err(doc_err)?;
         self.embed_doc(&repo, &doc).await;
+        self.index_chunks(ws, &doc).await;
         self.emit_doc_event(ws, "attached", &doc);
         Ok(doc_json(&doc))
     }
@@ -445,4 +487,77 @@ fn doc_json(d: &Document) -> Value {
         "uploaded_by": d.uploaded_by,
         "uploaded_at": d.uploaded_at.to_rfc3339(),
     })
+}
+
+impl DocumentsHandler {
+    /// Chunk-level RAG indexing (hq-c488cb): split the document's text into
+    /// overlapping chunks, embed each over the SAME engine the whole-doc
+    /// search column uses, and atomically replace the doc's chunk set.
+    /// Best-effort — a failure logs and never fails the write; without an
+    /// embedder the index is simply skipped (semantic retrieve then errors
+    /// loud, by design).
+    async fn index_chunks(&self, ws: Option<&str>, doc: &Document) {
+        let Some(emb) = &self.embedder else { return };
+        let text = doc
+            .body_md
+            .as_deref()
+            .or(doc.extracted_text.as_deref())
+            .unwrap_or("");
+        if text.trim().is_empty() {
+            return;
+        }
+        let pool = match self.pools.get(ws).await {
+            Ok(p) => p,
+            Err(e) => {
+                eprintln!("[documents] chunk index pool failed: {e}");
+                return;
+            }
+        };
+        let chunks_text = gt_docs_embed::chunk_text(text, 1200, 200);
+        let mut chunks: Vec<NewChunk> = Vec::with_capacity(chunks_text.len());
+        for (i, content) in chunks_text.into_iter().enumerate() {
+            match emb.embed(&content).await {
+                Ok(embedding) => chunks.push(NewChunk { chunk_idx: i as i32, content, embedding }),
+                Err(e) => {
+                    eprintln!("[documents] chunk embed failed for {} #{i}: {e}", doc.id);
+                    return; // partial index would lie; keep the previous set
+                }
+            }
+        }
+        if let Err(e) = PgDocChunks::new(pool)
+            .replace_chunks(&doc.id, &doc.owner_type, &doc.owner_id, &doc.filename, &chunks)
+            .await
+        {
+            eprintln!("[documents] chunk upsert failed for {}: {e}", doc.id);
+        }
+    }
+
+    /// Purge a removed document's chunks (best-effort).
+    async fn purge_chunks(&self, ws: Option<&str>, doc_id: &str) {
+        if let Ok(pool) = self.pools.get(ws).await {
+            if let Err(e) = PgDocChunks::new(pool).purge(doc_id).await {
+                eprintln!("[documents] chunk purge failed for {doc_id}: {e}");
+            }
+        }
+    }
+
+    /// One-shot backfill (hq-c488cb): chunk + embed every pre-existing live
+    /// document that has text but no chunks yet. Idempotent; the bin spawns it
+    /// at boot when the embedder is wired. Returns how many docs were indexed.
+    pub async fn backfill_chunks(&self, ws: Option<&str>) -> usize {
+        if self.embedder.is_none() {
+            return 0;
+        }
+        let Ok(pool) = self.pools.get(ws).await else { return 0 };
+        let repo = PgDocuments::new(pool.clone());
+        let Ok(ids) = PgDocChunks::new(pool).unindexed_doc_ids(500).await else { return 0 };
+        let mut done = 0usize;
+        for id in ids {
+            if let Ok(Some(doc)) = repo.get(&id).await {
+                self.index_chunks(ws, &doc).await;
+                done += 1;
+            }
+        }
+        done
+    }
 }

@@ -34,6 +34,11 @@ pub mod comments;
 pub use comments::{Comment, CommentError, CommentsRepository, NewComment, PgComments};
 
 #[cfg(feature = "pg")]
+pub mod doc_chunks;
+#[cfg(feature = "pg")]
+pub use doc_chunks::{ChunkError, DocChunksRepository, NewChunk, PgDocChunks, RetrievedChunk};
+
+#[cfg(feature = "pg")]
 pub mod email_outbox;
 #[cfg(feature = "pg")]
 pub use email_outbox::{EmailOutboxRepository, NewEmail, OutboxEntry, OutboxError, PgEmailOutbox};
@@ -116,6 +121,9 @@ const DOCS_0003_SQL: &str = include_str!("../migrations/gt-docs/0003_embedding.s
 /// (hq-web-extras.9).
 const DOCS_0004_SQL: &str = include_str!("../migrations/gt-docs/0004_document_shares.sql");
 
+/// Migration #5: per-workspace `doc_chunks` — chunk-level embeddings for agent RAG (hq-c488cb).
+const DOCS_0005_SQL: &str = include_str!("../migrations/gt-docs/0005_doc_chunks.sql");
+
 /// Migrations for the `gt-docs` per-workspace document store (hq-docs-store.1), in
 /// ascending apply order.
 ///
@@ -131,6 +139,7 @@ pub fn docs_migrations() -> Vec<Migration> {
         Migration::new(2, "0002_document_versions", DOCS_0002_SQL),
         Migration::new(3, "0003_embedding", DOCS_0003_SQL),
         Migration::new(4, "0004_document_shares", DOCS_0004_SQL),
+        Migration::new(5, "0005_doc_chunks", DOCS_0005_SQL),
     ]
 }
 
@@ -254,7 +263,7 @@ mod tests {
     #[test]
     fn docs_migrations_define_template_tables_in_order() {
         let migs = docs_migrations();
-        assert_eq!(migs.len(), 4);
+        assert_eq!(migs.len(), 5);
         assert_eq!(migs[0].version, 1);
         assert_eq!(migs[0].name, "0001_documents");
         assert_eq!(migs[1].version, 2);
@@ -263,6 +272,12 @@ mod tests {
         assert_eq!(migs[2].name, "0003_embedding");
         assert_eq!(migs[3].version, 4);
         assert_eq!(migs[3].name, "0004_document_shares");
+        assert_eq!(migs[4].version, 5);
+        assert_eq!(migs[4].name, "0005_doc_chunks");
+        // Chunk index (hq-c488cb): template table + pgvector ANN, no workspace col.
+        assert!(migs[4].sql.contains("ws_default.doc_chunks"));
+        assert!(migs[4].sql.contains("vector(384)"));
+        assert!(migs[4].sql.to_lowercase().contains("hnsw"));
         // Per-workspace share table: in the ws_default template, FKs the live doc, no workspace_id.
         let shares = &migs[3].sql;
         assert!(shares.contains("ws_default.document_shares"), "share table in template");

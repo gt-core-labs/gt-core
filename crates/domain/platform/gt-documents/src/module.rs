@@ -10,7 +10,7 @@ use gt_module::{Capability, GtModule, McpRegistry, ModuleId, ModuleMeta, Scope};
 use gt_module_mcp::schema_for;
 use semver::Version;
 
-use crate::commands::{AttachDoc, ListDocs, RemoveDoc, SearchDocs, UpdateDoc};
+use crate::commands::{AttachDoc, ListDocs, RemoveDoc, RetrieveDocs, SearchDocs, UpdateDoc};
 
 /// The [`GtModule`] facade. Without the `axum` feature it is the zero-sized unit struct the
 /// MCP harvest path registers: the live work happens in the injected `DocumentsRepository` /
@@ -127,6 +127,20 @@ impl GtModule for DocumentsModule {
                 "Phase-1 full-text search over document body_md/extracted_text, ranked by \
                  relevance; optionally narrowed to one owner.",
                 schema_for::<SearchDocs>(),
+            )
+            .tool_with_schema(
+                "documents.retrieve.validate",
+                "Check whether a chunk retrieval would be accepted (query non-empty, k >= 1). \
+                 No state change.",
+                schema_for::<RetrieveDocs>(),
+            )
+            .tool_with_schema(
+                "documents.retrieve.execute",
+                "Top-k chunk retrieval for agent prompt context (hq-c488cb): embeds the query \
+                 and returns the most similar chunks of THIS workspace's documents (structural \
+                 isolation; optional rig narrowing by owner bead prefix), each with doc id, \
+                 owner, filename, text, and cosine similarity. Read-only.",
+                schema_for::<RetrieveDocs>(),
             );
     }
 
@@ -175,8 +189,8 @@ mod tests {
         let mut reg = McpRegistry::new();
         DocumentsModule::default().register_mcp_tools(&mut reg);
         let names: Vec<&str> = reg.tools().iter().map(|t| t.name.as_str()).collect();
-        assert_eq!(names.len(), 10, "five commands × validate/execute");
-        for base in ["attach", "update", "remove", "list", "search"] {
+        assert_eq!(names.len(), 12, "six commands × validate/execute");
+        for base in ["attach", "update", "remove", "list", "search", "retrieve"] {
             assert!(names.contains(&format!("documents.{base}.validate").as_str()));
             assert!(names.contains(&format!("documents.{base}.execute").as_str()));
         }

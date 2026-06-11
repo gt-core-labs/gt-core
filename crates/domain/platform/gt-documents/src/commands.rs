@@ -396,3 +396,31 @@ mod tests {
         assert!(s.validate().is_err(), "owner_type without owner_id is rejected");
     }
 }
+
+/// Input for `documents.retrieve` (hq-c488cb): top-k chunk retrieval for agent
+/// prompt context. The workspace half of the scope is the caller's tenant
+/// (structural); `rig` narrows to owners of that rig when set.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, schemars::JsonSchema)]
+pub struct RetrieveDocs {
+    /// Natural-language query to embed and match.
+    pub query: String,
+    /// Top-k chunks to return. Default 6, capped at 50.
+    #[serde(default)]
+    pub k: Option<i64>,
+    /// Optional rig narrowing: only chunks whose owner bead id is `{rig}-…`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rig: Option<String>,
+}
+
+impl RetrieveDocs {
+    /// Shape-only guard.
+    pub fn validate(&self) -> Result<(), ValidationError> {
+        if self.query.trim().is_empty() {
+            return Err(err("query is empty"));
+        }
+        if matches!(self.k, Some(k) if k < 1) {
+            return Err(err("k must be >= 1"));
+        }
+        Ok(())
+    }
+}

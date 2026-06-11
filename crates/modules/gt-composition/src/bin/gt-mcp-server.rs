@@ -1895,7 +1895,7 @@ async fn build_domain_router(
     // memory + startup cost for no benefit. `Option<Arc<dyn Embedder>>` is cheap to
     // clone (a refcount bump), so both handlers ride the same engine.
     let embedder = build_embedder();
-    let router = router.register(Arc::new(
+    let documents_handler = Arc::new(
         DocumentsHandler::new(
             ws_pools.clone(),
             blob,
@@ -1906,7 +1906,20 @@ async fn build_domain_router(
         // hq-0c8fe1: document mutations broadcast documents.*.v1 frames the
         // doc:{id} SSE topic delivers (post-commit, best-effort).
         .with_event_log(event_log.clone()),
-    ));
+    );
+    let router = router.register(documents_handler.clone());
+    // hq-c488cb: one-shot RAG backfill — chunk + embed pre-existing docs that
+    // have text but no chunk index yet (default workspace; per-tenant docs
+    // backfill on their next write). Spawned so boot never blocks on it.
+    if embedder.is_some() {
+        let backfill = documents_handler.clone();
+        tokio::spawn(async move {
+            let n = backfill.backfill_chunks(None).await;
+            if n > 0 {
+                eprintln!("[gt-mcp-server] doc-chunk backfill indexed {n} document(s)");
+            }
+        });
+    }
 
     // memory.* dispatch (hq-memory-mcp.4): the durable, named semantic-memory store an
     // agent writes once and recalls BY MEANING. Mirror of documents.* — PG-backed,

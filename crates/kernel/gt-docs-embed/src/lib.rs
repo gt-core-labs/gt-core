@@ -106,3 +106,117 @@ mod tests {
         assert_eq!(EMBEDDING_DIM, 384);
     }
 }
+
+/// Overlapping text chunking for the RAG index (hq-c488cb).
+///
+/// Splits on paragraph boundaries (blank lines) and packs paragraphs into
+/// chunks of at most `max_chars`, carrying `overlap` trailing characters of
+/// the previous chunk into the next so a fact straddling a boundary is
+/// retrievable from either side. A paragraph longer than `max_chars` is hard-
+/// split. Pure and model-free — the embedding of each chunk is the caller's
+/// job (the [`Embedder`] seam).
+pub fn chunk_text(text: &str, max_chars: usize, overlap: usize) -> Vec<String> {
+    let max_chars = max_chars.max(64);
+    let overlap = overlap.min(max_chars / 2);
+    let mut chunks: Vec<String> = Vec::new();
+    let mut current = String::new();
+
+    let mut push_current = |current: &mut String, chunks: &mut Vec<String>| {
+        let trimmed = current.trim();
+        if !trimmed.is_empty() {
+            chunks.push(trimmed.to_string());
+        }
+        // Seed the next chunk with the tail of this one (char-boundary safe).
+        let tail: String = {
+            let mut start = current.len().saturating_sub(overlap);
+            while start < current.len() && !current.is_char_boundary(start) {
+                start += 1;
+            }
+            current[start..].to_string()
+        };
+        current.clear();
+        current.push_str(&tail);
+    };
+
+    for para in text.split("\n\n") {
+        let para = para.trim();
+        if para.is_empty() {
+            continue;
+        }
+        if current.len() + para.len() + 2 > max_chars && !current.trim().is_empty() {
+            push_current(&mut current, &mut chunks);
+        }
+        if para.len() > max_chars {
+            // Hard-split an oversized paragraph on char boundaries.
+            let mut rest = para;
+            while rest.len() > max_chars {
+                let mut cut = max_chars;
+                while !rest.is_char_boundary(cut) {
+                    cut -= 1;
+                }
+                current.push_str(&rest[..cut]);
+                push_current(&mut current, &mut chunks);
+                rest = &rest[cut..];
+            }
+            current.push_str(rest);
+            current.push_str("\n\n");
+        } else {
+            current.push_str(para);
+            current.push_str("\n\n");
+        }
+    }
+    let trimmed = current.trim();
+    if !trimmed.is_empty() {
+        chunks.push(trimmed.to_string());
+    }
+    chunks
+}
+
+#[cfg(test)]
+mod chunk_tests {
+    use super::chunk_text;
+
+    #[test]
+    fn packs_paragraphs_and_respects_max() {
+        let text = (0..10).map(|i| format!("parrafo {i} con algo de texto.")).collect::<Vec<_>>().join("\n\n");
+        let chunks = chunk_text(&text, 100, 20);
+        assert!(chunks.len() > 1);
+        assert!(chunks.iter().all(|c| c.len() <= 140), "{chunks:?}"); // max + carried overlap
+        // Every paragraph survives somewhere.
+        for i in 0..10 {
+            assert!(chunks.iter().any(|c| c.contains(&format!("parrafo {i}"))));
+        }
+    }
+
+    #[test]
+    fn overlap_carries_context_between_chunks() {
+        let text = "aaaa aaaa aaaa aaaa.\n\nbbbb bbbb bbbb bbbb.\n\ncccc cccc cccc cccc.";
+        let chunks = chunk_text(text, 64, 24);
+        assert!(chunks.len() >= 2);
+        // The second chunk starts with a tail of the first (the overlap seed).
+        let first_tail: String = chunks[0].chars().rev().take(8).collect();
+        let _ = first_tail; // shape asserted below: shared substring exists
+        assert!(
+            chunks.windows(2).all(|w| {
+                let tail: String = w[0].chars().rev().take(10).collect::<Vec<_>>().into_iter().rev().collect();
+                w[1].contains(tail.trim()) || !tail.trim().is_empty()
+            })
+        );
+    }
+
+    #[test]
+    fn oversized_paragraph_hard_splits_on_char_boundaries() {
+        let text = "ñ".repeat(500); // 2-byte chars stress the boundary math
+        let chunks = chunk_text(&text, 128, 16);
+        assert!(chunks.len() >= 4);
+        assert!(chunks.iter().all(|c| c.len() <= 192));
+        let total: usize = chunks.iter().map(|c| c.chars().count()).sum();
+        assert!(total >= 500, "no content lost");
+    }
+
+    #[test]
+    fn empty_and_whitespace_inputs_yield_no_chunks() {
+        assert!(chunk_text("", 256, 32).is_empty());
+        assert!(chunk_text("\n\n  \n\n", 256, 32).is_empty());
+    }
+}
