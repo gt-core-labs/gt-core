@@ -34,9 +34,12 @@ fi
 # self-update checks expect the binary at $HOME/.local/bin/claude (/root/.local/bin inside the
 # container). Symlink once on every start so those checks pass.
 if [ -f /usr/bin/claude ]; then
-    mkdir -p /root/.local/bin
-    ln -sf /usr/bin/claude /root/.local/bin/claude
-    echo "[entrypoint] claude: /root/.local/bin/claude → /usr/bin/claude ($(/usr/bin/claude --version 2>/dev/null || echo '?'))"
+    cdir="${HOME:-/root}/.local/bin"
+    if mkdir -p "$cdir" 2>/dev/null && ln -sf /usr/bin/claude "$cdir/claude" 2>/dev/null; then
+        echo "[entrypoint] claude: $cdir/claude → /usr/bin/claude ($(/usr/bin/claude --version 2>/dev/null || echo '?'))"
+    else
+        echo "[entrypoint] claude symlink skipped (non-root / read-only HOME)" >&2
+    fi
 fi
 
 exec "$@"
