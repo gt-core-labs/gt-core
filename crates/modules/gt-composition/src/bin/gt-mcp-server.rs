@@ -792,45 +792,36 @@ async fn main() -> anyhow::Result<()> {
     // /api/v1/* RBAC chain — a webhook authenticates by its signature, not a workspace JWT — gated on
     // BOTH a configured App webhook secret (GT_GITHUB_APP_WEBHOOK_SECRET_FILE) AND GT_PG_URL (the
     // connection store + per-workspace rig catalog). Without either, no route is mounted.
-    let github_webhook = match (gt_vcs::GithubAppConfig::from_env(), std::env::var("GT_PG_URL")) {
-        (Ok(Some(cfg)), Ok(pg_url)) => match cfg.webhook_secret() {
-            Some(secret) => match sqlx::PgPool::connect(&pg_url).await {
-                Ok(conn_pool) => {
-                    eprintln!(
-                        "[gt-mcp-server] GitHub push webhook on POST /api/v1/connection/github/webhook (HMAC-SHA256 verified; marks rig stale)"
-                    );
-                    let connections: Arc<dyn VcsConnectionRepo> =
-                        Arc::new(gt_vcs::PgVcsConnections::new(conn_pool));
-                    Some(gt_composition::webhook::github_webhook_router(
-                        gt_composition::webhook::GithubWebhookState::new(
-                            secret.as_bytes().to_vec(),
-                            Arc::new(WsPools::new(pg_url.clone())),
-                            connections,
-                            event_log.clone(),
-                        ),
-                    ))
-                }
-                Err(e) => {
-                    eprintln!("[gt-mcp-server] GitHub push webhook off (PG connect failed: {e})");
-                    None
-                }
-            },
-            None => {
+    // hq-61ea43: the webhook is mounted whenever PG is available and resolves the App webhook secret
+    // from the DB-backed config per delivery (env fallback). An unconfigured App / missing secret is
+    // a 503 at request time (the route exists, it just can't verify yet) rather than an unmounted
+    // route — so configuring the App from the UI lights it up with no redeploy.
+    let github_webhook = match std::env::var("GT_PG_URL") {
+        Ok(pg_url) => match sqlx::PgPool::connect(&pg_url).await {
+            Ok(conn_pool) => {
                 eprintln!(
-                    "[gt-mcp-server] GitHub push webhook off (GitHub App configured but GT_GITHUB_APP_WEBHOOK_SECRET_FILE unset)"
+                    "[gt-mcp-server] GitHub push webhook on POST /api/v1/connection/github/webhook (HMAC-SHA256 verified from DB config; marks rig stale)"
                 );
+                let source = gt_vcs::GithubAppSource::Db(gt_vcs::PgGithubAppConfig::new(
+                    conn_pool.clone(),
+                ));
+                let connections: Arc<dyn VcsConnectionRepo> =
+                    Arc::new(gt_vcs::PgVcsConnections::new(conn_pool));
+                Some(gt_composition::webhook::github_webhook_router(
+                    gt_composition::webhook::GithubWebhookState::new(
+                        source,
+                        Arc::new(WsPools::new(pg_url.clone())),
+                        connections,
+                        event_log.clone(),
+                    ),
+                ))
+            }
+            Err(e) => {
+                eprintln!("[gt-mcp-server] GitHub push webhook off (PG connect failed: {e})");
                 None
             }
         },
-        (Ok(None), _) => {
-            eprintln!("[gt-mcp-server] GitHub push webhook off (no GitHub App configured)");
-            None
-        }
-        (Err(e), _) => {
-            eprintln!("[gt-mcp-server] GitHub push webhook off (GitHub App config error: {e})");
-            None
-        }
-        (_, Err(_)) => {
+        Err(_) => {
             eprintln!("[gt-mcp-server] GitHub push webhook off (GT_PG_URL unset)");
             None
         }
@@ -856,18 +847,15 @@ async fn main() -> anyhow::Result<()> {
         Some(pg_url) => match sqlx::PgPool::connect(&pg_url).await {
             Ok(conn_pool) => {
                 let connections: Arc<dyn VcsConnectionRepo> =
-                    Arc::new(gt_vcs::PgVcsConnections::new(conn_pool));
-                // The App client mints JIT installation tokens for private rigs; absent → public-only.
-                let github = match gt_vcs::GithubAppConfig::from_env() {
-                    Ok(cfg) => cfg.map(gt_vcs::GithubAppClient::new),
-                    Err(e) => {
-                        eprintln!(
-                            "[gt-mcp-server] graph drift-reconcile: GitHub App config error \
-                             ({e}); private rigs will be skipped"
-                        );
-                        None
-                    }
-                };
+                    Arc::new(gt_vcs::PgVcsConnections::new(conn_pool.clone()));
+                // hq-61ea43: the App client mints JIT installation tokens for private rigs; resolved
+                // from the DB-backed config (env fallback). Absent/unconfigured → public rigs only.
+                let github = gt_vcs::GithubAppSource::Db(gt_vcs::PgGithubAppConfig::new(conn_pool))
+                    .load()
+                    .await
+                    .ok()
+                    .flatten()
+                    .map(gt_vcs::GithubAppClient::new);
                 eprintln!(
                     "[gt-mcp-server] graph drift-reconcile daemon on (every {drift_tick}s; \
                      ls-remote vs indexed commit; GitHub App {})",
@@ -989,13 +977,10 @@ async fn main() -> anyhow::Result<()> {
         let pool = sqlx::PgPool::connect(&pg_url)
             .await
             .context("GT_PG_URL must point at a reachable Postgres (REST backings)")?;
-        // The platform GitHub App, resolved once (env). A half-configured App fails loud; an
-        // absent one leaves the connection CRUD + PAT fallback + public-rig graph path working.
-        let github = match gt_vcs::GithubAppConfig::from_env() {
-            Ok(Some(cfg)) => Some(gt_vcs::GithubAppClient::new(cfg)),
-            Ok(None) => None,
-            Err(e) => panic!("GitHub App config is half-set: {e}"),
-        };
+        // The platform GitHub App is now DB-backed (hq-61ea43): the install/config routes resolve it
+        // from `public.github_app_config` per request (env fallback when no row), so it is configured
+        // from the UI with no redeploy. Pass the source, not a pre-resolved client.
+        let github = gt_vcs::GithubAppSource::Db(gt_vcs::PgGithubAppConfig::new(pool.clone()));
         let (blob, bucket) = build_blob_store();
         // Capture the PG url for the cross-workspace /me/stats membership pool (built below), which
         // needs an EAGER connect and so is mounted by main() after the assembly returns.
@@ -1782,11 +1767,14 @@ async fn build_domain_router(
     let graph_provisioner = {
         let connections: Arc<dyn VcsConnectionRepo> =
             Arc::new(gt_vcs::PgVcsConnections::new(pool.clone()));
-        let github = match gt_vcs::GithubAppConfig::from_env() {
-            Ok(Some(cfg)) => Some(gt_vcs::GithubAppClient::new(cfg)),
-            Ok(None) => None,
-            Err(e) => panic!("GitHub App config is half-set: {e}"),
-        };
+        // hq-61ea43: resolve the App client from the DB-backed config (env fallback) at boot. The
+        // provisioner mints JIT tokens for private rigs; an unconfigured App ⇒ public-rig-only.
+        let github = gt_vcs::GithubAppSource::Db(gt_vcs::PgGithubAppConfig::new(pool.clone()))
+            .load()
+            .await
+            .ok()
+            .flatten()
+            .map(gt_vcs::GithubAppClient::new);
         gt_composition::mcp::RigProvisioner::new(ws_pools.clone(), connections, github)
     };
     let router = DomainRouter::new()

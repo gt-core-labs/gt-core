@@ -53,9 +53,9 @@ fn parts_with_pg(event_log: Arc<EventLog>) -> RestModuleParts {
             pool,
             pg_url: DUMMY_PG.to_string(),
             issues_workspaces: None,
-            // No GitHub App: the connection CRUD + public-rig graph path still mount, which is the
-            // module surface (the install routes are conditional and carry no MCP tools either way).
-            github: None,
+            // No GitHub App configured: a Fixed(None) source. The install/config routes still mount
+            // (hq-61ea43) and answer 503 until configured; they carry no MCP tools either way.
+            github: gt_vcs::GithubAppSource::Fixed(None),
             blob: None,
             bucket: "gt-documents".to_string(),
             extractor: Extractor::without_ocr(),

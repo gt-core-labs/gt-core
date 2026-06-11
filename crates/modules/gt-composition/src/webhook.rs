@@ -64,24 +64,27 @@ pub const WEBHOOK_PATH: &str = "/github/webhook";
 /// — every field is an `Arc` or a small owned `Vec`.
 #[derive(Clone)]
 pub struct GithubWebhookState {
-    secret: Arc<Vec<u8>>,
+    /// The DB-backed App config source (hq-61ea43): the webhook secret is resolved per delivery, so
+    /// a UI rotation takes effect without a restart. `None` config / secret ⇒ the receiver answers
+    /// `503` (cannot verify) rather than silently accepting.
+    source: gt_vcs::GithubAppSource,
     pools: Arc<WsPools>,
     connections: Arc<dyn VcsConnectionRepo>,
     log: Arc<EventLog>,
 }
 
 impl GithubWebhookState {
-    /// Build the receiver state. `secret` is the App webhook secret (the value GitHub HMACs each
-    /// delivery with); `pools` resolves a tenant's `ws_<slug>` rig catalog; `connections` maps an
-    /// installation id to its workspace; `log` is the warden event log.
+    /// Build the receiver state. `source` resolves the App webhook secret (the value GitHub HMACs
+    /// each delivery with); `pools` resolves a tenant's `ws_<slug>` rig catalog; `connections` maps
+    /// an installation id to its workspace; `log` is the warden event log.
     pub fn new(
-        secret: impl Into<Vec<u8>>,
+        source: gt_vcs::GithubAppSource,
         pools: Arc<WsPools>,
         connections: Arc<dyn VcsConnectionRepo>,
         log: Arc<EventLog>,
     ) -> Self {
         Self {
-            secret: Arc::new(secret.into()),
+            source,
             pools,
             connections,
             log,
@@ -110,7 +113,27 @@ async fn receive(
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
-    let source = GitHubSource::new(st.secret.as_ref().clone());
+    // Resolve the App's webhook secret from the DB-backed config (hq-61ea43). No App / no secret ⇒
+    // we cannot verify the delivery — answer 503 rather than silently accepting an unverifiable push.
+    let secret = match st.source.load().await {
+        Ok(Some(cfg)) => match cfg.webhook_secret() {
+            Some(s) => s.as_bytes().to_vec(),
+            None => {
+                return (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "no webhook secret configured",
+                )
+                    .into_response()
+            }
+        },
+        Ok(None) => {
+            return (StatusCode::SERVICE_UNAVAILABLE, "no GitHub App configured").into_response()
+        }
+        Err(_) => {
+            return (StatusCode::INTERNAL_SERVER_ERROR, "config load failed").into_response()
+        }
+    };
+    let source = GitHubSource::new(secret);
 
     // 1. Signature — a forged/absent signature is rejected BEFORE any parse or state change.
     if source.verify(&headers, &body).is_err() {
@@ -412,8 +435,15 @@ mod tests {
     fn state_with(conn: VcsConnection) -> (GithubWebhookState, TempDir) {
         let dir = TempDir::new().unwrap();
         let log = Arc::new(EventLog::new(Some(dir.path().to_path_buf())));
+        // A fixed-config source carrying the test webhook secret (DB-backed in production).
+        let cfg = gt_vcs::GithubAppConfig::new(
+            "1",
+            Vec::new(),
+            "test-app",
+            Some(String::from_utf8(SECRET.to_vec()).unwrap()),
+        );
         let st = GithubWebhookState::new(
-            SECRET.to_vec(),
+            gt_vcs::GithubAppSource::Fixed(Some(cfg)),
             Arc::new(WsPools::new("postgres://unused")),
             Arc::new(OneConn(conn)),
             log,

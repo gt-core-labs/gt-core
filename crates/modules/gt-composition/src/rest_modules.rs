@@ -63,10 +63,10 @@ pub struct RestPgParts {
     /// The per-workspace issues Dolt pools the workspace provisioner threads through
     /// (`GT_DOLT_BASE_URL`-derived in `main()`); `None` ⇒ single-tenant.
     pub issues_workspaces: Option<Arc<gt_store_dolt::WorkspacePools>>,
-    /// The platform GitHub App, pre-resolved by the caller (env in `main()`). `Some`
-    /// mounts the install/callback/repos routes + JIT-token graph provisioning;
-    /// `None` leaves the connection CRUD + public-rig graph path.
-    pub github: Option<gt_vcs::GithubAppClient>,
+    /// The DB-backed GitHub App config source (hq-61ea43). The install/callback/repos/config routes
+    /// are ALWAYS mounted and resolve the App from this source per request (so a UI config takes
+    /// effect with no restart); the graph provisioner resolves a client from it at boot.
+    pub github: gt_vcs::GithubAppSource,
     /// The document blob store (`GT_BLOB_*` in `main()`); `None` ⇒ `.md`-only.
     pub blob: Option<Arc<BlobStore>>,
     /// The blob bucket name (recorded on a blob pointer).
@@ -207,6 +207,15 @@ pub async fn build_rest_modules(
             extractor,
             embedder,
         } = pg;
+        // Resolve a concrete App client ONCE for the graph provisioner (it consumes
+        // `Option<GithubAppClient>`); the install/config routes keep the live source for per-request
+        // resolution. A load fault / unconfigured App ⇒ `None` (public-rig graph path still works).
+        let github_client = github
+            .load()
+            .await
+            .ok()
+            .flatten()
+            .map(gt_vcs::GithubAppClient::new);
         rest = rest
             // workspace.*: REST create provisions a full tenant via the shared
             // provisioner (PG schema/RBAC + per-tenant Dolt).
@@ -226,13 +235,13 @@ pub async fn build_rest_modules(
             // an App is configured.
             .module({
                 let connections = Arc::new(gt_vcs::PgVcsConnections::new(pool.clone()));
-                let mut vcs = gt_vcs::VcsModule::with_http(gt_vcs::ConnectionApiState::new(
+                let vcs = gt_vcs::VcsModule::with_http(gt_vcs::ConnectionApiState::new(
                     connections.clone(),
                 ));
-                if let Some(client) = github.clone() {
-                    vcs = vcs.with_github(gt_vcs::GithubApiState::new(client, connections));
-                }
-                vcs
+                // The GitHub surface (install/callback/repos/config) is ALWAYS mounted (hq-61ea43):
+                // it resolves the App from the DB-backed source per request, so it works once the
+                // admin sets the config — no env, no redeploy.
+                vcs.with_github(gt_vcs::GithubApiState::new(github.clone(), connections))
             })
             // graph.* read-only REST + refresh. The REST wrap registers NO MCP tools
             // (the `graph.*` tools are 2-segment and served on the MCP DomainHandler
@@ -248,7 +257,7 @@ pub async fn build_rest_modules(
                     RigProvisioner::new(
                         Arc::new(WsPools::new(pg_url.clone())),
                         conns,
-                        github,
+                        github_client,
                     )
                 };
                 let refresh_handler = Arc::new(
