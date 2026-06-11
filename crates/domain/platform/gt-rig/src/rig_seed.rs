@@ -101,37 +101,13 @@ mod tests {
     use super::*;
 
     #[test]
-    fn embedded_seed_parses_and_carries_the_five_extracted_rigs() {
-        // The seed is the live-extracted catalog — assert the shape the prod rows had so a regen
-        // that drops/garbles a rig is caught at build/test time, not on a greenfield deploy.
+    fn embedded_seed_parses_and_is_empty() {
+        // The rig catalog is no longer seeded: repos are registered from the UI (Add-ons → GitHub),
+        // each bound to a VCS connection so the JIT clone is authenticated. The seed is intentionally
+        // empty so a greenfield deploy starts with NO rigs (the old prod catalog was removed). The
+        // file must still parse so the boot seed path is a clean no-op rather than a parse error.
         let rigs = seed_rigs().expect("embedded seed parses");
-        assert_eq!(rigs.len(), 5, "the five live rigs are vendored");
-
-        let names: Vec<&str> = rigs.iter().map(|r| r.name.as_str()).collect();
-        assert_eq!(names, vec!["gt", "gt_core", "gtmcp", "gtproxy", "gtweb"]);
-
-        // gt_core owns the `hq` prefix (the gt-core repo) — the most load-bearing mapping.
-        let core = rigs.iter().find(|r| r.name == "gt_core").unwrap();
-        assert_eq!(core.prefix, "hq");
-        assert_eq!(core.git_url, "git@github.com:gt-core-labs/gt-core.git");
-        assert_eq!(core.default_branch, "main");
-
-        // Prefixes are unique across the catalog (the catalog enforces this; a dup would 500 a
-        // greenfield boot at upsert time).
-        let mut prefixes: Vec<&str> = rigs.iter().map(|r| r.prefix.as_str()).collect();
-        prefixes.sort_unstable();
-        let dedup_len = {
-            let mut p = prefixes.clone();
-            p.dedup();
-            p.len()
-        };
-        assert_eq!(prefixes.len(), dedup_len, "rig prefixes are unique");
-
-        // No runtime VCS connection is vendored — every live rig clones over SSH (ref is null).
-        assert!(
-            rigs.iter().all(|r| r.git_connection_ref.is_none()),
-            "no rig binds a runtime vcs_connections ref in the seed"
-        );
+        assert!(rigs.is_empty(), "the rig catalog is no longer vendored — repos are UI-registered");
     }
 
     #[test]
