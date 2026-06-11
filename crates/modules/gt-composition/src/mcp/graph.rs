@@ -108,11 +108,30 @@ impl RigProvisioner {
     /// Provision the on-disk checkout for `rig` at the derived `path`: if the rig is bound to an
     /// active GitHub App connection, mint a JIT token and clone (absent) or fetch+reset (present)
     /// its `default_branch`. The token lives only for the duration of the git command and is
-    /// dropped. A rig without a connection (legacy / public) is left to whatever is already on disk.
+    /// dropped. A rig WITHOUT a connection is treated as a public repo and cloned/fetched over
+    /// HTTPS with no credentials (the host is normalized to github.com), so the refresh is
+    /// self-sufficient instead of relying on a hand-mounted checkout.
     async fn provision(&self, ws: Option<&str>, rig: &str, path: &Path) -> Result<(), AppError> {
         let entry = self.rig_entry(ws, rig).await?;
         let Some(conn_ref) = entry.git_connection_ref.as_deref() else {
-            // No VCS connection bound — legacy operator-mounted / public-repo path. Index in place.
+            // No VCS connection bound — public-repo path: clone/fetch the repo directly over HTTPS
+            // (no token). Normalizing to HTTPS also rescues SSH-form git_urls, since the runtime
+            // image ships no ssh client. This replaces the old "index whatever is on disk" branch
+            // that forced an operator to hand-mount a checkout (and silently built an empty graph
+            // when none existed).
+            let (owner, repo_name) = split_git_url(&entry.git_url).ok_or_else(|| {
+                AppError::Validation(format!(
+                    "cannot derive owner/repo from rig `{rig}` git_url `{}`",
+                    entry.git_url
+                ))
+            })?;
+            let public_url = format!("https://github.com/{owner}/{repo_name}.git");
+            let branch = &entry.default_branch;
+            if path.join(".git").is_dir() {
+                fetch_reset(path, &public_url, branch)?;
+            } else {
+                clone_branch(&public_url, branch, path)?;
+            }
             return Ok(());
         };
         let Some(github) = &self.github else {
