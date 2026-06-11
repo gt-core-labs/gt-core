@@ -83,7 +83,13 @@ impl GraphifyIndexer {
         for a in args {
             cmd.arg(a);
         }
-        cmd.stdin(Stdio::piped())
+        // graphify writes its artifacts (graphify-out/, manifest) relative to the
+        // process cwd, not the repo arg. Without this the driver inherits the server's
+        // cwd — unwritable under the non-root (uid 1000) runtime — and dies on
+        // `PermissionError: 'graphify-out'`. Run in the repo, which is owned by the
+        // server uid, so the relative artifact paths land in the rig.
+        cmd.current_dir(repo)
+            .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
 
