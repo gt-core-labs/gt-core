@@ -23,7 +23,8 @@
 //!    NEVER persisted) so a private `ls-remote` authenticates; a rig with no connection (a public
 //!    repo) is `ls-remote`d with no token;
 //! 4. runs `git ls-remote <git_url> refs/heads/<default_branch>` — one cheap call, no clone — to read
-//!    the remote tip;
+//!    the remote tip; a GitHub SSH `git_url` is rewritten to HTTPS first (the container has no ssh
+//!    client — hq-vcs-connections.14);
 //! 5. compares that tip to the warden's `last_indexed_commit`. GitHub returns the FULL 40-char SHA;
 //!    the warden records the SHORT `rev-parse --short` form, so the compare is by PREFIX
 //!    ([`diverged`]) — the same shape as the webhook's head-moved filter;
@@ -333,6 +334,10 @@ pub async fn run(
 
 /// Production [`RemoteTipResolver`]: `git ls-remote <git_url> refs/heads/<branch>`, embedding a JIT
 /// `x-access-token` into the URL for a private repo. One cheap network call — no clone.
+///
+/// A GitHub SSH `git_url` is rewritten to its HTTPS form first ([`https_github_url`]): the
+/// container ships no ssh client, so the SSH form can never work here (hq-vcs-connections.14),
+/// while HTTPS serves an anonymous read of a public repo and carries the token for a private one.
 pub struct GitLsRemote;
 
 #[async_trait]
@@ -343,7 +348,7 @@ impl RemoteTipResolver for GitLsRemote {
         branch: &str,
         token: Option<&str>,
     ) -> Result<Option<String>, gt_events::AppError> {
-        let url = authenticated_url(git_url, token);
+        let url = authenticated_url(&https_github_url(git_url), token);
         let git_ref = format!("refs/heads/{branch}");
         let url_for_blocking = url.clone();
         let ref_for_blocking = git_ref.clone();
@@ -371,9 +376,29 @@ impl RemoteTipResolver for GitLsRemote {
     }
 }
 
+/// Rewrite a GitHub SSH remote — scp-like `git@github.com:owner/repo[.git]` or
+/// `ssh://git@github.com/owner/repo[.git]` — to `https://github.com/owner/repo[.git]`.
+///
+/// The rig catalog stores whatever clone URL the operator registered, and the legacy
+/// operator-mounted rigs all carry the SSH form. This daemon runs in a container with no ssh
+/// client (and no SSH key material), so an SSH `ls-remote` always dies with "cannot run ssh"
+/// and the backstop sat inert for those rigs (hq-vcs-connections.14). The HTTPS form needs
+/// nothing extra for a public repo and takes the JIT installation token for a private one.
+/// Any other URL (already-HTTPS, non-GitHub host) is returned unchanged.
+fn https_github_url(git_url: &str) -> String {
+    if let Some(path) = git_url.strip_prefix("git@github.com:") {
+        return format!("https://github.com/{}", path.trim_start_matches('/'));
+    }
+    if let Some(path) = git_url.strip_prefix("ssh://git@github.com/") {
+        return format!("https://github.com/{path}");
+    }
+    git_url.to_string()
+}
+
 /// Build the `ls-remote` URL: embed the token as `x-access-token` for an `https://github.com/...`
-/// URL when `Some`, else return the URL unchanged. An SSH URL (`git@github.com:...`) is left as-is —
-/// a token does not apply to it (those rigs authenticate via the SSH agent, the legacy host path).
+/// URL when `Some`, else return the URL unchanged. GitHub SSH forms never reach here unchanged —
+/// [`GitLsRemote`] rewrites them through [`https_github_url`] first; a residual non-HTTPS URL
+/// (non-GitHub host) is left as-is since the token does not apply to it.
 fn authenticated_url(git_url: &str, token: Option<&str>) -> String {
     match token {
         Some(tok) if git_url.starts_with("https://github.com/") => git_url.replacen(
@@ -492,11 +517,42 @@ mod tests {
             authenticated_url("https://github.com/o/r.git", None),
             "https://github.com/o/r.git"
         );
-        // SSH URL → token does not apply, left as-is.
+        // A residual non-HTTPS URL (non-GitHub host) → token does not apply, left as-is.
         assert_eq!(
-            authenticated_url("git@github.com:o/r.git", Some(tok)),
-            "git@github.com:o/r.git"
+            authenticated_url("git@gitlab.example.com:o/r.git", Some(tok)),
+            "git@gitlab.example.com:o/r.git"
         );
+    }
+
+    #[test]
+    fn https_github_url_rewrites_ssh_forms_only() {
+        // scp-like SSH → HTTPS (the form every legacy operator-mounted rig carries).
+        assert_eq!(
+            https_github_url("git@github.com:gt-core-labs/gt-core.git"),
+            "https://github.com/gt-core-labs/gt-core.git"
+        );
+        // ssh:// scheme → HTTPS.
+        assert_eq!(
+            https_github_url("ssh://git@github.com/o/r.git"),
+            "https://github.com/o/r.git"
+        );
+        // Already HTTPS → unchanged.
+        assert_eq!(
+            https_github_url("https://github.com/o/r.git"),
+            "https://github.com/o/r.git"
+        );
+        // Non-GitHub host → unchanged (we cannot vouch for its HTTPS endpoint).
+        assert_eq!(
+            https_github_url("git@gitlab.example.com:o/r.git"),
+            "git@gitlab.example.com:o/r.git"
+        );
+    }
+
+    #[test]
+    fn ssh_github_url_rewritten_then_token_embedded() {
+        // The full GitLsRemote path: SSH form → HTTPS → JIT token applies (the .14 fix).
+        let url = authenticated_url(&https_github_url("git@github.com:o/r.git"), Some("ghs_tok"));
+        assert_eq!(url, "https://x-access-token:ghs_tok@github.com/o/r.git");
     }
 
     #[test]
