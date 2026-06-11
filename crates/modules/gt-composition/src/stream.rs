@@ -122,12 +122,92 @@ impl FeedState {
 /// `convoy`, `quota`, …). Absent ⇒ the whole workspace feed.
 /// `?rig=<name>` further narrows to events whose payload carries `"rig"` equal to
 /// `name` (hq-rig-isolation.3). Absent ⇒ all rigs (back-compat).
+/// `?topic=board:{rig}:{ws}` / `?topic=doc:{id}` subscribes one Kanban scope
+/// (hq-0c8fe1): a board topic delivers the rig's card events + card comments, a
+/// doc topic one document's edits + comments. Overrides `channel`/`rig`.
 #[derive(Debug, Default, Deserialize)]
 pub struct FeedParams {
     #[serde(default)]
     channel: Option<String>,
     #[serde(default)]
     rig: Option<String>,
+    #[serde(default)]
+    topic: Option<String>,
+}
+
+/// One Kanban realtime scope (hq-0c8fe1, ADR hq-423a4b D7): the SSE topics the
+/// board UI and the doc editor subscribe. Server-authoritative broadcast — the
+/// stream only pushes change events; every write flows through REST/MCP. Doc
+/// edits are last-write-wins per block (the ADR's ratified conflict policy);
+/// CRDT is explicitly out of scope until conflict pain is demonstrated.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Topic {
+    /// `board:{rig}:{workspace}` — the rig's card mutations
+    /// (`issues.*`, payload `rig`) plus comments on the rig's cards
+    /// (`comments.*`, `target_kind=card`, target id prefixed `{rig}-`).
+    Board {
+        /// The rig half of the board scope key.
+        rig: String,
+        /// The workspace half — must match the caller's resolved tenant.
+        workspace: String,
+    },
+    /// `doc:{id}` — one document's edits (`documents.*`) plus its comments
+    /// (`comments.*`, `target_kind=doc`).
+    Doc {
+        /// The document id.
+        id: String,
+    },
+}
+
+impl Topic {
+    /// Parse a `?topic=` value. `None` for an unrecognized shape so the handler
+    /// can 400 instead of silently streaming everything.
+    pub fn parse(raw: &str) -> Option<Self> {
+        if let Some(rest) = raw.strip_prefix("board:") {
+            let (rig, ws) = rest.split_once(':')?;
+            if rig.is_empty() || ws.is_empty() {
+                return None;
+            }
+            return Some(Topic::Board { rig: rig.to_string(), workspace: ws.to_string() });
+        }
+        if let Some(id) = raw.strip_prefix("doc:") {
+            if id.is_empty() {
+                return None;
+            }
+            return Some(Topic::Doc { id: id.to_string() });
+        }
+        None
+    }
+
+    /// Whether one event record belongs to this topic. Pure — unit-testable
+    /// without a stream.
+    pub fn matches(&self, kind: &str, payload: &serde_json::Value) -> bool {
+        let str_field = |k: &str| payload.get(k).and_then(|v| v.as_str());
+        match self {
+            Topic::Board { rig, .. } => {
+                if kind.starts_with("issues.") {
+                    return str_field("rig") == Some(rig.as_str());
+                }
+                if kind.starts_with("comments.") {
+                    return str_field("target_kind") == Some("card")
+                        && str_field("target_id")
+                            .map(|id| id.starts_with(&format!("{rig}-")))
+                            .unwrap_or(false);
+                }
+                false
+            }
+            Topic::Doc { id } => {
+                if kind.starts_with("documents.") {
+                    return str_field("id") == Some(id.as_str());
+                }
+                if kind.starts_with("comments.") {
+                    return str_field("target_kind") == Some("doc")
+                        && str_field("target_id") == Some(id.as_str());
+                }
+                false
+            }
+        }
+    }
 }
 
 /// The SSE feed router (`GET /stream`), ready to `.merge()` into the server's app.
@@ -157,8 +237,45 @@ async fn feed_stream(
         // `resolve_tenant` already audited the denial; the message is the 401 body.
         Err(msg) => return (StatusCode::UNAUTHORIZED, msg).into_response(),
     };
-    let channel = params.channel.filter(|c| !c.is_empty());
-    let rig_filter = params.rig.filter(|r| !r.is_empty());
+    // Kanban topic subscription (hq-0c8fe1): `?topic=` overrides channel/rig.
+    // A board topic spans two domains (issues.* + comments.*), so it reads the
+    // unnarrowed log and filters per record; its workspace half must agree with
+    // the caller's resolved tenant — a topic is a scope, never an escape hatch.
+    let topic = match params.topic.as_deref().filter(|t| !t.is_empty()) {
+        Some(raw) => match Topic::parse(raw) {
+            Some(t) => Some(t),
+            None => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    "unknown topic (expected board:{rig}:{workspace} or doc:{id})",
+                )
+                    .into_response()
+            }
+        },
+        None => None,
+    };
+    if let Some(Topic::Board { workspace: topic_ws, .. }) = &topic {
+        match &workspace {
+            Some(ws) if ws != topic_ws => {
+                return (
+                    StatusCode::FORBIDDEN,
+                    "topic workspace does not match the caller's tenant",
+                )
+                    .into_response();
+            }
+            _ => {}
+        }
+    }
+    let channel = if topic.is_some() {
+        None
+    } else {
+        params.channel.filter(|c| !c.is_empty())
+    };
+    let rig_filter = if topic.is_some() {
+        None
+    } else {
+        params.rig.filter(|r| !r.is_empty())
+    };
     // EventSource resends the last event's id on reconnect; our id is the record ts.
     let resume_from = header(&headers, "last-event-id");
 
@@ -178,6 +295,12 @@ async fn feed_stream(
                 if let Some(r) = &rig_filter {
                     let payload_rig = record.payload.get("rig").and_then(|v| v.as_str());
                     if payload_rig != Some(r.as_str()) {
+                        continue;
+                    }
+                }
+                // hq-0c8fe1: a topic subscription only sees its own scope.
+                if let Some(t) = &topic {
+                    if !t.matches(&record.kind, &record.payload) {
                         continue;
                     }
                 }
@@ -643,5 +766,63 @@ mod cookie_auth_tests {
             .await
             .expect("an SSE data frame");
         assert_eq!(event["n"], 3);
+    }
+}
+
+#[cfg(test)]
+mod topic_tests {
+    use super::Topic;
+    use serde_json::json;
+
+    #[test]
+    fn parses_board_and_doc_topics_and_rejects_garbage() {
+        assert_eq!(
+            Topic::parse("board:hq:default"),
+            Some(Topic::Board { rig: "hq".into(), workspace: "default".into() })
+        );
+        assert_eq!(Topic::parse("doc:01ABC"), Some(Topic::Doc { id: "01ABC".into() }));
+        for bad in ["board:hq", "board::ws", "board:hq:", "doc:", "kanban:x", ""] {
+            assert!(Topic::parse(bad).is_none(), "{bad} must not parse");
+        }
+    }
+
+    #[test]
+    fn board_topic_matches_rig_issue_events_and_card_comments() {
+        let t = Topic::parse("board:hq:default").unwrap();
+        // The rig's card mutations…
+        assert!(t.matches("issues.transitioned.v1", &json!({ "rig": "hq", "id": "hq-1" })));
+        // …but not another rig's.
+        assert!(!t.matches("issues.transitioned.v1", &json!({ "rig": "gtweb" })));
+        // Comments on the rig's cards ride the board topic.
+        assert!(t.matches(
+            "comments.created.v1",
+            &json!({ "target_kind": "card", "target_id": "hq-62130a" })
+        ));
+        assert!(!t.matches(
+            "comments.created.v1",
+            &json!({ "target_kind": "card", "target_id": "gtweb-9" })
+        ));
+        // Doc comments and unrelated domains do not.
+        assert!(!t.matches(
+            "comments.created.v1",
+            &json!({ "target_kind": "doc", "target_id": "01ABC" })
+        ));
+        assert!(!t.matches("merge.completed.v1", &json!({ "rig": "hq" })));
+    }
+
+    #[test]
+    fn doc_topic_matches_one_documents_edits_and_comments() {
+        let t = Topic::parse("doc:01ABC").unwrap();
+        assert!(t.matches("documents.updated.v1", &json!({ "id": "01ABC", "version": 3 })));
+        assert!(!t.matches("documents.updated.v1", &json!({ "id": "01XYZ" })));
+        assert!(t.matches(
+            "comments.created.v1",
+            &json!({ "target_kind": "doc", "target_id": "01ABC" })
+        ));
+        assert!(!t.matches(
+            "comments.created.v1",
+            &json!({ "target_kind": "card", "target_id": "01ABC" })
+        ));
+        assert!(!t.matches("issues.updated.v1", &json!({ "id": "01ABC" })));
     }
 }

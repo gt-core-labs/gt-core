@@ -80,6 +80,37 @@ impl EventKind for MentionNotification {
     }
 }
 
+/// One comment mutation, broadcast post-commit to the per-workspace SSE feed
+/// (hq-0c8fe1). `target_kind`/`target_id` ride at the TOP level so the stream's
+/// Kanban topics match without unpacking: `board:{rig}:{ws}` picks up
+/// `target_kind=card` comments by target-id rig prefix, `doc:{id}` picks up
+/// `target_kind=doc` ones. The producer (this handler) only appends to the
+/// event log — it never references the SSE stream or any subscriber (ADR D7
+/// low-coupling: consumers attach to the log, not to producers).
+#[derive(serde::Serialize)]
+struct CommentEvent {
+    verb: &'static str,
+    id: String,
+    target_kind: String,
+    target_id: String,
+    author: String,
+    parent_id: Option<String>,
+    actor: String,
+    /// The body, present on create/update so a client patches in place.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    body: Option<String>,
+}
+
+impl EventKind for CommentEvent {
+    fn kind(&self) -> &'static str {
+        match self.verb {
+            "created" => "comments.created.v1",
+            "updated" => "comments.updated.v1",
+            _ => "comments.deleted.v1",
+        }
+    }
+}
+
 fn parse<T: serde::de::DeserializeOwned>(args: Value) -> Result<T, AppError> {
     serde_json::from_value(args)
         .map_err(|e| AppError::Validation(format!("invalid arguments: {e}")))
@@ -178,6 +209,31 @@ impl CommentsHandler {
             "comment {} belongs to {}; only its author (or an admin) may modify it",
             comment.id, comment.author
         )))
+    }
+
+    /// Broadcast one comment mutation to the SSE feed, post-commit (hq-0c8fe1).
+    /// Best-effort: the write already succeeded; a feed failure only logs.
+    fn emit_comment_event(
+        &self,
+        ws: Option<&str>,
+        verb: &'static str,
+        comment: &Comment,
+        actor: &str,
+        with_body: bool,
+    ) {
+        let ev = CommentEvent {
+            verb,
+            id: comment.id.clone(),
+            target_kind: comment.target_kind.clone(),
+            target_id: comment.target_id.clone(),
+            author: comment.author.clone(),
+            parent_id: comment.parent_id.clone(),
+            actor: actor.to_string(),
+            body: with_body.then(|| comment.body.clone()),
+        };
+        if let Err(e) = self.log.append(ws, ev) {
+            eprintln!("[comments] SSE emit failed: {e}");
+        }
     }
 
     /// Best-effort `@mention` dispatch: resolve each handle against the tenant
@@ -284,6 +340,7 @@ impl DomainHandler for CommentsHandler {
                     })
                     .await
                     .map_err(comment_err)?;
+                self.emit_comment_event(ctx.workspace, "created", &comment, ctx.actor, true);
                 self.dispatch_mentions(ctx.workspace, &repo, ctx.actor, &comment)
                     .await;
                 Ok(comment_json(&comment))
@@ -322,6 +379,7 @@ impl DomainHandler for CommentsHandler {
                     .map_err(comment_err)?;
                 // Handles newly added by the edit notify too; resolution dedup
                 // is acceptable noise (best-effort, mirrors live chat tools).
+                self.emit_comment_event(ctx.workspace, "updated", &updated, ctx.actor, true);
                 self.dispatch_mentions(ctx.workspace, &repo, ctx.actor, &updated)
                     .await;
                 Ok(comment_json(&updated))
@@ -337,6 +395,7 @@ impl DomainHandler for CommentsHandler {
                 let existing = repo.get(&cmd.id).await.map_err(comment_err)?;
                 Self::check_author(ctx.actor, &existing)?;
                 repo.soft_delete(&cmd.id).await.map_err(comment_err)?;
+                self.emit_comment_event(ctx.workspace, "deleted", &existing, ctx.actor, false);
                 Ok(json!({ "ok": true, "id": cmd.id, "removed": true }))
             }
             other => Err(AppError::Validation(format!("unknown tool `{other}`"))),

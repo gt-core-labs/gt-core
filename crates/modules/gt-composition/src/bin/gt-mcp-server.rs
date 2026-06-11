@@ -1854,13 +1854,18 @@ async fn build_domain_router(
     // memory + startup cost for no benefit. `Option<Arc<dyn Embedder>>` is cheap to
     // clone (a refcount bump), so both handlers ride the same engine.
     let embedder = build_embedder();
-    let router = router.register(Arc::new(DocumentsHandler::new(
-        ws_pools.clone(),
-        blob,
-        bucket,
-        Extractor::without_ocr(),
-        embedder.clone(),
-    )));
+    let router = router.register(Arc::new(
+        DocumentsHandler::new(
+            ws_pools.clone(),
+            blob,
+            bucket,
+            Extractor::without_ocr(),
+            embedder.clone(),
+        )
+        // hq-0c8fe1: document mutations broadcast documents.*.v1 frames the
+        // doc:{id} SSE topic delivers (post-commit, best-effort).
+        .with_event_log(event_log.clone()),
+    ));
 
     // memory.* dispatch (hq-memory-mcp.4): the durable, named semantic-memory store an
     // agent writes once and recalls BY MEANING. Mirror of documents.* — PG-backed,

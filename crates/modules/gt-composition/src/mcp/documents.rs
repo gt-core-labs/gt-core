@@ -28,7 +28,37 @@ use gt_store_pg::{
     DocError, Document, DocumentPatch, DocumentsRepository, NewDocument, PgDocuments, VectorStore,
 };
 
+use gt_events::EventKind;
+
+use super::eventlog::EventLog;
 use super::pools::WsPools;
+
+/// One document mutation, broadcast post-commit to the per-workspace SSE feed
+/// (hq-0c8fe1). The document `id` rides at the TOP level so the stream's
+/// `doc:{id}` topic matches without unpacking. Per the ADR (hq-423a4b D7) doc
+/// edits are server-authoritative, last-write-wins per block; this event tells
+/// other editors to re-pull the changed doc (CRDT explicitly out of scope).
+/// The producer only appends to the event log — it never references the SSE
+/// stream or any subscriber.
+#[derive(serde::Serialize)]
+struct DocEvent {
+    verb: &'static str,
+    id: String,
+    owner_type: String,
+    owner_id: String,
+    filename: String,
+    version: i64,
+}
+
+impl EventKind for DocEvent {
+    fn kind(&self) -> &'static str {
+        match self.verb {
+            "attached" => "documents.attached.v1",
+            "updated" => "documents.updated.v1",
+            _ => "documents.removed.v1",
+        }
+    }
+}
 
 /// PG + blob backed handler for the `documents.*` tool namespace.
 pub struct DocumentsHandler {
@@ -44,6 +74,9 @@ pub struct DocumentsHandler {
     /// attach and `documents.search` uses the hybrid (text + vector) path; `None` ⇒ phase-1
     /// full-text only.
     embedder: Option<Arc<dyn Embedder>>,
+    /// SSE event log (hq-0c8fe1): document mutations broadcast `documents.*.v1`
+    /// frames the `doc:{id}` topic delivers. `None` keeps the handler emit-free.
+    log: Option<Arc<EventLog>>,
 }
 
 impl DocumentsHandler {
@@ -62,6 +95,30 @@ impl DocumentsHandler {
             bucket: bucket.into(),
             extractor,
             embedder,
+            log: None,
+        }
+    }
+
+    /// Wire the SSE event log (hq-0c8fe1): every successful attach/update/remove
+    /// then broadcasts its `documents.*.v1` frame for `doc:{id}` subscribers.
+    pub fn with_event_log(mut self, log: Arc<EventLog>) -> Self {
+        self.log = Some(log);
+        self
+    }
+
+    /// Broadcast one document mutation, post-commit + best-effort.
+    fn emit_doc_event(&self, ws: Option<&str>, verb: &'static str, doc: &Document) {
+        let Some(log) = &self.log else { return };
+        let ev = DocEvent {
+            verb,
+            id: doc.id.clone(),
+            owner_type: doc.owner_type.clone(),
+            owner_id: doc.owner_id.clone(),
+            filename: doc.filename.clone(),
+            version: doc.version,
+        };
+        if let Err(e) = log.append(ws, ev) {
+            eprintln!("[documents] SSE emit failed: {e}");
         }
     }
 
@@ -124,6 +181,7 @@ impl DomainHandler for DocumentsHandler {
                     .map_err(doc_err)?;
                 // Re-embed: the body may have changed (hq-docs-search.2). Best-effort.
                 self.embed_doc(&repo, &doc).await;
+                self.emit_doc_event(ctx.workspace, "updated", &doc);
                 Ok(doc_json(&doc))
             }
             "documents.remove.validate" => {
@@ -134,9 +192,13 @@ impl DomainHandler for DocumentsHandler {
                 let cmd = parse::<RemoveDoc>(ctx.args)?;
                 cmd.validate().map_err(val)?;
                 let repo = self.repo(ctx.workspace).await?;
+                let removed = repo.get(&cmd.id).await.map_err(doc_err)?;
                 repo.soft_delete(&cmd.id, cmd.expected_version)
                     .await
                     .map_err(doc_err)?;
+                if let Some(doc) = removed {
+                    self.emit_doc_event(ctx.workspace, "removed", &doc);
+                }
                 Ok(json!({ "ok": true, "id": cmd.id, "removed": true }))
             }
             "documents.list.validate" => {
@@ -278,6 +340,7 @@ impl DocumentsHandler {
 
         let doc = repo.create(new).await.map_err(doc_err)?;
         self.embed_doc(&repo, &doc).await;
+        self.emit_doc_event(ws, "attached", &doc);
         Ok(doc_json(&doc))
     }
 
