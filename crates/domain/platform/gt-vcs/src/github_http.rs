@@ -128,14 +128,14 @@ pub struct InstalledConnection {
         ("setup_action" = Option<String>, Query, description = "install | update"),
     ),
     responses(
-        (status = 200, description = "Connection persisted (kind=github_app, no token stored)"),
+        (status = 303, description = "Connection persisted; redirect back to the GitHub complemento page"),
     ),
 ))]
 async fn install_callback(
     State(st): State<GithubApiState>,
     ctx: WorkspaceContext,
     Query(params): Query<CallbackParams>,
-) -> Result<Json<InstalledConnection>, ApiError> {
+) -> Result<Response, ApiError> {
     let workspace = ctx.workspace().as_str().to_owned();
     let client = st.client().await?;
     // Resolve the org/account login the installation lives under by minting an installation token
@@ -167,11 +167,14 @@ async fn install_callback(
         })
         .await?;
 
-    Ok(Json(InstalledConnection {
-        id: stored.id,
-        installation_id: params.installation_id,
-        account_login,
-    }))
+    // Redirect the browser back to the complemento page (instead of dumping JSON): the install flow
+    // is a top-level navigation / popup, so a 303 lands the user on the app, which then refreshes its
+    // connection list. `gh_connected` lets the page close the popup + reload the opener.
+    Ok(axum::response::Redirect::to(&format!(
+        "/complementos/github?gh_connected={}",
+        stored.id
+    ))
+    .into_response())
 }
 
 /// Query params for `GET /repos` — the connection whose installation to list.
@@ -495,7 +498,10 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(res.status(), StatusCode::OK);
+        // 303 redirect back to the complemento page (carrying gh_connected), not a JSON body.
+        assert_eq!(res.status(), StatusCode::SEE_OTHER);
+        let loc = res.headers().get(axum::http::header::LOCATION).unwrap();
+        assert!(loc.to_str().unwrap().contains("gh-987654"));
         let rows = store.rows.lock().unwrap();
         let row = rows
             .iter()
