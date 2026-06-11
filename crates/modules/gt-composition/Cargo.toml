@@ -95,6 +95,8 @@ gt-store-pg = { workspace = true, features = ["pg"] }
 # the per-workspace DocumentsRepository (gt-store-pg `pg`), the blob store, and the
 # text extractor. base64 decodes attach payloads; ulid mints doc ids; sha2 dedups.
 gt-documents = { workspace = true, features = ["axum"] }
+# Threaded comments contract (hq-57042e): comments.* tool shapes + @mention parser.
+gt-comments = { workspace = true }
 gt-store-blob = { workspace = true }
 gt-docs-extract = { workspace = true }
 gt-docs-embed = { workspace = true }

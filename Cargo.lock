@@ -1654,6 +1654,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "gt-comments"
+version = "0.1.0"
+dependencies = [
+ "gt-module",
+ "gt-module-mcp",
+ "schemars 0.8.22",
+ "semver",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "gt-composition"
 version = "0.1.0"
 dependencies = [
@@ -1669,6 +1681,7 @@ dependencies = [
  "gt-beads",
  "gt-channel",
  "gt-claude-hooks",
+ "gt-comments",
  "gt-docs-embed",
  "gt-docs-extract",
  "gt-documents",

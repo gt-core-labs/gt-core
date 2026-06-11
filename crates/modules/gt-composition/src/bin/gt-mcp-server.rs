@@ -44,7 +44,7 @@ use gt_composition::denial_audit::audit_denials;
 use gt_composition::hooks::{hooks_router, HooksApiState};
 use gt_composition::notifications::{notifications_router, NotificationsApiState};
 use gt_composition::mcp::{
-    AgentHandler, AuditHandler, ConvoyHandler, DocumentsHandler, EventLog, EventLogHooks,
+    AgentHandler, AuditHandler, CommentsHandler, ConvoyHandler, DocumentsHandler, EventLog, EventLogHooks,
     EventLogIssueSink, GraphHandler, IdentityDoltMeStats, MemoryHandler, MergeHandler, NotifyHandler,
     PgDocumentsResource, PgRigPrefixes, PgWorkspaceStatus, QuotaBlockGuard, QuotaHandler, RigHandler,
     WorkspaceHandler, WsPools,
@@ -1421,6 +1421,7 @@ async fn apply_pg_catalog(pool: &sqlx::PgPool) -> anyhow::Result<()> {
     let feature_id = ModuleId::new("feature").expect("`feature` is a valid module id");
     let rig_id = ModuleId::new("rig").expect("`rig` is a valid module id");
     let docs_id = ModuleId::new("docs").expect("`docs` is a valid module id");
+    let comments_id = ModuleId::new("comments").expect("`comments` is a valid module id");
     let memory_id = ModuleId::new("memory").expect("`memory` is a valid module id");
     let notifications_id = ModuleId::new("notifications").expect("`notifications` is a valid module id");
     // hq-talos-migration.10: the GLOBAL `public.events` table — the Postgres-backed EventStore that
@@ -1443,6 +1444,8 @@ async fn apply_pg_catalog(pool: &sqlx::PgPool) -> anyhow::Result<()> {
     // hq-docs-store.1: the per-workspace `documents` template tables (docs/11). Like `rig`,
     // they seed the `ws_default` template so `gt_create_workspace_schema` clones them per tenant.
     let docs_migs = gt_store_pg::docs_migrations();
+    // hq-57042e: the per-workspace `comments` template table (threaded card|doc comments).
+    let comments_migs = gt_store_pg::comments_migrations();
     // hq-memory-mcp.1: the per-workspace `memories` template table (semantic agent memory).
     // Like `documents`, it seeds the `ws_default` template so it is cloned per tenant.
     let memory_migs = gt_store_pg::memory_migrations();
@@ -1472,6 +1475,7 @@ async fn apply_pg_catalog(pool: &sqlx::PgPool) -> anyhow::Result<()> {
         .chain(feature_migs.iter().map(|m| (&feature_id, m)))
         .chain(rig_migs.iter().map(|m| (&rig_id, m)))
         .chain(docs_migs.iter().map(|m| (&docs_id, m)))
+        .chain(comments_migs.iter().map(|m| (&comments_id, m)))
         .chain(memory_migs.iter().map(|m| (&memory_id, m)))
         .chain(notifications_migs.iter().map(|m| (&notifications_id, m)))
         .chain(events_migs.iter().map(|m| (&events_id, m)))
@@ -1827,6 +1831,27 @@ async fn build_domain_router(
     // pool cache and resolves `ws_<slug>.memories` per-request from the caller's tenant
     // (hq-memory-admin.4), exactly like documents.* — no longer bound to `ws_default`.
     let router = router.register(Arc::new(MemoryHandler::new(ws_pools.clone(), embedder)));
+
+    // comments.* dispatch (hq-57042e): threaded comments on cards (beads) + documents.
+    // Card-target existence checks need the Dolt tracker, so the handler is wired only
+    // when GT_DOLT_URL is set (it always is alongside the issues store); mention
+    // notifications ride the same `notifications` table + SSE event notify.send uses.
+    let router = match std::env::var("GT_DOLT_URL")
+        .ok()
+        .and_then(|url| DoltIssues::connect(&url).ok())
+    {
+        Some(comments_dolt) => router.register(Arc::new(CommentsHandler::new(
+            ws_pools.clone(),
+            Arc::new(comments_dolt),
+            dolt_pools.clone(),
+            pool.clone(),
+            event_log.clone(),
+        ))),
+        None => {
+            eprintln!("[gt-mcp-server] comments.* off — GT_DOLT_URL unset (card targets unverifiable)");
+            router
+        }
+    };
     eprintln!(
         "[gt-mcp-server] domain namespaces: {:?}",
         router.namespaces()

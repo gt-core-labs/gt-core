@@ -29,6 +29,11 @@ pub use documents::{
 };
 
 #[cfg(feature = "pg")]
+pub mod comments;
+#[cfg(feature = "pg")]
+pub use comments::{Comment, CommentError, CommentsRepository, NewComment, PgComments};
+
+#[cfg(feature = "pg")]
 pub mod memory_store;
 #[cfg(feature = "pg")]
 pub use memory_store::{
@@ -117,6 +122,21 @@ pub fn docs_migrations() -> Vec<Migration> {
         Migration::new(3, "0003_embedding", DOCS_0003_SQL),
         Migration::new(4, "0004_document_shares", DOCS_0004_SQL),
     ]
+}
+
+/// Migration #1: per-workspace `comments` table in the `ws_default` template.
+const COMMENTS_0001_SQL: &str = include_str!("../migrations/gt-comments/0001_comments.sql");
+
+/// Migrations for the `gt-comments` per-workspace threaded-comments store
+/// (hq-57042e), in ascending apply order.
+///
+/// Like `gt-docs`' `documents`, the `comments` table is per-workspace projection
+/// data defined ONCE in the `ws_default` template schema; the catalog runner
+/// applies it on boot and `gt_create_workspace_schema` clones it into every
+/// tenant (docs/04 §15). Polymorphic target (card|doc) — no FK, target existence
+/// is the handler's check (a `card` lives in Dolt, not this database).
+pub fn comments_migrations() -> Vec<Migration> {
+    vec![Migration::new(1, "0001_comments", COMMENTS_0001_SQL)]
 }
 
 /// Migration #1: per-workspace `memories` table in the `ws_default` template.

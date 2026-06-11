@@ -1,0 +1,21 @@
+[package]
+name = "gt-comments"
+edition.workspace = true
+version.workspace = true
+
+# hq-57042e (epic hq-56b5ee) — threaded comments for Kanban cards + documents as a GtModule.
+#
+# This crate owns the `comments.*` tool contract: the wire-shape structs + their shape-only
+# `validate()`, the @mention parser, and the GtModule facade the composition root harvests.
+# The PG-backed dispatch (target-existence checks, mention -> notification) lives in
+# gt-composition/src/mcp/comments.rs over the `CommentsRepository` port (gt-store-pg),
+# exactly the gt-documents split.
+[dependencies]
+gt-module = { workspace = true }
+gt-module-mcp = { workspace = true }
+schemars = { workspace = true }
+serde = { workspace = true }
+semver = { workspace = true }
+
+[dev-dependencies]
+serde_json = { workspace = true }
