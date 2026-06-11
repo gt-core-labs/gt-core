@@ -1674,6 +1674,7 @@ dependencies = [
  "async-trait",
  "axum",
  "base64 0.22.1",
+ "chrono",
  "futures-core",
  "gt-agent",
  "gt-audit",
@@ -1697,6 +1698,7 @@ dependencies = [
  "gt-meta",
  "gt-module",
  "gt-module-migrate",
+ "gt-notify",
  "gt-orchestration",
  "gt-patrol",
  "gt-plugin",
@@ -2356,6 +2358,7 @@ name = "gt-store-pg"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "chrono",
  "gt-docs-embed",
  "gt-memory",
  "gt-module",

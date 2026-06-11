@@ -97,6 +97,9 @@ gt-store-pg = { workspace = true, features = ["pg"] }
 gt-documents = { workspace = true, features = ["axum"] }
 # Threaded comments contract (hq-57042e): comments.* tool shapes + @mention parser.
 gt-comments = { workspace = true }
+# Email transport seam (hq-f24599): LogTransport now, SMTP later by config.
+gt-notify = { workspace = true }
+chrono = { workspace = true }
 gt-store-blob = { workspace = true }
 gt-docs-extract = { workspace = true }
 gt-docs-embed = { workspace = true }

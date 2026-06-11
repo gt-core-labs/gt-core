@@ -34,3 +34,5 @@ pg = ["dep:sqlx", "dep:async-trait", "dep:thiserror", "dep:pgvector", "dep:gt-me
 [dev-dependencies]
 # Drives the `pg`-gated WorkspacePool contract test (GT_PG_URL).
 tokio = { workspace = true }
+# Duration arithmetic in the email-outbox contract test (hq-f24599).
+chrono = { workspace = true }

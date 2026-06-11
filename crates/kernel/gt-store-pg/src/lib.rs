@@ -34,6 +34,11 @@ pub mod comments;
 pub use comments::{Comment, CommentError, CommentsRepository, NewComment, PgComments};
 
 #[cfg(feature = "pg")]
+pub mod email_outbox;
+#[cfg(feature = "pg")]
+pub use email_outbox::{EmailOutboxRepository, NewEmail, OutboxEntry, OutboxError, PgEmailOutbox};
+
+#[cfg(feature = "pg")]
 pub mod memory_store;
 #[cfg(feature = "pg")]
 pub use memory_store::{
@@ -152,6 +157,18 @@ const MEMORY_0001_SQL: &str = include_str!("../migrations/gt-memory/0001_memorie
 /// migration (no phase split), so a memory is recallable by meaning from row zero.
 pub fn memory_migrations() -> Vec<Migration> {
     vec![Migration::new(1, "0001_memories", MEMORY_0001_SQL)]
+}
+
+/// Initial migration: `email_outbox` table in the public schema.
+const EMAIL_0001_SQL: &str = include_str!("../migrations/email/0001_email_outbox.sql");
+
+/// Migrations for the transport-agnostic email outbox (hq-f24599).
+///
+/// Public schema (like `notifications`): one table keyed by a `workspace`
+/// column. Producers enqueue; the drain daemon delivers through the
+/// `gt_notify::EmailTransport` seam — the SMTP server stays pluggable.
+pub fn email_migrations() -> Vec<Migration> {
+    vec![Migration::new(1, "0001_email_outbox", EMAIL_0001_SQL)]
 }
 
 /// Initial migration: `notifications` table in the public schema.

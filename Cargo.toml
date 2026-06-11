@@ -197,6 +197,7 @@ gt-skills        = { path = "crates/domain/platform/gt-skills" }
 gt-claude-hooks  = { path = "crates/domain/platform/gt-claude-hooks" }
 gt-documents     = { path = "crates/domain/platform/gt-documents" }
 gt-comments      = { path = "crates/domain/platform/gt-comments" }
+gt-notify        = { path = "crates/domain/platform/gt-notify" }
 gt-agent         = { path = "crates/domain/lifecycle/gt-agent" }
 gt-polecat       = { path = "crates/domain/lifecycle/gt-polecat" }
 gt-sheriff       = { path = "crates/domain/roles/gt-sheriff" }

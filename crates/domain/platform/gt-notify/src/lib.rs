@@ -19,10 +19,17 @@
 //! escalation is the durable, awaited record; the notification is a best-effort heads-up on
 //! top of it.
 
+/// The outbound-email transport seam (hq-f24599): [`email::EmailTransport`] +
+/// the log/smtp implementations + env selection. Producers enqueue to the
+/// `email_outbox`; only the drain daemon touches a transport.
+pub mod email;
 mod fake;
 mod notification;
 mod route;
 
+pub use email::{
+    transport_from_env, EmailMessage, EmailTransport, LogTransport, SmtpConfig, SmtpTransport,
+};
 pub use fake::FakeNotifier;
 pub use notification::{Notification, Severity, Signal};
 pub use route::{route, Channel};

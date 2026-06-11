@@ -44,7 +44,7 @@ use gt_composition::denial_audit::audit_denials;
 use gt_composition::hooks::{hooks_router, HooksApiState};
 use gt_composition::notifications::{notifications_router, NotificationsApiState};
 use gt_composition::mcp::{
-    AgentHandler, AuditHandler, CommentsHandler, ConvoyHandler, DocumentsHandler, EventLog, EventLogHooks,
+    AgentHandler, AuditHandler, CommentsHandler, ConvoyHandler, DocumentsHandler, EmailHandler, EventLog, EventLogHooks,
     EventLogIssueSink, GraphHandler, IdentityDoltMeStats, MemoryHandler, MergeHandler, NotifyHandler,
     PgDocumentsResource, PgRigPrefixes, PgWorkspaceStatus, QuotaBlockGuard, QuotaHandler, RigHandler,
     WorkspaceHandler, WsPools,
@@ -831,6 +831,36 @@ async fn main() -> anyhow::Result<()> {
         }
     };
 
+    // Email-outbox drain daemon (hq-f24599): claims due email_outbox rows
+    // (pending|retry, send_at <= now) and delivers them through the configured
+    // EmailTransport (GT_EMAIL_TRANSPORT: log default; smtp once the server
+    // exists). Gated like the other daemons (singleton master switch) + on
+    // GT_PG_URL; tick via GT_EMAIL_DRAIN_TICK_SECS (default 30, 0 = off).
+    let email_tick = env_u64("GT_EMAIL_DRAIN_TICK_SECS", 30);
+    match (run_daemons && email_tick > 0)
+        .then_some(())
+        .and(std::env::var("GT_PG_URL").ok())
+    {
+        Some(pg_url) => match sqlx::PgPool::connect(&pg_url).await {
+            Ok(outbox_pool) => {
+                let transport = gt_notify::transport_from_env();
+                eprintln!(
+                    "[gt-mcp-server] email-outbox drain on (every {email_tick}s; transport {})",
+                    transport.label()
+                );
+                tokio::spawn(gt_composition::email_outbox_drain::run(
+                    std::time::Duration::from_secs(email_tick),
+                    outbox_pool,
+                    transport,
+                ));
+            }
+            Err(e) => eprintln!("[gt-mcp-server] email-outbox drain off (PG connect failed: {e})"),
+        },
+        None => eprintln!(
+            "[gt-mcp-server] email-outbox drain off (daemons disabled, tick=0, or GT_PG_URL unset)"
+        ),
+    }
+
     // Graph drift-reconcile daemon (hq-vcs-connections.8): the BACKSTOP for the deliveries the push
     // webhook (.7) misses (App downtime, a dropped delivery, the App reinstalled, a network blip). On
     // a low cadence it sweeps every workspace partition, and for each rig under graph custody runs a
@@ -1422,6 +1452,7 @@ async fn apply_pg_catalog(pool: &sqlx::PgPool) -> anyhow::Result<()> {
     let rig_id = ModuleId::new("rig").expect("`rig` is a valid module id");
     let docs_id = ModuleId::new("docs").expect("`docs` is a valid module id");
     let comments_id = ModuleId::new("comments").expect("`comments` is a valid module id");
+    let email_id = ModuleId::new("email").expect("`email` is a valid module id");
     let memory_id = ModuleId::new("memory").expect("`memory` is a valid module id");
     let notifications_id = ModuleId::new("notifications").expect("`notifications` is a valid module id");
     // hq-talos-migration.10: the GLOBAL `public.events` table — the Postgres-backed EventStore that
@@ -1446,6 +1477,8 @@ async fn apply_pg_catalog(pool: &sqlx::PgPool) -> anyhow::Result<()> {
     let docs_migs = gt_store_pg::docs_migrations();
     // hq-57042e: the per-workspace `comments` template table (threaded card|doc comments).
     let comments_migs = gt_store_pg::comments_migrations();
+    // hq-f24599: the public-schema email_outbox the programmed-send pipeline drains.
+    let email_migs = gt_store_pg::email_migrations();
     // hq-memory-mcp.1: the per-workspace `memories` template table (semantic agent memory).
     // Like `documents`, it seeds the `ws_default` template so it is cloned per tenant.
     let memory_migs = gt_store_pg::memory_migrations();
@@ -1476,6 +1509,7 @@ async fn apply_pg_catalog(pool: &sqlx::PgPool) -> anyhow::Result<()> {
         .chain(rig_migs.iter().map(|m| (&rig_id, m)))
         .chain(docs_migs.iter().map(|m| (&docs_id, m)))
         .chain(comments_migs.iter().map(|m| (&comments_id, m)))
+        .chain(email_migs.iter().map(|m| (&email_id, m)))
         .chain(memory_migs.iter().map(|m| (&memory_id, m)))
         .chain(notifications_migs.iter().map(|m| (&notifications_id, m)))
         .chain(events_migs.iter().map(|m| (&events_id, m)))
@@ -1798,6 +1832,10 @@ async fn build_domain_router(
         // notify.* — operator notification channel (hq-notifications): agents write
         // via notify.send; the browser bell polls/streams the same PG table.
         .register(Arc::new(NotifyHandler::new(pool.clone(), event_log.clone())))
+        // email.* — the programmed-send outbox (hq-f24599): schedule/list/cancel;
+        // the drain daemon (spawned in main, gated like the other daemons) delivers
+        // through the gt-notify EmailTransport seam.
+        .register(Arc::new(EmailHandler::new(pool.clone())))
         // graph.* read-only queries (hq-graphrig.10) + server-side refresh (hq-vcs-connections.4):
         // graphify-backed indexer; the warden state (replayed from event_log) resolves rig ->
         // repo_dir, and the provisioner clones/fetches from the rig's VCS connection on refresh.
