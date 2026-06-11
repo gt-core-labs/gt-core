@@ -37,6 +37,9 @@ pub struct DayPoint {
     pub closed: i64,
     /// Open scope remaining at end of day (burndown line).
     pub remaining: i64,
+    /// Estimated hours remaining at end of day (hours burndown; unestimated
+    /// cards weigh 0).
+    pub remaining_hours: f64,
 }
 
 /// AVANCE — progress.
@@ -95,6 +98,34 @@ pub struct Pendientes {
     pub by_module: Vec<Slice>,
 }
 
+/// HORAS — the planning estimates (`estimated_hours`, mockup "Horas Est.",
+/// hq-62130a). Sums over the same task rows the other KPIs read; cards without
+/// an estimate contribute 0 and are surfaced via `sin_estimar`.
+#[derive(Debug, Clone, Serialize)]
+pub struct Horas {
+    /// Sum of `estimated_hours` over every task in scope.
+    pub estimadas: f64,
+    /// Sum over `status = closed` tasks (work delivered, in plan hours).
+    pub completadas: f64,
+    /// Sum over open + working tasks (plan hours still outstanding).
+    pub pendientes: f64,
+    /// Tasks with no estimate — the planning-coverage gap.
+    pub sin_estimar: i64,
+    /// Per-module hours (key = module epic id, `""` = sin módulo).
+    pub by_module: Vec<ModuleHours>,
+}
+
+/// One module's estimated/completed hours.
+#[derive(Debug, Clone, Serialize)]
+pub struct ModuleHours {
+    /// The module epic id (`""` = sin módulo).
+    pub module: String,
+    /// Sum of `estimated_hours` over the module's tasks.
+    pub estimadas: f64,
+    /// Sum over the module's closed tasks.
+    pub completadas: f64,
+}
+
 /// RETRASOS — overdue + at-risk.
 #[derive(Debug, Clone, Serialize)]
 pub struct Retrasos {
@@ -123,6 +154,7 @@ pub struct AnalyticsSummary {
     pub errores: Errores,
     pub pendientes: Pendientes,
     pub retrasos: Retrasos,
+    pub horas: Horas,
     /// Work distribution by status (whole scope).
     pub by_status: Vec<Slice>,
     /// Created-vs-resolved + burndown, last `days` days, oldest first.
@@ -275,6 +307,38 @@ pub fn summarize(
         overdue_ids: overdue.into_iter().take(50).map(|(_, id)| id).collect(),
     };
 
+    // HORAS
+    let mut estimadas = 0.0f64;
+    let mut completadas = 0.0f64;
+    let mut h_pendientes = 0.0f64;
+    let mut sin_estimar = 0i64;
+    let mut h_module: BTreeMap<String, (f64, f64)> = BTreeMap::new(); // (estimadas, completadas)
+    for t in &tasks {
+        let Some(h) = t.estimated_hours else {
+            sin_estimar += 1;
+            continue;
+        };
+        estimadas += h;
+        let e = h_module.entry(t.external_ref.clone().unwrap_or_default()).or_default();
+        e.0 += h;
+        if t.status == "closed" {
+            completadas += h;
+            e.1 += h;
+        } else {
+            h_pendientes += h;
+        }
+    }
+    let horas = Horas {
+        estimadas,
+        completadas,
+        pendientes: h_pendientes,
+        sin_estimar,
+        by_module: h_module
+            .into_iter()
+            .map(|(module, (estimadas, completadas))| ModuleHours { module, estimadas, completadas })
+            .collect(),
+    };
+
     // Distribution by status (whole scope).
     let mut by_status: BTreeMap<String, i64> = BTreeMap::new();
     for t in &tasks {
@@ -286,31 +350,49 @@ pub fn summarize(
     let start = today_days - series_days + 1;
     let mut created_by_day: BTreeMap<i64, i64> = BTreeMap::new();
     let mut closed_by_day: BTreeMap<i64, i64> = BTreeMap::new();
+    let mut created_h_by_day: BTreeMap<i64, f64> = BTreeMap::new();
+    let mut closed_h_by_day: BTreeMap<i64, f64> = BTreeMap::new();
     let mut created_before = 0i64;
     let mut closed_before = 0i64;
+    let mut created_h_before = 0.0f64;
+    let mut closed_h_before = 0.0f64;
     for t in &tasks {
+        let h = t.estimated_hours.unwrap_or(0.0);
         if let Some(c) = day_of(&t.created_at).and_then(|d| epoch_days(&d)) {
             if c < start {
                 created_before += 1;
+                created_h_before += h;
             } else if c <= today_days {
                 *created_by_day.entry(c).or_default() += 1;
+                *created_h_by_day.entry(c).or_default() += h;
             }
         }
         if let Some(c) = day_of(&t.closed_at).and_then(|d| epoch_days(&d)) {
             if c < start {
                 closed_before += 1;
+                closed_h_before += h;
             } else if c <= today_days {
                 *closed_by_day.entry(c).or_default() += 1;
+                *closed_h_by_day.entry(c).or_default() += h;
             }
         }
     }
     let mut remaining = created_before - closed_before;
+    let mut remaining_hours = created_h_before - closed_h_before;
     let mut series = Vec::with_capacity(series_days.max(0) as usize);
     for day in start..=today_days {
         let created = created_by_day.get(&day).copied().unwrap_or(0);
         let closed = closed_by_day.get(&day).copied().unwrap_or(0);
         remaining += created - closed;
-        series.push(DayPoint { date: date_of_epoch_days(day), created, closed, remaining });
+        remaining_hours +=
+            created_h_by_day.get(&day).copied().unwrap_or(0.0) - closed_h_by_day.get(&day).copied().unwrap_or(0.0);
+        series.push(DayPoint {
+            date: date_of_epoch_days(day),
+            created,
+            closed,
+            remaining,
+            remaining_hours,
+        });
     }
 
     AnalyticsSummary {
@@ -321,6 +403,7 @@ pub fn summarize(
         errores,
         pendientes,
         retrasos,
+        horas,
         by_status: slices(by_status),
         series,
     }
@@ -340,6 +423,7 @@ mod tests {
         created: &str,
         closed: Option<&str>,
         due: Option<&str>,
+        hours: Option<f64>,
     ) -> IssueRow {
         let mut v: IssueRow = serde_json::from_value(serde_json::json!({
             "id": id, "title": id, "status": status, "priority": prio,
@@ -351,16 +435,17 @@ mod tests {
         }))
         .expect("row");
         v.due_date = due.map(str::to_string);
+        v.estimated_hours = hours;
         v
     }
 
     fn sample() -> Vec<IssueRow> {
         vec![
-            row("hq-mod", "epic", "open", 1, None, None, "2026-06-01", None, None),
-            row("hq-1", "task", "closed", 0, Some("hq-mod"), Some("ana"), "2026-06-01", Some("2026-06-05"), None),
-            row("hq-2", "task", "working", 1, Some("hq-mod"), Some("ana"), "2026-06-02", None, Some("2026-06-01")),
-            row("hq-3", "bug", "open", 0, Some("hq-mod"), Some("bob"), "2026-06-08", None, Some("2026-06-12")),
-            row("hq-4", "task", "open", 2, None, None, "2026-06-09", None, Some("2026-07-30")),
+            row("hq-mod", "epic", "open", 1, None, None, "2026-06-01", None, None, None),
+            row("hq-1", "task", "closed", 0, Some("hq-mod"), Some("ana"), "2026-06-01", Some("2026-06-05"), None, Some(5.0)),
+            row("hq-2", "task", "working", 1, Some("hq-mod"), Some("ana"), "2026-06-02", None, Some("2026-06-01"), Some(3.0)),
+            row("hq-3", "bug", "open", 0, Some("hq-mod"), Some("bob"), "2026-06-08", None, Some("2026-06-12"), None),
+            row("hq-4", "task", "open", 2, None, None, "2026-06-09", None, Some("2026-07-30"), Some(2.0)),
         ]
     }
 
@@ -380,6 +465,19 @@ mod tests {
         assert_eq!((s.retrasos.overdue, s.retrasos.at_risk), (1, 1));
         assert_eq!(s.retrasos.overdue_ids, vec!["hq-2".to_string()]);
         assert_eq!(s.retrasos.days_late, vec![Slice { key: "8-30".into(), count: 1 }]);
+        // HORAS: 5 (closed) + 3 (working) + 2 (open) estimated; hq-3 unestimated.
+        assert!((s.horas.estimadas - 10.0).abs() < 1e-9);
+        assert!((s.horas.completadas - 5.0).abs() < 1e-9);
+        assert!((s.horas.pendientes - 5.0).abs() < 1e-9);
+        assert_eq!(s.horas.sin_estimar, 1);
+        // by_module: hq-mod has 8h estimated / 5h completed; "" has 2h / 0h.
+        let m: Vec<(&str, f64, f64)> = s
+            .horas
+            .by_module
+            .iter()
+            .map(|m| (m.module.as_str(), m.estimadas, m.completadas))
+            .collect();
+        assert_eq!(m, vec![("", 2.0, 0.0), ("hq-mod", 8.0, 5.0)]);
     }
 
     #[test]
@@ -387,19 +485,25 @@ mod tests {
         let s = summarize("hq", "default", &sample(), 0, "2026-06-10", 3, 10);
         assert_eq!(s.series.len(), 10);
         assert_eq!(s.series.first().unwrap().date, "2026-06-01");
-        // 06-01: hq-1 created (the epic is excluded) → remaining 1.
-        assert_eq!(s.series[0], DayPoint { date: "2026-06-01".into(), created: 1, closed: 0, remaining: 1 });
-        // 06-05: hq-1 closes → remaining drops back to 1 (hq-2 arrived 06-02).
+        // 06-01: hq-1 created (the epic is excluded) → remaining 1 (5h).
+        assert_eq!(
+            s.series[0],
+            DayPoint { date: "2026-06-01".into(), created: 1, closed: 0, remaining: 1, remaining_hours: 5.0 }
+        );
+        // 06-05: hq-1 closes → remaining drops back to 1 (hq-2 arrived 06-02),
+        // hours drop to hq-2's 3h.
         let d5 = &s.series[4];
         assert_eq!((d5.closed, d5.remaining), (1, 1));
-        // End of window: 4 created, 1 closed → 3 remaining.
+        assert!((d5.remaining_hours - 3.0).abs() < 1e-9);
+        // End of window: 4 created, 1 closed → 3 remaining (3h + 0h + 2h).
         assert_eq!(s.series.last().unwrap().remaining, 3);
+        assert!((s.series.last().unwrap().remaining_hours - 5.0).abs() < 1e-9);
     }
 
     #[test]
     fn closed_rows_with_due_dates_never_count_as_overdue() {
         let rows = vec![row(
-            "hq-x", "task", "closed", 1, None, None, "2026-06-01", Some("2026-06-02"), Some("2026-05-01"),
+            "hq-x", "task", "closed", 1, None, None, "2026-06-01", Some("2026-06-02"), Some("2026-05-01"), None,
         )];
         let s = summarize("hq", "default", &rows, 0, "2026-06-10", 7, 7);
         assert_eq!(s.retrasos.overdue, 0);

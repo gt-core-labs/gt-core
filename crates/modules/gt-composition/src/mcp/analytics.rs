@@ -83,8 +83,10 @@ impl DomainHandler for AnalyticsHandler {
              operator KPIs — avance % (closed/total), errores (defect-type beads + \
              audit-derived reopens, by module and Nivel), pendientes (open+working, by \
              assignee/priority/module), retrasos (due_date < today and not closed, with \
-             a configurable at-risk window) — plus burndown / created-vs-resolved \
-             series and the status distribution. Same projection board.list and \
+             a configurable at-risk window) — plus horas (estimated-hours totals: \
+             estimadas/completadas/pendientes, sin_estimar coverage gap, by module), \
+             burndown / created-vs-resolved series (cards and remaining hours) and \
+             the status distribution. Same projection board.list and \
              report.generate read, so the numbers reconcile. Read-only.",
             &[
                 req("rig", "string"),
