@@ -341,7 +341,9 @@ moves), so it is unaffected; this caveat is specific to interactive sessions and
 4. Apply the remaining **gap seeds** (§4) — onboard ≥1 **quota Claude account** (§4.4 — `scripts/onboard-quota-account.sh`, one human OAuth step per account) and (re)start the `orchd` daemon to hydrate the keychain, and complete the GitHub-App manual steps (§4.2) if the deploy uses one (also re-binds any rig's `git_connection_ref` for private-repo clones, §4.3).
 5. Verify (§6).
 
-The detailed step-by-step runbook (with the exact apply commands per orchestrator) is **hq-greenfield-seeds.6**.
+The detailed step-by-step runbook (with the exact apply commands per orchestrator, for both
+docker compose and Talos/k8s) is **[`greenfield-bringup.md`](./greenfield-bringup.md)**
+(hq-greenfield-seeds.6).
 
 ---
 
