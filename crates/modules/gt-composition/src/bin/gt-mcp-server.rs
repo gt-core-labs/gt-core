@@ -42,6 +42,7 @@ use gt_claude_hooks::HooksStore;
 use gt_composition::auth::{authenticate, AuthState, PatVerifier, SharedAuthenticator};
 use gt_composition::denial_audit::audit_denials;
 use gt_composition::hooks::{hooks_router, HooksApiState};
+use gt_composition::kanban_rest::{kanban_rest_router, KanbanRestState};
 use gt_composition::notifications::{notifications_router, NotificationsApiState};
 use gt_composition::mcp::{
     AgentHandler, AuditHandler, CommentsHandler, ConvoyHandler, DocumentsHandler, EmailHandler, EventLog, EventLogHooks,
@@ -424,7 +425,12 @@ async fn main() -> anyhow::Result<()> {
             }
         }
     }
-    service = service.with_domains(Arc::new(domains));
+    let domains = Arc::new(domains);
+    // Kanban bridge REST (hq-95c2bb): comments/report/invites over cookie-auth
+    // HTTP, dispatching through this same router — clone the Arc before it
+    // moves into the MCP service.
+    let kanban_domains = domains.clone();
+    service = service.with_domains(domains);
     // Wire issues.create rig-prefix routing (hq-mt-rigs.6) when the PG rig catalog
     // is present; without it the server accepts any bead-id prefix as before.
     if let Some(prefixes) = rig_prefixes {
@@ -687,6 +693,20 @@ async fn main() -> anyhow::Result<()> {
         }
     };
 
+    // Kanban bridge REST (hq-95c2bb): comments + report + invites for the web
+    // Kanban, dispatched through the SAME domain router as MCP (zero logic
+    // forks). Gated on the RS256 verifier (cookie/bearer auth like notifications).
+    let kanban = verifier.as_ref().map(|v| {
+        eprintln!(
+            "[gt-mcp-server] kanban bridge REST on /api/v1/{{comments,report,invites}} (domain-router dispatch)"
+        );
+        kanban_rest_router(KanbanRestState::new(
+            v.clone(),
+            audit.clone(),
+            kanban_domains.clone(),
+        ))
+    });
+
     // Per-workspace pool cache for the archive interceptor (hq-docs-archive-sync): when the sweep
     // archives an epic, its `documents`/embeddings are soft-deleted so it drops out of
     // `documents.search`. Built from GT_PG_URL — `None` when unset (no docs store, nothing to clean).
@@ -945,6 +965,9 @@ async fn main() -> anyhow::Result<()> {
     }
     if let Some(notifications) = notifications {
         app = app.merge(notifications);
+    }
+    if let Some(kanban) = kanban {
+        app = app.merge(kanban);
     }
     if let Some(system) = system {
         app = app.merge(system);
