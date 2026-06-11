@@ -1,0 +1,157 @@
+# greenfield-smoke.compose.yml — ISOLATED smoke stack for hq-greenfield-seeds.7.
+#
+# A self-contained, prod-disjoint compose file that stands up a CLEAN gt-core stack
+# from EMPTY volumes to validate "functional from zero" (the boot auto-seeds of
+# hq-greenfield-seeds.2–.5). It is driven by scripts/greenfield-smoke.sh, which sets
+# COMPOSE_PROJECT_NAME=gtgf-smoke (namespacing every volume/network away from prod's
+# `gt-app` project) and passes the alternate host ports via the env vars below.
+#
+# It deliberately does NOT reuse gt-app-proxy/docker-compose.yml: that file mounts the
+# proxy/Traefik, watchtower, gt-web/gt-docs and the rig repos — none of which the §6
+# smoke needs, and several of which would collide with prod (proxy ports 80/443, the
+# shared proyectos-bi-quare network, watchtower's docker.sock). This trimmed copy keeps
+# ONLY the four stores + the API, on a private bridge network, on high alt ports.
+#
+# Parity with prod (gt-app-proxy/docker-compose.yml + compose.embeddings.yml) for the
+# bits that matter to the seed path: same pgvector/dolt/minio images, same env contract
+# (GT_PG_URL/GT_DOLT_URL/GT_BLOB_*/GT_EVENTLOG_ROOT/GT_ADMIN_*/oauth feature vars), and
+# the SAME locally-built :embeddings image (oauth feature ⇒ provider seed runs).
+#
+# Safety: distinct project name + distinct volume names (gtgf-*) + a private network.
+# `docker compose -p gtgf-smoke down -v` removes ONLY this project's resources.
+
+services:
+  smoke-postgres:
+    image: pgvector/pgvector:pg16
+    restart: "no"
+    environment:
+      POSTGRES_USER: gtapp
+      POSTGRES_PASSWORD: gtapp
+      POSTGRES_DB: gtapp
+    volumes:
+      - gtgf-pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U gtapp -d gtapp"]
+      interval: 3s
+      timeout: 3s
+      retries: 30
+    networks: [gtgf]
+
+  smoke-dolt:
+    image: dolthub/dolt-sql-server:latest
+    restart: "no"
+    entrypoint: ["sh", "-c"]
+    command:
+      - |
+        cd /var/lib/dolt
+        dolt sql -q "CREATE USER IF NOT EXISTS 'gtapp'@'%'; GRANT ALL PRIVILEGES ON *.* TO 'gtapp'@'%' WITH GRANT OPTION;"
+        exec dolt sql-server --host=0.0.0.0 --port=3307
+    volumes:
+      - gtgf-dolt:/var/lib/dolt
+    networks: [gtgf]
+
+  smoke-minio:
+    image: minio/minio:latest
+    restart: "no"
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: gtapp
+      MINIO_ROOT_PASSWORD: gtappsecret
+    volumes:
+      - gtgf-minio:/data
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    networks: [gtgf]
+
+  smoke-minio-init:
+    image: minio/mc:latest
+    restart: "no"
+    depends_on:
+      smoke-minio:
+        condition: service_healthy
+    entrypoint:
+      - sh
+      - -c
+      - |
+        until mc alias set local http://smoke-minio:9000 gtapp gtappsecret >/dev/null 2>&1; do
+          echo "waiting for minio..."; sleep 2;
+        done
+        mc mb --ignore-existing local/gt-documents
+        echo "bucket ready: gt-documents"
+    networks: [gtgf]
+
+  smoke-mcp-server:
+    # The SAME locally-built image prod runs (oauth + embeddings feature). pull_policy:never
+    # so a missing-tag never silently falls back to a hub pull of a different build.
+    image: codecsrayo/gt-core-mcp-server:embeddings
+    pull_policy: never
+    restart: "no"
+    depends_on:
+      smoke-postgres:
+        condition: service_healthy
+      smoke-dolt:
+        condition: service_started
+      smoke-minio:
+        condition: service_healthy
+    environment:
+      GT_MCP_HTTP_BIND: 0.0.0.0:8765
+      GT_DOLT_URL: mysql://gtapp@smoke-dolt:3307/hq
+      # Single-tenant for the smoke (no GT_DOLT_BASE_URL): the §6 checks all target the
+      # default workspace, so per-tenant Dolt routing is unnecessary surface.
+      GT_BLOB_ENDPOINT: http://smoke-minio:9000
+      GT_BLOB_BUCKET: gt-documents
+      GT_BLOB_REGION: us-east-1
+      GT_BLOB_ACCESS_KEY: gtapp
+      GT_BLOB_SECRET_KEY: gtappsecret
+      GT_PG_AUDIT_URL: postgres://gtapp:gtapp@smoke-postgres:5432/gtapp
+      GT_PG_URL: postgres://gtapp:gtapp@smoke-postgres:5432/gtapp
+      GT_EVENTLOG_ROOT: /var/lib/gt-core
+      GT_MCP_ACTOR: mcp-local
+      GT_SELF_URL: http://127.0.0.1:8765
+      GT_MCP_SCOPE_PROFILE: dev
+      GT_MCP_ALLOWED_HOSTS: localhost,127.0.0.1
+      # --- oauth-feature boot-fatal vars (the :embeddings image is built WITH oauth) ---
+      # GT_OIDC_REDIRECT_URI: db_oauth_resolver .expect()s this or the binary panics at boot.
+      GT_OIDC_REDIRECT_URI: http://localhost/auth/callback
+      # GT_SECRET_KEY: AES-256-GCM master key; without it seed_oauth_providers is skipped.
+      GT_SECRET_KEY: ${GT_SMOKE_SECRET_KEY:?set by greenfield-smoke.sh}
+      # The cleartext OAuth client secret for the seeded `google` provider. Supplied so the
+      # provider SEEDS (§4.2); we then flip enabled=true at runtime via /admin/providers so
+      # check 4 (>=1 IdP on the public /auth/providers) passes from zero.
+      GT_OAUTH_SEED_SECRET_GOOGLE: smoke-google-client-secret-not-real
+      # --- RS256 login signing (read-only reuse of prod's keys, mounted ro) ---
+      GT_JWT_RS256_PRIVATE_KEY_FILE: /run/secrets/jwt_private.pem
+      GT_JWT_RS256_SIGNING_KID: gt-main
+      GT_JWT_RS256_KEYS: gt-main=/run/secrets/jwt_public.pem
+      GT_AUTH_ACCESS_TTL_SECS: "900"
+      GT_AUTH_REFRESH_TTL_SECS: "2592000"
+      # --- admin seed (both required or seed_admin self-skips) ---
+      GT_ADMIN_EMAIL: ${GT_SMOKE_ADMIN_EMAIL:-admin@gt.local}
+      GT_ADMIN_PASSWORD: ${GT_SMOKE_ADMIN_PASSWORD:?set by greenfield-smoke.sh}
+      # No daemons in the API tier for the smoke (the quota account onboard + rotation
+      # daemon is the one cost-gated step exercised separately / documented, not here).
+      GT_RUN_DAEMONS: "0"
+      RUST_LOG: info
+    volumes:
+      - gtgf-eventlog:/var/lib/gt-core
+      # Read-only reuse of prod's RS256 keypair (never modified).
+      - /home/nixos/gt-app-proxy/secrets/jwt_private.pem:/run/secrets/jwt_private.pem:ro
+      - /home/nixos/gt-app-proxy/secrets/jwt_public.pem:/run/secrets/jwt_public.pem:ro
+    ports:
+      # Loopback-only publish on the alt port the harness picks (default 18765).
+      - "127.0.0.1:${GT_SMOKE_MCP_PORT:-18765}:8765"
+    networks: [gtgf]
+
+volumes:
+  gtgf-pgdata:
+  gtgf-dolt:
+  gtgf-minio:
+  gtgf-eventlog:
+
+networks:
+  gtgf:
+    # Private bridge; namespaced under the gtgf-smoke project, never the shared proxy net.
+    driver: bridge
