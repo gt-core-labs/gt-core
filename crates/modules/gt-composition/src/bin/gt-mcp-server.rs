@@ -45,7 +45,7 @@ use gt_composition::hooks::{hooks_router, HooksApiState};
 use gt_composition::kanban_rest::{kanban_rest_router, KanbanRestState};
 use gt_composition::notifications::{notifications_router, NotificationsApiState};
 use gt_composition::mcp::{
-    AgentHandler, AuditHandler, CommentsHandler, ConvoyHandler, DocumentsHandler, EmailHandler, EventLog, EventLogHooks,
+    AgentHandler, AnalyticsHandler, AuditHandler, CommentsHandler, ConvoyHandler, DocumentsHandler, EmailHandler, EventLog, EventLogHooks,
     EventLogIssueSink, GraphHandler, IdentityDoltMeStats, InvitesHandler, MemoryHandler, MergeHandler, NotifyHandler, ReportHandler,
     PgDocumentsResource, PgRigPrefixes, PgWorkspaceStatus, QuotaBlockGuard, QuotaHandler, RigHandler,
     WorkspaceHandler, WsPools,
@@ -359,7 +359,7 @@ async fn main() -> anyhow::Result<()> {
     // `with_issue_sink` (hq-issues-sse): an `issues.*.execute` over MCP — the agent-driven
     // movement the REST surface alone would miss — publishes its event into the same per-workspace
     // log the SSE feed fans out, so the tracker moves on `GET /stream?channel=issues`.
-    let mut service = IssuesServer::new(store, default_scope, rbac, audit.clone(), tools, repo_dir)
+    let mut service = IssuesServer::new(store.clone(), default_scope, rbac, audit.clone(), tools, repo_dir)
         .with_issue_sink(issue_sink.clone())
         // Claim-context custodian's quota signal (hq-context-custodian.2): a `working`
         // transition with no context is deferred (debt note) instead of stop-the-line ONLY
@@ -377,6 +377,13 @@ async fn main() -> anyhow::Result<()> {
     // Registered unconditionally — it reads the in-memory or Postgres sink, so it
     // works even when GT_PG_URL is unset and the rest of the router is empty.
     let domains = domains.register(Arc::new(AuditHandler::new(audit.clone())));
+    // analytics.summary (hq-1cd840): the Kanban dashboard KPIs over the same
+    // tracker rows board.list reads; reopens derive from this audit sink.
+    let domains = domains.register(Arc::new(AnalyticsHandler::new(
+        store.clone(),
+        issues_workspaces.clone(),
+        audit.clone(),
+    )));
     eprintln!("[gt-mcp-server] audit.tail dispatch on (per-workspace audit trail)");
     // The full served tools/list for meta.help (hq-fe-api-mount.2): issues+meta descriptors
     // plus every domain handler's, the same set `with_domains` folds into the MCP `tools/list`

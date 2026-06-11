@@ -73,6 +73,7 @@ pub fn kanban_rest_router(state: KanbanRestState) -> Router {
             axum::routing::patch(comments_update).delete(comments_delete),
         )
         .route("/api/v1/report/generate", post(report_generate))
+        .route("/api/v1/analytics/summary", get(analytics_summary))
         .route("/api/v1/invites", get(invites_list).post(invites_create))
         .route("/api/v1/invites/:id", delete(invites_revoke))
         .route("/api/v1/invites/accept", post(invites_accept))
@@ -209,6 +210,20 @@ async fn report_generate(
         Err(r) => return r,
     };
     dispatch(&st, &claims, "report.generate", body).await
+}
+
+/// `GET /api/v1/analytics/summary?rig&workspace[&…]` — the dashboard KPIs
+/// (hq-1cd840). Read-only; `issues.read` suffices.
+async fn analytics_summary(
+    State(st): State<KanbanRestState>,
+    headers: HeaderMap,
+    Query(q): Query<Value>,
+) -> Response {
+    let claims = match authorize(&st, &headers, "issues.read", &Method::GET, "/api/v1/analytics/summary") {
+        Ok(c) => c,
+        Err(r) => return r,
+    };
+    dispatch(&st, &claims, "analytics.summary", q).await
 }
 
 // ─── invites ─────────────────────────────────────────────────────────────────

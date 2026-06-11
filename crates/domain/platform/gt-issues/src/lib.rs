@@ -32,6 +32,10 @@
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
+/// The Kanban analytics projection (hq-1cd840): the four operator KPIs
+/// (avance/errores/pendientes/retrasos) + chart series, pure over the same
+/// rows board.list reads (read-only, no new store).
+pub mod analytics;
 /// The Kanban board projection (hq-62130a, ADR hq-423a4b): lexorank ordering,
 /// the `board.{list,move,reorder}` commands + transport-free handlers, and the
 /// pure column/lane bucketer. Cards ARE beads — no second store.
@@ -86,6 +90,7 @@ pub mod stats;
 pub mod surface;
 pub mod taxonomy;
 
+pub use analytics::{summarize as analytics_summarize, AnalyticsSummary};
 pub use board::{
     project_board, rank_between, run_board_list, run_board_move, run_board_reorder, spread_ranks,
     BoardList, BoardMove, BoardReorder, BoardSnapshot,
