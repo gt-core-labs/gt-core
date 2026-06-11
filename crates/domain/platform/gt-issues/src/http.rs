@@ -201,13 +201,24 @@ impl IssuesApiState {
     /// via [`WorkspacePools::ensured_pool`], so a REST-created tenant self-heals an empty
     /// `hq_<ws>` exactly once per slug per process; single-tenant falls back to the shared
     /// `store`, ignoring the workspace exactly as the pre-routing behaviour did.
-    async fn resolve(&self, ctx: &WorkspaceContext) -> Result<Arc<DoltIssues>, AppError> {
+    pub(crate) async fn resolve(&self, ctx: &WorkspaceContext) -> Result<Arc<DoltIssues>, AppError> {
         match &self.workspaces {
             Some(pools) => Ok(Arc::new(DoltIssues::new(
                 pools.ensured_pool(ctx.workspace().as_str()).await?,
             ))),
             None => Ok(self.store.clone()),
         }
+    }
+
+    /// The wired SSE event sink, if any — shared with the board REST adapter
+    /// (hq-62130a) so board mutations emit the same feed events as issues ones.
+    pub(crate) fn sink(&self) -> Option<&dyn IssueEventSink> {
+        self.event_sink.as_deref()
+    }
+
+    /// The server attribution actor — shared with the board REST adapter.
+    pub(crate) fn actor_str(&self) -> &str {
+        self.actor.as_ref()
     }
 }
 
@@ -271,6 +282,8 @@ struct ListQuery {
     ready: bool,
     /// Narrow to a single rig (hq-rig-isolation.1). Absent ⇒ workspace-wide (back-compat).
     rig: Option<String>,
+    /// Narrow to one board workspace (hq-62130a). Absent ⇒ all workspaces.
+    workspace: Option<String>,
 }
 
 impl ListQuery {
@@ -297,6 +310,7 @@ impl ListQuery {
             full: self.full,
             ready: self.ready,
             rig: self.rig,
+            workspace: self.workspace,
         }
     }
 }
@@ -441,6 +455,7 @@ async fn issue_stats(
         full: false,
         ready: false,
         rig: None,
+        workspace: None,
     };
     let rows = read_issues(&store, &filter).await?;
     Ok(Json(aggregate(&rows, &dims)))
@@ -737,7 +752,7 @@ fn with_path_id<T: serde::de::DeserializeOwned>(
 /// HTTP wrapper over the domain [`AppError`] so a handler can `?`-propagate it and have it
 /// rendered with the right status. The body is the bare error message — the same text the MCP
 /// path surfaces — so a client sees an identical reason across transports.
-struct ApiError(AppError);
+pub(crate) struct ApiError(pub(crate) AppError);
 
 impl From<AppError> for ApiError {
     fn from(e: AppError) -> Self {

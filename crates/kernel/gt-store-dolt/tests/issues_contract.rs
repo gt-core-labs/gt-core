@@ -58,7 +58,12 @@ async fn seed(base: &str) -> Result<(), Box<dyn std::error::Error>> {
             version             BIGINT NOT NULL DEFAULT 0,
             phase               ENUM('P1','P2','P3','P4') NOT NULL DEFAULT 'P1',
             delivered_sha       CHAR(40),
-            rig                 VARCHAR(255) NOT NULL DEFAULT ''
+            rig                 VARCHAR(255) NOT NULL DEFAULT '',
+            workspace           VARCHAR(255) NOT NULL DEFAULT 'default',
+            board_rank          VARCHAR(255) NOT NULL DEFAULT '',
+            estimated_hours     DECIMAL(8,2),
+            start_date          DATE,
+            due_date            DATE
         )",
     )
     .await?;

@@ -67,7 +67,7 @@ use sqlx::Row;
 // crate's `register_routes` so the FE reaches every namespace over authenticated HTTP.
 use gt_composition::system::{load_config, system_router, ArchiveDaemon, SystemApiState};
 use gt_eventlog::DEFAULT_EVENTLOG_ROOT;
-use gt_issues::{IssuesApiState, IssuesModule, MeApiState, MeModule};
+use gt_issues::{BoardModule, IssuesApiState, IssuesModule, MeApiState, MeModule};
 use gt_mcp_server::{
     health, DocumentsResource, DomainRouter, HealthState, IssuesServer, PatAuthenticator,
     PgAuditSink, WorkspaceRigPrefixes, WorkspaceStatusGate, WorkspaceStores,
@@ -280,7 +280,11 @@ async fn main() -> anyhow::Result<()> {
         );
     }
     let root = RootBuilder::new()
-        .module(IssuesModule::with_http(issues_api))
+        .module(IssuesModule::with_http(issues_api.clone()))
+        // hq-62130a: the Kanban board projection — board.* MCP tools + the
+        // /api/v1/board REST surface, sharing the issues API state (same store
+        // resolution, actor, and SSE event sink).
+        .module(BoardModule::with_http(issues_api))
         .module(MetaModule)
         .build()
         .map_err(|e| anyhow::anyhow!("module build failed: {e:?}"))?;

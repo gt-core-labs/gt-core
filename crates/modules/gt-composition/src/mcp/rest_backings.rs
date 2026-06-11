@@ -589,6 +589,7 @@ impl MeStatsSource for IdentityDoltMeStats {
             full: false,
             ready: false,
             rig: None,
+            workspace: None,
         };
         store.list(&filter).await
     }

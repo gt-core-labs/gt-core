@@ -642,14 +642,15 @@ impl ServerHandler for IssuesServer {
         gt_telemetry::metrics::observe_workspace_request(workspace_or_default(&workspace));
 
         // Route by namespace (the segment before the first dot): meta.* self-
-        // description, issues.* the tracker dispatch, everything else the domain
-        // router (hq-mcp-dispatch). An unowned namespace is an unknown tool.
+        // description, issues.*/board.* the tracker dispatch (the board is a
+        // projection over the same Dolt store, hq-62130a), everything else the
+        // domain router (hq-mcp-dispatch). An unowned namespace is an unknown tool.
         let result = async {
             match tool.split('.').next().unwrap_or("") {
                 "meta" => {
                     dispatch_meta(&store, &tool, args.clone(), &scope.actor, &self.tools).await
                 }
-                "issues" => {
+                "issues" | "board" => {
                     let repo_dir = self.repo_dir.as_deref().map(|p| p.as_path());
                     // hq-rig-isolation.7: request-level rig from X-Rig header; used as
                     // fallback in dispatch when the agent didn't pass rig in the args.

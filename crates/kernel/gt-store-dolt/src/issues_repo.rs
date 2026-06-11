@@ -133,6 +133,10 @@ pub struct IssueFilter {
     pub ready: bool,
     /// Narrow to a single rig (hq-rig-isolation.1). `None` = workspace-wide (back-compat).
     pub rig: Option<String>,
+    /// Narrow to one board workspace (hq-62130a). The board projection always
+    /// sets BOTH this and [`rig`](IssueFilter::rig) — the (rig, workspace) scope
+    /// key (ADR D4). `None` = no workspace filter (back-compat for plain lists).
+    pub workspace: Option<String>,
 }
 
 /// Snapshot row returned by [`DoltIssues::list`]. Mirrors the columns dashboards
@@ -190,6 +194,26 @@ pub struct IssueRow {
     /// prefix at create time and persisted for efficient filter-by-rig queries.
     #[serde(default)]
     pub rig: String,
+    /// The workspace half of the board scope key (hq-62130a, ADR D3/D4). Every
+    /// card belongs to BOTH a rig and a workspace; legacy rows backfill to
+    /// `'default'`.
+    #[serde(default = "default_workspace")]
+    pub workspace: String,
+    /// Lexorank ordering token WITHIN a (rig, workspace, status) column
+    /// (hq-62130a). `''` (the default) sorts after every ranked card — new cards
+    /// append until a move/reorder assigns a rank.
+    #[serde(default)]
+    pub board_rank: String,
+    /// Planning estimate (mockup "Horas Est."), `None` until planned.
+    #[serde(default)]
+    pub estimated_hours: Option<f64>,
+    /// Planned start date `YYYY-MM-DD` (mockup "Fecha Inicio").
+    #[serde(default)]
+    pub start_date: Option<String>,
+    /// Planned end date `YYYY-MM-DD` (mockup "Fecha Fin") — drives the retrasos
+    /// metric (`due_date < now AND status != closed`).
+    #[serde(default)]
+    pub due_date: Option<String>,
     /// Heavy text bodies, populated only when [`IssueFilter::full`] is set
     /// (hq-gap-issues-list-full). `None` in the cheap default snapshot and
     /// skipped from the JSON entirely, so back-compat consumers see the exact
@@ -206,6 +230,10 @@ pub struct IssueRow {
 
 fn default_json_array() -> String {
     "[]".to_string()
+}
+
+fn default_workspace() -> String {
+    "default".to_string()
 }
 
 /// One less-style page of the `gt://issues` snapshot (hq-core-mcp.13). Carries
@@ -335,6 +363,21 @@ pub struct IssueDetail {
     /// The rig this bead belongs to (hq-rig-isolation.1). See [`IssueRow::rig`].
     #[serde(default)]
     pub rig: String,
+    /// Board workspace scope (hq-62130a). See [`IssueRow::workspace`].
+    #[serde(default = "default_workspace")]
+    pub workspace: String,
+    /// Lexorank column ordering token (hq-62130a). See [`IssueRow::board_rank`].
+    #[serde(default)]
+    pub board_rank: String,
+    /// Planning estimate in hours (hq-62130a).
+    #[serde(default)]
+    pub estimated_hours: Option<f64>,
+    /// Planned start date `YYYY-MM-DD` (hq-62130a).
+    #[serde(default)]
+    pub start_date: Option<String>,
+    /// Planned end date `YYYY-MM-DD` (hq-62130a).
+    #[serde(default)]
+    pub due_date: Option<String>,
 }
 
 fn default_phase() -> String {
@@ -398,6 +441,16 @@ pub struct IssuePatch {
     /// the column untouched; `Some(_)` is a scalar overwrite the frontier
     /// validates against [`IssuePhase`] before the write.
     pub phase: Option<String>,
+    /// New planning estimate in hours (hq-62130a). Negative rejected upstream.
+    pub estimated_hours: Option<f64>,
+    /// New planned start date `YYYY-MM-DD` (hq-62130a). Empty string clears to
+    /// SQL `NULL`, mirroring the `assignee`/`external_ref` clear semantics.
+    pub start_date: Option<String>,
+    /// New planned end date `YYYY-MM-DD` (hq-62130a). Empty string clears.
+    pub due_date: Option<String>,
+    /// New board workspace (hq-62130a) — re-scopes the card to another project.
+    /// Empty rejected upstream (a card always belongs to a workspace).
+    pub workspace: Option<String>,
     /// Optimistic-concurrency guard (hq-mcp-issues.8). `None` = unguarded
     /// last-write-wins (back-compat). `Some(v)` makes the UPDATE match only when
     /// the row's current `version` equals `v`; a mismatch surfaces as
@@ -425,6 +478,10 @@ impl IssuePatch {
             && self.surface_json.is_none()
             && self.depends_on_json.is_none()
             && self.phase.is_none()
+            && self.estimated_hours.is_none()
+            && self.start_date.is_none()
+            && self.due_date.is_none()
+            && self.workspace.is_none()
     }
 }
 
@@ -477,6 +534,10 @@ pub struct NewIssue {
     /// The rig this bead belongs to (hq-rig-isolation.1). Derived from the bead id
     /// prefix by the composition layer before insert; defaults to `""`.
     pub rig: String,
+    /// The board workspace the card lands in (hq-62130a). Empty string is
+    /// normalised to `'default'` by [`DoltIssues::insert`] so every card carries
+    /// the full (rig, workspace) scope key from birth.
+    pub workspace: String,
 }
 
 /// Read-only Dolt adapter for the `issues` table. The canonical bead table is
@@ -676,6 +737,66 @@ impl DoltIssues {
             .await
             .map_err(map_err)?;
         }
+
+        // hq-62130a (ADR hq-423a4b D3) — the ONLY schema changes the Kanban board
+        // is allowed: scoping, ordering, and the planning fields. One idempotent
+        // column-add pass, mirroring the taxonomy block above.
+        //
+        // - `workspace`: scope key half — every card belongs to BOTH a rig (above)
+        //   and a workspace; board key = (rig, workspace). `NOT NULL DEFAULT
+        //   'default'` backfills existing rows to the default workspace in the
+        //   same ALTER (MySQL/Dolt fills prior rows with the column default).
+        // - `board_rank`: lexorank string ordering WITHIN a (rig, workspace,
+        //   status) column. `''` sorts last (appended); ranks are lazily assigned
+        //   on the first move/reorder, never by this migration.
+        // - `estimated_hours`/`start_date`/`due_date`: the planning fields backing
+        //   the operator mockup (Horas Est. / Fecha Inicio / Fecha Fin) and the
+        //   retrasos metric (`due_date < now AND status != closed`).
+        let board_columns: &[(&str, &str)] = &[
+            ("workspace", "VARCHAR(255) NOT NULL DEFAULT 'default'"),
+            ("board_rank", "VARCHAR(255) NOT NULL DEFAULT ''"),
+            ("estimated_hours", "DECIMAL(8,2) NULL"),
+            ("start_date", "DATE NULL"),
+            ("due_date", "DATE NULL"),
+        ];
+        let mut board_added = false;
+        for (name, ddl) in board_columns {
+            let exists: Option<i64> = conn
+                .exec_first(
+                    "SELECT 1 FROM information_schema.columns
+                     WHERE table_schema = DATABASE()
+                       AND table_name = 'issues'
+                       AND column_name = :col LIMIT 1",
+                    mysql_async::params! { "col" => *name },
+                )
+                .await
+                .map_err(map_err)?;
+            if exists.is_none() {
+                // Closed-set literals from `board_columns` only — no caller input.
+                let sql = format!("ALTER TABLE issues ADD COLUMN {name} {ddl}");
+                conn.query_drop(sql).await.map_err(map_err)?;
+                board_added = true;
+            }
+        }
+        if board_added {
+            conn.exec_drop(
+                "CALL DOLT_COMMIT('-A', '-m', :msg)",
+                mysql_async::params! {
+                    "msg" => "hq-62130a: add kanban board columns (workspace, board_rank, \
+                              estimated_hours, start_date, due_date)"
+                        .to_string(),
+                },
+            )
+            .await
+            .map_err(map_err)?;
+        }
+        // Idempotent index for the board projection's hot path: every board call
+        // filters by the (rig, workspace) scope key.
+        conn.query_drop(
+            "CREATE INDEX IF NOT EXISTS issues_rig_workspace_idx ON issues(rig, workspace)",
+        )
+        .await
+        .map_err(map_err)?;
 
         // hq-rig-isolation.1: backfill `rig` from the bead-id prefix for all rows
         // where `rig` is still the empty-string default. `SUBSTRING_INDEX(id,'-',1)` is
@@ -899,15 +1020,18 @@ impl DoltIssues {
         // Phase defaults to `P1` (matching the column default) when the caller
         // omits it; a `Some(_)` is validated against `IssuePhase` upstream.
         let phase = row.phase.as_deref().unwrap_or("P1");
+        // Workspace half of the board scope key (hq-62130a): a default-built
+        // `NewIssue` carries `""`, normalised to the column default.
+        let workspace = if row.workspace.is_empty() { "default" } else { row.workspace.as_str() };
         conn.exec_drop(
             "INSERT INTO issues
                 (id, title, description, design, acceptance_criteria, notes,
                  status, priority, issue_type, assignee, owner, created_by, external_ref,
-                 domain_json, surface_json, depends_on_json, role_scope, phase, rig)
+                 domain_json, surface_json, depends_on_json, role_scope, phase, rig, workspace)
              VALUES
                 (:id, :title, :description, :design, :acceptance_criteria, :notes,
                  'open', :priority, :issue_type, :assignee, :owner, :created_by, :external_ref,
-                 :domain_json, :surface_json, :depends_on_json, :role_scope, :phase, :rig)",
+                 :domain_json, :surface_json, :depends_on_json, :role_scope, :phase, :rig, :workspace)",
             mysql_async::params! {
                 "id" => &row.id,
                 "title" => &row.title,
@@ -927,6 +1051,7 @@ impl DoltIssues {
                 "role_scope" => row.role_scope.clone(),
                 "phase" => phase,
                 "rig" => &row.rig,
+                "workspace" => workspace,
             },
         )
         .await
@@ -1082,6 +1207,24 @@ impl DoltIssues {
             set_parts.push("phase = :phase");
             set_parts.push("phase_ratified_at = NOW()");
             params_vec.push(("phase".to_string(), mysql_async::Value::from(v.clone())));
+        }
+        // hq-62130a — the planning fields the board/planning view edits. Dates
+        // carry the empty-string-clears semantics of assignee/external_ref.
+        if let Some(v) = patch.estimated_hours {
+            set_parts.push("estimated_hours = :estimated_hours");
+            params_vec.push(("estimated_hours".to_string(), mysql_async::Value::from(v)));
+        }
+        if let Some(v) = &patch.start_date {
+            set_parts.push("start_date = :start_date");
+            params_vec.push(("start_date".to_string(), str_or_null(v)));
+        }
+        if let Some(v) = &patch.due_date {
+            set_parts.push("due_date = :due_date");
+            params_vec.push(("due_date".to_string(), str_or_null(v)));
+        }
+        if let Some(v) = &patch.workspace {
+            set_parts.push("workspace = :workspace");
+            params_vec.push(("workspace".to_string(), mysql_async::Value::from(v.clone())));
         }
 
         set_parts.push("updated_at = NOW()");
@@ -1420,6 +1563,186 @@ impl DoltIssues {
         Ok(())
     }
 
+    /// `board.move` write half (hq-62130a): set a card's column (status) AND its
+    /// lexorank in ONE status-guarded, scope-guarded UPDATE + ONE Dolt commit —
+    /// the atomicity the ADR mandates (a drag-drop is a single history entry,
+    /// never a transition commit followed by a rank commit).
+    ///
+    /// `target` is `None` for a same-column reorder (`board.reorder`): only the
+    /// rank moves, no state-machine guard applies. The WHERE carries the full
+    /// (rig, workspace) scope key, so a caller scoped to another workspace
+    /// matches zero rows and gets a `Validation` scope error — the server-side
+    /// cross-workspace rejection (ADR D4).
+    pub async fn board_move(
+        &self,
+        id: &str,
+        rig: &str,
+        workspace: &str,
+        target: Option<IssueStatus>,
+        rank: &str,
+    ) -> Result<(), AppError> {
+        let mut conn = self.pool.get_conn().await.map_err(map_err)?;
+
+        let mut params_vec: Vec<(String, mysql_async::Value)> = vec![
+            ("id".to_string(), mysql_async::Value::from(id.to_string())),
+            ("rig".to_string(), mysql_async::Value::from(rig.to_string())),
+            ("ws".to_string(), mysql_async::Value::from(workspace.to_string())),
+            ("rank".to_string(), mysql_async::Value::from(rank.to_string())),
+        ];
+
+        // Column move: reuse the transition state machine's legal-source guard so
+        // board.move can never perform a transition issues.transition would reject.
+        let (status_set, status_guard) = match target {
+            Some(target) => {
+                let legal_sources: Vec<&'static str> =
+                    [IssueStatus::Open, IssueStatus::Working, IssueStatus::Closed]
+                        .into_iter()
+                        .filter(|s| s.can_transition_to(target))
+                        .map(|s| s.as_str())
+                        .collect();
+                let placeholders: Vec<String> = legal_sources
+                    .iter()
+                    .enumerate()
+                    .map(|(i, _)| format!(":src_{i}"))
+                    .collect();
+                for (i, s) in legal_sources.iter().enumerate() {
+                    params_vec.push((format!("src_{i}"), mysql_async::Value::from(s.to_string())));
+                }
+                params_vec.push((
+                    "target".to_string(),
+                    mysql_async::Value::from(target.as_str().to_string()),
+                ));
+                let closed_at_set = match target {
+                    IssueStatus::Closed => "closed_at = NOW(),",
+                    IssueStatus::Open => "closed_at = NULL,",
+                    IssueStatus::Working => "",
+                };
+                let guard = if placeholders.is_empty() {
+                    "AND 1 = 0".to_string()
+                } else {
+                    format!("AND status IN ({})", placeholders.join(", "))
+                };
+                (format!("status = :target, {closed_at_set}"), guard)
+            }
+            None => (String::new(), String::new()),
+        };
+
+        let sql = format!(
+            "UPDATE issues
+             SET {status_set}
+                 board_rank = :rank,
+                 updated_at = NOW(),
+                 version = version + 1
+             WHERE id = :id AND rig = :rig AND workspace = :ws {status_guard}"
+        );
+        let result = conn
+            .exec_iter(sql, mysql_async::Params::from(params_vec))
+            .await
+            .map_err(map_err)?;
+        let affected = result.affected_rows();
+        let _ = result.drop_result().await.map_err(map_err)?;
+
+        if affected == 0 {
+            // Disambiguate for the frontier: missing row, out-of-scope caller, or
+            // an illegal column move — each fails loud with its own message.
+            let row: Option<(String, String, String)> = conn
+                .exec_first(
+                    "SELECT rig, workspace, status FROM issues WHERE id = :id LIMIT 1",
+                    mysql_async::params! { "id" => id },
+                )
+                .await
+                .map_err(map_err)?;
+            return match row {
+                None => Err(AppError::NotFound(format!("issue {id}"))),
+                Some((r, w, _)) if r != rig || w != workspace => Err(AppError::Validation(format!(
+                    "issue {id} is outside the caller's board scope (rig={rig}, workspace={workspace})"
+                ))),
+                Some((_, _, current)) => Err(AppError::Validation(format!(
+                    "invalid transition: {current} -> {}",
+                    target.map(IssueStatus::as_str).unwrap_or("<same>")
+                ))),
+            };
+        }
+
+        let commit_msg = match target {
+            Some(t) => format!("board.move {id} -> {} @ {rank}", t.as_str()),
+            None => format!("board.reorder {id} @ {rank}"),
+        };
+        conn.exec_drop(
+            "CALL DOLT_COMMIT('-A', '-m', :msg)",
+            mysql_async::params! { "msg" => commit_msg },
+        )
+        .await
+        .map_err(map_err)?;
+        Ok(())
+    }
+
+    /// The (id, board_rank) pairs of one column, in board order (ranked cards
+    /// lexicographically, the unranked `''` tail last by recency, mirroring the
+    /// projection sort). Feeds the frontier's neighbor lookup (`rank_between`)
+    /// and the rebalance pass.
+    pub async fn column_ranks(
+        &self,
+        rig: &str,
+        workspace: &str,
+        status: IssueStatus,
+    ) -> Result<Vec<(String, String)>, AppError> {
+        let mut conn = self.pool.get_conn().await.map_err(map_err)?;
+        let rows: Vec<(String, String)> = conn
+            .exec(
+                "SELECT id, board_rank FROM issues
+                 WHERE rig = :rig AND workspace = :ws AND status = :status
+                 ORDER BY (board_rank = ''), board_rank ASC, created_at DESC, id ASC",
+                mysql_async::params! {
+                    "rig" => rig,
+                    "ws" => workspace,
+                    "status" => status.as_str(),
+                },
+            )
+            .await
+            .map_err(map_err)?;
+        Ok(rows)
+    }
+
+    /// Rebalance one column (hq-62130a): overwrite every card's `board_rank` in a
+    /// single pass + ONE Dolt commit. Used when `rank_between` finds no room
+    /// between two adjacent ranks — the frontier recomputes evenly-spaced ranks
+    /// for the whole column and writes them here before retrying the move.
+    pub async fn board_set_ranks(
+        &self,
+        rig: &str,
+        workspace: &str,
+        ranks: &[(String, String)],
+    ) -> Result<(), AppError> {
+        if ranks.is_empty() {
+            return Ok(());
+        }
+        let mut conn = self.pool.get_conn().await.map_err(map_err)?;
+        for (id, rank) in ranks {
+            conn.exec_drop(
+                "UPDATE issues SET board_rank = :rank, version = version + 1
+                 WHERE id = :id AND rig = :rig AND workspace = :ws",
+                mysql_async::params! {
+                    "rank" => rank,
+                    "id" => id,
+                    "rig" => rig,
+                    "ws" => workspace,
+                },
+            )
+            .await
+            .map_err(map_err)?;
+        }
+        conn.exec_drop(
+            "CALL DOLT_COMMIT('-A', '-m', :msg)",
+            mysql_async::params! {
+                "msg" => format!("board.rebalance {rig}/{workspace} ({} cards)", ranks.len()),
+            },
+        )
+        .await
+        .map_err(map_err)?;
+        Ok(())
+    }
+
     /// Close an issue with attribution (hq-mcp-issues.5). Sets `status='closed'`,
     /// `closed_at=NOW()`, `closed_by_session=:session`, `updated_at=NOW()` in a
     /// single status-guarded UPDATE so only `open`/`working` rows actually
@@ -1648,6 +1971,10 @@ impl DoltIssues {
             where_parts.push("rig = :rig".to_string());
             params_vec.push(("rig".to_string(), mysql_async::Value::from(r.clone())));
         }
+        if let Some(w) = &filter.workspace {
+            where_parts.push("workspace = :workspace".to_string());
+            params_vec.push(("workspace".to_string(), mysql_async::Value::from(w.clone())));
+        }
 
         let where_clause = if where_parts.is_empty() {
             String::new()
@@ -1721,9 +2048,10 @@ impl DoltIssues {
         };
 
         // hq-gap-issues-list-full: when `full`, append the heavy text bodies
-        // after `delivered_sha` (ordinals 19-22) so a sub-epic review reads in one
-        // call. Kept at the END of the SELECT so the cheap-snapshot ordinals 0-18
-        // (incl. `phase` at 17, `delivered_sha` at 18) are untouched by `full`.
+        // after the board columns (ordinals 25-28) so a sub-epic review reads in
+        // one call. Kept at the END of the SELECT so the cheap-snapshot ordinals
+        // 0-24 (incl. `phase` at 17, `delivered_sha` at 18, the hq-62130a board
+        // columns at 20-24) are untouched by `full`.
         let body_cols = if filter.full {
             ", description, design, acceptance_criteria, notes"
         } else {
@@ -1736,7 +2064,11 @@ impl DoltIssues {
                     DATE_FORMAT(closed_at,  '%Y-%m-%dT%H:%i:%SZ') AS closed_at,
                     external_ref, spec_id,
                     domain_json, surface_json, depends_on_json, role_scope, version,
-                    phase, delivered_sha, rig{body_cols}
+                    phase, delivered_sha, rig,
+                    workspace, board_rank,
+                    CAST(estimated_hours AS DOUBLE) AS estimated_hours,
+                    DATE_FORMAT(start_date, '%Y-%m-%d') AS start_date,
+                    DATE_FORMAT(due_date,   '%Y-%m-%d') AS due_date{body_cols}
              FROM issues
              {where_clause}
              ORDER BY created_at DESC, id ASC
@@ -1771,7 +2103,11 @@ impl DoltIssues {
                     external_ref, spec_id,
                     description, design, acceptance_criteria, notes,
                     domain_json, surface_json, depends_on_json, role_scope, version,
-                    phase, delivered_sha, rig
+                    phase, delivered_sha, rig,
+                    workspace, board_rank,
+                    CAST(estimated_hours AS DOUBLE) AS estimated_hours,
+                    DATE_FORMAT(start_date, '%Y-%m-%d') AS start_date,
+                    DATE_FORMAT(due_date,   '%Y-%m-%d') AS due_date
              FROM issues
              WHERE id = :id
              LIMIT 1";
@@ -1822,6 +2158,12 @@ fn row_to_detail(row: mysql_async::Row) -> Result<IssueDetail, AppError> {
         phase: take_opt(&mut row, 21).unwrap_or_else(|| "P1".to_string()),
         delivered_sha: take_opt(&mut row, 22),
         rig: take_opt(&mut row, 23).unwrap_or_default(),
+        // Board columns (hq-62130a) — ordinals 24-28.
+        workspace: take_opt(&mut row, 24).unwrap_or_else(default_workspace),
+        board_rank: take_opt(&mut row, 25).unwrap_or_default(),
+        estimated_hours: row.take::<Option<f64>, _>(26).unwrap_or(None),
+        start_date: take_opt(&mut row, 27),
+        due_date: take_opt(&mut row, 28),
     })
 }
 
@@ -1864,11 +2206,17 @@ fn row_to_issue(row: mysql_async::Row, full: bool) -> Result<IssueRow, AppError>
         phase: take_opt(&mut row, 17).unwrap_or_else(|| "P1".to_string()),
         delivered_sha: take_opt(&mut row, 18),
         rig: take_opt(&mut row, 19).unwrap_or_default(),
-        // Bodies only SELECTed when `full` — ordinals 20-23.
-        description: full.then(|| take_opt(&mut row, 20).unwrap_or_default()),
-        design: full.then(|| take_opt(&mut row, 21).unwrap_or_default()),
-        acceptance_criteria: full.then(|| take_opt(&mut row, 22).unwrap_or_default()),
-        notes: full.then(|| take_opt(&mut row, 23).unwrap_or_default()),
+        // Board columns (hq-62130a) always SELECTed — ordinals 20-24.
+        workspace: take_opt(&mut row, 20).unwrap_or_else(default_workspace),
+        board_rank: take_opt(&mut row, 21).unwrap_or_default(),
+        estimated_hours: row.take::<Option<f64>, _>(22).unwrap_or(None),
+        start_date: take_opt(&mut row, 23),
+        due_date: take_opt(&mut row, 24),
+        // Bodies only SELECTed when `full` — ordinals 25-28.
+        description: full.then(|| take_opt(&mut row, 25).unwrap_or_default()),
+        design: full.then(|| take_opt(&mut row, 26).unwrap_or_default()),
+        acceptance_criteria: full.then(|| take_opt(&mut row, 27).unwrap_or_default()),
+        notes: full.then(|| take_opt(&mut row, 28).unwrap_or_default()),
     })
 }
 

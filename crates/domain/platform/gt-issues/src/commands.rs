@@ -39,6 +39,26 @@ fn taxonomy_err(e: gt_module_mcp::taxonomy::TaxonomyError) -> AppError {
     AppError::Validation(e.to_string())
 }
 
+/// Reject a planning date that is neither empty (the clear sentinel) nor
+/// `YYYY-MM-DD`-shaped (hq-62130a). Shape-only — calendar validity (e.g. a
+/// month 13) is left to the DATE column, which rejects it at execute.
+fn check_date(field: &str, value: &str) -> Result<(), AppError> {
+    if value.is_empty() {
+        return Ok(()); // clear-to-NULL sentinel, mirrors assignee/external_ref
+    }
+    let b = value.as_bytes();
+    let shaped = b.len() == 10
+        && b[4] == b'-'
+        && b[7] == b'-'
+        && b.iter().enumerate().all(|(i, c)| matches!(i, 4 | 7) || c.is_ascii_digit());
+    if !shaped {
+        return Err(AppError::Validation(format!(
+            "{field} must be YYYY-MM-DD (or empty to clear), got `{value}`"
+        )));
+    }
+    Ok(())
+}
+
 /// Reject a phase token outside the closed set `P1..P4` (hq-core-mcp.7). Returns
 /// the offending value verbatim so the agent sees exactly what was rejected.
 fn check_phase(phase: &str) -> Result<(), AppError> {
@@ -165,6 +185,10 @@ pub struct CreateIssue {
     /// `?ready=true` (S4) stops surfacing it while the frontier sits at `P3`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub phase: Option<String>,
+    /// Board workspace the card lands in (hq-62130a) — the second half of the
+    /// (rig, workspace) scope key. Default empty ⇒ the `'default'` workspace.
+    #[serde(default)]
+    pub workspace: String,
 }
 
 impl CreateIssue {
@@ -287,6 +311,7 @@ impl CreateIssue {
             role_scope: self.role_scope.clone(),
             phase: self.phase.clone(),
             rig,
+            workspace: self.workspace.clone(),
         }
     }
 }
@@ -358,6 +383,22 @@ pub struct UpdateIssue {
     /// version, else it fails with a `version conflict`. Omit for last-write-wins.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub expected_version: Option<i64>,
+    /// New planning estimate in hours (hq-62130a, mockup "Horas Est."). Must be
+    /// finite and ≥ 0.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub estimated_hours: Option<f64>,
+    /// New planned start date `YYYY-MM-DD` (hq-62130a, "Fecha Inicio"). Empty
+    /// string clears.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub start_date: Option<String>,
+    /// New planned end date `YYYY-MM-DD` (hq-62130a, "Fecha Fin" — drives the
+    /// retrasos metric). Empty string clears.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub due_date: Option<String>,
+    /// New board workspace (hq-62130a) — re-scopes the card to another project.
+    /// Empty rejected (a card always belongs to a workspace).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace: Option<String>,
 }
 
 impl UpdateIssue {
@@ -406,6 +447,24 @@ impl UpdateIssue {
         }
         if let Some(phase) = &self.phase {
             check_phase(phase)?;
+        }
+        // hq-62130a — planning-field shape rules.
+        if let Some(h) = self.estimated_hours {
+            if !h.is_finite() || h < 0.0 {
+                return Err(AppError::Validation(format!(
+                    "estimated_hours must be a finite non-negative number, got {h}"
+                )));
+            }
+        }
+        for (name, value) in [("start_date", &self.start_date), ("due_date", &self.due_date)] {
+            if let Some(d) = value {
+                check_date(name, d)?;
+            }
+        }
+        if matches!(&self.workspace, Some(w) if w.trim().is_empty()) {
+            return Err(AppError::Validation(
+                "workspace overwrite is empty; a card always belongs to a workspace".into(),
+            ));
         }
         if self.to_patch().is_empty() {
             return Err(AppError::Validation("no fields set; nothing to update".into()));
@@ -462,6 +521,10 @@ impl UpdateIssue {
             depends_on_json: self.depends_on.as_deref().map(to_json_array),
             phase: self.phase.clone(),
             expected_version: self.expected_version,
+            estimated_hours: self.estimated_hours,
+            start_date: self.start_date.clone(),
+            due_date: self.due_date.clone(),
+            workspace: self.workspace.clone(),
         }
     }
 }
@@ -660,6 +723,10 @@ pub struct ListIssues {
     /// Narrow to a single rig (hq-rig-isolation.1). Absent ⇒ workspace-wide (back-compat).
     #[serde(default)]
     pub rig: Option<String>,
+    /// Narrow to one board workspace (hq-62130a) — the second half of the
+    /// (rig, workspace) scope key. Absent ⇒ all workspaces (back-compat).
+    #[serde(default)]
+    pub workspace: Option<String>,
 }
 
 /// Input for `issues.read` — fetch a single bead with its full detail.
@@ -693,6 +760,7 @@ mod tests {
             depends_on: vec![],
             role_scope: None,
             phase: None,
+            workspace: String::new(),
         }
     }
 
@@ -715,6 +783,10 @@ mod tests {
             depends_on: None,
             phase: None,
             expected_version: None,
+            estimated_hours: None,
+            start_date: None,
+            due_date: None,
+            workspace: None,
         }
     }
 
@@ -893,6 +965,10 @@ mod tests {
             depends_on: None,
             phase: None,
             expected_version: None,
+            estimated_hours: None,
+            start_date: None,
+            due_date: None,
+            workspace: None,
         };
         assert!(u.validate().is_err());
     }
@@ -916,6 +992,10 @@ mod tests {
             depends_on: None,
             phase: None,
             expected_version: Some(7),
+            estimated_hours: None,
+            start_date: None,
+            due_date: None,
+            workspace: None,
         };
         assert!(u.validate().is_ok());
         assert_eq!(u.to_patch().expected_version, Some(7));
@@ -943,6 +1023,10 @@ mod tests {
             depends_on: None,
             phase: None,
             expected_version: None,
+            estimated_hours: None,
+            start_date: None,
+            due_date: None,
+            workspace: None,
         };
         assert!(u.validate().is_err());
     }
@@ -1105,6 +1189,10 @@ mod tests {
             depends_on: None,
             phase: Some("P4".into()),
             expected_version: None,
+            estimated_hours: None,
+            start_date: None,
+            due_date: None,
+            workspace: None,
         };
         assert!(u.validate().is_ok());
         assert_eq!(u.to_patch().phase.as_deref(), Some("P4"));

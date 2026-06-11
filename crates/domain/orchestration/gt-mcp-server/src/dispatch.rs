@@ -12,8 +12,9 @@ use gt_issues::handlers::{
     run_update_issue, ClaimResult,
 };
 use gt_issues::{
-    emit_issue_event, AdvancePhase, ClaimIssue, CloseIssue, CommitInspector, CreateIssue,
-    IssueEventSink, IssueVerb, ListIssues, ReadIssue, TransitionIssue, UpdateIssue,
+    emit_issue_event, run_board_list, run_board_move, run_board_reorder, AdvancePhase, BoardList,
+    BoardMove, BoardReorder, ClaimIssue, CloseIssue, CommitInspector, CreateIssue, IssueEventSink,
+    IssueVerb, ListIssues, ReadIssue, TransitionIssue, UpdateIssue,
 };
 use gt_issues::resources::{read_issue, read_issues_page, filter_ready, read_issues};
 use gt_meta::ReportGap;
@@ -246,6 +247,8 @@ pub async fn dispatch(
                 // the X-Rig header the polecat's .mcp.json injects on every call — so `list`
                 // is automatically scoped to the right rig without prompt engineering.
                 rig: a.rig.or_else(|| request_rig.map(str::to_string)),
+                // hq-62130a — optional board-workspace narrowing.
+                workspace: a.workspace,
             };
             if filter.ready {
                 // ready=true needs phase frontier + dep index + git tree (same as resource path)
@@ -272,6 +275,45 @@ pub async fn dispatch(
                     .map_err(|e| AppError::Other(format!("encode issue: {e}"))),
                 None => Err(AppError::NotFound(format!("issue `{}`", a.id))),
             }
+        }
+        // hq-62130a — the Kanban board projection (ADR hq-423a4b). Same store,
+        // same event sink as the issues tools; the board is a projection, so it
+        // dispatches here rather than through the domain router.
+        "board.list.execute" => {
+            let mut a: BoardList = parse_args(args)?;
+            // X-Rig fallback, mirroring issues.list (hq-rig-isolation.7).
+            if a.rig.is_empty() {
+                if let Some(rig) = request_rig {
+                    a.rig = rig.to_string();
+                }
+            }
+            let snapshot = run_board_list(store, &a, false).await?;
+            serde_json::to_value(&snapshot)
+                .map_err(|e| AppError::Other(format!("encode board: {e}")))
+        }
+        "board.move.validate" => {
+            let a: BoardMove = parse_args(args)?;
+            run_board_move(store, &a, true).await?;
+            Ok(json!({ "ok": true }))
+        }
+        "board.move.execute" => {
+            let a: BoardMove = parse_args(args)?;
+            let rank = run_board_move(store, &a, false).await?;
+            // The card changed column = a status transition; SSE consumers see
+            // the same issues.transitioned.v1 frame either write path produces.
+            emit_issue_event(sink, store, ws, IssueVerb::Transitioned, &a.id, actor).await;
+            Ok(json!({ "ok": true, "id": a.id, "column": a.column, "rank": rank }))
+        }
+        "board.reorder.validate" => {
+            let a: BoardReorder = parse_args(args)?;
+            run_board_reorder(store, &a, true).await?;
+            Ok(json!({ "ok": true }))
+        }
+        "board.reorder.execute" => {
+            let a: BoardReorder = parse_args(args)?;
+            let rank = run_board_reorder(store, &a, false).await?;
+            emit_issue_event(sink, store, ws, IssueVerb::Updated, &a.id, actor).await;
+            Ok(json!({ "ok": true, "id": a.id, "rank": rank }))
         }
         other => Err(AppError::Validation(format!("unknown tool `{other}`"))),
     }

@@ -32,6 +32,17 @@
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
+/// The Kanban board projection (hq-62130a, ADR hq-423a4b): lexorank ordering,
+/// the `board.{list,move,reorder}` commands + transport-free handlers, and the
+/// pure column/lane bucketer. Cards ARE beads — no second store.
+pub mod board;
+/// The off-by-default `axum` REST adapter for the board projection (hq-62130a),
+/// mounted at `/api/v1/board` behind the `board.read`/`board.write` guard.
+#[cfg(feature = "axum")]
+pub mod board_http;
+/// The [`GtModule`](gt_module::GtModule) facade for the board projection
+/// (hq-62130a): declares the `board.*` MCP tools + the REST surface.
+pub mod board_module;
 pub mod commands;
 pub mod delivery;
 /// Issue-mutation events for the per-workspace SSE feed (`hq-issues-sse`): the
@@ -70,6 +81,11 @@ pub mod stats;
 pub mod surface;
 pub mod taxonomy;
 
+pub use board::{
+    project_board, rank_between, run_board_list, run_board_move, run_board_reorder, spread_ranks,
+    BoardList, BoardMove, BoardReorder, BoardSnapshot,
+};
+pub use board_module::BoardModule;
 pub use commands::{
     AdvancePhase, ClaimIssue, CloseIssue, CreateIssue, ListIssues, ReadIssue, TransitionIssue,
     UpdateIssue,
