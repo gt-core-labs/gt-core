@@ -347,6 +347,27 @@ async fn main() -> anyhow::Result<()> {
         }
     };
 
+    // Server-side usage prober (hq-28b063 / hq-002cca): sweep every keychain account against the
+    // OAuth /usage endpoint so rotation gates on the PROVIDER's window — exact resets_at, external
+    // consumption included — instead of the locally-accumulated counters. Feeds the same
+    // QuotaHandle::probe path the header probe uses. Only armed with a keychain (the secret is each
+    // account's CLAUDE_CONFIG_DIR, where .credentials.json lives).
+    let _usage_probe_timer = keychain.as_ref().map(|kc| {
+        let prober =
+            gt_composition::usage_probe::UsageProber::new(kc.clone(), quota.clone());
+        let probe_secs = env_usize("GT_USAGE_PROBE_SECS", 300) as u64;
+        eprintln!(
+            "[gt-orch-server] usage prober on — sweep every {probe_secs}s against the OAuth /usage endpoint"
+        );
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(Duration::from_secs(probe_secs));
+            loop {
+                tick.tick().await;
+                prober.sweep().await;
+            }
+        })
+    });
+
     // Web onboarding (hq-quota-onboard-web) moved to the backend mcp-server in .4: claude now lives
     // IN the image, so onboarding rides the existing /api/v1/* auth chain instead of a host process
     // behind a docker→host firewall hole. The daemon no longer serves it — it only hydrates its

@@ -145,6 +145,9 @@ anyhow = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 sqlx = { workspace = true }
+# Server-side usage prober (hq-28b063 / usage_probe.rs): GET the OAuth /usage endpoint +
+# the refresh-token POST — the edge half of gt-quota::oauth_usage. rustls, no OpenSSL.
+reqwest = { workspace = true }
 
 [features]
 # Compile the local fastembed embedding engine into the server (hq-docs-search.2). Off by
