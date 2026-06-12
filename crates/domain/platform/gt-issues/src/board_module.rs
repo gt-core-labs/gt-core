@@ -11,7 +11,7 @@ use gt_module::{Capability, GtModule, McpRegistry, ModuleId, ModuleMeta, Scope};
 use gt_module_mcp::schema_for;
 use semver::Version;
 
-use crate::board::{BoardList, BoardMove, BoardReorder};
+use crate::board::{BoardList, BoardMove, BoardReorder, BoardScopes};
 
 /// The [`GtModule`] facade for the board projection. Stateless for the MCP
 /// harvest path, exactly like [`IssuesModule`](crate::IssuesModule); the live
@@ -70,6 +70,14 @@ impl GtModule for BoardModule {
                  Read-only — no state change. The board is a projection over hq.issues; \
                  cards ARE beads.",
                 schema_for::<BoardList>(),
+            )
+            .tool_with_schema(
+                "board.scopes.execute",
+                "The distinct (rig, workspace) pairs present in the tracker — the REAL \
+                 boards. Use it to offer/validate scope selectors against actual data: \
+                 the catalog cross-product offers combinations with no board, and bead \
+                 namespaces (e.g. `hq`) need not match rig-catalog names. Read-only.",
+                schema_for::<BoardScopes>(),
             )
             .tool_with_schema(
                 "board.move.validate",
@@ -150,6 +158,7 @@ mod tests {
             names,
             [
                 "board.list.execute",
+                "board.scopes.execute",
                 "board.move.validate",
                 "board.move.execute",
                 "board.reorder.validate",

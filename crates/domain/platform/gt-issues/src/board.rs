@@ -411,6 +411,57 @@ pub async fn run_board_list(
     )))
 }
 
+/// Input for `board.scopes` — no parameters; the projection is global by
+/// design (it answers "which boards exist at all?", the question the scope
+/// selectors ask BEFORE a (rig, workspace) is chosen).
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
+#[cfg_attr(feature = "axum", derive(utoipa::ToSchema, utoipa::IntoParams))]
+pub struct BoardScopes {}
+
+/// One real board scope: a `(rig, workspace)` pair that actually has beads.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[cfg_attr(feature = "axum", derive(utoipa::ToSchema))]
+pub struct BoardScope {
+    /// Rig half of the scope key, as stored on the beads (id-prefix namespace —
+    /// NOT necessarily a rig-catalog name).
+    pub rig: String,
+    /// Workspace half of the scope key (the workspace id/slug).
+    pub workspace: String,
+}
+
+/// Dedupe the flat row set into the sorted distinct `(rig, workspace)` pairs.
+/// Pure — unit-testable without a store.
+pub fn project_scopes(rows: &[IssueRow]) -> Vec<BoardScope> {
+    let mut pairs: Vec<(String, String)> = rows
+        .iter()
+        .map(|r| (r.rig.clone(), r.workspace.clone()))
+        .filter(|(r, w)| !r.is_empty() && !w.is_empty())
+        .collect();
+    pairs.sort();
+    pairs.dedup();
+    pairs
+        .into_iter()
+        .map(|(rig, workspace)| BoardScope { rig, workspace })
+        .collect()
+}
+
+/// `board.scopes`: the distinct `(rig, workspace)` pairs present in the
+/// tracker — the REAL boards, against which UI selectors are contrasted
+/// (hq-26d679). Reuses the same list query as `board.list` (no second store);
+/// catalog entries with no beads do not appear, and bead namespaces absent
+/// from the catalog (e.g. `hq`) do.
+pub async fn run_board_scopes(issues: &DoltIssues) -> Result<Vec<BoardScope>, AppError> {
+    let rows = issues
+        .list(&IssueFilter {
+            // Unscoped on purpose: None rig/workspace = no filter (back-compat
+            // semantics of the list query); the ceiling still bounds the read.
+            limit: Some(gt_store_dolt::issues_max_limit()),
+            ..Default::default()
+        })
+        .await?;
+    Ok(project_scopes(&rows))
+}
+
 /// Resolve the rank for placing `moving_id` in `(rig, workspace, column)`
 /// between the `after`/`before` neighbor card ids (both optional — neither
 /// appends at the bottom). Lazily backfills an unranked column with
@@ -739,5 +790,32 @@ mod tests {
         assert!(a.validate().is_ok());
         let bad = BoardReorder { rig: "".into(), ..a };
         assert!(bad.validate().is_err());
+    }
+
+    #[test]
+    fn project_scopes_dedupes_sorts_and_drops_blank_keys() {
+        let scoped = |id: &str, rig: &str, ws: &str| {
+            let mut r = row(id, "open", "", None, 1);
+            r.rig = rig.to_string();
+            r.workspace = ws.to_string();
+            r
+        };
+        let rows = vec![
+            scoped("hq-2", "hq", "default"),
+            scoped("gtcore-1", "gtcore", "default"),
+            scoped("hq-1", "hq", "default"),
+            scoped("hq-3", "hq", "confiar"),
+            scoped("x-1", "", "default"),
+            scoped("x-2", "hq", ""),
+        ];
+        let scopes = project_scopes(&rows);
+        assert_eq!(
+            scopes,
+            vec![
+                BoardScope { rig: "gtcore".into(), workspace: "default".into() },
+                BoardScope { rig: "hq".into(), workspace: "confiar".into() },
+                BoardScope { rig: "hq".into(), workspace: "default".into() },
+            ]
+        );
     }
 }

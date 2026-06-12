@@ -8,6 +8,7 @@
 //! | Method + path   | Maps to MCP tool        |
 //! |-----------------|-------------------------|
 //! | `GET /`         | `board.list.execute`    |
+//! | `GET /scopes`   | `board.scopes.execute`  |
 //! | `POST /move`    | `board.move.execute`    |
 //! | `POST /reorder` | `board.reorder.execute` |
 
@@ -18,7 +19,10 @@ use serde_json::{json, Value};
 
 use gt_workspace::WorkspaceContext;
 
-use crate::board::{run_board_list, run_board_move, run_board_reorder, BoardList, BoardMove, BoardReorder};
+use crate::board::{
+    run_board_list, run_board_move, run_board_reorder, run_board_scopes, BoardList, BoardMove,
+    BoardReorder, BoardScope,
+};
 use crate::events::{emit_issue_event, IssueVerb};
 use crate::http::{ApiError, IssuesApiState};
 
@@ -28,6 +32,7 @@ use crate::http::{ApiError, IssuesApiState};
 pub fn board_router(state: IssuesApiState) -> Router {
     Router::new()
         .route("/", get(board_list))
+        .route("/scopes", get(board_scopes))
         .route("/move", post(board_move))
         .route("/reorder", post(board_reorder))
         .with_state(state)
@@ -53,6 +58,25 @@ async fn board_list(
     Ok(Json(serde_json::to_value(snapshot).map_err(|e| {
         ApiError(gt_store_dolt::AppError::Other(format!("encode board: {e}")))
     })?))
+}
+
+/// `GET /scopes` — the distinct `(rig, workspace)` pairs present in the
+/// tracker (`board.scopes.execute`): the REAL boards, for contrasting UI
+/// selectors against actual data instead of the catalog cross-product
+/// (hq-26d679).
+#[utoipa::path(
+    get, path = "/scopes",
+    responses(
+        (status = 200, description = "Sorted distinct (rig, workspace) pairs", body = [BoardScope]),
+    ),
+)]
+async fn board_scopes(
+    State(st): State<IssuesApiState>,
+    ctx: WorkspaceContext,
+) -> Result<Json<Value>, ApiError> {
+    let store = st.resolve(&ctx).await?;
+    let scopes = run_board_scopes(&store).await?;
+    Ok(Json(json!({ "scopes": scopes })))
 }
 
 /// `POST /move` — column change + placement in ONE atomic Dolt commit
@@ -118,8 +142,8 @@ async fn board_reorder(
 /// rewrites them under `/api/v1/board` when mounting.
 #[derive(utoipa::OpenApi)]
 #[openapi(
-    paths(board_list, board_move, board_reorder),
-    components(schemas(BoardList, BoardMove, BoardReorder))
+    paths(board_list, board_scopes, board_move, board_reorder),
+    components(schemas(BoardList, BoardMove, BoardReorder, BoardScope))
 )]
 pub struct BoardApiDoc;
 
@@ -132,7 +156,7 @@ mod tests {
     fn openapi_lists_every_relative_route_prefix_free() {
         let doc = BoardApiDoc::openapi();
         let paths: Vec<&str> = doc.paths.paths.keys().map(String::as_str).collect();
-        for expected in ["/", "/move", "/reorder"] {
+        for expected in ["/", "/scopes", "/move", "/reorder"] {
             assert!(paths.contains(&expected), "missing {expected} in {paths:?}");
         }
         assert!(

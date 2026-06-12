@@ -95,8 +95,9 @@ pub mod taxonomy;
 
 pub use analytics::{summarize as analytics_summarize, AnalyticsSummary};
 pub use board::{
-    project_board, rank_between, run_board_list, run_board_move, run_board_reorder, spread_ranks,
-    BoardList, BoardMove, BoardReorder, BoardSnapshot,
+    project_board, project_scopes, rank_between, run_board_list, run_board_move,
+    run_board_reorder, run_board_scopes, spread_ranks, BoardList, BoardMove, BoardReorder,
+    BoardScope, BoardScopes, BoardSnapshot,
 };
 pub use board_module::BoardModule;
 pub use commands::{

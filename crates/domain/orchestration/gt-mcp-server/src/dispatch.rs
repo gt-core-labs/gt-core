@@ -12,7 +12,8 @@ use gt_issues::handlers::{
     run_update_issue, ClaimResult,
 };
 use gt_issues::{
-    emit_issue_event, run_board_list, run_board_move, run_board_reorder, AdvancePhase, BoardList,
+    emit_issue_event, run_board_list, run_board_move, run_board_reorder, run_board_scopes,
+    AdvancePhase, BoardList,
     BoardMove, BoardReorder, ClaimIssue, CloseIssue, CommitInspector, CreateIssue, IssueEventSink,
     IssueVerb, ListIssues, ReadIssue, TransitionIssue, UpdateIssue,
 };
@@ -290,6 +291,10 @@ pub async fn dispatch(
             let snapshot = run_board_list(store, &a, false).await?;
             serde_json::to_value(&snapshot)
                 .map_err(|e| AppError::Other(format!("encode board: {e}")))
+        }
+        "board.scopes.execute" => {
+            let scopes = run_board_scopes(store).await?;
+            Ok(json!({ "scopes": scopes }))
         }
         "board.move.validate" => {
             let a: BoardMove = parse_args(args)?;
