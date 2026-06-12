@@ -72,8 +72,17 @@ fn estado_label(status: &str) -> &'static str {
     match status {
         "open" => "Pendiente",
         "working" => "En curso",
-        "closed" => "Hecho",
+        "closed" => "Completado",
         _ => "Pendiente",
+    }
+}
+
+/// The operator vocabulary for the Nivel column (mockup: Alto/Medio/Bajo).
+fn nivel_label(priority: i32) -> &'static str {
+    match priority {
+        0 => "Alto",
+        1 => "Medio",
+        _ => "Bajo",
     }
 }
 
@@ -99,7 +108,7 @@ pub fn build_report(rig: &str, workspace: &str, rows: &[IssueRow]) -> OperatorRe
         buckets.entry(module).or_default().push(ReportRow {
             tarea: row.title.clone(),
             proceso: row.issue_type.clone(),
-            nivel: format!("P{}", row.priority),
+            nivel: nivel_label(row.priority).to_string(),
             horas: row.estimated_hours,
             estado: estado_label(&row.status).to_string(),
             responsable: row.assignee.clone().unwrap_or_default(),
@@ -186,64 +195,151 @@ pub fn to_csv(report: &OperatorReport) -> String {
     out
 }
 
-/// Serialize the report as XLSX: one sheet, bold module section headers,
-/// the mockup columns, per-section subtotals, and the TOTAL HORAS footer.
+/// Serialize the report as XLSX in the operator mockup aesthetic (hq-039316):
+/// merged navy title bar, navy header row (white bold), light-blue module
+/// section bands, color-coded Nivel (Alto rojo / Medio ámbar / Bajo verde) and
+/// Estado (Completado verde / Pendiente naranja / En curso azul), bordered data
+/// grid, and a navy TOTAL HORAS footer.
 pub fn to_xlsx(report: &OperatorReport) -> Result<Vec<u8>, String> {
-    use rust_xlsxwriter::{Format, Workbook};
+    use rust_xlsxwriter::{Format, FormatAlign, FormatBorder, Workbook};
+
+    const NAVY: &str = "1F3864";
+    const SECTION_BG: &str = "D9E1F2";
 
     let mut wb = Workbook::new();
     let sheet = wb.add_worksheet();
     sheet.set_name("Tracker").map_err(|e| e.to_string())?;
 
-    let bold = Format::new().set_bold();
-    let header = Format::new().set_bold().set_background_color("D9E1F2");
+    // Column widths follow the mockup proportions.
+    for (col, w) in [
+        (0u16, 18.0), (1, 42.0), (2, 34.0), (3, 9.0), (4, 10.0),
+        (5, 13.0), (6, 16.0), (7, 12.0), (8, 12.0), (9, 60.0),
+    ] {
+        sheet.set_column_width(col, w).map_err(|e| e.to_string())?;
+    }
 
+    let title_fmt = Format::new()
+        .set_bold()
+        .set_font_size(13)
+        .set_font_color("FFFFFF")
+        .set_background_color(NAVY)
+        .set_align(FormatAlign::Center)
+        .set_align(FormatAlign::VerticalCenter);
+    let header_fmt = Format::new()
+        .set_bold()
+        .set_font_color("FFFFFF")
+        .set_background_color(NAVY)
+        .set_align(FormatAlign::Center)
+        .set_align(FormatAlign::VerticalCenter)
+        .set_border(FormatBorder::Thin)
+        .set_border_color(NAVY);
+    let section_fmt = Format::new()
+        .set_bold()
+        .set_font_color(NAVY)
+        .set_background_color(SECTION_BG)
+        .set_border(FormatBorder::Thin)
+        .set_border_color("B4C6E7");
+    let cell = Format::new().set_border(FormatBorder::Thin).set_border_color("BFBFBF");
+    let cell_wrap = cell.clone().set_text_wrap().set_align(FormatAlign::Top);
+    let cell_center = cell.clone().set_align(FormatAlign::Center);
+    // Nivel chips (mockup: Alto rosa, Bajo verde; Medio ámbar).
+    let nivel_alto = cell_center.clone().set_bold().set_background_color("F8CBCC").set_font_color("9C0006");
+    let nivel_medio = cell_center.clone().set_bold().set_background_color("FFE599").set_font_color("9C6500");
+    let nivel_bajo = cell_center.clone().set_bold().set_background_color("C6EFCE").set_font_color("006100");
+    // Estado chips (mockup: Completado verde, Pendiente naranja; En curso azul).
+    let estado_done = cell_center.clone().set_bold().set_background_color("C6EFCE").set_font_color("006100");
+    let estado_pending = cell_center.clone().set_bold().set_background_color("FBE2B4").set_font_color("9C6500");
+    let estado_working = cell_center.clone().set_bold().set_background_color("DDEBF7").set_font_color("1F4E78");
+    let total_fmt = Format::new()
+        .set_bold()
+        .set_font_color("FFFFFF")
+        .set_background_color(NAVY)
+        .set_align(FormatAlign::Center);
+    let subtotal_fmt = Format::new()
+        .set_bold()
+        .set_font_color(NAVY)
+        .set_background_color(SECTION_BG)
+        .set_border(FormatBorder::Thin)
+        .set_border_color("B4C6E7");
+
+    const LAST_COL: u16 = 9;
+
+    // Title bar.
+    sheet.set_row_height(0, 26).map_err(|e| e.to_string())?;
+    sheet
+        .merge_range(0, 0, 0, LAST_COL, &format!("Tracker {} / {}", report.rig, report.workspace), &title_fmt)
+        .map_err(|e| e.to_string())?;
+
+    // Header row.
     let headers = [
         "Modulo", "Tarea", "Proceso", "Nivel", "Horas Est.", "Estado", "Responsable",
         "Fecha Inicio", "Fecha Fin", "Notas",
     ];
+    sheet.set_row_height(1, 20).map_err(|e| e.to_string())?;
     for (col, h) in headers.iter().enumerate() {
         sheet
-            .write_with_format(0, col as u16, *h, &header)
+            .write_with_format(1, col as u16, *h, &header_fmt)
             .map_err(|e| e.to_string())?;
     }
+    sheet.set_freeze_panes(2, 0).map_err(|e| e.to_string())?;
 
-    let mut r: u32 = 1;
+    let mut r: u32 = 2;
     for section in &report.sections {
-        // Section header row: the module title spanning the first column.
+        // Section band: the module title spanning the full width.
         sheet
-            .write_with_format(r, 0, section.module_title.as_str(), &bold)
+            .merge_range(r, 0, r, LAST_COL, &section.module_title, &section_fmt)
             .map_err(|e| e.to_string())?;
         r += 1;
         for row in &section.rows {
-            sheet.write(r, 1, row.tarea.as_str()).map_err(|e| e.to_string())?;
-            sheet.write(r, 2, row.proceso.as_str()).map_err(|e| e.to_string())?;
-            sheet.write(r, 3, row.nivel.as_str()).map_err(|e| e.to_string())?;
-            if let Some(h) = row.horas {
-                sheet.write(r, 4, h).map_err(|e| e.to_string())?;
+            sheet.write_with_format(r, 0, "", &cell).map_err(|e| e.to_string())?;
+            sheet.write_with_format(r, 1, row.tarea.as_str(), &cell_wrap).map_err(|e| e.to_string())?;
+            sheet.write_with_format(r, 2, row.proceso.as_str(), &cell_wrap).map_err(|e| e.to_string())?;
+            let nivel_fmt = match row.nivel.as_str() {
+                "Alto" => &nivel_alto,
+                "Medio" => &nivel_medio,
+                _ => &nivel_bajo,
+            };
+            sheet.write_with_format(r, 3, row.nivel.as_str(), nivel_fmt).map_err(|e| e.to_string())?;
+            match row.horas {
+                Some(h) => sheet.write_with_format(r, 4, h, &cell_center),
+                None => sheet.write_with_format(r, 4, "", &cell_center),
             }
-            sheet.write(r, 5, row.estado.as_str()).map_err(|e| e.to_string())?;
-            sheet.write(r, 6, row.responsable.as_str()).map_err(|e| e.to_string())?;
-            sheet.write(r, 7, row.fecha_inicio.as_str()).map_err(|e| e.to_string())?;
-            sheet.write(r, 8, row.fecha_fin.as_str()).map_err(|e| e.to_string())?;
-            sheet.write(r, 9, row.notas.as_str()).map_err(|e| e.to_string())?;
+            .map_err(|e| e.to_string())?;
+            let estado_fmt = match row.estado.as_str() {
+                "Completado" => &estado_done,
+                "En curso" => &estado_working,
+                _ => &estado_pending,
+            };
+            sheet.write_with_format(r, 5, row.estado.as_str(), estado_fmt).map_err(|e| e.to_string())?;
+            sheet.write_with_format(r, 6, row.responsable.as_str(), &cell_center).map_err(|e| e.to_string())?;
+            sheet.write_with_format(r, 7, row.fecha_inicio.as_str(), &cell_center).map_err(|e| e.to_string())?;
+            sheet.write_with_format(r, 8, row.fecha_fin.as_str(), &cell_center).map_err(|e| e.to_string())?;
+            sheet.write_with_format(r, 9, row.notas.as_str(), &cell_wrap).map_err(|e| e.to_string())?;
             r += 1;
         }
-        // Section subtotal.
+        // Section subtotal band.
         sheet
-            .write_with_format(r, 0, "Subtotal", &bold)
+            .merge_range(r, 0, r, 3, "Subtotal", &subtotal_fmt)
             .map_err(|e| e.to_string())?;
         sheet
-            .write_with_format(r, 4, section.horas, &bold)
+            .write_with_format(r, 4, section.horas, &subtotal_fmt)
             .map_err(|e| e.to_string())?;
-        r += 2; // blank spacer row between sections
+        for col in 5..=LAST_COL {
+            sheet.write_with_format(r, col, "", &subtotal_fmt).map_err(|e| e.to_string())?;
+        }
+        r += 1;
     }
+
+    // TOTAL HORAS footer, navy like the mockup.
     sheet
-        .write_with_format(r, 0, "TOTAL HORAS", &bold)
+        .merge_range(r, 0, r, 3, "TOTAL HORAS ESTIMADAS", &total_fmt)
         .map_err(|e| e.to_string())?;
     sheet
-        .write_with_format(r, 4, report.total_horas, &bold)
+        .write_with_format(r, 4, report.total_horas, &total_fmt)
         .map_err(|e| e.to_string())?;
+    for col in 5..=LAST_COL {
+        sheet.write_with_format(r, col, "", &total_fmt).map_err(|e| e.to_string())?;
+    }
 
     wb.save_to_buffer().map_err(|e| e.to_string())
 }
