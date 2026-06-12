@@ -49,6 +49,11 @@ pub mod board_http;
 pub mod board_module;
 pub mod commands;
 pub mod delivery;
+/// Dispatch-policy resolution with `child_of` inheritance (gtcore-1acbcf C1):
+/// [`dispatch::resolve_dispatch`] (the helper C3's `ready_for_auto` frontier
+/// consumes) and [`dispatch::filter_dispatch`] (the resolved `?dispatch=` list
+/// filter).
+pub mod dispatch;
 /// Issue-mutation events for the per-workspace SSE feed (`hq-issues-sse`): the
 /// versioned [`events::IssueEvent`] every successful mutation emits, the
 /// [`events::IssueEventSink`] seam the composition root backs with the event log, and
@@ -105,6 +110,7 @@ pub use commands::{
     UpdateIssue,
 };
 pub use delivery::{CommitInfo, CommitInspector, InspectorProvider};
+pub use dispatch::{filter_dispatch, resolve_dispatch};
 pub use events::{emit_issue_event, IssueEvent, IssueEventSink, IssueVerb};
 #[cfg(feature = "axum")]
 pub use http::{issues_router, ApiDoc, IssuesApiState};
@@ -126,4 +132,4 @@ pub use report::{build_report, to_csv, to_xlsx, OperatorReport, ReportRow, Repor
 pub use report_html::render_digest;
 pub use stats::{MeStatsResponse, WorkspaceStats};
 pub use surface::{AllowAllProvider, AllowAllTree, SurfaceEntry, SurfaceProvider, SurfaceTree};
-pub use taxonomy::{Domain, IssueType};
+pub use taxonomy::{Dispatch, Domain, IssueType};

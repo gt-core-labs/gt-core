@@ -111,7 +111,9 @@ impl GtModule for IssuesModule {
             .tool_with_schema(
                 "issues.create.execute",
                 "Insert a new row in hq.issues + atomic Dolt commit. Closes the docker-exec \
-                 bypass for agent-created beads.",
+                 bypass for agent-created beads. Optional dispatch=auto|manual sets the \
+                 agent-dispatch policy; omitted = inherit from the parent epic (child_of), \
+                 bottoming out at manual.",
                 schema_for::<CreateIssue>(),
             )
             .tool_with_schema(
@@ -131,7 +133,8 @@ impl GtModule for IssuesModule {
                  (from gt://issue/{id}) for optimistic concurrency — a stale write fails with \
                  'version conflict' instead of clobbering. On success returns the post-bump \
                  version so a follow-up edit can chain expected_version without re-reading. \
-                 Status transitions go through issues.transition.*.",
+                 dispatch=auto|manual sets the agent-dispatch policy ('' clears back to \
+                 inherit-from-parent). Status transitions go through issues.transition.*.",
                 schema_for::<UpdateIssue>(),
             )
             .tool_with_schema(
@@ -198,7 +201,9 @@ impl GtModule for IssuesModule {
                  {rows, total, next_offset, has_more} — advance offset=next_offset until \
                  has_more=false to walk the full corpus. Pass full=true to inline heavy bodies \
                  (description/acceptance_criteria/notes). Pass ready=true to narrow to actionable \
-                 beads only (all readiness clauses satisfied). Read-only — no state change.",
+                 beads only (all readiness clauses satisfied). Pass dispatch=auto|manual to narrow \
+                 by the RESOLVED dispatch policy (own value, else inherited from the parent epic \
+                 via child_of, else manual). Read-only — no state change.",
                 schema_for::<ListIssues>(),
             )
             .tool_with_schema(

@@ -12,15 +12,18 @@ use gt_issues::handlers::{
     run_update_issue, ClaimResult,
 };
 use gt_issues::{
-    emit_issue_event, run_board_list, run_board_move, run_board_reorder, run_board_scopes,
-    AdvancePhase, BoardList,
-    BoardMove, BoardReorder, ClaimIssue, CloseIssue, CommitInspector, CreateIssue, IssueEventSink,
-    IssueVerb, ListIssues, ReadIssue, TransitionIssue, UpdateIssue,
+    emit_issue_event, filter_dispatch, run_board_list, run_board_move, run_board_reorder,
+    run_board_scopes, AdvancePhase, BoardList,
+    BoardMove, BoardReorder, ClaimIssue, CloseIssue, CommitInspector, CreateIssue, Dispatch,
+    IssueEventSink, IssueVerb, ListIssues, ReadIssue, TransitionIssue, UpdateIssue,
 };
 use gt_issues::resources::{read_issue, read_issues_page, filter_ready, read_issues};
 use gt_meta::ReportGap;
 use gt_module::McpTool;
-use gt_store_dolt::{AppError, ClaimOutcome, DoltIssues, IssueFilter, NewIssue};
+use gt_store_dolt::{
+    issues_default_limit, issues_max_limit, AppError, ClaimOutcome, DoltIssues, IssueFilter,
+    IssuePage, NewIssue,
+};
 use serde_json::{json, Value};
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -251,6 +254,18 @@ pub async fn dispatch(
                 // hq-62130a — optional board-workspace narrowing.
                 workspace: a.workspace,
             };
+            // gtcore-1acbcf (C1) — `dispatch=auto|manual` narrows on the RESOLVED
+            // policy (own value, else `child_of` inheritance, else manual), never
+            // the raw column. Parse against the closed set up front so a typo
+            // fails loud before any query runs.
+            let want_dispatch = match a.dispatch.as_deref() {
+                None => None,
+                Some(raw) => Some(Dispatch::parse(raw).ok_or_else(|| {
+                    AppError::Validation(format!(
+                        "unknown dispatch filter `{raw}` (expected auto/manual)"
+                    ))
+                })?),
+            };
             if filter.ready {
                 // ready=true needs phase frontier + dep index + git tree (same as resource path)
                 let rows = read_issues(store, &filter).await?;
@@ -258,9 +273,48 @@ pub async fn dispatch(
                 let deps_map = store.depends_on_edges(&filter).await?;
                 let deps = store.dep_index().await?;
                 let tree = surface_tree(repo_dir);
-                let rows = filter_ready(rows, &deps_map, open_phase, &deps, tree.as_ref());
+                let mut rows = filter_ready(rows, &deps_map, open_phase, &deps, tree.as_ref());
+                if let Some(want) = want_dispatch {
+                    // Unscoped maps: an ancestor epic may sit outside the rig/ws slice.
+                    let parents = store.parent_map("", "").await?;
+                    let raw = store.dispatch_index().await?;
+                    rows = filter_dispatch(rows, want, &parents, &raw);
+                }
                 filter.ready = false; // consumed
                 return serde_json::to_value(&rows)
+                    .map_err(|e| AppError::Other(format!("encode issues: {e}")));
+            }
+            if let Some(want) = want_dispatch {
+                // Inheritance resolution cannot run in the SQL WHERE, so the page
+                // is assembled in memory: fetch the candidate set up to the max
+                // ceiling, resolve+filter per row, then slice the requested page
+                // (cost documented on `gt_issues::dispatch::filter_dispatch`).
+                let offset = filter.offset.unwrap_or(0);
+                let limit = filter
+                    .limit
+                    .unwrap_or_else(issues_default_limit)
+                    .min(issues_max_limit());
+                let mut unpaged = filter.clone();
+                unpaged.offset = None;
+                unpaged.limit = Some(issues_max_limit());
+                let rows = read_issues(store, &unpaged).await?;
+                let parents = store.parent_map("", "").await?;
+                let raw = store.dispatch_index().await?;
+                let rows = filter_dispatch(rows, want, &parents, &raw);
+                let total = rows.len() as i64;
+                let page_rows: Vec<_> = rows
+                    .into_iter()
+                    .skip(offset as usize)
+                    .take(limit as usize)
+                    .collect();
+                let next_offset = offset.saturating_add(page_rows.len() as u32);
+                let page = IssuePage {
+                    rows: page_rows,
+                    total,
+                    next_offset,
+                    has_more: (next_offset as i64) < total,
+                };
+                return serde_json::to_value(&page)
                     .map_err(|e| AppError::Other(format!("encode issues: {e}")));
             }
             let page = read_issues_page(store, &filter).await?;

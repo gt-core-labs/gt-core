@@ -30,7 +30,7 @@ use serde::{Deserialize, Serialize};
 use crate::surface::{
     check_surface_existence, check_surface_shape, surface_to_json, SurfaceEntry, SurfaceTree,
 };
-use crate::taxonomy::{Domain, IssueType};
+use crate::taxonomy::{Dispatch, Domain, IssueType};
 
 /// Map a [`gt_module_mcp::taxonomy::TaxonomyError`] onto the store's
 /// [`AppError::Validation`] so the NN-16 rejection surfaces with the same
@@ -65,6 +65,19 @@ fn check_phase(phase: &str) -> Result<(), AppError> {
     if IssuePhase::parse(phase).is_none() {
         return Err(AppError::Validation(format!(
             "unknown phase `{phase}` (expected one of P1/P2/P3/P4)"
+        )));
+    }
+    Ok(())
+}
+
+/// Reject a dispatch token outside the closed set (gtcore-1acbcf). The empty
+/// string is the clear-to-inherit sentinel (mirrors `assignee`/`start_date`):
+/// it nulls the own value so the bead falls back to its `child_of` parent
+/// chain, bottoming out at `manual`.
+fn check_dispatch(dispatch: &str) -> Result<(), AppError> {
+    if !dispatch.is_empty() && Dispatch::parse(dispatch).is_none() {
+        return Err(AppError::Validation(format!(
+            "unknown dispatch `{dispatch}` (expected auto/manual, or empty to clear back to inherit)"
         )));
     }
     Ok(())
@@ -190,6 +203,13 @@ pub struct CreateIssue {
     /// (rig, workspace) scope key. Default empty ⇒ the `'default'` workspace.
     #[serde(default)]
     pub workspace: String,
+    /// Dispatch policy (gtcore-1acbcf C1) — whether an agent may claim this
+    /// bead. Closed set ([`Dispatch`]): an out-of-set value is rejected at
+    /// deserialization, mirroring `issue_type`. `None` stores SQL `NULL` =
+    /// "inherit from the `child_of` parent chain", which bottoms out at
+    /// `manual` — so `auto` is always an explicit opt-in.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dispatch: Option<Dispatch>,
 }
 
 impl CreateIssue {
@@ -309,6 +329,7 @@ impl CreateIssue {
             phase: self.phase.clone(),
             rig,
             workspace: self.workspace.clone(),
+            dispatch: self.dispatch.map(|d| d.as_str().to_string()),
         }
     }
 }
@@ -397,6 +418,15 @@ pub struct UpdateIssue {
     /// Empty rejected (a card always belongs to a workspace).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workspace: Option<String>,
+    /// New dispatch policy (gtcore-1acbcf C1). `None` leaves the column
+    /// untouched; `Some("auto"|"manual")` overwrites (validated against the
+    /// closed [`Dispatch`] set); `Some("")` clears the own value back to
+    /// inherit-from-parent (`child_of` chain, bottoming out at `manual`) —
+    /// the same clear-to-NULL sentinel `assignee`/`start_date` use. A string
+    /// (not the enum) so the clear sentinel stays expressible, mirroring
+    /// `phase`'s plumbing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dispatch: Option<String>,
 }
 
 impl UpdateIssue {
@@ -440,6 +470,10 @@ impl UpdateIssue {
         }
         if let Some(phase) = &self.phase {
             check_phase(phase)?;
+        }
+        // gtcore-1acbcf — dispatch overwrite must stay in the closed set ("" clears).
+        if let Some(dispatch) = &self.dispatch {
+            check_dispatch(dispatch)?;
         }
         // hq-62130a — planning-field shape rules.
         if let Some(h) = self.estimated_hours {
@@ -517,6 +551,7 @@ impl UpdateIssue {
             start_date: self.start_date.clone(),
             due_date: self.due_date.clone(),
             workspace: self.workspace.clone(),
+            dispatch: self.dispatch.clone(),
         }
     }
 }
@@ -719,6 +754,15 @@ pub struct ListIssues {
     /// (rig, workspace) scope key. Absent ⇒ all workspaces (back-compat).
     #[serde(default)]
     pub workspace: Option<String>,
+    /// Filter by RESOLVED dispatch policy (`auto`|`manual`, gtcore-1acbcf C1):
+    /// the bead's own value, else the `child_of`-inherited one, else `manual`
+    /// — NOT the raw column. Validated against the closed [`Dispatch`] set at
+    /// the handler. Resolution runs per row above the store (see
+    /// [`crate::dispatch::filter_dispatch`] for the cost note), so a
+    /// dispatch-filtered list fetches the candidate set up to the configured
+    /// max-limit ceiling and pages in memory.
+    #[serde(default)]
+    pub dispatch: Option<String>,
 }
 
 /// Input for `issues.read` — fetch a single bead with its full detail.
@@ -753,6 +797,7 @@ mod tests {
             role_scope: None,
             phase: None,
             workspace: String::new(),
+            dispatch: None,
         }
     }
 
@@ -779,6 +824,7 @@ mod tests {
             start_date: None,
             due_date: None,
             workspace: None,
+            dispatch: None,
         }
     }
 
@@ -960,6 +1006,7 @@ mod tests {
             start_date: None,
             due_date: None,
             workspace: None,
+            dispatch: None,
         };
         assert!(u.validate().is_err());
     }
@@ -987,6 +1034,7 @@ mod tests {
             start_date: None,
             due_date: None,
             workspace: None,
+            dispatch: None,
         };
         assert!(u.validate().is_ok());
         assert_eq!(u.to_patch().expected_version, Some(7));
@@ -1018,6 +1066,7 @@ mod tests {
             start_date: None,
             due_date: None,
             workspace: None,
+            dispatch: None,
         };
         assert!(u.validate().is_err());
     }
@@ -1184,11 +1233,50 @@ mod tests {
             start_date: None,
             due_date: None,
             workspace: None,
+            dispatch: None,
         };
         assert!(u.validate().is_ok());
         assert_eq!(u.to_patch().phase.as_deref(), Some("P4"));
         u.phase = Some("nope".into());
         assert!(u.validate().is_err());
+    }
+
+    #[test]
+    fn create_carries_dispatch_through_to_new_and_rejects_out_of_set_wire() {
+        // Typed field: to_new serializes the lowercase store token.
+        let mut c = base_create();
+        c.dispatch = Some(Dispatch::Auto);
+        assert!(c.validate().is_ok());
+        assert_eq!(c.to_new().dispatch.as_deref(), Some("auto"));
+        // Omitted ⇒ NULL ⇒ inherit-from-parent (gtcore-1acbcf).
+        assert_eq!(base_create().to_new().dispatch, None);
+        // The closed set bites at deserialization, same plumbing as issue_type.
+        let mut wire = serde_json::to_value(base_create()).unwrap();
+        wire["dispatch"] = serde_json::json!("always");
+        assert!(serde_json::from_value::<CreateIssue>(wire.clone()).is_err());
+        wire["dispatch"] = serde_json::json!("manual");
+        let parsed: CreateIssue = serde_json::from_value(wire).unwrap();
+        assert_eq!(parsed.dispatch, Some(Dispatch::Manual));
+    }
+
+    #[test]
+    fn update_accepts_dispatch_overwrite_clear_and_rejects_bad() {
+        // Overwrite with a closed-set token.
+        let mut u = base_update();
+        u.dispatch = Some("auto".into());
+        assert!(u.validate().is_ok());
+        assert_eq!(u.to_patch().dispatch.as_deref(), Some("auto"));
+        // Empty string = clear back to inherit (NULL).
+        u.dispatch = Some(String::new());
+        assert!(u.validate().is_ok());
+        assert_eq!(u.to_patch().dispatch.as_deref(), Some(""));
+        // Out-of-set rejected by validate.
+        u.dispatch = Some("always".into());
+        assert!(matches!(u.validate(), Err(AppError::Validation(_))));
+        // A dispatch-only patch is a non-empty patch.
+        let mut u = base_update();
+        u.dispatch = Some("manual".into());
+        assert!(!u.to_patch().is_empty());
     }
 
     #[test]

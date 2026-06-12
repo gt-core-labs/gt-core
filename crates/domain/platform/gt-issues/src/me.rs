@@ -208,6 +208,7 @@ mod tests {
             estimated_hours: None,
             start_date: None,
             due_date: None,
+            dispatch: None,
             description: None,
             design: None,
             acceptance_criteria: None,

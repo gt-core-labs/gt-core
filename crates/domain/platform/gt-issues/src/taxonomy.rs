@@ -177,9 +177,52 @@ impl IssueType {
     }
 }
 
+/// A bead's dispatch policy — a CLOSED set (gtcore-1acbcf C1), same rationale as
+/// [`IssueType`]: whether an agent may claim the bead is an explicit operator
+/// decision, so an out-of-set value is rejected at deserialization rather than
+/// silently landing in the column.
+///
+/// `Manual` is the default ([`Default`]): nothing becomes agent-dispatchable by
+/// accident — `auto` is opt-in. On the wire the value rides per-bead as an
+/// OPTIONAL field: an omitted/`NULL` value means "inherit from the `child_of`
+/// parent chain", resolved in read by
+/// [`resolve_dispatch`](crate::dispatch::resolve_dispatch); a chain that yields
+/// no value resolves to `Manual`.
+#[allow(missing_docs)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
+#[cfg_attr(feature = "axum", derive(utoipa::ToSchema))]
+#[serde(rename_all = "lowercase")]
+pub enum Dispatch {
+    Auto,
+    #[default]
+    Manual,
+}
+
+impl Dispatch {
+    /// Parse a wire/SQL token (`"auto"`/`"manual"`) into the typed policy.
+    /// `None` for any other string so an out-of-set value is rejected at the
+    /// frontier instead of silently entering the column (mirrors
+    /// [`IssuePhase::parse`](gt_store_dolt::IssuePhase::parse)).
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "auto" => Some(Self::Auto),
+            "manual" => Some(Self::Manual),
+            _ => None,
+        }
+    }
+
+    /// The lowercase wire/store form (the `hq.issues.dispatch` column value).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::Manual => "manual",
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{Domain, IssueType};
+    use super::{Dispatch, Domain, IssueType};
 
     #[test]
     fn round_trips_dotted_wire_form() {
@@ -208,6 +251,27 @@ mod tests {
         assert!(serde_json::from_str::<IssueType>("\"banana\"").is_err());
         // Wire form is lowercase only — capitalized rejected too.
         assert!(serde_json::from_str::<IssueType>("\"Epic\"").is_err());
+    }
+
+    #[test]
+    fn dispatch_round_trips_lowercase_wire_form() {
+        let d: Dispatch = serde_json::from_str("\"auto\"").unwrap();
+        assert_eq!(d, Dispatch::Auto);
+        assert_eq!(serde_json::to_string(&d).unwrap(), "\"auto\"");
+        assert_eq!(Dispatch::Manual.as_str(), "manual");
+        assert_eq!(Dispatch::parse("auto"), Some(Dispatch::Auto));
+        assert_eq!(Dispatch::parse("manual"), Some(Dispatch::Manual));
+        // Default is the opt-in-safe Manual.
+        assert_eq!(Dispatch::default(), Dispatch::Manual);
+    }
+
+    #[test]
+    fn dispatch_rejects_out_of_set_value() {
+        assert!(serde_json::from_str::<Dispatch>("\"always\"").is_err());
+        // Wire form is lowercase only — capitalized rejected too.
+        assert!(serde_json::from_str::<Dispatch>("\"Auto\"").is_err());
+        assert_eq!(Dispatch::parse("Auto"), None);
+        assert_eq!(Dispatch::parse(""), None);
     }
 
     #[test]

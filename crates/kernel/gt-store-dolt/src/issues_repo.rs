@@ -210,6 +210,12 @@ pub struct IssueRow {
     /// metric (`due_date < now AND status != closed`).
     #[serde(default)]
     pub due_date: Option<String>,
+    /// RAW dispatch policy token (`"auto"`/`"manual"`, gtcore-1acbcf C1) — the
+    /// row's OWN value only. `None` = no own value: the effective policy is
+    /// inherited from the `child_of` parent chain (`manual` when the chain
+    /// yields nothing), resolved by `gt_issues::dispatch::resolve_dispatch`.
+    #[serde(default)]
+    pub dispatch: Option<String>,
     /// Heavy text bodies, populated only when [`IssueFilter::full`] is set
     /// (hq-gap-issues-list-full). `None` in the cheap default snapshot and
     /// skipped from the JSON entirely, so back-compat consumers see the exact
@@ -371,6 +377,10 @@ pub struct IssueDetail {
     /// Planned end date `YYYY-MM-DD` (hq-62130a).
     #[serde(default)]
     pub due_date: Option<String>,
+    /// RAW dispatch policy token (gtcore-1acbcf C1). See [`IssueRow::dispatch`]:
+    /// the own value only, `None` = inherits from the `child_of` parent chain.
+    #[serde(default)]
+    pub dispatch: Option<String>,
 }
 
 /// A row from the `issue_relations` table.
@@ -448,6 +458,12 @@ pub struct IssuePatch {
     /// New board workspace (hq-62130a) — re-scopes the card to another project.
     /// Empty rejected upstream (a card always belongs to a workspace).
     pub workspace: Option<String>,
+    /// New dispatch policy (`"auto"`/`"manual"`, gtcore-1acbcf C1). `None`
+    /// leaves the column untouched; `Some("")` clears it to SQL `NULL` =
+    /// "inherit from the `child_of` parent chain" (the clear-to-inherit
+    /// sentinel, mirroring `assignee`); a non-empty value is validated against
+    /// the closed `Dispatch` set upstream and overwrites.
+    pub dispatch: Option<String>,
     /// Optimistic-concurrency guard (hq-mcp-issues.8). `None` = unguarded
     /// last-write-wins (back-compat). `Some(v)` makes the UPDATE match only when
     /// the row's current `version` equals `v`; a mismatch surfaces as
@@ -478,6 +494,7 @@ impl IssuePatch {
             && self.start_date.is_none()
             && self.due_date.is_none()
             && self.workspace.is_none()
+            && self.dispatch.is_none()
     }
 }
 
@@ -532,6 +549,11 @@ pub struct NewIssue {
     /// normalised to `'default'` by [`DoltIssues::insert`] so every card carries
     /// the full (rig, workspace) scope key from birth.
     pub workspace: String,
+    /// Dispatch policy token (`"auto"`/`"manual"`, gtcore-1acbcf C1). `None`
+    /// stores SQL `NULL` = "inherit from the `child_of` parent chain" — the
+    /// opt-in default, resolved in read by gt-issues. The frontier validates a
+    /// `Some(_)` against the closed `Dispatch` set before insert.
+    pub dispatch: Option<String>,
 }
 
 /// Read-only Dolt adapter for the `issues` table. The canonical bead table is
@@ -782,6 +804,39 @@ impl DoltIssues {
             .await
             .map_err(map_err)?;
         }
+        // gtcore-1acbcf (C1 — dispatch policy) — the static auto|manual dispatch
+        // column. NULLable on purpose: NULL means "no own value, inherit from the
+        // `child_of` parent chain" (resolved IN READ by gt-issues, never
+        // materialized here); a chain that yields no value resolves to `manual`.
+        // So the effective default is `manual` — nothing becomes agent-
+        // dispatchable by accident — while flipping an epic to `auto` cascades to
+        // every NULL child with zero row writes. Same idempotent column-add pass
+        // as the taxonomy/board blocks above.
+        let dispatch_exists: Option<i64> = conn
+            .exec_first(
+                "SELECT 1 FROM information_schema.columns
+                 WHERE table_schema = DATABASE()
+                   AND table_name = 'issues'
+                   AND column_name = 'dispatch' LIMIT 1",
+                mysql_async::Params::Empty,
+            )
+            .await
+            .map_err(map_err)?;
+        if dispatch_exists.is_none() {
+            conn.query_drop("ALTER TABLE issues ADD COLUMN dispatch VARCHAR(16) NULL")
+                .await
+                .map_err(map_err)?;
+            conn.exec_drop(
+                "CALL DOLT_COMMIT('-A', '-m', :msg)",
+                mysql_async::params! {
+                    "msg" => "gtcore-1acbcf: add dispatch policy column (auto|manual, NULL = inherit)"
+                        .to_string(),
+                },
+            )
+            .await
+            .map_err(map_err)?;
+        }
+
         // ── issue_relations (idempotent) ──────────────────────────────────────
         conn.query_drop(
             "CREATE TABLE IF NOT EXISTS issue_relations (
@@ -1047,11 +1102,13 @@ impl DoltIssues {
             "INSERT INTO issues
                 (id, title, description, design, acceptance_criteria, notes,
                  status, priority, issue_type, assignee, owner, created_by,
-                 domain_json, surface_json, role_scope, phase, rig, workspace)
+                 domain_json, surface_json, role_scope, phase, rig, workspace,
+                 dispatch)
              VALUES
                 (:id, :title, :description, :design, :acceptance_criteria, :notes,
                  'open', :priority, :issue_type, :assignee, :owner, :created_by,
-                 :domain_json, :surface_json, :role_scope, :phase, :rig, :workspace)",
+                 :domain_json, :surface_json, :role_scope, :phase, :rig, :workspace,
+                 :dispatch)",
             mysql_async::params! {
                 "id" => &row.id,
                 "title" => &row.title,
@@ -1070,6 +1127,8 @@ impl DoltIssues {
                 "phase" => phase,
                 "rig" => &row.rig,
                 "workspace" => workspace,
+                // None ⇒ SQL NULL = inherit from the parent chain (gtcore-1acbcf).
+                "dispatch" => row.dispatch.clone(),
             },
         )
         .await
@@ -1202,6 +1261,13 @@ impl DoltIssues {
         if let Some(v) = &patch.workspace {
             set_parts.push("workspace = :workspace");
             params_vec.push(("workspace".to_string(), mysql_async::Value::from(v.clone())));
+        }
+        // gtcore-1acbcf — dispatch policy. Empty string clears to SQL NULL =
+        // "inherit from the `child_of` parent chain"; a non-empty value was
+        // validated against the closed `Dispatch` set upstream.
+        if let Some(v) = &patch.dispatch {
+            set_parts.push("dispatch = :dispatch");
+            params_vec.push(("dispatch".to_string(), str_or_null(v)));
         }
 
         set_parts.push("updated_at = NOW()");
@@ -1941,6 +2007,23 @@ impl DoltIssues {
             .collect())
     }
 
+    /// Map every bead id to its RAW `dispatch` value (gtcore-1acbcf C1):
+    /// `None` = NULL = "no own value, inherit from the `child_of` parent chain".
+    /// Unbounded and column-minimal (mirrors [`dep_index`](Self::dep_index)) so
+    /// per-row inheritance resolution (`gt_issues::dispatch::resolve_dispatch`)
+    /// can walk a chain whose ancestors may sit outside any filtered display set.
+    /// C3's `ready_for_auto` frontier consumes the same index.
+    pub async fn dispatch_index(
+        &self,
+    ) -> Result<std::collections::HashMap<String, Option<String>>, AppError> {
+        let mut conn = self.pool.get_conn().await.map_err(map_err)?;
+        let rows: Vec<(String, Option<String>)> = conn
+            .exec("SELECT id, dispatch FROM issues", mysql_async::Params::Empty)
+            .await
+            .map_err(map_err)?;
+        Ok(rows.into_iter().collect())
+    }
+
     /// Insert or ignore a relation into `issue_relations` and Dolt-commit it.
     pub async fn add_relation(&self, from_id: &str, to_id: &str, rel_type: &str) -> Result<(), AppError> {
         let mut conn = self.pool.get_conn().await.map_err(map_err)?;
@@ -2182,10 +2265,10 @@ impl DoltIssues {
         };
 
         // hq-gap-issues-list-full: when `full`, append the heavy text bodies
-        // after the board columns (ordinals 25-28) so a sub-epic review reads in
-        // one call. Kept at the END of the SELECT so the cheap-snapshot ordinals
-        // 0-24 (incl. `phase` at 17, `delivered_sha` at 18, the hq-62130a board
-        // columns at 20-24) are untouched by `full`.
+        // after the scalar columns so a sub-epic review reads in one call. Kept
+        // at the END of the SELECT so the cheap-snapshot ordinals 0-23 (incl.
+        // `phase` at 15, `delivered_sha` at 16, the hq-62130a board columns at
+        // 18-22, `dispatch` at 23) are untouched by `full`.
         let body_cols = if filter.full {
             ", description, design, acceptance_criteria, notes"
         } else {
@@ -2202,7 +2285,8 @@ impl DoltIssues {
                     workspace, board_rank,
                     CAST(estimated_hours AS DOUBLE) AS estimated_hours,
                     DATE_FORMAT(start_date, '%Y-%m-%d') AS start_date,
-                    DATE_FORMAT(due_date,   '%Y-%m-%d') AS due_date{body_cols}
+                    DATE_FORMAT(due_date,   '%Y-%m-%d') AS due_date,
+                    dispatch{body_cols}
              FROM issues
              {where_clause}
              ORDER BY created_at DESC, id ASC
@@ -2241,7 +2325,8 @@ impl DoltIssues {
                     workspace, board_rank,
                     CAST(estimated_hours AS DOUBLE) AS estimated_hours,
                     DATE_FORMAT(start_date, '%Y-%m-%d') AS start_date,
-                    DATE_FORMAT(due_date,   '%Y-%m-%d') AS due_date
+                    DATE_FORMAT(due_date,   '%Y-%m-%d') AS due_date,
+                    dispatch
              FROM issues
              WHERE id = :id
              LIMIT 1";
@@ -2272,7 +2357,7 @@ fn row_to_detail(row: mysql_async::Row) -> Result<IssueDetail, AppError> {
     // 11=description 12=design 13=acceptance_criteria 14=notes
     // 15=domain_json 16=surface_json 17=role_scope 18=version
     // 19=phase 20=delivered_sha 21=rig 22=workspace 23=board_rank
-    // 24=estimated_hours 25=start_date 26=due_date
+    // 24=estimated_hours 25=start_date 26=due_date 27=dispatch
     Ok(IssueDetail {
         id: take_string(&mut row, 0)?,
         title: take_string(&mut row, 1)?,
@@ -2301,6 +2386,8 @@ fn row_to_detail(row: mysql_async::Row) -> Result<IssueDetail, AppError> {
         estimated_hours: row.take::<Option<f64>, _>(24).unwrap_or(None),
         start_date: take_opt(&mut row, 25),
         due_date: take_opt(&mut row, 26),
+        // Raw own dispatch — NULL = inherit (gtcore-1acbcf C1).
+        dispatch: take_opt(&mut row, 27),
     })
 }
 
@@ -2326,7 +2413,7 @@ fn row_to_issue(row: mysql_async::Row, full: bool) -> Result<IssueRow, AppError>
     // 7=created_at 8=updated_at 9=closed_at 10=spec_id
     // 11=domain_json 12=surface_json 13=role_scope 14=version
     // 15=phase 16=delivered_sha 17=rig 18=workspace 19=board_rank
-    // 20=estimated_hours 21=start_date 22=due_date 23-26=body_cols
+    // 20=estimated_hours 21=start_date 22=due_date 23=dispatch 24-27=body_cols
     Ok(IssueRow {
         id: take_string(&mut row, 0)?,
         title: take_string(&mut row, 1)?,
@@ -2351,11 +2438,13 @@ fn row_to_issue(row: mysql_async::Row, full: bool) -> Result<IssueRow, AppError>
         estimated_hours: row.take::<Option<f64>, _>(20).unwrap_or(None),
         start_date: take_opt(&mut row, 21),
         due_date: take_opt(&mut row, 22),
-        // Bodies only SELECTed when `full` — ordinals 23-26.
-        description: full.then(|| take_opt(&mut row, 23).unwrap_or_default()),
-        design: full.then(|| take_opt(&mut row, 24).unwrap_or_default()),
-        acceptance_criteria: full.then(|| take_opt(&mut row, 25).unwrap_or_default()),
-        notes: full.then(|| take_opt(&mut row, 26).unwrap_or_default()),
+        // Raw own dispatch — NULL = inherit (gtcore-1acbcf C1).
+        dispatch: take_opt(&mut row, 23),
+        // Bodies only SELECTed when `full` — ordinals 24-27.
+        description: full.then(|| take_opt(&mut row, 24).unwrap_or_default()),
+        design: full.then(|| take_opt(&mut row, 25).unwrap_or_default()),
+        acceptance_criteria: full.then(|| take_opt(&mut row, 26).unwrap_or_default()),
+        notes: full.then(|| take_opt(&mut row, 27).unwrap_or_default()),
     })
 }
 

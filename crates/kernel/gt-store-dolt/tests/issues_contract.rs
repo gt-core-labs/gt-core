@@ -49,11 +49,9 @@ async fn seed(base: &str) -> Result<(), Box<dyn std::error::Error>> {
             updated_at          DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
             closed_at           DATETIME,
             closed_by_session   VARCHAR(255) DEFAULT '',
-            external_ref        VARCHAR(255),
             spec_id             VARCHAR(1024),
             domain_json         TEXT NOT NULL DEFAULT '[]',
             surface_json        TEXT NOT NULL DEFAULT '[]',
-            depends_on_json     TEXT NOT NULL DEFAULT '[]',
             role_scope          VARCHAR(32),
             version             BIGINT NOT NULL DEFAULT 0,
             phase               ENUM('P1','P2','P3','P4') NOT NULL DEFAULT 'P1',
@@ -63,18 +61,36 @@ async fn seed(base: &str) -> Result<(), Box<dyn std::error::Error>> {
             board_rank          VARCHAR(255) NOT NULL DEFAULT '',
             estimated_hours     DECIMAL(8,2),
             start_date          DATE,
-            due_date            DATE
+            due_date            DATE,
+            dispatch            VARCHAR(16)
+        )",
+    )
+    .await?;
+    // Parentage lives in issue_relations (child_of) since the external_ref refactor.
+    conn.query_drop(
+        "CREATE TABLE IF NOT EXISTS issue_relations (
+            from_id  VARCHAR(255) NOT NULL,
+            to_id    VARCHAR(255) NOT NULL,
+            rel_type VARCHAR(32)  NOT NULL,
+            PRIMARY KEY (from_id, to_id, rel_type)
         )",
     )
     .await?;
     conn.query_drop("DELETE FROM issues").await?;
+    conn.query_drop("DELETE FROM issue_relations").await?;
     conn.query_drop(
         "INSERT INTO issues (id, title, description, design, acceptance_criteria, notes,
-            status, priority, issue_type, assignee, external_ref) VALUES
-            ('hq-a',  'alpha',  '', '', '', '', 'open',    0, 'epic',  'alice', 'hq-root'),
-            ('hq-b',  'beta',   '', '', '', '', 'working', 1, 'task',  'bob',   NULL),
-            ('hq-c',  'gamma',  '', '', '', '', 'closed',  2, 'task',  NULL,    'hq-root'),
-            ('hq-d',  'delta',  '', '', '', '', 'open',    2, 'spike', 'alice', NULL)",
+            status, priority, issue_type, assignee) VALUES
+            ('hq-a',  'alpha',  '', '', '', '', 'open',    0, 'epic',  'alice'),
+            ('hq-b',  'beta',   '', '', '', '', 'working', 1, 'task',  'bob'),
+            ('hq-c',  'gamma',  '', '', '', '', 'closed',  2, 'task',  NULL),
+            ('hq-d',  'delta',  '', '', '', '', 'open',    2, 'spike', 'alice')",
+    )
+    .await?;
+    conn.query_drop(
+        "INSERT INTO issue_relations (from_id, to_id, rel_type) VALUES
+            ('hq-a', 'hq-root', 'child_of'),
+            ('hq-c', 'hq-root', 'child_of')",
     )
     .await?;
     Ok(())
@@ -127,14 +143,14 @@ async fn list_filters_combine() {
         .expect("list alice");
     assert_eq!(alice.len(), 2);
 
-    let by_ref = repo
+    let by_parent = repo
         .list(&IssueFilter {
-            external_ref: Some("hq-root".into()),
+            parent_id: Some("hq-root".into()),
             ..Default::default()
         })
         .await
-        .expect("list external_ref");
-    assert_eq!(by_ref.len(), 2);
+        .expect("list parent_id");
+    assert_eq!(by_parent.len(), 2);
 
     let epics = repo
         .list(&IssueFilter {
@@ -189,22 +205,22 @@ async fn insert_commits_atomic() {
         priority: 1,
         issue_type: "task".into(),
         created_by: "test".into(),
-        external_ref: Some("hq-root".into()),
+        parent_id: Some("hq-root".into()),
         assignee: Some("alice".into()),
         owner: Some("alice".into()),
         ..Default::default()
     };
     repo.insert(&row).await.expect("insert");
 
-    // Visible to a follow-up list (proves the row landed).
-    let by_ref = repo
+    // Visible to a follow-up list (proves the row + its child_of relation landed).
+    let by_parent = repo
         .list(&IssueFilter {
-            external_ref: Some("hq-root".into()),
+            parent_id: Some("hq-root".into()),
             ..Default::default()
         })
         .await
         .expect("list");
-    let ids: Vec<&str> = by_ref.iter().map(|r| r.id.as_str()).collect();
+    let ids: Vec<&str> = by_parent.iter().map(|r| r.id.as_str()).collect();
     assert!(ids.contains(&id.as_str()), "{id} should be visible: ids={ids:?}");
 
     // Duplicate insert errors with the underlying primary-key violation.
@@ -238,7 +254,7 @@ async fn update_patches_visible_fields_and_commits() {
         priority: 2,
         issue_type: "task".into(),
         created_by: "test".into(),
-        external_ref: None,
+        parent_id: None,
         assignee: None,
         owner: None,
         ..Default::default()
@@ -252,7 +268,6 @@ async fn update_patches_visible_fields_and_commits() {
         notes: Some("patched".into()),
         domain_json: Some("[\"orch.merge\"]".into()),
         surface_json: Some("[\"crates/domain/platform/gt-web-context\"]".into()),
-        depends_on_json: Some("[\"hq-dep-1\"]".into()),
         ..Default::default()
     };
     repo.update(&id, &patch).await.expect("update");
@@ -274,7 +289,6 @@ async fn update_patches_visible_fields_and_commits() {
     // JSON-array columns are patchable through issues.update now.
     assert_eq!(row_after.domain_json, "[\"orch.merge\"]");
     assert_eq!(row_after.surface_json, "[\"crates/domain/platform/gt-web-context\"]");
-    assert_eq!(row_after.depends_on_json, "[\"hq-dep-1\"]");
 
     // Empty-string overwrite clears the nullable columns back to NULL/None.
     let clear = IssuePatch {
@@ -307,38 +321,6 @@ async fn update_patches_visible_fields_and_commits() {
         repo.get_detail("hq-missing-zzz").await.expect("ok").is_none(),
         "missing id must be None",
     );
-
-    // Cross-bead cycle guard: self-edge and a 2-node back-edge are both rejected.
-    let self_cycle = IssuePatch {
-        depends_on_json: Some(format!("[\"{id}\"]")),
-        ..Default::default()
-    };
-    let err = repo
-        .update(&id, &self_cycle)
-        .await
-        .expect_err("self-cycle must be rejected");
-    assert!(err.to_string().contains("self-cycle"), "got `{err}`");
-
-    let other = format!("hq-cyc-{}", ulid::Ulid::new());
-    repo.insert(&NewIssue {
-        id: other.clone(),
-        title: "dependent".into(),
-        issue_type: "task".into(),
-        created_by: "test".into(),
-        depends_on_json: format!("[\"{id}\"]"),
-        ..Default::default()
-    })
-    .await
-    .expect("seed dependent");
-    let back_edge = IssuePatch {
-        depends_on_json: Some(format!("[\"{other}\"]")),
-        ..Default::default()
-    };
-    let err = repo
-        .update(&id, &back_edge)
-        .await
-        .expect_err("2-node cycle must be rejected");
-    assert!(err.to_string().contains("cycle"), "got `{err}`");
 
     // Unknown id surfaces a NotFound — the row never existed.
     let err = repo
@@ -419,7 +401,6 @@ async fn transition_state_machine_round_trip() {
         priority: 2,
         issue_type: "task".into(),
         created_by: "test".into(),
-        external_ref: None,
         assignee: None,
         owner: None,
         ..Default::default()
@@ -482,7 +463,6 @@ async fn close_stamps_attribution_and_rejects_double() {
         priority: 2,
         issue_type: "task".into(),
         created_by: "test".into(),
-        external_ref: None,
         assignee: None,
         owner: None,
         ..Default::default()
@@ -701,27 +681,32 @@ async fn detail_phase(repo: &DoltIssues, id: &str) -> String {
     repo.get_detail(id).await.expect("get_detail ok").expect("row").phase
 }
 
-/// Reseed `TEST_DB.issues` with exactly `n` rows under a fixed `external_ref`
-/// (`pg-walk`) and zero-padded ids so `ORDER BY created_at DESC, id ASC` is a
-/// deterministic permutation — the page-walk gate (hq-core-mcp.13) needs a stable
-/// known corpus to prove no dup/skip.
+/// Reseed `TEST_DB.issues` with exactly `n` rows parented (`child_of`) under a
+/// fixed `pg-walk` epic and zero-padded ids so `ORDER BY created_at DESC, id ASC`
+/// is a deterministic permutation — the page-walk gate (hq-core-mcp.13) needs a
+/// stable known corpus to prove no dup/skip.
 async fn seed_paged(base: &str, n: usize) -> Result<(), Box<dyn std::error::Error>> {
     let pool = gt_store_dolt::connect(base)?;
     let mut conn = pool.get_conn().await?;
     conn.query_drop(format!("USE {TEST_DB}")).await?;
     conn.query_drop("DELETE FROM issues").await?;
+    conn.query_drop("DELETE FROM issue_relations").await?;
     // Batch the inserts so a 200+ row seed stays one round-trip.
     let values: Vec<String> = (0..n)
-        .map(|i| {
-            format!(
-                "('pg-{i:04}', 'row {i}', '', '', '', '', 'open', 2, 'task', NULL, 'pg-walk')"
-            )
-        })
+        .map(|i| format!("('pg-{i:04}', 'row {i}', '', '', '', '', 'open', 2, 'task', NULL)"))
         .collect();
     conn.query_drop(format!(
         "INSERT INTO issues (id, title, description, design, acceptance_criteria, notes,
-            status, priority, issue_type, assignee, external_ref) VALUES {}",
+            status, priority, issue_type, assignee) VALUES {}",
         values.join(", ")
+    ))
+    .await?;
+    let rels: Vec<String> = (0..n)
+        .map(|i| format!("('pg-{i:04}', 'pg-walk', 'child_of')"))
+        .collect();
+    conn.query_drop(format!(
+        "INSERT INTO issue_relations (from_id, to_id, rel_type) VALUES {}",
+        rels.join(", ")
     ))
     .await?;
     Ok(())
@@ -750,7 +735,7 @@ async fn pager_walks_corpus_without_dup_or_skip() {
     std::env::remove_var("GT_ISSUES_MAX_LIMIT");
 
     let filter = |offset: u32| IssueFilter {
-        external_ref: Some("pg-walk".into()),
+        parent_id: Some("pg-walk".into()),
         limit: Some(50),
         offset: Some(offset),
         ..Default::default()
@@ -805,7 +790,7 @@ async fn pager_walks_corpus_without_dup_or_skip() {
     std::env::set_var("GT_ISSUES_DEFAULT_LIMIT", "17");
     let dflt = repo
         .list_page(&IssueFilter {
-            external_ref: Some("pg-walk".into()),
+            parent_id: Some("pg-walk".into()),
             ..Default::default()
         })
         .await
@@ -819,7 +804,7 @@ async fn pager_walks_corpus_without_dup_or_skip() {
     std::env::set_var("GT_ISSUES_MAX_LIMIT", "40");
     let capped = repo
         .list_page(&IssueFilter {
-            external_ref: Some("pg-walk".into()),
+            parent_id: Some("pg-walk".into()),
             limit: Some(9999),
             ..Default::default()
         })
@@ -880,6 +865,84 @@ async fn create_workspace_dolt_provisions_hq_db_and_issues_schema() {
 
     // Cleanup.
     conn.query_drop("DROP DATABASE IF EXISTS `hq_f3-prov`").await.expect("cleanup");
+}
+
+/// gtcore-1acbcf (C1): the `dispatch` column round-trips through insert/update/
+/// list/get_detail/dispatch_index, the empty-string patch clears it back to NULL
+/// (= inherit), and the `ensure_schema` migration that adds it is idempotent.
+#[tokio::test]
+async fn dispatch_column_round_trips_and_migration_is_idempotent() {
+    let Ok(base) = std::env::var("GT_DOLT_URL") else {
+        eprintln!("GT_DOLT_URL unset — skipping DoltIssues dispatch contract");
+        return;
+    };
+    let base = base.trim_end_matches('/').to_string();
+    seed(&base).await.expect("seed");
+    let repo = DoltIssues::connect(&format!("{base}/{TEST_DB}")).expect("connect");
+
+    // Migration idempotence: a second ensure_schema run is a no-op (the column
+    // probe in information_schema skips the ALTER).
+    repo.ensure_schema().await.expect("ensure_schema");
+    repo.ensure_schema().await.expect("ensure_schema idempotent");
+
+    // Omitted dispatch → NULL (= inherit-from-parent, manual at the root).
+    let plain = format!("hq-disp-{}", ulid::Ulid::new());
+    repo.insert(&NewIssue {
+        id: plain.clone(),
+        title: "inheriting".into(),
+        issue_type: "task".into(),
+        created_by: "test".into(),
+        ..Default::default()
+    })
+    .await
+    .expect("insert plain");
+    assert_eq!(
+        repo.get_detail(&plain).await.expect("d").expect("row").dispatch,
+        None,
+        "omitted dispatch stores NULL"
+    );
+
+    // Explicit dispatch on insert is honoured and surfaces on every read path.
+    let auto = format!("hq-disp-{}", ulid::Ulid::new());
+    repo.insert(&NewIssue {
+        id: auto.clone(),
+        title: "dispatchable".into(),
+        issue_type: "epic".into(),
+        created_by: "test".into(),
+        dispatch: Some("auto".into()),
+        ..Default::default()
+    })
+    .await
+    .expect("insert auto");
+    assert_eq!(
+        repo.get_detail(&auto).await.expect("d").expect("row").dispatch.as_deref(),
+        Some("auto")
+    );
+    let rows = repo.list(&IssueFilter::default()).await.expect("list");
+    let row = rows.iter().find(|r| r.id == auto).expect("row in snapshot");
+    assert_eq!(row.dispatch.as_deref(), Some("auto"), "dispatch in list snapshot");
+
+    // dispatch_index covers the whole table with the raw values.
+    let index = repo.dispatch_index().await.expect("dispatch_index");
+    assert_eq!(index.get(&auto).cloned().flatten().as_deref(), Some("auto"));
+    assert_eq!(index.get(&plain).cloned().flatten(), None);
+
+    // Patch overwrites; empty string clears back to NULL (= inherit).
+    repo.update(&auto, &IssuePatch { dispatch: Some("manual".into()), ..Default::default() })
+        .await
+        .expect("patch manual");
+    assert_eq!(
+        repo.get_detail(&auto).await.expect("d").expect("row").dispatch.as_deref(),
+        Some("manual")
+    );
+    repo.update(&auto, &IssuePatch { dispatch: Some(String::new()), ..Default::default() })
+        .await
+        .expect("clear dispatch");
+    assert_eq!(
+        repo.get_detail(&auto).await.expect("d").expect("row").dispatch,
+        None,
+        "empty-string patch clears back to NULL (inherit)"
+    );
 }
 
 /// hq-docs-archive-sync: `archive_old_closed` returns the archived set (id + issue_type), not a

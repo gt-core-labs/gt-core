@@ -41,11 +41,9 @@ const ISSUES_DDL: &str = "CREATE TABLE IF NOT EXISTS issues (
     updated_at          DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
     closed_at           DATETIME,
     closed_by_session   VARCHAR(255) DEFAULT '',
-    external_ref        VARCHAR(255),
     spec_id             VARCHAR(1024),
     domain_json         TEXT NOT NULL DEFAULT '[]',
     surface_json        TEXT NOT NULL DEFAULT '[]',
-    depends_on_json     TEXT NOT NULL DEFAULT '[]',
     role_scope          VARCHAR(32),
     version             BIGINT NOT NULL DEFAULT 0,
     phase               ENUM('P1','P2','P3','P4') NOT NULL DEFAULT 'P1',
@@ -54,7 +52,9 @@ const ISSUES_DDL: &str = "CREATE TABLE IF NOT EXISTS issues (
     board_rank          VARCHAR(255) NOT NULL DEFAULT '',
     estimated_hours     DECIMAL(8,2),
     start_date          DATE,
-    due_date            DATE
+    due_date            DATE,
+    rig                 VARCHAR(255) NOT NULL DEFAULT '',
+    dispatch            VARCHAR(16)
 )";
 
 /// A database name unique to this process + invocation.
@@ -74,6 +74,7 @@ fn issue(id: &str, priority: u8) -> NewIssue {
         priority,
         issue_type: "task".into(),
         created_by: "seed".into(),
+        parent_id: Some("hq-res".into()),
         ..Default::default()
     }
 }
