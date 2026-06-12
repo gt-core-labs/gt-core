@@ -60,7 +60,7 @@ pub fn render_digest(report: &OperatorReport, summary: &AnalyticsSummary, fecha:
 
     // Title bar (xlsx merged-title parity).
     html.push_str(&format!(
-        "<table style=\"border-collapse:collapse;width:100%;max-width:960px;\"><tr>\
+        "<table style=\"border-collapse:collapse;width:100%;\"><tr>\
          <td style=\"background:{NAVY};color:#ffffff;padding:12px 16px;font-size:18px;\
          font-weight:bold;\">Reporte de planning — {rig} / {ws}\
          <span style=\"float:right;font-weight:normal;font-size:13px;\">{fecha}</span>\
@@ -71,7 +71,7 @@ pub fn render_digest(report: &OperatorReport, summary: &AnalyticsSummary, fecha:
     ));
 
     // KPI strip — the 5 analytics headlines.
-    html.push_str("<table style=\"border-collapse:collapse;width:100%;max-width:960px;margin-top:12px;\"><tr>");
+    html.push_str("<table style=\"border-collapse:collapse;width:100%;margin-top:12px;\"><tr>");
     html.push_str(&kpi(
         "Avance",
         format!("{:.0}%", summary.avance.pct),
@@ -105,7 +105,7 @@ pub fn render_digest(report: &OperatorReport, summary: &AnalyticsSummary, fecha:
     // Bitácora: one table per module section, mockup column order.
     for section in &report.sections {
         html.push_str(&format!(
-            "<table style=\"border-collapse:collapse;width:100%;max-width:960px;\
+            "<table style=\"border-collapse:collapse;width:100%;\
              margin-top:16px;\"><tr><td colspan=\"9\" style=\"background:{HEADER_BG};\
              color:#ffffff;padding:8px 10px;font-weight:bold;font-size:14px;\">{title}\
              <span style=\"float:right;font-weight:normal;\">{horas:.1} h</span></td></tr>",
@@ -129,8 +129,10 @@ pub fn render_digest(report: &OperatorReport, summary: &AnalyticsSummary, fecha:
                  <td style=\"{TD}{bg}\">{nivel}</td>\
                  <td style=\"{TD}{bg}text-align:right;\">{horas}</td>\
                  <td style=\"{TD}{bg}color:{estado_color};font-weight:bold;\">{estado}</td>\
-                 <td style=\"{TD}{bg}\">{resp}</td><td style=\"{TD}{bg}\">{ini}</td>\
-                 <td style=\"{TD}{bg}\">{fin}</td><td style=\"{TD}{bg}\">{notas}</td></tr>",
+                 <td style=\"{TD}{bg}\">{resp}</td>\
+                 <td style=\"{TD}{bg}white-space:nowrap;\">{ini}</td>\
+                 <td style=\"{TD}{bg}white-space:nowrap;\">{fin}</td>\
+                 <td style=\"{TD}{bg}\">{notas}</td></tr>",
                 tarea = esc(&row.tarea),
                 id = esc(&row.id),
                 proceso = esc(&row.proceso),
@@ -149,7 +151,7 @@ pub fn render_digest(report: &OperatorReport, summary: &AnalyticsSummary, fecha:
 
     // TOTAL HORAS footer (xlsx parity).
     html.push_str(&format!(
-        "<table style=\"border-collapse:collapse;width:100%;max-width:960px;margin-top:12px;\">\
+        "<table style=\"border-collapse:collapse;width:100%;margin-top:12px;\">\
          <tr><td style=\"background:{NAVY};color:#ffffff;padding:10px 16px;font-weight:bold;\">\
          TOTAL HORAS<span style=\"float:right;\">{total:.1}</span></td></tr></table>",
         total = report.total_horas,

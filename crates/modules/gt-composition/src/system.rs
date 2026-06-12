@@ -53,10 +53,16 @@ pub struct ArchiveConfig {
     /// How often the daemon runs, in minutes.
     #[serde(default = "default_interval_minutes")]
     pub interval_minutes: u64,
-    /// The scheduled report digest (hq-84f93b). Rides the same persisted file
-    /// so old configs (no `report` key) keep parsing via the default.
+    /// The scheduled report digests (hq-7d50e4): a LIST of schedules, each
+    /// with its own mode (daily / every-n-days / once), board scope and
+    /// optional recipients.
     #[serde(default)]
-    pub report: crate::report_scheduler::ReportScheduleConfig,
+    pub report_schedules: Vec<crate::report_scheduler::ReportSchedule>,
+    /// The pre-multi-schedule scalar config (hq-84f93b), still read from the
+    /// persisted file's `report` key so a deployed config migrates into one
+    /// Daily schedule on load ([`load_config`]). Never written back.
+    #[serde(default, rename = "report", skip_serializing)]
+    pub report_legacy: Option<crate::report_scheduler::LegacyReportConfig>,
 }
 
 fn default_true() -> bool {
@@ -75,7 +81,8 @@ impl Default for ArchiveConfig {
             enabled: default_true(),
             archive_after_days: default_archive_days(),
             interval_minutes: default_interval_minutes(),
-            report: Default::default(),
+            report_schedules: Vec::new(),
+            report_legacy: None,
         }
     }
 }
@@ -92,11 +99,19 @@ struct ArchiveConfigPatch {
 pub type SharedArchiveConfig = Arc<RwLock<ArchiveConfig>>;
 
 /// Load config from disk at `path`; returns `Default` when the file is absent or malformed.
+/// A pre-multi-schedule `report` scalar (hq-84f93b) migrates into one Daily
+/// schedule when no `report_schedules` exist yet.
 pub fn load_config(path: &PathBuf) -> ArchiveConfig {
-    match std::fs::read_to_string(path) {
+    let mut cfg: ArchiveConfig = match std::fs::read_to_string(path) {
         Ok(s) => serde_json::from_str(&s).unwrap_or_default(),
         Err(_) => ArchiveConfig::default(),
+    };
+    if let Some(legacy) = cfg.report_legacy.take() {
+        if cfg.report_schedules.is_empty() {
+            cfg.report_schedules.push(legacy.into_schedule());
+        }
     }
+    cfg
 }
 
 pub(crate) fn persist_config(path: &PathBuf, cfg: &ArchiveConfig) {
@@ -354,6 +369,18 @@ fn subscriber_json(s: &gt_store_pg::ReportSubscriber) -> serde_json::Value {
     })
 }
 
+/// The workspace whose GLOBAL subscriber list the legacy endpoints manage:
+/// the first schedule's, else `default`.
+async fn report_workspace(st: &SystemApiState) -> String {
+    st.config
+        .read()
+        .await
+        .report_schedules
+        .first()
+        .map(|s| s.workspace.clone())
+        .unwrap_or_else(|| "default".to_string())
+}
+
 async fn get_report_schedule(
     State(st): State<SystemApiState>,
     headers: axum::http::HeaderMap,
@@ -361,7 +388,19 @@ async fn get_report_schedule(
     if let Err(resp) = authorize(&st, &headers, READ_SCOPE, &Method::GET) {
         return resp;
     }
-    let report = st.config.read().await.report.clone();
+    // Transitional shim (full CRUD: hq-c4f920): expose the FIRST schedule in
+    // the legacy scalar shape, or the defaults when none exist yet.
+    let report = st
+        .config
+        .read()
+        .await
+        .report_schedules
+        .first()
+        .cloned()
+        .unwrap_or(crate::report_scheduler::ReportSchedule {
+            enabled: false,
+            ..Default::default()
+        });
     (StatusCode::OK, Json(report)).into_response()
 }
 
@@ -388,8 +427,16 @@ async fn put_report_schedule(
     if patch.hour.is_some_and(|h| h > 23) || patch.minute.is_some_and(|m| m > 59) {
         return (StatusCode::BAD_REQUEST, "hour 0-23, minute 0-59").into_response();
     }
+    // Transitional shim (full CRUD: hq-c4f920): patch the FIRST schedule,
+    // creating a disabled Daily one when the list is empty.
     let mut cfg = st.config.write().await;
-    let r = &mut cfg.report;
+    if cfg.report_schedules.is_empty() {
+        cfg.report_schedules.push(crate::report_scheduler::ReportSchedule {
+            enabled: false,
+            ..Default::default()
+        });
+    }
+    let r = cfg.report_schedules.first_mut().expect("just ensured");
     if let Some(v) = patch.enabled {
         r.enabled = v;
     }
@@ -408,12 +455,13 @@ async fn put_report_schedule(
     if let Some(v) = patch.workspace {
         r.workspace = v;
     }
+    let first = r.clone();
     let snapshot = cfg.clone();
     drop(cfg);
     if let Some(path) = &st.config_path {
         persist_config(path, &snapshot);
     }
-    (StatusCode::OK, Json(snapshot.report)).into_response()
+    (StatusCode::OK, Json(first)).into_response()
 }
 
 async fn list_report_subscribers(
@@ -427,7 +475,7 @@ async fn list_report_subscribers(
         Ok(svc) => svc,
         Err(resp) => return resp,
     };
-    let workspace = st.config.read().await.report.workspace.clone();
+    let workspace = report_workspace(&st).await;
     match svc.subscribers().list(&workspace).await {
         Ok(subs) => {
             let subs: Vec<_> = subs.iter().map(subscriber_json).collect();
@@ -458,7 +506,7 @@ async fn add_report_subscriber(
     if !email.contains('@') {
         return (StatusCode::BAD_REQUEST, "email must be an address").into_response();
     }
-    let workspace = st.config.read().await.report.workspace.clone();
+    let workspace = report_workspace(&st).await;
     match svc.subscribers().add(&workspace, &email).await {
         Ok(()) => (StatusCode::OK, Json(serde_json::json!({ "ok": true }))).into_response(),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
@@ -477,7 +525,7 @@ async fn remove_report_subscriber(
         Ok(svc) => svc,
         Err(resp) => return resp,
     };
-    let workspace = st.config.read().await.report.workspace.clone();
+    let workspace = report_workspace(&st).await;
     match svc.subscribers().remove(&workspace, &email).await {
         Ok(()) => (StatusCode::OK, Json(serde_json::json!({ "ok": true }))).into_response(),
         Err(gt_store_pg::ReportSubscriptionError::NotFound(e)) => {
@@ -506,7 +554,7 @@ async fn toggle_report_subscriber(
         Ok(svc) => svc,
         Err(resp) => return resp,
     };
-    let workspace = st.config.read().await.report.workspace.clone();
+    let workspace = report_workspace(&st).await;
     match svc.subscribers().set_enabled(&workspace, &email, body.enabled).await {
         Ok(()) => (StatusCode::OK, Json(serde_json::json!({ "ok": true }))).into_response(),
         Err(gt_store_pg::ReportSubscriptionError::NotFound(e)) => {
@@ -528,11 +576,50 @@ async fn run_report_now(
         Ok(svc) => svc,
         Err(resp) => return resp,
     };
-    match svc.send_digest(&claims.sub).await {
+    // Transitional: no id ⇒ the single schedule (full per-id run: hq-c4f920).
+    let schedule = match svc.resolve_schedule(None).await {
+        Ok(s) => s,
+        Err(e) => return (StatusCode::BAD_REQUEST, e).into_response(),
+    };
+    match svc.send_schedule(&schedule, &claims.sub).await {
         Ok(queued) => {
             (StatusCode::OK, Json(serde_json::json!({ "queued": queued }))).into_response()
         }
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn load_config_migrates_legacy_scalar_report_into_one_daily_schedule() {
+        let dir = std::env::temp_dir().join(format!("gt-syscfg-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("system_config.json");
+        std::fs::write(
+            &path,
+            r#"{"enabled":true,"archive_after_days":30,"interval_minutes":60,
+                "report":{"enabled":true,"hour":9,"minute":15,"rig":"hq",
+                          "workspace":"default","last_sent_date":"2026-06-11"}}"#,
+        )
+        .unwrap();
+        let cfg = load_config(&path);
+        assert_eq!(cfg.report_schedules.len(), 1);
+        let s = &cfg.report_schedules[0];
+        assert!(s.enabled);
+        assert_eq!((s.hour, s.minute), (9, 15));
+        assert_eq!(s.last_sent_date.as_deref(), Some("2026-06-11"));
+        // Round-trip: persist writes the NEW shape only (no `report` key).
+        persist_config(&path, &cfg);
+        let raw = std::fs::read_to_string(&path).unwrap();
+        assert!(raw.contains("report_schedules"));
+        assert!(!raw.contains("\"report\":"), "legacy key never written back");
+        // Re-load keeps the schedule (no double migration).
+        let again = load_config(&path);
+        assert_eq!(again.report_schedules.len(), 1);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
 

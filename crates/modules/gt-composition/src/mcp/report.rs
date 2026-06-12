@@ -79,6 +79,20 @@ impl ReportHandler {
             .ok_or_else(|| AppError::Validation("report scheduler off (GT_PG_URL unset)".into()))
     }
 
+    /// The workspace whose GLOBAL subscriber list the subscriber tools manage:
+    /// the first schedule's, else `default`.
+    async fn report_workspace(
+        svc: &Arc<crate::report_scheduler::ReportService>,
+    ) -> String {
+        svc.config
+            .read()
+            .await
+            .report_schedules
+            .first()
+            .map(|s| s.workspace.clone())
+            .unwrap_or_else(|| "default".to_string())
+    }
+
     async fn tracker(&self, ws: Option<&str>) -> Result<Arc<DoltIssues>, AppError> {
         match (&self.dolt_workspaces, ws) {
             (Some(pools), Some(ws)) => Ok(Arc::new(DoltIssues::new(pools.ensured_pool(ws).await?))),
@@ -156,9 +170,11 @@ impl DomainHandler for ReportHandler {
         ),
         descriptor(
             "report.send-now",
-            "Render today's digest (bitácora + KPIs) and queue it to every ENABLED \
-             subscriber immediately. Does not affect the daily schedule.",
-            &[],
+            "Render one schedule's report and queue it to its recipients immediately \
+             (the schedule's own subscriber list, else the workspace's enabled \
+             globals). schedule_id optional when exactly one schedule exists. Does \
+             not affect the schedule's cadence.",
+            &[opt("schedule_id", "string")],
         )]
     }
 
@@ -333,7 +349,7 @@ impl DomainHandler for ReportHandler {
             }
             "report.subscribers.list" => {
                 let svc = self.scheduler()?;
-                let workspace = svc.config.read().await.report.workspace.clone();
+                let workspace = Self::report_workspace(svc).await;
                 let subs = svc
                     .subscribers()
                     .list(&workspace)
@@ -352,7 +368,7 @@ impl DomainHandler for ReportHandler {
                 if !email.contains('@') {
                     return Err(AppError::Validation(format!("`{email}` is not an address")));
                 }
-                let workspace = svc.config.read().await.report.workspace.clone();
+                let workspace = Self::report_workspace(svc).await;
                 svc.subscribers()
                     .add(&workspace, &email)
                     .await
@@ -362,7 +378,7 @@ impl DomainHandler for ReportHandler {
             "report.subscribers.remove" => {
                 let svc = self.scheduler()?;
                 let email = str_arg(&ctx.args, "email")?.trim().to_string();
-                let workspace = svc.config.read().await.report.workspace.clone();
+                let workspace = Self::report_workspace(svc).await;
                 svc.subscribers()
                     .remove(&workspace, &email)
                     .await
@@ -377,17 +393,24 @@ impl DomainHandler for ReportHandler {
                     .get("enabled")
                     .and_then(Value::as_bool)
                     .ok_or_else(|| AppError::Validation("`enabled` (boolean) required".into()))?;
-                let workspace = svc.config.read().await.report.workspace.clone();
+                let workspace = Self::report_workspace(svc).await;
                 svc.subscribers()
                     .set_enabled(&workspace, &email, enabled)
                     .await
                     .map_err(|e| AppError::Validation(format!("set-enabled: {e}")))?;
                 Ok(json!({ "ok": true, "email": email, "enabled": enabled }))
             }
+            // Transitional shims over the FIRST schedule (full multi-schedule
+            // CRUD: hq-c4f920).
             "report.schedule.get" => {
                 let svc = self.scheduler()?;
-                let report = svc.config.read().await.report.clone();
-                serde_json::to_value(&report)
+                let first = svc.config.read().await.report_schedules.first().cloned().unwrap_or(
+                    crate::report_scheduler::ReportSchedule {
+                        enabled: false,
+                        ..Default::default()
+                    },
+                );
+                serde_json::to_value(&first)
                     .map_err(|e| AppError::Other(format!("encode schedule: {e}")))
             }
             "report.schedule.set" => {
@@ -397,9 +420,15 @@ impl DomainHandler for ReportHandler {
                 if hour.is_some_and(|h| h > 23) || minute.is_some_and(|m| m > 59) {
                     return Err(AppError::Validation("hour 0-23, minute 0-59".into()));
                 }
-                {
+                let first = {
                     let mut cfg = svc.config.write().await;
-                    let r = &mut cfg.report;
+                    if cfg.report_schedules.is_empty() {
+                        cfg.report_schedules.push(crate::report_scheduler::ReportSchedule {
+                            enabled: false,
+                            ..Default::default()
+                        });
+                    }
+                    let r = cfg.report_schedules.first_mut().expect("just ensured");
                     if let Some(v) = ctx.args.get("enabled").and_then(Value::as_bool) {
                         r.enabled = v;
                     }
@@ -418,19 +447,22 @@ impl DomainHandler for ReportHandler {
                     if let Some(v) = ctx.args.get("workspace").and_then(Value::as_str) {
                         r.workspace = v.to_string();
                     }
-                }
+                    r.clone()
+                };
                 svc.persist().await;
-                let report = svc.config.read().await.report.clone();
-                serde_json::to_value(&report)
+                serde_json::to_value(&first)
                     .map_err(|e| AppError::Other(format!("encode schedule: {e}")))
             }
             "report.send-now" => {
                 let svc = self.scheduler()?;
+                let id = ctx.args.get("schedule_id").and_then(Value::as_str);
+                let schedule =
+                    svc.resolve_schedule(id).await.map_err(AppError::Validation)?;
                 let queued = svc
-                    .send_digest(ctx.actor)
+                    .send_schedule(&schedule, ctx.actor)
                     .await
                     .map_err(AppError::Other)?;
-                Ok(json!({ "ok": true, "queued": queued }))
+                Ok(json!({ "ok": true, "queued": queued, "schedule_id": schedule.id }))
             }
             other => Err(AppError::Validation(format!("unknown tool `{other}`"))),
         }

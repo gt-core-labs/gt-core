@@ -1,18 +1,19 @@
-//! Scheduled report digest — service + daemon (hq-84f93b, epic hq-efc379).
+//! Scheduled report digests — multi-schedule service + daemon (hq-7d50e4,
+//! epic hq-2ef0a3; supersedes the single daily schedule of hq-84f93b).
 //!
-//! Composes the pure pieces hq-562e0b shipped: the bitácora projection
-//! (`build_report`), the analytics KPIs (`summarize`) and the HTML render
-//! (`render_digest`) into one send: an outbox row per ENABLED subscriber
-//! (`report_subscriptions`, the operator's selection switch). Delivery is the
-//! outbox drain's job — this module never touches a transport (ADR hq-423a4b
-//! D8).
+//! The system config carries a LIST of [`ReportSchedule`]s. Each one scopes a
+//! board (rig, workspace), names a report [`kind`](ReportSchedule::kind) from
+//! the render REGISTRY, fires under one of three modes —
+//! [`Daily`](ScheduleMode::Daily), [`EveryNDays`](ScheduleMode::EveryNDays),
+//! [`Once`](ScheduleMode::Once) (auto-disables after sending) — and can carry
+//! its OWN recipient list (`subscribers`), falling back to the workspace's
+//! global enabled `report_subscriptions` when absent.
 //!
-//! Scheduling is fixed-time, not interval: [`ReportScheduler`] ticks every
-//! minute and fires when the configured local wall-clock time has passed and
-//! today's digest has not been sent (`last_sent_date` guard — idempotent
-//! across restarts, catch-up after downtime). Manual sends
-//! ([`ReportService::send_digest`] via `report.send-now` / the System UI) do
-//! NOT touch the guard: a manual send never cancels the scheduled one.
+//! Adding a new report type = registering one render fn in [`render_for`];
+//! the daemon, CRUD surface and UI pick it up from [`kinds`] untouched.
+//!
+//! Delivery stays outbox-first (ADR hq-423a4b D8): one row per recipient, the
+//! drain owns the transport. Manual sends never touch `last_sent_date`.
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -21,8 +22,8 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 use sqlx::PgPool;
 
-use gt_issues::analytics::summarize;
-use gt_issues::report::build_report;
+use gt_issues::analytics::{summarize, AnalyticsSummary};
+use gt_issues::report::{build_report, OperatorReport};
 use gt_issues::report_html::render_digest;
 use gt_store_dolt::{DoltIssues, IssueFilter};
 use gt_store_pg::{
@@ -32,35 +33,75 @@ use gt_store_pg::{
 
 use crate::system::SharedArchiveConfig;
 
-/// When the digest goes out, and over which board scope. Lives inside the
-/// persisted system config (`GT_SYSTEM_CONFIG_PATH`) next to the archive
-/// knobs; `#[serde(default)]` everywhere so pre-existing config files parse.
+/// When a schedule fires.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ScheduleMode {
+    /// Every day at `hour:minute`.
+    Daily,
+    /// When at least `n_days` local days passed since the last send (first
+    /// send = first tick with the time reached).
+    EveryNDays,
+    /// Exactly once on `date` at `hour:minute` (catch-up if the process was
+    /// down that day); auto-disables after sending.
+    Once,
+}
+
+/// One scheduled report send.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ReportScheduleConfig {
-    /// Master switch — off by default until the operator configures it.
+pub struct ReportSchedule {
+    /// Stable id (ulid) — the CRUD/run-now handle.
+    #[serde(default = "new_id")]
+    pub id: String,
+    /// Render-registry key ([`kinds`]). v1: `planning-digest`.
+    #[serde(default = "default_kind")]
+    pub kind: String,
+    #[serde(default = "default_mode")]
+    pub mode: ScheduleMode,
+    /// `EveryNDays` interval; min 1.
+    #[serde(default = "default_n_days")]
+    pub n_days: u32,
+    /// `Once` target local date (`YYYY-MM-DD`).
     #[serde(default)]
-    pub enabled: bool,
-    /// Local wall-clock hour (0-23) the digest fires at.
+    pub date: Option<String>,
+    /// Local wall-clock send time.
     #[serde(default = "default_hour")]
     pub hour: u8,
-    /// Local wall-clock minute (0-59).
     #[serde(default)]
     pub minute: u8,
-    /// Minutes added to UTC to get the operator's wall clock. Default −300
-    /// (UTC-5, Colombia — the deployment's operator timezone).
+    /// Minutes added to UTC for this schedule's wall clock. Default −300
+    /// (UTC-5, Colombia).
     #[serde(default = "default_tz_offset")]
     pub tz_offset_minutes: i64,
-    /// Board scope the digest projects.
+    /// Board scope the report projects.
     #[serde(default = "default_rig")]
     pub rig: String,
     #[serde(default = "default_workspace")]
     pub workspace: String,
-    /// Last LOCAL date (`YYYY-MM-DD`) the scheduler sent — the at-most-once-
-    /// per-day guard. Maintained by the daemon, read-only through the API.
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    /// Last LOCAL date sent (the at-most-once guard). Daemon bookkeeping;
+    /// read-only through the API.
     #[serde(default)]
     pub last_sent_date: Option<String>,
+    /// Per-schedule recipients. `None` ⇒ the workspace's global enabled
+    /// `report_subscriptions` list.
+    #[serde(default)]
+    pub subscribers: Option<Vec<String>>,
 }
 
+fn new_id() -> String {
+    ulid::Ulid::new().to_string()
+}
+fn default_kind() -> String {
+    "planning-digest".into()
+}
+fn default_mode() -> ScheduleMode {
+    ScheduleMode::Daily
+}
+fn default_n_days() -> u32 {
+    1
+}
 fn default_hour() -> u8 {
     8
 }
@@ -73,34 +114,179 @@ fn default_rig() -> String {
 fn default_workspace() -> String {
     "default".into()
 }
+fn default_true() -> bool {
+    true
+}
 
-impl Default for ReportScheduleConfig {
+impl Default for ReportSchedule {
     fn default() -> Self {
         Self {
-            enabled: false,
+            id: new_id(),
+            kind: default_kind(),
+            mode: default_mode(),
+            n_days: default_n_days(),
+            date: None,
             hour: default_hour(),
             minute: 0,
             tz_offset_minutes: default_tz_offset(),
             rig: default_rig(),
             workspace: default_workspace(),
+            enabled: true,
             last_sent_date: None,
+            subscribers: None,
         }
     }
 }
 
-/// `(local_date, minutes_since_midnight)` of `now_utc` shifted by `offset`.
+/// The PRE-multi-schedule scalar config (hq-84f93b). Still deserialized from
+/// the persisted file's `report` key so a deployed `system_config.json`
+/// migrates losslessly into one Daily schedule on load.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct LegacyReportConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default = "default_hour")]
+    pub hour: u8,
+    #[serde(default)]
+    pub minute: u8,
+    #[serde(default = "default_tz_offset")]
+    pub tz_offset_minutes: i64,
+    #[serde(default = "default_rig")]
+    pub rig: String,
+    #[serde(default = "default_workspace")]
+    pub workspace: String,
+    #[serde(default)]
+    pub last_sent_date: Option<String>,
+}
+
+impl LegacyReportConfig {
+    /// The equivalent Daily schedule.
+    pub fn into_schedule(self) -> ReportSchedule {
+        ReportSchedule {
+            mode: ScheduleMode::Daily,
+            enabled: self.enabled,
+            hour: self.hour,
+            minute: self.minute,
+            tz_offset_minutes: self.tz_offset_minutes,
+            rig: self.rig,
+            workspace: self.workspace,
+            last_sent_date: self.last_sent_date,
+            ..Default::default()
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Render registry — kind → (subject, html). Adding a report type happens HERE
+// and nowhere else.
+// ---------------------------------------------------------------------------
+
+/// A registered report renderer.
+pub type RenderFn = fn(&OperatorReport, &AnalyticsSummary, &str) -> (String, String);
+
+fn render_planning_digest(
+    report: &OperatorReport,
+    summary: &AnalyticsSummary,
+    fecha: &str,
+) -> (String, String) {
+    (
+        format!("Reporte de planning {}/{} — {fecha}", report.rig, report.workspace),
+        render_digest(report, summary, fecha),
+    )
+}
+
+/// Registry lookup. `None` = unknown kind (validation rejects it; a stale
+/// schedule with a retired kind is skipped with a log, never a panic).
+pub fn render_for(kind: &str) -> Option<RenderFn> {
+    match kind {
+        "planning-digest" => Some(render_planning_digest),
+        _ => None,
+    }
+}
+
+/// The registered kinds, for validation and the UI dropdown.
+pub fn kinds() -> Vec<&'static str> {
+    vec!["planning-digest"]
+}
+
+// ---------------------------------------------------------------------------
+// Clock math (no chrono dep: proleptic-Gregorian day arithmetic suffices for
+// schedule dates).
+// ---------------------------------------------------------------------------
+
+/// `(local_date, minutes_since_midnight)` of now-UTC shifted by `offset`.
 fn local_now(offset_minutes: i64) -> (String, i64) {
     let now = time::OffsetDateTime::now_utc() + time::Duration::minutes(offset_minutes);
     let date = format!("{:04}-{:02}-{:02}", now.year(), now.month() as u8, now.day());
     (date, i64::from(now.hour()) * 60 + i64::from(now.minute()))
 }
 
-/// The digest pipeline + subscriber CRUD, shared by the daemon, the MCP
+/// Days since the civil epoch of a `YYYY-MM-DD` string (Howard Hinnant's
+/// days_from_civil — same arithmetic the analytics projection uses).
+fn epoch_days(date: &str) -> Option<i64> {
+    let mut it = date.split('-');
+    let y: i64 = it.next()?.parse().ok()?;
+    let m: i64 = it.next()?.parse().ok()?;
+    let d: i64 = it.next()?.parse().ok()?;
+    let y = if m <= 2 { y - 1 } else { y };
+    let era = if y >= 0 { y } else { y - 399 } / 400;
+    let yoe = y - era * 400;
+    let mp = (m + 9) % 12;
+    let doy = (153 * mp + 2) / 5 + d - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    Some(era * 146097 + doe - 719468)
+}
+
+/// Fire decision, pure for tests.
+pub fn is_due(s: &ReportSchedule, local_date: &str, minutes_now: i64) -> bool {
+    if !s.enabled {
+        return false;
+    }
+    let time_reached = minutes_now >= i64::from(s.hour) * 60 + i64::from(s.minute);
+    let sent_today = s.last_sent_date.as_deref() == Some(local_date);
+    match s.mode {
+        ScheduleMode::Daily => time_reached && !sent_today,
+        ScheduleMode::EveryNDays => {
+            if !time_reached || sent_today {
+                return false;
+            }
+            match (&s.last_sent_date, epoch_days(local_date)) {
+                (None, _) => true,
+                (Some(last), Some(today)) => epoch_days(last)
+                    .map(|l| today - l >= i64::from(s.n_days.max(1)))
+                    .unwrap_or(true),
+                _ => false,
+            }
+        }
+        ScheduleMode::Once => {
+            // Fires on the target date once the time is reached; a LATER day
+            // still fires (catch-up after downtime). Never twice: the send
+            // both stamps last_sent_date and disables the schedule.
+            if s.last_sent_date.is_some() {
+                return false;
+            }
+            match (s.date.as_deref(), epoch_days(local_date)) {
+                (Some(target), Some(today)) => match epoch_days(target) {
+                    Some(t) if today > t => true,
+                    Some(t) if today == t => time_reached,
+                    _ => false,
+                },
+                _ => false,
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Service + daemon
+// ---------------------------------------------------------------------------
+
+/// The digest pipeline + subscriber store, shared by the daemon, the MCP
 /// `report.*` tools and the System REST surface.
 pub struct ReportService {
     dolt: Arc<DoltIssues>,
     pool: PgPool,
-    /// The persisted system config (the `report` half is ours).
+    /// The persisted system config (`report_schedules` is ours).
     pub config: SharedArchiveConfig,
     config_path: Option<PathBuf>,
 }
@@ -115,13 +301,12 @@ impl ReportService {
         Self { dolt, pool, config, config_path }
     }
 
-    /// The subscribers store over the shared public pool.
+    /// The global subscribers store over the shared public pool.
     pub fn subscribers(&self) -> PgReportSubscriptions {
         PgReportSubscriptions::new(self.pool.clone())
     }
 
-    /// Persist the current config snapshot to disk (same file the archive
-    /// knobs live in).
+    /// Persist the current config snapshot to disk.
     pub async fn persist(&self) {
         if let Some(path) = &self.config_path {
             let snapshot = self.config.read().await.clone();
@@ -129,19 +314,43 @@ impl ReportService {
         }
     }
 
-    /// Build + render today's digest and enqueue one outbox row per ENABLED
-    /// subscriber. Returns how many were queued (0 when no enabled
-    /// subscribers — not an error). Never touches `last_sent_date`; that is
-    /// the daemon's bookkeeping.
-    pub async fn send_digest(&self, created_by: &str) -> Result<usize, String> {
-        let report_cfg = self.config.read().await.report.clone();
-        let (rig, workspace) = (report_cfg.rig.clone(), report_cfg.workspace.clone());
+    /// Resolve the send target: an explicit id, or the single existing
+    /// schedule when unambiguous.
+    pub async fn resolve_schedule(&self, id: Option<&str>) -> Result<ReportSchedule, String> {
+        let schedules = self.config.read().await.report_schedules.clone();
+        match id {
+            Some(id) => schedules
+                .into_iter()
+                .find(|s| s.id == id)
+                .ok_or_else(|| format!("unknown schedule `{id}`")),
+            None => match schedules.len() {
+                0 => Err("no schedules configured".into()),
+                1 => Ok(schedules.into_iter().next().expect("len checked")),
+                n => Err(format!("{n} schedules exist — pass schedule_id")),
+            },
+        }
+    }
 
-        let recipients = self
-            .subscribers()
-            .enabled_emails(&workspace)
-            .await
-            .map_err(|e| format!("subscribers: {e}"))?;
+    /// Build + render ONE schedule's report and enqueue an outbox row per
+    /// recipient (the schedule's own list, else the workspace's enabled
+    /// globals). Returns how many were queued. Never touches
+    /// `last_sent_date` — that is the daemon's bookkeeping.
+    pub async fn send_schedule(
+        &self,
+        schedule: &ReportSchedule,
+        created_by: &str,
+    ) -> Result<usize, String> {
+        let render = render_for(&schedule.kind)
+            .ok_or_else(|| format!("unknown report kind `{}`", schedule.kind))?;
+
+        let recipients: Vec<String> = match &schedule.subscribers {
+            Some(own) => own.iter().map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect(),
+            None => self
+                .subscribers()
+                .enabled_emails(&schedule.workspace)
+                .await
+                .map_err(|e| format!("subscribers: {e}"))?,
+        };
         if recipients.is_empty() {
             return Ok(0);
         }
@@ -150,34 +359,32 @@ impl ReportService {
         let rows = self
             .dolt
             .list(&IssueFilter {
-                rig: Some(rig.clone()),
-                workspace: Some(workspace.clone()),
+                rig: Some(schedule.rig.clone()),
+                workspace: Some(schedule.workspace.clone()),
                 full: true,
                 limit: Some(gt_store_dolt::issues_max_limit()),
                 ..Default::default()
             })
             .await
             .map_err(|e| format!("tracker rows: {e}"))?;
-        let report = build_report(&rig, &workspace, &rows);
-        let (today, _) = local_now(report_cfg.tz_offset_minutes);
-        // reopens=0: the audit-derived count needs the audit sink the
-        // analytics handler owns; the digest's KPI strip tolerates the
-        // conservative zero (defects still counted).
-        let summary = summarize(&rig, &workspace, &rows, 0, &today, 7, 30);
-        let html = render_digest(&report, &summary, &today);
+        let report = build_report(&schedule.rig, &schedule.workspace, &rows);
+        let (today, _) = local_now(schedule.tz_offset_minutes);
+        // reopens=0: the audit-derived count lives with the analytics handler;
+        // the digest tolerates the conservative zero (defects still counted).
+        let summary = summarize(&schedule.rig, &schedule.workspace, &rows, 0, &today, 7, 30);
+        let (subject, html) = render(&report, &summary, &today);
 
         let outbox = PgEmailOutbox::new(self.pool.clone());
-        let subject = format!("Reporte de planning {rig}/{workspace} — {today}");
         let mut queued = 0;
         for to in recipients {
             match outbox
                 .enqueue(NewEmail {
                     id: ulid::Ulid::new().to_string(),
-                    workspace: workspace.clone(),
+                    workspace: schedule.workspace.clone(),
                     recipient: to,
                     subject: subject.clone(),
                     body: html.clone(),
-                    template_ref: Some("report-digest".into()),
+                    template_ref: Some(format!("report:{}", schedule.kind)),
                     send_at: None,
                     created_by: created_by.to_string(),
                 })
@@ -191,15 +398,7 @@ impl ReportService {
     }
 }
 
-/// Fire decision, pure for tests: send when enabled, the wall clock reached
-/// the configured time, and today's digest hasn't gone out.
-pub fn is_due(cfg: &ReportScheduleConfig, local_date: &str, minutes_now: i64) -> bool {
-    cfg.enabled
-        && minutes_now >= i64::from(cfg.hour) * 60 + i64::from(cfg.minute)
-        && cfg.last_sent_date.as_deref() != Some(local_date)
-}
-
-/// The fixed-time daemon. Spawn via `tokio::spawn(ReportScheduler::new(svc).run())`.
+/// The fixed-time daemon: ticks every minute, fires every due schedule.
 pub struct ReportScheduler {
     service: Arc<ReportService>,
 }
@@ -211,25 +410,39 @@ impl ReportScheduler {
 
     pub async fn run(self) {
         loop {
-            let report_cfg = self.service.config.read().await.report.clone();
-            let (local_date, minutes_now) = local_now(report_cfg.tz_offset_minutes);
-            if is_due(&report_cfg, &local_date, minutes_now) {
-                match self.service.send_digest("report-scheduler").await {
+            let schedules = self.service.config.read().await.report_schedules.clone();
+            for schedule in &schedules {
+                let (local_date, minutes_now) = local_now(schedule.tz_offset_minutes);
+                if !is_due(schedule, &local_date, minutes_now) {
+                    continue;
+                }
+                match self.service.send_schedule(schedule, "report-scheduler").await {
                     Ok(queued) => {
                         eprintln!(
-                            "[report-scheduler] digest queued to {queued} subscriber(s) \
+                            "[report-scheduler] `{}` ({}, {:?}) queued to {queued} recipient(s) \
                              ({local_date} {:02}:{:02})",
-                            report_cfg.hour, report_cfg.minute
+                            schedule.kind, schedule.rig, schedule.mode, schedule.hour,
+                            schedule.minute
                         );
-                        // Mark today as sent even when queued=0 (no enabled
-                        // subscribers): the schedule fired; re-firing every
-                        // minute would spam logs, and a subscriber added later
-                        // today gets tomorrow's digest (or send-now).
-                        self.service.config.write().await.report.last_sent_date =
-                            Some(local_date);
+                        // Stamp even when queued=0 (the schedule DID fire; a
+                        // recipient added later gets the next cycle or
+                        // send-now). Once auto-disables: exactly-one send.
+                        let mut cfg = self.service.config.write().await;
+                        if let Some(live) =
+                            cfg.report_schedules.iter_mut().find(|s| s.id == schedule.id)
+                        {
+                            live.last_sent_date = Some(local_date);
+                            if live.mode == ScheduleMode::Once {
+                                live.enabled = false;
+                            }
+                        }
+                        drop(cfg);
                         self.service.persist().await;
                     }
-                    Err(e) => eprintln!("[report-scheduler] digest failed (will retry next tick): {e}"),
+                    Err(e) => eprintln!(
+                        "[report-scheduler] `{}` failed (retry next tick): {e}",
+                        schedule.id
+                    ),
                 }
             }
             tokio::time::sleep(Duration::from_secs(60)).await;
@@ -241,39 +454,104 @@ impl ReportScheduler {
 mod tests {
     use super::*;
 
-    fn cfg(enabled: bool, hour: u8, minute: u8, last: Option<&str>) -> ReportScheduleConfig {
-        ReportScheduleConfig {
-            enabled,
-            hour,
-            minute,
-            last_sent_date: last.map(Into::into),
-            ..Default::default()
-        }
+    fn sched(mode: ScheduleMode) -> ReportSchedule {
+        ReportSchedule { mode, hour: 8, minute: 30, ..Default::default() }
+    }
+
+    const TODAY: &str = "2026-06-12";
+    const AT: i64 = 8 * 60 + 30;
+
+    #[test]
+    fn daily_fires_once_per_day_after_the_time() {
+        let mut s = sched(ScheduleMode::Daily);
+        assert!(!is_due(&s, TODAY, AT - 1));
+        assert!(is_due(&s, TODAY, AT));
+        s.last_sent_date = Some(TODAY.into());
+        assert!(!is_due(&s, TODAY, 23 * 60));
+        s.enabled = false;
+        s.last_sent_date = None;
+        assert!(!is_due(&s, TODAY, AT));
     }
 
     #[test]
-    fn fires_once_per_day_after_the_configured_time() {
-        let today = "2026-06-12";
-        // Before the configured time: not due.
-        assert!(!is_due(&cfg(true, 8, 30, None), today, 8 * 60 + 29));
-        // At/after: due.
-        assert!(is_due(&cfg(true, 8, 30, None), today, 8 * 60 + 30));
-        assert!(is_due(&cfg(true, 8, 30, Some("2026-06-11")), today, 23 * 60));
-        // Already sent today: never again (idempotent restarts).
-        assert!(!is_due(&cfg(true, 8, 30, Some(today)), today, 9 * 60));
-        // Disabled: never.
-        assert!(!is_due(&cfg(false, 8, 30, None), today, 9 * 60));
+    fn every_n_days_respects_the_interval() {
+        let mut s = sched(ScheduleMode::EveryNDays);
+        s.n_days = 3;
+        // Never sent: first reached tick fires.
+        assert!(is_due(&s, TODAY, AT));
+        // Sent today: no.
+        s.last_sent_date = Some(TODAY.into());
+        assert!(!is_due(&s, TODAY, 23 * 60));
+        // n-1 days ago: no. n days ago: yes.
+        s.last_sent_date = Some("2026-06-10".into());
+        assert!(!is_due(&s, TODAY, AT));
+        s.last_sent_date = Some("2026-06-09".into());
+        assert!(is_due(&s, TODAY, AT));
+        // n=0 clamps to 1: yesterday ⇒ due.
+        s.n_days = 0;
+        s.last_sent_date = Some("2026-06-11".into());
+        assert!(is_due(&s, TODAY, AT));
+        // Time not reached blocks regardless.
+        assert!(!is_due(&s, TODAY, AT - 1));
     }
 
     #[test]
-    fn config_defaults_are_off_and_colombia_morning() {
-        let c = ReportScheduleConfig::default();
-        assert!(!c.enabled);
-        assert_eq!((c.hour, c.minute), (8, 0));
-        assert_eq!(c.tz_offset_minutes, -300);
-        assert_eq!((c.rig.as_str(), c.workspace.as_str()), ("hq", "default"));
-        // Old config files (no `report` key) must keep parsing.
-        let parsed: ReportScheduleConfig = serde_json::from_str("{}").expect("empty object");
-        assert!(!parsed.enabled);
+    fn once_fires_exactly_once_with_catch_up() {
+        let mut s = sched(ScheduleMode::Once);
+        // No date: never.
+        assert!(!is_due(&s, TODAY, AT));
+        // Future date: no.
+        s.date = Some("2026-06-20".into());
+        assert!(!is_due(&s, TODAY, AT));
+        // Target day: only once the time is reached.
+        s.date = Some(TODAY.into());
+        assert!(!is_due(&s, TODAY, AT - 1));
+        assert!(is_due(&s, TODAY, AT));
+        // Process was down on the date: a later day catches up at any time.
+        s.date = Some("2026-06-10".into());
+        assert!(is_due(&s, TODAY, 0));
+        // Already sent: never again, any day.
+        s.last_sent_date = Some("2026-06-10".into());
+        assert!(!is_due(&s, "2026-07-01", 23 * 60));
+    }
+
+    #[test]
+    fn legacy_scalar_config_migrates_to_one_daily_schedule() {
+        let legacy: LegacyReportConfig = serde_json::from_str(
+            r#"{"enabled":true,"hour":9,"minute":15,"tz_offset_minutes":-300,
+                "rig":"hq","workspace":"default","last_sent_date":"2026-06-11"}"#,
+        )
+        .expect("legacy parses");
+        let s = legacy.into_schedule();
+        assert_eq!(s.mode, ScheduleMode::Daily);
+        assert!(s.enabled);
+        assert_eq!((s.hour, s.minute), (9, 15));
+        assert_eq!(s.last_sent_date.as_deref(), Some("2026-06-11"));
+        assert_eq!(s.kind, "planning-digest");
+        assert!(s.subscribers.is_none());
+        assert!(!s.id.is_empty());
+    }
+
+    #[test]
+    fn new_schedule_list_round_trips_and_defaults_hold() {
+        let s = ReportSchedule { mode: ScheduleMode::EveryNDays, n_days: 7, ..Default::default() };
+        let json = serde_json::to_string(&vec![s.clone()]).expect("encode");
+        let back: Vec<ReportSchedule> = serde_json::from_str(&json).expect("decode");
+        assert_eq!(back[0].id, s.id);
+        assert_eq!(back[0].mode, ScheduleMode::EveryNDays);
+        assert_eq!(back[0].n_days, 7);
+        // Defaults for an empty object.
+        let d: ReportSchedule = serde_json::from_str("{}").expect("empty");
+        assert_eq!(d.kind, "planning-digest");
+        assert_eq!(d.mode, ScheduleMode::Daily);
+        assert!(d.enabled);
+        assert_eq!(d.tz_offset_minutes, -300);
+    }
+
+    #[test]
+    fn registry_knows_planning_digest_and_rejects_unknown() {
+        assert!(render_for("planning-digest").is_some());
+        assert!(render_for("nope").is_none());
+        assert_eq!(kinds(), vec!["planning-digest"]);
     }
 }
