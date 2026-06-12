@@ -402,10 +402,14 @@ pub fn spawn_hydrated(
                     // Detect window rollovers before the probe overwrites state.
                     // When the provider reports a later resets_at, the old window
                     // has expired — record the final consumed for historical stats.
+                    // A window that burned nothing is bookkeeping, not history — and probes
+                    // synthesized for idle accounts (no five_hour in /usage, hq-4757bc) push
+                    // resets_at forward on every sweep, which would emit one of these per
+                    // sweep without the consumed gate.
                     let mut rollover_events: Vec<QuotaEvent> = Vec::new();
                     if let Some(acc) = registry.get(&account) {
                         if let Some(w) = &acc.window {
-                            if resets_at_secs > w.resets_at_secs {
+                            if resets_at_secs > w.resets_at_secs && w.consumed >= 1.0 {
                                 rollover_events.push(QuotaEvent::WindowReset {
                                     account: account.clone(),
                                     kind: format!("{:?}", w.kind),
@@ -418,7 +422,7 @@ pub fn spawn_hydrated(
                         if let (Some(ww), Some(new_wr)) =
                             (&acc.weekly_window, weekly_resets_at_secs)
                         {
-                            if new_wr > ww.resets_at_secs {
+                            if new_wr > ww.resets_at_secs && ww.consumed >= 1.0 {
                                 rollover_events.push(QuotaEvent::WindowReset {
                                     account: account.clone(),
                                     kind: format!("{:?}", ww.kind),
@@ -432,7 +436,7 @@ pub fn spawn_hydrated(
                     for evt in rollover_events {
                         let _ = events.send(Envelope::root(evt)).await;
                     }
-                    registry.apply_probe(&account, remaining, resets_at_secs, now_secs);
+                    registry.apply_probe(&account, remaining, resets_at_secs, weekly_remaining, now_secs);
                     if let (Some(w_rem), Some(w_reset)) =
                         (weekly_remaining, weekly_resets_at_secs)
                     {
@@ -521,8 +525,14 @@ pub fn spawn_hydrated(
                                     mw.resets_at_secs = new_resets;
                                     mw.consumed = 0.0;
                                 }
-                                // Fresh window: lift Cooldown so the account re-enters rotation.
-                                if acc.status == AccountQuotaStatus::Cooldown {
+                                // Fresh rolling window: lift Cooldown so the account re-enters
+                                // rotation — unless the weekly budget is still exhausted
+                                // (hq-34a2f5), in which case it stays parked until that turns.
+                                let weekly_ok = acc
+                                    .weekly_window
+                                    .as_ref()
+                                    .map_or(true, |w| w.remaining() > 0);
+                                if acc.status == AccountQuotaStatus::Cooldown && weekly_ok {
                                     acc.status = AccountQuotaStatus::Healthy;
                                 }
                             }
@@ -548,7 +558,13 @@ pub fn spawn_hydrated(
                                     ww.resets_at_secs = new_resets;
                                     ww.consumed = 0.0;
                                 }
-                                if acc.status == AccountQuotaStatus::Cooldown {
+                                // Same gate, mirrored: the weekly turned over, but the rolling
+                                // window may still be exhausted (hq-34a2f5).
+                                let rolling_ok = acc
+                                    .window
+                                    .as_ref()
+                                    .map_or(true, |w| w.remaining() > 0);
+                                if acc.status == AccountQuotaStatus::Cooldown && rolling_ok {
                                     acc.status = AccountQuotaStatus::Healthy;
                                 }
                             }

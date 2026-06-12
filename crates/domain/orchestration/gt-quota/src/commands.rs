@@ -111,7 +111,13 @@ impl Command for ProbeWindow {
 
     fn execute(&self, state: &mut Self::State) -> Result<Self::Output, AppError> {
         self.validate(state)?;
-        state.apply_probe(&self.account, self.remaining, self.resets_at_secs, self.now_secs);
+        state.apply_probe(
+            &self.account,
+            self.remaining,
+            self.resets_at_secs,
+            self.weekly_remaining,
+            self.now_secs,
+        );
         if let (Some(w_rem), Some(w_reset)) = (self.weekly_remaining, self.weekly_resets_at_secs) {
             state.apply_weekly_probe(&self.account, w_rem, w_reset, self.now_secs);
         }

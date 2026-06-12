@@ -303,8 +303,17 @@ impl AccountRegistry {
     /// Reconcile the live window against the provider's authoritative `remaining`/`resets_at`.
     /// Creates a synthetic Rolling5h window when none exists yet (first probe on a freshly
     /// registered account). Transitions Cooldown/Limited/Blocked → Healthy when `remaining > 0`
-    /// (the account recovered capacity). Shared by `QuotaMsg::Probe` and `ProbeWindow`.
-    pub fn apply_probe(&mut self, account: &str, remaining: u64, resets_at_secs: u64, now_secs: u64) {
+    /// AND the weekly budget is not exhausted (hq-34a2f5) — `weekly_remaining` from the same
+    /// probe when the provider sent it, else the stored weekly window, else no weekly quota ⇒
+    /// no objection. Shared by `QuotaMsg::Probe` and `ProbeWindow`.
+    pub fn apply_probe(
+        &mut self,
+        account: &str,
+        remaining: u64,
+        resets_at_secs: u64,
+        weekly_remaining: Option<u64>,
+        now_secs: u64,
+    ) {
         if let Some(acc) = self.get_mut(account) {
             match acc.window.as_mut() {
                 Some(w) => {
@@ -332,9 +341,15 @@ impl AccountRegistry {
             // sampled-since tail — from here the local counter is telemetry, not truth.
             acc.last_probe_secs = Some(now_secs);
             acc.sampled_since_probe = 0.0;
-            // A probe with remaining > 0 means the account has real capacity: lift any
-            // non-Healthy status (Cooldown after rotation, Limited/Blocked after a 429).
-            if remaining > 0 {
+            // A probe with remaining > 0 means the account has real 5h capacity: lift any
+            // non-Healthy status (Cooldown after rotation, Limited/Blocked after a 429) —
+            // unless the weekly budget is exhausted, in which case the account stays parked
+            // until the weekly window turns over.
+            let weekly_ok = match weekly_remaining {
+                Some(w) => w > 0,
+                None => acc.weekly_window.as_ref().map_or(true, |w| w.remaining() > 0),
+            };
+            if remaining > 0 && weekly_ok {
                 acc.status = AccountQuotaStatus::Healthy;
             }
         }
@@ -552,7 +567,13 @@ impl QuotaState {
                 }
                 entry.last_probe_secs = Some(*now_secs);
                 entry.sampled_since_probe = 0.0;
-                if *remaining > 0 {
+                // Same weekly gate as the live `apply_probe` (hq-34a2f5): 5h capacity alone
+                // must not lift an account whose weekly budget is exhausted.
+                let weekly_ok = match weekly_remaining {
+                    Some(w) => *w > 0,
+                    None => entry.weekly_window.as_ref().map_or(true, |w| w.remaining() > 0),
+                };
+                if *remaining > 0 && weekly_ok {
                     entry.status = AccountQuotaStatus::Healthy;
                 }
             }
@@ -575,8 +596,14 @@ impl QuotaState {
                     w.consumed = 0.0;
                 }
                 // A fresh window means quota is available again: lift Cooldown so the account
-                // re-enters the rotation pool automatically without waiting for a probe.
-                if entry.status == AccountQuotaStatus::Cooldown {
+                // re-enters the rotation pool automatically without waiting for a probe —
+                // unless the OTHER window is still exhausted (hq-34a2f5).
+                let other_ok = if kind == "Weekly" {
+                    entry.window.as_ref().map_or(true, |w| w.remaining() > 0)
+                } else {
+                    entry.weekly_window.as_ref().map_or(true, |w| w.remaining() > 0)
+                };
+                if entry.status == AccountQuotaStatus::Cooldown && other_ok {
                     entry.status = AccountQuotaStatus::Healthy;
                 }
             }
@@ -766,7 +793,7 @@ mod tests {
             sampled_since_probe: 0.0,
             probe_divergence: None,
         });
-        r.apply_probe("acc-1", 50_000_000, 36_000, 0);
+        r.apply_probe("acc-1", 50_000_000, 36_000, None, 0);
         let acc = r.get("acc-1").unwrap();
         assert_eq!(acc.status, AccountQuotaStatus::Healthy, "Cooldown lifted on remaining>0");
         let w = acc.window.as_ref().unwrap();
@@ -793,7 +820,7 @@ mod tests {
             sampled_since_probe: 0.0,
             probe_divergence: None,
         });
-        r.apply_probe("acc-1", 0, 18_000, 0);
+        r.apply_probe("acc-1", 0, 18_000, None, 0);
         assert_eq!(
             r.get("acc-1").unwrap().status,
             AccountQuotaStatus::Cooldown,
@@ -802,11 +829,77 @@ mod tests {
     }
 
     #[test]
+    fn probe_with_exhausted_weekly_does_not_lift_cooldown() {
+        // hq-34a2f5: 5h capacity alone must not rehabilitate an account whose weekly
+        // budget is burnt — it would only thrash back via 429s.
+        let mut r = AccountRegistry::default();
+        r.upsert_account(Account {
+            id: "acc-1".into(),
+            status: AccountQuotaStatus::Cooldown,
+            window: Some(AccountWindow {
+                kind: WindowKind::Rolling5h,
+                limit: DEFAULT_PLAN_LIMIT,
+                started_at_secs: 0,
+                resets_at_secs: 18_000,
+                consumed: DEFAULT_PLAN_LIMIT as f64,
+            }),
+            weekly_window: None,
+            last_probe_secs: None,
+            sampled_since_probe: 0.0,
+            probe_divergence: None,
+        });
+        // Probe reports recovered 5h capacity but an exhausted weekly budget.
+        r.apply_probe("acc-1", 40_000_000, 36_000, Some(0), 100);
+        assert_eq!(
+            r.get("acc-1").unwrap().status,
+            AccountQuotaStatus::Cooldown,
+            "weekly_remaining=0 must hold the account parked"
+        );
+        // Weekly capacity back ⇒ the same probe shape lifts it.
+        r.apply_probe("acc-1", 40_000_000, 36_000, Some(10), 200);
+        assert_eq!(r.get("acc-1").unwrap().status, AccountQuotaStatus::Healthy);
+    }
+
+    #[test]
+    fn probe_without_weekly_consults_stored_weekly_window() {
+        // A headers-only probe (no weekly half) must still respect a stored weekly
+        // window that shows zero remaining.
+        let mut r = AccountRegistry::default();
+        r.upsert_account(Account {
+            id: "acc-1".into(),
+            status: AccountQuotaStatus::Cooldown,
+            window: Some(AccountWindow {
+                kind: WindowKind::Rolling5h,
+                limit: DEFAULT_PLAN_LIMIT,
+                started_at_secs: 0,
+                resets_at_secs: 18_000,
+                consumed: DEFAULT_PLAN_LIMIT as f64,
+            }),
+            weekly_window: Some(AccountWindow {
+                kind: WindowKind::Weekly,
+                limit: 1_000,
+                started_at_secs: 0,
+                resets_at_secs: 600_000,
+                consumed: 1_000.0,
+            }),
+            last_probe_secs: None,
+            sampled_since_probe: 0.0,
+            probe_divergence: None,
+        });
+        r.apply_probe("acc-1", 40_000_000, 36_000, None, 100);
+        assert_eq!(
+            r.get("acc-1").unwrap().status,
+            AccountQuotaStatus::Cooldown,
+            "stored weekly at zero remaining must hold the account parked"
+        );
+    }
+
+    #[test]
     fn probe_creates_window_when_none_exists() {
         // hq-quota-refinement.1 (AC2): first probe on a freshly registered account seeds a window.
         let mut r = AccountRegistry::default();
         r.upsert_account(Account::new("acc-1")); // window = None
-        r.apply_probe("acc-1", 40_000_000, 18_000, 0);
+        r.apply_probe("acc-1", 40_000_000, 18_000, None, 0);
         let acc = r.get("acc-1").unwrap();
         assert_eq!(acc.status, AccountQuotaStatus::Healthy);
         let w = acc.window.as_ref().expect("window created by probe");
@@ -879,7 +972,7 @@ mod tests {
             sampled_since_probe: 0.0,
             probe_divergence: None,
         });
-        r.apply_probe("acc-1", 40_000_000, 36_000, 0);
+        r.apply_probe("acc-1", 40_000_000, 36_000, None, 0);
         assert_eq!(
             r.get("acc-1").unwrap().status,
             AccountQuotaStatus::Healthy,
@@ -1003,7 +1096,7 @@ mod tests {
         assert_eq!(acc.last_probe_secs, None, "never probed yet");
 
         // Provider says 850 remaining of 1000 ⇒ probed consumed 150; local said 200.
-        r.apply_probe("acc-1", 850, 20_000, 700);
+        r.apply_probe("acc-1", 850, 20_000, None, 700);
         let acc = r.get("acc-1").unwrap();
         assert_eq!(acc.window.as_ref().unwrap().consumed, 150.0, "probe is authoritative");
         assert_eq!(acc.probe_divergence, Some(50.0), "local over-count exposed");

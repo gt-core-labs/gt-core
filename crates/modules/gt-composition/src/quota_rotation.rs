@@ -116,13 +116,16 @@ fn hard_pct() -> f64 {
         .unwrap_or(90.0)
 }
 
-/// Rolling-5h utilization percent from the account's window. No window ⇒ 0 (an unverified
-/// account is a candidate — the first probe corrects it within one sweep).
+/// Utilization percent the gates consume: the WORSE of the rolling-5h and weekly windows
+/// (hq-34a2f5 — an account with the weekly budget burnt must not win as rotation target on a
+/// fresh 5h window alone). No window ⇒ 0 (an unverified account is a candidate — the first
+/// probe corrects it within one sweep).
 fn utilization_pct(acc: &Account) -> f64 {
-    match &acc.window {
+    let pct = |w: &Option<AccountWindow>| match w {
         Some(w) if w.limit > 0 => (w.consumed / w.limit as f64) * 100.0,
         _ => 0.0,
-    }
+    };
+    pct(&acc.window).max(pct(&acc.weekly_window))
 }
 
 /// A fresh Rolling5h window anchored at `now`, used when no provider headers supply the real one.
@@ -915,6 +918,30 @@ mod tests {
         // Only hard-exhausted alternatives ⇒ stay put.
         let only_hot = vec![acct_with_util("risk", 99.0, 100), acct_with_util("c", 95.0, 100)];
         assert!(QuotaRotationPlugin::pick_target(&only_hot, "risk").is_none());
+    }
+
+    #[test]
+    fn pick_target_excludes_weekly_exhausted_account() {
+        // hq-34a2f5: a fresh 5h window must not make an account whose WEEKLY budget is at
+        // 95% the rotation target — utilization gates on the worse of the two windows.
+        let mut weekly_hot = acct_with_util("a", 10.0, 100); // 5h at 10%
+        weekly_hot.weekly_window = Some(AccountWindow {
+            kind: WindowKind::Weekly,
+            limit: 100,
+            started_at_secs: 0,
+            resets_at_secs: FAR_FUTURE,
+            consumed: 95.0, // weekly at 95% ≥ hard(90)
+        });
+        let accounts = vec![
+            acct_with_util("risk", 99.0, 100),
+            weekly_hot,
+            acct_with_util("b", 70.0, 100),
+        ];
+        assert_eq!(
+            QuotaRotationPlugin::pick_target(&accounts, "risk").as_deref(),
+            Some("b"),
+            "weekly-exhausted 'a' must lose to 'b' despite the fresher 5h window"
+        );
     }
 
     #[tokio::test]
