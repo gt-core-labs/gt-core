@@ -39,7 +39,7 @@ use gt_polecat::{
 };
 use gt_quota::Keychain;
 use gt_scheduling::SchedEvent;
-use gt_skills::SkillState;
+use gt_skills::{ModelConfig, SkillState};
 
 use crate::mcp::EventLog;
 use crate::operator_event::IssueOperatorEvent;
@@ -559,6 +559,13 @@ impl Plugin for PolecatSupervisorPlugin {
                                     );
                                 }
                             }
+                            // Role model config (hq-b185a4): the same navbar-configured
+                            // RoleModelSet the terminal applies to interactive sessions —
+                            // stamp --model/--permission-mode/--effort onto the polecat
+                            // launch so Agents → Model governs autonomous agents too.
+                            if let Some(model) = state.catalog.role_model(role) {
+                                apply_role_model(&mut spec.args, &model);
+                            }
                         }
                         Err(e) => eprintln!(
                             "[polecat] skills replay failed — no skills/CLAUDE.md written for {bead}: {e}"
@@ -663,6 +670,36 @@ impl Plugin for PolecatSupervisorPlugin {
             }
             _ => Ok(()),
         }
+    }
+}
+
+/// Stamp a role's navbar-configured [`ModelConfig`] onto a polecat's launch args (`hq-b185a4`):
+/// `--model` / `--permission-mode` / `--effort` for each non-empty field, inserted BEFORE the
+/// trailing positional bead prompt so the prompt stays last (claude reads it as the kickoff).
+/// Mirrors what `terminal.rs` stamps for interactive sessions, so Agents → Model governs
+/// autonomous polecats too.
+///
+/// A role-set permission mode REPLACES the template's `--dangerously-skip-permissions`: the
+/// mode is the operator's explicit choice, and dropping the bypass flag is what lets a
+/// non-bypass mode (e.g. `acceptEdits`) skip the bypass accept prompt that otherwise blocks a
+/// fresh pod's first sling.
+pub fn apply_role_model(args: &mut Vec<String>, model: &ModelConfig) {
+    let prompt = args.pop();
+    if !model.model.trim().is_empty() {
+        args.push("--model".to_string());
+        args.push(model.model.clone());
+    }
+    if !model.permission_mode.trim().is_empty() {
+        args.retain(|a| a != "--dangerously-skip-permissions");
+        args.push("--permission-mode".to_string());
+        args.push(model.permission_mode.clone());
+    }
+    if !model.effort.trim().is_empty() {
+        args.push("--effort".to_string());
+        args.push(model.effort.clone());
+    }
+    if let Some(p) = prompt {
+        args.push(p);
     }
 }
 
@@ -1255,6 +1292,90 @@ mod tests {
     #[test]
     fn host_cap_is_at_least_one() {
         assert!(host_cap_from_metrics() >= 1);
+    }
+
+    #[test]
+    fn apply_role_model_stamps_flags_and_replaces_bypass() {
+        // hq-b185a4: the navbar RoleModelSet governs the polecat launch — non-empty fields become
+        // --model/--permission-mode/--effort, the prompt stays the LAST positional, and a role-set
+        // permission mode replaces the template's --dangerously-skip-permissions.
+        let mut args = vec![
+            "--dangerously-skip-permissions".to_string(),
+            "work the bead".to_string(),
+        ];
+        apply_role_model(
+            &mut args,
+            &ModelConfig {
+                model: "claude-opus-4-6".into(),
+                permission_mode: "acceptEdits".into(),
+                effort: "high".into(),
+            },
+        );
+        assert_eq!(
+            args,
+            vec![
+                "--model",
+                "claude-opus-4-6",
+                "--permission-mode",
+                "acceptEdits",
+                "--effort",
+                "high",
+                "work the bead",
+            ]
+        );
+
+        // Empty fields are skipped — and without a permission mode the bypass flag survives.
+        let mut args = vec![
+            "--dangerously-skip-permissions".to_string(),
+            "prompt".to_string(),
+        ];
+        apply_role_model(
+            &mut args,
+            &ModelConfig {
+                model: "haiku".into(),
+                permission_mode: String::new(),
+                effort: String::new(),
+            },
+        );
+        assert_eq!(
+            args,
+            vec!["--dangerously-skip-permissions", "--model", "haiku", "prompt"]
+        );
+    }
+
+    #[tokio::test]
+    async fn dispatch_applies_role_model_from_skills_log() {
+        // hq-b185a4 end-to-end through the sling path: a RoleModelSet for the polecat role in the
+        // skills.* log lands as launch flags on the slung spec (observed via the supervisor's
+        // re-sling respec hook is overkill — assert via the spawned tmux env? args aren't recorded
+        // by FakeTmux, so replay the SAME catalog read the sling does and assert the helper's
+        // contract against it).
+        let dir = tempfile::tempdir().unwrap();
+        let log = Arc::new(EventLog::new(Some(dir.path().to_path_buf())));
+        log.append(
+            Some("acme"),
+            gt_skills::SkillEvent::RoleModelSet {
+                role: "polecat".into(),
+                model: String::new(),
+                permission_mode: "acceptEdits".into(),
+                effort: String::new(),
+                now_secs: 1,
+            },
+        )
+        .unwrap();
+        let state = log
+            .replay_domain(Some("acme"), "skills.", SkillState::default(), SkillState::apply)
+            .unwrap();
+        let model = state
+            .catalog
+            .role_model("polecat")
+            .expect("RoleModelSet resolves for the polecat role");
+        let mut args = vec![
+            "--dangerously-skip-permissions".to_string(),
+            "prompt".to_string(),
+        ];
+        apply_role_model(&mut args, &model);
+        assert_eq!(args, vec!["--permission-mode", "acceptEdits", "prompt"]);
     }
 
     #[test]
