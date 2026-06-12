@@ -120,6 +120,23 @@ impl JwtMinter {
         encode(&self.header(), claims, &self.key)
             .map_err(|e| AuthError::SigningFailure(e.to_string()))
     }
+
+    /// Sign an **arbitrary JSON document** into a compact RS256 JWS — the generic sibling of
+    /// [`mint`](Self::mint) for payloads that are not [`JwtClaims`], e.g. the signed A2A Agent
+    /// Card (gtcore-9039b5). Same private key, same `kid` stamping (rotation works identically),
+    /// so a consumer verifies the document against the same public key/JWKS that verifies the
+    /// platform's bearer tokens — see
+    /// [`JwtAuthenticator::verify_json`](crate::JwtAuthenticator::verify_json). `payload` must be
+    /// a JSON object (a JWS claims set is one); anything else is [`AuthError::SigningFailure`].
+    pub fn sign_json(&self, payload: &serde_json::Value) -> Result<String, AuthError> {
+        if !payload.is_object() {
+            return Err(AuthError::SigningFailure(
+                "JWS payload must be a JSON object".into(),
+            ));
+        }
+        encode(&self.header(), payload, &self.key)
+            .map_err(|e| AuthError::SigningFailure(e.to_string()))
+    }
 }
 
 #[cfg(test)]
@@ -180,6 +197,31 @@ mod tests {
         let token = minter.mint(&claims()).unwrap();
         let auth = JwtAuthenticator::from_rsa_pem(TEST_PUB_PEM).unwrap();
         assert_eq!(auth.authenticate(&token), Err(AuthError::InvalidSignature));
+    }
+
+    #[test]
+    fn sign_json_round_trips_an_arbitrary_document_through_verify_json() {
+        // gtcore-9039b5: the signed A2A Agent Card path — an arbitrary JSON object signed with
+        // the platform key verifies (payload-identical) against the matching public key.
+        let minter = JwtMinter::from_rsa_pem(TEST_PRIV_PEM).unwrap();
+        let card = serde_json::json!({"name": "gt", "url": "https://gt/a2a", "skills": []});
+        let jws = minter.sign_json(&card).unwrap();
+        let auth = JwtAuthenticator::from_rsa_pem(TEST_PUB_PEM).unwrap();
+        assert_eq!(auth.verify_json(&jws).unwrap(), card);
+    }
+
+    #[test]
+    fn sign_json_with_a_different_key_fails_verification_and_non_objects_are_rejected() {
+        let other = JwtMinter::from_rsa_pem(OTHER_PRIV_PEM).unwrap();
+        let jws = other.sign_json(&serde_json::json!({"name": "gt"})).unwrap();
+        let auth = JwtAuthenticator::from_rsa_pem(TEST_PUB_PEM).unwrap();
+        assert_eq!(auth.verify_json(&jws), Err(AuthError::InvalidSignature));
+        // A JWS claims set is a JSON object; anything else is a signing error, not a panic.
+        let minter = JwtMinter::from_rsa_pem(TEST_PRIV_PEM).unwrap();
+        assert!(matches!(
+            minter.sign_json(&serde_json::json!("just a string")),
+            Err(AuthError::SigningFailure(_))
+        ));
     }
 
     #[test]

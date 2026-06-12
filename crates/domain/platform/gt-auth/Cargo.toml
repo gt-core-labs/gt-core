@@ -87,7 +87,10 @@ serde_json = { workspace = true, optional = true }
 # Production email+password provider — argon2 hash + verify.
 password-hash = ["dep:argon2"]
 # Production RS256 JWT verifier — jsonwebtoken decode + signature check (hq-auth-verify.1).
-jsonwebtoken = ["dep:jsonwebtoken", "dep:pem", "dep:simple_asn1", "dep:base64"]
+# `serde_json` rides along for the generic JWS payload surface (`JwtMinter::sign_json` /
+# `JwtAuthenticator::verify_json`, gtcore-9039b5): an arbitrary JSON document — e.g. the signed
+# A2A Agent Card — signed and verified with the same RS256 keys as the bearer tokens.
+jsonwebtoken = ["dep:jsonwebtoken", "dep:pem", "dep:simple_asn1", "dep:base64", "dep:serde_json"]
 # Postgres-backed login store (`PgUsers`, hq-auth-mint.2). Pulls in `sqlx` and the
 # `password-hash` adapter it reuses for argon2 verification — never duplicates that logic.
 pg = ["dep:sqlx", "dep:sha2", "password-hash"]

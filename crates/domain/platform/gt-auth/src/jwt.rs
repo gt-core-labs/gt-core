@@ -290,6 +290,23 @@ impl JwtAuthenticator {
                 .ok_or_else(|| AuthError::UnknownKey(String::new())),
         }
     }
+
+    /// Verify a compact RS256 JWS minted by
+    /// [`JwtMinter::sign_json`](crate::JwtMinter::sign_json) and return its JSON payload
+    /// (gtcore-9039b5). **Signature-only**: the payload is an arbitrary document (e.g. the
+    /// signed A2A Agent Card), so none of [`JwtClaims`]' semantic gates (`exp`, `workspace`)
+    /// apply — this proves the platform key signed exactly these bytes, nothing more. Key
+    /// selection follows the token's header `kid` like [`authenticate`](Authenticator::authenticate).
+    pub fn verify_json(&self, token: &str) -> Result<serde_json::Value, AuthError> {
+        let header = decode_header(token).map_err(map_err)?;
+        let key = self.key_for(header.kid.as_deref())?;
+        // `self.validation` is already signature-only (validate_exp/aud off, no
+        // required claims — see `rs256_validation`), so it fits a non-JwtClaims
+        // payload verbatim.
+        decode::<serde_json::Value>(token, key, &self.validation)
+            .map(|data| data.claims)
+            .map_err(map_err)
+    }
 }
 
 impl Authenticator for JwtAuthenticator {
