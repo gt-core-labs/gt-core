@@ -61,6 +61,7 @@ use gt_composition::polecat::{
 use gt_composition::quota_rotation::{self, QuotaRotationPlugin};
 use gt_composition::session_reconcile::{ReapScope, ReapSink, SessionReconciler};
 use gt_composition::witness_sweep::WitnessSweep;
+use gt_composition::workflow_notify::WorkflowNotifyPlugin;
 use gt_composition::{daemon_root, replay_quota_state, DaemonRoot};
 use gt_eventlog::DEFAULT_EVENTLOG_ROOT;
 use gt_plugin::{spawn_plugin_relay, PluginRegistry};
@@ -575,7 +576,7 @@ async fn main() -> anyhow::Result<()> {
     // event log the backend writes to — the polecat role's prompt becomes CLAUDE.md in its worktree,
     // the same pattern terminal.rs uses for interactive sessions.
     let knowledge_log = Arc::new(EventLog::new(Some(event_root_for_polecat)));
-    pol_plugin = pol_plugin.with_event_log(knowledge_log);
+    pol_plugin = pol_plugin.with_event_log(knowledge_log.clone());
     eprintln!("[gt-orch-server] Knowledge role prompt on — polecat CLAUDE.md from skills.* log");
     // Register the polecat supervisor and — when a keychain exists — the predictive rotation
     // observer on the same relay: a `quota.block_predicted.v1` / `quota.account_limited.v1` flips
@@ -605,6 +606,30 @@ async fn main() -> anyhow::Result<()> {
         "[gt-orch-server] git-merge edge on — branches land on main from rig checkout {} (+ per-rig routing)",
         rig_path.display()
     );
+    // Workflow notifications (hq-b7f7c1, epic hq-bb12a2): mirror dispatch / merge-landed /
+    // merge-failed onto the operator's notification bell — same write surfaces as notify.send
+    // (public.notifications + the SSE event log). Armed only with GT_PG_URL; best-effort inside.
+    match std::env::var("GT_PG_URL").ok().filter(|v| !v.is_empty()) {
+        Some(pg_url) => match sqlx::postgres::PgPoolOptions::new()
+            .max_connections(2)
+            .connect_lazy(&pg_url)
+        {
+            Ok(pool) => {
+                pol_registry = pol_registry.register(WorkflowNotifyPlugin::new(
+                    pool,
+                    knowledge_log.clone(),
+                    ws_slug.clone(),
+                ));
+                eprintln!(
+                    "[gt-orch-server] workflow notifications on — dispatch/merged/failed reach the operator bell"
+                );
+            }
+            Err(e) => eprintln!("[gt-orch-server] workflow notifications OFF (pg pool: {e})"),
+        },
+        None => {
+            eprintln!("[gt-orch-server] workflow notifications OFF — GT_PG_URL unset")
+        }
+    }
     let pol_registry = Arc::new(pol_registry);
     let pol_relay = spawn_plugin_relay(handle.subscribe_events(), pol_registry);
     eprintln!(

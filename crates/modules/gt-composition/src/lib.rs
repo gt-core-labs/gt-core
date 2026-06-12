@@ -63,6 +63,7 @@ pub mod terminal;
 pub mod usage_probe;
 pub mod webhook;
 pub mod witness_sweep;
+pub mod workflow_notify;
 pub mod worktree;
 
 use std::collections::HashMap;
