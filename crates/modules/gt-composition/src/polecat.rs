@@ -561,8 +561,9 @@ impl Plugin for PolecatSupervisorPlugin {
                             }
                             // Role model config (hq-b185a4): the same navbar-configured
                             // RoleModelSet the terminal applies to interactive sessions —
-                            // stamp --model/--permission-mode/--effort onto the polecat
-                            // launch so Agents → Model governs autonomous agents too.
+                            // stamp --model/--effort onto the polecat launch so Agents →
+                            // Model governs autonomous agents too. permission_mode is
+                            // deliberately NOT applied here (hq-e90522): see apply_role_model.
                             if let Some(model) = state.catalog.role_model(role) {
                                 apply_role_model(&mut spec.args, &model);
                             }
@@ -674,25 +675,21 @@ impl Plugin for PolecatSupervisorPlugin {
 }
 
 /// Stamp a role's navbar-configured [`ModelConfig`] onto a polecat's launch args (`hq-b185a4`):
-/// `--model` / `--permission-mode` / `--effort` for each non-empty field, inserted BEFORE the
-/// trailing positional bead prompt so the prompt stays last (claude reads it as the kickoff).
-/// Mirrors what `terminal.rs` stamps for interactive sessions, so Agents → Model governs
-/// autonomous polecats too.
+/// `--model` / `--effort` for each non-empty field, inserted BEFORE the trailing positional bead
+/// prompt so the prompt stays last (claude reads it as the kickoff). This is how Agents → Model
+/// governs autonomous polecats, not just the interactive sessions `terminal.rs` stamps.
 ///
-/// A role-set permission mode REPLACES the template's `--dangerously-skip-permissions`: the
-/// mode is the operator's explicit choice, and dropping the bypass flag is what lets a
-/// non-bypass mode (e.g. `acceptEdits`) skip the bypass accept prompt that otherwise blocks a
-/// fresh pod's first sling.
+/// `permission_mode` is DELIBERATELY ignored (`hq-e90522`): an interactive mode (`acceptEdits` /
+/// `plan` / `default`) makes claude stop and ask before a bash command — and nobody answers in an
+/// autonomous tmux session, so the polecat hangs until its restarts burn out. Autonomous agents
+/// keep the template's `--dangerously-skip-permissions` (or whatever `GT_POLECAT_ARGS` says);
+/// the navbar's permission mode keeps governing interactive sessions via `terminal.rs`, where a
+/// human can actually answer the prompt.
 pub fn apply_role_model(args: &mut Vec<String>, model: &ModelConfig) {
     let prompt = args.pop();
     if !model.model.trim().is_empty() {
         args.push("--model".to_string());
         args.push(model.model.clone());
-    }
-    if !model.permission_mode.trim().is_empty() {
-        args.retain(|a| a != "--dangerously-skip-permissions");
-        args.push("--permission-mode".to_string());
-        args.push(model.permission_mode.clone());
     }
     if !model.effort.trim().is_empty() {
         args.push("--effort".to_string());
@@ -1295,10 +1292,11 @@ mod tests {
     }
 
     #[test]
-    fn apply_role_model_stamps_flags_and_replaces_bypass() {
-        // hq-b185a4: the navbar RoleModelSet governs the polecat launch — non-empty fields become
-        // --model/--permission-mode/--effort, the prompt stays the LAST positional, and a role-set
-        // permission mode replaces the template's --dangerously-skip-permissions.
+    fn apply_role_model_stamps_model_effort_and_keeps_bypass() {
+        // hq-b185a4 + hq-e90522: the navbar RoleModelSet governs the polecat launch — non-empty
+        // model/effort become flags, the prompt stays the LAST positional, and the template's
+        // --dangerously-skip-permissions ALWAYS survives: an interactive permission mode would
+        // hang an autonomous tmux session on the first bash prompt, so it is never applied here.
         let mut args = vec![
             "--dangerously-skip-permissions".to_string(),
             "work the bead".to_string(),
@@ -1307,24 +1305,27 @@ mod tests {
             &mut args,
             &ModelConfig {
                 model: "claude-opus-4-6".into(),
-                permission_mode: "acceptEdits".into(),
+                permission_mode: "acceptEdits".into(), // navbar value — ignored for agents
                 effort: "high".into(),
             },
         );
         assert_eq!(
             args,
             vec![
+                "--dangerously-skip-permissions",
                 "--model",
                 "claude-opus-4-6",
-                "--permission-mode",
-                "acceptEdits",
                 "--effort",
                 "high",
                 "work the bead",
             ]
         );
+        assert!(
+            !args.iter().any(|a| a == "--permission-mode"),
+            "permission_mode never reaches an autonomous launch"
+        );
 
-        // Empty fields are skipped — and without a permission mode the bypass flag survives.
+        // Empty fields are skipped entirely.
         let mut args = vec![
             "--dangerously-skip-permissions".to_string(),
             "prompt".to_string(),
@@ -1356,9 +1357,9 @@ mod tests {
             Some("acme"),
             gt_skills::SkillEvent::RoleModelSet {
                 role: "polecat".into(),
-                model: String::new(),
-                permission_mode: "acceptEdits".into(),
-                effort: String::new(),
+                model: "claude-opus-4-6".into(),
+                permission_mode: "acceptEdits".into(), // set in the navbar — ignored for agents
+                effort: "high".into(),
                 now_secs: 1,
             },
         )
@@ -1375,7 +1376,18 @@ mod tests {
             "prompt".to_string(),
         ];
         apply_role_model(&mut args, &model);
-        assert_eq!(args, vec!["--permission-mode", "acceptEdits", "prompt"]);
+        assert_eq!(
+            args,
+            vec![
+                "--dangerously-skip-permissions",
+                "--model",
+                "claude-opus-4-6",
+                "--effort",
+                "high",
+                "prompt"
+            ],
+            "model+effort land, the bypass flag survives, permission_mode never applies"
+        );
     }
 
     #[test]
