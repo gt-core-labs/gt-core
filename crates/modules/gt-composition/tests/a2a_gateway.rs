@@ -13,8 +13,8 @@ use tower::ServiceExt;
 
 use gt_a2a::{a2a_router, AgentCapabilities, AgentCard};
 use gt_composition::a2a::{
-    A2aGateway, A2aGatewayConfig, BeadIntake, BeadSnapshot, ChannelDispatch, IntakeRequest,
-    SessionControl, TaskStore,
+    A2aGateway, A2aGatewayConfig, BeadIntake, BeadSnapshot, ChannelDispatch, EventFeed,
+    FeedRecord, IntakeRequest, SessionControl, TaskStore,
 };
 use gt_issues::Domain;
 
@@ -88,12 +88,24 @@ async fn rpc(app: axum::Router, body: Value) -> Value {
     serde_json::from_slice(&bytes).unwrap()
 }
 
+/// Feed fake: the subscribe wire path is exercised in the unit suite; the
+/// router tests only need the port satisfied.
+struct EmptyFeed;
+
+#[async_trait]
+impl EventFeed for EmptyFeed {
+    async fn tail(&self, _since: Option<&str>) -> Result<Vec<FeedRecord>, String> {
+        Ok(vec![])
+    }
+}
+
 fn test_config() -> A2aGatewayConfig {
     A2aGatewayConfig {
         rig: "gtcore".into(),
         parent_id: "gtcore-intake".into(),
         created_by: "a2a".into(),
         domain: vec![Domain::MetaGap],
+        poll: std::time::Duration::from_millis(5),
     }
 }
 
@@ -106,6 +118,7 @@ async fn post_a2a_send_mints_bead_drops_event_and_answers_submitted() {
         Arc::new(ChannelDispatch::new(channel.path().to_path_buf())),
         Arc::new(OneBeadStore(Mutex::new(vec![]))),
         Arc::new(OneSession(Mutex::new(vec![]))),
+        Arc::new(EmptyFeed),
         test_config(),
     );
     let app = a2a_router(card(), Arc::new(gateway));
@@ -155,6 +168,7 @@ fn projection_app() -> (axum::Router, Arc<OneBeadStore>, Arc<OneSession>) {
         Arc::new(ChannelDispatch::new(channel)),
         store.clone(),
         sessions.clone(),
+        Arc::new(EmptyFeed),
         test_config(),
     );
     (a2a_router(card(), Arc::new(gateway)), store, sessions)

@@ -36,15 +36,19 @@
 
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 
 use async_trait::async_trait;
 use time::format_description::well_known::Rfc3339;
 use time::OffsetDateTime;
 
 use gt_a2a::{
-    A2aError, A2aHandler, JsonRpcError, Part, Task, TaskIdParams, TaskSendParams, TaskState,
-    TaskStatus,
+    A2aError, A2aHandler, Artifact, EventStream, JsonRpcError, Part, StreamEvent, Task,
+    TaskArtifactUpdateEvent, TaskIdParams, TaskSendParams, TaskState, TaskStatus,
+    TaskStatusUpdateEvent,
 };
+use gt_agent::AgentEvent;
+use gt_merge::MergeEvent;
 use gt_issues::handlers::{run_create_issue, run_transition_issue};
 use gt_issues::{CreateIssue, Domain, IssueType, SurfaceTree, TransitionIssue};
 use gt_store_dolt::DoltIssues;
@@ -99,6 +103,23 @@ pub trait SessionControl: Send + Sync {
     async fn kill(&self, session: &str, reason: &str) -> Result<(), String>;
 }
 
+/// One type-erased record off the per-workspace event log.
+#[derive(Clone, Debug)]
+pub struct FeedRecord {
+    /// The log's resume marker (record `ts`, RFC3339 — lexicographically ordered).
+    pub ts: String,
+    pub kind: String,
+    pub payload: serde_json::Value,
+}
+
+/// Port: tail the workspace event log, oldest-first, strictly after `since`
+/// (`None` ⇒ from the recent tail). The B3 stream polls this — same tier as
+/// `stream.rs`'s poll-tail, there is no broadcast bus on this path yet.
+#[async_trait]
+pub trait EventFeed: Send + Sync {
+    async fn tail(&self, since: Option<&str>) -> Result<Vec<FeedRecord>, String>;
+}
+
 /// Deploy-fixed defaults an A2A task does not carry on the wire.
 #[derive(Clone, Debug)]
 pub struct A2aGatewayConfig {
@@ -111,6 +132,8 @@ pub struct A2aGatewayConfig {
     pub created_by: String,
     /// Taxonomy stamped on minted beads (a bead must carry ≥1 domain).
     pub domain: Vec<Domain>,
+    /// Cadence of the `sendSubscribe` poll-tail over [`EventFeed`].
+    pub poll: Duration,
 }
 
 /// The A2A operations server: `tasks/send` → bead + dispatch; `tasks/get` →
@@ -120,6 +143,7 @@ pub struct A2aGateway {
     sink: Arc<dyn DispatchSink>,
     store: Arc<dyn TaskStore>,
     sessions: Arc<dyn SessionControl>,
+    feed: Arc<dyn EventFeed>,
     config: A2aGatewayConfig,
 }
 
@@ -129,9 +153,10 @@ impl A2aGateway {
         sink: Arc<dyn DispatchSink>,
         store: Arc<dyn TaskStore>,
         sessions: Arc<dyn SessionControl>,
+        feed: Arc<dyn EventFeed>,
         config: A2aGatewayConfig,
     ) -> Self {
-        Self { intake, sink, store, sessions, config }
+        Self { intake, sink, store, sessions, feed, config }
     }
 
     /// Bead + session facts for `id`, or `-32001` when the bead does not exist.
@@ -266,6 +291,106 @@ impl A2aHandler for A2aGateway {
             history: vec![],
             metadata: None,
         })
+    }
+
+    async fn send_subscribe(&self, params: TaskSendParams) -> Result<EventStream, A2aError> {
+        // Same intake as `tasks/send` — subscribe is send + a live projection.
+        let task = self.send(params).await?;
+        let bead = task.id;
+        // The minted bead knows its rig (it names the session); fall back to the
+        // deploy default if the read lags the mint.
+        let rig = match self.store.fetch(&bead).await {
+            Ok(Some(snap)) => snap.rig,
+            _ => self.config.rig.clone(),
+        };
+        let session = session_of(&rig, &bead);
+        let feed = self.feed.clone();
+        let poll = self.config.poll;
+
+        Ok(Box::pin(async_stream::stream! {
+            yield status_update(&bead, TaskState::Submitted, false);
+            let mut since: Option<String> = None;
+            loop {
+                // A feed read error ends the stream: the client's reconnect (a
+                // fresh sendSubscribe is invalid, but tasks/get is) beats a
+                // silent busy-loop against a broken log.
+                let Ok(batch) = feed.tail(since.as_deref()).await else { return };
+                for rec in batch {
+                    since = Some(rec.ts.clone());
+                    for ev in translate(&rec, &bead, &session) {
+                        let done = ev.is_final();
+                        yield ev;
+                        if done {
+                            return;
+                        }
+                    }
+                }
+                tokio::time::sleep(poll).await;
+            }
+        }))
+    }
+}
+
+/// A status frame for the subscribed task, stamped now.
+fn status_update(bead: &str, state: TaskState, is_final: bool) -> StreamEvent {
+    StreamEvent::Status(TaskStatusUpdateEvent {
+        id: bead.into(),
+        status: TaskStatus { state, timestamp: rfc3339_now(), message: None },
+        is_final,
+        metadata: None,
+    })
+}
+
+/// Project one log record onto the subscribed task's stream (B3 mapping):
+/// `agent.spawned` → `working`; `agent.session-end`/`merge.merged` →
+/// `completed` final; `merge.failed` → `failed` final; `agent.killed` →
+/// `canceled` final. Records for other beads/sessions vanish. `merge.merged`
+/// also carries the delivered sha as the task's one artifact.
+fn translate(rec: &FeedRecord, bead: &str, session: &str) -> Vec<StreamEvent> {
+    match rec.kind.as_str() {
+        "agent.spawned.v1" | "agent.session-end.v1" | "agent.killed.v1" => {
+            let Ok(ev) = serde_json::from_value::<AgentEvent>(rec.payload.clone()) else {
+                return vec![];
+            };
+            match ev {
+                AgentEvent::Spawned { session: s, .. } if s == session => {
+                    vec![status_update(bead, TaskState::Working, false)]
+                }
+                AgentEvent::SessionEnd { session: s } if s == session => {
+                    vec![status_update(bead, TaskState::Completed, true)]
+                }
+                AgentEvent::Killed { session: s, .. } if s == session => {
+                    vec![status_update(bead, TaskState::Canceled, true)]
+                }
+                _ => vec![],
+            }
+        }
+        "merge.merged.v1" | "merge.failed.v1" => {
+            let Ok(ev) = serde_json::from_value::<MergeEvent>(rec.payload.clone()) else {
+                return vec![];
+            };
+            match ev {
+                MergeEvent::Merged { bead: b, sha } if b == bead => vec![
+                    StreamEvent::Artifact(TaskArtifactUpdateEvent {
+                        id: bead.into(),
+                        artifact: Artifact {
+                            name: Some("merge".into()),
+                            parts: vec![Part::Text { text: sha, metadata: None }],
+                            index: 0,
+                            append: None,
+                            last_chunk: Some(true),
+                        },
+                        metadata: None,
+                    }),
+                    status_update(bead, TaskState::Completed, true),
+                ],
+                MergeEvent::Failed { bead: b, .. } if b == bead => {
+                    vec![status_update(bead, TaskState::Failed, true)]
+                }
+                _ => vec![],
+            }
+        }
+        _ => vec![],
     }
 }
 
@@ -452,6 +577,40 @@ impl SessionControl for RestSessionControl {
     }
 }
 
+/// [`EventFeed`] over the per-workspace partitioned event log — the same
+/// source `stream.rs` poll-tails for the operator SSE feed. Channel-unfiltered
+/// (the subscribe projection needs both `agent.*` and `merge.*`);
+/// [`translate`] drops everything that is not the subscribed task's.
+pub struct LogEventFeed {
+    log: Arc<crate::mcp::EventLog>,
+    workspace: Option<String>,
+}
+
+impl LogEventFeed {
+    pub fn new(log: Arc<crate::mcp::EventLog>, workspace: Option<String>) -> Self {
+        Self { log, workspace }
+    }
+}
+
+/// Most records one tail read returns — same altitude as `stream.rs`'s replay
+/// cap; the per-bead filter discards almost all of them.
+const FEED_CAP: usize = 4096;
+
+#[async_trait]
+impl EventFeed for LogEventFeed {
+    async fn tail(&self, since: Option<&str>) -> Result<Vec<FeedRecord>, String> {
+        self.log
+            .read_since(self.workspace.as_deref(), None, since, FEED_CAP)
+            .map(|records| {
+                records
+                    .into_iter()
+                    .map(|r| FeedRecord { ts: r.ts, kind: r.kind, payload: r.payload })
+                    .collect()
+            })
+            .map_err(|e| e.to_string())
+    }
+}
+
 impl DispatchSink for ChannelDispatch {
     fn dispatch(&self, bead: &str, priority: u8) -> Result<(), String> {
         use std::sync::atomic::{AtomicU64, Ordering};
@@ -521,6 +680,23 @@ mod tests {
         }
     }
 
+    /// Feed fake: scripted batches, one per `tail` call; empty when exhausted.
+    #[derive(Default)]
+    struct FakeFeed {
+        batches: Mutex<std::collections::VecDeque<Vec<FeedRecord>>>,
+    }
+
+    #[async_trait]
+    impl EventFeed for FakeFeed {
+        async fn tail(&self, _since: Option<&str>) -> Result<Vec<FeedRecord>, String> {
+            Ok(self.batches.lock().unwrap().pop_front().unwrap_or_default())
+        }
+    }
+
+    fn record(kind: &str, payload: serde_json::Value) -> FeedRecord {
+        FeedRecord { ts: format!("2026-06-12T00:00:00Z#{kind}"), kind: kind.into(), payload }
+    }
+
     /// Session fake: a fixed registry state (None ⇒ never slung) + kill trail.
     #[derive(Default)]
     struct FakeSessions {
@@ -545,6 +721,7 @@ mod tests {
             parent_id: "gtcore-intake".into(),
             created_by: "a2a".into(),
             domain: vec![Domain::MetaGap],
+            poll: Duration::from_millis(1),
         }
     }
 
@@ -570,9 +747,41 @@ mod tests {
             sink.clone(),
             Arc::new(FakeStore::default()),
             Arc::new(FakeSessions::default()),
+            Arc::new(FakeFeed::default()),
             config(),
         );
         (gw, intake, sink)
+    }
+
+    /// Gateway wired for the subscribe path: scripted feed batches.
+    fn subscribe_gateway(batches: Vec<Vec<FeedRecord>>) -> A2aGateway {
+        A2aGateway::new(
+            Arc::new(FakeIntake { seen: Mutex::new(vec![]), fail: false }),
+            Arc::new(FakeSink(Mutex::new(vec![]))),
+            Arc::new(FakeStore::default()), // fetch None ⇒ rig falls back to config
+            Arc::new(FakeSessions::default()),
+            Arc::new(FakeFeed { batches: Mutex::new(batches.into()) }),
+            config(),
+        )
+    }
+
+    /// Pull the next stream item (the stream is endless-poll, so a missing
+    /// expected item would hang — bound it).
+    async fn next(stream: &mut gt_a2a::EventStream) -> StreamEvent {
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            std::future::poll_fn(|cx| stream.as_mut().poll_next(cx)),
+        )
+        .await
+        .expect("stream item within 5s")
+        .expect("stream not ended")
+    }
+
+    fn state_of(ev: &StreamEvent) -> (TaskState, bool) {
+        match ev {
+            StreamEvent::Status(s) => (s.status.state, s.is_final),
+            StreamEvent::Artifact(_) => panic!("expected status, got artifact"),
+        }
     }
 
     /// Gateway wired for the get/cancel paths: bead status + session state fakes.
@@ -596,6 +805,7 @@ mod tests {
             Arc::new(FakeSink(Mutex::new(vec![]))),
             store.clone(),
             sessions.clone(),
+            Arc::new(FakeFeed::default()),
             config(),
         );
         (gw, store, sessions)
@@ -716,6 +926,122 @@ mod tests {
     async fn cancel_unknown_bead_is_task_not_found() {
         let (gw, _, _) = projection_gateway(None, None);
         assert_eq!(gw.cancel(id_params("gtcore-nope")).await.unwrap_err().0.code, -32001);
+    }
+
+    // ── tasks/sendSubscribe (B3) ─────────────────────────────────────────────
+
+    /// The minted bead is FakeIntake's fixed id; FakeStore answers None, so the
+    /// rig falls back to config ("gtcore") and the session follows the sling
+    /// convention.
+    const SUB_BEAD: &str = "gtcore-abc123";
+    const SUB_SESSION: &str = "gtcore-gtcore-abc123";
+
+    fn spawned(session: &str) -> FeedRecord {
+        record(
+            "agent.spawned.v1",
+            serde_json::to_value(AgentEvent::Spawned {
+                session: session.into(),
+                rig: "gtcore".into(),
+                role: Default::default(),
+                crew: None,
+                skills: vec![],
+                hooks: vec![],
+                maintains_heartbeat: true,
+                tmux_socket: None,
+            })
+            .unwrap(),
+        )
+    }
+
+    #[tokio::test]
+    async fn subscribe_streams_submitted_working_then_merge_artifact_and_completed() {
+        let gw = subscribe_gateway(vec![
+            // Noise for another session + our spawn.
+            vec![spawned("gtweb-gtweb-zzz"), spawned(SUB_SESSION)],
+            // Empty poll round, then the merge.
+            vec![],
+            vec![record(
+                "merge.merged.v1",
+                serde_json::to_value(MergeEvent::Merged {
+                    bead: SUB_BEAD.into(),
+                    sha: "abc1234".into(),
+                })
+                .unwrap(),
+            )],
+        ]);
+        let mut s = gw.send_subscribe(send_params("do the thing")).await.unwrap();
+
+        assert_eq!(state_of(&next(&mut s).await), (TaskState::Submitted, false));
+        assert_eq!(state_of(&next(&mut s).await), (TaskState::Working, false));
+        match next(&mut s).await {
+            StreamEvent::Artifact(a) => {
+                assert_eq!(a.id, SUB_BEAD);
+                assert_eq!(a.artifact.parts, vec![Part::Text { text: "abc1234".into(), metadata: None }]);
+            }
+            other => panic!("expected merge artifact, got {other:?}"),
+        }
+        assert_eq!(state_of(&next(&mut s).await), (TaskState::Completed, true));
+    }
+
+    #[tokio::test]
+    async fn subscribe_session_end_is_completed_final() {
+        let gw = subscribe_gateway(vec![vec![record(
+            "agent.session-end.v1",
+            serde_json::to_value(AgentEvent::SessionEnd { session: SUB_SESSION.into() }).unwrap(),
+        )]]);
+        let mut s = gw.send_subscribe(send_params("t")).await.unwrap();
+        assert_eq!(state_of(&next(&mut s).await), (TaskState::Submitted, false));
+        assert_eq!(state_of(&next(&mut s).await), (TaskState::Completed, true));
+    }
+
+    #[tokio::test]
+    async fn subscribe_merge_failed_is_failed_final() {
+        let gw = subscribe_gateway(vec![
+            vec![spawned(SUB_SESSION)],
+            vec![record(
+                "merge.failed.v1",
+                serde_json::to_value(MergeEvent::Failed {
+                    bead: SUB_BEAD.into(),
+                    reason: "conflict".into(),
+                })
+                .unwrap(),
+            )],
+        ]);
+        let mut s = gw.send_subscribe(send_params("t")).await.unwrap();
+        assert_eq!(state_of(&next(&mut s).await), (TaskState::Submitted, false));
+        assert_eq!(state_of(&next(&mut s).await), (TaskState::Working, false));
+        assert_eq!(state_of(&next(&mut s).await), (TaskState::Failed, true));
+    }
+
+    #[tokio::test]
+    async fn subscribe_killed_session_is_canceled_final_and_foreign_events_vanish() {
+        let gw = subscribe_gateway(vec![vec![
+            // Foreign merge + foreign kill never reach the stream.
+            record(
+                "merge.merged.v1",
+                serde_json::to_value(MergeEvent::Merged { bead: "gtweb-zzz".into(), sha: "x".into() })
+                    .unwrap(),
+            ),
+            record(
+                "agent.killed.v1",
+                serde_json::to_value(AgentEvent::Killed {
+                    session: "gtweb-gtweb-zzz".into(),
+                    reason: "other".into(),
+                })
+                .unwrap(),
+            ),
+            record(
+                "agent.killed.v1",
+                serde_json::to_value(AgentEvent::Killed {
+                    session: SUB_SESSION.into(),
+                    reason: "canceled via A2A tasks/cancel".into(),
+                })
+                .unwrap(),
+            ),
+        ]]);
+        let mut s = gw.send_subscribe(send_params("t")).await.unwrap();
+        assert_eq!(state_of(&next(&mut s).await), (TaskState::Submitted, false));
+        assert_eq!(state_of(&next(&mut s).await), (TaskState::Canceled, true));
     }
 
     #[test]
