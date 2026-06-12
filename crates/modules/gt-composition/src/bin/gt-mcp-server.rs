@@ -1013,6 +1013,28 @@ async fn main() -> anyhow::Result<()> {
         // auth chain merged below — the HMAC signature is the credential.
         app = app.nest("/api/v1/connection", webhook);
     }
+    // Inbound-email webhook (hq-6c6d16): the mail provider POSTs received
+    // messages here; the receiver writes them into the command-mailbox dir the
+    // FileInbox daemon above polls. Same opt-in env as the mailbox, plus the
+    // shared secret. Outside the auth chain — the secret header is the
+    // credential. Absolute path: /api/v1/email/inbound.
+    if let Ok(dir) = std::env::var("GT_INBOUND_MAIL_DIR") {
+        let secret = std::env::var("GT_INBOUND_WEBHOOK_SECRET").ok();
+        if secret.is_none() {
+            eprintln!(
+                "[gt-mcp-server] inbound-email webhook UNCONFIGURED \
+                 (GT_INBOUND_WEBHOOK_SECRET unset — endpoint answers 503)"
+            );
+        } else {
+            eprintln!("[gt-mcp-server] inbound-email webhook on (-> {dir})");
+        }
+        app = app.nest(
+            "/api/v1/email",
+            gt_composition::inbound_email::inbound_email_router(
+                gt_composition::inbound_email::InboundEmailState::new(secret, dir),
+            ),
+        );
+    }
     if let Some(terminal) = terminal {
         app = app.merge(terminal);
     }
