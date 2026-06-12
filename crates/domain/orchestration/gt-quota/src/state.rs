@@ -556,7 +556,7 @@ impl QuotaState {
                     entry.status = AccountQuotaStatus::Healthy;
                 }
             }
-            QuotaEvent::WindowReset { account, started_at_secs, resets_at_secs } => {
+            QuotaEvent::WindowReset { account, started_at_secs, resets_at_secs, .. } => {
                 let entry = self
                     .accounts
                     .entry(account.clone())

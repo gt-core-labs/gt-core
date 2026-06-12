@@ -40,9 +40,17 @@ pub enum QuotaEvent {
         now_secs: u64,
     },
     /// Window reset (rolling-5h, weekly...): block prediction only applies within the live
-    /// window; on reset the accumulated counter starts over.
+    /// window; on reset the accumulated counter starts over. `consumed` and `kind` carry the
+    /// last window's final usage — the primary source for historical token statistics.
     WindowReset {
         account: String,
+        /// Window kind string ("Rolling5h" | "Weekly") — kept as `String` to avoid a
+        /// circular dep with `state::WindowKind`.
+        #[serde(default)]
+        kind: String,
+        /// Tokens consumed in the window that just expired (cost units, f64).
+        #[serde(default)]
+        consumed: f64,
         started_at_secs: u64,
         resets_at_secs: u64,
     },

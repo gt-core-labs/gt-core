@@ -399,6 +399,39 @@ pub fn spawn_hydrated(
                     weekly_resets_at_secs,
                     now_secs,
                 } => {
+                    // Detect window rollovers before the probe overwrites state.
+                    // When the provider reports a later resets_at, the old window
+                    // has expired — record the final consumed for historical stats.
+                    let mut rollover_events: Vec<QuotaEvent> = Vec::new();
+                    if let Some(acc) = registry.get(&account) {
+                        if let Some(w) = &acc.window {
+                            if resets_at_secs > w.resets_at_secs {
+                                rollover_events.push(QuotaEvent::WindowReset {
+                                    account: account.clone(),
+                                    kind: format!("{:?}", w.kind),
+                                    consumed: w.consumed,
+                                    started_at_secs: w.started_at_secs,
+                                    resets_at_secs: w.resets_at_secs,
+                                });
+                            }
+                        }
+                        if let (Some(ww), Some(new_wr)) =
+                            (&acc.weekly_window, weekly_resets_at_secs)
+                        {
+                            if new_wr > ww.resets_at_secs {
+                                rollover_events.push(QuotaEvent::WindowReset {
+                                    account: account.clone(),
+                                    kind: format!("{:?}", ww.kind),
+                                    consumed: ww.consumed,
+                                    started_at_secs: ww.started_at_secs,
+                                    resets_at_secs: ww.resets_at_secs,
+                                });
+                            }
+                        }
+                    }
+                    for evt in rollover_events {
+                        let _ = events.send(Envelope::root(evt)).await;
+                    }
                     registry.apply_probe(&account, remaining, resets_at_secs, now_secs);
                     if let (Some(w_rem), Some(w_reset)) =
                         (weekly_remaining, weekly_resets_at_secs)
@@ -421,6 +454,13 @@ pub fn spawn_hydrated(
                     started_at_secs,
                     resets_at_secs,
                 } => {
+                    // Snapshot consumed + kind before zeroing so the event carries
+                    // the full history record for the window that just expired.
+                    let (snap_kind, snap_consumed) = registry
+                        .get(&account)
+                        .and_then(|a| a.window.as_ref())
+                        .map(|w| (format!("{:?}", w.kind), w.consumed))
+                        .unwrap_or_default();
                     if let Some(acc) = registry.get_mut(&account) {
                         if let Some(w) = acc.window.as_mut() {
                             w.started_at_secs = started_at_secs;
@@ -432,6 +472,8 @@ pub fn spawn_hydrated(
                     let _ = events
                         .send(Envelope::root(QuotaEvent::WindowReset {
                             account,
+                            kind: snap_kind,
+                            consumed: snap_consumed,
                             started_at_secs,
                             resets_at_secs,
                         }))

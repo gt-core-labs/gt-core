@@ -71,6 +71,15 @@ pub trait WorkspaceQuota: Send + Sync {
 
     /// Append one decided quota event to `workspace`'s log, closing the read-modify-append.
     async fn append(&self, workspace: &str, event: QuotaEvent) -> Result<(), AppError>;
+
+    /// All `quota.window_reset.v1` payloads for `workspace`, ordered by log position.
+    /// Each element is the raw JSON payload — `{account, kind, consumed, started_at_secs,
+    /// resets_at_secs}` — ready to serve as chart data. Default impl returns empty (for mocks /
+    /// backwards-compat); the file/PG implementation overrides.
+    async fn window_resets(&self, workspace: &str) -> Result<Vec<serde_json::Value>, AppError> {
+        let _ = workspace;
+        Ok(vec![])
+    }
 }
 
 /// The deploy-global catalog of onboarded claude accounts — every account whose credentials live
@@ -166,6 +175,7 @@ impl QuotaApiState {
 /// | `POST /probe/sweep`       | (sync all)       |
 pub fn quota_router(state: QuotaApiState) -> Router {
     Router::new()
+        .route("/history", get(list_history))
         .route("/", get(list_accounts))
         // `/account` (singular) is the onboarding collection POST — distinct from `/:account` so the
         // register body carries the id, not the path (the account does not exist yet).
@@ -416,6 +426,21 @@ async fn probe_sweep(
     Ok(Json(json!({ "ok": true, "probed": n })))
 }
 
+/// `GET /history` — all `quota.window_reset.v1` payloads for this workspace, in log order.
+/// Each element is `{account, kind, consumed, started_at_secs, resets_at_secs}`. Used by the
+/// admin quota page to chart past token consumption per window period.
+#[cfg_attr(feature = "axum", utoipa::path(
+    get, path = "/history",
+    responses((status = 200, description = "Ordered list of window-reset records for charting")),
+))]
+async fn list_history(
+    State(st): State<QuotaApiState>,
+    ctx: WorkspaceContext,
+) -> Result<Json<Value>, ApiError> {
+    let resets = st.quota.window_resets(ctx.workspace().as_str()).await?;
+    Ok(Json(json!({ "resets": resets })))
+}
+
 /// Replay → execute → append: the REST mirror of the MCP `QuotaHandler::run`.
 ///
 /// Rehydrates the registry from the workspace log, runs the command's decide/apply against it
@@ -437,6 +462,7 @@ where
 /// the `#[utoipa::path]` annotations stay prefix-free.
 #[derive(utoipa::OpenApi)]
 #[openapi(paths(
+    list_history,
     list_accounts,
     get_account,
     sample_account,

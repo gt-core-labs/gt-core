@@ -159,6 +159,8 @@ fn parity_map(ns: &str) -> Vec<Route> {
             rt("POST", "/{id}/kill", Some("agent.kill")),
         ],
         "quota" => vec![
+            // Token window history (quota.window_reset.v1 log scan) — REST-only chart data.
+            rt("GET", "/history", None),
             rt("GET", "/", Some("quota.list")),
             rt("GET", "/{account}", Some("quota.info")),
             rt("POST", "/{account}/sample", Some("quota.sample")),

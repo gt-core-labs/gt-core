@@ -159,6 +159,11 @@ impl WorkspaceQuota for EventLogQuota {
     async fn append(&self, workspace: &str, event: QuotaEvent) -> Result<(), AppError> {
         self.log.append(Some(workspace), event).map_err(lift)
     }
+
+    async fn window_resets(&self, workspace: &str) -> Result<Vec<serde_json::Value>, AppError> {
+        let records = self.log.read_kind(Some(workspace), "quota.window_reset.v1").map_err(lift)?;
+        Ok(records.into_iter().map(|r| r.payload).collect())
+    }
 }
 
 /// REST backing for the deploy-global account catalog (`gt_quota::AccountCatalog`,

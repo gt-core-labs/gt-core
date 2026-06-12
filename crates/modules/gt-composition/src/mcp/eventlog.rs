@@ -133,6 +133,13 @@ impl EventLog {
         replay(&records, initial, apply).map_err(ev_err)
     }
 
+    /// All records for `workspace` whose `kind` matches `kind` exactly (after legacy upgrade).
+    /// Used by the quota history endpoint to surface `quota.window_reset.v1` events without
+    /// replaying full domain state.
+    pub fn read_kind(&self, workspace: Option<&str>, kind: &str) -> Result<Vec<EventRecord>, AppError> {
+        Ok(self.read_all(workspace)?.into_iter().filter(|r| r.kind == kind).collect())
+    }
+
     /// Append one decided event to the workspace log.
     pub fn append<E>(&self, workspace: Option<&str>, event: E) -> Result<(), AppError>
     where
