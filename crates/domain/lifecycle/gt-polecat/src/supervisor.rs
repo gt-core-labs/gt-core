@@ -271,7 +271,18 @@ mod daemon_tests {
 pub struct PolecatSupervisor {
     tmux: Arc<dyn Tmux>,
     state: Mutex<SupervisorState>,
+    /// Optional spec rewriter applied at RE-sling time (hq-49198f). A polecat that died
+    /// mid-task may have been slung on an account that is now Blocked/rotated; re-slinging
+    /// the stored spec verbatim burns the restart budget against dead credentials. The
+    /// composition root wires a closure that re-resolves the account-dependent env
+    /// (`CLAUDE_CONFIG_DIR`, `GT_HOOK_ACCOUNT`, proxy attribution headers) from the
+    /// keychain's CURRENT active pointer, so the re-sling lands on a healthy account while
+    /// the bead's branch/worktree survive untouched. `None` ⇒ verbatim re-sling (legacy).
+    respec: Mutex<Option<RespecFn>>,
 }
+
+/// Spec rewriter applied before a re-sling (see [`PolecatSupervisor::set_respec`]).
+pub type RespecFn = Box<dyn Fn(SpawnSpec) -> SpawnSpec + Send + Sync>;
 
 struct SupervisorState {
     /// session id -> spec to re-sling it from.
@@ -293,7 +304,14 @@ impl PolecatSupervisor {
                 restarts: HashMap::new(),
                 max_restarts,
             }),
+            respec: Mutex::new(None),
         }
+    }
+
+    /// Install the re-sling spec rewriter (hq-49198f) — settable post-`Arc` because the
+    /// composition root builds the supervisor before the keychain exists. See [`RespecFn`].
+    pub fn set_respec(&self, f: RespecFn) {
+        *self.respec.lock().unwrap() = Some(f);
     }
 
     /// Register a freshly-slung polecat so its death is detected and recovered. Keyed by
@@ -373,6 +391,18 @@ impl PolecatSupervisor {
             st.tracker.record_restart(&session, now);
             let spec = st.watched.get(&session).cloned();
             if let Some(spec) = spec {
+                // Re-resolve account-dependent env before the re-sling (hq-49198f): the
+                // stored spec may point at an account that blocked/rotated since the
+                // original sling. The rewritten spec replaces the watched one so future
+                // re-slings (and `sessions_for_account`) see the current account.
+                let spec = match self.respec.lock().unwrap().as_ref() {
+                    Some(f) => {
+                        let fresh = f(spec);
+                        st.watched.insert(session.clone(), fresh.clone());
+                        fresh
+                    }
+                    None => spec,
+                };
                 match spawn_tmux(self.tmux.as_ref(), &spec) {
                     Ok(()) => {
                         *st.restarts.entry(session).or_insert(0) += 1;
@@ -442,6 +472,41 @@ mod polecat_supervisor_tests {
         assert!(!tmux.has_session("gt-furiosa"));
         assert_eq!(sup.tick(1000), 1);
         assert!(tmux.has_session("gt-furiosa"), "re-slung session exists again");
+    }
+
+    #[test]
+    fn resling_applies_respec_and_persists_the_rewritten_spec() {
+        // hq-49198f: the re-sling must re-resolve account-dependent env (the stored spec may
+        // point at a now-blocked account) and keep the rewrite for subsequent passes.
+        let tmux: Arc<FakeTmux> = Arc::new(FakeTmux::new());
+        let sup = PolecatSupervisor::new(
+            tmux.clone(),
+            RestartConfig {
+                initial_backoff_secs: 1,
+                crash_loop_count: 100,
+                ..RestartConfig::default()
+            },
+            u32::MAX,
+        );
+        let mut s = spec("gt-rotor", "hq-9");
+        s.env
+            .push((crate::GT_HOOK_ACCOUNT.to_string(), "old-acct".to_string()));
+        spawn_tmux(tmux.as_ref(), &s).unwrap();
+        sup.watch(s);
+        sup.set_respec(Box::new(|mut spec| {
+            for (k, v) in spec.env.iter_mut() {
+                if k == crate::GT_HOOK_ACCOUNT {
+                    *v = "new-acct".to_string();
+                }
+            }
+            spec
+        }));
+
+        tmux.kill_session("gt-rotor").unwrap();
+        assert_eq!(sup.tick(1000), 1, "dead session re-slung");
+        // The rewritten spec replaced the watched one: account attribution moved.
+        assert!(sup.sessions_for_account("old-acct").is_empty());
+        assert_eq!(sup.sessions_for_account("new-acct"), vec!["gt-rotor".to_string()]);
     }
 
     #[test]

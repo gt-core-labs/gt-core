@@ -404,6 +404,45 @@ async fn main() -> anyhow::Result<()> {
         }
     };
 
+    // Re-sling account re-resolution (hq-49198f): a dead polecat's stored spec may point at an
+    // account that blocked/rotated since the original sling — re-slinging it verbatim burns
+    // max_restarts against dead credentials. Rewrite the account-dependent env from the
+    // keychain's CURRENT active pointer just before each re-sling; branch/worktree survive.
+    if let Some(kc) = &keychain {
+        let kc = kc.clone();
+        let proxy = anthropic_proxy_url.clone();
+        supervisor.set_respec(Box::new(move |mut spec| {
+            fn set_env(env: &mut Vec<(String, String)>, key: &str, value: String) {
+                match env.iter_mut().find(|(k, _)| k == key) {
+                    Some((_, v)) => *v = value,
+                    None => env.push((key.to_string(), value)),
+                }
+            }
+            let resolved = kc
+                .active()
+                .ok()
+                .flatten()
+                .and_then(|a| kc.get(&a).ok().flatten().map(|c| (a, c.secret)));
+            if let Some((account, config_dir)) = resolved {
+                set_env(&mut spec.env, "CLAUDE_CONFIG_DIR", config_dir);
+                set_env(
+                    &mut spec.env,
+                    gt_polecat::GT_HOOK_ACCOUNT,
+                    account.clone(),
+                );
+                if proxy.is_some() {
+                    set_env(
+                        &mut spec.env,
+                        "ANTHROPIC_CUSTOM_HEADERS",
+                        format!("x-gt-account: {account}\nx-gt-session: {}", spec.session),
+                    );
+                }
+            }
+            spec
+        }));
+        eprintln!("[gt-orch-server] re-sling account re-resolution armed (keychain-backed)");
+    }
+
     // Web onboarding (hq-quota-onboard-web) moved to the backend mcp-server in .4: claude now lives
     // IN the image, so onboarding rides the existing /api/v1/* auth chain instead of a host process
     // behind a docker→host firewall hole. The daemon no longer serves it — it only hydrates its

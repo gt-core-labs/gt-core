@@ -97,6 +97,34 @@ fn plan_limit() -> u64 {
         .unwrap_or(DEFAULT_PLAN_LIMIT)
 }
 
+/// Soft (draining) threshold percent (`GT_QUOTA_SOFT_PCT`, default 80): a probed account at or
+/// above it stops RECEIVING work — the rotation pointer moves off it while in-flight polecats
+/// finish naturally (hq-49198f). Pairs with the provider's `allowed_warning` verdict.
+fn soft_pct() -> f64 {
+    std::env::var("GT_QUOTA_SOFT_PCT")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(80.0)
+}
+
+/// Hard threshold percent (`GT_QUOTA_HARD_PCT`, default 90): an account at or above it is never
+/// a rotation TARGET — rotating into an almost-exhausted account just moves the wall closer.
+fn hard_pct() -> f64 {
+    std::env::var("GT_QUOTA_HARD_PCT")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(90.0)
+}
+
+/// Rolling-5h utilization percent from the account's window. No window ⇒ 0 (an unverified
+/// account is a candidate — the first probe corrects it within one sweep).
+fn utilization_pct(acc: &Account) -> f64 {
+    match &acc.window {
+        Some(w) if w.limit > 0 => (w.consumed / w.limit as f64) * 100.0,
+        _ => 0.0,
+    }
+}
+
 /// A fresh Rolling5h window anchored at `now`, used when no provider headers supply the real one.
 fn synthetic_window(now: u64) -> AccountWindow {
     AccountWindow {
@@ -134,13 +162,26 @@ impl QuotaRotationPlugin {
         self
     }
 
-    /// Pick a healthy rotation target `!= at_risk` from the registry snapshot. Deterministic:
-    /// `accounts()` preserves insertion order, so the first healthy alternative wins. `None` when
-    /// no healthy account other than the at-risk one exists (the caller then stays put).
+    /// Pick a healthy rotation target `!= at_risk` from the registry snapshot. Candidates at or
+    /// above the HARD threshold are excluded (rotating into an almost-exhausted account just
+    /// moves the wall, hq-49198f); among the rest the LOWEST probed utilization wins, so the
+    /// pointer lands on the account with the most real headroom. Deterministic: utilization
+    /// ties break on the registry's insertion order. `None` when no eligible account exists
+    /// (the caller then stays put).
     fn pick_target(accounts: &[Account], at_risk: &str) -> Option<String> {
+        let hard = hard_pct();
         accounts
             .iter()
-            .find(|a| a.id != at_risk && a.status == AccountQuotaStatus::Healthy)
+            .filter(|a| {
+                a.id != at_risk
+                    && a.status == AccountQuotaStatus::Healthy
+                    && utilization_pct(a) < hard
+            })
+            .min_by(|a, b| {
+                utilization_pct(a)
+                    .partial_cmp(&utilization_pct(b))
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
             .map(|a| a.id.clone())
     }
 
@@ -214,14 +255,47 @@ impl Plugin for QuotaRotationPlugin {
                 };
                 self.rotate_away_from(&at_risk).await
             }
-            // Hard block with a Retry-After timestamp → schedule a probe at until_secs + 5s so
-            // the account re-enters rotation as soon as the provider window closes, not on the
-            // next periodic poll (which could be minutes later).
+            // Hard block (the proxy saw `rejected`, or a 429 with Retry-After): rotate the
+            // pointer IMMEDIATELY (hq-49198f — without this, the supervisor re-slung dead
+            // polecats onto the blocked account until max_restarts burned out), then schedule
+            // a probe at until_secs + 5s so the account re-enters rotation as soon as the
+            // provider window closes, not on the next periodic poll.
             "quota.blocked.v1" => {
-                if let QuotaEvent::Blocked { account, until_secs: Some(until), .. } =
+                if let QuotaEvent::Blocked { account, until_secs, .. } =
                     record.decode::<QuotaEvent>()?
                 {
-                    schedule_unblock(self.quota.clone(), account, until);
+                    self.rotate_away_from(&account).await?;
+                    if let Some(until) = until_secs {
+                        schedule_unblock(self.quota.clone(), account, until);
+                    }
+                }
+                Ok(())
+            }
+            // Probe-driven draining gate (hq-49198f): every probe (per-call proxy headers or
+            // the /usage sweep) re-evaluates the ACTIVE account against the soft threshold.
+            // At/above it the pointer moves to the account with the most headroom — in-flight
+            // polecats finish on the old account (drain), new slings land on the target.
+            "quota.usage_probed.v1" => {
+                let account = match record.decode::<QuotaEvent>()? {
+                    QuotaEvent::UsageProbed { account, .. } => account,
+                    _ => return Ok(()),
+                };
+                // Only the live pointer gates assignment; probes for parked accounts are
+                // recovery signals, not draining triggers.
+                if self.keychain.active()?.as_deref() != Some(account.as_str()) {
+                    return Ok(());
+                }
+                let accounts = self.quota.accounts().await;
+                let Some(acc) = accounts.iter().find(|a| a.id == account) else {
+                    return Ok(());
+                };
+                let pct = utilization_pct(acc);
+                if pct >= soft_pct() {
+                    eprintln!(
+                        "[quota-rotation] {account} probed at {pct:.0}% (soft {:.0}%) — draining",
+                        soft_pct()
+                    );
+                    self.rotate_away_from(&account).await?;
                 }
                 Ok(())
             }
@@ -786,5 +860,113 @@ mod tests {
             secret: "/cfg/a".into(),
         };
         assert_eq!(rec.secret, "/cfg/a");
+    }
+
+    // hq-49198f tests ---------------------------------------------------------------------
+
+    fn acct_with_util(id: &str, consumed: f64, limit: u64) -> Account {
+        let mut a = Account::new(id);
+        a.window = Some(AccountWindow {
+            kind: WindowKind::Rolling5h,
+            limit,
+            started_at_secs: 0,
+            resets_at_secs: 18_000,
+            consumed,
+        });
+        a
+    }
+
+    #[test]
+    fn pick_target_prefers_headroom_and_excludes_hard() {
+        // c at 95% ≥ hard(90) is never a target even though Healthy; between a (70%) and
+        // b (10%), the most headroom wins.
+        let accounts = vec![
+            acct_with_util("risk", 99.0, 100),
+            acct_with_util("a", 70.0, 100),
+            acct_with_util("b", 10.0, 100),
+            acct_with_util("c", 95.0, 100),
+        ];
+        assert_eq!(
+            QuotaRotationPlugin::pick_target(&accounts, "risk").as_deref(),
+            Some("b")
+        );
+        // Only hard-exhausted alternatives ⇒ stay put.
+        let only_hot = vec![acct_with_util("risk", 99.0, 100), acct_with_util("c", 95.0, 100)];
+        assert!(QuotaRotationPlugin::pick_target(&only_hot, "risk").is_none());
+    }
+
+    #[tokio::test]
+    async fn blocked_event_rotates_immediately() {
+        // The proxy's `rejected` verdict lands as quota.blocked.v1 — the pointer must move
+        // in the SAME event, not wait for a prediction (re-slings burned restarts before).
+        let (quota, _rx) = quota_with_two().await;
+        let keychain = Arc::new(InMemoryKeychain::seeded([("a", "/cfg/a"), ("b", "/cfg/b")]));
+        keychain.set_active("a").unwrap();
+        let plugin = QuotaRotationPlugin::new(quota, keychain.clone());
+
+        plugin
+            .on_event(&record(QuotaEvent::Blocked {
+                account: "a".into(),
+                until_secs: None,
+                now_secs: 1000,
+            }))
+            .await
+            .unwrap();
+
+        assert_eq!(keychain.active().unwrap().as_deref(), Some("b"));
+    }
+
+    #[tokio::test]
+    async fn probe_at_soft_threshold_drains_the_active_account() {
+        let (tx, _rx) = mpsc::channel(64);
+        let quota = gt_quota::actor::spawn(tx, std::collections::HashMap::new());
+        quota.upsert_account(acct_with_util("a", 85.0, 100)).await; // 85% ≥ soft(80)
+        quota.upsert_account(acct_with_util("b", 10.0, 100)).await;
+        let keychain = Arc::new(InMemoryKeychain::seeded([("a", "/cfg/a"), ("b", "/cfg/b")]));
+        keychain.set_active("a").unwrap();
+        let plugin = QuotaRotationPlugin::new(quota, keychain.clone());
+
+        plugin
+            .on_event(&record(QuotaEvent::UsageProbed {
+                account: "a".into(),
+                remaining: 15,
+                resets_at_secs: 18_000,
+                weekly_remaining: None,
+                weekly_resets_at_secs: None,
+                now_secs: 1_000,
+            }))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            keychain.active().unwrap().as_deref(),
+            Some("b"),
+            "soft threshold drains: pointer moved, in-flight work finishes on a"
+        );
+    }
+
+    #[tokio::test]
+    async fn probe_below_soft_keeps_the_active_account() {
+        let (tx, _rx) = mpsc::channel(64);
+        let quota = gt_quota::actor::spawn(tx, std::collections::HashMap::new());
+        quota.upsert_account(acct_with_util("a", 50.0, 100)).await; // 50% < soft
+        quota.upsert_account(acct_with_util("b", 10.0, 100)).await;
+        let keychain = Arc::new(InMemoryKeychain::seeded([("a", "/cfg/a"), ("b", "/cfg/b")]));
+        keychain.set_active("a").unwrap();
+        let plugin = QuotaRotationPlugin::new(quota, keychain.clone());
+
+        plugin
+            .on_event(&record(QuotaEvent::UsageProbed {
+                account: "a".into(),
+                remaining: 50,
+                resets_at_secs: 18_000,
+                weekly_remaining: None,
+                weekly_resets_at_secs: None,
+                now_secs: 1_000,
+            }))
+            .await
+            .unwrap();
+
+        assert_eq!(keychain.active().unwrap().as_deref(), Some("a"), "no drain below soft");
     }
 }
