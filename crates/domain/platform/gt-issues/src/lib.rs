@@ -121,4 +121,4 @@ pub use readiness::is_ready;
 pub use report::{build_report, to_csv, to_xlsx, OperatorReport, ReportRow, ReportSection};
 pub use stats::{MeStatsResponse, WorkspaceStats};
 pub use surface::{AllowAllProvider, AllowAllTree, SurfaceEntry, SurfaceProvider, SurfaceTree};
-pub use taxonomy::Domain;
+pub use taxonomy::{Domain, IssueType};

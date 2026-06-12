@@ -30,7 +30,7 @@ use serde::{Deserialize, Serialize};
 use crate::surface::{
     check_surface_existence, check_surface_shape, surface_to_json, SurfaceEntry, SurfaceTree,
 };
-use crate::taxonomy::Domain;
+use crate::taxonomy::{Domain, IssueType};
 
 /// Map a [`gt_module_mcp::taxonomy::TaxonomyError`] onto the store's
 /// [`AppError::Validation`] so the NN-16 rejection surfaces with the same
@@ -148,8 +148,9 @@ pub struct CreateIssue {
     /// Priority `0..=2` (0 = P0). Defaults to `2`.
     #[serde(default = "default_priority")]
     pub priority: u8,
-    /// `epic`/`task`/`spike`/... — required.
-    pub issue_type: String,
+    /// Bead type — required. Closed set ([`IssueType`]): an out-of-set value is
+    /// rejected at deserialization, mirroring `domain` (hq-48ca5c).
+    pub issue_type: IssueType,
     /// Bead creator (the agent or operator). Required.
     pub created_by: String,
     /// Optional epic linkage (the sub-epic this bead belongs to). Required for a
@@ -224,9 +225,6 @@ impl CreateIssue {
         if self.title.is_empty() {
             return Err(AppError::Validation("issue title is empty".into()));
         }
-        if self.issue_type.is_empty() {
-            return Err(AppError::Validation("issue_type is empty".into()));
-        }
         if self.created_by.is_empty() {
             return Err(AppError::Validation("created_by is empty".into()));
         }
@@ -244,7 +242,7 @@ impl CreateIssue {
         if let Some(id) = &self.id {
             taxonomy_validate(&BeadTaxonomy {
                 id,
-                issue_type: &self.issue_type,
+                issue_type: self.issue_type.as_str(),
                 external_ref: self.external_ref.as_deref().unwrap_or(""),
             })
             .map_err(taxonomy_err)?;
@@ -253,7 +251,7 @@ impl CreateIssue {
         } else {
             // Auto-generated id: require external_ref for non-epics (NN-16 linkage
             // is preserved; the id format constraint is relaxed).
-            if !self.issue_type.eq_ignore_ascii_case("epic")
+            if !self.issue_type.is_epic()
                 && self.external_ref.as_deref().unwrap_or("").trim().is_empty()
             {
                 return Err(AppError::Validation(
@@ -300,7 +298,7 @@ impl CreateIssue {
             acceptance_criteria: self.acceptance_criteria.clone(),
             notes: self.notes.clone(),
             priority: self.priority,
-            issue_type: self.issue_type.clone(),
+            issue_type: self.issue_type.as_str().to_string(),
             created_by: self.created_by.clone(),
             external_ref: self.external_ref.clone(),
             assignee: self.assignee.clone(),
@@ -343,9 +341,10 @@ pub struct UpdateIssue {
     /// New priority `0..=2` (0 = P0).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub priority: Option<u8>,
-    /// New `issue_type`. Empty rejected.
+    /// New `issue_type`. Closed set ([`IssueType`]): an out-of-set value is
+    /// rejected at deserialization, mirroring `domain` (hq-48ca5c).
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub issue_type: Option<String>,
+    pub issue_type: Option<IssueType>,
     /// New assignee. Empty string clears to canonical "unassigned".
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub assignee: Option<String>,
@@ -412,9 +411,6 @@ impl UpdateIssue {
         if matches!(&self.title, Some(s) if s.is_empty()) {
             return Err(AppError::Validation("title is empty".into()));
         }
-        if matches!(&self.issue_type, Some(s) if s.is_empty()) {
-            return Err(AppError::Validation("issue_type is empty".into()));
-        }
         if let Some(p) = self.priority {
             if p > 2 {
                 return Err(AppError::Validation(format!("priority must be 0..=2, got {p}")));
@@ -428,8 +424,8 @@ impl UpdateIssue {
         // `run_update_issue` re-checks against the EXISTING row's type. Assuming
         // `task` here wrongly rejected re-parenting a dash-named epic like
         // `hq-core-host` -> `hq-core` (hq-gap-issues-update-external-ref).
-        if let Some(issue_type) = &self.issue_type {
-            self.check_taxonomy(issue_type)?;
+        if let Some(issue_type) = self.issue_type {
+            self.check_taxonomy(issue_type.as_str())?;
         }
         if let Some(domain) = &self.domain {
             if domain.is_empty() {
@@ -512,7 +508,7 @@ impl UpdateIssue {
             acceptance_criteria: self.acceptance_criteria.clone(),
             notes: self.notes.clone(),
             priority: self.priority,
-            issue_type: self.issue_type.clone(),
+            issue_type: self.issue_type.map(|t| t.as_str().to_string()),
             assignee: self.assignee.clone(),
             owner: self.owner.clone(),
             external_ref: self.external_ref.clone(),
@@ -750,7 +746,7 @@ mod tests {
             acceptance_criteria: String::new(),
             notes: String::new(),
             priority: 1,
-            issue_type: "task".into(),
+            issue_type: IssueType::Task,
             created_by: "me".into(),
             external_ref: Some("hq-core-host".into()),
             assignee: None,
@@ -836,7 +832,7 @@ mod tests {
         // An epic with provided id is exempt.
         let mut c = base_create();
         c.id = Some("hq-core-host".into());
-        c.issue_type = "epic".into();
+        c.issue_type = IssueType::Epic;
         c.external_ref = None;
         assert!(c.validate().is_ok());
         // Auto-generated id (id=None): non-epic requires external_ref.
@@ -855,7 +851,7 @@ mod tests {
         let mut c = base_create();
         c.id = None;
         c.rig = "hq".into();
-        c.issue_type = "epic".into();
+        c.issue_type = IssueType::Epic;
         c.external_ref = None;
         assert!(c.validate().is_ok());
     }
@@ -877,7 +873,7 @@ mod tests {
         assert!(c.validate().is_err());
         // rig alone (no id) → ok for epic.
         c.rig = "gtweb".into();
-        c.issue_type = "epic".into();
+        c.issue_type = IssueType::Epic;
         c.external_ref = None;
         assert!(c.validate().is_ok());
     }
@@ -887,7 +883,7 @@ mod tests {
         let mut c = base_create();
         c.id = None;
         c.rig = "gtweb".into();
-        c.issue_type = "epic".into();
+        c.issue_type = IssueType::Epic;
         c.external_ref = None;
         let n = c.to_new();
         assert!(n.id.starts_with("gtweb-"), "id={}", n.id);
@@ -1038,7 +1034,7 @@ mod tests {
         // exempt from the `<external_ref>.<n>` id rule, same as create.
         let mut u = base_update();
         u.external_ref = Some("hq-core".into());
-        u.issue_type = Some("epic".into());
+        u.issue_type = Some(IssueType::Epic);
         assert!(u.validate().is_ok());
     }
 
@@ -1058,7 +1054,7 @@ mod tests {
         // `hq-core-host` is not `<hq-core>.<n>`.
         let mut u = base_update();
         u.external_ref = Some("hq-core".into());
-        u.issue_type = Some("task".into());
+        u.issue_type = Some(IssueType::Task);
         assert!(matches!(u.validate(), Err(AppError::Validation(_))));
     }
 

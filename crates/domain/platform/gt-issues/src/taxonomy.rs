@@ -136,9 +136,50 @@ pub enum Domain {
     MetaGap,
 }
 
+/// A bead's `issue_type` — a CLOSED set (hq-48ca5c), same rationale as
+/// [`Domain`]: a free-form string let any value (`"banana"`) pass shape
+/// validation, while `domain` and `phase` were already closed. Typing the wire
+/// field also surfaces the allowed variants as a JSON-schema `enum`, so an MCP
+/// client can offer a picker instead of a blank text box.
+///
+/// Existing rows keep whatever legacy string they carry — the read path
+/// (`IssueRow`/`IssueDetail`) stays `String`; only `issues.create` /
+/// `issues.update` narrow.
+#[allow(missing_docs)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
+#[cfg_attr(feature = "axum", derive(utoipa::ToSchema))]
+#[serde(rename_all = "lowercase")]
+pub enum IssueType {
+    Epic,
+    Task,
+    Bug,
+    Spike,
+    Chore,
+    Feature,
+}
+
+impl IssueType {
+    /// The lowercase wire/store form (the `hq.issues.issue_type` column value).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Epic => "epic",
+            Self::Task => "task",
+            Self::Bug => "bug",
+            Self::Spike => "spike",
+            Self::Chore => "chore",
+            Self::Feature => "feature",
+        }
+    }
+
+    /// Whether this is the epic type — the NN-16 `external_ref` exemption.
+    pub fn is_epic(self) -> bool {
+        matches!(self, Self::Epic)
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::Domain;
+    use super::{Domain, IssueType};
 
     #[test]
     fn round_trips_dotted_wire_form() {
@@ -150,6 +191,23 @@ mod tests {
     #[test]
     fn rejects_unknown_domain() {
         assert!(serde_json::from_str::<Domain>("\"orch.bogus\"").is_err());
+    }
+
+    #[test]
+    fn issue_type_round_trips_lowercase_wire_form() {
+        let t: IssueType = serde_json::from_str("\"task\"").unwrap();
+        assert_eq!(t, IssueType::Task);
+        assert_eq!(serde_json::to_string(&t).unwrap(), "\"task\"");
+        assert_eq!(IssueType::Epic.as_str(), "epic");
+        assert!(IssueType::Epic.is_epic());
+        assert!(!IssueType::Bug.is_epic());
+    }
+
+    #[test]
+    fn issue_type_rejects_out_of_set_value() {
+        assert!(serde_json::from_str::<IssueType>("\"banana\"").is_err());
+        // Wire form is lowercase only — capitalized rejected too.
+        assert!(serde_json::from_str::<IssueType>("\"Epic\"").is_err());
     }
 
     #[test]
