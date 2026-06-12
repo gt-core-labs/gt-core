@@ -59,10 +59,13 @@ pub fn render_digest(report: &OperatorReport, summary: &AnalyticsSummary, fecha:
     );
 
     // Title bar (xlsx merged-title parity).
+    let total_tasks: usize = report.sections.iter().map(|s| s.rows.len()).sum();
     html.push_str(&format!(
         "<table style=\"border-collapse:collapse;width:100%;\"><tr>\
          <td style=\"background:{NAVY};color:#ffffff;padding:12px 16px;font-size:18px;\
          font-weight:bold;\">Reporte de planning — {rig} / {ws}\
+         <span style=\"font-size:13px;font-weight:normal;margin-left:12px;\
+         opacity:.8;\">{total_tasks} tareas</span>\
          <span style=\"float:right;font-weight:normal;font-size:13px;\">{fecha}</span>\
          </td></tr></table>",
         rig = esc(&report.rig),
@@ -208,6 +211,7 @@ mod tests {
         }
         // Reconciles with the summary by construction.
         assert!(html.contains(&format!("{:.0}%", summary.avance.pct)));
+        assert!(html.contains("3 tareas"), "missing task count in header");
         assert!(html.contains("TOTAL HORAS"));
         assert!(html.contains(&format!("{:.1}", report.total_horas)));
         // Escaping: the raw note must not inject markup.
