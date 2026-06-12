@@ -74,7 +74,6 @@ fn issue(id: &str, priority: u8) -> NewIssue {
         priority,
         issue_type: "task".into(),
         created_by: "seed".into(),
-        external_ref: Some("hq-res".into()),
         ..Default::default()
     }
 }
