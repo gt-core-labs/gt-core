@@ -238,6 +238,7 @@ pub fn documents_router(state: DocumentsApiState) -> Router {
         .route("/shares", get(list_shares))
         .route("/shares/:hash", axum::routing::patch(patch_share).delete(revoke_share))
         .route("/:id/share", axum::routing::post(create_share))
+        .route("/:id/download", get(download_document))
         .route("/:id", get(get_document).patch(update_document).delete(remove_document))
         .with_state(state)
 }
@@ -374,6 +375,82 @@ async fn get_document(
         Some(doc) => Ok(Json(doc_json(&doc))),
         None => Err(ApiError::NotFound(format!("document not found: {id}"))),
     }
+}
+
+/// `GET /:id/download` — the document's raw bytes as a file download (hq-039316): a `md` row
+/// serves its `body_md` as `text/markdown`; a `blob` row proxies the object-store bytes through
+/// the backend (works on every backend — the `fs` dev store cannot presign). The
+/// `Content-Disposition: attachment` header carries the stored filename so the browser saves
+/// e.g. a generated xlsx report under its real name.
+#[utoipa::path(
+    get, path = "/{id}/download",
+    params(("id" = String, Path, description = "Document id")),
+    responses(
+        (status = 200, description = "The raw document bytes (Content-Disposition: attachment)"),
+        (status = 404, description = "No document with that id"),
+    ),
+)]
+async fn download_document(
+    State(st): State<DocumentsApiState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> Result<Response, ApiError> {
+    let repo = st.repo(workspace_of(&headers).as_deref()).await?;
+    let doc = repo
+        .get(&id)
+        .await
+        .map_err(doc_err)?
+        .ok_or_else(|| ApiError::NotFound(format!("document not found: {id}")))?;
+
+    let (bytes, content_type) = if doc.kind == "md" {
+        (
+            doc.body_md.clone().unwrap_or_default().into_bytes(),
+            doc.content_type.clone().unwrap_or_else(|| "text/markdown".into()),
+        )
+    } else {
+        let key = doc
+            .key
+            .as_deref()
+            .ok_or_else(|| ApiError::Internal(format!("blob document {id} has no object key")))?;
+        let blob = st
+            .inner
+            .blob
+            .as_ref()
+            .ok_or_else(|| ApiError::Internal("no object store configured for blob attachments".into()))?;
+        (
+            blob.get(key).await.map_err(blob_err)?,
+            doc.content_type.clone().unwrap_or_else(|| "application/octet-stream".into()),
+        )
+    };
+
+    // RFC 6266/5987: ASCII fallback + UTF-8 form so any stored filename survives the header.
+    let ascii: String = doc
+        .filename
+        .chars()
+        .map(|c| if c.is_ascii_graphic() && c != '"' { c } else { '_' })
+        .collect();
+    let utf8: String = doc
+        .filename
+        .bytes()
+        .map(|b| {
+            if b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-' | b'_') {
+                (b as char).to_string()
+            } else {
+                format!("%{b:02X}")
+            }
+        })
+        .collect();
+    let disposition = format!("attachment; filename=\"{ascii}\"; filename*=UTF-8''{utf8}");
+
+    Ok((
+        StatusCode::OK,
+        [
+            (axum::http::header::CONTENT_TYPE, content_type),
+            (axum::http::header::CONTENT_DISPOSITION, disposition),
+        ],
+        bytes,
+    )
+        .into_response())
 }
 
 /// `PATCH /:id` — edit a document under its optimistic version guard (`documents.update.execute`).
@@ -636,6 +713,7 @@ fn share_json(s: &DocumentShare, now: DateTime<Utc>) -> Value {
     list_documents,
     search_documents,
     get_document,
+    download_document,
     update_document,
     remove_document,
     create_share,
