@@ -25,6 +25,7 @@ use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
 
 use crate::commands::ProbeWindow;
+use crate::state::ROLLING_5H_SECS;
 
 /// Default refresh skew: treat a token as expired this long BEFORE its real expiry so a
 /// probe never races the cutoff mid-request (5 minutes).
@@ -185,16 +186,22 @@ fn parse_rfc3339_secs(raw: &str) -> Option<u64> {
 /// percent utilization, while the registry windows count cost units against `limit` — so
 /// `remaining = limit × (100 − utilization)/100`, clamped to `[0, limit]` (utilization can
 /// exceed 100 on overage; that clamps to 0 remaining, which flips the account out of
-/// rotation). Returns `None` without a `five_hour` window — there is nothing for the
-/// rolling-5h reconciliation to consume.
+/// rotation). A missing `five_hour` window means the account has NO active rolling window —
+/// the provider only opens one on first use — i.e. zero utilization, full capacity: the
+/// probe carries `remaining = limit` anchored 5h out, so `apply_probe` still runs and lifts
+/// a parked Cooldown/Limited/Blocked account instead of leaving it stuck until someone
+/// happens to use it (hq-4757bc).
 pub fn probe_from_usage(
     snapshot: &UsageSnapshot,
     account: impl Into<String>,
     limit: u64,
     weekly_limit: u64,
     now_secs: u64,
-) -> Option<ProbeWindow> {
-    let five = snapshot.five_hour.as_ref()?;
+) -> ProbeWindow {
+    let (remaining, resets_at_secs) = match &snapshot.five_hour {
+        Some(five) => (remaining_units(limit, five.utilization), five.resets_at_secs),
+        None => (limit, now_secs + ROLLING_5H_SECS),
+    };
     let (weekly_remaining, weekly_resets_at_secs) = match &snapshot.seven_day {
         Some(w) => (
             Some(remaining_units(weekly_limit, w.utilization)),
@@ -202,14 +209,14 @@ pub fn probe_from_usage(
         ),
         None => (None, None),
     };
-    Some(ProbeWindow {
+    ProbeWindow {
         account: account.into(),
-        remaining: remaining_units(limit, five.utilization),
-        resets_at_secs: five.resets_at_secs,
+        remaining,
+        resets_at_secs,
         weekly_remaining,
         weekly_resets_at_secs,
         now_secs,
-    })
+    }
 }
 
 fn remaining_units(limit: u64, utilization: f64) -> u64 {
@@ -330,7 +337,7 @@ mod tests {
     #[test]
     fn probe_maps_percent_to_remaining_units() {
         let s = parse_usage_response(USAGE).unwrap();
-        let p = probe_from_usage(&s, "acc-1", 1_000, 2_000, 42).unwrap();
+        let p = probe_from_usage(&s, "acc-1", 1_000, 2_000, 42);
         assert_eq!(p.account, "acc-1");
         assert_eq!(p.remaining, 230, "(100-77)% of 1000");
         assert_eq!(p.resets_at_secs, 1_781_250_000);
@@ -340,7 +347,9 @@ mod tests {
     }
 
     #[test]
-    fn probe_requires_five_hour_window_and_clamps_overage() {
+    fn probe_without_five_hour_window_reports_full_capacity() {
+        // No active rolling window (idle account) = zero utilization, NOT an error: the
+        // probe must still run so apply_probe lifts a parked Cooldown/Blocked account.
         let none = UsageSnapshot {
             five_hour: None,
             seven_day: Some(UsageWindow {
@@ -348,8 +357,15 @@ mod tests {
                 resets_at_secs: 10,
             }),
         };
-        assert!(probe_from_usage(&none, "a", 100, 100, 0).is_none());
+        let p = probe_from_usage(&none, "a", 100, 200, 1_000);
+        assert_eq!(p.remaining, 100, "full capacity when no rolling window is open");
+        assert_eq!(p.resets_at_secs, 1_000 + ROLLING_5H_SECS);
+        assert_eq!(p.weekly_remaining, Some(198), "weekly still passes through");
+        assert_eq!(p.weekly_resets_at_secs, Some(10));
+    }
 
+    #[test]
+    fn probe_clamps_overage() {
         // Overage (>100%) clamps to 0 remaining — account drops out of rotation.
         let over = UsageSnapshot {
             five_hour: Some(UsageWindow {
@@ -358,7 +374,7 @@ mod tests {
             }),
             seven_day: None,
         };
-        let p = probe_from_usage(&over, "a", 100, 100, 0).unwrap();
+        let p = probe_from_usage(&over, "a", 100, 100, 0);
         assert_eq!(p.remaining, 0);
         assert_eq!(p.weekly_remaining, None);
     }

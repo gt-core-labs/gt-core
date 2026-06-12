@@ -124,8 +124,7 @@ impl UsageProber {
             DEFAULT_PLAN_LIMIT,
             DEFAULT_PLAN_LIMIT,
             now_secs(),
-        )
-        .ok_or("usage endpoint: no five_hour window in response")?;
+        );
         eprintln!(
             "[usage-probe] {account}: 5h {:.0}% (resets {}), 7d {}",
             snapshot
@@ -431,19 +430,13 @@ impl gt_quota::http::SyncProber for EventLogSyncProber {
                     continue;
                 }
             };
-            let probe = match probe_from_usage(
+            let probe = probe_from_usage(
                 &snapshot,
                 account.as_str(),
                 DEFAULT_PLAN_LIMIT,
                 DEFAULT_PLAN_LIMIT,
                 now_secs(),
-            ) {
-                Some(p) => p,
-                None => {
-                    eprintln!("[sync-probe] {account}: no five_hour window");
-                    continue;
-                }
-            };
+            );
             let event = match probe.execute(&mut registry) {
                 Ok(e) => e,
                 Err(e) => {
