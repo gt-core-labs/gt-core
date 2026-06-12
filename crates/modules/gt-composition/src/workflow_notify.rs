@@ -114,6 +114,11 @@ pub struct WorkflowNotifyPlugin {
     pool: PgPool,
     log: Arc<EventLog>,
     workspace: String,
+    /// Failure-email recipient (`hq-80e92c`, phase 2): when set, a `merge.failed.v1` ALSO
+    /// enqueues an email into the existing `email_outbox` (drained by the scheduling daemon's
+    /// EmailTransport). `None` ⇒ bell only. Only failures email — the bell suffices for the
+    /// happy-path milestones.
+    failure_email: Option<String>,
 }
 
 impl WorkflowNotifyPlugin {
@@ -122,7 +127,20 @@ impl WorkflowNotifyPlugin {
             pool,
             log,
             workspace: workspace.into(),
+            failure_email: None,
         }
+    }
+
+    /// Also email `recipient` on every merge failure (`hq-80e92c`, `GT_NOTIFY_EMAIL`). Empty ⇒
+    /// unchanged (bell only).
+    pub fn with_failure_email(mut self, recipient: impl Into<String>) -> Self {
+        let recipient = recipient.into();
+        self.failure_email = if recipient.trim().is_empty() {
+            None
+        } else {
+            Some(recipient)
+        };
+        self
     }
 }
 
@@ -156,6 +174,7 @@ impl Plugin for WorkflowNotifyPlugin {
             }
         };
         // Same SSE append as notify.send — the bell's live listener reacts to this.
+        let (title_for_email, body_for_email) = (draft.title.clone(), draft.body.clone());
         let ev = NotificationCreated {
             id,
             workspace: self.workspace.clone(),
@@ -171,6 +190,28 @@ impl Plugin for WorkflowNotifyPlugin {
         };
         if let Err(e) = self.log.append(ws_opt, ev) {
             eprintln!("[workflow-notify] SSE emit failed: {e}");
+        }
+        // Phase 2 (hq-80e92c): a merge FAILURE also lands in the operator's inbox via the
+        // existing email_outbox (the scheduling drain + EmailTransport deliver it). Only the
+        // alert kind emails — dispatched/merged stay bell-only. Best-effort like the rest.
+        if draft.kind == "alert" {
+            if let Some(recipient) = &self.failure_email {
+                use gt_store_pg::{EmailOutboxRepository, NewEmail, PgEmailOutbox};
+                let outbox = PgEmailOutbox::new(self.pool.clone());
+                let new = NewEmail {
+                    id: ulid::Ulid::new().to_string(),
+                    workspace: self.workspace.clone(),
+                    recipient: recipient.clone(),
+                    subject: format!("[gt] {}", title_for_email),
+                    body: body_for_email,
+                    template_ref: None,
+                    send_at: None, // now
+                    created_by: FROM_ROLE.to_string(),
+                };
+                if let Err(e) = outbox.enqueue(new).await {
+                    eprintln!("[workflow-notify] failure email enqueue failed: {e}");
+                }
+            }
         }
         Ok(())
     }

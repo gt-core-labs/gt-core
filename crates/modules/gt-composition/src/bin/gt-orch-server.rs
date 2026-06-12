@@ -615,11 +615,20 @@ async fn main() -> anyhow::Result<()> {
             .connect_lazy(&pg_url)
         {
             Ok(pool) => {
-                pol_registry = pol_registry.register(WorkflowNotifyPlugin::new(
-                    pool,
-                    knowledge_log.clone(),
-                    ws_slug.clone(),
-                ));
+                let mut notify_plugin =
+                    WorkflowNotifyPlugin::new(pool, knowledge_log.clone(), ws_slug.clone());
+                // Phase 2 (hq-80e92c): GT_NOTIFY_EMAIL ⇒ merge failures also email the operator
+                // via the existing email_outbox drain. Unset ⇒ bell only.
+                match std::env::var("GT_NOTIFY_EMAIL").ok().filter(|v| !v.trim().is_empty()) {
+                    Some(rcpt) => {
+                        eprintln!("[gt-orch-server] merge-failure emails on → {rcpt}");
+                        notify_plugin = notify_plugin.with_failure_email(rcpt);
+                    }
+                    None => eprintln!(
+                        "[gt-orch-server] merge-failure emails off — GT_NOTIFY_EMAIL unset (bell only)"
+                    ),
+                }
+                pol_registry = pol_registry.register(notify_plugin);
                 eprintln!(
                     "[gt-orch-server] workflow notifications on — dispatch/merged/failed reach the operator bell"
                 );
