@@ -91,6 +91,22 @@ pub trait AccountCatalog: Send + Sync {
     async fn config_dir(&self, account: &str) -> Result<Option<String>, AppError>;
 }
 
+/// On-demand usage probe: hit the OAuth `/usage` endpoint for every account in the workspace
+/// and reconcile the local windows — the REST-path equivalent of the scheduled daemon sweep.
+/// Returns the number of accounts successfully probed.
+///
+/// The composition layer implements this; the domain declares the interface so the REST
+/// adapter stays I/O-free.
+#[async_trait]
+pub trait SyncProber: Send + Sync {
+    async fn sweep(
+        &self,
+        workspace: &str,
+        quota: &dyn WorkspaceQuota,
+        catalog: &dyn AccountCatalog,
+    ) -> usize;
+}
+
 /// Everything the quota REST handlers need, baked into the router with [`Router::with_state`]
 /// before it leaves [`quota_router`] so the merged application router carries no outstanding
 /// state type (the kernel's state-erased `Router<()>` contract).
@@ -102,6 +118,9 @@ pub struct QuotaApiState {
     /// The deploy-global account catalog (`hq-quota-ws-accounts.1`). `None` ⇒ no catalog wired, so
     /// `/catalog` returns an empty pool and `/:account/assign` is unavailable (`422`).
     catalog: Option<Arc<dyn AccountCatalog>>,
+    /// Optional on-demand OAuth usage prober for `POST /probe/sweep`. `None` ⇒ the endpoint
+    /// returns 503; set it from `gt-mcp-server` when the accounts root is available.
+    sync_prober: Option<Arc<dyn SyncProber>>,
 }
 
 impl QuotaApiState {
@@ -111,6 +130,7 @@ impl QuotaApiState {
         Self {
             quota,
             catalog: None,
+            sync_prober: None,
         }
     }
 
@@ -118,6 +138,12 @@ impl QuotaApiState {
     /// `POST /:account/assign` (attach an onboarded account to the active workspace).
     pub fn with_catalog(mut self, catalog: Arc<dyn AccountCatalog>) -> Self {
         self.catalog = Some(catalog);
+        self
+    }
+
+    /// Wire an on-demand sync prober, enabling `POST /probe/sweep`.
+    pub fn with_sync_prober(mut self, prober: Arc<dyn SyncProber>) -> Self {
+        self.sync_prober = Some(prober);
         self
     }
 }
@@ -137,6 +163,7 @@ impl QuotaApiState {
 /// | `POST /:account/rotate`   | `quota.rotate`   |
 /// | `POST /account`           | `quota.register` |
 /// | `DELETE /:account`        | `quota.retire`   |
+/// | `POST /probe/sweep`       | (sync all)       |
 pub fn quota_router(state: QuotaApiState) -> Router {
     Router::new()
         .route("/", get(list_accounts))
@@ -145,6 +172,8 @@ pub fn quota_router(state: QuotaApiState) -> Router {
         .route("/account", post(register_account))
         // `/catalog` is the deploy-global pool (static segment, matched ahead of `/:account`).
         .route("/catalog", get(list_catalog))
+        // `/probe/sweep` is a static two-segment path, matched ahead of `/:account/*`.
+        .route("/probe/sweep", post(probe_sweep))
         .route("/:account", get(get_account).delete(retire_account))
         .route("/:account/assign", post(assign_account))
         .route("/:account/sample", post(sample_account))
@@ -360,6 +389,33 @@ async fn assign_account(
     run(&st, ctx.workspace().as_str(), cmd).await
 }
 
+/// `POST /probe/sweep` — probe every workspace account against the OAuth usage endpoint.
+/// Returns `{"ok": true, "probed": N}`. `503` when no sync prober is configured.
+#[cfg_attr(feature = "axum", utoipa::path(
+    post, path = "/probe/sweep",
+    responses(
+        (status = 200, description = "All accounts probed; returns count"),
+        (status = 503, description = "No sync prober configured"),
+    ),
+))]
+async fn probe_sweep(
+    State(st): State<QuotaApiState>,
+    ctx: WorkspaceContext,
+) -> Result<Json<Value>, ApiError> {
+    let prober = st
+        .sync_prober
+        .as_ref()
+        .ok_or_else(|| ApiError(AppError::Validation("no sync prober configured".into())))?;
+    let catalog = st
+        .catalog
+        .as_ref()
+        .ok_or_else(|| ApiError(AppError::Validation("no account catalog configured".into())))?;
+    let n = prober
+        .sweep(ctx.workspace().as_str(), &*st.quota, &**catalog)
+        .await;
+    Ok(Json(json!({ "ok": true, "probed": n })))
+}
+
 /// Replay → execute → append: the REST mirror of the MCP `QuotaHandler::run`.
 ///
 /// Rehydrates the registry from the workspace log, runs the command's decide/apply against it
@@ -390,6 +446,7 @@ where
     retire_account,
     list_catalog,
     assign_account,
+    probe_sweep,
 ))]
 pub struct ApiDoc;
 
@@ -472,6 +529,7 @@ mod tests {
             "/{account}/rotate",
             "/catalog",
             "/{account}/assign",
+            "/probe/sweep",
         ] {
             assert!(paths.contains(&expected), "missing {expected} in {paths:?}");
         }

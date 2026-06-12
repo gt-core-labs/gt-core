@@ -48,6 +48,7 @@ fn parts_with_pg(event_log: Arc<EventLog>) -> RestModuleParts {
         dispatch_channel: None,
         event_log,
         accounts_root: std::env::temp_dir().join("gt-boot-smoke-accounts"),
+        sync_prober: None,
         skills_seed_workspace: "default".to_string(),
         pg: Some(RestPgParts {
             pool,
@@ -129,6 +130,7 @@ async fn rest_module_set_builds_without_postgres() {
         dispatch_channel: None,
         event_log: temp_event_log(),
         accounts_root: std::env::temp_dir().join("gt-boot-smoke-accounts-nopg"),
+        sync_prober: None,
         skills_seed_workspace: "default".to_string(),
         pg: None,
     };

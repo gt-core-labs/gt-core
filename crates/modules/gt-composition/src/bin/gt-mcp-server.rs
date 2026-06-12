@@ -1173,6 +1173,7 @@ async fn main() -> anyhow::Result<()> {
             dispatch_channel: agent_dispatch_channel,
             event_log: event_log.clone(),
             accounts_root,
+            sync_prober: Some(Arc::new(gt_composition::usage_probe::EventLogSyncProber::new())),
             skills_seed_workspace,
             pg: rest_pg,
         },

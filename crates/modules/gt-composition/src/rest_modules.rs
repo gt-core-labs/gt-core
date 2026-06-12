@@ -98,6 +98,10 @@ pub struct RestModuleParts {
     /// The claude-account credential root the quota catalog lists onboarded accounts
     /// from.
     pub accounts_root: PathBuf,
+    /// Optional on-demand OAuth usage prober for `POST /api/v1/quota/probe/sweep`.
+    /// `None` ⇒ the endpoint returns 503; set it from `gt-mcp-server` when the accounts
+    /// root is available.
+    pub sync_prober: Option<std::sync::Arc<dyn gt_quota::http::SyncProber>>,
     /// The workspace slug the skills catalog seeds its role preset into when empty.
     pub skills_seed_workspace: String,
     /// The Postgres-gated module slice; `None` ⇒ no workspace/rig/connection/graph/
@@ -131,6 +135,7 @@ pub async fn build_rest_modules(
         event_log,
         accounts_root,
         skills_seed_workspace,
+        sync_prober,
         pg,
     } = parts;
 
@@ -151,10 +156,14 @@ pub async fn build_rest_modules(
             }
         }))
         // quota.*: per-workspace assignment + the deploy-global account catalog.
-        .module(QuotaModule::with_http(
-            QuotaApiState::new(Arc::new(EventLogQuota::new(event_log.clone())))
-                .with_catalog(Arc::new(FsAccountCatalog::new(accounts_root))),
-        ))
+        .module(QuotaModule::with_http({
+            let mut quota_state = QuotaApiState::new(Arc::new(EventLogQuota::new(event_log.clone())))
+                .with_catalog(Arc::new(FsAccountCatalog::new(accounts_root)));
+            if let Some(prober) = sync_prober {
+                quota_state = quota_state.with_sync_prober(prober);
+            }
+            quota_state
+        }))
         // merge.*: the durable event-sourced board.
         .module(MergeModule::with_http(MergeApiState::new(Arc::new(
             EventLogMerges::new(event_log.clone()),

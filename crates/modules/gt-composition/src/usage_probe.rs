@@ -241,3 +241,226 @@ fn now_ms() -> u64 {
         .map(|d| d.as_millis() as u64)
         .unwrap_or(0)
 }
+
+/// REST-path on-demand usage prober: the same OAuth sweep the timer-driven [`UsageProber`]
+/// runs every `GT_USAGE_PROBE_SECS`, but appended through the event-sourced
+/// [`WorkspaceQuota`] path so it works from `gt-mcp-server` (which has no live actor).
+pub struct EventLogSyncProber {
+    http: reqwest::Client,
+    usage_url: String,
+    token_url: String,
+    client_id: String,
+}
+
+impl EventLogSyncProber {
+    pub fn new() -> Self {
+        let http = reqwest::Client::builder()
+            .timeout(Duration::from_secs(15))
+            .build()
+            .expect("reqwest client");
+        Self {
+            http,
+            usage_url: std::env::var("GT_OAUTH_USAGE_URL")
+                .unwrap_or_else(|_| DEFAULT_USAGE_URL.to_string()),
+            token_url: std::env::var("GT_OAUTH_TOKEN_URL")
+                .unwrap_or_else(|_| DEFAULT_TOKEN_URL.to_string()),
+            client_id: std::env::var("GT_OAUTH_CLIENT_ID")
+                .unwrap_or_else(|_| DEFAULT_CLIENT_ID.to_string()),
+        }
+    }
+
+    async fn fetch_usage(&self, access_token: &str) -> Result<Option<String>, String> {
+        let resp = self
+            .http
+            .get(&self.usage_url)
+            .bearer_auth(access_token)
+            .header("anthropic-beta", OAUTH_BETA_HEADER)
+            .send()
+            .await
+            .map_err(|e| format!("usage endpoint: {e}"))?;
+        match resp.status() {
+            s if s.is_success() => Ok(Some(
+                resp.text()
+                    .await
+                    .map_err(|e| format!("usage endpoint body: {e}"))?,
+            )),
+            reqwest::StatusCode::UNAUTHORIZED => Ok(None),
+            s => Err(format!("usage endpoint: HTTP {s}")),
+        }
+    }
+
+    async fn refresh(
+        &self,
+        creds: &OauthCredentials,
+        original_raw: &str,
+        creds_path: &std::path::Path,
+    ) -> Result<OauthCredentials, String> {
+        let refresh_token = creds
+            .refresh_token
+            .as_deref()
+            .ok_or("access token expired and no refresh token stored")?;
+        let resp = self
+            .http
+            .post(&self.token_url)
+            .json(&serde_json::json!({
+                "grant_type": "refresh_token",
+                "refresh_token": refresh_token,
+                "client_id": self.client_id,
+            }))
+            .send()
+            .await
+            .map_err(|e| format!("token refresh: {e}"))?;
+        if !resp.status().is_success() {
+            return Err(format!("token refresh: HTTP {}", resp.status()));
+        }
+        let body = resp
+            .text()
+            .await
+            .map_err(|e| format!("token refresh body: {e}"))?;
+        let fresh = parse_refresh_response(&body, now_ms())?;
+        let new_raw = render_credentials_json(original_raw, &fresh)?;
+        std::fs::write(creds_path, &new_raw)
+            .map_err(|e| format!("write {}: {e}", creds_path.display()))?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(creds_path, std::fs::Permissions::from_mode(0o600));
+        }
+        // Carry the stored refresh token forward when the response omitted one.
+        Ok(OauthCredentials {
+            refresh_token: fresh
+                .refresh_token
+                .clone()
+                .or_else(|| creds.refresh_token.clone()),
+            ..fresh
+        })
+    }
+}
+
+#[async_trait::async_trait]
+impl gt_quota::http::SyncProber for EventLogSyncProber {
+    async fn sweep(
+        &self,
+        workspace: &str,
+        quota: &dyn gt_quota::http::WorkspaceQuota,
+        catalog: &dyn gt_quota::http::AccountCatalog,
+    ) -> usize {
+        use gt_events::Command;
+        let mut registry = match quota.registry(workspace).await {
+            Ok(r) => r,
+            Err(e) => {
+                eprintln!("[sync-probe] registry load for {workspace}: {e}");
+                return 0;
+            }
+        };
+        let accounts: Vec<String> = registry.accounts().map(|a| a.id.clone()).collect();
+        let mut ok = 0usize;
+        for account in &accounts {
+            let config_dir = match catalog.config_dir(account).await {
+                Ok(Some(d)) => d,
+                Ok(None) => {
+                    eprintln!("[sync-probe] {account}: no credentials dir in catalog");
+                    continue;
+                }
+                Err(e) => {
+                    eprintln!("[sync-probe] {account}: catalog error: {e}");
+                    continue;
+                }
+            };
+            let creds_path = std::path::Path::new(&config_dir).join(".credentials.json");
+            let raw = match std::fs::read_to_string(&creds_path) {
+                Ok(r) => r,
+                Err(e) => {
+                    eprintln!("[sync-probe] {account}: read credentials: {e}");
+                    continue;
+                }
+            };
+            let mut creds = match parse_credentials_json(&raw) {
+                Ok(c) => c,
+                Err(e) => {
+                    eprintln!("[sync-probe] {account}: parse credentials: {e}");
+                    continue;
+                }
+            };
+            if creds.needs_refresh(now_ms(), REFRESH_SKEW_MS) {
+                match self.refresh(&creds, &raw, &creds_path).await {
+                    Ok(fresh) => creds = fresh,
+                    Err(e) => {
+                        eprintln!("[sync-probe] {account}: refresh: {e}");
+                        continue;
+                    }
+                }
+            }
+            let mut body = match self.fetch_usage(&creds.access_token).await {
+                Ok(b) => b,
+                Err(e) => {
+                    eprintln!("[sync-probe] {account}: fetch_usage: {e}");
+                    continue;
+                }
+            };
+            if body.is_none() {
+                // 401 — refresh once and retry
+                match self.refresh(&creds, &raw, &creds_path).await {
+                    Ok(fresh) => {
+                        creds = fresh;
+                        match self.fetch_usage(&creds.access_token).await {
+                            Ok(b) => body = b,
+                            Err(e) => {
+                                eprintln!("[sync-probe] {account}: fetch_usage after refresh: {e}");
+                                continue;
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!("[sync-probe] {account}: refresh on 401: {e}");
+                        continue;
+                    }
+                }
+            }
+            let body = match body {
+                Some(b) => b,
+                None => {
+                    eprintln!("[sync-probe] {account}: 401 after refresh");
+                    continue;
+                }
+            };
+            let snapshot = match parse_usage_response(&body) {
+                Ok(s) => s,
+                Err(e) => {
+                    eprintln!("[sync-probe] {account}: parse_usage_response: {e}");
+                    continue;
+                }
+            };
+            let probe = match probe_from_usage(
+                &snapshot,
+                account.as_str(),
+                DEFAULT_PLAN_LIMIT,
+                DEFAULT_PLAN_LIMIT,
+                now_secs(),
+            ) {
+                Some(p) => p,
+                None => {
+                    eprintln!("[sync-probe] {account}: no five_hour window");
+                    continue;
+                }
+            };
+            let event = match probe.execute(&mut registry) {
+                Ok(e) => e,
+                Err(e) => {
+                    eprintln!("[sync-probe] {account}: execute probe command: {e}");
+                    continue;
+                }
+            };
+            if let Err(e) = quota.append(workspace, event).await {
+                eprintln!("[sync-probe] {account}: append event: {e}");
+                continue;
+            }
+            eprintln!(
+                "[sync-probe] {account}: probed OK ({:.0}%)",
+                snapshot.five_hour.as_ref().map(|w| w.utilization).unwrap_or(0.0)
+            );
+            ok += 1;
+        }
+        ok
+    }
+}

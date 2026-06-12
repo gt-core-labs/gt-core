@@ -41,7 +41,7 @@ pub use cost::{cost_units, Cost, ModelWeights};
 pub use events::QuotaEvent;
 pub use expectations::{predict, Prediction};
 #[cfg(feature = "axum")]
-pub use http::{quota_router, AccountCatalog, ApiDoc, QuotaApiState, WorkspaceQuota};
+pub use http::{quota_router, AccountCatalog, ApiDoc, QuotaApiState, SyncProber, WorkspaceQuota};
 pub use keychain::{CredentialRecord, InMemoryKeychain, Keychain};
 pub use oauth_usage::{
     parse_credentials_json, parse_refresh_response, parse_usage_response, probe_from_usage,
