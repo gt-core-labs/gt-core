@@ -1,9 +1,13 @@
 //! The off-by-default `axum` adapter (B1, gtcore-fbf90e / epic gtcore-155917): `POST /a2a`
 //! (JSON-RPC dispatch) + `GET /.well-known/agent.json` (discovery).
 //!
-//! Auth is NOT here — the composition root mounts this router behind the same
-//! PAT guard as the MCP surface, exactly as the other domain routers. Errors
-//! follow JSON-RPC-over-HTTP convention: HTTP 200 with an `error` member.
+//! Auth is NOT here — the composition root guards `POST /a2a` behind the same
+//! PAT guard as the MCP surface, exactly as the other domain routers, while
+//! `GET /.well-known/agent.json` stays public (the spec's discovery document
+//! must be fetchable without credentials). [`a2a_split_router`] hands the two
+//! surfaces back separately so the root can apply the guard to the RPC half
+//! only (B5, gtcore-9039b5). Errors follow JSON-RPC-over-HTTP convention:
+//! HTTP 200 with an `error` member.
 
 use std::convert::Infallible;
 use std::sync::Arc;
@@ -28,13 +32,26 @@ pub struct A2aApiState {
 }
 
 /// Build the A2A router. The composition root nests it at `/` so the
-/// well-known path lands at the URL the spec mandates.
+/// well-known path lands at the URL the spec mandates. Auth-free — see
+/// [`a2a_split_router`] when the deploy guards the RPC surface.
 pub fn a2a_router(card: AgentCard, handler: Arc<dyn A2aHandler>) -> Router {
+    let (discovery, rpc) = a2a_split_router(card, handler);
+    discovery.merge(rpc)
+}
+
+/// The two A2A surfaces as separate routers — `(discovery, rpc)` — over one
+/// shared state (B5, gtcore-9039b5). The composition root merges `discovery`
+/// (`GET /.well-known/agent.json`) unguarded — the spec's public discovery
+/// document — and wraps `rpc` (`POST /a2a`) in its auth middleware, so the
+/// guard covers exactly the surface that mutates.
+pub fn a2a_split_router(card: AgentCard, handler: Arc<dyn A2aHandler>) -> (Router, Router) {
     let state = A2aApiState { card: Arc::new(card), handler };
-    Router::new()
-        .route("/.well-known/agent.json", get(agent_card))
-        .route("/a2a", post(rpc))
-        .with_state(state)
+    (
+        Router::new()
+            .route("/.well-known/agent.json", get(agent_card))
+            .with_state(state.clone()),
+        Router::new().route("/a2a", post(rpc)).with_state(state),
+    )
 }
 
 async fn agent_card(State(state): State<A2aApiState>) -> Json<AgentCard> {
@@ -188,6 +205,7 @@ mod tests {
             default_input_modes: vec!["text".into()],
             default_output_modes: vec!["text".into()],
             skills: vec![],
+            signature: None,
         }
     }
 
@@ -225,6 +243,30 @@ mod tests {
         let v: Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(v["name"], "gt");
         assert_eq!(v["capabilities"]["streaming"], true);
+    }
+
+    #[tokio::test]
+    async fn split_router_separates_discovery_from_rpc() {
+        // B5 (gtcore-9039b5): the composition root guards only the rpc half, so
+        // each half must serve exactly its own route.
+        let (discovery, rpc_router) = a2a_split_router(card(), Arc::new(Fake));
+        let resp = discovery
+            .oneshot(
+                axum::http::Request::get("/.well-known/agent.json")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), axum::http::StatusCode::OK);
+        let (status, v) = rpc_call(
+            rpc_router,
+            json!({"jsonrpc": "2.0", "id": 1, "method": "tasks/send",
+                   "params": {"id": "c", "message": {"role": "user", "parts": [{"type": "text", "text": "go"}]}}}),
+        )
+        .await;
+        assert_eq!(status, axum::http::StatusCode::OK);
+        assert_eq!(v["result"]["id"], "hq-minted");
     }
 
     #[tokio::test]

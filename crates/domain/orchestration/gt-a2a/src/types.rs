@@ -32,6 +32,14 @@ pub struct AgentCard {
     pub default_output_modes: Vec<String>,
     /// One skill per dispatchable rig — hydrated from the rig catalog up-tier.
     pub skills: Vec<AgentSkill>,
+    /// Compact RS256 JWS over the card's canonical JSON **without** this field
+    /// (B5, gtcore-9039b5). The composition root mints it with the platform's
+    /// existing RS256 signing key (`gt-auth`), so a client verifies the card
+    /// against the same public key/JWKS that verifies the platform's bearer
+    /// tokens. Optional: an unsigned card (no signing key configured) simply
+    /// omits the field, and pre-B5 documents deserialize unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signature: Option<String>,
 }
 
 fn text_modes() -> Vec<String> {
@@ -271,6 +279,26 @@ mod tests {
         );
         assert!(card.capabilities.streaming);
         assert_eq!(card.skills[0].id, "gtcore");
+        // A document without a `signature` (pre-B5 / unsigned deploy) stays
+        // byte-stable: the optional field must not appear on re-serialization.
+        assert_eq!(card.signature, None);
+    }
+
+    #[test]
+    fn agent_card_signature_round_trips_when_present() {
+        let card: AgentCard = round_trip(
+            r#"{
+              "name": "gt",
+              "url": "https://gt-dev.codecsrayo.com/a2a",
+              "version": "0.1.0",
+              "capabilities": {"streaming": true, "pushNotifications": false, "stateTransitionHistory": false},
+              "defaultInputModes": ["text"],
+              "defaultOutputModes": ["text"],
+              "skills": [],
+              "signature": "eyJhbGciOiJSUzI1NiJ9.e30.sig"
+            }"#,
+        );
+        assert_eq!(card.signature.as_deref(), Some("eyJhbGciOiJSUzI1NiJ9.e30.sig"));
     }
 
     #[test]

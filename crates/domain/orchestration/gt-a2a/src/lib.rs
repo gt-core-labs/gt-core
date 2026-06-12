@@ -37,10 +37,10 @@ pub use handler::{A2aError, A2aHandler, EventStream, StreamEvent};
 pub use jsonrpc::{JsonRpcError, JsonRpcRequest, JsonRpcResponse, JSONRPC_VERSION};
 pub use sse::sse_frame;
 pub use types::{
-    AgentCapabilities, AgentCard, AgentProvider, AgentSkill, Artifact, Message, Part, Role, Task,
-    TaskArtifactUpdateEvent, TaskIdParams, TaskSendParams, TaskState, TaskStatus,
-    TaskStatusUpdateEvent,
+    AgentAuthentication, AgentCapabilities, AgentCard, AgentProvider, AgentSkill, Artifact,
+    Message, Part, Role, Task, TaskArtifactUpdateEvent, TaskIdParams, TaskSendParams, TaskState,
+    TaskStatus, TaskStatusUpdateEvent,
 };
 
 #[cfg(feature = "axum")]
-pub use http::a2a_router;
+pub use http::{a2a_router, a2a_split_router};
