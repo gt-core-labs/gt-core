@@ -19,11 +19,90 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use serde::Serialize;
 use sqlx::types::chrono::Utc;
 use sqlx::PgPool;
 
+use gt_events::EventKind;
 use gt_notify::{EmailMessage, EmailTransport};
 use gt_store_pg::{EmailOutboxRepository, PgEmailOutbox};
+
+use crate::mcp::eventlog::EventLog;
+
+const DEFAULT_WORKSPACE: &str = "default";
+const FROM_ROLE: &str = "report-digest";
+/// template_ref prefix that marks a scheduled report email.
+const REPORT_REF_PREFIX: &str = "report:";
+
+/// Bell-notification emitter for the drain (hq-9643ec). Fires an `info`
+/// notification when a report email is delivered and an `alert` when one
+/// permanently fails — keeps operators informed without tailing logs.
+///
+/// Only emails whose `template_ref` starts with `"report:"` are notified;
+/// merge-failure emails already have their own notification from
+/// `workflow_notify`.
+pub struct DrainNotifier {
+    pool: PgPool,
+    log: Arc<EventLog>,
+}
+
+impl DrainNotifier {
+    pub fn new(pool: PgPool, log: Arc<EventLog>) -> Self {
+        Self { pool, log }
+    }
+
+    /// Insert a notification row + append the SSE event. Best-effort: any
+    /// error is logged and swallowed — a notification outage never kills the
+    /// drain.
+    async fn fire(&self, workspace: &str, title: &str, body: &str, kind: &str) {
+        let row: Result<(String,), _> = sqlx::query_as(
+            "INSERT INTO notifications (workspace, from_role, title, body, kind) \
+             VALUES ($1, $2, $3, $4, $5) RETURNING id::text",
+        )
+        .bind(workspace)
+        .bind(FROM_ROLE)
+        .bind(title)
+        .bind(body)
+        .bind(kind)
+        .fetch_one(&self.pool)
+        .await;
+
+        let id = match row {
+            Ok((id,)) => id,
+            Err(e) => {
+                eprintln!("[email-outbox] notification insert failed: {e}");
+                return;
+            }
+        };
+
+        #[derive(Serialize)]
+        struct NotificationCreated {
+            id: String,
+            workspace: String,
+            from_role: String,
+            title: String,
+            body: String,
+            kind: String,
+        }
+        impl EventKind for NotificationCreated {
+            fn kind(&self) -> &'static str {
+                "notification.created.v1"
+            }
+        }
+        let ev = NotificationCreated {
+            id,
+            workspace: workspace.to_string(),
+            from_role: FROM_ROLE.to_string(),
+            title: title.to_string(),
+            body: body.to_string(),
+            kind: kind.to_string(),
+        };
+        let ws_opt = if workspace == DEFAULT_WORKSPACE { None } else { Some(workspace) };
+        if let Err(e) = self.log.append(ws_opt, ev) {
+            eprintln!("[email-outbox] notification SSE emit failed: {e}");
+        }
+    }
+}
 
 /// Delivery attempts before a row settles as `failed`.
 pub const MAX_ATTEMPTS: i32 = 5;
@@ -44,10 +123,16 @@ pub fn backoff_delay(prior_attempts: i32) -> Duration {
 pub async fn drain_once(
     repo: &PgEmailOutbox,
     transport: &Arc<dyn EmailTransport>,
+    notifier: Option<&DrainNotifier>,
 ) -> Result<usize, gt_store_pg::OutboxError> {
     let claimed = repo.claim_due(CLAIM_BATCH).await?;
     let n = claimed.len();
     for entry in claimed {
+        let is_report = entry
+            .template_ref
+            .as_deref()
+            .map(|r| r.starts_with(REPORT_REF_PREFIX))
+            .unwrap_or(false);
         let msg = EmailMessage {
             to: entry.recipient.clone(),
             subject: entry.subject.clone(),
@@ -60,7 +145,15 @@ pub async fn drain_once(
             .await
             .unwrap_or_else(|e| Err(format!("transport panicked: {e}")));
         match outcome {
-            Ok(()) => repo.mark_sent(&entry.id).await?,
+            Ok(()) => {
+                repo.mark_sent(&entry.id).await?;
+                if is_report {
+                    if let Some(n) = notifier {
+                        let body = format!("{}\n→ {}", entry.subject, entry.recipient);
+                        n.fire(&entry.workspace, "Reporte enviado", &body, "info").await;
+                    }
+                }
+            }
             Err(reason) => {
                 if entry.attempts + 1 >= MAX_ATTEMPTS {
                     repo.mark_failed(&entry.id, &reason).await?;
@@ -69,6 +162,21 @@ pub async fn drain_once(
                         entry.id,
                         entry.attempts + 1
                     );
+                    if is_report {
+                        if let Some(n) = notifier {
+                            let body = format!(
+                                "{}\n→ {}\n{}",
+                                entry.subject, entry.recipient, reason
+                            );
+                            n.fire(
+                                &entry.workspace,
+                                "Error de envío de reporte",
+                                &body,
+                                "alert",
+                            )
+                            .await;
+                        }
+                    }
                 } else {
                     let next = Utc::now()
                         + chrono::Duration::from_std(backoff_delay(entry.attempts))
@@ -83,13 +191,18 @@ pub async fn drain_once(
 
 /// The daemon loop: tick every `interval`, drain a batch, log failures and keep
 /// going — a transient PG error never kills the drain.
-pub async fn run(interval: Duration, pool: PgPool, transport: Arc<dyn EmailTransport>) {
+pub async fn run(
+    interval: Duration,
+    pool: PgPool,
+    transport: Arc<dyn EmailTransport>,
+    notifier: Option<DrainNotifier>,
+) {
     let repo = PgEmailOutbox::new(pool);
     let mut tick = tokio::time::interval(interval);
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
         tick.tick().await;
-        match drain_once(&repo, &transport).await {
+        match drain_once(&repo, &transport, notifier.as_ref()).await {
             Ok(0) => {}
             Ok(n) => eprintln!("[email-outbox] drained {n} due email(s) via {}", transport.label()),
             Err(e) => eprintln!("[email-outbox] drain tick failed: {e}"),

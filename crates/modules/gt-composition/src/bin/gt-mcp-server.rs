@@ -971,10 +971,17 @@ async fn main() -> anyhow::Result<()> {
                     "[gt-mcp-server] email-outbox drain on (every {email_tick}s; transport {})",
                     transport.label()
                 );
+                let drain_notifier = Some(
+                    gt_composition::email_outbox_drain::DrainNotifier::new(
+                        outbox_pool.clone(),
+                        event_log.clone(),
+                    ),
+                );
                 tokio::spawn(gt_composition::email_outbox_drain::run(
                     std::time::Duration::from_secs(email_tick),
                     outbox_pool,
                     transport,
+                    drain_notifier,
                 ));
             }
             Err(e) => eprintln!("[gt-mcp-server] email-outbox drain off (PG connect failed: {e})"),
