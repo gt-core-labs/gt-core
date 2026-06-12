@@ -19,6 +19,7 @@
 //! Eviction on a shrunk cap is *not* done — admission is side-effect-free, running polecats finish
 //! naturally (NN#2, mirrored from [`gt_polecat::pool`]).
 
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -29,6 +30,7 @@ use gt_agent::{AgentEvent, SessionRole};
 use gt_auth::{JwtClaims, JwtMinter};
 use gt_eventlog::EventRecord;
 use gt_events::{AppError, Envelope};
+use gt_mcp_server::bead_prefix;
 use gt_merge::MergeEvent;
 use gt_plugin::Plugin;
 use gt_polecat::{
@@ -97,6 +99,19 @@ impl AgentTokenMinter {
     }
 }
 
+/// Everything the supervisor needs to sling a polecat into ONE catalog rig (`hq-0ecfec`, epic
+/// hq-554308): the rig's [`SpawnTemplate`] (built via [`SpawnTemplate::for_rig`] from the live
+/// rig catalog at boot) plus its per-polecat worktree root. Keyed by bead prefix in
+/// [`PolecatSupervisorPlugin::with_rig_configs`] so a `gtweb-*` bead lands in the gtweb checkout
+/// instead of the boot rig's.
+#[derive(Debug, Clone)]
+pub struct RigConfig {
+    pub template: SpawnTemplate,
+    /// Per-polecat worktree root for this rig. `None` ⇒ the rig's polecats share
+    /// `template.workdir` directly (same semantics as the legacy `worktree_root`).
+    pub worktree_root: Option<std::path::PathBuf>,
+}
+
 /// Observer that turns the scheduler's dispatch decisions into live, supervised tmux polecats for
 /// one workspace, bounded by a shared [`PoolAllocator`]. Registered on the daemon's event hub
 /// alongside the reactor arms (`hq-orchd.3`).
@@ -145,6 +160,11 @@ pub struct PolecatSupervisorPlugin {
     /// real values. `None` ⇒ no CLAUDE.md is written (the repo's project CLAUDE.md is all the
     /// polecat sees).
     event_log: Option<Arc<EventLog>>,
+    /// Per-rig spawn configs keyed by bead prefix (`hq-0ecfec`, epic hq-554308). A dispatched
+    /// bead whose prefix matches routes to that rig's template + worktree root; an unknown
+    /// prefix falls back to the legacy single `template`/`worktree_root` — so a deployment that
+    /// never calls [`Self::with_rig_configs`] behaves exactly as before.
+    rig_configs: HashMap<String, RigConfig>,
 }
 
 impl PolecatSupervisorPlugin {
@@ -173,6 +193,25 @@ impl PolecatSupervisorPlugin {
             server_url: None,
             anthropic_proxy_url: None,
             event_log: None,
+            rig_configs: HashMap::new(),
+        }
+    }
+
+    /// Route dispatched beads to their rig by bead prefix (`hq-0ecfec`, epic hq-554308): a
+    /// `gtweb-*` bead slings in the gtweb rig's checkout/template instead of the boot rig's.
+    /// Beads with a prefix not in the map keep the legacy single-template path.
+    pub fn with_rig_configs(mut self, configs: HashMap<String, RigConfig>) -> Self {
+        self.rig_configs = configs;
+        self
+    }
+
+    /// The (template, worktree_root) pair for `bead`, by its rig prefix. Falls back to the
+    /// legacy single `template` + `worktree_root` for an unknown prefix, so single-rig
+    /// deployments are untouched.
+    fn route(&self, bead: &str) -> (&SpawnTemplate, Option<&std::path::PathBuf>) {
+        match self.rig_configs.get(bead_prefix(bead)) {
+            Some(cfg) => (&cfg.template, cfg.worktree_root.as_ref()),
+            None => (&self.template, self.worktree_root.as_ref()),
         }
     }
 
@@ -304,7 +343,10 @@ impl Plugin for PolecatSupervisorPlugin {
                     );
                     return Ok(());
                 }
-                let mut spec = self.template.spec_for(&self.workspace, &bead);
+                // Route to the bead's rig by prefix (hq-0ecfec): matched ⇒ that rig's template +
+                // worktree root; unknown prefix ⇒ the legacy boot template, unchanged behaviour.
+                let (template, worktree_root) = self.route(&bead);
+                let mut spec = template.spec_for(&self.workspace, &bead);
                 // Stamp a least-privilege per-agent token (hq-agent-provisioning.3) so the polecat
                 // acts as itself, scoped to its role — not as the operator. Best-effort: a mint
                 // failure logs and the polecat still slings (it just lacks GT_TOKEN).
@@ -383,9 +425,9 @@ impl Plugin for PolecatSupervisorPlugin {
                 // `-b <bead-id>`), base = the template's rig checkout. Best-effort — a git failure
                 // logs and the polecat falls back to the shared checkout (spec.workdir unchanged),
                 // keeping liveness over isolation. Idempotent: a re-sling reuses the same tree.
-                if let Some(root) = &self.worktree_root {
+                if let Some(root) = worktree_root {
                     let wt = root.join(&spec.session);
-                    match crate::worktree::provision(&self.template.workdir, &wt, &bead) {
+                    match crate::worktree::provision(&template.workdir, &wt, &bead) {
                         Ok(()) => {
                             // The worktree is a FRESH tree: the boot-time hook install + the
                             // machine-local .mcp.json both live in the base rig checkout, not here
@@ -407,7 +449,7 @@ impl Plugin for PolecatSupervisorPlugin {
                                 crate::worktree::write_mcp_json(&wt, url, &self.workspace, &spec.rig, tok)
                             }).unwrap_or(false);
                             if !mcp_written {
-                                crate::worktree::seed_mcp_config(&self.template.workdir, &wt);
+                                crate::worktree::seed_mcp_config(&template.workdir, &wt);
                             }
                             // hq-rig-isolation.5: write .gt-config so `gt` CLI knows the rig.
                             // Best-effort alongside write_mcp_json — same server_url + token.
@@ -430,7 +472,7 @@ impl Plugin for PolecatSupervisorPlugin {
                         Err(e) => eprintln!(
                             "[polecat] worktree provision failed for {bead} at {}: {e} — using shared checkout {}",
                             wt.display(),
-                            self.template.workdir.display()
+                            template.workdir.display()
                         ),
                     }
                 }
@@ -597,13 +639,16 @@ impl Plugin for PolecatSupervisorPlugin {
                     .release(&self.workspace);
                 // Close the agent session for that bead (hq-orchd.6): the session id is the
                 // deterministic `spec_for` session, so it matches the `Spawned` emitted at sling.
-                let session = self.template.spec_for(&self.workspace, &bead).session;
+                // Routed by bead prefix (hq-0ecfec) so a gtweb bead's session/worktree derive from
+                // the SAME template the sling used — else teardown would miss the tree.
+                let (template, worktree_root) = self.route(&bead);
+                let session = template.spec_for(&self.workspace, &bead).session;
                 // Tear down the per-bead worktree now its work has landed (hq-orchd-deploy.9):
                 // best-effort, mirrors the deterministic `<root>/<session>` path used at sling. The
                 // branch itself is reaped by the branch-GC reactor on this same event.
-                if let Some(root) = &self.worktree_root {
+                if let Some(root) = worktree_root {
                     let wt = root.join(&session);
-                    if let Err(e) = crate::worktree::remove(&self.template.workdir, &wt) {
+                    if let Err(e) = crate::worktree::remove(&template.workdir, &wt) {
                         eprintln!(
                             "[polecat] worktree teardown for {bead} at {} skipped: {e}",
                             wt.display()
@@ -939,6 +984,179 @@ mod tests {
             .arg(&base)
             .args(["worktree", "remove", "--force", wt.to_str().unwrap()])
             .status();
+        let _ = std::fs::remove_dir_all(&base);
+        let _ = std::fs::remove_dir_all(&wt_root);
+    }
+
+    #[tokio::test]
+    async fn dispatch_routes_bead_to_its_rig_config_by_prefix() {
+        // hq-0ecfec (epic hq-554308): a `gtweb-*` bead slings with the gtweb rig's template —
+        // session prefix + GT_RIG/GT_RIG_PATH from the catalog entry, not the boot rig's. A bead
+        // with an unknown prefix keeps the legacy fallback template.
+        let fake = Arc::new(FakeTmux::new());
+        let tmux: Arc<dyn Tmux> = fake.clone();
+        let supervisor = Arc::new(PolecatSupervisor::new(
+            tmux.clone(),
+            RestartConfig::default(),
+            8,
+        ));
+        let template = SpawnTemplate {
+            rig: "gtcore".into(),
+            prefix: "gtcore".into(),
+            workdir: "/rig-wt/gtcore".into(),
+            command: "true".into(),
+            args: vec![],
+            base_env: vec![
+                ("GT_RIG".to_string(), "gtcore".to_string()),
+                ("GT_RIG_PATH".to_string(), "/rig-wt/gtcore".to_string()),
+            ],
+            heartbeat_dir: std::env::temp_dir(),
+        };
+        let gtweb = RigConfig {
+            template: SpawnTemplate::for_rig(
+                "gtweb",
+                "gtweb",
+                "/rig-wt/gtweb".into(),
+                template.command.clone(),
+                template.args.clone(),
+                template.base_env.clone(),
+                template.heartbeat_dir.clone(),
+            ),
+            worktree_root: None,
+        };
+        let alloc = Arc::new(Mutex::new(PoolAllocator::new(10, 5)));
+        let p = PolecatSupervisorPlugin::new("acme", tmux, template, supervisor, alloc)
+            .with_rig_configs(HashMap::from([("gtweb".to_string(), gtweb)]));
+
+        p.on_event(&record(SchedEvent::Dispatched {
+            bead: "gtweb-968172".into(),
+            worker: "w1".into(),
+        }))
+        .await
+        .unwrap();
+        // The session is named with the gtweb rig's prefix and carries ITS rig env.
+        assert_eq!(
+            fake.show_environment("gtweb-gtweb-968172", "GT_RIG").unwrap().as_deref(),
+            Some("gtweb")
+        );
+        assert_eq!(
+            fake.show_environment("gtweb-gtweb-968172", "GT_RIG_PATH").unwrap().as_deref(),
+            Some("/rig-wt/gtweb")
+        );
+
+        // Unknown prefix → the legacy fallback template (boot rig), unchanged.
+        p.on_event(&record(SchedEvent::Dispatched {
+            bead: "zz-1".into(),
+            worker: "w2".into(),
+        }))
+        .await
+        .unwrap();
+        assert_eq!(
+            fake.show_environment("gtcore-zz-1", "GT_RIG").unwrap().as_deref(),
+            Some("gtcore")
+        );
+        assert_eq!(
+            fake.show_environment("gtcore-zz-1", "GT_RIG_PATH").unwrap().as_deref(),
+            Some("/rig-wt/gtcore")
+        );
+    }
+
+    #[tokio::test]
+    async fn merged_routed_bead_releases_slot_and_tears_down_its_rig_worktree() {
+        // hq-0ecfec: merge.merged.v1 for a routed bead derives the session + worktree from the
+        // SAME rig config the sling used — slot released, worktree gone, session-end emitted
+        // under the routed session id.
+        let uniq = format!(
+            "{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        let base = std::env::temp_dir().join(format!("gt-rigweb-{uniq}"));
+        let wt_root = std::env::temp_dir().join(format!("gt-rigweb-wt-{uniq}"));
+        std::fs::create_dir_all(&base).unwrap();
+        std::fs::create_dir_all(&wt_root).unwrap();
+        let git = |args: &[&str]| {
+            std::process::Command::new("git")
+                .arg("-C")
+                .arg(&base)
+                .args(args)
+                .status()
+                .unwrap()
+                .success()
+        };
+        assert!(git(&["init", "-q", "-b", "main"]));
+        assert!(git(&["config", "user.email", "t@t"]));
+        assert!(git(&["config", "user.name", "t"]));
+        std::fs::write(base.join("f"), "x").unwrap();
+        assert!(git(&["add", "."]));
+        assert!(git(&["commit", "-qm", "init"]));
+
+        let fake = Arc::new(FakeTmux::new());
+        let tmux: Arc<dyn Tmux> = fake.clone();
+        let supervisor = Arc::new(PolecatSupervisor::new(
+            tmux.clone(),
+            RestartConfig::default(),
+            8,
+        ));
+        // Boot template points at a DIFFERENT (nonexistent) checkout: only the routed gtweb
+        // config can have provisioned/torn down the worktree.
+        let template = SpawnTemplate {
+            rig: "gtcore".into(),
+            prefix: "gtcore".into(),
+            workdir: "/nonexistent-gtcore".into(),
+            command: "true".into(),
+            args: vec![],
+            base_env: vec![],
+            heartbeat_dir: std::env::temp_dir(),
+        };
+        let gtweb = RigConfig {
+            template: SpawnTemplate::for_rig(
+                "gtweb",
+                "gtweb",
+                base.clone(),
+                "true",
+                vec![],
+                vec![],
+                std::env::temp_dir(),
+            ),
+            worktree_root: Some(wt_root.clone()),
+        };
+        let alloc = Arc::new(Mutex::new(PoolAllocator::new(10, 5)));
+        let (tx, mut rx) = broadcast::channel::<EventRecord>(16);
+        let p = PolecatSupervisorPlugin::new("acme", tmux, template, supervisor, alloc.clone())
+            .with_rig_configs(HashMap::from([("gtweb".to_string(), gtweb)]))
+            .with_session_events(tx);
+
+        p.on_event(&record(SchedEvent::Dispatched {
+            bead: "gtweb-1".into(),
+            worker: "w1".into(),
+        }))
+        .await
+        .unwrap();
+        let wt = wt_root.join("gtweb-gtweb-1");
+        assert!(wt.exists(), "routed worktree provisioned at {}", wt.display());
+        // Drain the sling-side events (agent.spawned + issues.operated).
+        assert_eq!(rx.try_recv().unwrap().kind, "agent.spawned.v1");
+        assert_eq!(rx.try_recv().unwrap().kind, "issues.operated.v1");
+
+        p.on_event(&record(MergeEvent::Merged {
+            bead: "gtweb-1".into(),
+            sha: "abc".into(),
+        }))
+        .await
+        .unwrap();
+        assert!(!wt.exists(), "routed worktree torn down after merge");
+        assert_eq!(alloc.lock().unwrap().in_flight("acme"), 0, "slot released");
+        let closed = rx.try_recv().expect("session-end emitted");
+        assert_eq!(closed.kind, "agent.session-end.v1");
+        let AgentEvent::SessionEnd { session } = closed.decode::<AgentEvent>().unwrap() else {
+            panic!("expected SessionEnd");
+        };
+        assert_eq!(session, "gtweb-gtweb-1", "session id derives from the ROUTED template");
+
         let _ = std::fs::remove_dir_all(&base);
         let _ = std::fs::remove_dir_all(&wt_root);
     }
