@@ -35,6 +35,7 @@
 //! their events onto the hub via `RootHandle::drain_events_from`.
 //! [`git_merge::GitMergePlugin`] (edge git-merge) and [`witness_sweep::WitnessSweep`] (witness safety-net) are the wired edge effects that close the autonomous loop.
 
+pub mod a2a;
 pub mod account_dirs;
 pub mod anthropic_proxy;
 pub mod auth;

@@ -126,6 +126,9 @@ tokio = { workspace = true, features = ["macros", "rt-multi-thread", "net", "pro
 # one Rule-4-legal home for the per-domain DomainHandler wiring. It composes the
 # gt-mcp-server library + the issues/meta modules + the domain handlers.
 gt-mcp-server = { workspace = true }
+# A2A protocol contract (gtcore-155917): the A2aHandler port this crate implements
+# (a2a.rs) — the Rule-4-legal home for the gt-issues + dispatch-channel integration.
+gt-a2a = { workspace = true }
 # The `axum` feature compiles the issues REST adapter (hq-auth-routes.2): IssuesModule's
 # register_routes/openapi + the http.rs router the bin mounts at /api/v1/issues.
 gt-issues = { workspace = true, features = ["axum"] }
@@ -173,6 +176,9 @@ path = "src/bin/gt-orch-server.rs"
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "sync", "time", "test-util"] }
 serde_json = { workspace = true }
+# Mount the real `POST /a2a` router over the gateway in-process (gtcore-c7bbef);
+# the production dep stays featureless until B5 wires the HTTP surface.
+gt-a2a = { workspace = true, features = ["axum"] }
 # Tempdir-rooted event logs for the event-sourced handler tests.
 tempfile = { workspace = true }
 # Drive the SSE feed router in-process (hq-mcp-test.7): `oneshot` a request and
