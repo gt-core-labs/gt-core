@@ -1,4 +1,4 @@
-//! SSE framing for `tasks/sendSubscribe` (plans/a2a-checklist.md B1).
+//! SSE framing for `tasks/sendSubscribe` (B1, gtcore-fbf90e / epic gtcore-155917).
 //!
 //! Per spec, each SSE `data:` field carries a **complete JSON-RPC response**
 //! whose `result` is the update event — not the bare event. This module owns

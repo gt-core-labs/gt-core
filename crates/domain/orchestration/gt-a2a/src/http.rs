@@ -1,4 +1,4 @@
-//! The off-by-default `axum` adapter (plans/a2a-checklist.md B1): `POST /a2a`
+//! The off-by-default `axum` adapter (B1, gtcore-fbf90e / epic gtcore-155917): `POST /a2a`
 //! (JSON-RPC dispatch) + `GET /.well-known/agent.json` (discovery).
 //!
 //! Auth is NOT here — the composition root mounts this router behind the same

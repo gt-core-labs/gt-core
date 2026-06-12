@@ -1,4 +1,4 @@
-//! JSON-RPC 2.0 envelope + the A2A error space (plans/a2a-checklist.md B1).
+//! JSON-RPC 2.0 envelope + the A2A error space (B1, gtcore-fbf90e / epic gtcore-155917).
 //!
 //! A2A rides plain JSON-RPC 2.0: one `POST /a2a` per call, `method` selects the
 //! operation. Error codes: the standard -32600..-32700 band plus the A2A-specific

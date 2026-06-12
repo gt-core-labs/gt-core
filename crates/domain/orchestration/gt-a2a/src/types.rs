@@ -1,4 +1,4 @@
-//! A2A v1.0 spec objects (plans/a2a-checklist.md B1).
+//! A2A v1.0 spec objects (B1, gtcore-fbf90e / epic gtcore-155917).
 //!
 //! Native serde types for the subset of the spec gt-core speaks — no `a2a-rs`
 //! dependency: the surface is ~10 stable structs and an external crate would
@@ -240,7 +240,7 @@ mod tests {
     use super::*;
 
     /// Round-trip a spec-shaped document and require byte-stable JSON keys —
-    /// the conformance pin for plans/a2a-checklist.md B1.
+    /// the conformance pin for B1, gtcore-fbf90e / epic gtcore-155917.
     fn round_trip<T: Serialize + for<'de> Deserialize<'de> + PartialEq + std::fmt::Debug>(
         json: &str,
     ) -> T {

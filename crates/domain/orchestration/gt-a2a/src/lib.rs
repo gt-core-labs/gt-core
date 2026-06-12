@@ -1,4 +1,4 @@
-//! `gt-a2a` — the A2A (Agent2Agent) v1.0 protocol contract (plans/a2a-checklist.md B1).
+//! `gt-a2a` — the A2A (Agent2Agent) v1.0 protocol contract (B1, gtcore-fbf90e / epic gtcore-155917).
 //!
 //! A2A is the Linux Foundation standard for agent-to-agent task delegation:
 //! JSON-RPC 2.0 over HTTP plus SSE streaming, with capability discovery via a

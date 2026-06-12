@@ -1,4 +1,4 @@
-//! The [`A2aHandler`] port (plans/a2a-checklist.md B1).
+//! The [`A2aHandler`] port (B1, gtcore-fbf90e / epic gtcore-155917).
 //!
 //! The seam between this contract crate and the cross-domain integration:
 //! `gt-composition` (tier `modules`, docs/03 Rule 4) implements it against

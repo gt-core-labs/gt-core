@@ -11,7 +11,7 @@ async-trait = { workspace = true }
 # `Stream` for the subscribe seam — the SSE event stream the B3 observer plugin
 # will feed. Only the trait object type; no combinators (no futures-util).
 futures-core = { workspace = true }
-# Off-by-default `axum` adapter (plans/a2a-checklist.md B1): the JSON-RPC POST /a2a
+# Off-by-default `axum` adapter (B1, gtcore-fbf90e / epic gtcore-155917): the JSON-RPC POST /a2a
 # endpoint + GET /.well-known/agent.json, gated exactly as gt-quota/gt-merge gate
 # theirs — never a sibling crate (docs/03 Rule 4). `async-stream` adapts our
 # `EventStream` into the `Stream<Item = Result<Event, _>>` axum's `Sse` wants.
