@@ -376,6 +376,10 @@ pub fn polecat_settings_json() -> String {
     let v = json!({
         MANAGED_MARKER: MANAGED_VALUE,
         "hasCompletedOnboarding": true,
+        // Suppress the interactive "1. No / 2. Yes, I accept" bypass-permissions confirmation
+        // dialog on startup. Without this, autonomous polecats block waiting for a keypress even
+        // though `permissions.defaultMode` is already `bypassPermissions`.
+        "dangerouslySkipPermissions": true,
         "enabledMcpjsonServers": ["gt"],
         // bypassPermissions still skips the interactive prompt, but the `deny` rule is honoured even
         // under it: a declarative backstop to the PreToolUse memory guard (hq-memory-mcp.6). The agent
@@ -439,6 +443,8 @@ mod tests {
         assert_eq!(v[MANAGED_MARKER], json!("polecat-hooks"));
         assert_eq!(v["permissions"]["defaultMode"], json!("bypassPermissions"));
         assert_eq!(v["hasCompletedOnboarding"], json!(true));
+        // Suppress the interactive bypass-permissions confirmation dialog on startup.
+        assert_eq!(v["dangerouslySkipPermissions"], json!(true));
         // The project .mcp.json `gt` server is pre-trusted so the polecat never stalls on the
         // interactive "Use this MCP server?" prompt (hq-polecat-provisioning-20260608.1).
         assert_eq!(v["enabledMcpjsonServers"], json!(["gt"]));
