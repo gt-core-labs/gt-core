@@ -367,12 +367,36 @@ async fn main() -> anyhow::Result<()> {
         // quota event log the quota.* handler replays. Always on (the log is always present).
         .with_quota_signal(Arc::new(QuotaBlockGuard::new(event_log.clone())));
 
+    // System config (hq-system-config) is loaded BEFORE the domain router so the
+    // report-digest service (hq-84f93b) inside it and the /api/v1/system surface
+    // below share ONE SharedArchiveConfig — a PUT/schedule.set is visible to the
+    // scheduler daemon and the MCP tools without a restart.
+    let system_config_path = std::env::var("GT_SYSTEM_CONFIG_PATH")
+        .map(std::path::PathBuf::from)
+        .ok()
+        .or_else(|| {
+            std::env::var("GT_EVENTLOG_ROOT")
+                .ok()
+                .map(|r| std::path::PathBuf::from(r).with_file_name("system_config.json"))
+        });
+    let system_initial_cfg = system_config_path.as_ref().map(load_config).unwrap_or_default();
+    let system_config = std::sync::Arc::new(RwLock::new(system_initial_cfg.clone()));
+
     // Domain dispatch (hq-mcp-dispatch): tool namespaces beyond issues.*/meta.*
     // (workspace.*, rig.*, …) route to PG-backed handlers. Wired only when
     // GT_PG_URL is set; unset ⇒ an empty router, so the server serves issues +
     // meta exactly as before.
-    let (domains, rig_prefixes, ws_status, documents) =
-        build_domain_router(event_log.clone()).await?;
+    let (domains, rig_prefixes, ws_status, documents, report_service) =
+        build_domain_router(event_log.clone(), system_config.clone(), system_config_path.clone())
+            .await?;
+    // Report-digest scheduler (hq-84f93b): fixed-time daily send to the ENABLED
+    // subscribers. Like the outbox drain/mailbox, NOT behind the singleton gate —
+    // it must tick where the outbox lives; the `last_sent_date` guard in the
+    // persisted config keeps the send at-most-once per day.
+    if let Some(svc) = &report_service {
+        tokio::spawn(gt_composition::report_scheduler::ReportScheduler::new(svc.clone()).run());
+        eprintln!("[gt-mcp-server] report scheduler on (digest via /api/v1/system/report/*)");
+    }
     // audit.* tails the same audit sink the server records into (hq-mt-ops.3).
     // Registered unconditionally — it reads the in-memory or Postgres sink, so it
     // works even when GT_PG_URL is unset and the rest of the router is empty.
@@ -775,16 +799,11 @@ async fn main() -> anyhow::Result<()> {
     // POST /api/v1/system/archive/run. Scoped to system.read/system.write (admin `*` satisfies both).
     // Spawns the background archive daemon that sweeps old closed issues on a configurable interval.
     let system = verifier.as_ref().map(|v| {
-        let config_path = std::env::var("GT_SYSTEM_CONFIG_PATH")
-            .map(std::path::PathBuf::from)
-            .ok()
-            .or_else(|| {
-                std::env::var("GT_EVENTLOG_ROOT")
-                    .ok()
-                    .map(|r| std::path::PathBuf::from(r).with_file_name("system_config.json"))
-            });
-        let initial_cfg = config_path.as_ref().map(load_config).unwrap_or_default();
-        let config = std::sync::Arc::new(RwLock::new(initial_cfg.clone()));
+        // The shared config + path were built before the domain router (the
+        // report-digest service shares them — see system_config above).
+        let config = system_config.clone();
+        let config_path = system_config_path.clone();
+        let initial_cfg = system_initial_cfg.clone();
         // The background sweep is a SINGLETON (hq-talos-migration.4): gate the spawn on the master
         // switch so the API tier never sweeps, but ALWAYS build the system_router below — GET/PUT
         // /api/v1/system/* + the on-demand POST /archive/run stay served on every replica.
@@ -808,6 +827,7 @@ async fn main() -> anyhow::Result<()> {
             config,
             config_path,
             archive_pools.clone(),
+            report_service.clone(),
         ))
     });
 
@@ -1785,15 +1805,18 @@ ORDER BY c.relname, a.attnum";
 /// SSE feed streams from.
 async fn build_domain_router(
     event_log: Arc<EventLog>,
+    system_config: gt_composition::system::SharedArchiveConfig,
+    system_config_path: Option<std::path::PathBuf>,
 ) -> anyhow::Result<(
     DomainRouter,
     Option<Arc<dyn WorkspaceRigPrefixes>>,
     Option<Arc<dyn WorkspaceStatusGate>>,
     Option<Arc<dyn DocumentsResource>>,
+    Option<Arc<gt_composition::report_scheduler::ReportService>>,
 )> {
     let Ok(pg_url) = std::env::var("GT_PG_URL") else {
         eprintln!("[gt-mcp-server] GT_PG_URL unset; domain dispatch disabled (issues + meta only)");
-        return Ok((DomainRouter::new(), None, None, None));
+        return Ok((DomainRouter::new(), None, None, None, None));
     };
     // The workspace catalog lives in the shared `public` schema, so it uses a
     // plain pool; the per-workspace domains (rig, …) resolve their `ws_<slug>`
@@ -2028,25 +2051,37 @@ async fn build_domain_router(
     // (rig, workspace) board into the tracker mockup, attaches it as a document
     // (xlsx via the blob store, csv as text), optionally announcing via the
     // email outbox. Needs the Dolt tracker for the row source.
-    let router = match std::env::var("GT_DOLT_URL")
+    let (router, report_service) = match std::env::var("GT_DOLT_URL")
         .ok()
         .and_then(|url| DoltIssues::connect(&url).ok())
     {
         Some(report_dolt) => {
+            let report_dolt = Arc::new(report_dolt);
             let (report_blob, report_bucket) = build_blob_store();
-            router.register(Arc::new(ReportHandler::new(
+            // The digest service (hq-84f93b): same Dolt row source + outbox
+            // pool as report.generate; shares the persisted system config so
+            // schedule edits land without a restart.
+            let service = Arc::new(gt_composition::report_scheduler::ReportService::new(
+                report_dolt.clone(),
+                pool.clone(),
+                system_config,
+                system_config_path,
+            ));
+            let router = router.register(Arc::new(ReportHandler::new(
                 ws_pools.clone(),
-                Arc::new(report_dolt),
+                report_dolt,
                 dolt_pools.clone(),
                 report_blob,
                 report_bucket,
                 pool.clone(),
                 std::env::var("GT_PUBLIC_URL").ok(),
-            )))
+                Some(service.clone()),
+            )));
+            (router, Some(service))
         }
         None => {
             eprintln!("[gt-mcp-server] report.* off — GT_DOLT_URL unset (no row source)");
-            router
+            (router, None)
         }
     };
     eprintln!(
@@ -2064,7 +2099,7 @@ async fn build_domain_router(
     // The same per-workspace pool cache backs the document resource reads (hq-docs-api.3):
     // gt://doc/{id} + the documents inline on gt://issue/{id}.
     let documents: Arc<dyn DocumentsResource> = Arc::new(PgDocumentsResource::new(ws_pools));
-    Ok((router, Some(rig_prefixes), Some(ws_status), Some(documents)))
+    Ok((router, Some(rig_prefixes), Some(ws_status), Some(documents), report_service))
 }
 
 /// Resolve the RBAC config from the environment (scope-profiles feature). Precedence:

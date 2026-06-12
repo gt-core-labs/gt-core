@@ -152,12 +152,22 @@ fn parse_smtp_url(url: &str) -> Result<(bool, &str, Option<u16>), String> {
     Ok((smtps, host, port))
 }
 
+/// Is this body an HTML document? The outbox stores one `body TEXT` with no
+/// content-type column (hq-f24599); the report digest (hq-84f93b) writes a
+/// full standalone document, so a leading doctype/html tag is the marker.
+fn body_is_html(body: &str) -> bool {
+    let head = body.trim_start();
+    let lower = head.get(..15).unwrap_or(head).to_ascii_lowercase();
+    lower.starts_with("<!doctype html") || lower.starts_with("<html")
+}
+
 impl EmailTransport for SmtpTransport {
     fn send(&self, msg: &EmailMessage) -> Result<(), String> {
+        use lettre::message::header::ContentType;
         use lettre::transport::smtp::authentication::Credentials;
         use lettre::{Message, Transport};
 
-        let email = Message::builder()
+        let builder = Message::builder()
             .from(
                 self.config
                     .from
@@ -165,9 +175,15 @@ impl EmailTransport for SmtpTransport {
                     .map_err(|e| format!("invalid GT_SMTP_FROM {:?}: {e}", self.config.from))?,
             )
             .to(msg.to.parse().map_err(|e| format!("invalid recipient {:?}: {e}", msg.to))?)
-            .subject(msg.subject.clone())
-            .body(msg.body.clone())
-            .map_err(|e| format!("message build failed: {e}"))?;
+            .subject(msg.subject.clone());
+        // HTML bodies (the report digest) ride as text/html so the client
+        // renders instead of showing source; everything else stays plain.
+        let email = if body_is_html(&msg.body) {
+            builder.header(ContentType::TEXT_HTML).body(msg.body.clone())
+        } else {
+            builder.body(msg.body.clone())
+        }
+        .map_err(|e| format!("message build failed: {e}"))?;
 
         let (smtps, host, port) = parse_smtp_url(&self.config.url)?;
         // smtps:// = implicit TLS (465); smtp:// = mandatory STARTTLS (587).
@@ -240,6 +256,16 @@ mod tests {
         assert_eq!(sent[0].subject, "reporte");
         assert_eq!(sent[1].subject, "otro");
         assert_eq!(t.label(), "log");
+    }
+
+    #[test]
+    fn html_bodies_are_detected_by_leading_markup_only() {
+        assert!(body_is_html("<!DOCTYPE html><html></html>"));
+        assert!(body_is_html("  <html lang=\"es\">"));
+        assert!(body_is_html("<!doctype HTML>"));
+        assert!(!body_is_html("hola, mira este <html> tag en medio"));
+        assert!(!body_is_html("reporte plano"));
+        assert!(!body_is_html(""));
     }
 
     #[test]

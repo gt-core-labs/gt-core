@@ -29,7 +29,7 @@ use tokio::sync::RwLock;
 
 use gt_auth::JwtClaims;
 use gt_store_dolt::{ArchivedIssue, DoltIssues};
-use gt_store_pg::{DocumentsRepository, PgDocuments};
+use gt_store_pg::{DocumentsRepository, PgDocuments, ReportSubscriptionsRepository};
 
 use crate::auth::SharedAuthenticator;
 use crate::denial_audit::{record_denial, SharedAudit, ANONYMOUS};
@@ -53,6 +53,10 @@ pub struct ArchiveConfig {
     /// How often the daemon runs, in minutes.
     #[serde(default = "default_interval_minutes")]
     pub interval_minutes: u64,
+    /// The scheduled report digest (hq-84f93b). Rides the same persisted file
+    /// so old configs (no `report` key) keep parsing via the default.
+    #[serde(default)]
+    pub report: crate::report_scheduler::ReportScheduleConfig,
 }
 
 fn default_true() -> bool {
@@ -71,6 +75,7 @@ impl Default for ArchiveConfig {
             enabled: default_true(),
             archive_after_days: default_archive_days(),
             interval_minutes: default_interval_minutes(),
+            report: Default::default(),
         }
     }
 }
@@ -94,7 +99,7 @@ pub fn load_config(path: &PathBuf) -> ArchiveConfig {
     }
 }
 
-fn persist_config(path: &PathBuf, cfg: &ArchiveConfig) {
+pub(crate) fn persist_config(path: &PathBuf, cfg: &ArchiveConfig) {
     if let Ok(json) = serde_json::to_string_pretty(cfg) {
         let _ = std::fs::write(path, json);
     }
@@ -112,6 +117,9 @@ pub struct SystemApiState {
     /// soft-deleting an archived epic's `documents`. `None` when `GT_PG_URL` is unset — no
     /// documents store, so nothing to clean up.
     pools: Option<Arc<WsPools>>,
+    /// The report-digest service (hq-84f93b): schedule + subscribers + manual
+    /// send. `None` when `GT_PG_URL` is unset — the report routes answer 503.
+    report: Option<Arc<crate::report_scheduler::ReportService>>,
 }
 
 impl SystemApiState {
@@ -122,6 +130,7 @@ impl SystemApiState {
         config: SharedArchiveConfig,
         config_path: Option<PathBuf>,
         pools: Option<Arc<WsPools>>,
+        report: Option<Arc<crate::report_scheduler::ReportService>>,
     ) -> Self {
         Self {
             authenticator,
@@ -130,6 +139,7 @@ impl SystemApiState {
             config,
             config_path,
             pools,
+            report,
         }
     }
 }
@@ -138,6 +148,19 @@ pub fn system_router(state: SystemApiState) -> Router {
     Router::new()
         .route("/api/v1/system/config", get(get_config).put(put_config))
         .route("/api/v1/system/archive/run", post(run_archive_now))
+        .route(
+            "/api/v1/system/report/schedule",
+            get(get_report_schedule).put(put_report_schedule),
+        )
+        .route(
+            "/api/v1/system/report/subscribers",
+            get(list_report_subscribers).post(add_report_subscriber),
+        )
+        .route(
+            "/api/v1/system/report/subscribers/:email",
+            axum::routing::delete(remove_report_subscriber).patch(toggle_report_subscriber),
+        )
+        .route("/api/v1/system/report/run", post(run_report_now))
         .with_state(state)
 }
 
@@ -308,6 +331,208 @@ pub async fn purge_archived_epic_documents(pools: &WsPools, archived: &[Archived
                 );
             }
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Report digest surface (hq-84f93b): schedule + subscribers + manual run.
+// Same auth ladder as the archive knobs; every handler 503s when the service
+// is absent (GT_PG_URL unset).
+// ---------------------------------------------------------------------------
+
+fn report_service(
+    st: &SystemApiState,
+) -> Result<Arc<crate::report_scheduler::ReportService>, Response> {
+    st.report.clone().ok_or_else(|| {
+        (StatusCode::SERVICE_UNAVAILABLE, "report service off (GT_PG_URL unset)").into_response()
+    })
+}
+
+fn subscriber_json(s: &gt_store_pg::ReportSubscriber) -> serde_json::Value {
+    serde_json::json!({
+        "id": s.id, "email": s.email, "enabled": s.enabled, "created_at": s.created_at,
+    })
+}
+
+async fn get_report_schedule(
+    State(st): State<SystemApiState>,
+    headers: axum::http::HeaderMap,
+) -> Response {
+    if let Err(resp) = authorize(&st, &headers, READ_SCOPE, &Method::GET) {
+        return resp;
+    }
+    let report = st.config.read().await.report.clone();
+    (StatusCode::OK, Json(report)).into_response()
+}
+
+/// Partial schedule update; `last_sent_date` is daemon bookkeeping and not
+/// patchable.
+#[derive(Debug, Deserialize)]
+struct ReportSchedulePatch {
+    enabled: Option<bool>,
+    hour: Option<u8>,
+    minute: Option<u8>,
+    tz_offset_minutes: Option<i64>,
+    rig: Option<String>,
+    workspace: Option<String>,
+}
+
+async fn put_report_schedule(
+    State(st): State<SystemApiState>,
+    headers: axum::http::HeaderMap,
+    Json(patch): Json<ReportSchedulePatch>,
+) -> Response {
+    if let Err(resp) = authorize(&st, &headers, WRITE_SCOPE, &Method::PUT) {
+        return resp;
+    }
+    if patch.hour.is_some_and(|h| h > 23) || patch.minute.is_some_and(|m| m > 59) {
+        return (StatusCode::BAD_REQUEST, "hour 0-23, minute 0-59").into_response();
+    }
+    let mut cfg = st.config.write().await;
+    let r = &mut cfg.report;
+    if let Some(v) = patch.enabled {
+        r.enabled = v;
+    }
+    if let Some(v) = patch.hour {
+        r.hour = v;
+    }
+    if let Some(v) = patch.minute {
+        r.minute = v;
+    }
+    if let Some(v) = patch.tz_offset_minutes {
+        r.tz_offset_minutes = v.clamp(-14 * 60, 14 * 60);
+    }
+    if let Some(v) = patch.rig {
+        r.rig = v;
+    }
+    if let Some(v) = patch.workspace {
+        r.workspace = v;
+    }
+    let snapshot = cfg.clone();
+    drop(cfg);
+    if let Some(path) = &st.config_path {
+        persist_config(path, &snapshot);
+    }
+    (StatusCode::OK, Json(snapshot.report)).into_response()
+}
+
+async fn list_report_subscribers(
+    State(st): State<SystemApiState>,
+    headers: axum::http::HeaderMap,
+) -> Response {
+    if let Err(resp) = authorize(&st, &headers, READ_SCOPE, &Method::GET) {
+        return resp;
+    }
+    let svc = match report_service(&st) {
+        Ok(svc) => svc,
+        Err(resp) => return resp,
+    };
+    let workspace = st.config.read().await.report.workspace.clone();
+    match svc.subscribers().list(&workspace).await {
+        Ok(subs) => {
+            let subs: Vec<_> = subs.iter().map(subscriber_json).collect();
+            (StatusCode::OK, Json(serde_json::json!({ "subscribers": subs }))).into_response()
+        }
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct AddSubscriberBody {
+    email: String,
+}
+
+async fn add_report_subscriber(
+    State(st): State<SystemApiState>,
+    headers: axum::http::HeaderMap,
+    Json(body): Json<AddSubscriberBody>,
+) -> Response {
+    if let Err(resp) = authorize(&st, &headers, WRITE_SCOPE, &Method::POST) {
+        return resp;
+    }
+    let svc = match report_service(&st) {
+        Ok(svc) => svc,
+        Err(resp) => return resp,
+    };
+    let email = body.email.trim().to_string();
+    if !email.contains('@') {
+        return (StatusCode::BAD_REQUEST, "email must be an address").into_response();
+    }
+    let workspace = st.config.read().await.report.workspace.clone();
+    match svc.subscribers().add(&workspace, &email).await {
+        Ok(()) => (StatusCode::OK, Json(serde_json::json!({ "ok": true }))).into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+    }
+}
+
+async fn remove_report_subscriber(
+    State(st): State<SystemApiState>,
+    headers: axum::http::HeaderMap,
+    axum::extract::Path(email): axum::extract::Path<String>,
+) -> Response {
+    if let Err(resp) = authorize(&st, &headers, WRITE_SCOPE, &Method::DELETE) {
+        return resp;
+    }
+    let svc = match report_service(&st) {
+        Ok(svc) => svc,
+        Err(resp) => return resp,
+    };
+    let workspace = st.config.read().await.report.workspace.clone();
+    match svc.subscribers().remove(&workspace, &email).await {
+        Ok(()) => (StatusCode::OK, Json(serde_json::json!({ "ok": true }))).into_response(),
+        Err(gt_store_pg::ReportSubscriptionError::NotFound(e)) => {
+            (StatusCode::NOT_FOUND, format!("unknown subscriber {e}")).into_response()
+        }
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+    }
+}
+
+/// The send-selection switch: PATCH `{"enabled": bool}`.
+#[derive(Debug, Deserialize)]
+struct ToggleSubscriberBody {
+    enabled: bool,
+}
+
+async fn toggle_report_subscriber(
+    State(st): State<SystemApiState>,
+    headers: axum::http::HeaderMap,
+    axum::extract::Path(email): axum::extract::Path<String>,
+    Json(body): Json<ToggleSubscriberBody>,
+) -> Response {
+    if let Err(resp) = authorize(&st, &headers, WRITE_SCOPE, &Method::PATCH) {
+        return resp;
+    }
+    let svc = match report_service(&st) {
+        Ok(svc) => svc,
+        Err(resp) => return resp,
+    };
+    let workspace = st.config.read().await.report.workspace.clone();
+    match svc.subscribers().set_enabled(&workspace, &email, body.enabled).await {
+        Ok(()) => (StatusCode::OK, Json(serde_json::json!({ "ok": true }))).into_response(),
+        Err(gt_store_pg::ReportSubscriptionError::NotFound(e)) => {
+            (StatusCode::NOT_FOUND, format!("unknown subscriber {e}")).into_response()
+        }
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+    }
+}
+
+async fn run_report_now(
+    State(st): State<SystemApiState>,
+    headers: axum::http::HeaderMap,
+) -> Response {
+    let claims = match authorize(&st, &headers, WRITE_SCOPE, &Method::POST) {
+        Ok(claims) => claims,
+        Err(resp) => return resp,
+    };
+    let svc = match report_service(&st) {
+        Ok(svc) => svc,
+        Err(resp) => return resp,
+    };
+    match svc.send_digest(&claims.sub).await {
+        Ok(queued) => {
+            (StatusCode::OK, Json(serde_json::json!({ "queued": queued }))).into_response()
+        }
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
     }
 }
 

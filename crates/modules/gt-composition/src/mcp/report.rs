@@ -22,6 +22,7 @@ use gt_store_blob::{sha256_hex, BlobStore};
 use gt_store_dolt::{AppError, DoltIssues, IssueFilter, WorkspacePools};
 use gt_store_pg::{
     DocumentsRepository, EmailOutboxRepository, NewDocument, NewEmail, PgDocuments, PgEmailOutbox,
+    ReportSubscriptionsRepository,
 };
 
 use super::pools::WsPools;
@@ -43,6 +44,9 @@ pub struct ReportHandler {
     pool: PgPool,
     /// Base public URL for the download link in the announce email.
     public_url: Option<String>,
+    /// The scheduled-digest service (hq-84f93b): subscribers CRUD + schedule
+    /// + send-now. `None` ⇒ those tools answer with a validation error.
+    scheduler: Option<Arc<crate::report_scheduler::ReportService>>,
 }
 
 impl ReportHandler {
@@ -55,6 +59,7 @@ impl ReportHandler {
         bucket: impl Into<String>,
         pool: PgPool,
         public_url: Option<String>,
+        scheduler: Option<Arc<crate::report_scheduler::ReportService>>,
     ) -> Self {
         Self {
             pools,
@@ -64,7 +69,14 @@ impl ReportHandler {
             bucket: bucket.into(),
             pool,
             public_url,
+            scheduler,
         }
+    }
+
+    fn scheduler(&self) -> Result<&Arc<crate::report_scheduler::ReportService>, AppError> {
+        self.scheduler
+            .as_ref()
+            .ok_or_else(|| AppError::Validation("report scheduler off (GT_PG_URL unset)".into()))
     }
 
     async fn tracker(&self, ws: Option<&str>) -> Result<Arc<DoltIssues>, AppError> {
@@ -98,6 +110,55 @@ impl DomainHandler for ReportHandler {
                 opt("format", "string"),
                 opt("email_to", "string"),
             ],
+        ),
+        descriptor(
+            "report.subscribers.list",
+            "List the scheduled report digest's subscribers (email, enabled, created_at). \
+             `enabled` is the send-selection switch: only enabled subscribers receive.",
+            &[],
+        ),
+        descriptor(
+            "report.subscribers.add",
+            "Subscribe an email to the scheduled report digest (idempotent; a re-add \
+             does NOT re-enable a disabled subscriber).",
+            &[req("email", "string")],
+        ),
+        descriptor(
+            "report.subscribers.remove",
+            "Unsubscribe an email from the scheduled report digest.",
+            &[req("email", "string")],
+        ),
+        descriptor(
+            "report.subscribers.set-enabled",
+            "Flip a subscriber's send-selection switch: enabled=false keeps the row \
+             listed but excludes it from sends.",
+            &[req("email", "string"), req("enabled", "boolean")],
+        ),
+        descriptor(
+            "report.schedule.get",
+            "Read the digest schedule: enabled, hour/minute (local wall clock), \
+             tz_offset_minutes, board scope (rig/workspace), last_sent_date.",
+            &[],
+        ),
+        descriptor(
+            "report.schedule.set",
+            "Update the digest schedule (partial: any of enabled, hour 0-23, minute \
+             0-59, tz_offset_minutes, rig, workspace). last_sent_date is daemon \
+             bookkeeping and not settable.",
+            &[
+                opt("enabled", "boolean"),
+                opt("hour", "integer"),
+                opt("minute", "integer"),
+                opt("tz_offset_minutes", "integer"),
+                opt("rig", "string"),
+                opt("workspace", "string"),
+            ],
+        ),
+        descriptor(
+            "report.send-now",
+            "Render today's digest (bitácora + KPIs) and queue it to every ENABLED \
+             subscriber immediately. Does not affect the daily schedule.",
+            &[],
         )]
     }
 
@@ -269,6 +330,107 @@ impl DomainHandler for ReportHandler {
                     "total_horas": report.total_horas,
                     "email_queued": email_queued,
                 }))
+            }
+            "report.subscribers.list" => {
+                let svc = self.scheduler()?;
+                let workspace = svc.config.read().await.report.workspace.clone();
+                let subs = svc
+                    .subscribers()
+                    .list(&workspace)
+                    .await
+                    .map_err(|e| AppError::Other(format!("subscribers: {e}")))?;
+                Ok(json!({
+                    "subscribers": subs.iter().map(|s| json!({
+                        "id": s.id, "email": s.email, "enabled": s.enabled,
+                        "created_at": s.created_at,
+                    })).collect::<Vec<_>>(),
+                }))
+            }
+            "report.subscribers.add" => {
+                let svc = self.scheduler()?;
+                let email = str_arg(&ctx.args, "email")?.trim().to_string();
+                if !email.contains('@') {
+                    return Err(AppError::Validation(format!("`{email}` is not an address")));
+                }
+                let workspace = svc.config.read().await.report.workspace.clone();
+                svc.subscribers()
+                    .add(&workspace, &email)
+                    .await
+                    .map_err(|e| AppError::Other(format!("add subscriber: {e}")))?;
+                Ok(json!({ "ok": true, "email": email }))
+            }
+            "report.subscribers.remove" => {
+                let svc = self.scheduler()?;
+                let email = str_arg(&ctx.args, "email")?.trim().to_string();
+                let workspace = svc.config.read().await.report.workspace.clone();
+                svc.subscribers()
+                    .remove(&workspace, &email)
+                    .await
+                    .map_err(|e| AppError::Validation(format!("remove subscriber: {e}")))?;
+                Ok(json!({ "ok": true }))
+            }
+            "report.subscribers.set-enabled" => {
+                let svc = self.scheduler()?;
+                let email = str_arg(&ctx.args, "email")?.trim().to_string();
+                let enabled = ctx
+                    .args
+                    .get("enabled")
+                    .and_then(Value::as_bool)
+                    .ok_or_else(|| AppError::Validation("`enabled` (boolean) required".into()))?;
+                let workspace = svc.config.read().await.report.workspace.clone();
+                svc.subscribers()
+                    .set_enabled(&workspace, &email, enabled)
+                    .await
+                    .map_err(|e| AppError::Validation(format!("set-enabled: {e}")))?;
+                Ok(json!({ "ok": true, "email": email, "enabled": enabled }))
+            }
+            "report.schedule.get" => {
+                let svc = self.scheduler()?;
+                let report = svc.config.read().await.report.clone();
+                serde_json::to_value(&report)
+                    .map_err(|e| AppError::Other(format!("encode schedule: {e}")))
+            }
+            "report.schedule.set" => {
+                let svc = self.scheduler()?;
+                let hour = ctx.args.get("hour").and_then(Value::as_u64);
+                let minute = ctx.args.get("minute").and_then(Value::as_u64);
+                if hour.is_some_and(|h| h > 23) || minute.is_some_and(|m| m > 59) {
+                    return Err(AppError::Validation("hour 0-23, minute 0-59".into()));
+                }
+                {
+                    let mut cfg = svc.config.write().await;
+                    let r = &mut cfg.report;
+                    if let Some(v) = ctx.args.get("enabled").and_then(Value::as_bool) {
+                        r.enabled = v;
+                    }
+                    if let Some(v) = hour {
+                        r.hour = v as u8;
+                    }
+                    if let Some(v) = minute {
+                        r.minute = v as u8;
+                    }
+                    if let Some(v) = ctx.args.get("tz_offset_minutes").and_then(Value::as_i64) {
+                        r.tz_offset_minutes = v.clamp(-14 * 60, 14 * 60);
+                    }
+                    if let Some(v) = ctx.args.get("rig").and_then(Value::as_str) {
+                        r.rig = v.to_string();
+                    }
+                    if let Some(v) = ctx.args.get("workspace").and_then(Value::as_str) {
+                        r.workspace = v.to_string();
+                    }
+                }
+                svc.persist().await;
+                let report = svc.config.read().await.report.clone();
+                serde_json::to_value(&report)
+                    .map_err(|e| AppError::Other(format!("encode schedule: {e}")))
+            }
+            "report.send-now" => {
+                let svc = self.scheduler()?;
+                let queued = svc
+                    .send_digest(ctx.actor)
+                    .await
+                    .map_err(AppError::Other)?;
+                Ok(json!({ "ok": true, "queued": queued }))
             }
             other => Err(AppError::Validation(format!("unknown tool `{other}`"))),
         }
