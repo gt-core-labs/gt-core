@@ -782,66 +782,33 @@ impl DoltIssues {
             .await
             .map_err(map_err)?;
         }
-        // issue_relations migration: drop legacy inline columns when they still exist
-        // (idempotent — second runs skip if already dropped).
-        let mut dropped_legacy = false;
-        for col in &["external_ref", "depends_on_json"] {
-            let exists: Option<i64> = conn
-                .exec_first(
-                    "SELECT 1 FROM information_schema.columns
-                     WHERE table_schema = DATABASE()
-                       AND table_name = 'issues'
-                       AND column_name = :col LIMIT 1",
-                    mysql_async::params! { "col" => *col },
+        // ── issue_relations (idempotent) ──────────────────────────────────────
+        conn.query_drop(
+            "CREATE TABLE IF NOT EXISTS issue_relations (
+                from_id  VARCHAR(255) NOT NULL,
+                to_id    VARCHAR(255) NOT NULL,
+                rel_type VARCHAR(32)  NOT NULL,
+                PRIMARY KEY (from_id, to_id, rel_type),
+                INDEX idx_ir_to_id (to_id),
+                INDEX idx_ir_rel_type (rel_type)
+            )",
+        )
+        .await
+        .map_err(map_err)?;
+        {
+            let commit_res = conn
+                .exec_drop(
+                    "CALL DOLT_COMMIT('-A', '-m', :msg)",
+                    mysql_async::params! {
+                        "msg" => "issue_relations: create normalized relation table".to_string(),
+                    },
                 )
-                .await
-                .map_err(map_err)?;
-            if exists.is_some() {
-                let sql = format!("ALTER TABLE issues DROP COLUMN {col}");
-                conn.query_drop(sql).await.map_err(map_err)?;
-                dropped_legacy = true;
+                .await;
+            if let Err(ref e) = commit_res {
+                if !e.to_string().contains("nothing to commit") {
+                    return Err(map_err(commit_res.unwrap_err()));
+                }
             }
-        }
-        if dropped_legacy {
-            conn.exec_drop(
-                "CALL DOLT_COMMIT('-A', '-m', :msg)",
-                mysql_async::params! {
-                    "msg" => "issue_relations: drop legacy external_ref + depends_on_json columns".to_string(),
-                },
-            )
-            .await
-            .map_err(map_err)?;
-        }
-
-        // issue_relations normalized relation table (replaces external_ref + depends_on_json).
-        let ir_exists: Option<i64> = conn
-            .query_first(
-                "SELECT 1 FROM information_schema.tables
-                 WHERE table_schema = DATABASE() AND table_name = 'issue_relations' LIMIT 1",
-            )
-            .await
-            .map_err(map_err)?;
-        if ir_exists.is_none() {
-            conn.query_drop(
-                "CREATE TABLE IF NOT EXISTS issue_relations (
-                    from_id  VARCHAR(255) NOT NULL,
-                    to_id    VARCHAR(255) NOT NULL,
-                    rel_type VARCHAR(32)  NOT NULL,
-                    PRIMARY KEY (from_id, to_id, rel_type),
-                    INDEX idx_ir_to_id (to_id),
-                    INDEX idx_ir_rel_type (rel_type)
-                )",
-            )
-            .await
-            .map_err(map_err)?;
-            conn.exec_drop(
-                "CALL DOLT_COMMIT('-A', '-m', :msg)",
-                mysql_async::params! {
-                    "msg" => "issue_relations: create normalized relation table".to_string(),
-                },
-            )
-            .await
-            .map_err(map_err)?;
         }
 
         // Idempotent index for the board projection's hot path: every board call
