@@ -33,7 +33,7 @@ pub mod module;
 mod repo;
 mod state;
 
-pub use commands::{CompleteMember, FailMember, LaunchConvoy, OrchCommand};
+pub use commands::{CompleteMember, FailMember, LaunchConvoy, OrchCommand, ReconcileConvoy, RetryMember};
 pub use events::OrchEvent;
 #[cfg(feature = "axum")]
 pub use http::{convoy_router, ApiDoc, ConvoyApiState, WorkspaceConvoy};

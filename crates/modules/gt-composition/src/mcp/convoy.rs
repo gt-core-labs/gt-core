@@ -21,6 +21,7 @@ use gt_mcp_server::{DomainCtx, DomainHandler};
 use gt_module::McpTool;
 use gt_orchestration::{
     CompleteMember, Convoy, ConvoyBoard, FailMember, LaunchConvoy, OrchEvent, OrchState,
+    ReconcileConvoy, RetryMember,
 };
 use gt_scheduling::dispatch::DispatchPayload;
 use gt_store_dolt::AppError;
@@ -153,6 +154,16 @@ impl DomainHandler for ConvoyHandler {
             ),
             descriptor("convoy.list", "List every convoy in the workspace with its state + members.", &[]),
             descriptor("convoy.info", "Show one convoy's state + members.", &[req("convoy", "string")]),
+            descriptor(
+                "convoy.reconcile",
+                "Force-complete a set of members (regardless of their current state) and close the convoy when all are done. Use when the operator delivered work outside the polecat path.",
+                &[req("convoy", "string"), req("closed_members", "array")],
+            ),
+            descriptor(
+                "convoy.retry-member",
+                "Reset a single Failed convoy member back to Pending and re-dispatch it. The convoy resumes from Failed → Launched.",
+                &[req("convoy", "string"), req("member", "string")],
+            ),
         ]
     }
 
@@ -162,6 +173,8 @@ impl DomainHandler for ConvoyHandler {
             "convoy.launch" => self.run::<LaunchConvoy>(ws, ctx.args),
             "convoy.complete-member" => self.run::<CompleteMember>(ws, ctx.args),
             "convoy.fail-member" => self.run::<FailMember>(ws, ctx.args),
+            "convoy.reconcile" => self.run::<ReconcileConvoy>(ws, ctx.args),
+            "convoy.retry-member" => self.run::<RetryMember>(ws, ctx.args),
             "convoy.list" => {
                 let board = self.board(ws)?;
                 Ok(

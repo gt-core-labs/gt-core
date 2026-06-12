@@ -37,6 +37,12 @@ pub enum OrchEvent {
     ConvoyClosed { convoy: String },
     /// A member failed and halted the convoy. `Launched → Failed`.
     ConvoyFailed { convoy: String, member: String, reason: String },
+    /// A member was force-completed by a reconcile command, regardless of its prior state.
+    MemberForceCompleted { convoy: String, member: String },
+    /// A failed member was reset to Pending for retry. `Failed → Pending`.
+    MemberRetried { convoy: String, member: String },
+    /// A failed convoy was resumed to Launched (precondition for close or next dispatch).
+    ConvoyResumed { convoy: String },
 }
 
 impl EventKind for OrchEvent {
@@ -57,6 +63,9 @@ impl EventKind for OrchEvent {
             OrchEvent::MemberFailed { .. } => "convoy.member_failed.v1",
             OrchEvent::ConvoyClosed { .. } => "convoy.closed.v1",
             OrchEvent::ConvoyFailed { .. } => "convoy.failed.v1",
+            OrchEvent::MemberForceCompleted { .. } => "convoy.member_force_completed.v1",
+            OrchEvent::MemberRetried { .. } => "convoy.member_retried.v1",
+            OrchEvent::ConvoyResumed { .. } => "convoy.resumed.v1",
         }
     }
 }

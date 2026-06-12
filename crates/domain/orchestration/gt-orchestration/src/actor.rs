@@ -160,6 +160,15 @@ async fn persist_event<R: OrchRepository>(repo: &R, ev: &OrchEvent) {
         OrchEvent::ConvoyFailed { convoy, .. } => {
             repo.set_convoy_state(convoy, ConvoyState::Failed).await
         }
+        OrchEvent::MemberForceCompleted { convoy, member } => {
+            repo.set_member_state(convoy, member, MemberState::Done).await
+        }
+        OrchEvent::MemberRetried { convoy, member } => {
+            repo.set_member_state(convoy, member, MemberState::Pending).await
+        }
+        OrchEvent::ConvoyResumed { convoy } => {
+            repo.set_convoy_state(convoy, ConvoyState::Launched).await
+        }
     };
     if let Err(e) = res {
         eprintln!("[gt-orchestration] persist {}: {e}", ev_kind(ev));
@@ -175,6 +184,9 @@ fn ev_kind(ev: &OrchEvent) -> &'static str {
         OrchEvent::MemberFailed { .. } => "MemberFailed",
         OrchEvent::ConvoyClosed { .. } => "ConvoyClosed",
         OrchEvent::ConvoyFailed { .. } => "ConvoyFailed",
+        OrchEvent::MemberForceCompleted { .. } => "MemberForceCompleted",
+        OrchEvent::MemberRetried { .. } => "MemberRetried",
+        OrchEvent::ConvoyResumed { .. } => "ConvoyResumed",
     }
 }
 

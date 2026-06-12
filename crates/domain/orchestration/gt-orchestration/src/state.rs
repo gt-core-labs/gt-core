@@ -128,6 +128,7 @@ impl Convoy {
             (self.state, to),
             (ConvoyState::Staged, ConvoyState::Launched)
                 | (ConvoyState::Launched, ConvoyState::Closed)
+                | (ConvoyState::Failed, ConvoyState::Closed)
         );
         if ok {
             self.state = to;
@@ -172,6 +173,39 @@ impl Convoy {
 
     pub fn fail(&mut self, bead: &str) -> Result<(), AppError> {
         self.member_mut(bead)?.transition(MemberState::Failed)
+    }
+
+    /// Unconditional Done — used by reconcile. Any prior state is accepted.
+    pub fn force_complete(&mut self, bead: &str) -> Result<(), AppError> {
+        self.member_mut(bead)?.state = MemberState::Done;
+        Ok(())
+    }
+
+    /// Reset a `Failed` member back to `Pending` so it can be re-dispatched.
+    pub fn retry_member(&mut self, bead: &str) -> Result<(), AppError> {
+        let m = self.member_mut(bead)?;
+        if m.state != MemberState::Failed {
+            return Err(AppError::InvalidTransition(format!(
+                "member {}: {} → pending (only Failed members can be retried)",
+                bead,
+                m.state.as_str()
+            )));
+        }
+        m.state = MemberState::Pending;
+        Ok(())
+    }
+
+    /// `Failed → Launched`. Allows a halted convoy to resume after a member retry.
+    pub fn resume(&mut self) -> Result<(), AppError> {
+        if self.state != ConvoyState::Failed {
+            return Err(AppError::InvalidTransition(format!(
+                "convoy {}: {} → launched (only Failed convoys can be resumed)",
+                self.id,
+                self.state.as_str()
+            )));
+        }
+        self.state = ConvoyState::Launched;
+        Ok(())
     }
 
     /// Every member reached `Done`. An empty convoy is trivially done.
@@ -223,6 +257,18 @@ impl ConvoyBoard {
 
     pub fn fail(&mut self, id: &str, member: &str) -> Result<(), AppError> {
         self.get_mut(id)?.fail(member)
+    }
+
+    pub fn force_complete(&mut self, id: &str, member: &str) -> Result<(), AppError> {
+        self.get_mut(id)?.force_complete(member)
+    }
+
+    pub fn retry_member(&mut self, id: &str, member: &str) -> Result<(), AppError> {
+        self.get_mut(id)?.retry_member(member)
+    }
+
+    pub fn resume(&mut self, id: &str) -> Result<(), AppError> {
+        self.get_mut(id)?.resume()
     }
 
     pub fn all_done(&self, id: &str) -> bool {
@@ -313,6 +359,15 @@ impl OrchState {
                 self.with(convoy, |c| c.set_state(ConvoyState::Failed));
                 self.failed
                     .push((convoy.clone(), member.clone(), reason.clone()));
+            }
+            OrchEvent::MemberForceCompleted { convoy, member } => {
+                self.with(convoy, |c| c.set_member(member, MemberState::Done));
+            }
+            OrchEvent::MemberRetried { convoy, member } => {
+                self.with(convoy, |c| c.set_member(member, MemberState::Pending));
+            }
+            OrchEvent::ConvoyResumed { convoy } => {
+                self.with(convoy, |c| c.set_state(ConvoyState::Launched));
             }
         }
     }
