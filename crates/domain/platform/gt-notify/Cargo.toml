@@ -5,11 +5,14 @@ version.workspace = true
 
 # Ported up from the upstream app (hq-core-port.20; was hq-mysw). Notifier PORT: defines the port +
 # the notification vocabulary + the signal→channel routing policy (which signals warrant mail
-# vs feed-only). Adapters live at the edge (a `bins/` mail sender, the in-process fake for
-# tests). This crate must NOT depend on any mail/transport crate — that is the point of the
-# port. No reducer / event-log coupling, so replay-safe.
+# vs feed-only). The Notifier port itself stays transport-free; the ONE sanctioned exception is
+# the EmailTransport seam (hq-f24599): `SmtpTransport::send` is the designated landing spot for
+# the real SMTP client (hq-8d848e), selected only via GT_EMAIL_TRANSPORT=smtp config.
+# No reducer / event-log coupling, so replay-safe.
 [dependencies]
 gt-events = { workspace = true }
 serde = { workspace = true }
 # FileInbox message files are JSON (hq-8a521a inbound seam).
 serde_json = { workspace = true }
+# Real SMTP delivery for SmtpTransport (hq-8d848e). Blocking + rustls.
+lettre = { workspace = true }

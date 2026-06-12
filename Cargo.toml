@@ -172,6 +172,11 @@ anyhow = "1"
 # HTTP client (REST surface). rustls so no system OpenSSL.
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 
+# SMTP client for the real EmailTransport (hq-8d848e, epic hq-9c199d). Blocking
+# transport by design (the outbox drain owns concurrency); rustls so no system
+# OpenSSL, matching reqwest above.
+lettre = { version = "0.11", default-features = false, features = ["smtp-transport", "builder", "rustls-tls"] }
+
 # Internal crates — referenced as `<name> = { workspace = true }` from member Cargo.toml.
 # Path-centralized here so members never juggle relative paths across tiers.
 gt-events        = { path = "crates/kernel/gt-events" }

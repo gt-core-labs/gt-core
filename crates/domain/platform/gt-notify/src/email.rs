@@ -1,20 +1,20 @@
 //! `EmailTransport` — the outbound-email seam (hq-f24599, epic hq-56b5ee).
 //!
-//! The SMTP mail server is PENDING; the platform must not block on it (ADR
-//! hq-423a4b D8). Producers never talk to a mail server: they enqueue rows into
-//! the `email_outbox` (gt-store-pg) and the drain daemon pushes due rows through
-//! THIS trait. Swapping engines is a config change, never a producer change:
+//! Producers never talk to a mail server: they enqueue rows into the
+//! `email_outbox` (gt-store-pg) and the drain daemon pushes due rows through
+//! THIS trait (ADR hq-423a4b D8). Swapping engines is a config change, never a
+//! producer change:
 //!
-//! - [`LogTransport`] — the shipping default: records the send in memory and
-//!   logs it, so the whole outbox pipeline (schedule → due → drain → status) is
-//!   exercisable today.
-//! - [`SmtpTransport`] — the documented, config-selected seam the real server
-//!   plugs into. It parses its config now ([`SmtpConfig::from_env`]) and fails
-//!   sends with an explicit "server pending" error until the SMTP
-//!   implementation lands here (one `send` body; nothing else changes).
+//! - [`LogTransport`] — the default: records the send in memory and logs it,
+//!   so the whole outbox pipeline (schedule → due → drain → status) is
+//!   exercisable with no external dependency.
+//! - [`SmtpTransport`] — real delivery via `lettre` (hq-8d848e, epic
+//!   hq-9c199d): submission to the configured relay/provider
+//!   ([`SmtpConfig::from_env`]), `smtps://` = implicit TLS (465), `smtp://` =
+//!   STARTTLS (587).
 //!
-//! Selection: [`transport_from_env`] reads `GT_EMAIL_TRANSPORT` (`log` default,
-//! `smtp` once the server exists).
+//! Selection: [`transport_from_env`] reads `GT_EMAIL_TRANSPORT` (`log`
+//! default, `smtp` for real delivery).
 
 use std::sync::Mutex;
 
@@ -105,10 +105,10 @@ impl SmtpConfig {
     }
 }
 
-/// The real-server seam. Wired and selectable TODAY (`GT_EMAIL_TRANSPORT=smtp`
-/// + `GT_SMTP_URL`/`GT_SMTP_FROM`); the `send` body is the single place the
-/// actual SMTP client (e.g. `lettre`) lands once the mail server exists. Until
-/// then a send fails loud — the outbox marks the row retry/failed and nothing
+/// Real SMTP delivery via `lettre` (hq-8d848e). Selected with
+/// `GT_EMAIL_TRANSPORT=smtp` + `GT_SMTP_URL`/`GT_SMTP_FROM`. Blocking by
+/// design (the drain daemon owns concurrency); any config or delivery error
+/// returns `Err(reason)` so the outbox marks the row retry/failed — nothing
 /// upstream blocks or breaks.
 pub struct SmtpTransport {
     config: SmtpConfig,
@@ -126,15 +126,69 @@ impl SmtpTransport {
     }
 }
 
+/// Split a `smtp://host[:port]` / `smtps://host[:port]` URL into
+/// `(implicit_tls, host, port)`. Errors name the env var so a misconfigured
+/// deploy is diagnosable straight from the outbox row.
+fn parse_smtp_url(url: &str) -> Result<(bool, &str, Option<u16>), String> {
+    let (smtps, rest) = if let Some(r) = url.strip_prefix("smtps://") {
+        (true, r)
+    } else if let Some(r) = url.strip_prefix("smtp://") {
+        (false, r)
+    } else {
+        return Err(format!("GT_SMTP_URL must start with smtp:// or smtps://, got {url:?}"));
+    };
+    let rest = rest.trim_end_matches('/');
+    let (host, port) = match rest.rsplit_once(':') {
+        Some((h, p)) => {
+            let port =
+                p.parse::<u16>().map_err(|e| format!("invalid port in GT_SMTP_URL {url:?}: {e}"))?;
+            (h, Some(port))
+        }
+        None => (rest, None),
+    };
+    if host.is_empty() {
+        return Err(format!("GT_SMTP_URL has no host: {url:?}"));
+    }
+    Ok((smtps, host, port))
+}
+
 impl EmailTransport for SmtpTransport {
     fn send(&self, msg: &EmailMessage) -> Result<(), String> {
-        // SMTP server PENDING (hq-f24599): this is deliberately the only line to
-        // replace with the real client call when it exists.
-        Err(format!(
-            "smtp transport configured ({} from {}) but the mail server is pending — \
-             cannot deliver to {} yet",
-            self.config.url, self.config.from, msg.to
-        ))
+        use lettre::transport::smtp::authentication::Credentials;
+        use lettre::{Message, Transport};
+
+        let email = Message::builder()
+            .from(
+                self.config
+                    .from
+                    .parse()
+                    .map_err(|e| format!("invalid GT_SMTP_FROM {:?}: {e}", self.config.from))?,
+            )
+            .to(msg.to.parse().map_err(|e| format!("invalid recipient {:?}: {e}", msg.to))?)
+            .subject(msg.subject.clone())
+            .body(msg.body.clone())
+            .map_err(|e| format!("message build failed: {e}"))?;
+
+        let (smtps, host, port) = parse_smtp_url(&self.config.url)?;
+        // smtps:// = implicit TLS (465); smtp:// = mandatory STARTTLS (587).
+        // Plaintext submission is deliberately not offered.
+        let mut builder = if smtps {
+            lettre::SmtpTransport::relay(host)
+        } else {
+            lettre::SmtpTransport::starttls_relay(host)
+        }
+        .map_err(|e| format!("smtp relay setup failed for {host}: {e}"))?;
+        if let Some(port) = port {
+            builder = builder.port(port);
+        }
+        if let (Some(user), Some(pass)) = (&self.config.user, &self.config.pass) {
+            builder = builder.credentials(Credentials::new(user.clone(), pass.clone()));
+        }
+        builder
+            .build()
+            .send(&email)
+            .map(|_| ())
+            .map_err(|e| format!("smtp delivery to {} via {host} failed: {e}", msg.to))
     }
 
     fn label(&self) -> &'static str {
@@ -189,16 +243,55 @@ mod tests {
     }
 
     #[test]
-    fn smtp_transport_is_a_wired_seam_that_fails_loud_until_the_server_exists() {
-        let t = SmtpTransport::new(SmtpConfig {
-            url: "smtp://mail:587".into(),
-            from: "gt@example.com".into(),
-            user: None,
-            pass: None,
-        });
-        let err = t.send(&msg()).expect_err("pending server must fail loud");
-        assert!(err.contains("pending"), "{err}");
-        assert_eq!(t.label(), "smtp");
-        assert_eq!(t.config().from, "gt@example.com");
+    fn smtp_url_parses_starttls_implicit_tls_and_ports() {
+        assert_eq!(parse_smtp_url("smtp://mail.example.com:587").unwrap(), (
+            false,
+            "mail.example.com",
+            Some(587)
+        ));
+        assert_eq!(parse_smtp_url("smtps://mail.example.com:465").unwrap(), (
+            true,
+            "mail.example.com",
+            Some(465)
+        ));
+        // No port -> lettre's scheme default applies.
+        assert_eq!(parse_smtp_url("smtps://mail.example.com").unwrap(), (
+            true,
+            "mail.example.com",
+            None
+        ));
+    }
+
+    #[test]
+    fn smtp_url_misconfig_fails_loud_naming_the_env_var() {
+        for bad in ["http://mail:25", "smtp://", "smtp://mail:notaport", "mail.example.com"] {
+            let err = parse_smtp_url(bad).expect_err(bad);
+            assert!(err.contains("GT_SMTP_URL"), "{bad} -> {err}");
+        }
+    }
+
+    #[test]
+    fn smtp_send_rejects_bad_addresses_and_urls_before_any_network_io() {
+        let t = |url: &str, from: &str| {
+            SmtpTransport::new(SmtpConfig {
+                url: url.into(),
+                from: from.into(),
+                user: None,
+                pass: None,
+            })
+        };
+        assert_eq!(t("smtp://mail:587", "gt@example.com").label(), "smtp");
+        assert_eq!(t("smtp://mail:587", "gt@example.com").config().from, "gt@example.com");
+
+        let err = t("smtp://mail:587", "not-an-address").send(&msg()).expect_err("bad from");
+        assert!(err.contains("GT_SMTP_FROM"), "{err}");
+
+        let mut bad_to = msg();
+        bad_to.to = "nope".into();
+        let err = t("smtp://mail:587", "gt@example.com").send(&bad_to).expect_err("bad to");
+        assert!(err.contains("recipient"), "{err}");
+
+        let err = t("ftp://mail:21", "gt@example.com").send(&msg()).expect_err("bad scheme");
+        assert!(err.contains("GT_SMTP_URL"), "{err}");
     }
 }
