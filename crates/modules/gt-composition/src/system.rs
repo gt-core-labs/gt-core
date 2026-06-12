@@ -28,8 +28,10 @@ use time::OffsetDateTime;
 use tokio::sync::RwLock;
 
 use gt_auth::JwtClaims;
-use gt_store_dolt::{ArchivedIssue, DoltIssues};
+use gt_rig::WorkspaceRigs;
+use gt_store_dolt::{ArchivedIssue, DoltIssues, IssueFilter};
 use gt_store_pg::{DocumentsRepository, PgDocuments, ReportSubscriptionsRepository};
+use gt_workspace::{WorkspaceRepository, WorkspaceStatus};
 
 use crate::auth::SharedAuthenticator;
 use crate::denial_audit::{record_denial, SharedAudit, ANONYMOUS};
@@ -135,6 +137,11 @@ pub struct SystemApiState {
     /// The report-digest service (hq-84f93b): schedule + subscribers + manual
     /// send. `None` when `GT_PG_URL` is unset — the report routes answer 503.
     report: Option<Arc<crate::report_scheduler::ReportService>>,
+    /// Operator scope options (hq-00ed29): the workspace catalog + per-tenant
+    /// rig provider that back `GET /report/scopes`. Both `None` when
+    /// `GT_PG_URL` is unset — the route then reports beads-derived pairs only.
+    workspaces: Option<Arc<dyn WorkspaceRepository>>,
+    rigs: Option<Arc<dyn WorkspaceRigs>>,
 }
 
 impl SystemApiState {
@@ -155,7 +162,21 @@ impl SystemApiState {
             config_path,
             pools,
             report,
+            workspaces: None,
+            rigs: None,
         }
+    }
+
+    /// Attach the operator scope-option sources (hq-00ed29): the workspace
+    /// catalog + the per-tenant rig provider `GET /report/scopes` folds in.
+    pub fn with_scope_sources(
+        mut self,
+        workspaces: Arc<dyn WorkspaceRepository>,
+        rigs: Arc<dyn WorkspaceRigs>,
+    ) -> Self {
+        self.workspaces = Some(workspaces);
+        self.rigs = Some(rigs);
+        self
     }
 }
 
@@ -173,6 +194,7 @@ pub fn system_router(state: SystemApiState) -> Router {
         )
         .route("/api/v1/system/report/schedules/:id/run", post(run_report_schedule))
         .route("/api/v1/system/report/kinds", get(list_report_kinds))
+        .route("/api/v1/system/report/scopes", get(report_scope_options))
         .route(
             "/api/v1/system/report/subscribers",
             get(list_report_subscribers).post(add_report_subscriber),
@@ -492,6 +514,88 @@ async fn list_report_kinds(
         Json(serde_json::json!({ "kinds": crate::report_scheduler::kinds() })),
     )
         .into_response()
+}
+
+/// `GET /api/v1/system/report/scopes` — the operator's scope options
+/// (hq-00ed29): per workspace, the union of the bead namespaces with boards
+/// there AND the tenant's own rig-catalog prefixes. The per-tenant catalog is
+/// unreachable from a cross-workspace session (X-GT-Workspace anti-spoof),
+/// so this operator-scoped (`system.read`) route folds it server-side — a
+/// freshly registered rig with no beads yet is still offered as a report
+/// target. A workspace whose catalog read fails is reported with its
+/// beads-derived rigs only (best-effort, never a 500).
+async fn report_scope_options(
+    State(st): State<SystemApiState>,
+    headers: axum::http::HeaderMap,
+) -> Response {
+    if let Err(resp) = authorize(&st, &headers, READ_SCOPE, &Method::GET) {
+        return resp;
+    }
+
+    // Bead namespaces per workspace — the same unscoped projection as
+    // `board.scopes` (None rig/workspace = no filter).
+    let mut by_ws: std::collections::BTreeMap<String, std::collections::BTreeSet<String>> =
+        std::collections::BTreeMap::new();
+    match st
+        .store
+        .list(&IssueFilter {
+            limit: Some(gt_store_dolt::issues_max_limit()),
+            ..Default::default()
+        })
+        .await
+    {
+        Ok(rows) => {
+            for row in rows {
+                if !row.rig.is_empty() && !row.workspace.is_empty() {
+                    by_ws.entry(row.workspace).or_default().insert(row.rig);
+                }
+            }
+        }
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("tracker rows: {e}"),
+            )
+                .into_response()
+        }
+    }
+
+    // Fold each ACTIVE workspace's own rig catalog in (prefixes = the bead
+    // namespace schedules/boards key by; the display name only as fallback).
+    if let (Some(workspaces), Some(rigs)) = (&st.workspaces, &st.rigs) {
+        if let Ok(entries) = workspaces.list().await {
+            for entry in entries {
+                if entry.status != WorkspaceStatus::Active {
+                    continue;
+                }
+                let slug = entry.id.to_string();
+                let bucket = by_ws.entry(slug.clone()).or_default();
+                match rigs.repo(&slug).await {
+                    Ok(repo) => match repo.list().await {
+                        Ok(catalog) => {
+                            for rig in catalog {
+                                let ns = if rig.prefix.is_empty() { rig.name } else { rig.prefix };
+                                bucket.insert(ns);
+                            }
+                        }
+                        Err(e) => eprintln!("[system] report/scopes: rig list ({slug}): {e}"),
+                    },
+                    Err(e) => eprintln!("[system] report/scopes: rig repo ({slug}): {e}"),
+                }
+            }
+        }
+    }
+
+    let scopes: Vec<serde_json::Value> = by_ws
+        .into_iter()
+        .map(|(workspace, rigs)| {
+            serde_json::json!({
+                "workspace": workspace,
+                "rigs": rigs.into_iter().collect::<Vec<_>>(),
+            })
+        })
+        .collect();
+    (StatusCode::OK, Json(serde_json::json!({ "scopes": scopes }))).into_response()
 }
 
 async fn list_report_subscribers(

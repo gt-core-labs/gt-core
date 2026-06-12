@@ -795,6 +795,26 @@ async fn main() -> anyhow::Result<()> {
         .ok()
         .map(|pg_url| Arc::new(WsPools::new(pg_url)));
 
+    // Operator scope options for GET /api/v1/system/report/scopes (hq-00ed29):
+    // the public-schema workspace catalog + the per-tenant rig provider. Both
+    // ride GT_PG_URL; a connect failure just leaves the route beads-only.
+    let scope_sources: Option<(
+        Arc<dyn gt_workspace::WorkspaceRepository>,
+        Arc<dyn gt_rig::WorkspaceRigs>,
+    )> = match std::env::var("GT_PG_URL") {
+        Ok(pg_url) => match sqlx::PgPool::connect(&pg_url).await {
+            Ok(pool) => Some((
+                Arc::new(gt_workspace::PgWorkspaces::new(pool)),
+                Arc::new(gt_composition::mcp::WsPoolRigs::new(Arc::new(WsPools::new(pg_url)))),
+            )),
+            Err(e) => {
+                eprintln!("[gt-mcp-server] report/scopes catalog off (PG connect failed: {e})");
+                None
+            }
+        },
+        Err(_) => None,
+    };
+
     // System config REST surface (hq-system-config): GET/PUT /api/v1/system/config and
     // POST /api/v1/system/archive/run. Scoped to system.read/system.write (admin `*` satisfies both).
     // Spawns the background archive daemon that sweeps old closed issues on a configurable interval.
@@ -820,7 +840,7 @@ async fn main() -> anyhow::Result<()> {
         eprintln!(
             "[gt-mcp-server] system config REST on /api/v1/system/* (scope system.read/write)"
         );
-        system_router(SystemApiState::new(
+        let mut state = SystemApiState::new(
             v.clone(),
             audit.clone(),
             system_store.clone(),
@@ -828,7 +848,11 @@ async fn main() -> anyhow::Result<()> {
             config_path,
             archive_pools.clone(),
             report_service.clone(),
-        ))
+        );
+        if let Some((workspaces, rigs)) = scope_sources.clone() {
+            state = state.with_scope_sources(workspaces, rigs);
+        }
+        system_router(state)
     });
 
     // Orphan claude-credential GC (hq-quota-onboard-web.6): the backend is the only always-on
