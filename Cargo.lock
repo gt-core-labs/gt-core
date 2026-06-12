@@ -1741,6 +1741,7 @@ dependencies = [
  "mysql_async",
  "portable-pty",
  "postgres",
+ "reqwest 0.12.28",
  "rmcp",
  "serde",
  "serde_json",
