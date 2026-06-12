@@ -399,7 +399,7 @@ pub fn spawn_hydrated(
                     weekly_resets_at_secs,
                     now_secs,
                 } => {
-                    registry.apply_probe(&account, remaining, resets_at_secs);
+                    registry.apply_probe(&account, remaining, resets_at_secs, now_secs);
                     if let (Some(w_rem), Some(w_reset)) =
                         (weekly_remaining, weekly_resets_at_secs)
                     {

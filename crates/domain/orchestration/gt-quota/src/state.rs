@@ -73,6 +73,20 @@ pub struct Account {
     /// from "field not yet available" (`hq-quota-weekly.5`).
     #[serde(default)]
     pub weekly_window: Option<AccountWindow>,
+    /// When the provider last CONFIRMED this account's window (probe instant, epoch secs,
+    /// hq-46cdf4). `None` ⇒ everything in `window.consumed` is locally-sampled guesswork —
+    /// rotation should treat the window as unverified.
+    #[serde(default)]
+    pub last_probe_secs: Option<u64>,
+    /// Cost units sampled locally SINCE the last probe — the telemetry tail between
+    /// reconciliations. Reset to 0 on every probe; never authoritative on its own.
+    #[serde(default)]
+    pub sampled_since_probe: f64,
+    /// Divergence observed at the last probe: locally-accumulated `consumed` minus the
+    /// provider-reported one, in cost units (positive = local over-counted). Exposed on
+    /// `quota.list`/`quota.info` so counter drift is diagnosable instead of silent.
+    #[serde(default)]
+    pub probe_divergence: Option<f64>,
 }
 
 impl Account {
@@ -82,6 +96,9 @@ impl Account {
             status: AccountQuotaStatus::Healthy,
             window: None,
             weekly_window: None,
+            last_probe_secs: None,
+            sampled_since_probe: 0.0,
+            probe_divergence: None,
         }
     }
 
@@ -263,6 +280,10 @@ impl AccountRegistry {
             if let Some(w) = acc.window.as_mut() {
                 w.consumed += cost.0;
             }
+            // Track the locally-sampled tail since the last provider confirmation
+            // (hq-46cdf4): never authoritative, but it shows HOW MUCH of the current
+            // `consumed` is guesswork vs probed truth.
+            acc.sampled_since_probe += cost.0;
         }
         let rate = match self.get(account).and_then(|a| a.window.as_ref()) {
             Some(w) => {
@@ -283,11 +304,15 @@ impl AccountRegistry {
     /// Creates a synthetic Rolling5h window when none exists yet (first probe on a freshly
     /// registered account). Transitions Cooldown/Limited/Blocked → Healthy when `remaining > 0`
     /// (the account recovered capacity). Shared by `QuotaMsg::Probe` and `ProbeWindow`.
-    pub fn apply_probe(&mut self, account: &str, remaining: u64, resets_at_secs: u64) {
+    pub fn apply_probe(&mut self, account: &str, remaining: u64, resets_at_secs: u64, now_secs: u64) {
         if let Some(acc) = self.get_mut(account) {
             match acc.window.as_mut() {
                 Some(w) => {
-                    w.consumed = (w.limit.saturating_sub(remaining)) as f64;
+                    let probed = (w.limit.saturating_sub(remaining)) as f64;
+                    // Provider truth replaces the local accumulation (hq-46cdf4); the
+                    // pre-overwrite divergence is kept so drift is diagnosable.
+                    acc.probe_divergence = Some(w.consumed - probed);
+                    w.consumed = probed;
                     w.resets_at_secs = resets_at_secs;
                 }
                 None => {
@@ -303,6 +328,10 @@ impl AccountRegistry {
                     });
                 }
             }
+            // The provider just confirmed the window: stamp the probe instant and zero the
+            // sampled-since tail — from here the local counter is telemetry, not truth.
+            acc.last_probe_secs = Some(now_secs);
+            acc.sampled_since_probe = 0.0;
             // A probe with remaining > 0 means the account has real capacity: lift any
             // non-Healthy status (Cooldown after rotation, Limited/Blocked after a 429).
             if remaining > 0 {
@@ -440,12 +469,10 @@ impl QuotaState {
                 // synthetic Rolling5h window on the first sample (no provider headers in replay),
                 // recycle it once its 5h reset has passed, then add the IDENTITY-weighted cost (the
                 // reducer carries no per-model calibration, same default the daemon uses uncalibrated).
-                let entry = self.accounts.entry(account.clone()).or_insert_with(|| Account {
-                    id: account.clone(),
-                    status: AccountQuotaStatus::Healthy,
-                    window: None,
-                    weekly_window: None,
-                });
+                let entry = self
+                    .accounts
+                    .entry(account.clone())
+                    .or_insert_with(|| Account::new(account.clone()));
                 if entry.window.is_none() {
                     entry.window = Some(AccountWindow {
                         kind: WindowKind::Rolling5h,
@@ -470,6 +497,9 @@ impl QuotaState {
                         &HashMap::new(),
                     );
                     w.consumed += cost.0;
+                    // Same sampled-since-probe tail the live registry tracks (hq-46cdf4) —
+                    // replay must rebuild it byte-for-byte.
+                    entry.sampled_since_probe += cost.0;
                 }
             }
             QuotaEvent::UsageProbed {
@@ -480,15 +510,15 @@ impl QuotaState {
                 weekly_resets_at_secs,
                 now_secs,
             } => {
-                let entry = self.accounts.entry(account.clone()).or_insert_with(|| Account {
-                    id: account.clone(),
-                    status: AccountQuotaStatus::Healthy,
-                    window: None,
-                    weekly_window: None,
-                });
+                let entry = self
+                    .accounts
+                    .entry(account.clone())
+                    .or_insert_with(|| Account::new(account.clone()));
                 match entry.window.as_mut() {
                     Some(w) => {
-                        w.consumed = (w.limit.saturating_sub(*remaining)) as f64;
+                        let probed = (w.limit.saturating_sub(*remaining)) as f64;
+                        entry.probe_divergence = Some(w.consumed - probed);
+                        w.consumed = probed;
                         w.resets_at_secs = *resets_at_secs;
                     }
                     None => {
@@ -520,19 +550,17 @@ impl QuotaState {
                         }
                     }
                 }
+                entry.last_probe_secs = Some(*now_secs);
+                entry.sampled_since_probe = 0.0;
                 if *remaining > 0 {
                     entry.status = AccountQuotaStatus::Healthy;
                 }
             }
             QuotaEvent::WindowReset { account, started_at_secs, resets_at_secs } => {
-                let entry = self.accounts.entry(account.clone()).or_insert_with(|| {
-                    Account {
-                        id: account.clone(),
-                        status: AccountQuotaStatus::Healthy,
-                        window: None,
-                        weekly_window: None,
-                    }
-                });
+                let entry = self
+                    .accounts
+                    .entry(account.clone())
+                    .or_insert_with(|| Account::new(account.clone()));
                 if let Some(w) = entry.window.as_mut() {
                     w.started_at_secs = *started_at_secs;
                     w.resets_at_secs = *resets_at_secs;
@@ -566,12 +594,9 @@ impl QuotaState {
                 self.registered.insert(account.clone(), config_dir.clone());
                 // Make it a rotation candidate too (Healthy with no window yet; the window arrives
                 // from the first probe). Idempotent: re-register just refreshes the config_dir.
-                self.accounts.entry(account.clone()).or_insert_with(|| Account {
-                    id: account.clone(),
-                    status: AccountQuotaStatus::Healthy,
-                    window: None,
-                    weekly_window: None,
-                });
+                self.accounts
+                    .entry(account.clone())
+                    .or_insert_with(|| Account::new(account.clone()));
             }
             QuotaEvent::AccountDeregistered { account, .. } => {
                 self.registered.remove(account);
@@ -724,8 +749,11 @@ mod tests {
                 consumed: DEFAULT_PLAN_LIMIT as f64,
             }),
             weekly_window: None,
+            last_probe_secs: None,
+            sampled_since_probe: 0.0,
+            probe_divergence: None,
         });
-        r.apply_probe("acc-1", 50_000_000, 36_000);
+        r.apply_probe("acc-1", 50_000_000, 36_000, 0);
         let acc = r.get("acc-1").unwrap();
         assert_eq!(acc.status, AccountQuotaStatus::Healthy, "Cooldown lifted on remaining>0");
         let w = acc.window.as_ref().unwrap();
@@ -748,8 +776,11 @@ mod tests {
                 consumed: DEFAULT_PLAN_LIMIT as f64,
             }),
             weekly_window: None,
+            last_probe_secs: None,
+            sampled_since_probe: 0.0,
+            probe_divergence: None,
         });
-        r.apply_probe("acc-1", 0, 18_000);
+        r.apply_probe("acc-1", 0, 18_000, 0);
         assert_eq!(
             r.get("acc-1").unwrap().status,
             AccountQuotaStatus::Cooldown,
@@ -762,7 +793,7 @@ mod tests {
         // hq-quota-refinement.1 (AC2): first probe on a freshly registered account seeds a window.
         let mut r = AccountRegistry::default();
         r.upsert_account(Account::new("acc-1")); // window = None
-        r.apply_probe("acc-1", 40_000_000, 18_000);
+        r.apply_probe("acc-1", 40_000_000, 18_000, 0);
         let acc = r.get("acc-1").unwrap();
         assert_eq!(acc.status, AccountQuotaStatus::Healthy);
         let w = acc.window.as_ref().expect("window created by probe");
@@ -787,6 +818,9 @@ mod tests {
                 status: AccountQuotaStatus::Cooldown,
                 window: None,
                 weekly_window: None,
+                last_probe_secs: None,
+                sampled_since_probe: 0.0,
+                probe_divergence: None,
             },
         );
         s.apply(&QuotaEvent::UsageProbed {
@@ -828,8 +862,11 @@ mod tests {
             status: AccountQuotaStatus::Blocked,
             window: Some(window_resetting_at(18_000)),
             weekly_window: None,
+            last_probe_secs: None,
+            sampled_since_probe: 0.0,
+            probe_divergence: None,
         });
-        r.apply_probe("acc-1", 40_000_000, 36_000);
+        r.apply_probe("acc-1", 40_000_000, 36_000, 0);
         assert_eq!(
             r.get("acc-1").unwrap().status,
             AccountQuotaStatus::Healthy,
@@ -845,6 +882,9 @@ mod tests {
             status: AccountQuotaStatus::Blocked,
             window: Some(window_resetting_at(10_000)),
             weekly_window: None,
+            last_probe_secs: None,
+            sampled_since_probe: 0.0,
+            probe_divergence: None,
         };
         assert!(fresh.is_genuinely_blocked(9_000), "fresh block confirmed");
         // Stale block: the window already lapsed ⇒ NOT genuinely blocked (awaiting re-probe).
@@ -856,6 +896,9 @@ mod tests {
             status: AccountQuotaStatus::Blocked,
             window: None,
             weekly_window: None,
+            last_probe_secs: None,
+            sampled_since_probe: 0.0,
+            probe_divergence: None,
         };
         assert!(!no_window.is_genuinely_blocked(0));
         // Any non-Blocked status is never genuinely blocked, regardless of window.
@@ -869,6 +912,9 @@ mod tests {
                 status,
                 window: Some(window_resetting_at(10_000)),
                 weekly_window: None,
+                last_probe_secs: None,
+                sampled_since_probe: 0.0,
+                probe_divergence: None,
             };
             assert!(!acc.is_genuinely_blocked(9_000), "{status:?} is not a block");
         }
@@ -881,6 +927,9 @@ mod tests {
             status: AccountQuotaStatus::Blocked,
             window: Some(window_resetting_at(10_000)),
             weekly_window: None,
+            last_probe_secs: None,
+            sampled_since_probe: 0.0,
+            probe_divergence: None,
         };
         let now = 9_000; // before the 10_000 reset ⇒ fresh
 
@@ -904,11 +953,78 @@ mod tests {
             status: AccountQuotaStatus::Blocked,
             window: Some(window_resetting_at(10_000)),
             weekly_window: None,
+            last_probe_secs: None,
+            sampled_since_probe: 0.0,
+            probe_divergence: None,
         });
         assert!(
             !r.pool_genuinely_blocked(10_500),
             "a stale Blocked forces re-probe / context — never grants a deferral"
         );
+    }
+
+    // hq-46cdf4 tests -------------------------------------------------------------------
+
+    #[test]
+    fn probe_records_divergence_and_resets_sampled_tail() {
+        let mut r = AccountRegistry::default();
+        r.upsert_account(Account {
+            id: "acc-1".into(),
+            status: AccountQuotaStatus::Healthy,
+            window: Some(AccountWindow {
+                kind: WindowKind::Rolling5h,
+                limit: 1_000,
+                started_at_secs: 0,
+                resets_at_secs: 18_000,
+                consumed: 0.0,
+            }),
+            weekly_window: None,
+            last_probe_secs: None,
+            sampled_since_probe: 0.0,
+            probe_divergence: None,
+        });
+        // Local sampling accumulates the unverified tail (IDENTITY weights: 100+100=200).
+        r.apply_sample("acc-1", "s1", "opus", 100, 100, 0, 0, 600);
+        let acc = r.get("acc-1").unwrap();
+        assert_eq!(acc.sampled_since_probe, 200.0);
+        assert_eq!(acc.last_probe_secs, None, "never probed yet");
+
+        // Provider says 850 remaining of 1000 ⇒ probed consumed 150; local said 200.
+        r.apply_probe("acc-1", 850, 20_000, 700);
+        let acc = r.get("acc-1").unwrap();
+        assert_eq!(acc.window.as_ref().unwrap().consumed, 150.0, "probe is authoritative");
+        assert_eq!(acc.probe_divergence, Some(50.0), "local over-count exposed");
+        assert_eq!(acc.last_probe_secs, Some(700));
+        assert_eq!(acc.sampled_since_probe, 0.0, "tail reset on probe");
+    }
+
+    #[test]
+    fn reducer_rebuilds_probe_provenance_byte_for_byte() {
+        let mut s = QuotaState::default();
+        s.apply(&QuotaEvent::TokensSampled {
+            account: "acc-1".into(),
+            session: "s1".into(),
+            model: "opus".into(),
+            input: 100,
+            output: 100,
+            cache_read: 0,
+            cache_creation: 0,
+            now_secs: 600,
+        });
+        assert_eq!(s.accounts["acc-1"].sampled_since_probe, 200.0);
+        s.apply(&QuotaEvent::UsageProbed {
+            account: "acc-1".into(),
+            remaining: DEFAULT_PLAN_LIMIT - 150,
+            resets_at_secs: 20_000,
+            weekly_remaining: None,
+            weekly_resets_at_secs: None,
+            now_secs: 700,
+        });
+        let acc = &s.accounts["acc-1"];
+        assert_eq!(acc.window.as_ref().unwrap().consumed, 150.0);
+        assert_eq!(acc.probe_divergence, Some(50.0));
+        assert_eq!(acc.last_probe_secs, Some(700));
+        assert_eq!(acc.sampled_since_probe, 0.0);
     }
 
     // hq-quota-weekly.2 tests -----------------------------------------------------------
@@ -933,6 +1049,9 @@ mod tests {
                 resets_at_secs: 604_800,
                 consumed: 5_000_000.0,
             }),
+            last_probe_secs: None,
+            sampled_since_probe: 0.0,
+            probe_divergence: None,
         };
         let json = serde_json::to_string(&acc).unwrap();
         let back: Account = serde_json::from_str(&json).unwrap();

@@ -328,6 +328,9 @@ async fn apply_feed(quota: &QuotaHandle, p: QuotaFeedPayload) {
                         consumed: limit.saturating_sub(remaining) as f64,
                     }),
                     weekly_window: None,
+                    last_probe_secs: None,
+                    sampled_since_probe: 0.0,
+                    probe_divergence: None,
                 })
                 .await;
         }
@@ -368,6 +371,9 @@ async fn apply_feed(quota: &QuotaHandle, p: QuotaFeedPayload) {
                         status: AccountQuotaStatus::Healthy,
                         window: Some(synthetic_window(now)),
                         weekly_window: None,
+                        last_probe_secs: None,
+                        sampled_since_probe: 0.0,
+                        probe_divergence: None,
                     })
                     .await;
             }
@@ -534,6 +540,9 @@ mod tests {
                     consumed: 900.0,        // remaining 100
                 }),
                 weekly_window: None,
+                last_probe_secs: None,
+                sampled_since_probe: 0.0,
+                probe_divergence: None,
             })
             .await;
         // A sample sets the burn-rate EWMA (0 tokens ⇒ consumed unchanged, rate = consumed/elapsed).
@@ -628,6 +637,9 @@ mod tests {
                     consumed: 999_999.0,
                 }),
                 weekly_window: None,
+                last_probe_secs: None,
+                sampled_since_probe: 0.0,
+                probe_divergence: None,
             })
             .await;
         apply_feed(
@@ -700,6 +712,9 @@ mod tests {
                     consumed: plan_limit() as f64,
                 }),
                 weekly_window: None,
+                last_probe_secs: None,
+                sampled_since_probe: 0.0,
+                probe_divergence: None,
             })
             .await;
         // Simulate the actor receiving a 429 (sets status = Blocked).

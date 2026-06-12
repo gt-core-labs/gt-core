@@ -38,6 +38,9 @@ fn account_with_window() -> Account {
             consumed: 0.0,
         }),
         weekly_window: None,
+        last_probe_secs: None,
+        sampled_since_probe: 0.0,
+        probe_divergence: None,
     }
 }
 

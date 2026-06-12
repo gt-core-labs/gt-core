@@ -111,7 +111,7 @@ impl Command for ProbeWindow {
 
     fn execute(&self, state: &mut Self::State) -> Result<Self::Output, AppError> {
         self.validate(state)?;
-        state.apply_probe(&self.account, self.remaining, self.resets_at_secs);
+        state.apply_probe(&self.account, self.remaining, self.resets_at_secs, self.now_secs);
         if let (Some(w_rem), Some(w_reset)) = (self.weekly_remaining, self.weekly_resets_at_secs) {
             state.apply_weekly_probe(&self.account, w_rem, w_reset, self.now_secs);
         }
@@ -320,6 +320,9 @@ mod tests {
                 consumed: 0.0,
             }),
             weekly_window: None,
+            last_probe_secs: None,
+            sampled_since_probe: 0.0,
+            probe_divergence: None,
         });
         // acc-2: a healthy standby used by rotate tests as a valid target.
         r.upsert_account(Account::new("acc-2"));
@@ -516,6 +519,9 @@ mod tests {
             status: AccountQuotaStatus::Cooldown,
             window: None,
             weekly_window: None,
+            last_probe_secs: None,
+            sampled_since_probe: 0.0,
+            probe_divergence: None,
         });
         let cmd = RotateAccount {
             from_account: "acc-1".into(),
@@ -537,6 +543,9 @@ mod tests {
             status: AccountQuotaStatus::Limited,
             window: None,
             weekly_window: None,
+            last_probe_secs: None,
+            sampled_since_probe: 0.0,
+            probe_divergence: None,
         });
         let cmd = RotateAccount {
             from_account: "acc-1".into(),
