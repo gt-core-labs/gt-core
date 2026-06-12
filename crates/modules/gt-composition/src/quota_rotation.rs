@@ -291,11 +291,29 @@ impl Plugin for QuotaRotationPlugin {
                 };
                 let pct = utilization_pct(acc);
                 if pct >= soft_pct() {
-                    eprintln!(
-                        "[quota-rotation] {account} probed at {pct:.0}% (soft {:.0}%) — draining",
-                        soft_pct()
-                    );
-                    self.rotate_away_from(&account).await?;
+                    // Skip the drain if the window resets within the prediction threshold: the
+                    // account will recover on its own and rotating now just creates unnecessary
+                    // Cooldown → Healthy churn (hq-49198f-drain-guard).
+                    let resets_in = acc
+                        .window
+                        .as_ref()
+                        .map(|w| w.resets_at_secs.saturating_sub(now_secs()))
+                        .unwrap_or(u64::MAX);
+                    let threshold = std::env::var("GT_QUOTA_THRESHOLD_SECS")
+                        .ok()
+                        .and_then(|v| v.parse::<u64>().ok())
+                        .unwrap_or(300);
+                    if resets_in <= threshold {
+                        eprintln!(
+                            "[quota-rotation] {account} at {pct:.0}% but window resets in {resets_in}s (≤ threshold {threshold}s) — skip drain",
+                        );
+                    } else {
+                        eprintln!(
+                            "[quota-rotation] {account} probed at {pct:.0}% (soft {:.0}%) — draining",
+                            soft_pct()
+                        );
+                        self.rotate_away_from(&account).await?;
+                    }
                 }
                 Ok(())
             }
@@ -864,13 +882,17 @@ mod tests {
 
     // hq-49198f tests ---------------------------------------------------------------------
 
+    /// A far-future reset instant used in tests that need the window to be live (not expired).
+    /// Large enough that `resets_in > GT_QUOTA_THRESHOLD_SECS` is always true at test time.
+    const FAR_FUTURE: u64 = 9_000_000_000;
+
     fn acct_with_util(id: &str, consumed: f64, limit: u64) -> Account {
         let mut a = Account::new(id);
         a.window = Some(AccountWindow {
             kind: WindowKind::Rolling5h,
             limit,
             started_at_secs: 0,
-            resets_at_secs: 18_000,
+            resets_at_secs: FAR_FUTURE,
             consumed,
         });
         a
@@ -930,7 +952,8 @@ mod tests {
             .on_event(&record(QuotaEvent::UsageProbed {
                 account: "a".into(),
                 remaining: 15,
-                resets_at_secs: 18_000,
+                // FAR_FUTURE: window is not near reset, so the drain must fire.
+                resets_at_secs: FAR_FUTURE,
                 weekly_remaining: None,
                 weekly_resets_at_secs: None,
                 now_secs: 1_000,
@@ -942,6 +965,46 @@ mod tests {
             keychain.active().unwrap().as_deref(),
             Some("b"),
             "soft threshold drains: pointer moved, in-flight work finishes on a"
+        );
+    }
+
+    #[tokio::test]
+    async fn probe_at_soft_threshold_skips_drain_when_window_resets_soon() {
+        // hq-49198f-drain-guard: an account above the soft threshold must NOT be drained when
+        // its window resets within the prediction threshold — it will recover on its own, and
+        // draining now only creates unnecessary Cooldown → Healthy churn.
+        let (tx, _rx) = mpsc::channel(64);
+        let quota = gt_quota::actor::spawn(tx, std::collections::HashMap::new());
+        quota.upsert_account(acct_with_util("a", 85.0, 100)).await; // 85% ≥ soft(80)
+        quota.upsert_account(acct_with_util("b", 10.0, 100)).await;
+        let keychain = Arc::new(InMemoryKeychain::seeded([("a", "/cfg/a"), ("b", "/cfg/b")]));
+        keychain.set_active("a").unwrap();
+        let plugin = QuotaRotationPlugin::new(quota.clone(), keychain.clone());
+
+        // Probe with a reset 60 seconds away: well within the 300s threshold.
+        // Send the probe to the actor first so its in-memory state reflects the near reset,
+        // matching the production sequence (actor processes probe → emits event → plugin fires).
+        let near_reset = now_secs() + 60;
+        let now = now_secs();
+        quota.probe("a", 15, near_reset, None, None, now).await;
+        let _ = quota.snapshot().await; // sync barrier: actor has processed the probe
+
+        plugin
+            .on_event(&record(QuotaEvent::UsageProbed {
+                account: "a".into(),
+                remaining: 15,
+                resets_at_secs: near_reset,
+                weekly_remaining: None,
+                weekly_resets_at_secs: None,
+                now_secs: now,
+            }))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            keychain.active().unwrap().as_deref(),
+            Some("a"),
+            "drain skipped: window resets in 60s (≤ threshold 300s), no unnecessary Cooldown"
         );
     }
 
@@ -959,7 +1022,7 @@ mod tests {
             .on_event(&record(QuotaEvent::UsageProbed {
                 account: "a".into(),
                 remaining: 50,
-                resets_at_secs: 18_000,
+                resets_at_secs: FAR_FUTURE,
                 weekly_remaining: None,
                 weekly_resets_at_secs: None,
                 now_secs: 1_000,
