@@ -368,6 +368,42 @@ async fn main() -> anyhow::Result<()> {
         })
     });
 
+    // Anthropic passthrough proxy (hq-284842): polecats' claude points here via
+    // ANTHROPIC_BASE_URL; every response feeds per-call quota truth (unified-status verdicts,
+    // tokens-family probe, API-reported usage samples) with zero extra requests. Listener is
+    // always armed (harmless when nothing routes through it); GT_ANTHROPIC_PROXY_BIND="" disables.
+    let anthropic_proxy_url: Option<String> = {
+        let bind = std::env::var("GT_ANTHROPIC_PROXY_BIND")
+            .unwrap_or_else(|_| "127.0.0.1:8089".to_string());
+        if bind.is_empty() {
+            eprintln!("[gt-orch-server] anthropic proxy disabled (GT_ANTHROPIC_PROXY_BIND empty) — no per-call quota truth");
+            None
+        } else {
+            let app =
+                Arc::new(gt_composition::anthropic_proxy::AnthropicProxy::new(quota.clone()))
+                    .router();
+            match tokio::net::TcpListener::bind(&bind).await {
+                Ok(listener) => {
+                    let url = std::env::var("GT_ANTHROPIC_PROXY_URL")
+                        .unwrap_or_else(|_| format!("http://{bind}"));
+                    eprintln!(
+                        "[gt-orch-server] anthropic proxy on http://{bind} (polecats see {url})"
+                    );
+                    tokio::spawn(async move {
+                        if let Err(e) = axum::serve(listener, app).await {
+                            eprintln!("[gt-orch-server] anthropic proxy serve failed: {e}");
+                        }
+                    });
+                    Some(url)
+                }
+                Err(e) => {
+                    eprintln!("[gt-orch-server] anthropic proxy bind {bind} failed: {e} — polecats go straight to the API");
+                    None
+                }
+            }
+        }
+    };
+
     // Web onboarding (hq-quota-onboard-web) moved to the backend mcp-server in .4: claude now lives
     // IN the image, so onboarding rides the existing /api/v1/* auth chain instead of a host process
     // behind a docker→host firewall hole. The daemon no longer serves it — it only hydrates its
@@ -390,6 +426,9 @@ async fn main() -> anyhow::Result<()> {
     }
     if let Some(kc) = &keychain {
         pol_plugin = pol_plugin.with_keychain(kc.clone());
+    }
+    if let Some(url) = &anthropic_proxy_url {
+        pol_plugin = pol_plugin.with_anthropic_proxy(url.clone());
     }
     // Per-polecat git worktree (hq-orchd-deploy.9): with GT_POLECAT_WORKTREE_ROOT set, each sling
     // gets its own worktree off the rig checkout (branch = bead) so concurrent polecats don't race

@@ -15,6 +15,7 @@
 //!   tests without a DB and the first half of the Step 6.c contract.
 
 pub mod actor;
+pub mod body_usage;
 pub mod commands;
 pub mod expectations;
 /// The off-by-default `axum` REST adapter (`hq-fe-api-orch.4`): the orchestration sibling of the
@@ -49,7 +50,11 @@ pub use oauth_usage::{
 #[cfg(feature = "axum")]
 pub use module::QuotaHttpModule;
 pub use module::QuotaModule;
-pub use probe::{parse_anthropic_ratelimit, RatelimitHeaders};
+pub use body_usage::{parse_messages_json_usage, parse_messages_sse_usage, BodyUsage};
+pub use probe::{
+    parse_anthropic_ratelimit, parse_unified_ratelimit, RatelimitHeaders, UnifiedRatelimit,
+    UnifiedStatus,
+};
 pub use repo::{InMemoryQuota, QuotaRepository, UsageSample};
 pub use state::{
     Account, AccountQuotaStatus, AccountRegistry, AccountWindow, Ewma, QuotaState, WindowKind,

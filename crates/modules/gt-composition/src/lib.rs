@@ -36,6 +36,7 @@
 //! [`git_merge::GitMergePlugin`] (edge git-merge) and [`witness_sweep::WitnessSweep`] (witness safety-net) are the wired edge effects that close the autonomous loop.
 
 pub mod account_dirs;
+pub mod anthropic_proxy;
 pub mod auth;
 pub mod denial_audit;
 pub mod drift_reconcile;

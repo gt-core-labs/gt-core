@@ -106,6 +106,46 @@ pub fn parse_anthropic_ratelimit(
     })
 }
 
+/// The provider's unified rate-limit verdict, sent on EVERY response
+/// (`anthropic-ratelimit-unified-status`, hq-284842). `AllowedWarning` is the pre-block
+/// signal (account should drain — finish current work, take no new), `Rejected` is the
+/// hard wall (the request was refused; the account is out until `resets_at`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UnifiedStatus {
+    Allowed,
+    AllowedWarning,
+    Rejected,
+}
+
+/// Parsed unified-status pair: the verdict plus the reset instant when the provider sent
+/// one (`anthropic-ratelimit-unified-reset`, epoch seconds or RFC 3339 like the rest).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnifiedRatelimit {
+    pub status: UnifiedStatus,
+    pub resets_at_secs: Option<u64>,
+}
+
+/// Parse the unified-status headers (case-insensitive). `None` when the status header is
+/// absent or carries an unknown value — the caller falls back to the tokens-family probe.
+pub fn parse_unified_ratelimit(headers: &[(String, String)]) -> Option<UnifiedRatelimit> {
+    let lookup = |name: &str| -> Option<&str> {
+        headers
+            .iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case(name))
+            .map(|(_, v)| v.as_str())
+    };
+    let status = match lookup("anthropic-ratelimit-unified-status")?.trim() {
+        "allowed" => UnifiedStatus::Allowed,
+        "allowed_warning" => UnifiedStatus::AllowedWarning,
+        "rejected" => UnifiedStatus::Rejected,
+        _ => return None,
+    };
+    Some(UnifiedRatelimit {
+        status,
+        resets_at_secs: lookup("anthropic-ratelimit-unified-reset").and_then(parse_reset_secs),
+    })
+}
+
 fn parse_u64(raw: &str) -> Option<u64> {
     raw.trim().parse().ok()
 }
@@ -283,5 +323,46 @@ mod tests {
         assert!(!RatelimitHeaders::from_headers(&headers_partial).has_weekly_window());
 
         assert!(!RatelimitHeaders::from_headers(&[]).has_weekly_window());
+    }
+
+    // hq-284842 tests ---------------------------------------------------------------------
+
+    #[test]
+    fn unified_status_parses_all_verdicts_case_insensitive_header() {
+        for (raw, want) in [
+            ("allowed", UnifiedStatus::Allowed),
+            ("allowed_warning", UnifiedStatus::AllowedWarning),
+            ("rejected", UnifiedStatus::Rejected),
+        ] {
+            let headers = h(&[
+                ("Anthropic-RateLimit-Unified-Status", raw),
+                ("anthropic-ratelimit-unified-reset", "1748430000"),
+            ]);
+            let u = parse_unified_ratelimit(&headers).expect("parsed");
+            assert_eq!(u.status, want);
+            assert_eq!(u.resets_at_secs, Some(1_748_430_000));
+        }
+    }
+
+    #[test]
+    fn unified_status_none_on_absent_or_unknown() {
+        assert!(parse_unified_ratelimit(&[]).is_none());
+        let unknown = h(&[("anthropic-ratelimit-unified-status", "banana")]);
+        assert!(parse_unified_ratelimit(&unknown).is_none());
+        // Missing reset degrades to None reset, not a parse failure.
+        let no_reset = h(&[("anthropic-ratelimit-unified-status", "rejected")]);
+        let u = parse_unified_ratelimit(&no_reset).unwrap();
+        assert_eq!(u.status, UnifiedStatus::Rejected);
+        assert_eq!(u.resets_at_secs, None);
+    }
+
+    #[test]
+    fn unified_status_reset_accepts_rfc3339() {
+        let headers = h(&[
+            ("anthropic-ratelimit-unified-status", "allowed_warning"),
+            ("anthropic-ratelimit-unified-reset", "2026-05-28T11:00:00Z"),
+        ]);
+        let u = parse_unified_ratelimit(&headers).unwrap();
+        assert!(u.resets_at_secs.unwrap() > 1_748_400_000);
     }
 }

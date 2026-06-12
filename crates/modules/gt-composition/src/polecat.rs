@@ -132,6 +132,12 @@ pub struct PolecatSupervisorPlugin {
     /// static file. `None` ⇒ falls back to copying the operator-placed `.mcp.json` from the base
     /// checkout (legacy behaviour, the token in that file may be expired or rig-specific).
     server_url: Option<String>,
+    /// Base URL of the Anthropic passthrough proxy (`hq-284842`, `GT_ANTHROPIC_PROXY_URL`).
+    /// When set, each sling stamps `ANTHROPIC_BASE_URL` so the polecat's claude routes through
+    /// the proxy, plus `ANTHROPIC_CUSTOM_HEADERS` with `x-gt-account`/`x-gt-session` so the
+    /// proxy can attribute every call. `None` ⇒ claude talks straight to the real API
+    /// (no per-call quota truth).
+    anthropic_proxy_url: Option<String>,
     /// Event log to read the Knowledge role prompt from (`hq-polecat-knowledge.1`). When set,
     /// each sling replays the `skills.*` stream and writes the polecat role's prompt as
     /// `CLAUDE.md` in the worktree — the same pattern `terminal.rs` uses for interactive
@@ -165,8 +171,19 @@ impl PolecatSupervisorPlugin {
             worktree_root: None,
             run_as: None,
             server_url: None,
+            anthropic_proxy_url: None,
             event_log: None,
         }
+    }
+
+    /// Route each polecat's claude through the Anthropic passthrough proxy (`hq-284842`):
+    /// stamps `ANTHROPIC_BASE_URL` + the `x-gt-account`/`x-gt-session` attribution headers
+    /// (via `ANTHROPIC_CUSTOM_HEADERS`) at sling time. Without it, calls go straight to the
+    /// real API and quota truth arrives only via the periodic /usage sweep.
+    pub fn with_anthropic_proxy(mut self, url: impl Into<String>) -> Self {
+        let url = url.into();
+        self.anthropic_proxy_url = if url.is_empty() { None } else { Some(url) };
+        self
     }
 
     /// Load the polecat role's prompt from the Knowledge event log at sling time and materialise
@@ -338,6 +355,27 @@ impl Plugin for PolecatSupervisorPlugin {
                         Err(e) => eprintln!(
                             "[polecat] keychain active() failed: {e} — host default ~/.claude"
                         ),
+                    }
+                }
+                // Route claude through the Anthropic passthrough proxy (hq-284842) so EVERY call
+                // feeds per-call quota truth (unified-status headers + API-reported usage).
+                // Attribution rides ANTHROPIC_CUSTOM_HEADERS (claude parses one `Name: value` per
+                // line; tmux passes env values as exec args, so the embedded newline survives).
+                // The account is the keychain account resolved above (GT_HOOK_ACCOUNT); without
+                // one the proxy still forwards but records nothing for this polecat.
+                if let Some(proxy_url) = &self.anthropic_proxy_url {
+                    let account = spec
+                        .env
+                        .iter()
+                        .find(|(k, _)| k == gt_polecat::GT_HOOK_ACCOUNT)
+                        .map(|(_, v)| v.clone());
+                    spec.env
+                        .push(("ANTHROPIC_BASE_URL".to_string(), proxy_url.clone()));
+                    if let Some(account) = account {
+                        spec.env.push((
+                            "ANTHROPIC_CUSTOM_HEADERS".to_string(),
+                            format!("x-gt-account: {account}\nx-gt-session: {}", spec.session),
+                        ));
                     }
                 }
                 // Isolate the polecat in its own git worktree (hq-orchd-deploy.9): concurrent
