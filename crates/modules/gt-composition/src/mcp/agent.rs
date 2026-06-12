@@ -118,7 +118,7 @@ impl DomainHandler for AgentHandler {
             descriptor(
                 "agent.list",
                 "List every agent session in the workspace.",
-                &[],
+                &[opt("crew", "string")],
             ),
             descriptor(
                 "agent.info",
@@ -190,14 +190,31 @@ impl DomainHandler for AgentHandler {
             }
             "agent.list" => {
                 let reg = self.registry(ws)?;
-                Ok(
-                    json!({ "sessions": reg.snapshot().iter().map(session_json).collect::<Vec<_>>() }),
-                )
+                let crew_filter = ctx.args.get("crew").and_then(|v| v.as_str());
+                let sessions: Vec<_> = if let Some(mayor_id) = crew_filter {
+                    reg.crew_of(mayor_id).iter().map(|s| session_json(s)).collect()
+                } else {
+                    reg.snapshot().iter().map(session_json).collect()
+                };
+                Ok(json!({ "sessions": sessions }))
             }
             "agent.info" => {
                 let id = str_arg(&ctx.args, "session")?;
-                match self.registry(ws)?.get(id) {
-                    Some(s) => Ok(session_json(s)),
+                let reg = self.registry(ws)?;
+                match reg.get(id) {
+                    Some(s) => {
+                        let mut val = session_json(s);
+                        // For mayor sessions, include the polecats supervised by this session.
+                        if s.role == SessionRole::Mayor {
+                            let members: Vec<_> = reg
+                                .crew_of(id)
+                                .iter()
+                                .map(|p| json!({ "id": p.id, "role": p.role.as_str(), "state": state_str(p.state) }))
+                                .collect();
+                            val["members"] = json!(members);
+                        }
+                        Ok(val)
+                    }
                     None => Err(AppError::NotFound(format!("session {id}"))),
                 }
             }

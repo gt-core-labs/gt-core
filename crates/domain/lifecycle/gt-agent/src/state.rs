@@ -237,6 +237,15 @@ impl SessionRegistry {
         self.sessions.values().cloned().collect()
     }
 
+    /// All sessions whose `crew` field equals `mayor_id` — the polecats supervised by
+    /// that mayor session. Order is not guaranteed (HashMap source).
+    pub fn crew_of(&self, mayor_id: &str) -> Vec<&Session> {
+        self.sessions
+            .values()
+            .filter(|s| s.crew.as_deref() == Some(mayor_id))
+            .collect()
+    }
+
     /// Solo sesiones no-terminales.
     pub fn active(&self) -> Vec<Session> {
         self.sessions
