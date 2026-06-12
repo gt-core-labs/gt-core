@@ -149,24 +149,60 @@ impl DomainHandler for ReportHandler {
             &[req("email", "string"), req("enabled", "boolean")],
         ),
         descriptor(
-            "report.schedule.get",
-            "Read the digest schedule: enabled, hour/minute (local wall clock), \
-             tz_offset_minutes, board scope (rig/workspace), last_sent_date.",
+            "report.schedules.list",
+            "List every report schedule: id, kind, mode (daily | every_n_days | \
+             once), n_days/date, hour/minute (local wall clock), tz_offset_minutes, \
+             board scope (rig/workspace), enabled, last_sent_date, per-schedule \
+             subscribers (absent = the workspace's global enabled list).",
             &[],
         ),
         descriptor(
-            "report.schedule.set",
-            "Update the digest schedule (partial: any of enabled, hour 0-23, minute \
-             0-59, tz_offset_minutes, rig, workspace). last_sent_date is daemon \
-             bookkeeping and not settable.",
+            "report.schedules.create",
+            "Create a schedule. mode daily (default) | every_n_days (requires \
+             n_days>=1) | once (requires date YYYY-MM-DD; auto-disables after \
+             sending). kind from report.kinds.list (default planning-digest). \
+             subscribers optional (own recipient list; absent = global fallback).",
             &[
-                opt("enabled", "boolean"),
+                opt("kind", "string"),
+                opt("mode", "string"),
+                opt("n_days", "integer"),
+                opt("date", "string"),
                 opt("hour", "integer"),
                 opt("minute", "integer"),
                 opt("tz_offset_minutes", "integer"),
                 opt("rig", "string"),
                 opt("workspace", "string"),
+                opt("enabled", "boolean"),
+                opt("subscribers", "array"),
             ],
+        ),
+        descriptor(
+            "report.schedules.update",
+            "Patch one schedule by id (same fields as create; omitted = untouched; \
+             subscribers=[] clears back to the global fallback). last_sent_date is \
+             daemon bookkeeping and not settable.",
+            &[
+                req("id", "string"),
+                opt("kind", "string"),
+                opt("mode", "string"),
+                opt("n_days", "integer"),
+                opt("date", "string"),
+                opt("hour", "integer"),
+                opt("minute", "integer"),
+                opt("tz_offset_minutes", "integer"),
+                opt("rig", "string"),
+                opt("workspace", "string"),
+                opt("enabled", "boolean"),
+                opt("subscribers", "array"),
+            ],
+        ),
+        descriptor("report.schedules.delete", "Delete one schedule by id.", &[req(
+            "id", "string",
+        )]),
+        descriptor(
+            "report.kinds.list",
+            "The registered report kinds a schedule can reference.",
+            &[],
         ),
         descriptor(
             "report.send-now",
@@ -400,58 +436,42 @@ impl DomainHandler for ReportHandler {
                     .map_err(|e| AppError::Validation(format!("set-enabled: {e}")))?;
                 Ok(json!({ "ok": true, "email": email, "enabled": enabled }))
             }
-            // Transitional shims over the FIRST schedule (full multi-schedule
-            // CRUD: hq-c4f920).
-            "report.schedule.get" => {
+            "report.schedules.list" => {
                 let svc = self.scheduler()?;
-                let first = svc.config.read().await.report_schedules.first().cloned().unwrap_or(
-                    crate::report_scheduler::ReportSchedule {
-                        enabled: false,
-                        ..Default::default()
-                    },
-                );
-                serde_json::to_value(&first)
+                let schedules = svc.list_schedules().await;
+                Ok(json!({ "schedules": schedules }))
+            }
+            "report.schedules.create" => {
+                let svc = self.scheduler()?;
+                let patch: crate::report_scheduler::SchedulePatch =
+                    serde_json::from_value(ctx.args.clone())
+                        .map_err(|e| AppError::Validation(format!("bad schedule args: {e}")))?;
+                let s = svc.create_schedule(patch).await.map_err(AppError::Validation)?;
+                serde_json::to_value(&s)
                     .map_err(|e| AppError::Other(format!("encode schedule: {e}")))
             }
-            "report.schedule.set" => {
+            "report.schedules.update" => {
                 let svc = self.scheduler()?;
-                let hour = ctx.args.get("hour").and_then(Value::as_u64);
-                let minute = ctx.args.get("minute").and_then(Value::as_u64);
-                if hour.is_some_and(|h| h > 23) || minute.is_some_and(|m| m > 59) {
-                    return Err(AppError::Validation("hour 0-23, minute 0-59".into()));
+                let id = str_arg(&ctx.args, "id")?.trim().to_string();
+                let mut args = ctx.args.clone();
+                if let Some(map) = args.as_object_mut() {
+                    map.remove("id");
                 }
-                let first = {
-                    let mut cfg = svc.config.write().await;
-                    if cfg.report_schedules.is_empty() {
-                        cfg.report_schedules.push(crate::report_scheduler::ReportSchedule {
-                            enabled: false,
-                            ..Default::default()
-                        });
-                    }
-                    let r = cfg.report_schedules.first_mut().expect("just ensured");
-                    if let Some(v) = ctx.args.get("enabled").and_then(Value::as_bool) {
-                        r.enabled = v;
-                    }
-                    if let Some(v) = hour {
-                        r.hour = v as u8;
-                    }
-                    if let Some(v) = minute {
-                        r.minute = v as u8;
-                    }
-                    if let Some(v) = ctx.args.get("tz_offset_minutes").and_then(Value::as_i64) {
-                        r.tz_offset_minutes = v.clamp(-14 * 60, 14 * 60);
-                    }
-                    if let Some(v) = ctx.args.get("rig").and_then(Value::as_str) {
-                        r.rig = v.to_string();
-                    }
-                    if let Some(v) = ctx.args.get("workspace").and_then(Value::as_str) {
-                        r.workspace = v.to_string();
-                    }
-                    r.clone()
-                };
-                svc.persist().await;
-                serde_json::to_value(&first)
+                let patch: crate::report_scheduler::SchedulePatch =
+                    serde_json::from_value(args)
+                        .map_err(|e| AppError::Validation(format!("bad schedule args: {e}")))?;
+                let s = svc.update_schedule(&id, patch).await.map_err(AppError::Validation)?;
+                serde_json::to_value(&s)
                     .map_err(|e| AppError::Other(format!("encode schedule: {e}")))
+            }
+            "report.schedules.delete" => {
+                let svc = self.scheduler()?;
+                let id = str_arg(&ctx.args, "id")?.trim().to_string();
+                svc.delete_schedule(&id).await.map_err(AppError::Validation)?;
+                Ok(json!({ "ok": true }))
+            }
+            "report.kinds.list" => {
+                Ok(json!({ "kinds": crate::report_scheduler::kinds() }))
             }
             "report.send-now" => {
                 let svc = self.scheduler()?;

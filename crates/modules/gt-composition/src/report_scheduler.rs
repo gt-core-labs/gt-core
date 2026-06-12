@@ -210,6 +210,109 @@ pub fn kinds() -> Vec<&'static str> {
 }
 
 // ---------------------------------------------------------------------------
+// CRUD patch + validation — ONE shape shared by the MCP tools and the System
+// REST surface (hq-c4f920), so both reject the same garbage the same way.
+// ---------------------------------------------------------------------------
+
+/// Partial schedule write. `None` leaves the field untouched. `last_sent_date`
+/// and `id` are deliberately absent — daemon bookkeeping / immutable handle.
+#[derive(Debug, Default, Clone, Deserialize)]
+pub struct SchedulePatch {
+    pub kind: Option<String>,
+    pub mode: Option<ScheduleMode>,
+    pub n_days: Option<u32>,
+    pub date: Option<String>,
+    pub hour: Option<u8>,
+    pub minute: Option<u8>,
+    pub tz_offset_minutes: Option<i64>,
+    pub rig: Option<String>,
+    pub workspace: Option<String>,
+    pub enabled: Option<bool>,
+    /// `Some(list)` sets the per-schedule recipients (trimmed, empties
+    /// dropped; an empty result clears back to the global fallback).
+    pub subscribers: Option<Vec<String>>,
+}
+
+/// Apply `patch` onto `s`, then validate the result. The schedule is only
+/// mutated on success (validation runs on a candidate).
+pub fn apply_patch(s: &mut ReportSchedule, patch: SchedulePatch) -> Result<(), String> {
+    let mut c = s.clone();
+    if let Some(v) = patch.kind {
+        c.kind = v;
+    }
+    if let Some(v) = patch.mode {
+        c.mode = v;
+    }
+    if let Some(v) = patch.n_days {
+        c.n_days = v;
+    }
+    if let Some(v) = patch.date {
+        c.date = if v.trim().is_empty() { None } else { Some(v.trim().to_string()) };
+    }
+    if let Some(v) = patch.hour {
+        c.hour = v;
+    }
+    if let Some(v) = patch.minute {
+        c.minute = v;
+    }
+    if let Some(v) = patch.tz_offset_minutes {
+        c.tz_offset_minutes = v;
+    }
+    if let Some(v) = patch.rig {
+        c.rig = v.trim().to_string();
+    }
+    if let Some(v) = patch.workspace {
+        c.workspace = v.trim().to_string();
+    }
+    if let Some(v) = patch.enabled {
+        c.enabled = v;
+    }
+    if let Some(list) = patch.subscribers {
+        let cleaned: Vec<String> =
+            list.iter().map(|e| e.trim().to_string()).filter(|e| !e.is_empty()).collect();
+        c.subscribers = (!cleaned.is_empty()).then_some(cleaned);
+    }
+    validate(&c)?;
+    *s = c;
+    Ok(())
+}
+
+/// The closed validation every write path runs.
+pub fn validate(s: &ReportSchedule) -> Result<(), String> {
+    if render_for(&s.kind).is_none() {
+        return Err(format!("unknown report kind `{}` (known: {:?})", s.kind, kinds()));
+    }
+    if s.hour > 23 || s.minute > 59 {
+        return Err("hour 0-23, minute 0-59".into());
+    }
+    if !(-14 * 60..=14 * 60).contains(&s.tz_offset_minutes) {
+        return Err("tz_offset_minutes out of range (±840)".into());
+    }
+    if s.rig.is_empty() || s.workspace.is_empty() {
+        return Err("rig and workspace are required".into());
+    }
+    match s.mode {
+        ScheduleMode::Once => match s.date.as_deref() {
+            Some(d) if epoch_days(d).is_some() => {}
+            Some(d) => return Err(format!("`date` must be YYYY-MM-DD, got `{d}`")),
+            None => return Err("mode `once` requires `date` (YYYY-MM-DD)".into()),
+        },
+        ScheduleMode::EveryNDays => {
+            if s.n_days == 0 {
+                return Err("mode `every_n_days` requires n_days >= 1".into());
+            }
+        }
+        ScheduleMode::Daily => {}
+    }
+    if let Some(list) = &s.subscribers {
+        if let Some(bad) = list.iter().find(|e| !e.contains('@')) {
+            return Err(format!("`{bad}` is not an email address"));
+        }
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
 // Clock math (no chrono dep: proleptic-Gregorian day arithmetic suffices for
 // schedule dates).
 // ---------------------------------------------------------------------------
@@ -312,6 +415,54 @@ impl ReportService {
             let snapshot = self.config.read().await.clone();
             crate::system::persist_config(path, &snapshot);
         }
+    }
+
+    /// All schedules (the CRUD list).
+    pub async fn list_schedules(&self) -> Vec<ReportSchedule> {
+        self.config.read().await.report_schedules.clone()
+    }
+
+    /// Create a schedule from a patch over the defaults; persisted on success.
+    pub async fn create_schedule(&self, patch: SchedulePatch) -> Result<ReportSchedule, String> {
+        let mut s = ReportSchedule::default();
+        apply_patch(&mut s, patch)?;
+        self.config.write().await.report_schedules.push(s.clone());
+        self.persist().await;
+        Ok(s)
+    }
+
+    /// Patch one schedule by id; `last_sent_date`/`id` untouched by design.
+    pub async fn update_schedule(
+        &self,
+        id: &str,
+        patch: SchedulePatch,
+    ) -> Result<ReportSchedule, String> {
+        let updated = {
+            let mut cfg = self.config.write().await;
+            let s = cfg
+                .report_schedules
+                .iter_mut()
+                .find(|s| s.id == id)
+                .ok_or_else(|| format!("unknown schedule `{id}`"))?;
+            apply_patch(s, patch)?;
+            s.clone()
+        };
+        self.persist().await;
+        Ok(updated)
+    }
+
+    /// Remove one schedule by id; persisted on success.
+    pub async fn delete_schedule(&self, id: &str) -> Result<(), String> {
+        {
+            let mut cfg = self.config.write().await;
+            let before = cfg.report_schedules.len();
+            cfg.report_schedules.retain(|s| s.id != id);
+            if cfg.report_schedules.len() == before {
+                return Err(format!("unknown schedule `{id}`"));
+            }
+        }
+        self.persist().await;
+        Ok(())
     }
 
     /// Resolve the send target: an explicit id, or the single existing
@@ -546,6 +697,76 @@ mod tests {
         assert_eq!(d.mode, ScheduleMode::Daily);
         assert!(d.enabled);
         assert_eq!(d.tz_offset_minutes, -300);
+    }
+
+    #[test]
+    fn patch_validation_rejects_the_documented_garbage() {
+        let base = ReportSchedule::default();
+        let try_patch = |p: SchedulePatch| {
+            let mut s = base.clone();
+            apply_patch(&mut s, p)
+        };
+        // Unknown kind.
+        assert!(try_patch(SchedulePatch { kind: Some("nope".into()), ..Default::default() })
+            .unwrap_err()
+            .contains("unknown report kind"));
+        // once without date / bad date.
+        assert!(try_patch(SchedulePatch {
+            mode: Some(ScheduleMode::Once),
+            ..Default::default()
+        })
+        .unwrap_err()
+        .contains("requires `date`"));
+        assert!(try_patch(SchedulePatch {
+            mode: Some(ScheduleMode::Once),
+            date: Some("12/06/2026".into()),
+            ..Default::default()
+        })
+        .unwrap_err()
+        .contains("YYYY-MM-DD"));
+        // every_n_days with n_days=0.
+        assert!(try_patch(SchedulePatch {
+            mode: Some(ScheduleMode::EveryNDays),
+            n_days: Some(0),
+            ..Default::default()
+        })
+        .unwrap_err()
+        .contains("n_days >= 1"));
+        // Hour out of range; bad subscriber.
+        assert!(try_patch(SchedulePatch { hour: Some(24), ..Default::default() }).is_err());
+        assert!(try_patch(SchedulePatch {
+            subscribers: Some(vec!["sin-arroba".into()]),
+            ..Default::default()
+        })
+        .unwrap_err()
+        .contains("not an email"));
+        // Failure leaves the original untouched.
+        let mut s = base.clone();
+        let _ = apply_patch(&mut s, SchedulePatch { hour: Some(24), ..Default::default() });
+        assert_eq!(s.hour, base.hour);
+    }
+
+    #[test]
+    fn patch_applies_and_normalizes_subscribers() {
+        let mut s = ReportSchedule::default();
+        apply_patch(&mut s, SchedulePatch {
+            mode: Some(ScheduleMode::Once),
+            date: Some(" 2026-06-20 ".into()),
+            hour: Some(7),
+            subscribers: Some(vec![" ana@x.com ".into(), "".into()]),
+            ..Default::default()
+        })
+        .expect("valid patch");
+        assert_eq!(s.mode, ScheduleMode::Once);
+        assert_eq!(s.date.as_deref(), Some("2026-06-20"));
+        assert_eq!(s.subscribers.as_deref(), Some(&["ana@x.com".to_string()][..]));
+        // Empty subscriber list clears back to the global fallback.
+        apply_patch(&mut s, SchedulePatch {
+            subscribers: Some(vec![]),
+            ..Default::default()
+        })
+        .expect("clear");
+        assert!(s.subscribers.is_none());
     }
 
     #[test]

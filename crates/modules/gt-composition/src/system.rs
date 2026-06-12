@@ -164,9 +164,15 @@ pub fn system_router(state: SystemApiState) -> Router {
         .route("/api/v1/system/config", get(get_config).put(put_config))
         .route("/api/v1/system/archive/run", post(run_archive_now))
         .route(
-            "/api/v1/system/report/schedule",
-            get(get_report_schedule).put(put_report_schedule),
+            "/api/v1/system/report/schedules",
+            get(list_report_schedules).post(create_report_schedule),
         )
+        .route(
+            "/api/v1/system/report/schedules/:id",
+            axum::routing::put(update_report_schedule).delete(delete_report_schedule),
+        )
+        .route("/api/v1/system/report/schedules/:id/run", post(run_report_schedule))
+        .route("/api/v1/system/report/kinds", get(list_report_kinds))
         .route(
             "/api/v1/system/report/subscribers",
             get(list_report_subscribers).post(add_report_subscriber),
@@ -175,7 +181,6 @@ pub fn system_router(state: SystemApiState) -> Router {
             "/api/v1/system/report/subscribers/:email",
             axum::routing::delete(remove_report_subscriber).patch(toggle_report_subscriber),
         )
-        .route("/api/v1/system/report/run", post(run_report_now))
         .with_state(state)
 }
 
@@ -381,87 +386,112 @@ async fn report_workspace(st: &SystemApiState) -> String {
         .unwrap_or_else(|| "default".to_string())
 }
 
-async fn get_report_schedule(
+async fn list_report_schedules(
     State(st): State<SystemApiState>,
     headers: axum::http::HeaderMap,
 ) -> Response {
     if let Err(resp) = authorize(&st, &headers, READ_SCOPE, &Method::GET) {
         return resp;
     }
-    // Transitional shim (full CRUD: hq-c4f920): expose the FIRST schedule in
-    // the legacy scalar shape, or the defaults when none exist yet.
-    let report = st
-        .config
-        .read()
-        .await
-        .report_schedules
-        .first()
-        .cloned()
-        .unwrap_or(crate::report_scheduler::ReportSchedule {
-            enabled: false,
-            ..Default::default()
-        });
-    (StatusCode::OK, Json(report)).into_response()
+    let schedules = st.config.read().await.report_schedules.clone();
+    (StatusCode::OK, Json(serde_json::json!({ "schedules": schedules }))).into_response()
 }
 
-/// Partial schedule update; `last_sent_date` is daemon bookkeeping and not
-/// patchable.
-#[derive(Debug, Deserialize)]
-struct ReportSchedulePatch {
-    enabled: Option<bool>,
-    hour: Option<u8>,
-    minute: Option<u8>,
-    tz_offset_minutes: Option<i64>,
-    rig: Option<String>,
-    workspace: Option<String>,
-}
-
-async fn put_report_schedule(
+async fn create_report_schedule(
     State(st): State<SystemApiState>,
     headers: axum::http::HeaderMap,
-    Json(patch): Json<ReportSchedulePatch>,
+    Json(patch): Json<crate::report_scheduler::SchedulePatch>,
+) -> Response {
+    if let Err(resp) = authorize(&st, &headers, WRITE_SCOPE, &Method::POST) {
+        return resp;
+    }
+    let svc = match report_service(&st) {
+        Ok(svc) => svc,
+        Err(resp) => return resp,
+    };
+    match svc.create_schedule(patch).await {
+        Ok(s) => (StatusCode::OK, Json(s)).into_response(),
+        Err(e) => (StatusCode::BAD_REQUEST, e).into_response(),
+    }
+}
+
+async fn update_report_schedule(
+    State(st): State<SystemApiState>,
+    headers: axum::http::HeaderMap,
+    axum::extract::Path(id): axum::extract::Path<String>,
+    Json(patch): Json<crate::report_scheduler::SchedulePatch>,
 ) -> Response {
     if let Err(resp) = authorize(&st, &headers, WRITE_SCOPE, &Method::PUT) {
         return resp;
     }
-    if patch.hour.is_some_and(|h| h > 23) || patch.minute.is_some_and(|m| m > 59) {
-        return (StatusCode::BAD_REQUEST, "hour 0-23, minute 0-59").into_response();
+    let svc = match report_service(&st) {
+        Ok(svc) => svc,
+        Err(resp) => return resp,
+    };
+    match svc.update_schedule(&id, patch).await {
+        Ok(s) => (StatusCode::OK, Json(s)).into_response(),
+        Err(e) if e.starts_with("unknown schedule") => {
+            (StatusCode::NOT_FOUND, e).into_response()
+        }
+        Err(e) => (StatusCode::BAD_REQUEST, e).into_response(),
     }
-    // Transitional shim (full CRUD: hq-c4f920): patch the FIRST schedule,
-    // creating a disabled Daily one when the list is empty.
-    let mut cfg = st.config.write().await;
-    if cfg.report_schedules.is_empty() {
-        cfg.report_schedules.push(crate::report_scheduler::ReportSchedule {
-            enabled: false,
-            ..Default::default()
-        });
+}
+
+async fn delete_report_schedule(
+    State(st): State<SystemApiState>,
+    headers: axum::http::HeaderMap,
+    axum::extract::Path(id): axum::extract::Path<String>,
+) -> Response {
+    if let Err(resp) = authorize(&st, &headers, WRITE_SCOPE, &Method::DELETE) {
+        return resp;
     }
-    let r = cfg.report_schedules.first_mut().expect("just ensured");
-    if let Some(v) = patch.enabled {
-        r.enabled = v;
+    let svc = match report_service(&st) {
+        Ok(svc) => svc,
+        Err(resp) => return resp,
+    };
+    match svc.delete_schedule(&id).await {
+        Ok(()) => (StatusCode::OK, Json(serde_json::json!({ "ok": true }))).into_response(),
+        Err(e) => (StatusCode::NOT_FOUND, e).into_response(),
     }
-    if let Some(v) = patch.hour {
-        r.hour = v;
+}
+
+async fn run_report_schedule(
+    State(st): State<SystemApiState>,
+    headers: axum::http::HeaderMap,
+    axum::extract::Path(id): axum::extract::Path<String>,
+) -> Response {
+    let claims = match authorize(&st, &headers, WRITE_SCOPE, &Method::POST) {
+        Ok(claims) => claims,
+        Err(resp) => return resp,
+    };
+    let svc = match report_service(&st) {
+        Ok(svc) => svc,
+        Err(resp) => return resp,
+    };
+    let schedule = match svc.resolve_schedule(Some(&id)).await {
+        Ok(s) => s,
+        Err(e) => return (StatusCode::NOT_FOUND, e).into_response(),
+    };
+    match svc.send_schedule(&schedule, &claims.sub).await {
+        Ok(queued) => {
+            (StatusCode::OK, Json(serde_json::json!({ "queued": queued }))).into_response()
+        }
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
     }
-    if let Some(v) = patch.minute {
-        r.minute = v;
+}
+
+async fn list_report_kinds(
+    State(st): State<SystemApiState>,
+    headers: axum::http::HeaderMap,
+) -> Response {
+    if let Err(resp) = authorize(&st, &headers, READ_SCOPE, &Method::GET) {
+        return resp;
     }
-    if let Some(v) = patch.tz_offset_minutes {
-        r.tz_offset_minutes = v.clamp(-14 * 60, 14 * 60);
-    }
-    if let Some(v) = patch.rig {
-        r.rig = v;
-    }
-    if let Some(v) = patch.workspace {
-        r.workspace = v;
-    }
-    let first = r.clone();
-    let snapshot = cfg.clone();
-    drop(cfg);
-    if let Some(path) = &st.config_path {
-        persist_config(path, &snapshot);
-    }
-    (StatusCode::OK, Json(first)).into_response()
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({ "kinds": crate::report_scheduler::kinds() })),
+    )
+        .into_response()
 }
 
 async fn list_report_subscribers(
@@ -561,31 +591,6 @@ async fn toggle_report_subscriber(
             (StatusCode::NOT_FOUND, format!("unknown subscriber {e}")).into_response()
         }
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
-    }
-}
-
-async fn run_report_now(
-    State(st): State<SystemApiState>,
-    headers: axum::http::HeaderMap,
-) -> Response {
-    let claims = match authorize(&st, &headers, WRITE_SCOPE, &Method::POST) {
-        Ok(claims) => claims,
-        Err(resp) => return resp,
-    };
-    let svc = match report_service(&st) {
-        Ok(svc) => svc,
-        Err(resp) => return resp,
-    };
-    // Transitional: no id ⇒ the single schedule (full per-id run: hq-c4f920).
-    let schedule = match svc.resolve_schedule(None).await {
-        Ok(s) => s,
-        Err(e) => return (StatusCode::BAD_REQUEST, e).into_response(),
-    };
-    match svc.send_schedule(&schedule, &claims.sub).await {
-        Ok(queued) => {
-            (StatusCode::OK, Json(serde_json::json!({ "queued": queued }))).into_response()
-        }
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
     }
 }
 
