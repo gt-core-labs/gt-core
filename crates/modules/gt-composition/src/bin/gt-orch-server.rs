@@ -251,6 +251,9 @@ async fn main() -> anyhow::Result<()> {
     let event_root_for_reconcile = event_root.clone();
     // Keep a copy for the polecat Knowledge prompt reader (hq-polecat-knowledge.1).
     let event_root_for_polecat = event_root.clone();
+    // Keep a copy for the polecat heartbeat emitter (hq-e5b288): appends AgentEvent::Heartbeat
+    // for each watched session after every supervisor tick so the MCP audit trail reflects liveness.
+    let event_root_for_heartbeat = event_root.clone();
     let DaemonRoot {
         handle,
         sched,
@@ -543,6 +546,8 @@ async fn main() -> anyhow::Result<()> {
     let tick_secs = env_usize("GT_POLECAT_TICK_SECS", 15) as u64;
     let sup_timer = supervisor.clone();
     let alloc_timer = allocator.clone();
+    let heartbeat_log = Arc::new(EventLog::new(Some(event_root_for_heartbeat)));
+    let heartbeat_ws = ws_slug.clone();
     let pol_timer = tokio::spawn(async move {
         let mut tick = tokio::time::interval(Duration::from_secs(tick_secs));
         tick.tick().await; // skip the immediate first fire
@@ -560,6 +565,16 @@ async fn main() -> anyhow::Result<()> {
                 .unwrap_or(0);
             if reslung > 0 {
                 eprintln!("[gt-orch-server] re-slung {reslung} dead polecat(s)");
+            }
+            // Emit MCP agent heartbeats for all still-watched polecats (hq-e5b288): after the
+            // tick, the watched set only contains sessions that are alive or being re-slung.
+            // Best-effort: a log failure never aborts the supervision loop.
+            let ws_opt = Some(heartbeat_ws.as_str());
+            for session in sup_timer.watched_sessions() {
+                let ev = gt_agent::AgentEvent::Heartbeat { session };
+                if let Err(e) = heartbeat_log.append(ws_opt, ev) {
+                    eprintln!("[gt-orch-server] heartbeat append failed: {e}");
+                }
             }
         }
     });

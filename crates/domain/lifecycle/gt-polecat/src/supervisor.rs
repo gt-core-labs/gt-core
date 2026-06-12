@@ -350,6 +350,12 @@ impl PolecatSupervisor {
     }
 
     /// Session ids of every supervised polecat whose env carries `GT_HOOK_ACCOUNT == account`.
+    /// All session ids currently watched by the supervisor — alive or pending re-sling.
+    /// Used to emit MCP agent heartbeats after each tick without changing tick's return type.
+    pub fn watched_sessions(&self) -> Vec<String> {
+        self.state.lock().unwrap().watched.keys().cloned().collect()
+    }
+
     /// Used by the quota-rotation observer to detect in-flight polecats at risk when their account
     /// is rotated (`hq-quota-refinement.3`). Returns an empty vec when none match.
     pub fn sessions_for_account(&self, account: &str) -> Vec<String> {
