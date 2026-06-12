@@ -1880,29 +1880,29 @@ async fn build_domain_router(
     // handlers but must stay on the file channel). Otherwise the existing file-based channel under
     // GT_CHANNEL_ROOT is used, EXACTLY as before — flipping GT_EVENTLOG_PG off restores it. With the
     // PG queue, mcp-server and orchd share NO filesystem for dispatch (the .11 decoupling).
-    let convoy_handler = {
-        let handler = ConvoyHandler::new(event_log.clone());
+    // Build the shared dispatch sink once — convoy AND agent both bridge through it so
+    // convoy.launch members and agent.spawn(bead=…) both sling real polecats via orchd.
+    let dispatch_sink: Option<Arc<gt_channel::DispatchSink>> = {
         let dispatch_name =
             std::env::var("GT_DISPATCH_CHANNEL").unwrap_or_else(|_| "dispatch".to_string());
         let want_pg = std::env::var("GT_EVENTLOG_PG")
             .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"))
             .unwrap_or(false);
         if want_pg {
-            // PG queue over the SAME GT_PG_URL the domain handlers already use (in scope here).
             match gt_channel::PgQueue::connect(&dispatch_pg_url, &dispatch_name)
                 .and_then(|q| q.ensure_schema().map(|()| q))
             {
                 Ok(queue) => {
                     eprintln!(
-                        "[gt-mcp-server] convoy→scheduler bridge on (Postgres queue public.dispatch_jobs, channel {dispatch_name}) — GT_EVENTLOG_PG"
+                        "[gt-mcp-server] convoy/agent→scheduler bridge on (Postgres queue public.dispatch_jobs, channel {dispatch_name}) — GT_EVENTLOG_PG"
                     );
-                    handler.with_dispatch_channel(Arc::new(gt_channel::DispatchSink::Pg(queue)))
+                    Some(Arc::new(gt_channel::DispatchSink::Pg(queue)))
                 }
                 Err(e) => {
                     eprintln!(
-                        "[gt-mcp-server] convoy→scheduler bridge off — PG queue init failed: {e}"
+                        "[gt-mcp-server] convoy/agent→scheduler bridge off — PG queue init failed: {e}"
                     );
-                    handler
+                    None
                 }
             }
         } else {
@@ -1910,25 +1910,31 @@ async fn build_domain_router(
                 Ok(root) => match gt_channel::Channel::open(&root, &dispatch_name) {
                     Ok(channel) => {
                         eprintln!(
-                            "[gt-mcp-server] convoy→scheduler bridge on (file channel {root}/{dispatch_name}; set GT_EVENTLOG_PG=1 for the Postgres queue)"
+                            "[gt-mcp-server] convoy/agent→scheduler bridge on (file channel {root}/{dispatch_name}; set GT_EVENTLOG_PG=1 for the Postgres queue)"
                         );
-                        handler
-                            .with_dispatch_channel(Arc::new(gt_channel::DispatchSink::File(channel)))
+                        Some(Arc::new(gt_channel::DispatchSink::File(channel)))
                     }
                     Err(e) => {
                         eprintln!(
-                            "[gt-mcp-server] convoy→scheduler bridge off — channel open failed at {root}/{dispatch_name}: {e}"
+                            "[gt-mcp-server] convoy/agent→scheduler bridge off — channel open failed at {root}/{dispatch_name}: {e}"
                         );
-                        handler
+                        None
                     }
                 },
                 Err(_) => {
                     eprintln!(
-                        "[gt-mcp-server] convoy→scheduler bridge off — GT_CHANNEL_ROOT unset"
+                        "[gt-mcp-server] convoy/agent→scheduler bridge off — GT_CHANNEL_ROOT unset"
                     );
-                    handler
+                    None
                 }
             }
+        }
+    };
+    let convoy_handler = {
+        let handler = ConvoyHandler::new(event_log.clone());
+        match &dispatch_sink {
+            Some(sink) => handler.with_dispatch_channel(sink.clone()),
+            None => handler,
         }
     };
     // graph.* server-side provisioner (hq-vcs-connections.4): graph.refresh no longer trusts a
@@ -1959,7 +1965,13 @@ async fn build_domain_router(
             MergeHandler::new(event_log.clone()).with_rig_pools(ws_pools.clone()),
         ))
         .register(Arc::new(convoy_handler))
-        .register(Arc::new(AgentHandler::new(event_log.clone())))
+        .register(Arc::new({
+            let handler = AgentHandler::new(event_log.clone());
+            match &dispatch_sink {
+                Some(sink) => handler.with_dispatch_channel(sink.clone()),
+                None => handler,
+            }
+        }))
         .register(Arc::new(QuotaHandler::new(event_log.clone())))
         // notify.* — operator notification channel (hq-notifications): agents write
         // via notify.send; the browser bell polls/streams the same PG table.

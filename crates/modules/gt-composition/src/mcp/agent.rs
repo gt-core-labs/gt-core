@@ -28,8 +28,10 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 
 use gt_agent::{AgentEvent, Session, SessionRegistry, SessionRole, SessionState};
+use gt_channel::DispatchSink;
 use gt_mcp_server::{DomainCtx, DomainHandler};
 use gt_module::McpTool;
+use gt_scheduling::dispatch::DispatchPayload;
 use gt_store_dolt::AppError;
 
 use super::eventlog::EventLog;
@@ -41,12 +43,41 @@ const NS: &str = "agent.";
 /// Event-sourced handler for the `agent.*` tool namespace.
 pub struct AgentHandler {
     log: Arc<EventLog>,
+    /// Optional bridge to the orchd scheduler. When wired, `agent.spawn` with a `bead`
+    /// argument drops a `{bead,priority}` request on the same channel orchd's dispatch
+    /// loop consumes, causing a real polecat to sling. `None` ⇒ spawn only records the
+    /// event (in-memory tests, GT_CHANNEL_ROOT/GT_EVENTLOG_PG unset).
+    dispatch: Option<Arc<DispatchSink>>,
 }
 
 impl AgentHandler {
     /// Wrap the per-workspace event log.
     pub fn new(log: Arc<EventLog>) -> Self {
-        Self { log }
+        Self { log, dispatch: None }
+    }
+
+    /// Wire the dispatch sink so `agent.spawn` with a `bead` argument bridges to orchd.
+    pub fn with_dispatch_channel(mut self, channel: Arc<DispatchSink>) -> Self {
+        self.dispatch = Some(channel);
+        self
+    }
+
+    /// Drop a `{bead,priority}` dispatch request on the channel — orchd picks it up and
+    /// slings a real polecat. Best-effort: a failure logs but never fails the spawn call.
+    fn bridge_to_scheduler(&self, channel: &DispatchSink, bead: &str) {
+        let payload = DispatchPayload {
+            bead: bead.to_string(),
+            title: None,
+            priority: 1,
+        };
+        match serde_json::to_vec(&payload) {
+            Ok(bytes) => {
+                if let Err(e) = channel.emit(&bytes) {
+                    eprintln!("[agent] dispatch bridge: emit failed for {bead} — {e}");
+                }
+            }
+            Err(e) => eprintln!("[agent] dispatch bridge: serialize failed — {e}"),
+        }
     }
 
     /// Rebuild the session registry from the workspace's agent events.
@@ -71,7 +102,9 @@ impl AgentHandler {
 }
 
 /// `agent.spawn` payload: a session id + rig, with an optional role/crew (the
-/// `Spawned` event's own defaults apply when omitted).
+/// `Spawned` event's own defaults apply when omitted). `bead` is optional: when
+/// provided and the dispatch channel is wired, the bead is bridged to the orchd
+/// scheduler so a real tmux polecat actually slings.
 #[derive(Deserialize)]
 struct SpawnArgs {
     session: String,
@@ -80,6 +113,9 @@ struct SpawnArgs {
     role: SessionRole,
     #[serde(default)]
     crew: Option<String>,
+    /// Bead id to dispatch to orchd after recording the spawn event.
+    #[serde(default)]
+    bead: Option<String>,
 }
 
 #[async_trait]
@@ -92,12 +128,13 @@ impl DomainHandler for AgentHandler {
         vec![
             descriptor(
                 "agent.spawn",
-                "Record a new agent session (spawn) under a session id + rig.",
+                "Record a new agent session (spawn) under a session id + rig. Pass `bead` to also dispatch to orchd so a real polecat slings.",
                 &[
                     req("session", "string"),
                     req("rig", "string"),
                     opt("role", "string"),
                     opt("crew", "string"),
+                    opt("bead", "string"),
                 ],
             ),
             descriptor(
@@ -140,7 +177,8 @@ impl DomainHandler for AgentHandler {
                     )));
                 }
                 let session = a.session.clone();
-                self.record(
+                let bead = a.bead.clone();
+                let result = self.record(
                     ws,
                     AgentEvent::Spawned {
                         session: a.session,
@@ -154,7 +192,13 @@ impl DomainHandler for AgentHandler {
                         tmux_socket: a.role.tmux_socket(ws.unwrap_or("default")),
                     },
                     &session,
-                )
+                )?;
+                // Bridge the bead to orchd so a real tmux polecat slings. Best-effort:
+                // the spawn event is already recorded regardless of dispatch outcome.
+                if let (Some(bead_id), Some(channel)) = (&bead, &self.dispatch) {
+                    self.bridge_to_scheduler(channel, bead_id);
+                }
+                Ok(result)
             }
             "agent.heartbeat" => {
                 let session = self.require_session(ws, &ctx.args)?;
