@@ -13,11 +13,13 @@
 //! ## Auth
 //!
 //! A shared secret (`GT_INBOUND_WEBHOOK_SECRET`) carried in the
-//! `x-gt-inbound-secret` header, compared via SHA-256 digests so the check is
+//! `x-gt-inbound-secret` header OR the `secret` query parameter (providers
+//! like Resend let you set the endpoint URL but not custom headers — the
+//! query form rides inside TLS), compared via SHA-256 digests so the check is
 //! effectively constant-time. Providers that sign deliveries (Mailgun HMAC,
-//! SNS signatures) can layer a verifying parser later — the secret header is
-//! the provider-agnostic baseline and every provider's forwarder can attach a
-//! custom header. No secret configured ⇒ `503` (never silently open).
+//! svix) can layer a verifying parser later — the shared secret is the
+//! provider-agnostic baseline. No secret configured ⇒ `503` (never silently
+//! open).
 //!
 //! ## Payload
 //!
@@ -100,7 +102,21 @@ fn pick(v: &Value, keys: &[&str]) -> Option<String> {
 /// Normalize a provider JSON payload into the mailbox's [`InboundEmail`]
 /// shape. `None` when no sender can be extracted — the one field the mailbox
 /// cannot proceed without (it resolves the sender against the member mirror).
+///
+/// Event-wrapper payloads (Resend: `{"type":"email.received","data":{…}}`)
+/// are unwrapped to their `data` object first; flat payloads (Mailgun routes,
+/// generic forwarders) normalize as-is.
 fn normalize(payload: &Value) -> Option<InboundEmail> {
+    if let Some(inner) = payload.get("data").filter(|d| d.is_object()) {
+        if let Some(msg) = normalize_flat(inner) {
+            return Some(msg);
+        }
+    }
+    normalize_flat(payload)
+}
+
+/// One vocabulary table over a flat (un-wrapped) payload.
+fn normalize_flat(payload: &Value) -> Option<InboundEmail> {
     let from = pick(payload, &["from", "sender", "From"])?;
     Some(InboundEmail {
         from,
@@ -110,8 +126,11 @@ fn normalize(payload: &Value) -> Option<InboundEmail> {
             &["body", "text", "stripped-text", "body-plain", "body_plain"],
         )
         .unwrap_or_default(),
-        message_id: pick(payload, &["message_id", "Message-Id", "Message-ID", "message-id"])
-            .unwrap_or_else(|| ulid::Ulid::new().to_string()),
+        message_id: pick(
+            payload,
+            &["message_id", "Message-Id", "Message-ID", "message-id", "email_id"],
+        )
+        .unwrap_or_else(|| ulid::Ulid::new().to_string()),
         in_reply_to: pick(payload, &["in_reply_to", "In-Reply-To", "in-reply-to"]),
     })
 }
@@ -143,6 +162,7 @@ fn write_message(dir: &PathBuf, msg: &InboundEmail) -> std::io::Result<()> {
 /// - `200` with the stored message id on success.
 async fn receive(
     State(st): State<InboundEmailState>,
+    axum::extract::RawQuery(query): axum::extract::RawQuery,
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
@@ -153,10 +173,21 @@ async fn receive(
         )
             .into_response();
     };
-    let authed = headers
+    // Header form, or `?secret=` for providers that cannot set custom headers
+    // (Resend). The query value is taken verbatim — generate the secret
+    // URL-safe (alnum) so no percent-encoding ambiguity exists.
+    let provided = headers
         .get(SECRET_HEADER)
         .and_then(|v| v.to_str().ok())
-        .is_some_and(|provided| secret_matches(provided, expected));
+        .map(str::to_string)
+        .or_else(|| {
+            query.as_deref().and_then(|q| {
+                q.split('&')
+                    .find_map(|kv| kv.strip_prefix("secret="))
+                    .map(str::to_string)
+            })
+        });
+    let authed = provided.is_some_and(|p| secret_matches(&p, expected));
     if !authed {
         return (StatusCode::UNAUTHORIZED, "invalid webhook secret").into_response();
     }
@@ -190,8 +221,9 @@ mod tests {
         d
     }
 
-    async fn post(
+    async fn post_uri(
         state: InboundEmailState,
+        uri: &str,
         secret: Option<&str>,
         body: &str,
     ) -> (StatusCode, String) {
@@ -199,7 +231,7 @@ mod tests {
         let app = inbound_email_router(state);
         let mut req = axum::http::Request::builder()
             .method("POST")
-            .uri(INBOUND_EMAIL_PATH)
+            .uri(uri)
             .header("content-type", "application/json");
         if let Some(s) = secret {
             req = req.header(SECRET_HEADER, s);
@@ -211,6 +243,44 @@ mod tests {
         let status = res.status();
         let bytes = axum::body::to_bytes(res.into_body(), 64 * 1024).await.unwrap();
         (status, String::from_utf8_lossy(&bytes).into_owned())
+    }
+
+    async fn post(
+        state: InboundEmailState,
+        secret: Option<&str>,
+        body: &str,
+    ) -> (StatusCode, String) {
+        post_uri(state, INBOUND_EMAIL_PATH, secret, body).await
+    }
+
+    #[tokio::test]
+    async fn secret_via_query_param_works_for_headerless_providers() {
+        let d = dir("query");
+        let st = InboundEmailState::new(Some("s3cret".into()), &d);
+        let uri = format!("{INBOUND_EMAIL_PATH}?secret=s3cret");
+        // Resend event-wrapper shape: fields nested under `data`.
+        let payload = r#"{
+            "type": "email.received",
+            "data": {
+                "email_id": "re-001",
+                "from": "ana@x.com",
+                "subject": "estado",
+                "text": "ping"
+            }
+        }"#;
+        let (status, body) = post_uri(st.clone(), &uri, None, payload).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let polled = gt_notify::FileInbox::new(&d).poll().expect("poll");
+        assert_eq!(polled.len(), 1);
+        assert_eq!(polled[0].from, "ana@x.com");
+        assert_eq!(polled[0].body, "ping");
+        assert_eq!(polled[0].message_id, "re-001");
+
+        // Wrong query secret still 401.
+        let bad = format!("{INBOUND_EMAIL_PATH}?secret=nope");
+        let (status, _) = post_uri(st, &bad, None, payload).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        let _ = std::fs::remove_dir_all(&d);
     }
 
     #[tokio::test]
