@@ -164,6 +164,11 @@ impl WorkspaceQuota for EventLogQuota {
         let records = self.log.read_kind(Some(workspace), "quota.window_reset.v1").map_err(lift)?;
         Ok(records.into_iter().map(|r| r.payload).collect())
     }
+
+    async fn token_samples(&self, workspace: &str) -> Result<Vec<serde_json::Value>, AppError> {
+        let records = self.log.read_kind(Some(workspace), "quota.tokens_sampled.v1").map_err(lift)?;
+        Ok(records.into_iter().map(|r| r.payload).collect())
+    }
 }
 
 /// REST backing for the deploy-global account catalog (`gt_quota::AccountCatalog`,

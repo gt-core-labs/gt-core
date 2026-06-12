@@ -80,6 +80,15 @@ pub trait WorkspaceQuota: Send + Sync {
         let _ = workspace;
         Ok(vec![])
     }
+
+    /// All `quota.tokens_sampled.v1` payloads for `workspace`, ordered by log position.
+    /// Each element is `{account, session, model, input, output, cache_read, cache_creation,
+    /// now_secs}` — the per-call sample stream. Default impl returns empty; the file/PG
+    /// implementation overrides.
+    async fn token_samples(&self, workspace: &str) -> Result<Vec<serde_json::Value>, AppError> {
+        let _ = workspace;
+        Ok(vec![])
+    }
 }
 
 /// The deploy-global catalog of onboarded claude accounts — every account whose credentials live
@@ -176,6 +185,7 @@ impl QuotaApiState {
 pub fn quota_router(state: QuotaApiState) -> Router {
     Router::new()
         .route("/history", get(list_history))
+        .route("/tokens", get(list_tokens))
         .route("/", get(list_accounts))
         // `/account` (singular) is the onboarding collection POST — distinct from `/:account` so the
         // register body carries the id, not the path (the account does not exist yet).
@@ -441,6 +451,21 @@ async fn list_history(
     Ok(Json(json!({ "resets": resets })))
 }
 
+/// `GET /tokens` — all `quota.tokens_sampled.v1` payloads for this workspace, in log order.
+/// Each element is `{account, session, model, input, output, cache_read, cache_creation,
+/// now_secs}`. Used by the admin quota page to chart per-model token consumption.
+#[cfg_attr(feature = "axum", utoipa::path(
+    get, path = "/tokens",
+    responses((status = 200, description = "Ordered list of per-call token samples for charting")),
+))]
+async fn list_tokens(
+    State(st): State<QuotaApiState>,
+    ctx: WorkspaceContext,
+) -> Result<Json<Value>, ApiError> {
+    let samples = st.quota.token_samples(ctx.workspace().as_str()).await?;
+    Ok(Json(json!({ "samples": samples })))
+}
+
 /// Replay → execute → append: the REST mirror of the MCP `QuotaHandler::run`.
 ///
 /// Rehydrates the registry from the workspace log, runs the command's decide/apply against it
@@ -463,6 +488,7 @@ where
 #[derive(utoipa::OpenApi)]
 #[openapi(paths(
     list_history,
+    list_tokens,
     list_accounts,
     get_account,
     sample_account,

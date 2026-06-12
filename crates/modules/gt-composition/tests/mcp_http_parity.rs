@@ -161,6 +161,8 @@ fn parity_map(ns: &str) -> Vec<Route> {
         "quota" => vec![
             // Token window history (quota.window_reset.v1 log scan) — REST-only chart data.
             rt("GET", "/history", None),
+            // Per-call token sample stream (quota.tokens_sampled.v1 log scan) — REST-only chart data.
+            rt("GET", "/tokens", None),
             rt("GET", "/", Some("quota.list")),
             rt("GET", "/{account}", Some("quota.info")),
             rt("POST", "/{account}/sample", Some("quota.sample")),
