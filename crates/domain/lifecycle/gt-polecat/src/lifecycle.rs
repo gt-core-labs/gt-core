@@ -275,6 +275,44 @@ impl SpawnTemplate {
         }
     }
 
+    /// Build a [`SpawnTemplate`] for one catalog rig from explicit arguments (`hq-2ae5fe`),
+    /// instead of the process env [`SpawnTemplate::from_env`] reads. The composition root calls
+    /// this once per rig-catalog entry at startup, passing the rig's `name`/`prefix`/resolved
+    /// worktree root plus the shared fields (command/args/heartbeat_dir/base_env) inherited from
+    /// the base env-built template — so every rig's polecats launch the same agent the same way,
+    /// just in *their* rig's checkout.
+    ///
+    /// `base_env` is the base template's env, which still carries the *base* rig's `GT_RIG` /
+    /// `GT_RIG_PATH`; both are overwritten here so a slung polecat sees ITS rig, not the boot one.
+    pub fn for_rig(
+        name: impl Into<String>,
+        prefix: impl Into<String>,
+        workdir: PathBuf,
+        command: impl Into<String>,
+        args: Vec<String>,
+        mut base_env: Vec<(String, String)>,
+        heartbeat_dir: PathBuf,
+    ) -> Self {
+        let rig = name.into();
+        let set = |env: &mut Vec<(String, String)>, key: &str, value: String| {
+            match env.iter_mut().find(|(k, _)| k == key) {
+                Some((_, v)) => *v = value,
+                None => env.push((key.to_string(), value)),
+            }
+        };
+        set(&mut base_env, "GT_RIG", rig.clone());
+        set(&mut base_env, "GT_RIG_PATH", workdir.display().to_string());
+        SpawnTemplate {
+            rig,
+            prefix: prefix.into(),
+            workdir,
+            command: command.into(),
+            args,
+            base_env,
+            heartbeat_dir,
+        }
+    }
+
     /// Build the per-member [`SpawnSpec`]. `member` is the dispatched convoy member / slung
     /// bead: it becomes both the polecat-name suffix and the pinned `GT_HOOK_BEAD`. `convoy`
     /// is carried in `GT_CONVOY` for context (mirrors the Go `gt sling <convoy> <member>`
@@ -475,6 +513,39 @@ mod lifecycle_tests {
         // The user + the real command sit between the runuser flags and the prompt.
         assert!(spec.args.iter().any(|a| a == "claude"));
         assert!(spec.args.iter().any(|a| a == "gtpolecat"));
+    }
+
+    #[test]
+    fn for_rig_builds_template_from_explicit_args_and_repins_rig_env() {
+        // hq-2ae5fe: per-rig template from catalog values, not env vars. The inherited base_env
+        // still carries the BASE rig's GT_RIG/GT_RIG_PATH — for_rig must overwrite both so the
+        // polecat sees its own rig.
+        let base = template();
+        let t = SpawnTemplate::for_rig(
+            "gtweb",
+            "gtweb",
+            PathBuf::from("/rig-wt/gtweb"),
+            base.command.clone(),
+            base.args.clone(),
+            vec![
+                ("GT_ROLE".to_string(), "polecat".to_string()),
+                ("GT_RIG".to_string(), "gtcore".to_string()),
+                ("GT_RIG_PATH".to_string(), "/rig-wt/gtcore".to_string()),
+            ],
+            base.heartbeat_dir.clone(),
+        );
+        let spec = t.spec_for("ws", "gtweb-968172");
+        assert_eq!(spec.session, "gtweb-gtweb-968172");
+        assert_eq!(spec.rig, "gtweb");
+        assert_eq!(spec.workdir, PathBuf::from("/rig-wt/gtweb"));
+        assert!(spec.env.iter().any(|(k, v)| k == "GT_RIG" && v == "gtweb"));
+        assert!(spec
+            .env
+            .iter()
+            .any(|(k, v)| k == "GT_RIG_PATH" && v == "/rig-wt/gtweb"));
+        // Shared fields inherited untouched.
+        assert_eq!(spec.command, "claude");
+        assert!(spec.env.iter().any(|(k, v)| k == "GT_ROLE" && v == "polecat"));
     }
 
     #[test]
