@@ -24,6 +24,7 @@ pub mod expectations;
 pub mod http;
 pub mod keychain;
 pub mod module;
+pub mod oauth_usage;
 pub mod probe;
 pub mod repo;
 
@@ -41,6 +42,10 @@ pub use expectations::{predict, Prediction};
 #[cfg(feature = "axum")]
 pub use http::{quota_router, AccountCatalog, ApiDoc, QuotaApiState, WorkspaceQuota};
 pub use keychain::{CredentialRecord, InMemoryKeychain, Keychain};
+pub use oauth_usage::{
+    parse_credentials_json, parse_refresh_response, parse_usage_response, probe_from_usage,
+    render_credentials_json, OauthCredentials, UsageSnapshot, UsageWindow, REFRESH_SKEW_MS,
+};
 #[cfg(feature = "axum")]
 pub use module::QuotaHttpModule;
 pub use module::QuotaModule;
@@ -48,4 +53,5 @@ pub use probe::{parse_anthropic_ratelimit, RatelimitHeaders};
 pub use repo::{InMemoryQuota, QuotaRepository, UsageSample};
 pub use state::{
     Account, AccountQuotaStatus, AccountRegistry, AccountWindow, Ewma, QuotaState, WindowKind,
+    DEFAULT_PLAN_LIMIT,
 };
