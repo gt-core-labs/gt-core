@@ -141,6 +141,7 @@ fn parity_map(ns: &str) -> Vec<Route> {
             rt("GET", "/{id}", None), // gt://doc/{id}
             rt("PATCH", "/{id}", Some("documents.update.execute")),
             rt("DELETE", "/{id}", Some("documents.remove.execute")),
+            rt("GET", "/{id}/download", None), // Raw document bytes download — REST-only streaming endpoint (hq-039316)
             // Share lifecycle (hq-web-extras.9) — REST-only capability URLs, no MCP tool sibling.
             // The public GET /share/{hash} read lives in a SEPARATE PublicApiDoc mounted outside
             // /api/v1/documents, so it never enters this namespace's served OpenAPI (no row here).
@@ -245,6 +246,9 @@ fn is_routable(tool: &str) -> bool {
         // lives on the `/auth/providers` surface (the gt-auth router, covered by its own OpenAPI
         // test), not the `workspace` module's `ApiDoc`.
         && !tool.starts_with("workspace.provider-")
+        // Vector-store retrieval (documents.retrieve.*): MCP-only semantic search over the document
+        // embedding index — no REST equivalent; streaming bytes use GET /{id}/download instead (hq-c488cb).
+        && tool != "documents.retrieve.execute"
 }
 
 /// The `(METHOD, path)` set a module's OpenAPI actually declares.
