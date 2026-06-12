@@ -347,8 +347,10 @@ pub fn polecat_prompt(workspace: &str, bead: &str, branch: &str) -> String {
     format!(
         "You are a gt polecat in workspace `{workspace}`. Your assigned bead is `{bead}`. \
          Begin your duties per CLAUDE.md. Work autonomously and do not ask for confirmation. \
-         When your work is committed on branch `{branch}`, signal completion by running EXACTLY \
-         this Bash command once: \
+         When your work is committed on branch `{branch}`, signal completion by calling \
+         the MCP tool `mcp__gt__merge_submit` with arguments \
+         {{\"bead\":\"{bead}\",\"branch\":\"{branch}\"}}. \
+         If the MCP tool is unavailable, fall back to this Bash command: \
          `d=\"$GT_CHANNEL_ROOT/merge-ready\"; mkdir -p \"$d\"; i=$(cat /proc/sys/kernel/random/uuid \
          2>/dev/null || date +%s%N); printf '{{\"bead\":\"%s\",\"branch\":\"%s\"}}' \"$GT_HOOK_BEAD\" \
          \"$GT_BRANCH\" > \"$d/.$i.tmp\" && mv \"$d/.$i.tmp\" \"$d/$i.event\"` \

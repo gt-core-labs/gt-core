@@ -88,7 +88,7 @@ fn enable(s: &mut SkillState, role: &str, skill: &str) {
 /// Build the canonical least-privilege catalog binding each automatic agent role to the minimal
 /// scope set its work needs. No role is granted `*`; an unbound role (e.g. `overseer`) gets nothing.
 ///
-/// - `polecat` → `issues.read`, `issues.write` (work + claim + transition its bead).
+/// - `polecat` → `issues.read`, `issues.write`, `merge.write` (work + claim + transition + submit merge).
 /// - `sheriff` → `merge.read`, `merge.write` (drive merges / github).
 /// - `refinery` → `merge.write` (submit MERGE_READY).
 /// - `witness` → `issues.read` (observe only).
@@ -101,6 +101,7 @@ pub fn agent_least_privilege_catalog() -> SkillCatalog {
     register(&mut s, "observe", &["issues.read"]);
 
     enable(&mut s, "polecat", "bead-work");
+    enable(&mut s, "polecat", "merge-submit");
     enable(&mut s, "sheriff", "merge-ops");
     enable(&mut s, "refinery", "merge-submit");
     enable(&mut s, "witness", "observe");
