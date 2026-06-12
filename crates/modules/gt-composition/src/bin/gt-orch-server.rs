@@ -45,6 +45,7 @@
 //! - `GT_METRICS_BIND` (`127.0.0.1:9099`) — Prometheus `/metrics` scrape endpoint (exposes
 //!   `gt_workspace_session_minutes` + the golden counters from this daemon process).
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -54,7 +55,8 @@ use gt_channel::Channel;
 use gt_composition::git_merge::GitMergePlugin;
 use gt_composition::mcp::eventlog::EventLog;
 use gt_composition::polecat::{
-    host_cap_from_metrics, AgentTokenMinter, PolecatSupervisorPlugin, ScopeResolver,
+    host_cap_from_metrics, rig_routing_from_catalog, AgentTokenMinter, PolecatSupervisorPlugin,
+    RigConfig, ScopeResolver,
 };
 use gt_composition::quota_rotation::{self, QuotaRotationPlugin};
 use gt_composition::session_reconcile::{ReapScope, ReapSink, SessionReconciler};
@@ -299,6 +301,66 @@ async fn main() -> anyhow::Result<()> {
         ),
     }
 
+    // Per-polecat git worktree root (hq-orchd-deploy.9), hoisted before the rig-catalog load so
+    // every routed rig inherits the same per-bead worktree isolation (session names embed the rig
+    // prefix, so one shared root never collides).
+    let polecat_worktree_root: Option<PathBuf> = std::env::var("GT_POLECAT_WORKTREE_ROOT")
+        .ok()
+        .filter(|v| !v.is_empty())
+        .map(PathBuf::from);
+
+    // Multi-rig dispatch routing (hq-d15050, epic hq-554308): with GT_PG_URL set, read the
+    // workspace's live rig catalog and build the per-prefix routing tables — bead prefix →
+    // RigConfig (polecat supervisor) and bead prefix → rig checkout (git-merge edge). Each rig's
+    // workdir is its resolved_worktree_root; per-rig templates inherit the boot template's shared
+    // fields via SpawnTemplate::for_rig. Without GT_PG_URL (or on any load failure) both maps stay
+    // empty and the daemon behaves exactly as the legacy single-rig deployment.
+    let (rig_configs, rig_paths): (HashMap<String, RigConfig>, HashMap<String, PathBuf>) =
+        match std::env::var("GT_PG_URL").ok().filter(|v| !v.is_empty()) {
+            Some(pg_url) => match gt_store_pg::WorkspacePool::connect(&pg_url, &ws_slug).await {
+                Ok(pool) => {
+                    use gt_rig::RigRepository;
+                    let repo = gt_rig::PgRigs::new(pool.pool().clone());
+                    match repo.list().await {
+                        Ok(rigs) => {
+                            eprintln!(
+                                "[gt-orch-server] rig catalog loaded — {} rig(s) registered",
+                                rigs.len()
+                            );
+                            let home = PathBuf::from(
+                                std::env::var("HOME").unwrap_or_else(|_| "/root".into()),
+                            );
+                            rig_routing_from_catalog(
+                                &rigs,
+                                &template,
+                                polecat_worktree_root.as_deref(),
+                                &ws_slug,
+                                &home,
+                            )
+                        }
+                        Err(e) => {
+                            eprintln!(
+                                "[gt-orch-server] rig catalog list failed: {e} — single-rig dispatch (boot template only)"
+                            );
+                            (HashMap::new(), HashMap::new())
+                        }
+                    }
+                }
+                Err(e) => {
+                    eprintln!(
+                        "[gt-orch-server] rig catalog PG connect failed: {e} — single-rig dispatch (boot template only)"
+                    );
+                    (HashMap::new(), HashMap::new())
+                }
+            },
+            None => {
+                eprintln!(
+                    "[gt-orch-server] GT_PG_URL unset — single-rig dispatch (boot template only)"
+                );
+                (HashMap::new(), HashMap::new())
+            }
+        };
+
     // Per-agent least-privilege token (hq-agent-provisioning.3): mint GT_TOKEN scoped to the
     // polecat's role so it acts as ITSELF, not the operator. Needs an RS256 signing key
     // (GT_JWT_RS256_PRIVATE_KEY_FILE); absent ⇒ polecats sling without a token (logged). Scopes
@@ -462,7 +524,10 @@ async fn main() -> anyhow::Result<()> {
     )
     // Emit agent.spawned/session-end onto the hub (hq-orchd.6) so the session-minutes
     // projector (registered inside daemon_root) feeds gt_workspace_session_minutes.
-    .with_session_events(handle.events_sender());
+    .with_session_events(handle.events_sender())
+    // Route dispatched beads to their rig by prefix (hq-0ecfec/hq-d15050): an empty map (no
+    // GT_PG_URL / empty catalog) is a no-op — every bead keeps the boot template.
+    .with_rig_configs(rig_configs);
     if let Some(tm) = agent_token {
         pol_plugin = pol_plugin.with_agent_token(tm);
     }
@@ -475,12 +540,12 @@ async fn main() -> anyhow::Result<()> {
     // Per-polecat git worktree (hq-orchd-deploy.9): with GT_POLECAT_WORKTREE_ROOT set, each sling
     // gets its own worktree off the rig checkout (branch = bead) so concurrent polecats don't race
     // on a shared HEAD (CLAUDE.md). Unset ⇒ the legacy single shared checkout, unchanged.
-    if let Some(root) = std::env::var("GT_POLECAT_WORKTREE_ROOT")
-        .ok()
-        .filter(|v| !v.is_empty())
-    {
-        eprintln!("[gt-orch-server] per-polecat worktrees under {root} (branch = bead, off the rig checkout)");
-        pol_plugin = pol_plugin.with_worktree_root(PathBuf::from(root));
+    if let Some(root) = &polecat_worktree_root {
+        eprintln!(
+            "[gt-orch-server] per-polecat worktrees under {} (branch = bead, off the rig checkout)",
+            root.display()
+        );
+        pol_plugin = pol_plugin.with_worktree_root(root.clone());
     } else {
         eprintln!("[gt-orch-server] GT_POLECAT_WORKTREE_ROOT unset — polecats share the rig checkout (single-polecat safe only)");
     }
@@ -529,9 +594,15 @@ async fn main() -> anyhow::Result<()> {
     // `merge.started.v1` it pushes <branch>:main from the rig checkout (rebasing on divergence) and
     // drives the slot to Merged/Failed — the arm that closes the autonomous loop. Registered on the
     // same hub relay as the polecat sling (both are real I/O, kept out of pure-state daemon_root).
-    pol_registry = pol_registry.register(GitMergePlugin::new(merge.clone(), rig_path.clone()));
+    // Routed by bead prefix (hq-c846f5): a gtweb bead's ff-merge runs from the gtweb checkout;
+    // unknown prefixes (or an empty catalog) fall back to the boot rig checkout.
+    pol_registry = pol_registry.register(GitMergePlugin::with_rig_paths(
+        merge.clone(),
+        rig_paths,
+        rig_path.clone(),
+    ));
     eprintln!(
-        "[gt-orch-server] git-merge edge on — branches land on main from rig checkout {}",
+        "[gt-orch-server] git-merge edge on — branches land on main from rig checkout {} (+ per-rig routing)",
         rig_path.display()
     );
     let pol_registry = Arc::new(pol_registry);

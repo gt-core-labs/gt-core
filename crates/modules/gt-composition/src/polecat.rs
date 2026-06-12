@@ -666,6 +666,70 @@ impl Plugin for PolecatSupervisorPlugin {
     }
 }
 
+/// Build the per-rig routing tables the daemon wires at boot (`hq-d15050`, epic hq-554308) from
+/// the workspace's live rig catalog: bead prefix → [`RigConfig`] for the polecat supervisor,
+/// and bead prefix → rig checkout path for the git-merge edge.
+///
+/// Each rig's workdir is its [`RigEntry::resolved_worktree_root`] (an explicit catalog override,
+/// else the `<home>/gastown-wt/<ws>/<name>` convention). The per-rig template inherits the boot
+/// template's shared fields (command/args/base_env/heartbeat_dir) via [`SpawnTemplate::for_rig`];
+/// `polecat_worktree_root` (the global `GT_POLECAT_WORKTREE_ROOT`) carries over so every rig's
+/// polecats get per-bead worktrees — session names embed the rig prefix, so one shared root never
+/// collides.
+///
+/// A rig whose resolved workdir does not exist on this host is skipped (logged): provisioning
+/// missing rig checkouts is explicitly out of scope for hq-554308, and skipping keeps its beads
+/// on the boot-template fallback instead of slinging into a dead directory.
+pub fn rig_routing_from_catalog(
+    rigs: &[gt_rig::RigEntry],
+    base: &SpawnTemplate,
+    polecat_worktree_root: Option<&std::path::Path>,
+    ws: &str,
+    home: &std::path::Path,
+) -> (
+    HashMap<String, RigConfig>,
+    HashMap<String, std::path::PathBuf>,
+) {
+    let mut configs = HashMap::new();
+    let mut paths = HashMap::new();
+    for rig in rigs {
+        let workdir = rig.resolved_worktree_root(ws, home);
+        if !workdir.is_dir() {
+            eprintln!(
+                "[gt-orch-server] rig '{}' (prefix '{}') skipped — worktree root {} does not exist; its beads fall back to the boot template",
+                rig.name,
+                rig.prefix,
+                workdir.display()
+            );
+            continue;
+        }
+        eprintln!(
+            "[gt-orch-server] rig '{}' (prefix '{}') → {}",
+            rig.name,
+            rig.prefix,
+            workdir.display()
+        );
+        let template = SpawnTemplate::for_rig(
+            &rig.name,
+            &rig.prefix,
+            workdir.clone(),
+            base.command.clone(),
+            base.args.clone(),
+            base.base_env.clone(),
+            base.heartbeat_dir.clone(),
+        );
+        configs.insert(
+            rig.prefix.clone(),
+            RigConfig {
+                template,
+                worktree_root: polecat_worktree_root.map(Into::into),
+            },
+        );
+        paths.insert(rig.prefix.clone(), workdir);
+    }
+    (configs, paths)
+}
+
 /// Compute the host-wide polecat admission cap from live metrics (`hq-orchd.3`): the lesser of the
 /// CPU-core count and `MemAvailable / per-polecat budget`, floored at 1 so the daemon can always
 /// make progress. Linux-native (`/proc/meminfo` + std), no external dependency — keeping the
@@ -1191,6 +1255,49 @@ mod tests {
     #[test]
     fn host_cap_is_at_least_one() {
         assert!(host_cap_from_metrics() >= 1);
+    }
+
+    #[test]
+    fn rig_routing_from_catalog_maps_prefixes_and_skips_missing_roots() {
+        // hq-d15050: a catalog rig with an existing resolved worktree root becomes a routed
+        // RigConfig + merge path keyed by its prefix; one whose root is absent on this host is
+        // skipped so its beads keep the boot-template fallback (provisioning is out of scope).
+        use gt_rig::RigEntry;
+        let dir = tempfile::tempdir().unwrap();
+        let gtweb_root = dir.path().join("gtweb");
+        std::fs::create_dir_all(&gtweb_root).unwrap();
+
+        let mut gtweb = RigEntry::new("gtweb", "gtweb", "https://x/gtweb.git", "main", 0);
+        gtweb.worktree_root = Some(gtweb_root.clone());
+        // No override + nonexistent convention default ⇒ skipped.
+        let ghost = RigEntry::new("ghost", "gh", "https://x/ghost.git", "main", 0);
+
+        let base = SpawnTemplate {
+            rig: "gtcore".into(),
+            prefix: "gtcore".into(),
+            workdir: "/rig".into(),
+            command: "claude".into(),
+            args: vec!["--flag".into()],
+            base_env: vec![("GT_ROLE".to_string(), "polecat".to_string())],
+            heartbeat_dir: std::env::temp_dir(),
+        };
+        let wt_root = std::path::Path::new("/rig-wt");
+        let (configs, paths) = rig_routing_from_catalog(
+            &[gtweb, ghost],
+            &base,
+            Some(wt_root),
+            "default",
+            dir.path(),
+        );
+
+        assert_eq!(configs.len(), 1, "only the rig with an existing root routes");
+        let cfg = configs.get("gtweb").expect("keyed by bead prefix");
+        assert_eq!(cfg.template.rig, "gtweb");
+        assert_eq!(cfg.template.workdir, gtweb_root);
+        assert_eq!(cfg.template.command, "claude", "shared fields inherited");
+        assert_eq!(cfg.worktree_root.as_deref(), Some(wt_root));
+        assert_eq!(paths.get("gtweb"), Some(&gtweb_root));
+        assert!(!paths.contains_key("gh"), "missing-root rig not routed");
     }
 
     #[tokio::test]
