@@ -1,0 +1,214 @@
+//! HTML render of the scheduled report digest (hq-562e0b, epic hq-efc379).
+//!
+//! Email body for the System report scheduler: the planning bitácora
+//! ([`OperatorReport`], same projection `report.generate` serializes to
+//! csv/xlsx) plus the analytics KPIs ([`AnalyticsSummary`], same numbers
+//! `analytics.summary` returns) — reconciliation by construction, both render
+//! from the structs the existing engines already build.
+//!
+//! Email-client constraints: ONE standalone document, inline styles only (no
+//! `<link>`/`<script>`/external CSS — Gmail strips them), table layout, same
+//! navy aesthetic as the xlsx report.
+
+use crate::analytics::AnalyticsSummary;
+use crate::report::OperatorReport;
+
+/// Minimal HTML escaping for text nodes/attributes.
+fn esc(s: &str) -> String {
+    s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;").replace('"', "&quot;")
+}
+
+fn fmt_horas(h: Option<f64>) -> String {
+    h.map(|v| format!("{v:.1}")).unwrap_or_default()
+}
+
+/// Estado chip colors, mirroring the xlsx vocabulary.
+fn estado_color(estado: &str) -> &'static str {
+    match estado {
+        "Completado" => "#1e7e34",
+        "En curso" => "#b8860b",
+        _ => "#6c757d",
+    }
+}
+
+const NAVY: &str = "#1f3864";
+const HEADER_BG: &str = "#2e5395";
+const ROW_ALT: &str = "#f2f6fc";
+const TD: &str = "padding:6px 8px;border:1px solid #d9e2f3;font-size:13px;";
+
+/// One KPI card cell.
+fn kpi(label: &str, value: String, detail: String) -> String {
+    format!(
+        "<td style=\"padding:10px 14px;border:1px solid #d9e2f3;background:{ROW_ALT};\
+         text-align:center;\"><div style=\"font-size:11px;color:{NAVY};text-transform:uppercase;\
+         letter-spacing:.5px;\">{label}</div><div style=\"font-size:22px;font-weight:bold;\
+         color:{NAVY};\">{value}</div><div style=\"font-size:11px;color:#6c757d;\">{detail}\
+         </div></td>"
+    )
+}
+
+/// Render the digest: `(bitácora, kpis, fecha)` → standalone HTML document.
+/// Pure — no IO, no clock (the caller passes `fecha`, normally
+/// `summary.today`).
+pub fn render_digest(report: &OperatorReport, summary: &AnalyticsSummary, fecha: &str) -> String {
+    let mut html = String::with_capacity(16 * 1024);
+    html.push_str(
+        "<!DOCTYPE html><html><head><meta charset=\"utf-8\"></head>\
+         <body style=\"margin:0;padding:16px;background:#ffffff;\
+         font-family:Arial,Helvetica,sans-serif;color:#212529;\">",
+    );
+
+    // Title bar (xlsx merged-title parity).
+    html.push_str(&format!(
+        "<table style=\"border-collapse:collapse;width:100%;max-width:960px;\"><tr>\
+         <td style=\"background:{NAVY};color:#ffffff;padding:12px 16px;font-size:18px;\
+         font-weight:bold;\">Reporte de planning — {rig} / {ws}\
+         <span style=\"float:right;font-weight:normal;font-size:13px;\">{fecha}</span>\
+         </td></tr></table>",
+        rig = esc(&report.rig),
+        ws = esc(&report.workspace),
+        fecha = esc(fecha),
+    ));
+
+    // KPI strip — the 5 analytics headlines.
+    html.push_str("<table style=\"border-collapse:collapse;width:100%;max-width:960px;margin-top:12px;\"><tr>");
+    html.push_str(&kpi(
+        "Avance",
+        format!("{:.0}%", summary.avance.pct),
+        format!("{} / {} cerradas", summary.avance.closed, summary.avance.total),
+    ));
+    html.push_str(&kpi(
+        "Errores",
+        summary.errores.total.to_string(),
+        format!("{} defectos, {} reaperturas", summary.errores.defects, summary.errores.reopens),
+    ));
+    html.push_str(&kpi(
+        "Pendientes",
+        summary.pendientes.total.to_string(),
+        format!("{} abiertas, {} en curso", summary.pendientes.open, summary.pendientes.working),
+    ));
+    html.push_str(&kpi(
+        "Retrasos",
+        summary.retrasos.overdue.to_string(),
+        format!("{} en riesgo ({}d)", summary.retrasos.at_risk, summary.retrasos.at_risk_days),
+    ));
+    html.push_str(&kpi(
+        "Horas",
+        format!("{:.1}", summary.horas.estimadas),
+        format!(
+            "{:.1} hechas / {:.1} pendientes",
+            summary.horas.completadas, summary.horas.pendientes
+        ),
+    ));
+    html.push_str("</tr></table>");
+
+    // Bitácora: one table per module section, mockup column order.
+    for section in &report.sections {
+        html.push_str(&format!(
+            "<table style=\"border-collapse:collapse;width:100%;max-width:960px;\
+             margin-top:16px;\"><tr><td colspan=\"9\" style=\"background:{HEADER_BG};\
+             color:#ffffff;padding:8px 10px;font-weight:bold;font-size:14px;\">{title}\
+             <span style=\"float:right;font-weight:normal;\">{horas:.1} h</span></td></tr>",
+            title = esc(&section.module_title),
+            horas = section.horas,
+        ));
+        html.push_str(&format!(
+            "<tr>{}</tr>",
+            ["Tarea", "Proceso", "Nivel", "Horas Est.", "Estado", "Responsable",
+             "Fecha Inicio", "Fecha Fin", "Notas"]
+                .map(|h| format!(
+                    "<th style=\"{TD}background:{ROW_ALT};color:{NAVY};text-align:left;\">{h}</th>"
+                ))
+                .join("")
+        ));
+        for (i, row) in section.rows.iter().enumerate() {
+            let bg = if i % 2 == 1 { format!("background:{ROW_ALT};") } else { String::new() };
+            html.push_str(&format!(
+                "<tr><td style=\"{TD}{bg}\">{tarea}<div style=\"font-size:11px;color:#6c757d;\">\
+                 {id}</div></td><td style=\"{TD}{bg}\">{proceso}</td>\
+                 <td style=\"{TD}{bg}\">{nivel}</td>\
+                 <td style=\"{TD}{bg}text-align:right;\">{horas}</td>\
+                 <td style=\"{TD}{bg}color:{estado_color};font-weight:bold;\">{estado}</td>\
+                 <td style=\"{TD}{bg}\">{resp}</td><td style=\"{TD}{bg}\">{ini}</td>\
+                 <td style=\"{TD}{bg}\">{fin}</td><td style=\"{TD}{bg}\">{notas}</td></tr>",
+                tarea = esc(&row.tarea),
+                id = esc(&row.id),
+                proceso = esc(&row.proceso),
+                nivel = esc(&row.nivel),
+                horas = fmt_horas(row.horas),
+                estado_color = estado_color(&row.estado),
+                estado = esc(&row.estado),
+                resp = esc(&row.responsable),
+                ini = esc(&row.fecha_inicio),
+                fin = esc(&row.fecha_fin),
+                notas = esc(&row.notas),
+            ));
+        }
+        html.push_str("</table>");
+    }
+
+    // TOTAL HORAS footer (xlsx parity).
+    html.push_str(&format!(
+        "<table style=\"border-collapse:collapse;width:100%;max-width:960px;margin-top:12px;\">\
+         <tr><td style=\"background:{NAVY};color:#ffffff;padding:10px 16px;font-weight:bold;\">\
+         TOTAL HORAS<span style=\"float:right;\">{total:.1}</span></td></tr></table>",
+        total = report.total_horas,
+    ));
+
+    html.push_str("</body></html>");
+    html
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::analytics::summarize;
+    use crate::report::build_report;
+    use gt_store_dolt::IssueRow;
+
+    fn row(id: &str, ty: &str, title: &str, status: &str, eref: Option<&str>) -> IssueRow {
+        let mut v: IssueRow = serde_json::from_value(serde_json::json!({
+            "id": id, "title": title, "status": status, "priority": 1,
+            "issue_type": ty, "assignee": "ana", "owner": null,
+            "created_at": null, "updated_at": null, "closed_at": null,
+            "external_ref": eref, "spec_id": null, "role_scope": null,
+        }))
+        .expect("row");
+        v.estimated_hours = Some(2.0);
+        v.start_date = Some("2026-06-01".into());
+        v.due_date = Some("2026-06-30".into());
+        v.notes = Some("nota <x>".into());
+        v
+    }
+
+    #[test]
+    fn digest_contains_every_row_and_the_five_kpis() {
+        let rows = vec![
+            row("hq-e1", "epic", "Modulo Uno", "open", None),
+            row("hq-1", "task", "Tarea A", "closed", Some("hq-e1")),
+            row("hq-2", "task", "Tarea B", "working", Some("hq-e1")),
+            row("hq-3", "bug", "Suelta", "open", None),
+        ];
+        let report = build_report("hq", "default", &rows);
+        let summary = summarize("hq", "default", &rows, 0, "2026-06-12", 7, 30);
+        let html = render_digest(&report, &summary, "2026-06-12");
+
+        // Standalone, no external resources.
+        assert!(html.starts_with("<!DOCTYPE html>"));
+        assert!(!html.contains("<link") && !html.contains("<script"));
+        // Every task row present; epic titles section, not row.
+        for needle in ["Tarea A", "Tarea B", "Suelta", "Modulo Uno", "Sin módulo"] {
+            assert!(html.contains(needle), "missing {needle}");
+        }
+        // The five KPIs.
+        for kpi in ["Avance", "Errores", "Pendientes", "Retrasos", "Horas"] {
+            assert!(html.contains(kpi), "missing KPI {kpi}");
+        }
+        // Reconciles with the summary by construction.
+        assert!(html.contains(&format!("{:.0}%", summary.avance.pct)));
+        assert!(html.contains("TOTAL HORAS"));
+        assert!(html.contains(&format!("{:.1}", report.total_horas)));
+        // Escaping: the raw note must not inject markup.
+        assert!(html.contains("nota &lt;x&gt;") && !html.contains("nota <x>"));
+    }
+}

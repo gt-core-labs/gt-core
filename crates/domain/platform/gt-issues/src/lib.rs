@@ -81,6 +81,9 @@ pub mod readiness;
 /// with CSV + XLSX serializers. Delivery (doc attach / outbox email) is the
 /// composition handler's job.
 pub mod report;
+/// HTML render of the scheduled report digest (hq-562e0b): the same
+/// [`report`] bitácora + [`analytics`] KPIs as one standalone email body.
+pub mod report_html;
 pub mod resources;
 /// Transport-free statistics aggregation (`hq-web-extras.12`): counts + progress + lead-time
 /// roll-ups over the tracker rows, grouped by epic/rig/status/domain/assignee/owner. The cheap
@@ -119,6 +122,7 @@ pub use policy::{
 };
 pub use readiness::is_ready;
 pub use report::{build_report, to_csv, to_xlsx, OperatorReport, ReportRow, ReportSection};
+pub use report_html::render_digest;
 pub use stats::{MeStatsResponse, WorkspaceStats};
 pub use surface::{AllowAllProvider, AllowAllTree, SurfaceEntry, SurfaceProvider, SurfaceTree};
 pub use taxonomy::{Domain, IssueType};
