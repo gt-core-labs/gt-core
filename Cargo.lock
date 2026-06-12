@@ -1568,6 +1568,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "gt-a2a"
+version = "0.1.0"
+dependencies = [
+ "async-stream",
+ "async-trait",
+ "axum",
+ "futures-core",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "tokio",
+ "tower",
+]
+
+[[package]]
 name = "gt-agent"
 version = "0.1.0"
 dependencies = [

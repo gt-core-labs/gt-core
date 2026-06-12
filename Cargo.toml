@@ -48,6 +48,7 @@ members = [
     "crates/domain/orchestration/gt-dog",
     "crates/domain/orchestration/gt-runtime",
     "crates/domain/orchestration/gt-mcp-server",
+    "crates/domain/orchestration/gt-a2a",
     "crates/domain/orchestration/gt-reconciler",
     "crates/domain/orchestration/gt-memory",
     "crates/domain/orchestration/gt-planner",
@@ -225,6 +226,7 @@ gt-runtime       = { path = "crates/domain/orchestration/gt-runtime" }
 gt-memory        = { path = "crates/domain/orchestration/gt-memory" }
 gt-planner       = { path = "crates/domain/orchestration/gt-planner" }
 gt-mcp-server    = { path = "crates/domain/orchestration/gt-mcp-server" }
+gt-a2a           = { path = "crates/domain/orchestration/gt-a2a" }
 
 gt-store-pg      = { path = "crates/kernel/gt-store-pg" }
 gt-store-dolt    = { path = "crates/kernel/gt-store-dolt" }

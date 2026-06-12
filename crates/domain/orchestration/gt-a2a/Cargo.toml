@@ -1,0 +1,31 @@
+[package]
+name = "gt-a2a"
+edition.workspace = true
+version.workspace = true
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+async-trait = { workspace = true }
+# `Stream` for the subscribe seam — the SSE event stream the B3 observer plugin
+# will feed. Only the trait object type; no combinators (no futures-util).
+futures-core = { workspace = true }
+# Off-by-default `axum` adapter (plans/a2a-checklist.md B1): the JSON-RPC POST /a2a
+# endpoint + GET /.well-known/agent.json, gated exactly as gt-quota/gt-merge gate
+# theirs — never a sibling crate (docs/03 Rule 4). `async-stream` adapts our
+# `EventStream` into the `Stream<Item = Result<Event, _>>` axum's `Sse` wants.
+axum = { workspace = true, optional = true }
+async-stream = { workspace = true, optional = true }
+
+[features]
+# Compile the axum adapter (`http.rs`). Off by default — the MCP-only build pulls
+# no HTTP stack; the composition bin enables it to expose the A2A surface.
+axum = ["dep:axum", "dep:async-stream"]
+
+[dev-dependencies]
+# Exercise the router in-process: `oneshot` a request, read the response, no socket.
+axum = { workspace = true }
+tower = { workspace = true, features = ["util"] }
+tokio = { workspace = true }
+async-stream = { workspace = true }
