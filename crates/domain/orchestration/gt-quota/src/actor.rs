@@ -16,7 +16,7 @@ use crate::commands::QuotaCommand;
 use crate::cost::ModelWeights;
 use crate::events::QuotaEvent;
 use crate::expectations::predict;
-use crate::state::{Account, AccountRegistry, AccountWindow};
+use crate::state::{Account, AccountRegistry, AccountWindow, WindowKind, ROLLING_5H_SECS};
 
 pub enum QuotaMsg {
     /// Initialize / replace an account's window (read by an edge probe).
@@ -483,33 +483,98 @@ pub fn spawn_hydrated(
                     now_secs,
                     threshold_secs,
                 } => {
-                    // Stable snapshot of accounts-with-window to avoid re-borrowing the
-                    // registry during iteration.
-                    let candidates: Vec<(String, AccountWindow, f64)> = registry
-                        .accounts()
-                        .filter_map(|a| {
-                            let w = a.window.clone()?;
-                            let rate = registry.rate(&a.id).map(|e| e.value).unwrap_or(0.0);
-                            Some((a.id.clone(), w, rate))
-                        })
-                        .collect();
-                    for (id, window, rate) in candidates {
-                        let started_at = window.started_at_secs;
-                        let p = predict(&window, now_secs, rate, threshold_secs);
-                        if p.should_predict_block {
-                            if registry.mark_predicted(&id, started_at) {
-                                if let Some(eta) = p.eta_to_block_secs {
-                                    predictions_emitted += 1;
-                                    let _ = events
-                                        .send(Envelope::root(QuotaEvent::BlockPredicted {
-                                            account: id,
-                                            eta_to_block_secs: eta,
-                                            consumed: p.consumed,
-                                            limit: window.limit,
-                                            rate_per_min: p.rate_per_min,
-                                            now_secs,
-                                        }))
-                                        .await;
+                    // Stable snapshot of accounts with at least one window, including both
+                    // rolling and weekly, to avoid re-borrowing the registry during iteration.
+                    let candidates: Vec<(String, Option<AccountWindow>, Option<AccountWindow>, f64)> =
+                        registry
+                            .accounts()
+                            .filter(|a| a.window.is_some() || a.weekly_window.is_some())
+                            .map(|a| {
+                                let rate =
+                                    registry.rate(&a.id).map(|e| e.value).unwrap_or(0.0);
+                                (a.id.clone(), a.window.clone(), a.weekly_window.clone(), rate)
+                            })
+                            .collect();
+
+                    for (id, main_win, weekly_win, rate) in candidates {
+                        // Expired rolling window: zero counter, emit WindowReset for history.
+                        // The next probe overwrites resets_at_secs with the real provider value.
+                        let main_expired = main_win
+                            .as_ref()
+                            .filter(|w| now_secs >= w.resets_at_secs)
+                            .cloned();
+                        let weekly_expired = weekly_win
+                            .as_ref()
+                            .filter(|w| now_secs >= w.resets_at_secs)
+                            .cloned();
+
+                        if let Some(w) = main_expired {
+                            let period = match w.kind {
+                                WindowKind::Rolling5h => ROLLING_5H_SECS,
+                                WindowKind::Weekly => 7 * 24 * 3600,
+                            };
+                            let new_started = w.resets_at_secs;
+                            let new_resets = w.resets_at_secs + period;
+                            if let Some(acc) = registry.get_mut(&id) {
+                                if let Some(mw) = acc.window.as_mut() {
+                                    mw.started_at_secs = new_started;
+                                    mw.resets_at_secs = new_resets;
+                                    mw.consumed = 0.0;
+                                }
+                            }
+                            registry.clear_window_prediction(&id);
+                            let _ = events
+                                .send(Envelope::root(QuotaEvent::WindowReset {
+                                    account: id.clone(),
+                                    kind: format!("{:?}", w.kind),
+                                    consumed: w.consumed,
+                                    started_at_secs: new_started,
+                                    resets_at_secs: new_resets,
+                                }))
+                                .await;
+                        }
+
+                        if let Some(w) = weekly_expired {
+                            let period: u64 = 7 * 24 * 3600;
+                            let new_started = w.resets_at_secs;
+                            let new_resets = w.resets_at_secs + period;
+                            if let Some(acc) = registry.get_mut(&id) {
+                                if let Some(ww) = acc.weekly_window.as_mut() {
+                                    ww.started_at_secs = new_started;
+                                    ww.resets_at_secs = new_resets;
+                                    ww.consumed = 0.0;
+                                }
+                            }
+                            let _ = events
+                                .send(Envelope::root(QuotaEvent::WindowReset {
+                                    account: id.clone(),
+                                    kind: format!("{:?}", w.kind),
+                                    consumed: w.consumed,
+                                    started_at_secs: new_started,
+                                    resets_at_secs: new_resets,
+                                }))
+                                .await;
+                        }
+
+                        // Run predictor on the rolling window if it hasn't expired.
+                        if let Some(window) = main_win.filter(|w| now_secs < w.resets_at_secs) {
+                            let started_at = window.started_at_secs;
+                            let p = predict(&window, now_secs, rate, threshold_secs);
+                            if p.should_predict_block {
+                                if registry.mark_predicted(&id, started_at) {
+                                    if let Some(eta) = p.eta_to_block_secs {
+                                        predictions_emitted += 1;
+                                        let _ = events
+                                            .send(Envelope::root(QuotaEvent::BlockPredicted {
+                                                account: id,
+                                                eta_to_block_secs: eta,
+                                                consumed: p.consumed,
+                                                limit: window.limit,
+                                                rate_per_min: p.rate_per_min,
+                                                now_secs,
+                                            }))
+                                            .await;
+                                    }
                                 }
                             }
                         }
