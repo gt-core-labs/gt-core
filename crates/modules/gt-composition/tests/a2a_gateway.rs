@@ -13,7 +13,8 @@ use tower::ServiceExt;
 
 use gt_a2a::{a2a_router, AgentCapabilities, AgentCard};
 use gt_composition::a2a::{
-    A2aGateway, A2aGatewayConfig, BeadIntake, ChannelDispatch, IntakeRequest,
+    A2aGateway, A2aGatewayConfig, BeadIntake, BeadSnapshot, ChannelDispatch, IntakeRequest,
+    SessionControl, TaskStore,
 };
 use gt_issues::Domain;
 
@@ -25,6 +26,35 @@ impl BeadIntake for RecordingIntake {
     async fn create(&self, req: IntakeRequest) -> Result<String, String> {
         self.0.lock().unwrap().push(req);
         Ok("gtcore-minted1".into())
+    }
+}
+
+/// Bead store fake: one known working bead + a terminate trail.
+struct OneBeadStore(Mutex<Vec<String>>);
+
+#[async_trait]
+impl TaskStore for OneBeadStore {
+    async fn fetch(&self, bead: &str) -> Result<Option<BeadSnapshot>, String> {
+        Ok((bead == "gtcore-minted1")
+            .then(|| BeadSnapshot { status: "working".into(), rig: "gtcore".into() }))
+    }
+    async fn terminate(&self, bead: &str, _reason: &str) -> Result<(), String> {
+        self.0.lock().unwrap().push(bead.into());
+        Ok(())
+    }
+}
+
+/// Session fake: the known bead runs a live session + a kill trail.
+struct OneSession(Mutex<Vec<String>>);
+
+#[async_trait]
+impl SessionControl for OneSession {
+    async fn state(&self, session: &str) -> Result<Option<String>, String> {
+        Ok((session == "gtcore-gtcore-minted1").then(|| "working".into()))
+    }
+    async fn kill(&self, session: &str, _reason: &str) -> Result<(), String> {
+        self.0.lock().unwrap().push(session.into());
+        Ok(())
     }
 }
 
@@ -58,6 +88,15 @@ async fn rpc(app: axum::Router, body: Value) -> Value {
     serde_json::from_slice(&bytes).unwrap()
 }
 
+fn test_config() -> A2aGatewayConfig {
+    A2aGatewayConfig {
+        rig: "gtcore".into(),
+        parent_id: "gtcore-intake".into(),
+        created_by: "a2a".into(),
+        domain: vec![Domain::MetaGap],
+    }
+}
+
 #[tokio::test]
 async fn post_a2a_send_mints_bead_drops_event_and_answers_submitted() {
     let channel = tempfile::tempdir().unwrap();
@@ -65,12 +104,9 @@ async fn post_a2a_send_mints_bead_drops_event_and_answers_submitted() {
     let gateway = A2aGateway::new(
         intake.clone(),
         Arc::new(ChannelDispatch::new(channel.path().to_path_buf())),
-        A2aGatewayConfig {
-            rig: "gtcore".into(),
-            parent_id: "gtcore-intake".into(),
-            created_by: "a2a".into(),
-            domain: vec![Domain::MetaGap],
-        },
+        Arc::new(OneBeadStore(Mutex::new(vec![]))),
+        Arc::new(OneSession(Mutex::new(vec![]))),
+        test_config(),
     );
     let app = a2a_router(card(), Arc::new(gateway));
 
@@ -109,25 +145,51 @@ async fn post_a2a_send_mints_bead_drops_event_and_answers_submitted() {
     assert_eq!(order, json!({"bead": "gtcore-minted1", "priority": 1}));
 }
 
-#[tokio::test]
-async fn post_a2a_get_is_unsupported_until_b4() {
-    let channel = tempfile::tempdir().unwrap();
+/// get/cancel router app over the one-bead fakes; returns the trails.
+fn projection_app() -> (axum::Router, Arc<OneBeadStore>, Arc<OneSession>) {
+    let channel = std::env::temp_dir(); // unused by get/cancel
+    let store = Arc::new(OneBeadStore(Mutex::new(vec![])));
+    let sessions = Arc::new(OneSession(Mutex::new(vec![])));
     let gateway = A2aGateway::new(
         Arc::new(RecordingIntake(Mutex::new(vec![]))),
-        Arc::new(ChannelDispatch::new(channel.path().to_path_buf())),
-        A2aGatewayConfig {
-            rig: "gtcore".into(),
-            parent_id: "gtcore-intake".into(),
-            created_by: "a2a".into(),
-            domain: vec![Domain::MetaGap],
-        },
+        Arc::new(ChannelDispatch::new(channel)),
+        store.clone(),
+        sessions.clone(),
+        test_config(),
     );
-    let app = a2a_router(card(), Arc::new(gateway));
+    (a2a_router(card(), Arc::new(gateway)), store, sessions)
+}
+
+#[tokio::test]
+async fn post_a2a_get_projects_live_task_and_404s_unknown() {
+    let (app, _, _) = projection_app();
     let v = rpc(
-        app,
+        app.clone(),
         json!({"jsonrpc": "2.0", "id": 8, "method": "tasks/get",
                "params": {"id": "gtcore-minted1"}}),
     )
     .await;
-    assert_eq!(v["error"]["code"], -32004);
+    assert_eq!(v["result"]["status"]["state"], "working");
+
+    let v = rpc(
+        app,
+        json!({"jsonrpc": "2.0", "id": 9, "method": "tasks/get",
+               "params": {"id": "gtcore-ghost"}}),
+    )
+    .await;
+    assert_eq!(v["error"]["code"], -32001);
+}
+
+#[tokio::test]
+async fn post_a2a_cancel_kills_session_and_answers_canceled() {
+    let (app, store, sessions) = projection_app();
+    let v = rpc(
+        app,
+        json!({"jsonrpc": "2.0", "id": 10, "method": "tasks/cancel",
+               "params": {"id": "gtcore-minted1"}}),
+    )
+    .await;
+    assert_eq!(v["result"]["status"]["state"], "canceled");
+    assert_eq!(*sessions.0.lock().unwrap(), vec!["gtcore-gtcore-minted1".to_string()]);
+    assert_eq!(*store.0.lock().unwrap(), vec!["gtcore-minted1".to_string()]);
 }

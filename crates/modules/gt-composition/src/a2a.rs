@@ -19,9 +19,20 @@
 //! - [`DispatchSink`] — *what dispatching means*. Production:
 //!   [`ChannelDispatch`], the `{bead,priority}` tmp→rename drop on the orchd
 //!   channel dir (mirrors `gt-agent`'s auto-dispatch bridge).
+//! - [`TaskStore`] — *reading and terminating the bead* (gtcore-f5f7c7, B4).
+//!   Production: [`DoltTaskStore`] over `get_detail` + `run_transition_issue`.
+//! - [`SessionControl`] — *observing and killing the live session*. Production:
+//!   [`RestSessionControl`] against the orchd agent REST surface — tmux lives
+//!   in the orchd pod, so the kill MUST go through `POST /:id/kill` there (the
+//!   only place that both records `agent.killed.v1` and reaps the process).
 //!
-//! `tasks/get` / `tasks/cancel` answer `-32004 UnsupportedOperation` until
-//! gtcore-f5f7c7 (B4) completes them.
+//! ## State projection (decision #2: the event log stays the source of truth)
+//!
+//! `tasks/get` projects, never stores: bead `closed` → `completed`; a `killed`
+//! session over a non-closed bead → `canceled` (exactly the residue `cancel`
+//! leaves, so a follow-up `get` agrees with it); otherwise
+//! [`TaskState::from_bead_status`]. `failed` is a merge fact and lands with the
+//! B3 stream — this projection never invents it.
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -34,8 +45,8 @@ use gt_a2a::{
     A2aError, A2aHandler, JsonRpcError, Part, Task, TaskIdParams, TaskSendParams, TaskState,
     TaskStatus,
 };
-use gt_issues::handlers::run_create_issue;
-use gt_issues::{CreateIssue, Domain, IssueType, SurfaceTree};
+use gt_issues::handlers::{run_create_issue, run_transition_issue};
+use gt_issues::{CreateIssue, Domain, IssueType, SurfaceTree, TransitionIssue};
 use gt_store_dolt::DoltIssues;
 
 /// What an inbound A2A task asks the tracker to mint. Already shaped by the
@@ -60,6 +71,34 @@ pub trait DispatchSink: Send + Sync {
     fn dispatch(&self, bead: &str, priority: u8) -> Result<(), String>;
 }
 
+/// What `tasks/get`/`tasks/cancel` need to know about a bead: its tracker
+/// status drives the state projection, its rig names the session
+/// (`<rig>-<bead>`, the polecat sling convention).
+#[derive(Clone, Debug, PartialEq)]
+pub struct BeadSnapshot {
+    pub status: String,
+    pub rig: String,
+}
+
+/// Port: read a bead and flip it terminal on cancel.
+#[async_trait]
+pub trait TaskStore: Send + Sync {
+    /// `None` ⇒ no such bead (`-32001 TaskNotFound` at the protocol edge).
+    async fn fetch(&self, bead: &str) -> Result<Option<BeadSnapshot>, String>;
+    /// Mark the bead terminal after a cancel, leaving `reason` as the audit
+    /// breadcrumb.
+    async fn terminate(&self, bead: &str, reason: &str) -> Result<(), String>;
+}
+
+/// Port: observe and kill the live session a bead runs in.
+#[async_trait]
+pub trait SessionControl: Send + Sync {
+    /// Registry state (`spawned`/`working`/`done`/`killed`), `None` when the
+    /// bead was never slung.
+    async fn state(&self, session: &str) -> Result<Option<String>, String>;
+    async fn kill(&self, session: &str, reason: &str) -> Result<(), String>;
+}
+
 /// Deploy-fixed defaults an A2A task does not carry on the wire.
 #[derive(Clone, Debug)]
 pub struct A2aGatewayConfig {
@@ -74,10 +113,13 @@ pub struct A2aGatewayConfig {
     pub domain: Vec<Domain>,
 }
 
-/// The A2A operations server: `tasks/send` → bead + dispatch.
+/// The A2A operations server: `tasks/send` → bead + dispatch; `tasks/get` →
+/// projection; `tasks/cancel` → session kill + terminal bead.
 pub struct A2aGateway {
     intake: Arc<dyn BeadIntake>,
     sink: Arc<dyn DispatchSink>,
+    store: Arc<dyn TaskStore>,
+    sessions: Arc<dyn SessionControl>,
     config: A2aGatewayConfig,
 }
 
@@ -85,10 +127,50 @@ impl A2aGateway {
     pub fn new(
         intake: Arc<dyn BeadIntake>,
         sink: Arc<dyn DispatchSink>,
+        store: Arc<dyn TaskStore>,
+        sessions: Arc<dyn SessionControl>,
         config: A2aGatewayConfig,
     ) -> Self {
-        Self { intake, sink, config }
+        Self { intake, sink, store, sessions, config }
     }
+
+    /// Bead + session facts for `id`, or `-32001` when the bead does not exist.
+    async fn snapshot(&self, id: &str) -> Result<(BeadSnapshot, Option<String>), A2aError> {
+        let bead = self
+            .store
+            .fetch(id)
+            .await
+            .map_err(|e| A2aError::from(JsonRpcError::internal(format!("bead fetch: {e}"))))?
+            .ok_or_else(|| A2aError::from(JsonRpcError::task_not_found(id)))?;
+        let session = self
+            .sessions
+            .state(&session_of(&bead.rig, id))
+            .await
+            .map_err(|e| A2aError::from(JsonRpcError::internal(format!("session state: {e}"))))?;
+        Ok((bead, session))
+    }
+}
+
+/// The polecat sling convention: a bead's session is `<rig>-<bead id>`.
+fn session_of(rig: &str, bead: &str) -> String {
+    format!("{rig}-{bead}")
+}
+
+/// Bead status + session state → task state. Conservative: only facts the
+/// tracker/registry actually hold (see the module doc).
+fn project_state(bead_status: &str, session_state: Option<&str>) -> TaskState {
+    if bead_status == "closed" {
+        return TaskState::Completed;
+    }
+    if session_state == Some("killed") {
+        return TaskState::Canceled;
+    }
+    TaskState::from_bead_status(bead_status)
+}
+
+/// RFC3339 "now", stamped here because the contract crate is clock-free.
+fn rfc3339_now() -> Option<String> {
+    OffsetDateTime::now_utc().format(&Rfc3339).ok()
 }
 
 #[async_trait]
@@ -134,9 +216,21 @@ impl A2aHandler for A2aGateway {
         Ok(Task {
             id: bead,
             session_id: params.session_id,
+            status: TaskStatus { state: TaskState::Submitted, timestamp: rfc3339_now(), message: None },
+            artifacts: vec![],
+            history: vec![],
+            metadata: None,
+        })
+    }
+
+    async fn get(&self, params: TaskIdParams) -> Result<Task, A2aError> {
+        let (bead, session) = self.snapshot(&params.id).await?;
+        Ok(Task {
+            id: params.id,
+            session_id: None,
             status: TaskStatus {
-                state: TaskState::Submitted,
-                timestamp: OffsetDateTime::now_utc().format(&Rfc3339).ok(),
+                state: project_state(&bead.status, session.as_deref()),
+                timestamp: rfc3339_now(),
                 message: None,
             },
             artifacts: vec![],
@@ -145,13 +239,33 @@ impl A2aHandler for A2aGateway {
         })
     }
 
-    async fn get(&self, _params: TaskIdParams) -> Result<Task, A2aError> {
-        Err(JsonRpcError::unsupported_operation("tasks/get lands with gtcore-f5f7c7 (B4)").into())
-    }
-
-    async fn cancel(&self, _params: TaskIdParams) -> Result<Task, A2aError> {
-        Err(JsonRpcError::unsupported_operation("tasks/cancel lands with gtcore-f5f7c7 (B4)")
-            .into())
+    async fn cancel(&self, params: TaskIdParams) -> Result<Task, A2aError> {
+        let (bead, session) = self.snapshot(&params.id).await?;
+        if project_state(&bead.status, session.as_deref()).is_terminal() {
+            return Err(JsonRpcError::task_not_cancelable(&params.id).into());
+        }
+        // Reap the live process first — terminating the bead while the polecat
+        // keeps running would leave work charging ahead on a canceled task. A
+        // session that is absent or already done has nothing to kill.
+        const REASON: &str = "canceled via A2A tasks/cancel";
+        if matches!(session.as_deref(), Some("spawned") | Some("working")) {
+            self.sessions
+                .kill(&session_of(&bead.rig, &params.id), REASON)
+                .await
+                .map_err(|e| A2aError::from(JsonRpcError::internal(format!("session kill: {e}"))))?;
+        }
+        self.store
+            .terminate(&params.id, REASON)
+            .await
+            .map_err(|e| A2aError::from(JsonRpcError::internal(format!("bead terminate: {e}"))))?;
+        Ok(Task {
+            id: params.id,
+            session_id: None,
+            status: TaskStatus { state: TaskState::Canceled, timestamp: rfc3339_now(), message: None },
+            artifacts: vec![],
+            history: vec![],
+            metadata: None,
+        })
     }
 }
 
@@ -250,6 +364,94 @@ impl ChannelDispatch {
     }
 }
 
+/// [`TaskStore`] over the Dolt store: `fetch` is the `gt://issue/{id}` detail
+/// read; `terminate` leaves the audit breadcrumb and flips the bead `closed`
+/// through `run_transition_issue` — the same frontier the MCP
+/// `issues.transition` tool drives (a canceled bead has no delivered sha, so
+/// `issues.close`'s code-surface gate is the wrong door).
+pub struct DoltTaskStore {
+    issues: Arc<DoltIssues>,
+}
+
+impl DoltTaskStore {
+    pub fn new(issues: Arc<DoltIssues>) -> Self {
+        Self { issues }
+    }
+}
+
+#[async_trait]
+impl TaskStore for DoltTaskStore {
+    async fn fetch(&self, bead: &str) -> Result<Option<BeadSnapshot>, String> {
+        self.issues
+            .get_detail(bead)
+            .await
+            .map(|d| d.map(|d| BeadSnapshot { status: d.status, rig: d.rig }))
+            .map_err(|e| e.to_string())
+    }
+
+    async fn terminate(&self, bead: &str, reason: &str) -> Result<(), String> {
+        self.issues.append_notes(bead, reason).await.map_err(|e| e.to_string())?;
+        let args = TransitionIssue { id: bead.into(), target: "closed".into(), context: None };
+        run_transition_issue(&self.issues, &args, false, false)
+            .await
+            .map_err(|e| e.to_string())
+    }
+}
+
+/// [`SessionControl`] against the orchd agent REST surface
+/// (`/api/v1/agent/...`): the tmux server lives in the orchd pod, and its
+/// `POST /:id/kill` is the one place that both records `agent.killed.v1` and
+/// reaps the process — killing from here would record without reaping.
+pub struct RestSessionControl {
+    /// Origin of the orchd REST surface, e.g. `http://gt-orchd:8080`.
+    base: String,
+    /// Bearer for the `agent.read`/`agent.write` scope guard.
+    token: Option<String>,
+    client: reqwest::Client,
+}
+
+impl RestSessionControl {
+    pub fn new(base: impl Into<String>, token: Option<String>) -> Self {
+        Self { base: base.into(), token, client: reqwest::Client::new() }
+    }
+
+    fn request(&self, method: reqwest::Method, path: &str) -> reqwest::RequestBuilder {
+        let req = self.client.request(method, format!("{}{path}", self.base));
+        match &self.token {
+            Some(t) => req.bearer_auth(t),
+            None => req,
+        }
+    }
+}
+
+#[async_trait]
+impl SessionControl for RestSessionControl {
+    async fn state(&self, session: &str) -> Result<Option<String>, String> {
+        let resp = self
+            .request(reqwest::Method::GET, &format!("/api/v1/agent/{session}"))
+            .send()
+            .await
+            .map_err(|e| e.to_string())?;
+        if resp.status() == reqwest::StatusCode::NOT_FOUND {
+            return Ok(None);
+        }
+        let body: serde_json::Value =
+            resp.error_for_status().map_err(|e| e.to_string())?.json().await.map_err(|e| e.to_string())?;
+        Ok(body.get("state").and_then(|s| s.as_str()).map(str::to_owned))
+    }
+
+    async fn kill(&self, session: &str, reason: &str) -> Result<(), String> {
+        self.request(reqwest::Method::POST, &format!("/api/v1/agent/{session}/kill"))
+            .json(&serde_json::json!({ "reason": reason }))
+            .send()
+            .await
+            .map_err(|e| e.to_string())?
+            .error_for_status()
+            .map(|_| ())
+            .map_err(|e| e.to_string())
+    }
+}
+
 impl DispatchSink for ChannelDispatch {
     fn dispatch(&self, bead: &str, priority: u8) -> Result<(), String> {
         use std::sync::atomic::{AtomicU64, Ordering};
@@ -301,6 +503,42 @@ mod tests {
         }
     }
 
+    /// Tracker fake: a fixed snapshot (None ⇒ unknown bead) + terminate trail.
+    #[derive(Default)]
+    struct FakeStore {
+        snapshot: Option<BeadSnapshot>,
+        terminated: Mutex<Vec<(String, String)>>,
+    }
+
+    #[async_trait]
+    impl TaskStore for FakeStore {
+        async fn fetch(&self, _bead: &str) -> Result<Option<BeadSnapshot>, String> {
+            Ok(self.snapshot.clone())
+        }
+        async fn terminate(&self, bead: &str, reason: &str) -> Result<(), String> {
+            self.terminated.lock().unwrap().push((bead.into(), reason.into()));
+            Ok(())
+        }
+    }
+
+    /// Session fake: a fixed registry state (None ⇒ never slung) + kill trail.
+    #[derive(Default)]
+    struct FakeSessions {
+        state: Option<String>,
+        killed: Mutex<Vec<(String, String)>>,
+    }
+
+    #[async_trait]
+    impl SessionControl for FakeSessions {
+        async fn state(&self, _session: &str) -> Result<Option<String>, String> {
+            Ok(self.state.clone())
+        }
+        async fn kill(&self, session: &str, reason: &str) -> Result<(), String> {
+            self.killed.lock().unwrap().push((session.into(), reason.into()));
+            Ok(())
+        }
+    }
+
     fn config() -> A2aGatewayConfig {
         A2aGatewayConfig {
             rig: "gtcore".into(),
@@ -327,7 +565,44 @@ mod tests {
     fn gateway(fail: bool) -> (A2aGateway, Arc<FakeIntake>, Arc<FakeSink>) {
         let intake = Arc::new(FakeIntake { seen: Mutex::new(vec![]), fail });
         let sink = Arc::new(FakeSink(Mutex::new(vec![])));
-        (A2aGateway::new(intake.clone(), sink.clone(), config()), intake, sink)
+        let gw = A2aGateway::new(
+            intake.clone(),
+            sink.clone(),
+            Arc::new(FakeStore::default()),
+            Arc::new(FakeSessions::default()),
+            config(),
+        );
+        (gw, intake, sink)
+    }
+
+    /// Gateway wired for the get/cancel paths: bead status + session state fakes.
+    fn projection_gateway(
+        bead: Option<(&str, &str)>,
+        session: Option<&str>,
+    ) -> (A2aGateway, Arc<FakeStore>, Arc<FakeSessions>) {
+        let store = Arc::new(FakeStore {
+            snapshot: bead.map(|(status, rig)| BeadSnapshot {
+                status: status.into(),
+                rig: rig.into(),
+            }),
+            terminated: Mutex::new(vec![]),
+        });
+        let sessions = Arc::new(FakeSessions {
+            state: session.map(str::to_owned),
+            killed: Mutex::new(vec![]),
+        });
+        let gw = A2aGateway::new(
+            Arc::new(FakeIntake { seen: Mutex::new(vec![]), fail: false }),
+            Arc::new(FakeSink(Mutex::new(vec![]))),
+            store.clone(),
+            sessions.clone(),
+            config(),
+        );
+        (gw, store, sessions)
+    }
+
+    fn id_params(id: &str) -> TaskIdParams {
+        TaskIdParams { id: id.into(), history_length: None, metadata: None }
     }
 
     #[tokio::test]
@@ -382,11 +657,65 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn get_and_cancel_are_unsupported_until_b4() {
-        let (gw, _, _) = gateway(false);
-        let p = TaskIdParams { id: "gtcore-x".into(), history_length: None, metadata: None };
-        assert_eq!(gw.get(p.clone()).await.unwrap_err().0.code, -32004);
-        assert_eq!(gw.cancel(p).await.unwrap_err().0.code, -32004);
+    async fn get_unknown_bead_is_task_not_found() {
+        let (gw, _, _) = projection_gateway(None, None);
+        assert_eq!(gw.get(id_params("gtcore-nope")).await.unwrap_err().0.code, -32001);
+    }
+
+    #[tokio::test]
+    async fn get_projects_bead_and_session_state() {
+        for (bead, session, want) in [
+            (("open", "gtcore"), None, TaskState::Submitted),
+            (("working", "gtcore"), Some("working"), TaskState::Working),
+            (("closed", "gtcore"), Some("done"), TaskState::Completed),
+            // The residue cancel leaves: live bead, killed session.
+            (("working", "gtcore"), Some("killed"), TaskState::Canceled),
+        ] {
+            let (gw, _, _) = projection_gateway(Some(bead), session);
+            let task = gw.get(id_params("gtcore-abc123")).await.unwrap();
+            assert_eq!(task.status.state, want, "bead {bead:?} session {session:?}");
+            assert!(task.status.timestamp.is_some());
+        }
+    }
+
+    #[tokio::test]
+    async fn cancel_kills_live_session_and_terminates_bead() {
+        let (gw, store, sessions) = projection_gateway(Some(("working", "gtweb")), Some("working"));
+        let task = gw.cancel(id_params("gtweb-abc123")).await.unwrap();
+        assert_eq!(task.status.state, TaskState::Canceled);
+        // The session is named by the sling convention and reaped first.
+        let killed = sessions.killed.lock().unwrap();
+        assert_eq!(killed[0].0, "gtweb-gtweb-abc123");
+        let terminated = store.terminated.lock().unwrap();
+        assert_eq!(terminated[0].0, "gtweb-abc123");
+        assert!(terminated[0].1.contains("canceled via A2A"));
+    }
+
+    #[tokio::test]
+    async fn cancel_never_slung_bead_skips_kill_but_terminates() {
+        let (gw, store, sessions) = projection_gateway(Some(("open", "gtcore")), None);
+        let task = gw.cancel(id_params("gtcore-abc123")).await.unwrap();
+        assert_eq!(task.status.state, TaskState::Canceled);
+        assert!(sessions.killed.lock().unwrap().is_empty(), "nothing to kill");
+        assert_eq!(store.terminated.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn cancel_terminal_task_is_not_cancelable() {
+        // Closed bead and already-killed session are both terminal.
+        for (bead, session) in [(("closed", "gtcore"), None), (("working", "gtcore"), Some("killed"))] {
+            let (gw, store, sessions) = projection_gateway(Some(bead), session);
+            let err = gw.cancel(id_params("gtcore-abc123")).await.unwrap_err();
+            assert_eq!(err.0.code, -32002, "bead {bead:?} session {session:?}");
+            assert!(sessions.killed.lock().unwrap().is_empty());
+            assert!(store.terminated.lock().unwrap().is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn cancel_unknown_bead_is_task_not_found() {
+        let (gw, _, _) = projection_gateway(None, None);
+        assert_eq!(gw.cancel(id_params("gtcore-nope")).await.unwrap_err().0.code, -32001);
     }
 
     #[test]
