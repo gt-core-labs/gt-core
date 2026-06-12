@@ -90,8 +90,14 @@ fn nivel_label(priority: i32) -> &'static str {
 
 /// Build the report from one (rig, workspace)'s tracker rows — the same rows
 /// `board.list` projects. Epics title the module sections (D5) and are not
-/// task rows; everything else groups under its `external_ref`.
-pub fn build_report(rig: &str, workspace: &str, rows: &[IssueRow]) -> OperatorReport {
+/// task rows; everything else groups under its parent epic from `parent_map`
+/// (`issue_relations` `child_of` rows, keyed by child id).
+pub fn build_report(
+    rig: &str,
+    workspace: &str,
+    rows: &[IssueRow],
+    parent_map: &std::collections::HashMap<String, String>,
+) -> OperatorReport {
     // Module titles: the epics present in the row set.
     let mut titles: BTreeMap<&str, &str> = BTreeMap::new();
     for row in rows {
@@ -106,7 +112,7 @@ pub fn build_report(rig: &str, workspace: &str, rows: &[IssueRow]) -> OperatorRe
         if row.issue_type == "epic" {
             continue;
         }
-        let module = row.external_ref.clone().unwrap_or_default();
+        let module = parent_map.get(&row.id).cloned().unwrap_or_default();
         buckets.entry(module).or_default().push(ReportRow {
             id: row.id.clone(),
             tarea: row.title.clone(),
@@ -352,14 +358,15 @@ pub fn to_xlsx(report: &OperatorReport) -> Result<Vec<u8>, String> {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
     use super::*;
 
-    fn row(id: &str, ty: &str, title: &str, eref: Option<&str>, horas: Option<f64>, status: &str) -> IssueRow {
+    fn row(id: &str, ty: &str, title: &str, horas: Option<f64>, status: &str) -> IssueRow {
         let mut v: IssueRow = serde_json::from_value(serde_json::json!({
             "id": id, "title": title, "status": status, "priority": 1,
             "issue_type": ty, "assignee": "ana", "owner": null,
             "created_at": null, "updated_at": null, "closed_at": null,
-            "external_ref": eref, "spec_id": null, "role_scope": null,
+            "spec_id": null, "role_scope": null,
         }))
         .expect("row");
         v.estimated_hours = horas;
@@ -370,12 +377,15 @@ mod tests {
 
     fn sample() -> OperatorReport {
         let rows = vec![
-            row("hq-mod-a", "epic", "Módulo Auth", None, None, "open"),
-            row("hq-1", "task", "Login form", Some("hq-mod-a"), Some(8.0), "working"),
-            row("hq-2", "task", "Sesiones, con \"comillas\"", Some("hq-mod-a"), Some(4.5), "closed"),
-            row("hq-3", "spike", "Suelto", None, Some(2.0), "open"),
+            row("hq-mod-a", "epic", "Módulo Auth", None, "open"),
+            row("hq-1", "task", "Login form", Some(8.0), "working"),
+            row("hq-2", "task", "Sesiones, con \"comillas\"", Some(4.5), "closed"),
+            row("hq-3", "spike", "Suelto", Some(2.0), "open"),
         ];
-        build_report("hq", "default", &rows)
+        let mut parent_map = HashMap::new();
+        parent_map.insert("hq-1".to_string(), "hq-mod-a".to_string());
+        parent_map.insert("hq-2".to_string(), "hq-mod-a".to_string());
+        build_report("hq", "default", &rows, &parent_map)
     }
 
     #[test]

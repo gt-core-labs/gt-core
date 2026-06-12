@@ -238,7 +238,7 @@ pub async fn dispatch(
                 status: a.status.map(|s| s.split(',').filter(|v| !v.is_empty()).map(String::from).collect()).unwrap_or_default(),
                 priority_max: a.priority_max,
                 assignee: a.assignee,
-                external_ref: a.external_ref,
+                parent_id: a.parent_id,
                 issue_type: a.issue_type,
                 limit: a.limit,
                 offset: a.offset,
@@ -255,9 +255,10 @@ pub async fn dispatch(
                 // ready=true needs phase frontier + dep index + git tree (same as resource path)
                 let rows = read_issues(store, &filter).await?;
                 let open_phase = store.open_phase().await?;
+                let deps_map = store.depends_on_edges(&filter).await?;
                 let deps = store.dep_index().await?;
                 let tree = surface_tree(repo_dir);
-                let rows = filter_ready(rows, open_phase, &deps, tree.as_ref());
+                let rows = filter_ready(rows, &deps_map, open_phase, &deps, tree.as_ref());
                 filter.ready = false; // consumed
                 return serde_json::to_value(&rows)
                     .map_err(|e| AppError::Other(format!("encode issues: {e}")));
@@ -364,21 +365,26 @@ pub async fn dispatch_meta(
                 created_by: actor.into(),
                 notes: g.notes.unwrap_or_default(),
                 priority,
-                external_ref: Some(external_ref.clone()),
+                parent_id: Some(external_ref.clone()),
                 // Seed the graph columns so native-surface filtering + reconciler
                 // edge derivation pick the bead up without a manual issues.update.
                 domain_json: json_array(g.domain.as_deref()),
                 surface_json: json_array(g.surface.as_deref()),
-                depends_on_json: json_array(g.depends_on.as_deref()),
                 rig: bead_prefix(&id).to_string(),
                 ..Default::default()
             };
             store.insert(&new).await?;
+            // Insert depends_on relations (replaces depends_on_json column).
+            if let Some(deps) = &g.depends_on {
+                for dep_id in deps {
+                    store.add_relation(&id, dep_id, "depends_on").await?;
+                }
+            }
             Ok(json!({
                 "bead": id,
                 "operation": g.operation,
                 "priority": priority,
-                "external_ref": external_ref,
+                "parent_id": external_ref,
             }))
         }
         other => Err(AppError::Validation(format!("unknown tool `{other}`"))),
@@ -482,7 +488,7 @@ pub fn parse_issue_filter(qs: &str) -> Result<IssueFilter, AppError> {
                 );
             }
             "assignee" => filter.assignee = Some(value.to_string()),
-            "external_ref" => filter.external_ref = Some(value.to_string()),
+            "parent_id" => filter.parent_id = Some(value.to_string()),
             "issue_type" => filter.issue_type = Some(value.to_string()),
             "limit" => {
                 filter.limit = Some(
@@ -625,8 +631,8 @@ mod tests {
         assert!(parse_issue_filter("ready=1").unwrap().ready);
         assert!(parse_issue_filter("ready=true").unwrap().ready);
         // Combinable with other filters; absent ⇒ false.
-        let f = parse_issue_filter("external_ref=hq-core-mcp&ready=yes").unwrap();
-        assert!(f.ready && f.external_ref.as_deref() == Some("hq-core-mcp"));
+        let f = parse_issue_filter("parent_id=hq-core-mcp&ready=yes").unwrap();
+        assert!(f.ready && f.parent_id.as_deref() == Some("hq-core-mcp"));
         assert!(!parse_issue_filter("status=open").unwrap().ready);
     }
 

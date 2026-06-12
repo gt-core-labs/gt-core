@@ -105,9 +105,9 @@ impl GroupDim {
     /// value; `domain` yields one per taxonomy entry (or `[""]` when the row has none, so an
     /// undomained bead still counts once). The canonical "missing" value is `""` across the board,
     /// matching how the store represents unassigned/unowned/orphan.
-    fn values_of(self, row: &IssueRow) -> Vec<String> {
+    fn values_of(self, row: &IssueRow, parent_map: &std::collections::HashMap<String, String>) -> Vec<String> {
         match self {
-            Self::Epic => vec![row.external_ref.clone().unwrap_or_default()],
+            Self::Epic => vec![parent_map.get(&row.id).cloned().unwrap_or_default()],
             Self::Rig => vec![rig_of(&row.id)],
             Self::Status => vec![row.status.clone()],
             Self::Assignee => vec![row.assignee.clone().unwrap_or_default()],
@@ -309,7 +309,7 @@ fn parse_ts(s: &str) -> Option<i64> {
 /// contributes to: scalar dimensions yield one value, the multi-valued `domain` dimension fans the
 /// row across its domains. `totals` folds every row once, ungrouped, regardless of fan-out, so the
 /// denominator stays the true row count.
-pub fn aggregate(rows: &[IssueRow], dims: &[GroupDim]) -> StatsResponse {
+pub fn aggregate(rows: &[IssueRow], dims: &[GroupDim], parent_map: &std::collections::HashMap<String, String>) -> StatsResponse {
     use std::collections::BTreeMap;
 
     let mut buckets: BTreeMap<Vec<(String, String)>, Acc> = BTreeMap::new();
@@ -321,7 +321,7 @@ pub fn aggregate(rows: &[IssueRow], dims: &[GroupDim]) -> StatsResponse {
 
         // Build the per-dimension value lists, then the cartesian product of keys this row hits.
         let per_dim: Vec<(GroupDim, Vec<String>)> =
-            dims.iter().map(|&d| (d, d.values_of(row))).collect();
+            dims.iter().map(|&d| (d, d.values_of(row, parent_map))).collect();
         for key in cartesian(&per_dim) {
             buckets.entry(key).or_default().observe(row);
         }
@@ -390,7 +390,7 @@ pub fn workspace_stats(workspace: &str, role: &str, rows: &[IssueRow]) -> Worksp
     for row in rows {
         totals.observe(row);
     }
-    let rigs = aggregate(rows, &[GroupDim::Rig]).buckets;
+    let rigs = aggregate(rows, &[GroupDim::Rig], &std::collections::HashMap::new()).buckets;
     WorkspaceStats {
         workspace: workspace.to_string(),
         role: role.to_string(),
@@ -457,11 +457,9 @@ mod tests {
             created_at: created.map(String::from),
             updated_at: None,
             closed_at: closed.map(String::from),
-            external_ref: None,
             spec_id: None,
             domain_json: "[]".into(),
             surface_json: "[]".into(),
-            depends_on_json: "[]".into(),
             role_scope: None,
             version: 0,
             phase: "P1".into(),
@@ -509,7 +507,7 @@ mod tests {
             row("hq-a.3", "closed", Some("2026-01-01T00:00:00Z"), Some("2026-01-02T00:00:00Z")),
             row("hq-a.4", "closed", Some("2026-01-01T00:00:00Z"), Some("2026-01-03T00:00:00Z")),
         ];
-        let resp = aggregate(&rows, &[GroupDim::Status]);
+        let resp = aggregate(&rows, &[GroupDim::Status], &std::collections::HashMap::new());
         // One bucket per distinct status.
         let by: std::collections::HashMap<_, _> = resp
             .buckets
@@ -533,7 +531,7 @@ mod tests {
             row("hq-a.2", "closed", Some("2026-01-01T00:00:00Z"), Some("2026-01-02T00:00:00Z")),
             row("hq-a.3", "closed", Some("2026-01-01T00:00:00Z"), Some("2026-01-02T00:00:00Z")),
         ];
-        let resp = aggregate(&rows, &[GroupDim::Rig]);
+        let resp = aggregate(&rows, &[GroupDim::Rig], &std::collections::HashMap::new());
         assert_eq!(resp.buckets.len(), 1);
         // 2 of 3 closed => 66.7%.
         assert_eq!(resp.buckets[0].progress_pct, 66.7);
@@ -549,7 +547,7 @@ mod tests {
             // open row contributes no lead sample.
             row("hq-a.3", "open", Some("2026-01-01T00:00:00Z"), None),
         ];
-        let resp = aggregate(&rows, &[GroupDim::Rig]);
+        let resp = aggregate(&rows, &[GroupDim::Rig], &std::collections::HashMap::new());
         let lt = &resp.buckets[0].lead_time;
         assert_eq!(lt.count, 2);
         assert_eq!(lt.min_secs, Some(86_400));
@@ -561,7 +559,7 @@ mod tests {
     #[test]
     fn lead_time_empty_when_no_closed_rows() {
         let rows = vec![row("hq-a.1", "open", Some("2026-01-01T00:00:00Z"), None)];
-        let resp = aggregate(&rows, &[GroupDim::Rig]);
+        let resp = aggregate(&rows, &[GroupDim::Rig], &std::collections::HashMap::new());
         let lt = &resp.buckets[0].lead_time;
         assert_eq!(lt.count, 0);
         assert_eq!(lt.mean_secs, None);
@@ -576,7 +574,7 @@ mod tests {
             // unparseable — skipped.
             row("hq-a.2", "closed", Some("not-a-date"), Some("also-bad")),
         ];
-        let resp = aggregate(&rows, &[GroupDim::Rig]);
+        let resp = aggregate(&rows, &[GroupDim::Rig], &std::collections::HashMap::new());
         let b = &resp.buckets[0];
         // Both still count as closed rows...
         assert_eq!(b.closed, 2);
@@ -592,7 +590,7 @@ mod tests {
         r2.assignee = Some("alice".into());
         let mut r3 = row("hq-c.1", "open", None, None);
         r3.assignee = Some("bob".into());
-        let resp = aggregate(&[r1, r2, r3], &[GroupDim::Assignee, GroupDim::Rig]);
+        let resp = aggregate(&[r1, r2, r3], &[GroupDim::Assignee, GroupDim::Rig], &std::collections::HashMap::new());
         // (alice,hq) (alice,tobx) (bob,hq) => 3 buckets.
         assert_eq!(resp.buckets.len(), 3);
         let find = |a: &str, rg: &str| {
@@ -615,7 +613,7 @@ mod tests {
         let mut r = row("hq-a.1", "open", None, None);
         r.domain_json = r#"["platform.auth","platform.documents"]"#.into();
         let undomained = row("hq-b.1", "open", None, None); // domain_json "[]"
-        let resp = aggregate(&[r, undomained], &[GroupDim::Domain]);
+        let resp = aggregate(&[r, undomained], &[GroupDim::Domain], &std::collections::HashMap::new());
         // auth, documents, and the "" bucket for the undomained row.
         assert_eq!(resp.buckets.len(), 3);
         let total: u64 = resp.buckets.iter().map(|b| b.total).sum();
@@ -628,7 +626,7 @@ mod tests {
     #[test]
     fn assignee_owner_missing_maps_to_empty_string() {
         let rows = vec![row("hq-a.1", "open", None, None)];
-        let resp = aggregate(&rows, &[GroupDim::Assignee]);
+        let resp = aggregate(&rows, &[GroupDim::Assignee], &std::collections::HashMap::new());
         assert_eq!(resp.buckets[0].key.get("assignee").map(String::as_str), Some(""));
     }
 

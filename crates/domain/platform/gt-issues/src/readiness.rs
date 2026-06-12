@@ -56,6 +56,7 @@ pub fn dep_satisfied(fact: &DepFact) -> bool {
 ///   wired, so the surface clause passes — mirroring the §S3 degradation).
 pub fn is_ready(
     row: &IssueRow,
+    deps: &[String],
     open_phase: IssuePhase,
     dep_fact: &dyn Fn(&str) -> Option<DepFact>,
     tree: &(dyn SurfaceTree + Sync),
@@ -72,7 +73,7 @@ pub fn is_ready(
     }
     // Clause 1 (S2 + §C): every dependency must be satisfied — a non-epic dep by
     // delivery (sha on main), an epic dep by close — not merely be marked closed.
-    let deps: Vec<String> = serde_json::from_str(&row.depends_on_json).unwrap_or_default();
+    // Deps come from the `issue_relations` table (passed in by caller).
     if !deps
         .iter()
         .all(|d| dep_fact(d).as_ref().map(dep_satisfied).unwrap_or(false))
@@ -94,7 +95,7 @@ mod tests {
 
     /// Minimal `IssueRow` with the readiness-relevant fields set; the rest take
     /// cheap defaults the predicate ignores.
-    fn row(status: &str, phase: &str, depends_on: &str, surface: &str) -> IssueRow {
+    fn row(status: &str, phase: &str, surface: &str) -> IssueRow {
         IssueRow {
             id: "hq-x.1".into(),
             title: "t".into(),
@@ -106,11 +107,9 @@ mod tests {
             created_at: None,
             updated_at: None,
             closed_at: None,
-            external_ref: None,
             spec_id: None,
             domain_json: "[]".into(),
             surface_json: surface.into(),
-            depends_on_json: depends_on.into(),
             role_scope: None,
             version: 0,
             phase: phase.into(),
@@ -144,36 +143,32 @@ mod tests {
 
     #[test]
     fn open_no_deps_no_surface_is_ready() {
-        let r = row("open", "P1", "[]", "[]");
-        assert!(is_ready(&r, IssuePhase::P3, &none_delivered, &AllowAllTree));
+        let r = row("open", "P1", "[]");
+        assert!(is_ready(&r, &[], IssuePhase::P3, &none_delivered, &AllowAllTree));
     }
 
     #[test]
     fn closed_or_working_is_never_ready() {
-        assert!(!is_ready(&row("closed", "P1", "[]", "[]"), IssuePhase::P3, &all_delivered, &AllowAllTree));
-        assert!(!is_ready(&row("working", "P1", "[]", "[]"), IssuePhase::P3, &all_delivered, &AllowAllTree));
+        assert!(!is_ready(&row("closed", "P1", "[]"), &[], IssuePhase::P3, &all_delivered, &AllowAllTree));
+        assert!(!is_ready(&row("working", "P1", "[]"), &[], IssuePhase::P3, &all_delivered, &AllowAllTree));
     }
 
     #[test]
     fn phase_above_frontier_is_gated() {
-        // P4 bead while open_phase=P3 → excluded (the mt-data.3/refactor.2 case).
-        assert!(!is_ready(&row("open", "P4", "[]", "[]"), IssuePhase::P3, &all_delivered, &AllowAllTree));
-        // P3 bead at the frontier → allowed.
-        assert!(is_ready(&row("open", "P3", "[]", "[]"), IssuePhase::P3, &all_delivered, &AllowAllTree));
+        assert!(!is_ready(&row("open", "P4", "[]"), &[], IssuePhase::P3, &all_delivered, &AllowAllTree));
+        assert!(is_ready(&row("open", "P3", "[]"), &[], IssuePhase::P3, &all_delivered, &AllowAllTree));
     }
 
     #[test]
     fn undelivered_dependency_blocks() {
-        let r = row("open", "P1", r#"["hq-dep.1"]"#, "[]");
-        assert!(!is_ready(&r, IssuePhase::P3, &none_delivered, &AllowAllTree));
-        assert!(is_ready(&r, IssuePhase::P3, &all_delivered, &AllowAllTree));
+        let r = row("open", "P1", "[]");
+        let deps = vec!["hq-dep.1".to_string()];
+        assert!(!is_ready(&r, &deps, IssuePhase::P3, &none_delivered, &AllowAllTree));
+        assert!(is_ready(&r, &deps, IssuePhase::P3, &all_delivered, &AllowAllTree));
     }
 
     #[test]
     fn epic_dep_rule_closed_epic_satisfies_undelivered_task_does_not() {
-        // §C: a dep that is a CLOSED EPIC satisfies (epics deliver-by-close, never
-        // stamp a single delivered_sha) — so a bead depending on it is ready even
-        // though the epic has delivered_sha NULL.
         let closed_epic = |_: &str| {
             Some(DepFact {
                 issue_type: "epic".into(),
@@ -181,11 +176,10 @@ mod tests {
                 delivered: false,
             })
         };
-        let r = row("open", "P1", r#"["hq-epic"]"#, "[]");
-        assert!(is_ready(&r, IssuePhase::P3, &closed_epic, &AllowAllTree));
+        let r = row("open", "P1", "[]");
+        let epic_deps = vec!["hq-epic".to_string()];
+        assert!(is_ready(&r, &epic_deps, IssuePhase::P3, &closed_epic, &AllowAllTree));
 
-        // §C: a dep that is a CLOSED TASK with delivered_sha NULL does NOT satisfy
-        // (a wontfix/no-deliverable close produced no artifact).
         let closed_task_no_sha = |_: &str| {
             Some(DepFact {
                 issue_type: "task".into(),
@@ -193,10 +187,9 @@ mod tests {
                 delivered: false,
             })
         };
-        let r = row("open", "P1", r#"["hq-task.1"]"#, "[]");
-        assert!(!is_ready(&r, IssuePhase::P3, &closed_task_no_sha, &AllowAllTree));
+        let task_deps = vec!["hq-task.1".to_string()];
+        assert!(!is_ready(&r, &task_deps, IssuePhase::P3, &closed_task_no_sha, &AllowAllTree));
 
-        // An OPEN epic does not satisfy (deliver-by-close requires the close).
         let open_epic = |_: &str| {
             Some(DepFact {
                 issue_type: "epic".into(),
@@ -204,7 +197,7 @@ mod tests {
                 delivered: false,
             })
         };
-        assert!(!is_ready(&r, IssuePhase::P3, &open_epic, &AllowAllTree));
+        assert!(!is_ready(&r, &epic_deps, IssuePhase::P3, &open_epic, &AllowAllTree));
     }
 
     #[test]
@@ -215,11 +208,9 @@ mod tests {
                 false
             }
         }
-        // non-planned + absent on main → not ready.
-        let blocked = row("open", "P1", "[]", r#"[{"path":"crates/missing","planned":false}]"#);
-        assert!(!is_ready(&blocked, IssuePhase::P3, &all_delivered, &Empty));
-        // planned:true → the surface clause is skipped, so it is ready.
-        let planned = row("open", "P1", "[]", r#"[{"path":"crates/missing","planned":true}]"#);
-        assert!(is_ready(&planned, IssuePhase::P3, &all_delivered, &Empty));
+        let blocked = row("open", "P1", r#"[{"path":"crates/missing","planned":false}]"#);
+        assert!(!is_ready(&blocked, &[], IssuePhase::P3, &all_delivered, &Empty));
+        let planned = row("open", "P1", r#"[{"path":"crates/missing","planned":true}]"#);
+        assert!(is_ready(&planned, &[], IssuePhase::P3, &all_delivered, &Empty));
     }
 }

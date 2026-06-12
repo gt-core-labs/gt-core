@@ -68,17 +68,21 @@ pub async fn read_issue(issues: &DoltIssues, id: &str) -> Result<Option<IssueDet
 /// issues data rather than in the transport bin.
 pub fn filter_ready(
     rows: Vec<IssueRow>,
+    deps_map: &HashMap<String, Vec<String>>,
     open_phase: IssuePhase,
     deps: &HashMap<String, DepFact>,
     tree: &(dyn SurfaceTree + Sync),
 ) -> Vec<IssueRow> {
     rows.into_iter()
-        .filter(|r| is_ready(r, open_phase, &|id| deps.get(id).cloned(), tree))
+        .filter(|r| {
+            let row_deps: &[String] = deps_map.get(&r.id).map(|v| v.as_slice()).unwrap_or(&[]);
+            is_ready(r, row_deps, open_phase, &|id| deps.get(id).cloned(), tree)
+        })
         .collect()
 }
 
 /// Header line of the [`rows_to_tsv`] table — the column order every row follows.
-const TSV_HEADER: &str = "id\tstatus\tpriority\tphase\ttype\tassignee\texternal_ref\ttitle";
+const TSV_HEADER: &str = "id\tstatus\tpriority\tphase\ttype\tassignee\tparent_id\ttitle";
 
 /// Render a bare issues snapshot as a dense TSV table (hq-mcp-output-format): one
 /// header line then one tab-separated row per bead, carrying only the cheap scalar
@@ -87,11 +91,12 @@ const TSV_HEADER: &str = "id\tstatus\tpriority\tphase\ttype\tassignee\texternal_
 /// the largest token saving on a list-heavy read. Heavy text bodies and the
 /// `*_json` arrays are intentionally omitted; a caller needing those re-reads the
 /// row as JSON (`gt://issue/{id}` or `?full=1`).
-pub fn rows_to_tsv(rows: &[IssueRow]) -> String {
+pub fn rows_to_tsv(rows: &[IssueRow], parent_map: &HashMap<String, String>) -> String {
     let mut out = String::from(TSV_HEADER);
     for r in rows {
         // `title` last so its free-text spaces never collide with a tab delimiter;
         // every string cell is still sanitised in case one carries a stray tab.
+        let parent_id = parent_map.get(&r.id).map(String::as_str).unwrap_or("");
         let _ = write!(
             out,
             "\n{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
@@ -101,7 +106,7 @@ pub fn rows_to_tsv(rows: &[IssueRow]) -> String {
             cell(&r.phase),
             cell(&r.issue_type),
             cell(r.assignee.as_deref().unwrap_or("")),
-            cell(r.external_ref.as_deref().unwrap_or("")),
+            cell(parent_id),
             cell(&r.title),
         );
     }
@@ -112,8 +117,8 @@ pub fn rows_to_tsv(rows: &[IssueRow]) -> String {
 /// table followed by a trailer comment line carrying the pager envelope
 /// (`total`/`next_offset`/`has_more`) so a caller still walks the corpus by offset
 /// without paying for the JSON envelope's whitespace + repeated row keys.
-pub fn page_to_tsv(page: &IssuePage) -> String {
-    let mut out = rows_to_tsv(&page.rows);
+pub fn page_to_tsv(page: &IssuePage, parent_map: &HashMap<String, String>) -> String {
+    let mut out = rows_to_tsv(&page.rows, parent_map);
     let _ = write!(
         out,
         "\n# total={} next_offset={} has_more={}",
@@ -149,11 +154,9 @@ mod tsv_tests {
             created_at: None,
             updated_at: None,
             closed_at: None,
-            external_ref: Some("hq-epic".to_string()),
             spec_id: None,
             domain_json: "[]".to_string(),
             surface_json: "[]".to_string(),
-            depends_on_json: "[]".to_string(),
             role_scope: None,
             version: 0,
             phase: "P1".to_string(),
@@ -173,7 +176,9 @@ mod tsv_tests {
 
     #[test]
     fn header_then_one_line_per_row() {
-        let tsv = rows_to_tsv(&[row("a-1", "open", "first"), row("a-2", "working", "second")]);
+        let mut parent_map = HashMap::new();
+        parent_map.insert("a-1".to_string(), "hq-epic".to_string());
+        let tsv = rows_to_tsv(&[row("a-1", "open", "first"), row("a-2", "working", "second")], &parent_map);
         let lines: Vec<&str> = tsv.lines().collect();
         assert_eq!(lines[0], TSV_HEADER);
         assert_eq!(lines.len(), 3, "header + 2 rows");
@@ -184,12 +189,12 @@ mod tsv_tests {
 
     #[test]
     fn empty_snapshot_is_header_only() {
-        assert_eq!(rows_to_tsv(&[]), TSV_HEADER);
+        assert_eq!(rows_to_tsv(&[], &HashMap::new()), TSV_HEADER);
     }
 
     #[test]
     fn control_chars_in_title_collapse_to_spaces() {
-        let tsv = rows_to_tsv(&[row("a-1", "open", "tab\there\nand newline")]);
+        let tsv = rows_to_tsv(&[row("a-1", "open", "tab\there\nand newline")], &HashMap::new());
         let cells: Vec<&str> = tsv.lines().nth(1).unwrap().split('\t').collect();
         assert_eq!(cells.len(), 8, "stray tab/newline must not add columns/rows");
         assert_eq!(cells[7], "tab here and newline");
@@ -203,7 +208,7 @@ mod tsv_tests {
             next_offset: 1,
             has_more: true,
         };
-        let tsv = page_to_tsv(&page);
+        let tsv = page_to_tsv(&page, &HashMap::new());
         let last = tsv.lines().last().unwrap();
         assert_eq!(last, "# total=42 next_offset=1 has_more=true");
     }

@@ -88,7 +88,7 @@ pub async fn run_update_issue(
     // -> `hq-core`) is accepted just like `issues.create` accepts it. Runs before
     // the `validate_only` return so the `.validate` tool reports it too. A missing
     // row is left to the execute path's `affected_rows == 0` existence check.
-    if args.issue_type.is_none() && args.external_ref.as_deref().is_some_and(|r| !r.is_empty()) {
+    if args.issue_type.is_none() && args.parent_id.as_deref().is_some_and(|r| !r.is_empty()) {
         if let Some(detail) = issues.get_detail(&args.id).await? {
             args.check_taxonomy(&detail.issue_type)?;
         }

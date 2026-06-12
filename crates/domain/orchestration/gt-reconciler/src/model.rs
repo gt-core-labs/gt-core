@@ -23,15 +23,15 @@ pub struct Bead {
 }
 
 impl Bead {
-    /// Project a store row, parsing the surface + depends_on JSON columns.
-    pub fn from_row(r: &IssueRow) -> Self {
+    /// Project a store row with pre-fetched depends_on edges.
+    pub fn from_row(r: &IssueRow, depends_on: Vec<String>) -> Self {
         Bead {
             id: r.id.clone(),
             issue_type: r.issue_type.clone(),
             status: r.status.clone(),
             closed_at: r.closed_at.clone(),
             surface: parse_surface_json(&r.surface_json),
-            depends_on: serde_json::from_str(&r.depends_on_json).unwrap_or_default(),
+            depends_on,
             delivered: r
                 .delivered_sha
                 .as_ref()

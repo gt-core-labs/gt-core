@@ -518,11 +518,16 @@ impl ReportService {
             })
             .await
             .map_err(|e| format!("tracker rows: {e}"))?;
-        let report = build_report(&schedule.rig, &schedule.workspace, &rows);
+        let parent_map = self
+            .dolt
+            .parent_map(&schedule.rig, &schedule.workspace)
+            .await
+            .map_err(|e| format!("parent_map: {e}"))?;
+        let report = build_report(&schedule.rig, &schedule.workspace, &rows, &parent_map);
         let (today, _) = local_now(schedule.tz_offset_minutes);
         // reopens=0: the audit-derived count lives with the analytics handler;
         // the digest tolerates the conservative zero (defects still counted).
-        let summary = summarize(&schedule.rig, &schedule.workspace, &rows, 0, &today, 7, 30);
+        let summary = summarize(&schedule.rig, &schedule.workspace, &rows, 0, &today, 7, 30, &parent_map);
         let (subject, html) = render(&report, &summary, &today);
 
         let outbox = PgEmailOutbox::new(self.pool.clone());

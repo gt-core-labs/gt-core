@@ -843,15 +843,20 @@ impl IssuesServer {
             if filter.ready {
                 let rows = gt_issues::resources::read_issues(store, &filter).await?;
                 let open_phase = store.open_phase().await?;
+                let deps_map = store.depends_on_edges(&filter).await?;
                 let deps = store.dep_index().await?;
                 let repo_dir = self.repo_dir.as_deref().map(|p| p.as_path());
                 let tree = crate::git_tree::surface_tree(repo_dir);
-                let rows =
-                    gt_issues::resources::filter_ready(rows, open_phase, &deps, tree.as_ref());
+                let rows = gt_issues::resources::filter_ready(rows, &deps_map, open_phase, &deps, tree.as_ref());
                 // hq-mcp-output-format: the frontier is list-heavy too — honour tsv.
                 if format == OutputFormat::Tsv {
+                    let parent_map = store.parent_map(
+                        filter.rig.as_deref().unwrap_or(""),
+                        filter.workspace.as_deref().unwrap_or(""),
+                    ).await?;
                     return Ok(ResourcePayload::Text(gt_issues::resources::rows_to_tsv(
                         &rows,
+                        &parent_map,
                     )));
                 }
                 return serde_json::to_value(&rows)
@@ -864,8 +869,13 @@ impl IssuesServer {
             let page = gt_issues::resources::read_issues_page(store, &filter).await?;
             // hq-mcp-output-format: the dense tabular shape for the largest read.
             if format == OutputFormat::Tsv {
+                let parent_map = store.parent_map(
+                    filter.rig.as_deref().unwrap_or(""),
+                    filter.workspace.as_deref().unwrap_or(""),
+                ).await?;
                 return Ok(ResourcePayload::Text(gt_issues::resources::page_to_tsv(
                     &page,
+                    &parent_map,
                 )));
             }
             return serde_json::to_value(&page)

@@ -263,8 +263,8 @@ struct ListQuery {
     priority_max: Option<u8>,
     /// Exact `assignee` match (`""` is the canonical unassigned value).
     assignee: Option<String>,
-    /// Exact `external_ref` match (epic linkage).
-    external_ref: Option<String>,
+    /// Narrow to children of this parent epic id (`child_of` relation).
+    parent_id: Option<String>,
     /// Exact `issue_type` match.
     issue_type: Option<String>,
     /// Page size; unset ⇒ the store's configured default.
@@ -303,7 +303,7 @@ impl ListQuery {
                 .unwrap_or_default(),
             priority_max: self.priority_max,
             assignee: self.assignee,
-            external_ref: self.external_ref,
+            parent_id: self.parent_id,
             issue_type: self.issue_type,
             limit: self.limit,
             offset: self.offset,
@@ -336,7 +336,7 @@ where
         ("status" = Option<String>, Query, description = "Comma-separated status filter"),
         ("priority_max" = Option<u8>, Query, description = "Keep priority <= this"),
         ("assignee" = Option<String>, Query, description = "Exact assignee match"),
-        ("external_ref" = Option<String>, Query, description = "Exact external_ref (epic) match"),
+        ("parent_id" = Option<String>, Query, description = "Narrow to children of this parent epic id"),
         ("issue_type" = Option<String>, Query, description = "Exact issue_type match"),
         ("limit" = Option<u32>, Query, description = "Page size"),
         ("offset" = Option<u32>, Query, description = "Zero-based row offset"),
@@ -362,9 +362,10 @@ async fn list_issues(
     if filter.ready {
         let rows = read_issues(&store, &filter).await?;
         let open_phase = store.open_phase().await?;
+        let deps_map = store.depends_on_edges(&filter).await?;
         let deps = store.dep_index().await?;
         let tree = st.surfaces.surface_tree();
-        let ready = filter_ready(rows, open_phase, &deps, tree.as_ref());
+        let ready = filter_ready(rows, &deps_map, open_phase, &deps, tree.as_ref());
         // hq-agent-observability.3: inline `operated_by` per row when an operator provider is
         // wired (the bare `ready` array is rows too). Without one, serve the rows unchanged.
         let ws = ctx.workspace();
@@ -393,8 +394,8 @@ struct StatsQuery {
     priority_max: Option<u8>,
     /// Optional exact `assignee` pre-filter (`""` = unassigned).
     assignee: Option<String>,
-    /// Optional exact `external_ref` (epic) pre-filter.
-    external_ref: Option<String>,
+    /// Optional parent epic id pre-filter (`child_of` relation).
+    parent_id: Option<String>,
     /// Optional exact `issue_type` pre-filter.
     issue_type: Option<String>,
 }
@@ -418,7 +419,7 @@ struct StatsQuery {
         ("status" = Option<String>, Query, description = "Comma-separated status pre-filter"),
         ("priority_max" = Option<u8>, Query, description = "Keep priority <= this"),
         ("assignee" = Option<String>, Query, description = "Exact assignee pre-filter"),
-        ("external_ref" = Option<String>, Query, description = "Exact external_ref (epic) pre-filter"),
+        ("parent_id" = Option<String>, Query, description = "Parent epic id pre-filter (child_of relation)"),
         ("issue_type" = Option<String>, Query, description = "Exact issue_type pre-filter"),
     ),
     responses(
@@ -448,7 +449,7 @@ async fn issue_stats(
             .unwrap_or_default(),
         priority_max: q.priority_max,
         assignee: q.assignee,
-        external_ref: q.external_ref,
+        parent_id: q.parent_id,
         issue_type: q.issue_type,
         limit: Some(gt_store_dolt::issues_max_limit()),
         offset: None,
@@ -458,7 +459,8 @@ async fn issue_stats(
         workspace: None,
     };
     let rows = read_issues(&store, &filter).await?;
-    Ok(Json(aggregate(&rows, &dims)))
+    let parent_map = store.parent_map("", "").await?;
+    Ok(Json(aggregate(&rows, &dims, &parent_map)))
 }
 
 /// `GET /:id` — one issue with its heavy bodies + `version` (`gt://issue/{id}`); `404` when no

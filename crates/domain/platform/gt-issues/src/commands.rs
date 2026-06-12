@@ -153,10 +153,10 @@ pub struct CreateIssue {
     pub issue_type: IssueType,
     /// Bead creator (the agent or operator). Required.
     pub created_by: String,
-    /// Optional epic linkage (the sub-epic this bead belongs to). Required for a
-    /// non-epic bead by NN-16; see [`Self::validate`].
+    /// Optional parent epic id (`child_of` relation). Required for a non-epic
+    /// bead by NN-16; see [`Self::validate`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub external_ref: Option<String>,
+    pub parent_id: Option<String>,
     /// Optional assignee.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub assignee: Option<String>,
@@ -236,26 +236,26 @@ impl CreateIssue {
         }
 
         // NN-16: when a manual id is provided, enforce the full old-format rule
-        // (`<external_ref>.<n>`) for backward compat. When the id will be
-        // server-generated ({rig}-{6hex} format), only require external_ref for
+        // (`<parent_id>.<n>`) for backward compat. When the id will be
+        // server-generated ({rig}-{6hex} format), only require parent_id for
         // non-epics — the id no longer embeds the epic linkage.
         if let Some(id) = &self.id {
             taxonomy_validate(&BeadTaxonomy {
                 id,
                 issue_type: self.issue_type.as_str(),
-                external_ref: self.external_ref.as_deref().unwrap_or(""),
+                external_ref: self.parent_id.as_deref().unwrap_or(""),
             })
             .map_err(taxonomy_err)?;
             // Self-cycle check only makes sense with a known id.
             check_depends_on(id, &self.depends_on)?;
         } else {
-            // Auto-generated id: require external_ref for non-epics (NN-16 linkage
+            // Auto-generated id: require parent_id for non-epics (NN-16 linkage
             // is preserved; the id format constraint is relaxed).
             if !self.issue_type.is_epic()
-                && self.external_ref.as_deref().unwrap_or("").trim().is_empty()
+                && self.parent_id.as_deref().unwrap_or("").trim().is_empty()
             {
                 return Err(AppError::Validation(
-                    "external_ref is required for non-epic beads (NN-16)".into(),
+                    "parent_id is required for non-epic beads (NN-16)".into(),
                 ));
             }
         }
@@ -300,12 +300,11 @@ impl CreateIssue {
             priority: self.priority,
             issue_type: self.issue_type.as_str().to_string(),
             created_by: self.created_by.clone(),
-            external_ref: self.external_ref.clone(),
+            parent_id: self.parent_id.clone(),
             assignee: self.assignee.clone(),
             owner: self.owner.clone(),
             domain_json: domain_to_json(&self.domain),
             surface_json: surface_to_json(&self.surface),
-            depends_on_json: to_json_array(&self.depends_on),
             role_scope: self.role_scope.clone(),
             phase: self.phase.clone(),
             rig,
@@ -351,10 +350,10 @@ pub struct UpdateIssue {
     /// New owner. Empty string clears.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub owner: Option<String>,
-    /// New epic linkage. Empty string clears. When set non-empty, NN-16 is
-    /// re-checked against the (possibly also-updated) `issue_type`.
+    /// New parent epic id (`child_of` relation). `Some("")` clears; `Some(id)` upserts; `None` leaves unchanged.
+    /// When set non-empty, NN-16 is re-checked against the (possibly also-updated) `issue_type`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub external_ref: Option<String>,
+    pub parent_id: Option<String>,
     /// New semantic domains (closed set [`Domain`]). `None` leaves the column
     /// untouched; an empty overwrite is rejected (a bead must keep at least one
     /// domain); an out-of-set value is rejected at deserialization.
@@ -416,14 +415,12 @@ impl UpdateIssue {
                 return Err(AppError::Validation(format!("priority must be 0..=2, got {p}")));
             }
         }
-        // NN-16 is only checkable when the caller (re)points `external_ref`, and
+        // NN-16 is only checkable when the caller (re)points `parent_id`, and
         // only the shape-only part here: when the patch ALSO carries `issue_type`
         // the post-update type is known, so validate against it (epics exempt).
         // When `issue_type` is omitted, a partial patch cannot tell an epic
         // (exempt) from a bead, so this guard defers — the store-aware
-        // `run_update_issue` re-checks against the EXISTING row's type. Assuming
-        // `task` here wrongly rejected re-parenting a dash-named epic like
-        // `hq-core-host` -> `hq-core` (hq-gap-issues-update-external-ref).
+        // `run_update_issue` re-checks against the EXISTING row's type.
         if let Some(issue_type) = self.issue_type {
             self.check_taxonomy(issue_type.as_str())?;
         }
@@ -468,18 +465,18 @@ impl UpdateIssue {
         Ok(())
     }
 
-    /// NN-16 re-check for a re-pointed `external_ref`, against a resolved
+    /// NN-16 re-check for a re-pointed `parent_id`, against a resolved
     /// `issue_type` — the patch's own when present, else the existing row's type
     /// (the store-aware [`run_update_issue`](crate::handlers::run_update_issue)
     /// supplies it). Epics are exempt, matching `issues.create`. A no-op when the
-    /// patch does not set `external_ref` to a non-empty value.
+    /// patch does not set `parent_id` to a non-empty value.
     pub fn check_taxonomy(&self, issue_type: &str) -> Result<(), AppError> {
-        if let Some(external_ref) = &self.external_ref {
-            if !external_ref.is_empty() {
+        if let Some(parent_id) = &self.parent_id {
+            if !parent_id.is_empty() {
                 taxonomy_validate(&BeadTaxonomy {
                     id: &self.id,
                     issue_type,
-                    external_ref,
+                    external_ref: parent_id,
                 })
                 .map_err(taxonomy_err)?;
             }
@@ -511,10 +508,9 @@ impl UpdateIssue {
             issue_type: self.issue_type.map(|t| t.as_str().to_string()),
             assignee: self.assignee.clone(),
             owner: self.owner.clone(),
-            external_ref: self.external_ref.clone(),
+            parent_id: self.parent_id.clone(),
             domain_json: self.domain.as_deref().map(domain_to_json),
             surface_json: self.surface.as_deref().map(surface_to_json),
-            depends_on_json: self.depends_on.as_deref().map(to_json_array),
             phase: self.phase.clone(),
             expected_version: self.expected_version,
             estimated_hours: self.estimated_hours,
@@ -702,8 +698,8 @@ pub struct ListIssues {
     pub priority_max: Option<u8>,
     /// Filter by exact assignee.
     pub assignee: Option<String>,
-    /// Filter by exact external_ref (epic linkage).
-    pub external_ref: Option<String>,
+    /// Filter by parent epic id (`child_of` relation).
+    pub parent_id: Option<String>,
     /// Filter by issue type (`epic`, `task`, `spike`, …).
     pub issue_type: Option<String>,
     /// Page size (default and ceiling governed by server env vars).
@@ -748,7 +744,7 @@ mod tests {
             priority: 1,
             issue_type: IssueType::Task,
             created_by: "me".into(),
-            external_ref: Some("hq-core-host".into()),
+            parent_id: Some("hq-core-host".into()),
             assignee: None,
             owner: None,
             domain: vec![Domain::StoreDolt],
@@ -773,7 +769,7 @@ mod tests {
             issue_type: None,
             assignee: None,
             owner: None,
-            external_ref: None,
+            parent_id: None,
             domain: None,
             surface: None,
             depends_on: None,
@@ -820,39 +816,39 @@ mod tests {
     }
 
     #[test]
-    fn create_enforces_nn16_external_ref() {
+    fn create_enforces_nn16_parent_id() {
         // Non-epic with a mismatched sub-epic is rejected (old format, id provided).
         let mut c = base_create();
-        c.external_ref = Some("hq-other".into());
+        c.parent_id = Some("hq-other".into());
         assert!(c.validate().is_err());
-        // Missing external_ref on a non-epic is rejected (old format).
+        // Missing parent_id on a non-epic is rejected (old format).
         let mut c = base_create();
-        c.external_ref = None;
+        c.parent_id = None;
         assert!(c.validate().is_err());
         // An epic with provided id is exempt.
         let mut c = base_create();
         c.id = Some("hq-core-host".into());
         c.issue_type = IssueType::Epic;
-        c.external_ref = None;
+        c.parent_id = None;
         assert!(c.validate().is_ok());
-        // Auto-generated id (id=None): non-epic requires external_ref.
+        // Auto-generated id (id=None): non-epic requires parent_id.
         let mut c = base_create();
         c.id = None;
         c.rig = "hq".into();
-        c.external_ref = None;
+        c.parent_id = None;
         assert!(c.validate().is_err());
-        // Auto-generated id: non-epic with external_ref passes.
+        // Auto-generated id: non-epic with parent_id passes.
         let mut c = base_create();
         c.id = None;
         c.rig = "hq".into();
-        c.external_ref = Some("hq-core-host".into());
+        c.parent_id = Some("hq-core-host".into());
         assert!(c.validate().is_ok());
         // Auto-generated id: epic is exempt.
         let mut c = base_create();
         c.id = None;
         c.rig = "hq".into();
         c.issue_type = IssueType::Epic;
-        c.external_ref = None;
+        c.parent_id = None;
         assert!(c.validate().is_ok());
     }
 
@@ -874,7 +870,7 @@ mod tests {
         // rig alone (no id) → ok for epic.
         c.rig = "gtweb".into();
         c.issue_type = IssueType::Epic;
-        c.external_ref = None;
+        c.parent_id = None;
         assert!(c.validate().is_ok());
     }
 
@@ -884,7 +880,7 @@ mod tests {
         c.id = None;
         c.rig = "gtweb".into();
         c.issue_type = IssueType::Epic;
-        c.external_ref = None;
+        c.parent_id = None;
         let n = c.to_new();
         assert!(n.id.starts_with("gtweb-"), "id={}", n.id);
         assert_eq!(n.rig, "gtweb");
@@ -898,7 +894,6 @@ mod tests {
         assert_eq!(n.rig, "hq"); // derived from id prefix (backward compat)
         assert_eq!(n.domain_json, "[\"store.dolt\"]");
         assert_eq!(n.surface_json, "[]");
-        assert_eq!(n.depends_on_json, "[]");
     }
 
     #[test]
@@ -955,7 +950,7 @@ mod tests {
             issue_type: None,
             assignee: None,
             owner: None,
-            external_ref: None,
+            parent_id: None,
             domain: None,
             surface: None,
             depends_on: None,
@@ -982,7 +977,7 @@ mod tests {
             issue_type: None,
             assignee: None,
             owner: None,
-            external_ref: None,
+            parent_id: None,
             domain: None,
             surface: None,
             depends_on: None,
@@ -1013,7 +1008,7 @@ mod tests {
             issue_type: None,
             assignee: None,
             owner: None,
-            external_ref: None,
+            parent_id: None,
             domain: None,
             surface: None,
             depends_on: None,
@@ -1029,11 +1024,11 @@ mod tests {
 
     #[test]
     fn update_reparent_to_epic_passes_shape_validate_when_type_in_patch() {
-        // Re-parenting a dash-named epic (`hq-core-host` -> ext_ref `hq-core`)
+        // Re-parenting a dash-named epic (`hq-core-host` -> parent `hq-core`)
         // is accepted when the patch declares `issue_type=epic` — epics are
-        // exempt from the `<external_ref>.<n>` id rule, same as create.
+        // exempt from the `<parent_id>.<n>` id rule, same as create.
         let mut u = base_update();
-        u.external_ref = Some("hq-core".into());
+        u.parent_id = Some("hq-core".into());
         u.issue_type = Some(IssueType::Epic);
         assert!(u.validate().is_ok());
     }
@@ -1042,9 +1037,9 @@ mod tests {
     fn update_reparent_defers_taxonomy_when_type_omitted() {
         // With `issue_type` omitted the shape-only guard cannot tell an epic from
         // a bead, so it no longer assumes `task`; the store-aware handler
-        // re-checks against the row's real type (hq-gap-issues-update-external-ref).
+        // re-checks against the row's real type.
         let mut u = base_update();
-        u.external_ref = Some("hq-core".into());
+        u.parent_id = Some("hq-core".into());
         assert!(u.validate().is_ok());
     }
 
@@ -1053,7 +1048,7 @@ mod tests {
         // When the patch declares a non-epic type, the strict bead rule applies:
         // `hq-core-host` is not `<hq-core>.<n>`.
         let mut u = base_update();
-        u.external_ref = Some("hq-core".into());
+        u.parent_id = Some("hq-core".into());
         u.issue_type = Some(IssueType::Task);
         assert!(matches!(u.validate(), Err(AppError::Validation(_))));
     }
@@ -1062,12 +1057,12 @@ mod tests {
     fn check_taxonomy_exempts_epic_and_rejects_mismatched_bead() {
         let mut u = base_update();
         u.id = "hq-core-host".into();
-        u.external_ref = Some("hq-core".into());
+        u.parent_id = Some("hq-core".into());
         // Resolved as epic -> exempt.
         assert!(u.check_taxonomy("epic").is_ok());
         // Resolved as a bead -> id must be `<hq-core>.<n>`, which it is not.
         assert!(u.check_taxonomy("task").is_err());
-        // No external_ref repoint -> no-op regardless of type.
+        // No parent_id repoint -> no-op regardless of type.
         let u = base_update();
         assert!(u.check_taxonomy("task").is_ok());
     }
@@ -1179,7 +1174,7 @@ mod tests {
             issue_type: None,
             assignee: None,
             owner: None,
-            external_ref: None,
+            parent_id: None,
             domain: None,
             surface: None,
             depends_on: None,

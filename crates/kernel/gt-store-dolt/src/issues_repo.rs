@@ -104,8 +104,8 @@ pub struct IssueFilter {
     /// Match `assignee` exactly. `""` (empty string) matches the canonical
     /// "unassigned" value the schema stores as `''`.
     pub assignee: Option<String>,
-    /// Match `external_ref` exactly (used for epic linkage by `hq-fe-*`).
-    pub external_ref: Option<String>,
+    /// Match beads whose `issue_relations` table has a `child_of` row pointing to this epic id.
+    pub parent_id: Option<String>,
     /// Match `issue_type` exactly (`epic`, `task`, `spike`, ...).
     pub issue_type: Option<String>,
     /// Page size. When `None`, [`DoltIssues::list`] falls back to
@@ -155,7 +155,6 @@ pub struct IssueRow {
     pub created_at: Option<String>,
     pub updated_at: Option<String>,
     pub closed_at: Option<String>,
-    pub external_ref: Option<String>,
     pub spec_id: Option<String>,
     /// JSON array of taxonomy domains (hq-taxon.3). Serialised as a raw JSON
     /// string so consumers (`gt-mcp` resources, `bd` mirrors) re-parse without
@@ -165,9 +164,6 @@ pub struct IssueRow {
     /// JSON array of impact surfaces (crate names or repo paths).
     #[serde(default = "default_json_array")]
     pub surface_json: String,
-    /// JSON array of bead ids this bead is blocked on (forward edges).
-    #[serde(default = "default_json_array")]
-    pub depends_on_json: String,
     /// Optional `role_scope` discriminator (e.g. `sheriff`); `None` when no
     /// role owns the bead. Stored as `VARCHAR(32)` so `bd` legacy callers can
     /// keep filtering with plain string equality.
@@ -335,7 +331,6 @@ pub struct IssueDetail {
     pub created_at: Option<String>,
     pub updated_at: Option<String>,
     pub closed_at: Option<String>,
-    pub external_ref: Option<String>,
     pub spec_id: Option<String>,
     pub description: String,
     pub design: String,
@@ -345,8 +340,6 @@ pub struct IssueDetail {
     pub domain_json: String,
     #[serde(default = "default_json_array")]
     pub surface_json: String,
-    #[serde(default = "default_json_array")]
-    pub depends_on_json: String,
     pub role_scope: Option<String>,
     /// Optimistic-concurrency token (hq-mcp-issues.8). See [`IssueRow::version`].
     #[serde(default)]
@@ -378,6 +371,14 @@ pub struct IssueDetail {
     /// Planned end date `YYYY-MM-DD` (hq-62130a).
     #[serde(default)]
     pub due_date: Option<String>,
+}
+
+/// A row from the `issue_relations` table.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IssueRelation {
+    pub from_id: String,
+    pub to_id: String,
+    pub rel_type: String,
 }
 
 fn default_phase() -> String {
@@ -424,9 +425,8 @@ pub struct IssuePatch {
     pub assignee: Option<String>,
     /// New owner. Same nullability shape as `assignee`.
     pub owner: Option<String>,
-    /// New epic linkage. `Some(String::new())` clears to empty string (schema
-    /// is nullable, so the frontier can map to `NULL` if desired).
-    pub external_ref: Option<String>,
+    /// New parent epic id. `Some("")` clears the `child_of` relation; `Some(id)` upserts it; `None` leaves it unchanged.
+    pub parent_id: Option<String>,
     /// New `domain_json` — raw JSON array string (e.g. `["orch.merge"]`).
     /// `None` leaves the column alone; `Some(_)` overwrites verbatim. The
     /// frontier serializes typed `Vec<Domain>` so the stored form round-trips.
@@ -434,9 +434,6 @@ pub struct IssuePatch {
     /// New `surface_json` — raw JSON array string of crate names / repo paths.
     /// `None` leaves the column alone; `Some(_)` overwrites verbatim.
     pub surface_json: Option<String>,
-    /// New `depends_on_json` — raw JSON array string of dependency bead ids.
-    /// `None` leaves the column alone; `Some(_)` overwrites verbatim.
-    pub depends_on_json: Option<String>,
     /// New lifecycle phase token (`"P1".."P4"`, hq-core-mcp.7). `None` leaves
     /// the column untouched; `Some(_)` is a scalar overwrite the frontier
     /// validates against [`IssuePhase`] before the write.
@@ -473,10 +470,9 @@ impl IssuePatch {
             && self.issue_type.is_none()
             && self.assignee.is_none()
             && self.owner.is_none()
-            && self.external_ref.is_none()
+            && self.parent_id.is_none()
             && self.domain_json.is_none()
             && self.surface_json.is_none()
-            && self.depends_on_json.is_none()
             && self.phase.is_none()
             && self.estimated_hours.is_none()
             && self.start_date.is_none()
@@ -510,8 +506,8 @@ pub struct NewIssue {
     pub issue_type: String,
     /// Bead creator. Maps to `created_by`.
     pub created_by: String,
-    /// Optional epic linkage. `None` stores `NULL`.
-    pub external_ref: Option<String>,
+    /// Optional parent epic id. When `Some(id)`, inserts a `child_of` relation into `issue_relations` after insert.
+    pub parent_id: Option<String>,
     /// Optional assignee. `None` stores `NULL`.
     pub assignee: Option<String>,
     /// Optional initial owner. `None` stores schema default `''`.
@@ -523,8 +519,6 @@ pub struct NewIssue {
     pub domain_json: String,
     /// Raw JSON array of impact surfaces (free-form strings).
     pub surface_json: String,
-    /// Raw JSON array of bead ids this bead is blocked on.
-    pub depends_on_json: String,
     /// Optional `role_scope` discriminator. `None` stores `NULL`.
     pub role_scope: Option<String>,
     /// Lifecycle phase token (`"P1".."P4"`, hq-core-mcp.7). `None` lets the
@@ -570,7 +564,6 @@ const ISSUES_BASE_TABLE_SQL: &str = "CREATE TABLE IF NOT EXISTS issues (
     updated_at          DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
     closed_at           DATETIME,
     closed_by_session   VARCHAR(255) DEFAULT '',
-    external_ref        VARCHAR(255),
     spec_id             VARCHAR(1024)
 )";
 
@@ -681,7 +674,6 @@ impl DoltIssues {
         let taxonomy_columns: &[(&str, &str)] = &[
             ("domain_json", "TEXT NOT NULL DEFAULT '[]'"),
             ("surface_json", "TEXT NOT NULL DEFAULT '[]'"),
-            ("depends_on_json", "TEXT NOT NULL DEFAULT '[]'"),
             ("role_scope", "VARCHAR(32) NULL"),
             // hq-mcp-issues.8 — optimistic-concurrency token. Bumped on every
             // write path; `issues.update` can guard on it (expected_version) so
@@ -790,6 +782,68 @@ impl DoltIssues {
             .await
             .map_err(map_err)?;
         }
+        // issue_relations migration: drop legacy inline columns when they still exist
+        // (idempotent — second runs skip if already dropped).
+        let mut dropped_legacy = false;
+        for col in &["external_ref", "depends_on_json"] {
+            let exists: Option<i64> = conn
+                .exec_first(
+                    "SELECT 1 FROM information_schema.columns
+                     WHERE table_schema = DATABASE()
+                       AND table_name = 'issues'
+                       AND column_name = :col LIMIT 1",
+                    mysql_async::params! { "col" => *col },
+                )
+                .await
+                .map_err(map_err)?;
+            if exists.is_some() {
+                let sql = format!("ALTER TABLE issues DROP COLUMN {col}");
+                conn.query_drop(sql).await.map_err(map_err)?;
+                dropped_legacy = true;
+            }
+        }
+        if dropped_legacy {
+            conn.exec_drop(
+                "CALL DOLT_COMMIT('-A', '-m', :msg)",
+                mysql_async::params! {
+                    "msg" => "issue_relations: drop legacy external_ref + depends_on_json columns".to_string(),
+                },
+            )
+            .await
+            .map_err(map_err)?;
+        }
+
+        // issue_relations normalized relation table (replaces external_ref + depends_on_json).
+        let ir_exists: Option<i64> = conn
+            .query_first(
+                "SELECT 1 FROM information_schema.tables
+                 WHERE table_schema = DATABASE() AND table_name = 'issue_relations' LIMIT 1",
+            )
+            .await
+            .map_err(map_err)?;
+        if ir_exists.is_none() {
+            conn.query_drop(
+                "CREATE TABLE IF NOT EXISTS issue_relations (
+                    from_id  VARCHAR(255) NOT NULL,
+                    to_id    VARCHAR(255) NOT NULL,
+                    rel_type VARCHAR(32)  NOT NULL,
+                    PRIMARY KEY (from_id, to_id, rel_type),
+                    INDEX idx_ir_to_id (to_id),
+                    INDEX idx_ir_rel_type (rel_type)
+                )",
+            )
+            .await
+            .map_err(map_err)?;
+            conn.exec_drop(
+                "CALL DOLT_COMMIT('-A', '-m', :msg)",
+                mysql_async::params! {
+                    "msg" => "issue_relations: create normalized relation table".to_string(),
+                },
+            )
+            .await
+            .map_err(map_err)?;
+        }
+
         // Idempotent index for the board projection's hot path: every board call
         // filters by the (rig, workspace) scope key.
         conn.query_drop(
@@ -1016,7 +1070,6 @@ impl DoltIssues {
         // strings as `""`) so the NOT NULL columns honour their `[]` invariant.
         let domain_json = if row.domain_json.is_empty() { "[]" } else { row.domain_json.as_str() };
         let surface_json = if row.surface_json.is_empty() { "[]" } else { row.surface_json.as_str() };
-        let depends_on_json = if row.depends_on_json.is_empty() { "[]" } else { row.depends_on_json.as_str() };
         // Phase defaults to `P1` (matching the column default) when the caller
         // omits it; a `Some(_)` is validated against `IssuePhase` upstream.
         let phase = row.phase.as_deref().unwrap_or("P1");
@@ -1026,12 +1079,12 @@ impl DoltIssues {
         conn.exec_drop(
             "INSERT INTO issues
                 (id, title, description, design, acceptance_criteria, notes,
-                 status, priority, issue_type, assignee, owner, created_by, external_ref,
-                 domain_json, surface_json, depends_on_json, role_scope, phase, rig, workspace)
+                 status, priority, issue_type, assignee, owner, created_by,
+                 domain_json, surface_json, role_scope, phase, rig, workspace)
              VALUES
                 (:id, :title, :description, :design, :acceptance_criteria, :notes,
-                 'open', :priority, :issue_type, :assignee, :owner, :created_by, :external_ref,
-                 :domain_json, :surface_json, :depends_on_json, :role_scope, :phase, :rig, :workspace)",
+                 'open', :priority, :issue_type, :assignee, :owner, :created_by,
+                 :domain_json, :surface_json, :role_scope, :phase, :rig, :workspace)",
             mysql_async::params! {
                 "id" => &row.id,
                 "title" => &row.title,
@@ -1044,10 +1097,8 @@ impl DoltIssues {
                 "assignee" => row.assignee.clone(),
                 "owner" => row.owner.clone().unwrap_or_default(),
                 "created_by" => &row.created_by,
-                "external_ref" => row.external_ref.clone(),
                 "domain_json" => domain_json,
                 "surface_json" => surface_json,
-                "depends_on_json" => depends_on_json,
                 "role_scope" => row.role_scope.clone(),
                 "phase" => phase,
                 "rig" => &row.rig,
@@ -1065,12 +1116,31 @@ impl DoltIssues {
         let commit_msg = format!("create {}", row.id);
         conn.exec_drop(
             "CALL DOLT_COMMIT('-A', '-m', :msg)",
-            mysql_async::params! {
-                "msg" => commit_msg,
-            },
+            mysql_async::params! { "msg" => commit_msg },
         )
         .await
         .map_err(map_err)?;
+
+        // If a parent epic was supplied, create the child_of relation.
+        if let Some(ref pid) = row.parent_id {
+            if !pid.is_empty() {
+                conn.exec_drop(
+                    "INSERT IGNORE INTO issue_relations (from_id, to_id, rel_type) \
+                     VALUES (:from_id, :to_id, 'child_of')",
+                    mysql_async::params! { "from_id" => &row.id, "to_id" => pid },
+                )
+                .await
+                .map_err(map_err)?;
+                conn.exec_drop(
+                    "CALL DOLT_COMMIT('-A', '-m', :msg)",
+                    mysql_async::params! {
+                        "msg" => format!("relate {} child_of {}", row.id, pid),
+                    },
+                )
+                .await
+                .map_err(map_err)?;
+            }
+        }
 
         Ok(())
     }
@@ -1086,53 +1156,6 @@ impl DoltIssues {
     /// which is wasted churn; the frontier validates before delegating.
     pub async fn update(&self, id: &str, patch: &IssuePatch) -> Result<(), AppError> {
         let mut conn = self.pool.get_conn().await.map_err(map_err)?;
-
-        // Advisory cross-bead cycle guard: when the patch overwrites
-        // `depends_on`, refuse an edge set that would make `id` reachable from
-        // one of its own (transitive) dependencies. Best-effort only — it reads
-        // the current edges and is not atomic with the write below (a concurrent
-        // edit could still introduce a cycle), but it catches the common case of
-        // a single agent wiring a back-edge by hand. Self-edges are rejected too.
-        if let Some(deps_json) = &patch.depends_on_json {
-            let new_deps: Vec<String> = serde_json::from_str(deps_json)
-                .map_err(|e| AppError::Validation(format!("depends_on is not a JSON array: {e}")))?;
-            if new_deps.iter().any(|d| d == id) {
-                return Err(AppError::Validation(format!(
-                    "depends_on contains the bead's own id ({id}) — self-cycle"
-                )));
-            }
-            // Load the full edge set once, then override this bead's deps with the
-            // proposed set and walk forward from each new dep looking for `id`.
-            let edge_rows: Vec<(String, String)> = conn
-                .exec(
-                    "SELECT id, depends_on_json FROM issues",
-                    mysql_async::Params::Empty,
-                )
-                .await
-                .map_err(map_err)?;
-            let mut adj: std::collections::HashMap<String, Vec<String>> = std::collections::HashMap::new();
-            for (rid, dj) in edge_rows {
-                let v: Vec<String> = serde_json::from_str(&dj).unwrap_or_default();
-                adj.insert(rid, v);
-            }
-            adj.insert(id.to_string(), new_deps.clone());
-            // BFS from each proposed dependency; reaching `id` means id -> dep ->* id.
-            let mut stack: Vec<String> = new_deps.clone();
-            let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
-            while let Some(node) = stack.pop() {
-                if node == id {
-                    return Err(AppError::Validation(format!(
-                        "depends_on would create a cycle: {id} is reachable from its own dependency `{node}`"
-                    )));
-                }
-                if !seen.insert(node.clone()) {
-                    continue;
-                }
-                if let Some(next) = adj.get(&node) {
-                    stack.extend(next.iter().cloned());
-                }
-            }
-        }
 
         let mut set_parts: Vec<&str> = Vec::new();
         let mut params_vec: Vec<(String, mysql_async::Value)> =
@@ -1169,11 +1192,9 @@ impl DoltIssues {
             set_parts.push("issue_type = :issue_type");
             params_vec.push(("issue_type".to_string(), mysql_async::Value::from(v.clone())));
         }
-        // `assignee`/`owner`/`external_ref` carry "clear" semantics: an empty
-        // string overwrites the column with SQL `NULL` (canonical "unassigned"
-        // / "no epic"), so the read side's `take_opt` round-trips back to `None`.
-        // A non-empty string is stored verbatim. This is the only way to detach
-        // an owner/assignee — there is no separate "unset" wire field.
+        // `assignee`/`owner` carry "clear" semantics: an empty string overwrites
+        // the column with SQL `NULL` (canonical "unassigned"), so the read side's
+        // `take_opt` round-trips back to `None`. A non-empty string is stored verbatim.
         if let Some(v) = &patch.assignee {
             set_parts.push("assignee = :assignee");
             params_vec.push(("assignee".to_string(), str_or_null(v)));
@@ -1182,10 +1203,6 @@ impl DoltIssues {
             set_parts.push("owner = :owner");
             params_vec.push(("owner".to_string(), str_or_null(v)));
         }
-        if let Some(v) = &patch.external_ref {
-            set_parts.push("external_ref = :external_ref");
-            params_vec.push(("external_ref".to_string(), str_or_null(v)));
-        }
         if let Some(v) = &patch.domain_json {
             set_parts.push("domain_json = :domain_json");
             params_vec.push(("domain_json".to_string(), mysql_async::Value::from(v.clone())));
@@ -1193,13 +1210,6 @@ impl DoltIssues {
         if let Some(v) = &patch.surface_json {
             set_parts.push("surface_json = :surface_json");
             params_vec.push(("surface_json".to_string(), mysql_async::Value::from(v.clone())));
-        }
-        if let Some(v) = &patch.depends_on_json {
-            set_parts.push("depends_on_json = :depends_on_json");
-            params_vec.push((
-                "depends_on_json".to_string(),
-                mysql_async::Value::from(v.clone()),
-            ));
         }
         // hq-core-mcp.7 — a phase overwrite also stamps `phase_ratified_at` so the
         // last ratification is auditable, mirroring the frontier's `ratified_at`.
@@ -1271,12 +1281,48 @@ impl DoltIssues {
         let commit_msg = format!("update {id}");
         conn.exec_drop(
             "CALL DOLT_COMMIT('-A', '-m', :msg)",
-            mysql_async::params! {
-                "msg" => commit_msg,
-            },
+            mysql_async::params! { "msg" => commit_msg },
         )
         .await
         .map_err(map_err)?;
+
+        // Handle parent_id relation change after the issues UPDATE commits.
+        if let Some(ref pid) = patch.parent_id {
+            // Remove any existing child_of relation for this issue.
+            conn.exec_drop(
+                "DELETE FROM issue_relations WHERE from_id = :id AND rel_type = 'child_of'",
+                mysql_async::params! { "id" => id },
+            )
+            .await
+            .map_err(map_err)?;
+            if !pid.is_empty() {
+                // Insert new parent.
+                conn.exec_drop(
+                    "INSERT IGNORE INTO issue_relations (from_id, to_id, rel_type) \
+                     VALUES (:from_id, :to_id, 'child_of')",
+                    mysql_async::params! { "from_id" => id, "to_id" => pid },
+                )
+                .await
+                .map_err(map_err)?;
+            }
+            let rel_commit_res = conn
+                .exec_drop(
+                    "CALL DOLT_COMMIT('-A', '-m', :msg)",
+                    mysql_async::params! {
+                        "msg" => if pid.is_empty() {
+                            format!("unrelate {id} child_of (cleared)")
+                        } else {
+                            format!("relate {id} child_of {pid}")
+                        },
+                    },
+                )
+                .await;
+            if let Err(ref e) = rel_commit_res {
+                if !e.to_string().contains("nothing to commit") {
+                    return Err(map_err(rel_commit_res.unwrap_err()));
+                }
+            }
+        }
 
         Ok(())
     }
@@ -1928,6 +1974,127 @@ impl DoltIssues {
             .collect())
     }
 
+    /// Insert or ignore a relation into `issue_relations` and Dolt-commit it.
+    pub async fn add_relation(&self, from_id: &str, to_id: &str, rel_type: &str) -> Result<(), AppError> {
+        let mut conn = self.pool.get_conn().await.map_err(map_err)?;
+        conn.exec_drop(
+            "INSERT IGNORE INTO issue_relations (from_id, to_id, rel_type) \
+             VALUES (:from_id, :to_id, :rel_type)",
+            mysql_async::params! { "from_id" => from_id, "to_id" => to_id, "rel_type" => rel_type },
+        )
+        .await
+        .map_err(map_err)?;
+        let commit_res = conn
+            .exec_drop(
+                "CALL DOLT_COMMIT('-A', '-m', :msg)",
+                mysql_async::params! { "msg" => format!("relate {from_id} {rel_type} {to_id}") },
+            )
+            .await;
+        if let Err(ref e) = commit_res {
+            if !e.to_string().contains("nothing to commit") {
+                return Err(map_err(commit_res.unwrap_err()));
+            }
+        }
+        Ok(())
+    }
+
+    /// Remove a relation from `issue_relations` and Dolt-commit it.
+    pub async fn remove_relation(&self, from_id: &str, to_id: &str, rel_type: &str) -> Result<(), AppError> {
+        let mut conn = self.pool.get_conn().await.map_err(map_err)?;
+        conn.exec_drop(
+            "DELETE FROM issue_relations WHERE from_id = :from_id AND to_id = :to_id AND rel_type = :rel_type",
+            mysql_async::params! { "from_id" => from_id, "to_id" => to_id, "rel_type" => rel_type },
+        )
+        .await
+        .map_err(map_err)?;
+        let commit_res = conn
+            .exec_drop(
+                "CALL DOLT_COMMIT('-A', '-m', :msg)",
+                mysql_async::params! { "msg" => format!("unrelate {from_id} {rel_type} {to_id}") },
+            )
+            .await;
+        if let Err(ref e) = commit_res {
+            if !e.to_string().contains("nothing to commit") {
+                return Err(map_err(commit_res.unwrap_err()));
+            }
+        }
+        Ok(())
+    }
+
+    /// Return a map of `child_id → parent_epic_id` for all beads in `(rig, ws)` that have a `child_of` relation.
+    pub async fn parent_map(&self, rig: &str, ws: &str) -> Result<std::collections::HashMap<String, String>, AppError> {
+        let mut conn = self.pool.get_conn().await.map_err(map_err)?;
+        let rows: Vec<(String, String)> = if rig.is_empty() && ws.is_empty() {
+            conn.exec(
+                "SELECT from_id, to_id FROM issue_relations WHERE rel_type = 'child_of'",
+                mysql_async::Params::Empty,
+            )
+            .await
+            .map_err(map_err)?
+        } else {
+            let mut conds = vec!["ir.rel_type = 'child_of'".to_string()];
+            let mut params_vec: Vec<(String, mysql_async::Value)> = Vec::new();
+            if !rig.is_empty() {
+                conds.push("i.rig = :rig".to_string());
+                params_vec.push(("rig".to_string(), mysql_async::Value::from(rig.to_string())));
+            }
+            if !ws.is_empty() {
+                conds.push("i.workspace = :ws".to_string());
+                params_vec.push(("ws".to_string(), mysql_async::Value::from(ws.to_string())));
+            }
+            let where_str = conds.join(" AND ");
+            let sql = format!(
+                "SELECT ir.from_id, ir.to_id \
+                 FROM issue_relations ir \
+                 JOIN issues i ON i.id = ir.from_id \
+                 WHERE {where_str}"
+            );
+            conn.exec(sql, mysql_async::Params::from(params_vec))
+                .await
+                .map_err(map_err)?
+        };
+        Ok(rows.into_iter().collect())
+    }
+
+    /// Return a map of `issue_id → Vec<dep_id>` for all `depends_on` relations scoped by the filter's rig/workspace.
+    pub async fn depends_on_edges(&self, filter: &IssueFilter) -> Result<std::collections::HashMap<String, Vec<String>>, AppError> {
+        let mut conn = self.pool.get_conn().await.map_err(map_err)?;
+        let rows: Vec<(String, String)> = if filter.rig.is_some() || filter.workspace.is_some() {
+            let mut conds = vec!["ir.rel_type = 'depends_on'".to_string()];
+            let mut params_vec: Vec<(String, mysql_async::Value)> = Vec::new();
+            if let Some(ref rig) = filter.rig {
+                conds.push("i.rig = :rig".to_string());
+                params_vec.push(("rig".to_string(), mysql_async::Value::from(rig.clone())));
+            }
+            if let Some(ref ws) = filter.workspace {
+                conds.push("i.workspace = :ws".to_string());
+                params_vec.push(("ws".to_string(), mysql_async::Value::from(ws.clone())));
+            }
+            let where_str = conds.join(" AND ");
+            let sql = format!(
+                "SELECT ir.from_id, ir.to_id \
+                 FROM issue_relations ir \
+                 JOIN issues i ON i.id = ir.from_id \
+                 WHERE {where_str}"
+            );
+            conn.exec(sql, mysql_async::Params::from(params_vec))
+                .await
+                .map_err(map_err)?
+        } else {
+            conn.exec(
+                "SELECT from_id, to_id FROM issue_relations WHERE rel_type = 'depends_on'",
+                mysql_async::Params::Empty,
+            )
+            .await
+            .map_err(map_err)?
+        };
+        let mut map: std::collections::HashMap<String, Vec<String>> = std::collections::HashMap::new();
+        for (from_id, to_id) in rows {
+            map.entry(from_id).or_default().push(to_id);
+        }
+        Ok(map)
+    }
+
     /// Build the shared `WHERE` clause + bound params for the list/count queries
     /// from `filter`. Returns `("" | "WHERE ...", params)`. Both `list` and
     /// `count` go through this so a page's rows and its `total` are computed
@@ -1956,12 +2123,12 @@ impl DoltIssues {
             where_parts.push("assignee = :assignee".to_string());
             params_vec.push(("assignee".to_string(), mysql_async::Value::from(a.clone())));
         }
-        if let Some(r) = &filter.external_ref {
-            where_parts.push("external_ref = :external_ref".to_string());
-            params_vec.push((
-                "external_ref".to_string(),
-                mysql_async::Value::from(r.clone()),
-            ));
+        if let Some(ref pid) = filter.parent_id {
+            where_parts.push(
+                "issues.id IN (SELECT from_id FROM issue_relations WHERE rel_type = 'child_of' AND to_id = :parent_id)"
+                    .to_string(),
+            );
+            params_vec.push(("parent_id".to_string(), mysql_async::Value::from(pid.clone())));
         }
         if let Some(t) = &filter.issue_type {
             where_parts.push("issue_type = :issue_type".to_string());
@@ -2062,8 +2229,8 @@ impl DoltIssues {
                     DATE_FORMAT(created_at, '%Y-%m-%dT%H:%i:%SZ') AS created_at,
                     DATE_FORMAT(updated_at, '%Y-%m-%dT%H:%i:%SZ') AS updated_at,
                     DATE_FORMAT(closed_at,  '%Y-%m-%dT%H:%i:%SZ') AS closed_at,
-                    external_ref, spec_id,
-                    domain_json, surface_json, depends_on_json, role_scope, version,
+                    spec_id,
+                    domain_json, surface_json, role_scope, version,
                     phase, delivered_sha, rig,
                     workspace, board_rank,
                     CAST(estimated_hours AS DOUBLE) AS estimated_hours,
@@ -2100,9 +2267,9 @@ impl DoltIssues {
                     DATE_FORMAT(created_at, '%Y-%m-%dT%H:%i:%SZ') AS created_at,
                     DATE_FORMAT(updated_at, '%Y-%m-%dT%H:%i:%SZ') AS updated_at,
                     DATE_FORMAT(closed_at,  '%Y-%m-%dT%H:%i:%SZ') AS closed_at,
-                    external_ref, spec_id,
+                    spec_id,
                     description, design, acceptance_criteria, notes,
-                    domain_json, surface_json, depends_on_json, role_scope, version,
+                    domain_json, surface_json, role_scope, version,
                     phase, delivered_sha, rig,
                     workspace, board_rank,
                     CAST(estimated_hours AS DOUBLE) AS estimated_hours,
@@ -2132,6 +2299,13 @@ fn row_to_detail(row: mysql_async::Row) -> Result<IssueDetail, AppError> {
     let take_opt =
         |row: &mut mysql_async::Row, i: usize| -> Option<String> { row.take::<Option<String>, _>(i).unwrap_or(None) };
 
+    // Ordinals after removing external_ref (was 10) and depends_on_json (was 18):
+    // 0=id 1=title 2=status 3=priority 4=issue_type 5=assignee 6=owner
+    // 7=created_at 8=updated_at 9=closed_at 10=spec_id
+    // 11=description 12=design 13=acceptance_criteria 14=notes
+    // 15=domain_json 16=surface_json 17=role_scope 18=version
+    // 19=phase 20=delivered_sha 21=rig 22=workspace 23=board_rank
+    // 24=estimated_hours 25=start_date 26=due_date
     Ok(IssueDetail {
         id: take_string(&mut row, 0)?,
         title: take_string(&mut row, 1)?,
@@ -2143,27 +2317,23 @@ fn row_to_detail(row: mysql_async::Row) -> Result<IssueDetail, AppError> {
         created_at: take_opt(&mut row, 7),
         updated_at: take_opt(&mut row, 8),
         closed_at: take_opt(&mut row, 9),
-        external_ref: take_opt(&mut row, 10),
-        spec_id: take_opt(&mut row, 11),
-        description: take_opt(&mut row, 12).unwrap_or_default(),
-        design: take_opt(&mut row, 13).unwrap_or_default(),
-        acceptance_criteria: take_opt(&mut row, 14).unwrap_or_default(),
-        notes: take_opt(&mut row, 15).unwrap_or_default(),
-        domain_json: take_string(&mut row, 16)?,
-        surface_json: take_string(&mut row, 17)?,
-        depends_on_json: take_string(&mut row, 18)?,
-        role_scope: take_opt(&mut row, 19),
-        version: row.take::<i64, _>(20).unwrap_or(0),
-        // hq-core-mcp.8 — phase echoed at claim time so the agent sees the gate.
-        phase: take_opt(&mut row, 21).unwrap_or_else(|| "P1".to_string()),
-        delivered_sha: take_opt(&mut row, 22),
-        rig: take_opt(&mut row, 23).unwrap_or_default(),
-        // Board columns (hq-62130a) — ordinals 24-28.
-        workspace: take_opt(&mut row, 24).unwrap_or_else(default_workspace),
-        board_rank: take_opt(&mut row, 25).unwrap_or_default(),
-        estimated_hours: row.take::<Option<f64>, _>(26).unwrap_or(None),
-        start_date: take_opt(&mut row, 27),
-        due_date: take_opt(&mut row, 28),
+        spec_id: take_opt(&mut row, 10),
+        description: take_opt(&mut row, 11).unwrap_or_default(),
+        design: take_opt(&mut row, 12).unwrap_or_default(),
+        acceptance_criteria: take_opt(&mut row, 13).unwrap_or_default(),
+        notes: take_opt(&mut row, 14).unwrap_or_default(),
+        domain_json: take_string(&mut row, 15)?,
+        surface_json: take_string(&mut row, 16)?,
+        role_scope: take_opt(&mut row, 17),
+        version: row.take::<i64, _>(18).unwrap_or(0),
+        phase: take_opt(&mut row, 19).unwrap_or_else(|| "P1".to_string()),
+        delivered_sha: take_opt(&mut row, 20),
+        rig: take_opt(&mut row, 21).unwrap_or_default(),
+        workspace: take_opt(&mut row, 22).unwrap_or_else(default_workspace),
+        board_rank: take_opt(&mut row, 23).unwrap_or_default(),
+        estimated_hours: row.take::<Option<f64>, _>(24).unwrap_or(None),
+        start_date: take_opt(&mut row, 25),
+        due_date: take_opt(&mut row, 26),
     })
 }
 
@@ -2184,6 +2354,12 @@ fn row_to_issue(row: mysql_async::Row, full: bool) -> Result<IssueRow, AppError>
         row.take::<Option<String>, _>(i).unwrap_or(None)
     };
 
+    // Ordinals after removing external_ref (was 10) and depends_on_json (was 14):
+    // 0=id 1=title 2=status 3=priority 4=issue_type 5=assignee 6=owner
+    // 7=created_at 8=updated_at 9=closed_at 10=spec_id
+    // 11=domain_json 12=surface_json 13=role_scope 14=version
+    // 15=phase 16=delivered_sha 17=rig 18=workspace 19=board_rank
+    // 20=estimated_hours 21=start_date 22=due_date 23-26=body_cols
     Ok(IssueRow {
         id: take_string(&mut row, 0)?,
         title: take_string(&mut row, 1)?,
@@ -2195,28 +2371,24 @@ fn row_to_issue(row: mysql_async::Row, full: bool) -> Result<IssueRow, AppError>
         created_at: take_opt(&mut row, 7),
         updated_at: take_opt(&mut row, 8),
         closed_at: take_opt(&mut row, 9),
-        external_ref: take_opt(&mut row, 10),
-        spec_id: take_opt(&mut row, 11),
-        domain_json: take_string(&mut row, 12)?,
-        surface_json: take_string(&mut row, 13)?,
-        depends_on_json: take_string(&mut row, 14)?,
-        role_scope: take_opt(&mut row, 15),
-        version: row.take::<i64, _>(16).unwrap_or(0),
-        // `phase`, `delivered_sha`, `rig` always SELECTed (ordinals 17-19).
-        phase: take_opt(&mut row, 17).unwrap_or_else(|| "P1".to_string()),
-        delivered_sha: take_opt(&mut row, 18),
-        rig: take_opt(&mut row, 19).unwrap_or_default(),
-        // Board columns (hq-62130a) always SELECTed — ordinals 20-24.
-        workspace: take_opt(&mut row, 20).unwrap_or_else(default_workspace),
-        board_rank: take_opt(&mut row, 21).unwrap_or_default(),
-        estimated_hours: row.take::<Option<f64>, _>(22).unwrap_or(None),
-        start_date: take_opt(&mut row, 23),
-        due_date: take_opt(&mut row, 24),
-        // Bodies only SELECTed when `full` — ordinals 25-28.
-        description: full.then(|| take_opt(&mut row, 25).unwrap_or_default()),
-        design: full.then(|| take_opt(&mut row, 26).unwrap_or_default()),
-        acceptance_criteria: full.then(|| take_opt(&mut row, 27).unwrap_or_default()),
-        notes: full.then(|| take_opt(&mut row, 28).unwrap_or_default()),
+        spec_id: take_opt(&mut row, 10),
+        domain_json: take_string(&mut row, 11)?,
+        surface_json: take_string(&mut row, 12)?,
+        role_scope: take_opt(&mut row, 13),
+        version: row.take::<i64, _>(14).unwrap_or(0),
+        phase: take_opt(&mut row, 15).unwrap_or_else(|| "P1".to_string()),
+        delivered_sha: take_opt(&mut row, 16),
+        rig: take_opt(&mut row, 17).unwrap_or_default(),
+        workspace: take_opt(&mut row, 18).unwrap_or_else(default_workspace),
+        board_rank: take_opt(&mut row, 19).unwrap_or_default(),
+        estimated_hours: row.take::<Option<f64>, _>(20).unwrap_or(None),
+        start_date: take_opt(&mut row, 21),
+        due_date: take_opt(&mut row, 22),
+        // Bodies only SELECTed when `full` — ordinals 23-26.
+        description: full.then(|| take_opt(&mut row, 23).unwrap_or_default()),
+        design: full.then(|| take_opt(&mut row, 24).unwrap_or_default()),
+        acceptance_criteria: full.then(|| take_opt(&mut row, 25).unwrap_or_default()),
+        notes: full.then(|| take_opt(&mut row, 26).unwrap_or_default()),
     })
 }
 

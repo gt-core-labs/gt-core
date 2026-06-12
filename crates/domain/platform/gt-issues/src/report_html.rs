@@ -194,8 +194,11 @@ mod tests {
             row("hq-2", "task", "Tarea B", "working", Some("hq-e1")),
             row("hq-3", "bug", "Suelta", "open", None),
         ];
-        let report = build_report("hq", "default", &rows);
-        let summary = summarize("hq", "default", &rows, 0, "2026-06-12", 7, 30);
+        let mut parent_map = std::collections::HashMap::new();
+        parent_map.insert("hq-1".to_string(), "hq-e1".to_string());
+        parent_map.insert("hq-2".to_string(), "hq-e1".to_string());
+        let report = build_report("hq", "default", &rows, &parent_map);
+        let summary = summarize("hq", "default", &rows, 0, "2026-06-12", 7, 30, &parent_map);
         let html = render_digest(&report, &summary, "2026-06-12");
 
         // Standalone, no external resources.

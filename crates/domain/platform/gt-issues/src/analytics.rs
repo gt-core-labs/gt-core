@@ -209,10 +209,11 @@ fn date_of_epoch_days(z: i64) -> String {
 
 /// Build the summary. `rows` = the (rig, workspace) scope exactly as
 /// `board.list`/the report read it (epics included — they title modules and are
-/// excluded from task KPIs, mirroring the report projection). `reopens` is the
-/// audit-derived reopened-transition count the caller supplies. `today` is
-/// `YYYY-MM-DD` (server clock at the edge); `at_risk_days` the configurable
-/// window; `series_days` the chart span.
+/// excluded from task KPIs, mirroring the report projection). `parent_map` maps
+/// child issue id → parent epic id (from `issue_relations` `child_of` rows).
+/// `reopens` is the audit-derived reopened-transition count the caller supplies.
+/// `today` is `YYYY-MM-DD` (server clock at the edge); `at_risk_days` the
+/// configurable window; `series_days` the chart span.
 pub fn summarize(
     rig: &str,
     workspace: &str,
@@ -221,6 +222,7 @@ pub fn summarize(
     today: &str,
     at_risk_days: i64,
     series_days: i64,
+    parent_map: &std::collections::HashMap<String, String>,
 ) -> AnalyticsSummary {
     let tasks: Vec<&IssueRow> = rows.iter().filter(|r| r.issue_type != "epic").collect();
 
@@ -229,7 +231,7 @@ pub fn summarize(
     let closed = tasks.iter().filter(|r| r.status == "closed").count() as i64;
     let mut module_acc: BTreeMap<String, (i64, i64)> = BTreeMap::new();
     for t in &tasks {
-        let m = t.external_ref.clone().unwrap_or_default();
+        let m = parent_map.get(&t.id).cloned().unwrap_or_default();
         let e = module_acc.entry(m).or_default();
         e.1 += 1;
         if t.status == "closed" {
@@ -252,7 +254,7 @@ pub fn summarize(
     let mut err_mod: BTreeMap<String, i64> = BTreeMap::new();
     let mut err_nivel: BTreeMap<String, i64> = BTreeMap::new();
     for d in &defects {
-        *err_mod.entry(d.external_ref.clone().unwrap_or_default()).or_default() += 1;
+        *err_mod.entry(parent_map.get(&d.id).cloned().unwrap_or_default()).or_default() += 1;
         *err_nivel.entry(format!("P{}", d.priority)).or_default() += 1;
     }
     let errores = Errores {
@@ -272,7 +274,7 @@ pub fn summarize(
     for t in tasks.iter().filter(|r| r.status != "closed") {
         *p_assignee.entry(t.assignee.clone().unwrap_or_default()).or_default() += 1;
         *p_priority.entry(format!("P{}", t.priority)).or_default() += 1;
-        *p_module.entry(t.external_ref.clone().unwrap_or_default()).or_default() += 1;
+        *p_module.entry(parent_map.get(&t.id).cloned().unwrap_or_default()).or_default() += 1;
     }
     let pendientes = Pendientes {
         open,
@@ -319,7 +321,7 @@ pub fn summarize(
             continue;
         };
         estimadas += h;
-        let e = h_module.entry(t.external_ref.clone().unwrap_or_default()).or_default();
+        let e = h_module.entry(parent_map.get(&t.id).cloned().unwrap_or_default()).or_default();
         e.0 += h;
         if t.status == "closed" {
             completadas += h;
@@ -411,6 +413,7 @@ pub fn summarize(
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
     use super::*;
 
     fn row(
@@ -418,7 +421,6 @@ mod tests {
         ty: &str,
         status: &str,
         prio: i32,
-        eref: Option<&str>,
         assignee: Option<&str>,
         created: &str,
         closed: Option<&str>,
@@ -431,7 +433,7 @@ mod tests {
             "created_at": format!("{created}T10:00:00Z"),
             "updated_at": null,
             "closed_at": closed.map(|c| format!("{c}T10:00:00Z")),
-            "external_ref": eref, "spec_id": null, "role_scope": null,
+            "spec_id": null, "role_scope": null,
         }))
         .expect("row");
         v.due_date = due.map(str::to_string);
@@ -439,19 +441,25 @@ mod tests {
         v
     }
 
-    fn sample() -> Vec<IssueRow> {
-        vec![
-            row("hq-mod", "epic", "open", 1, None, None, "2026-06-01", None, None, None),
-            row("hq-1", "task", "closed", 0, Some("hq-mod"), Some("ana"), "2026-06-01", Some("2026-06-05"), None, Some(5.0)),
-            row("hq-2", "task", "working", 1, Some("hq-mod"), Some("ana"), "2026-06-02", None, Some("2026-06-01"), Some(3.0)),
-            row("hq-3", "bug", "open", 0, Some("hq-mod"), Some("bob"), "2026-06-08", None, Some("2026-06-12"), None),
-            row("hq-4", "task", "open", 2, None, None, "2026-06-09", None, Some("2026-07-30"), Some(2.0)),
-        ]
+    fn sample() -> (Vec<IssueRow>, HashMap<String, String>) {
+        let rows = vec![
+            row("hq-mod", "epic", "open", 1, None, "2026-06-01", None, None, None),
+            row("hq-1", "task", "closed", 0, Some("ana"), "2026-06-01", Some("2026-06-05"), None, Some(5.0)),
+            row("hq-2", "task", "working", 1, Some("ana"), "2026-06-02", None, Some("2026-06-01"), Some(3.0)),
+            row("hq-3", "bug", "open", 0, Some("bob"), "2026-06-08", None, Some("2026-06-12"), None),
+            row("hq-4", "task", "open", 2, None, "2026-06-09", None, Some("2026-07-30"), Some(2.0)),
+        ];
+        let mut parent_map = HashMap::new();
+        parent_map.insert("hq-1".to_string(), "hq-mod".to_string());
+        parent_map.insert("hq-2".to_string(), "hq-mod".to_string());
+        parent_map.insert("hq-3".to_string(), "hq-mod".to_string());
+        (rows, parent_map)
     }
 
     #[test]
     fn kpis_match_their_pinned_definitions() {
-        let s = summarize("hq", "default", &sample(), 2, "2026-06-10", 3, 14);
+        let (sample_rows, parent_map) = sample();
+        let s = summarize("hq", "default", &sample_rows, 2, "2026-06-10", 3, 14, &parent_map);
         // AVANCE: 1 closed of 4 tasks (the epic is never a task row).
         assert_eq!((s.avance.closed, s.avance.total), (1, 4));
         assert!((s.avance.pct - 25.0).abs() < 1e-9);
@@ -482,7 +490,8 @@ mod tests {
 
     #[test]
     fn series_tracks_created_closed_and_burndown_remaining() {
-        let s = summarize("hq", "default", &sample(), 0, "2026-06-10", 3, 10);
+        let (sample_rows, parent_map) = sample();
+        let s = summarize("hq", "default", &sample_rows, 0, "2026-06-10", 3, 10, &parent_map);
         assert_eq!(s.series.len(), 10);
         assert_eq!(s.series.first().unwrap().date, "2026-06-01");
         // 06-01: hq-1 created (the epic is excluded) → remaining 1 (5h).
@@ -503,9 +512,9 @@ mod tests {
     #[test]
     fn closed_rows_with_due_dates_never_count_as_overdue() {
         let rows = vec![row(
-            "hq-x", "task", "closed", 1, None, None, "2026-06-01", Some("2026-06-02"), Some("2026-05-01"), None,
+            "hq-x", "task", "closed", 1, None, "2026-06-01", Some("2026-06-02"), Some("2026-05-01"), None,
         )];
-        let s = summarize("hq", "default", &rows, 0, "2026-06-10", 7, 7);
+        let s = summarize("hq", "default", &rows, 0, "2026-06-10", 7, 7, &HashMap::new());
         assert_eq!(s.retrasos.overdue, 0);
     }
 

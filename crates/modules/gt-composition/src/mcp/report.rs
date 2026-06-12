@@ -242,13 +242,14 @@ impl DomainHandler for ReportHandler {
                     .list(&IssueFilter {
                         rig: Some(rig.clone()),
                         workspace: Some(workspace.clone()),
-                        external_ref: epic,
+                        parent_id: epic,
                         full: true,
                         limit: Some(gt_store_dolt::issues_max_limit()),
                         ..Default::default()
                     })
                     .await?;
-                let report = build_report(&rig, &workspace, &rows);
+                let parent_map = tracker.parent_map(&rig, &workspace).await?;
+                let report = build_report(&rig, &workspace, &rows, &parent_map);
 
                 // Serialize + attach as a document of the board's report owner.
                 let docs = PgDocuments::new(self.pools.get(ctx.workspace).await?);

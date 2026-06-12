@@ -127,15 +127,16 @@ impl DomainHandler for AnalyticsHandler {
                     .list(&IssueFilter {
                         rig: Some(rig.clone()),
                         workspace: Some(workspace.clone()),
-                        external_ref: epic,
+                        parent_id: epic,
                         limit: Some(gt_store_dolt::issues_max_limit()),
                         ..Default::default()
                     })
                     .await?;
+                let parent_map = tracker.parent_map(&rig, &workspace).await?;
                 let reopens = self.reopens(ctx.workspace.unwrap_or("default"), &rig);
                 let today = sqlx::types::chrono::Utc::now().format("%Y-%m-%d").to_string();
                 let summary =
-                    summarize(&rig, &workspace, &rows, reopens, &today, at_risk_days, series_days);
+                    summarize(&rig, &workspace, &rows, reopens, &today, at_risk_days, series_days, &parent_map);
                 serde_json::to_value(&summary)
                     .map_err(|e| AppError::Other(format!("encode summary: {e}")))
             }

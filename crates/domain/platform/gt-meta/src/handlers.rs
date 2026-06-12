@@ -62,20 +62,25 @@ pub async fn run_report_gap(
         created_by: actor.into(),
         notes: gap.notes.clone().unwrap_or_default(),
         priority,
-        external_ref: Some(external_ref.clone()),
+        parent_id: Some(external_ref.clone()),
         // Seed the graph columns so native-surface filtering + reconciler edge
         // derivation pick the bead up without a manual issues.update.
         domain_json: json_array(gap.domain.as_deref()),
         surface_json: json_array(gap.surface.as_deref()),
-        depends_on_json: json_array(gap.depends_on.as_deref()),
         ..Default::default()
     };
     store.insert(&new).await?;
+    // Insert depends_on relations (replaces depends_on_json column).
+    if let Some(deps) = &gap.depends_on {
+        for dep_id in deps {
+            store.add_relation(&id, dep_id, "depends_on").await?;
+        }
+    }
     Ok(json!({
         "bead": id,
         "operation": gap.operation,
         "priority": priority,
-        "external_ref": external_ref,
+        "parent_id": external_ref,
     }))
 }
 

@@ -592,7 +592,7 @@ impl MeStatsSource for IdentityDoltMeStats {
             status: Vec::new(),
             priority_max: None,
             assignee: None,
-            external_ref: None,
+            parent_id: None,
             issue_type: None,
             limit: Some(issues_max_limit()),
             offset: None,

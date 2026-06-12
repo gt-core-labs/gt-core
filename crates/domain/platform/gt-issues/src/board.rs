@@ -321,10 +321,10 @@ fn column_sort(cards: &mut [IssueRow]) {
 }
 
 /// The lane key of a card under `group_by`.
-fn lane_key(card: &IssueRow, group_by: &str) -> String {
+fn lane_key(card: &IssueRow, group_by: &str, parent_map: &std::collections::HashMap<String, String>) -> String {
     match group_by {
         "assignee" => card.assignee.clone().unwrap_or_default(),
-        "epic" => card.external_ref.clone().unwrap_or_default(),
+        "epic" => parent_map.get(&card.id).cloned().unwrap_or_default(),
         "priority" => card.priority.to_string(),
         _ => String::new(),
     }
@@ -337,6 +337,7 @@ pub fn project_board(
     workspace: &str,
     rows: Vec<IssueRow>,
     group_by: Option<&str>,
+    parent_map: &std::collections::HashMap<String, String>,
 ) -> BoardSnapshot {
     let mut columns: Vec<BoardColumn> = ["open", "working", "closed"]
         .into_iter()
@@ -358,7 +359,7 @@ pub fn project_board(
             // column's board order.
             let mut lanes: Vec<BoardLane> = Vec::new();
             for card in &col.cards {
-                let key = lane_key(card, g);
+                let key = lane_key(card, g, parent_map);
                 match lanes.iter_mut().find(|l| l.key == key) {
                     Some(lane) => lane.cards.push(card.clone()),
                     None => lanes.push(BoardLane { key, cards: vec![card.clone()] }),
@@ -393,7 +394,7 @@ pub async fn run_board_list(
     let filter = IssueFilter {
         rig: Some(args.rig.clone()),
         workspace: Some(args.workspace.clone()),
-        external_ref: args.epic.clone(),
+        parent_id: args.epic.clone(),
         assignee: args.assignee.clone(),
         priority_max: args.priority_max,
         issue_type: args.issue_type.clone(),
@@ -403,11 +404,13 @@ pub async fn run_board_list(
         ..Default::default()
     };
     let rows = issues.list(&filter).await?;
+    let parent_map = issues.parent_map(&args.rig, &args.workspace).await?;
     Ok(Some(project_board(
         &args.rig,
         &args.workspace,
         rows,
         args.group_by.as_deref(),
+        &parent_map,
     )))
 }
 
@@ -611,7 +614,7 @@ mod tests {
             "id": id, "title": id, "status": status, "priority": priority,
             "issue_type": "task", "assignee": assignee, "owner": null,
             "created_at": null, "updated_at": null, "closed_at": null,
-            "external_ref": null, "spec_id": null, "role_scope": null,
+            "spec_id": null, "role_scope": null,
         }))
         .expect("row");
         v.board_rank = rank.to_string();
@@ -692,7 +695,7 @@ mod tests {
             row("w", "working", "a", None, 2),
             row("z", "closed", "", None, 2),
         ];
-        let board = project_board("hq", "default", rows, None);
+        let board = project_board("hq", "default", rows, None, &std::collections::HashMap::new());
         assert_eq!(board.columns.len(), 3);
         let open: Vec<&str> = board.columns[0].cards.iter().map(|c| c.id.as_str()).collect();
         // Ranked d < m first, unranked tail last.
@@ -709,7 +712,7 @@ mod tests {
             row("c", "open", "d", Some("ana"), 2),
             row("d", "open", "", None, 2),
         ];
-        let board = project_board("hq", "default", rows, Some("assignee"));
+        let board = project_board("hq", "default", rows, Some("assignee"), &std::collections::HashMap::new());
         let lanes = board.columns[0].lanes.as_ref().expect("lanes");
         assert_eq!(lanes.len(), 3);
         assert_eq!(lanes[0].key, "ana");
@@ -724,7 +727,7 @@ mod tests {
     #[test]
     fn group_by_priority_keys_lanes_numerically() {
         let rows = vec![row("a", "open", "b", None, 0), row("b", "open", "c", None, 2)];
-        let board = project_board("hq", "default", rows, Some("priority"));
+        let board = project_board("hq", "default", rows, Some("priority"), &std::collections::HashMap::new());
         let lanes = board.columns[0].lanes.as_ref().unwrap();
         assert_eq!(lanes[0].key, "0");
         assert_eq!(lanes[1].key, "2");

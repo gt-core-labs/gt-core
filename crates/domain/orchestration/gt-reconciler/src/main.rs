@@ -86,7 +86,14 @@ async fn main() -> anyhow::Result<()> {
             ..Default::default()
         })
         .await?;
-    let beads: Vec<Bead> = rows.iter().map(Bead::from_row).collect();
+    let deps_map = store.depends_on_edges(&IssueFilter::default()).await?;
+    let beads: Vec<Bead> = rows
+        .iter()
+        .map(|r| {
+            let depends_on = deps_map.get(&r.id).cloned().unwrap_or_default();
+            Bead::from_row(r, depends_on)
+        })
+        .collect();
     let by_id: BTreeMap<&str, &Bead> = beads.iter().map(|b| (b.id.as_str(), b)).collect();
 
     println!(
@@ -121,25 +128,24 @@ async fn main() -> anyhow::Result<()> {
         if apply {
             for (bead_id, targets) in &added {
                 let bead = by_id.get(bead_id.as_str()).expect("bead present");
-                let mut merged: BTreeSet<String> = bead.depends_on.iter().cloned().collect();
-                let before = merged.len();
-                merged.extend(targets.iter().cloned());
-                if merged.len() == before {
+                let existing: BTreeSet<&str> = bead.depends_on.iter().map(String::as_str).collect();
+                let new_targets: Vec<&str> = targets
+                    .iter()
+                    .filter(|t| !existing.contains(t.as_str()))
+                    .map(String::as_str)
+                    .collect();
+                if new_targets.is_empty() {
                     continue; // nothing new (idempotent guard).
                 }
-                let json = serde_json::to_string(&merged.into_iter().collect::<Vec<_>>())?;
-                match store
-                    .update(
-                        bead_id,
-                        &IssuePatch {
-                            depends_on_json: Some(json),
-                            ..Default::default()
-                        },
-                    )
-                    .await
-                {
-                    Ok(_) => edges_created += targets.len(),
-                    Err(e) => eprintln!("  ! skip {bead_id} edge update: {e}"),
+                let mut ok = true;
+                for target in &new_targets {
+                    if let Err(e) = store.add_relation(bead_id, target, "depends_on").await {
+                        eprintln!("  ! skip {bead_id} -> {target} edge: {e}");
+                        ok = false;
+                    }
+                }
+                if ok {
+                    edges_created += new_targets.len();
                 }
             }
         }
