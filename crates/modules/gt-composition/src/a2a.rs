@@ -33,25 +33,73 @@
 //! leaves, so a follow-up `get` agrees with it); otherwise
 //! [`TaskState::from_bead_status`]. `failed` is a merge fact and lands with the
 //! B3 stream — this projection never invents it.
+//!
+//! ## HTTP mount (B5, gtcore-9039b5)
+//!
+//! [`a2a_app`] assembles the served surface: `GET /.well-known/agent.json` is
+//! **public** (the spec's discovery document must be fetchable without
+//! credentials) while `POST /a2a` sits behind [`authenticate`] — the SAME
+//! [`AuthState`] (RS256 verifier + `gtpat_…` [`PatVerifier`](crate::auth::PatVerifier))
+//! the `/api/v1/*` chain and the MCP transport's PAT authenticator resolve
+//! bearers through — plus [`require_claims`], which turns an anonymous request
+//! into a hard `401` (the REST chain leaves that to per-route scope guards;
+//! A2A has none, so the guard is the mount's).
+//!
+//! The wiring is **opt-in**: [`a2a_env`] resolves the deploy envs and answers
+//! `None` — so the bin mounts nothing — unless ALL of the required ones are
+//! present:
+//!
+//! - `GT_A2A_DEFAULT_RIG` — default rig minted beads route to
+//!   (`metadata.rig` overrides per task).
+//! - `GT_A2A_INTAKE_EPIC` — the intake epic minted beads hang off
+//!   (`metadata.parent_id` overrides per task).
+//! - `GT_A2A_ORCHD_URL` — origin of the orchd agent REST surface
+//!   [`RestSessionControl`] kills sessions through.
+//! - `GT_A2A_ORCHD_TOKEN` — optional bearer for that surface; when unset the
+//!   bin falls back to minting one with the platform RS256 key.
+//!
+//! On top, the bin requires the dispatch channel (`GT_CHANNEL_ROOT`) and the
+//! RS256 verifier (no verifier ⇒ no guard ⇒ no A2A). `GT_PUBLIC_URL` names the
+//! card's public origin (e.g. `https://gt-dev.codecsrayo.com`).
+//!
+//! ## The signed Agent Card
+//!
+//! [`agent_card`] hydrates one [`AgentSkill`] per catalog rig (work routes per
+//! rig, so a rig IS the unit of capability); [`sign_card`] stamps
+//! `card.signature` with a **compact RS256 JWS over the card's canonical JSON
+//! without the `signature` field**, minted by gt-auth's existing
+//! [`JwtMinter`] — a client verifies it against the same public key/JWKS that
+//! verifies the platform's bearer tokens (shape decision documented on
+//! [`sign_card`]).
 
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
+use axum::extract::Request;
+use axum::http::StatusCode;
+use axum::middleware::Next;
+use axum::response::{IntoResponse, Response};
+use axum::Router;
 use time::format_description::well_known::Rfc3339;
 use time::OffsetDateTime;
 
 use gt_a2a::{
-    A2aError, A2aHandler, Artifact, EventStream, JsonRpcError, Part, StreamEvent, Task,
+    A2aError, A2aHandler, AgentAuthentication, AgentCapabilities, AgentCard, AgentProvider,
+    AgentSkill, Artifact, EventStream, JsonRpcError, Part, StreamEvent, Task,
     TaskArtifactUpdateEvent, TaskIdParams, TaskSendParams, TaskState, TaskStatus,
     TaskStatusUpdateEvent,
 };
 use gt_agent::AgentEvent;
+use gt_auth::{AuthError, JwtMinter};
 use gt_merge::MergeEvent;
 use gt_issues::handlers::{run_create_issue, run_transition_issue};
 use gt_issues::{CreateIssue, Domain, IssueType, SurfaceTree, TransitionIssue};
+use gt_rig::RigEntry;
 use gt_store_dolt::DoltIssues;
+
+use crate::auth::{authenticate, AuthState};
 
 /// What an inbound A2A task asks the tracker to mint. Already shaped by the
 /// gateway (title/description split, rig and parent resolved), so an intake
@@ -631,6 +679,133 @@ impl DispatchSink for ChannelDispatch {
     }
 }
 
+// ---------------------------------------------------------------------------
+// HTTP mount (B5, gtcore-9039b5)
+// ---------------------------------------------------------------------------
+
+/// The deploy-fixed A2A envs (module doc, *HTTP mount*). Resolved by [`a2a_env`].
+#[derive(Clone, Debug, PartialEq)]
+pub struct A2aEnv {
+    /// `GT_A2A_DEFAULT_RIG` — default rig for minted beads.
+    pub rig: String,
+    /// `GT_A2A_INTAKE_EPIC` — the parent epic minted beads hang off.
+    pub parent_id: String,
+    /// `GT_A2A_ORCHD_URL` — origin of the orchd agent REST surface.
+    pub orchd_url: String,
+    /// `GT_A2A_ORCHD_TOKEN` — optional bearer for that surface (the bin falls
+    /// back to minting one with the platform RS256 key when unset).
+    pub orchd_token: Option<String>,
+}
+
+/// Resolve the A2A deploy envs through the injected lookup (testable like the
+/// bin's `should_run_daemons`). `None` unless every required env is present —
+/// the A2A surface is opt-in wiring, a default deploy serves none.
+pub fn a2a_env(env: impl Fn(&str) -> Option<String>) -> Option<A2aEnv> {
+    let var = |k: &str| env(k).map(|v| v.trim().to_string()).filter(|v| !v.is_empty());
+    Some(A2aEnv {
+        rig: var("GT_A2A_DEFAULT_RIG")?,
+        parent_id: var("GT_A2A_INTAKE_EPIC")?,
+        orchd_url: var("GT_A2A_ORCHD_URL")?,
+        orchd_token: var("GT_A2A_ORCHD_TOKEN"),
+    })
+}
+
+/// Hydrate the discovery card from the rig catalog: one [`AgentSkill`] per
+/// dispatchable rig (work routes per rig — `metadata.rig` on `tasks/send` — so
+/// a rig IS the unit of capability the card advertises). `public_url` is the
+/// served origin (e.g. `https://gt-dev.codecsrayo.com`); the JSON-RPC target is
+/// `<public_url>/a2a`. `capabilities.streaming` is true — `tasks/sendSubscribe`
+/// is real since B3. Unsigned here; [`sign_card`] stamps the signature.
+pub fn agent_card(public_url: &str, rigs: &[RigEntry]) -> AgentCard {
+    AgentCard {
+        name: "gt".into(),
+        description: Some(
+            "gt platform orchestrator — an A2A task becomes a tracker bead dispatched onto the named rig"
+                .into(),
+        ),
+        url: format!("{}/a2a", public_url.trim_end_matches('/')),
+        version: env!("CARGO_PKG_VERSION").into(),
+        provider: Some(AgentProvider { organization: "gt-core-labs".into(), url: None }),
+        capabilities: AgentCapabilities {
+            streaming: true,
+            push_notifications: false,
+            state_transition_history: false,
+        },
+        authentication: Some(AgentAuthentication { schemes: vec!["bearer".into()] }),
+        default_input_modes: vec!["text".into()],
+        default_output_modes: vec!["text".into()],
+        skills: rigs
+            .iter()
+            .map(|r| AgentSkill {
+                id: r.name.clone(),
+                name: r.name.clone(),
+                description: Some(if r.git_url.is_empty() {
+                    format!("dispatch work onto rig `{}`", r.name)
+                } else {
+                    format!(
+                        "dispatch work onto rig `{}` ({}; default branch {})",
+                        r.name, r.git_url, r.default_branch
+                    )
+                }),
+                tags: vec![r.prefix.clone()],
+            })
+            .collect(),
+        signature: None,
+    }
+}
+
+/// Sign the Agent Card with the platform's RS256 key (B5, gtcore-9039b5).
+///
+/// **Shape decision**: the A2A v1.0 spec asks for a *signed* card but pins no
+/// envelope, so the signature is the simplest verifiable thing the platform
+/// already speaks — a **compact RS256 JWS whose payload is the card's
+/// canonical (serde) JSON with the `signature` field absent**, minted by
+/// gt-auth's [`JwtMinter`] (same key + `kid` rotation as the bearer tokens).
+/// A client strips `signature`, re-serializes, and checks the JWS payload
+/// matches — [`gt_auth::JwtAuthenticator::verify_json`] is the in-house
+/// verifier the tests pin this against.
+pub fn sign_card(card: AgentCard, minter: &JwtMinter) -> Result<AgentCard, AuthError> {
+    let mut card = card;
+    card.signature = None;
+    let payload = serde_json::to_value(&card)
+        .map_err(|e| AuthError::SigningFailure(format!("card serialization: {e}")))?;
+    card.signature = Some(minter.sign_json(&payload)?);
+    Ok(card)
+}
+
+/// The served A2A surface: public discovery + guarded RPC.
+///
+/// `GET /.well-known/agent.json` is mounted bare — per spec the discovery
+/// document is public. `POST /a2a` is wrapped in [`authenticate`] over the
+/// SAME [`AuthState`] (RS256 verifier + PAT port) the rest of the deploy
+/// authenticates with, plus [`require_claims`] so an anonymous request — which
+/// `authenticate` deliberately passes through for public routes — is a `401`
+/// here.
+pub fn a2a_app(card: AgentCard, handler: Arc<dyn A2aHandler>, auth: AuthState) -> Router {
+    let (discovery, rpc) = gt_a2a::a2a_split_router(card, handler);
+    discovery.merge(
+        rpc
+            // Innermost-first: `authenticate` (outermost) resolves the bearer —
+            // PAT or JWT — into claims; `require_claims` then rejects requests
+            // that resolved to no identity.
+            .layer(axum::middleware::from_fn(require_claims))
+            .layer(axum::middleware::from_fn_with_state(auth, authenticate)),
+    )
+}
+
+/// Reject requests [`authenticate`] passed through anonymously (no bearer at
+/// all): every A2A RPC requires a verified identity.
+async fn require_claims(req: Request, next: Next) -> Response {
+    if req.extensions().get::<gt_auth::JwtClaims>().is_none() {
+        return (
+            StatusCode::UNAUTHORIZED,
+            "A2A requires a bearer token (gtpat_… PAT or RS256 JWT)",
+        )
+            .into_response();
+    }
+    next.run(req).await
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1051,6 +1226,173 @@ mod tests {
         assert!(title.chars().count() <= 72);
         assert!(title.ends_with('…'));
         assert_eq!(desc, long);
+    }
+
+    // ── B5: mount, guard, card, signature (gtcore-9039b5) ───────────────────
+
+    use crate::auth::PatVerifier;
+    use gt_audit::InMemoryAudit;
+    use gt_auth::{InMemoryAuthenticator, JwtAuthenticator, JwtClaims};
+    use tower::ServiceExt;
+
+    // The same throwaway RS256 fixtures the polecat token tests use.
+    const TEST_PRIV: &[u8] = include_bytes!("../tests/fixtures/rs256_priv.pem");
+    const TEST_PUB: &[u8] = include_bytes!("../tests/fixtures/rs256_pub.pem");
+
+    fn test_claims(sub: &str) -> JwtClaims {
+        JwtClaims {
+            sub: sub.into(),
+            workspace: "default".into(),
+            scopes: vec![],
+            exp: 9_999_999_999,
+            nbf: None,
+            iat: 0,
+        }
+    }
+
+    /// PAT double standing in for the deploy's PgPatStore: exactly one valid
+    /// `gtpat_…` token — the same port instance the MCP transport verifies through.
+    struct OnePat;
+
+    #[async_trait]
+    impl PatVerifier for OnePat {
+        async fn verify(&self, token: &str, _now: u64) -> Result<JwtClaims, ()> {
+            (token == "gtpat_ok").then(|| test_claims("pat-agent")).ok_or(())
+        }
+    }
+
+    fn catalog() -> Vec<RigEntry> {
+        vec![
+            RigEntry::new("gtcore", "gtcore", "https://github.com/gt-core-labs/gt-core", "main", 0),
+            RigEntry::new("gtweb", "gtweb", "https://github.com/gt-core-labs/gt-web", "main", 0),
+        ]
+    }
+
+    fn mounted_app() -> Router {
+        let (gw, _, _) = gateway(false);
+        let auth = AuthState::new(
+            Arc::new(InMemoryAuthenticator::new().with_token("good-jwt", test_claims("alice"))),
+            Arc::new(InMemoryAudit::new()),
+        )
+        .with_pat(Arc::new(OnePat));
+        a2a_app(agent_card("https://gt-dev.codecsrayo.com", &catalog()), Arc::new(gw), auth)
+    }
+
+    async fn post_a2a(app: Router, bearer: Option<&str>) -> (axum::http::StatusCode, serde_json::Value) {
+        let mut req = axum::http::Request::post("/a2a").header("content-type", "application/json");
+        if let Some(b) = bearer {
+            req = req.header("authorization", format!("Bearer {b}"));
+        }
+        let body = serde_json::json!({"jsonrpc": "2.0", "id": 1, "method": "tasks/send", "params": {
+            "id": "client-1",
+            "message": {"role": "user", "parts": [{"type": "text", "text": "do the thing"}]}
+        }});
+        let resp = app
+            .oneshot(req.body(axum::body::Body::from(body.to_string())).unwrap())
+            .await
+            .unwrap();
+        let status = resp.status();
+        let bytes = axum::body::to_bytes(resp.into_body(), 1 << 20).await.unwrap();
+        (status, serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null))
+    }
+
+    #[tokio::test]
+    async fn mounted_app_serves_the_card_without_auth() {
+        // The discovery document is public per spec — no bearer, no cookie.
+        let resp = mounted_app()
+            .oneshot(
+                axum::http::Request::get("/.well-known/agent.json")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), axum::http::StatusCode::OK);
+        let bytes = axum::body::to_bytes(resp.into_body(), 1 << 20).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(v["name"], "gt");
+        assert_eq!(v["url"], "https://gt-dev.codecsrayo.com/a2a");
+        assert_eq!(v["capabilities"]["streaming"], true, "B3 made streaming truthful");
+        assert_eq!(v["authentication"]["schemes"], serde_json::json!(["bearer"]));
+        // One skill per catalog rig, tagged with its bead prefix.
+        assert_eq!(v["skills"][0]["id"], "gtcore");
+        assert_eq!(v["skills"][1]["id"], "gtweb");
+        assert_eq!(v["skills"][0]["tags"], serde_json::json!(["gtcore"]));
+    }
+
+    #[tokio::test]
+    async fn post_a2a_without_token_is_unauthorized() {
+        let (status, _) = post_a2a(mounted_app(), None).await;
+        assert_eq!(status, axum::http::StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn post_a2a_with_invalid_token_is_unauthorized() {
+        let (status, _) = post_a2a(mounted_app(), Some("nope")).await;
+        assert_eq!(status, axum::http::StatusCode::UNAUTHORIZED);
+        let (status, _) = post_a2a(mounted_app(), Some("gtpat_nope")).await;
+        assert_eq!(status, axum::http::StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn post_a2a_with_pat_or_jwt_reaches_the_gateway() {
+        // The same PAT port the MCP transport authenticates `gtpat_…` bearers through.
+        let (status, v) = post_a2a(mounted_app(), Some("gtpat_ok")).await;
+        assert_eq!(status, axum::http::StatusCode::OK);
+        assert_eq!(v["result"]["id"], "gtcore-abc123");
+        assert_eq!(v["result"]["status"]["state"], "submitted");
+
+        let (status, v) = post_a2a(mounted_app(), Some("good-jwt")).await;
+        assert_eq!(status, axum::http::StatusCode::OK);
+        assert_eq!(v["result"]["id"], "gtcore-abc123");
+    }
+
+    #[test]
+    fn signed_card_verifies_against_the_public_key() {
+        let minter = JwtMinter::from_rsa_pem(TEST_PRIV).unwrap();
+        let card = agent_card("https://gt-dev.codecsrayo.com", &catalog());
+        let signed = sign_card(card.clone(), &minter).unwrap();
+        let jws = signed.signature.clone().expect("signature stamped");
+
+        // The JWS payload is the canonical card JSON without the signature field.
+        let verifier = JwtAuthenticator::from_rsa_pem(TEST_PUB).unwrap();
+        let payload = verifier.verify_json(&jws).expect("signature verifies");
+        assert_eq!(payload, serde_json::to_value(&card).unwrap());
+
+        // A different key does NOT verify it (a real, rejectable signature).
+        let other = JwtAuthenticator::from_rsa_pem(
+            include_bytes!("../../../domain/platform/gt-auth/tests/fixtures/rs256_other_pub.pem"),
+        )
+        .unwrap();
+        assert!(other.verify_json(&jws).is_err());
+    }
+
+    #[test]
+    fn a2a_env_is_opt_in() {
+        // Missing any required env ⇒ None ⇒ the bin mounts nothing.
+        assert_eq!(a2a_env(|_| None), None);
+        let partial = |k: &str| (k == "GT_A2A_DEFAULT_RIG").then(|| "gtcore".to_string());
+        assert_eq!(a2a_env(partial), None);
+
+        let full = |k: &str| match k {
+            "GT_A2A_DEFAULT_RIG" => Some("gtcore".to_string()),
+            "GT_A2A_INTAKE_EPIC" => Some("gtcore-intake".to_string()),
+            "GT_A2A_ORCHD_URL" => Some("http://gt-orchd:8080".to_string()),
+            _ => None,
+        };
+        let env = a2a_env(full).expect("all required envs present");
+        assert_eq!(env.rig, "gtcore");
+        assert_eq!(env.parent_id, "gtcore-intake");
+        assert_eq!(env.orchd_url, "http://gt-orchd:8080");
+        assert_eq!(env.orchd_token, None, "token is optional");
+
+        // Blank values count as unset — a `GT_A2A_ORCHD_URL=""` chart default
+        // must not half-mount the surface.
+        let blank = |k: &str| match k {
+            "GT_A2A_ORCHD_URL" => Some("  ".to_string()),
+            other => full(other),
+        };
+        assert_eq!(a2a_env(blank), None);
     }
 
     #[test]

@@ -70,6 +70,7 @@ fn card() -> AgentCard {
         default_input_modes: vec!["text".into()],
         default_output_modes: vec!["text".into()],
         skills: vec![],
+        signature: None,
     }
 }
 

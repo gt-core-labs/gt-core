@@ -23,6 +23,13 @@
 //! - `GT_DOLT_BASE_URL` — multi-tenant routing (hq-mt-routing.5); unset ⇒
 //!   single-tenant on `GT_DOLT_URL`.
 //! - `GT_PG_AUDIT_URL` — durable Postgres audit sink; unset ⇒ in-memory.
+//! - `GT_A2A_DEFAULT_RIG` / `GT_A2A_INTAKE_EPIC` / `GT_A2A_ORCHD_URL` — the A2A
+//!   ingress (B5, gtcore-9039b5): all three present (plus `GT_CHANNEL_ROOT` and
+//!   the RS256 verifier) ⇒ `POST /a2a` + the public `/.well-known/agent.json`
+//!   are served; any missing ⇒ no A2A surface. `GT_A2A_ORCHD_TOKEN` optionally
+//!   pins the session-control bearer (else one is minted with the signing key,
+//!   ttl `GT_A2A_ORCHD_TOKEN_TTL_SECS`); `GT_PUBLIC_URL` names the card's
+//!   public origin (e.g. `https://gt-dev.codecsrayo.com`).
 
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -1147,6 +1154,10 @@ async fn main() -> anyhow::Result<()> {
             None
         }
     };
+    // The A2A gateway (B5, gtcore-9039b5) drops its dispatch orders on the SAME
+    // channel dir — captured before `agent_dispatch_channel` moves into the REST
+    // module parts below.
+    let a2a_dispatch_channel = agent_dispatch_channel.clone();
     let accounts_root = gt_composition::account_dirs::accounts_root(&agent_root);
     let skills_seed_workspace =
         std::env::var("GT_WORKSPACE").unwrap_or_else(|_| "default".to_string());
@@ -1489,6 +1500,146 @@ async fn main() -> anyhow::Result<()> {
             eprintln!(
                 "[gt-mcp-server] login surface off (needs RS256 verifier + GT_JWT_RS256_PRIVATE_KEY_FILE + GT_PG_URL)"
             );
+            app
+        }
+    };
+
+    // A2A ingress (B5, gtcore-9039b5 / epic gtcore-155917): `POST /a2a` (JSON-RPC
+    // tasks/send|get|cancel|sendSubscribe over the A2aGateway) + the public
+    // `GET /.well-known/agent.json` discovery card. Opt-in wiring — mounted ONLY
+    // when ALL of these are present (see gt_composition::a2a's module doc):
+    //   - GT_A2A_DEFAULT_RIG + GT_A2A_INTAKE_EPIC — intake defaults for minted beads;
+    //   - GT_A2A_ORCHD_URL (+ optional GT_A2A_ORCHD_TOKEN) — the orchd agent REST
+    //     surface tasks/cancel kills sessions through; without a token one is
+    //     minted with the platform RS256 key (agent.read/agent.write scopes);
+    //   - GT_CHANNEL_ROOT — the dispatch channel the minted bead's order drops on;
+    //   - the RS256 verifier — POST /a2a sits behind the SAME PAT/JWT authenticator
+    //     as /mcp and /api/v1/* (the card endpoint stays public per spec).
+    // GT_PUBLIC_URL names the card's served origin (default http://<bind>).
+    let app = match (
+        gt_composition::a2a::a2a_env(|k| std::env::var(k).ok()),
+        &verifier,
+        &a2a_dispatch_channel,
+    ) {
+        (Some(a2a), Some(v), Some(channel)) => {
+            // One AgentSkill per catalog rig (single-tenant: the GT_WORKSPACE
+            // schema). No PG / empty catalog ⇒ the default rig is the one skill,
+            // so the card never advertises nothing.
+            let a2a_ws = std::env::var("GT_WORKSPACE").unwrap_or_else(|_| "default".to_string());
+            let mut rigs: Vec<gt_rig::RigEntry> = match &scope_sources {
+                Some((_, rig_provider)) => match rig_provider.repo(&a2a_ws).await {
+                    Ok(repo) => repo.list().await.unwrap_or_default(),
+                    Err(_) => vec![],
+                },
+                None => vec![],
+            };
+            if rigs.is_empty() {
+                rigs.push(gt_rig::RigEntry::new(
+                    a2a.rig.clone(),
+                    a2a.rig.clone(),
+                    String::new(),
+                    "main",
+                    0,
+                ));
+            }
+            let public_url =
+                std::env::var("GT_PUBLIC_URL").unwrap_or_else(|_| format!("http://{bind}"));
+            let card = gt_composition::a2a::agent_card(&public_url, &rigs);
+            // Sign with the deploy's existing RS256 signing key; a deploy without
+            // one serves the card unsigned (discovery still works, just unattested).
+            let card = match JwtMinter::from_env() {
+                Ok(minter) => match gt_composition::a2a::sign_card(card.clone(), &minter) {
+                    Ok(signed) => {
+                        eprintln!("[gt-mcp-server] A2A agent card signed (RS256 JWS)");
+                        signed
+                    }
+                    Err(e) => {
+                        eprintln!("[gt-mcp-server] A2A agent card UNSIGNED (sign failed: {e})");
+                        card
+                    }
+                },
+                Err(e) => {
+                    eprintln!("[gt-mcp-server] A2A agent card UNSIGNED (no signing key: {e})");
+                    card
+                }
+            };
+            // tasks/cancel authenticates against the orchd agent REST surface with
+            // the configured token, else a token minted with the platform key —
+            // the same key that verifier accepts, so the kill rides the normal
+            // auth chain. Boot-lifetime mint: ttl via GT_A2A_ORCHD_TOKEN_TTL_SECS
+            // (default one year).
+            let orchd_token = a2a.orchd_token.clone().or_else(|| {
+                let minter = JwtMinter::from_env().ok()?;
+                let now = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0);
+                let ttl = env_u64("GT_A2A_ORCHD_TOKEN_TTL_SECS", 31_536_000);
+                minter
+                    .mint(&gt_auth::JwtClaims {
+                        sub: "a2a-gateway".into(),
+                        workspace: a2a_ws.clone(),
+                        scopes: vec!["agent.read".into(), "agent.write".into()],
+                        exp: now + ttl,
+                        nbf: None,
+                        iat: now,
+                    })
+                    .ok()
+            });
+            // External intake lands as meta.gap — the "work arrived from outside
+            // the planning loop" bucket — until the taxonomy grows a dedicated
+            // a2a/intake discriminator.
+            let gateway = gt_composition::a2a::A2aGateway::new(
+                Arc::new(gt_composition::a2a::DoltIntake::new(
+                    store.clone(),
+                    "a2a".into(),
+                    vec![gt_issues::Domain::MetaGap],
+                )),
+                Arc::new(gt_composition::a2a::ChannelDispatch::new(channel.clone())),
+                Arc::new(gt_composition::a2a::DoltTaskStore::new(store.clone())),
+                Arc::new(gt_composition::a2a::RestSessionControl::new(
+                    a2a.orchd_url.clone(),
+                    orchd_token,
+                )),
+                Arc::new(gt_composition::a2a::LogEventFeed::new(
+                    event_log.clone(),
+                    Some(a2a_ws.clone()),
+                )),
+                gt_composition::a2a::A2aGatewayConfig {
+                    rig: a2a.rig.clone(),
+                    parent_id: a2a.parent_id.clone(),
+                    created_by: "a2a".into(),
+                    domain: vec![gt_issues::Domain::MetaGap],
+                    poll: std::time::Duration::from_secs(1),
+                },
+            );
+            // The SAME PAT port the /mcp transport and /api/v1/* authenticate
+            // gtpat_… bearers through; the card route stays outside the guard.
+            let mut a2a_auth = AuthState::new(v.clone(), audit.clone());
+            if let Some(pv) = pat_verifier.clone() {
+                a2a_auth = a2a_auth.with_pat(pv);
+            }
+            eprintln!(
+                "[gt-mcp-server] A2A on POST /a2a (PAT/JWT guarded) + GET /.well-known/agent.json (public; {} skill(s); intake {} → rig {}; orchd {})",
+                rigs.len(),
+                a2a.parent_id,
+                a2a.rig,
+                a2a.orchd_url,
+            );
+            app.merge(gt_composition::a2a::a2a_app(card, Arc::new(gateway), a2a_auth))
+        }
+        (env_cfg, v, channel) => {
+            let mut missing: Vec<&str> = vec![];
+            if env_cfg.is_none() {
+                missing.push("GT_A2A_DEFAULT_RIG/GT_A2A_INTAKE_EPIC/GT_A2A_ORCHD_URL");
+            }
+            if v.is_none() {
+                missing.push("RS256 verifier");
+            }
+            if channel.is_none() {
+                missing.push("GT_CHANNEL_ROOT");
+            }
+            eprintln!("[gt-mcp-server] A2A off (missing: {})", missing.join(", "));
             app
         }
     };
