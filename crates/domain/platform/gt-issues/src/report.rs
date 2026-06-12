@@ -21,6 +21,8 @@ use gt_store_dolt::IssueRow;
 /// One task row of the report, mockup column order.
 #[derive(Debug, Clone, Serialize)]
 pub struct ReportRow {
+    /// The bead id (xlsx Módulo column reference; not a CSV column).
+    pub id: String,
     /// Tarea — the card title.
     pub tarea: String,
     /// Proceso — the card's `issue_type` (task/spike/…).
@@ -106,6 +108,7 @@ pub fn build_report(rig: &str, workspace: &str, rows: &[IssueRow]) -> OperatorRe
         }
         let module = row.external_ref.clone().unwrap_or_default();
         buckets.entry(module).or_default().push(ReportRow {
+            id: row.id.clone(),
             tarea: row.title.clone(),
             proceso: row.issue_type.clone(),
             nivel: nivel_label(row.priority).to_string(),
@@ -239,9 +242,13 @@ pub fn to_xlsx(report: &OperatorReport) -> Result<Vec<u8>, String> {
         .set_background_color(SECTION_BG)
         .set_border(FormatBorder::Thin)
         .set_border_color("B4C6E7");
-    let cell = Format::new().set_border(FormatBorder::Thin).set_border_color("BFBFBF");
+    let cell = Format::new()
+        .set_border(FormatBorder::Thin)
+        .set_border_color("BFBFBF")
+        .set_align(FormatAlign::VerticalCenter);
     let cell_wrap = cell.clone().set_text_wrap().set_align(FormatAlign::Top);
     let cell_center = cell.clone().set_align(FormatAlign::Center);
+    let cell_id = cell.clone().set_font_size(9).set_font_color("595959");
     // Nivel chips (mockup: Alto rosa, Bajo verde; Medio ámbar).
     let nivel_alto = cell_center.clone().set_bold().set_background_color("F8CBCC").set_font_color("9C0006");
     let nivel_medio = cell_center.clone().set_bold().set_background_color("FFE599").set_font_color("9C6500");
@@ -285,13 +292,23 @@ pub fn to_xlsx(report: &OperatorReport) -> Result<Vec<u8>, String> {
 
     let mut r: u32 = 2;
     for section in &report.sections {
-        // Section band: the module title spanning the full width.
+        // Section band: module title left, the section's hours subtotal in the
+        // Horas column (mockup has no separate Subtotal row).
         sheet
-            .merge_range(r, 0, r, LAST_COL, &section.module_title, &section_fmt)
+            .merge_range(r, 0, r, 3, &section.module_title, &section_fmt)
+            .map_err(|e| e.to_string())?;
+        sheet
+            .write_with_format(r, 4, section.horas, &subtotal_fmt)
+            .map_err(|e| e.to_string())?;
+        sheet
+            .merge_range(r, 5, r, LAST_COL, "", &section_fmt)
             .map_err(|e| e.to_string())?;
         r += 1;
         for row in &section.rows {
-            sheet.write_with_format(r, 0, "", &cell).map_err(|e| e.to_string())?;
+            // Fixed height: wrapped Tarea/Notas clip at ~2 lines instead of
+            // blowing the row up — the operator expands a row when needed.
+            sheet.set_row_height(r, 30).map_err(|e| e.to_string())?;
+            sheet.write_with_format(r, 0, row.id.as_str(), &cell_id).map_err(|e| e.to_string())?;
             sheet.write_with_format(r, 1, row.tarea.as_str(), &cell_wrap).map_err(|e| e.to_string())?;
             sheet.write_with_format(r, 2, row.proceso.as_str(), &cell_wrap).map_err(|e| e.to_string())?;
             let nivel_fmt = match row.nivel.as_str() {
@@ -317,17 +334,6 @@ pub fn to_xlsx(report: &OperatorReport) -> Result<Vec<u8>, String> {
             sheet.write_with_format(r, 9, row.notas.as_str(), &cell_wrap).map_err(|e| e.to_string())?;
             r += 1;
         }
-        // Section subtotal band.
-        sheet
-            .merge_range(r, 0, r, 3, "Subtotal", &subtotal_fmt)
-            .map_err(|e| e.to_string())?;
-        sheet
-            .write_with_format(r, 4, section.horas, &subtotal_fmt)
-            .map_err(|e| e.to_string())?;
-        for col in 5..=LAST_COL {
-            sheet.write_with_format(r, col, "", &subtotal_fmt).map_err(|e| e.to_string())?;
-        }
-        r += 1;
     }
 
     // TOTAL HORAS footer, navy like the mockup.
