@@ -171,6 +171,9 @@ fn parity_map(ns: &str) -> Vec<Route> {
             // pool + attach an onboarded account to the active workspace. No MCP sibling.
             rt("GET", "/catalog", None),
             rt("POST", "/{account}/assign", None),
+            // On-demand usage sweep (hq-28b063): syncs all workspace accounts against the OAuth
+            // /usage endpoint in one shot — REST-only, no MCP tool sibling.
+            rt("POST", "/probe/sweep", None),
         ],
         "merge" => vec![
             rt("GET", "/", Some("merge.list")),

@@ -36,6 +36,7 @@ fn make_events() -> Vec<AgentEvent> {
     for i in 0..10 {
         evs.push(AgentEvent::Heartbeat {
             session: format!("p{i:02}"),
+            timestamp_secs: Some(1_700_000_000 + i as u64),
         });
     }
     assert_eq!(evs.len(), 100);

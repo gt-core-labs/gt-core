@@ -43,7 +43,14 @@ pub enum AgentEvent {
         #[serde(default)]
         tmux_socket: Option<String>,
     },
-    Heartbeat { session: String },
+    Heartbeat {
+        session: String,
+        /// Unix seconds at emission. `None` for log entries written before this field was added
+        /// (`#[serde(default)]` keeps those replayable; the registry skips updating
+        /// `last_heartbeat_at` when the timestamp is absent rather than stamping epoch zero).
+        #[serde(default)]
+        timestamp_secs: Option<u64>,
+    },
     SessionEnd { session: String },
     Killed { session: String, reason: String },
 }
@@ -57,7 +64,7 @@ impl EventKind for AgentEvent {
         // event-log NS filter is the `agent.` prefix, so old bare-kind records still replay.
         match self {
             AgentEvent::Spawned { .. } => "agent.spawned.v1",
-            AgentEvent::Heartbeat { .. } => "agent.heartbeat.v1",
+            AgentEvent::Heartbeat { .. } => "agent.heartbeat.v1", // kind unchanged; new field is additive
             AgentEvent::SessionEnd { .. } => "agent.session-end.v1",
             AgentEvent::Killed { .. } => "agent.killed.v1",
         }

@@ -158,10 +158,15 @@ impl DomainHandler for AgentHandler {
             }
             "agent.heartbeat" => {
                 let session = self.require_session(ws, &ctx.args)?;
+                let ts = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs())
+                    .ok();
                 self.record(
                     ws,
                     AgentEvent::Heartbeat {
                         session: session.clone(),
+                        timestamp_secs: ts,
                     },
                     &session,
                 )
@@ -253,6 +258,7 @@ fn session_json(session: &Session) -> Value {
         "state": state_str(session.state),
         "role": session.role.as_str(),
         "crew": session.crew,
+        "last_heartbeat_at": session.last_heartbeat_at,
     })
 }
 
@@ -304,10 +310,18 @@ mod tests {
         assert_eq!(info["state"], "spawned");
         assert_eq!(info["rig"], "granite");
 
-        // Heartbeat is a no-op on the registry but must be accepted + logged.
+        // Heartbeat updates last_heartbeat_at on the session and must be accepted + logged.
         h.dispatch("agent.heartbeat", ctx(json!({ "session": "s1" })))
             .await
             .unwrap();
+        let info = h
+            .dispatch("agent.info", ctx(json!({ "session": "s1" })))
+            .await
+            .unwrap();
+        assert!(
+            info["last_heartbeat_at"].is_number(),
+            "heartbeat stamps last_heartbeat_at"
+        );
 
         h.dispatch("agent.end", ctx(json!({ "session": "s1" })))
             .await

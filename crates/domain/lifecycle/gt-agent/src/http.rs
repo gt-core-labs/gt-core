@@ -291,7 +291,11 @@ async fn heartbeat_session(
     let ws = workspace_of(&headers);
     let ws = ws.as_deref();
     st.require_session(ws, &id)?;
-    Ok(Json(st.record(ws, AgentEvent::Heartbeat { session: id.clone() }, &id)?))
+    let timestamp_secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .ok();
+    Ok(Json(st.record(ws, AgentEvent::Heartbeat { session: id.clone(), timestamp_secs }, &id)?))
 }
 
 /// `POST /:id/end` — record a session's normal end (`agent.end`). Emits `agent.session-end.v1`,

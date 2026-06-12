@@ -140,6 +140,11 @@ pub struct Session {
     /// `#[serde(default)]` → `None` for pre-flag log entries (reconciler skips those safely).
     #[serde(default)]
     pub tmux_socket: Option<String>,
+    /// Unix seconds of the most recent `AgentEvent::Heartbeat` that carried a timestamp.
+    /// `None` until the first stamped heartbeat arrives (pre-timestamp log entries, or sessions
+    /// that have not yet received their first supervisor-tick heartbeat).
+    #[serde(default)]
+    pub last_heartbeat_at: Option<u64>,
 }
 
 impl Session {
@@ -156,6 +161,7 @@ impl Session {
             hooks: Vec::new(),
             maintains_heartbeat: true,
             tmux_socket: None,
+            last_heartbeat_at: None,
         }
     }
 
@@ -176,6 +182,7 @@ impl Session {
             hooks: Vec::new(),
             maintains_heartbeat: role.maintains_heartbeat(),
             tmux_socket: None,
+            last_heartbeat_at: None,
         }
     }
 
@@ -276,7 +283,11 @@ impl SessionRegistry {
                 s.tmux_socket = tmux_socket.clone();
                 self.add(s);
             }
-            AgentEvent::Heartbeat { .. } => {} // no cambia el registro
+            AgentEvent::Heartbeat { session, timestamp_secs } => {
+                if let (Some(s), Some(ts)) = (self.sessions.get_mut(session), *timestamp_secs) {
+                    s.last_heartbeat_at = Some(ts);
+                }
+            }
             AgentEvent::SessionEnd { session } => {
                 if let Some(s) = self.sessions.get_mut(session) {
                     s.state = SessionState::Done;

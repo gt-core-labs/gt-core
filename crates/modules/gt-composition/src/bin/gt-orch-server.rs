@@ -570,8 +570,9 @@ async fn main() -> anyhow::Result<()> {
             // tick, the watched set only contains sessions that are alive or being re-slung.
             // Best-effort: a log failure never aborts the supervision loop.
             let ws_opt = Some(heartbeat_ws.as_str());
+            let hb_ts = now_secs();
             for session in sup_timer.watched_sessions() {
-                let ev = gt_agent::AgentEvent::Heartbeat { session };
+                let ev = gt_agent::AgentEvent::Heartbeat { session, timestamp_secs: Some(hb_ts) };
                 if let Err(e) = heartbeat_log.append(ws_opt, ev) {
                     eprintln!("[gt-orch-server] heartbeat append failed: {e}");
                 }
