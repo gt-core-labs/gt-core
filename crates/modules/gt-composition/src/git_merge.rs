@@ -22,6 +22,7 @@
 //! `git -C <worktree> rebase origin/main` against the worktree that holds the branch, discovered
 //! from `git worktree list`.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -29,6 +30,7 @@ use async_trait::async_trait;
 
 use gt_eventlog::EventRecord;
 use gt_events::AppError;
+use gt_mcp_server::bead_prefix;
 use gt_merge::actor::MergeHandle;
 use gt_merge::MergeEvent;
 use gt_plugin::Plugin;
@@ -179,13 +181,44 @@ fn resolve_sha(rig: &Path, branch: &str) -> MergeOutcome {
 pub struct GitMergePlugin {
     merge: MergeHandle,
     rig: PathBuf,
+    /// Per-rig checkout paths keyed by bead prefix (`hq-c846f5`, epic hq-554308). A
+    /// `merge.started.v1` for a bead whose prefix matches runs the ff-merge from THAT rig's
+    /// checkout; an unknown prefix falls back to `rig` — legacy single-rig deployments
+    /// (constructed via [`GitMergePlugin::new`]) are unchanged.
+    rig_paths: HashMap<String, PathBuf>,
 }
 
 impl GitMergePlugin {
     /// Wire the merge command handle (for branch resolution + the terminal transition) and the
     /// rig checkout the push runs from (`GT_RIG_PATH`).
     pub fn new(merge: MergeHandle, rig: PathBuf) -> Self {
-        Self { merge, rig }
+        Self {
+            merge,
+            rig,
+            rig_paths: HashMap::new(),
+        }
+    }
+
+    /// Multi-rig constructor (`hq-c846f5`): route each merge to its rig checkout by bead
+    /// prefix, falling back to `fallback_rig` for prefixes not in the map.
+    pub fn with_rig_paths(
+        merge: MergeHandle,
+        rig_paths: HashMap<String, PathBuf>,
+        fallback_rig: PathBuf,
+    ) -> Self {
+        Self {
+            merge,
+            rig: fallback_rig,
+            rig_paths,
+        }
+    }
+
+    /// The checkout the ff-merge for `bead` runs from: its prefix's rig, else the fallback.
+    fn rig_for(&self, bead: &str) -> &Path {
+        self.rig_paths
+            .get(bead_prefix(bead))
+            .map(PathBuf::as_path)
+            .unwrap_or(&self.rig)
     }
 }
 
@@ -216,7 +249,8 @@ impl Plugin for GitMergePlugin {
         };
 
         // Shell git off the runtime workers; the result drives the terminal transition.
-        let rig = self.rig.clone();
+        // Routed by bead prefix (hq-c846f5): a gtweb bead's merge runs from the gtweb checkout.
+        let rig = self.rig_for(&bead).to_path_buf();
         let branch_for_git = branch.clone();
         let outcome =
             tokio::task::spawn_blocking(move || merge_branch_to_main(&rig, &branch_for_git))
@@ -287,6 +321,94 @@ branch refs/heads/hq-other.3
             "legacy shared-checkout case: branch checked out directly in the rig"
         );
         assert_eq!(worktree_for_branch(porcelain, "hq-absent.9"), None);
+    }
+
+    #[tokio::test]
+    async fn rig_for_routes_by_prefix_and_falls_back() {
+        // hq-c846f5 (epic hq-554308): the merge for a gtweb bead runs from the gtweb checkout;
+        // an unknown prefix keeps the legacy fallback rig.
+        let (tx, _rx) = tokio::sync::mpsc::channel(8);
+        let merge = gt_merge::actor::spawn(gt_merge::InMemoryMergeRepo::default(), tx);
+        let plugin = GitMergePlugin::with_rig_paths(
+            merge,
+            HashMap::from([("gtweb".to_string(), PathBuf::from("/rig-wt/gtweb"))]),
+            PathBuf::from("/rig-wt/gtcore"),
+        );
+        assert_eq!(plugin.rig_for("gtweb-968172"), Path::new("/rig-wt/gtweb"));
+        assert_eq!(plugin.rig_for("zz-1"), Path::new("/rig-wt/gtcore"));
+        assert_eq!(
+            plugin.rig_for("hq-mod-hooks.9"),
+            Path::new("/rig-wt/gtcore"),
+            "prefix is the FIRST dash token only"
+        );
+    }
+
+    #[tokio::test]
+    async fn merge_started_executes_ff_merge_from_routed_checkout() {
+        // hq-c846f5: end-to-end — a merge.started.v1 for a gtweb-prefixed bead lands the branch
+        // on origin/main FROM the gtweb checkout. The fallback rig is nonexistent, so only
+        // correct routing can make the push succeed.
+        use gt_events::Envelope;
+        let uniq = format!(
+            "{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        let root = std::env::temp_dir().join(format!("gt-gitmerge-{uniq}"));
+        let origin = root.join("origin.git");
+        let gtweb = root.join("gtweb");
+        std::fs::create_dir_all(&origin).unwrap();
+        let sh = |dir: &Path, args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .arg("-C")
+                .arg(dir)
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "git {args:?} in {}: {}",
+                dir.display(),
+                String::from_utf8_lossy(&out.stderr)
+            );
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        };
+        sh(&origin, &["init", "-q", "--bare", "-b", "main"]);
+        sh(&root, &["clone", "-q", origin.to_str().unwrap(), "gtweb"]);
+        sh(&gtweb, &["config", "user.email", "t@t"]);
+        sh(&gtweb, &["config", "user.name", "t"]);
+        sh(&gtweb, &["checkout", "-q", "-b", "gtweb-1"]);
+        std::fs::write(gtweb.join("f"), "x").unwrap();
+        sh(&gtweb, &["add", "."]);
+        sh(&gtweb, &["commit", "-qm", "work"]);
+        let want_sha = sh(&gtweb, &["rev-parse", "gtweb-1"]);
+
+        // A real merge actor whose board holds the slot (bead + branch) the plugin resolves.
+        let (tx, _rx) = tokio::sync::mpsc::channel(8);
+        let merge = gt_merge::actor::spawn(gt_merge::InMemoryMergeRepo::default(), tx);
+        merge.submit("gtweb-1", "gtweb-1", "01ABC").await;
+        merge.start("gtweb-1").await;
+
+        let plugin = GitMergePlugin::with_rig_paths(
+            merge,
+            HashMap::from([("gtweb".to_string(), gtweb.clone())]),
+            root.join("nonexistent-fallback"),
+        );
+        let record = EventRecord::from_envelope(&Envelope::root(MergeEvent::Started {
+            bead: "gtweb-1".into(),
+        }))
+        .unwrap();
+        plugin.on_event(&record).await.unwrap();
+
+        assert_eq!(
+            sh(&origin, &["rev-parse", "main"]),
+            want_sha,
+            "the branch fast-forwarded origin/main from the ROUTED gtweb checkout"
+        );
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
