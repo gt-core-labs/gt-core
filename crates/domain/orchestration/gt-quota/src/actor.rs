@@ -16,7 +16,7 @@ use crate::commands::QuotaCommand;
 use crate::cost::ModelWeights;
 use crate::events::QuotaEvent;
 use crate::expectations::predict;
-use crate::state::{Account, AccountRegistry, AccountWindow, WindowKind, ROLLING_5H_SECS};
+use crate::state::{Account, AccountRegistry, AccountWindow, AccountQuotaStatus, WindowKind, ROLLING_5H_SECS};
 
 pub enum QuotaMsg {
     /// Initialize / replace an account's window (read by an edge probe).
@@ -521,6 +521,10 @@ pub fn spawn_hydrated(
                                     mw.resets_at_secs = new_resets;
                                     mw.consumed = 0.0;
                                 }
+                                // Fresh window: lift Cooldown so the account re-enters rotation.
+                                if acc.status == AccountQuotaStatus::Cooldown {
+                                    acc.status = AccountQuotaStatus::Healthy;
+                                }
                             }
                             registry.clear_window_prediction(&id);
                             let _ = events
@@ -543,6 +547,9 @@ pub fn spawn_hydrated(
                                     ww.started_at_secs = new_started;
                                     ww.resets_at_secs = new_resets;
                                     ww.consumed = 0.0;
+                                }
+                                if acc.status == AccountQuotaStatus::Cooldown {
+                                    acc.status = AccountQuotaStatus::Healthy;
                                 }
                             }
                             let _ = events

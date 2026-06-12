@@ -556,15 +556,28 @@ impl QuotaState {
                     entry.status = AccountQuotaStatus::Healthy;
                 }
             }
-            QuotaEvent::WindowReset { account, started_at_secs, resets_at_secs, .. } => {
+            QuotaEvent::WindowReset { account, kind, started_at_secs, resets_at_secs, .. } => {
                 let entry = self
                     .accounts
                     .entry(account.clone())
                     .or_insert_with(|| Account::new(account.clone()));
-                if let Some(w) = entry.window.as_mut() {
+                // Route to the right window by kind; "Weekly" targets weekly_window, everything
+                // else (Rolling5h, empty from old events) targets the main rolling window.
+                if kind == "Weekly" {
+                    if let Some(w) = entry.weekly_window.as_mut() {
+                        w.started_at_secs = *started_at_secs;
+                        w.resets_at_secs = *resets_at_secs;
+                        w.consumed = 0.0;
+                    }
+                } else if let Some(w) = entry.window.as_mut() {
                     w.started_at_secs = *started_at_secs;
                     w.resets_at_secs = *resets_at_secs;
                     w.consumed = 0.0;
+                }
+                // A fresh window means quota is available again: lift Cooldown so the account
+                // re-enters the rotation pool automatically without waiting for a probe.
+                if entry.status == AccountQuotaStatus::Cooldown {
+                    entry.status = AccountQuotaStatus::Healthy;
                 }
             }
             QuotaEvent::BlockPredicted { account, eta_to_block_secs, now_secs, .. } => {
