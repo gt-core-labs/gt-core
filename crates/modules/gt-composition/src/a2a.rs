@@ -1207,6 +1207,7 @@ mod tests {
                 hooks: vec![],
                 maintains_heartbeat: true,
                 tmux_socket: None,
+                spawned_by: None,
             })
             .unwrap(),
         )

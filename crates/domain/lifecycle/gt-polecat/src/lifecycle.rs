@@ -93,6 +93,7 @@ impl SpawnSpec {
             hooks: Vec::new(),
             maintains_heartbeat: true,
             tmux_socket: None,
+            spawned_by: None,
         }
     }
 

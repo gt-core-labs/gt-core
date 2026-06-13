@@ -275,7 +275,7 @@ impl SessionRegistry {
     /// total → reconstrucción determinista del estado desde el log (gate del Paso 3).
     pub fn apply(&mut self, event: &AgentEvent) {
         match event {
-            AgentEvent::Spawned { session, rig, role, crew, skills, hooks, maintains_heartbeat, tmux_socket } => {
+            AgentEvent::Spawned { session, rig, role, crew, skills, hooks, maintains_heartbeat, tmux_socket, .. } => {
                 let mut s = Session::with_role(session.clone(), rig.clone(), *role, crew.clone());
                 s.skills = skills.clone();
                 s.hooks = hooks.clone();

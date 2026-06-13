@@ -1430,6 +1430,7 @@ mod tests {
                 hooks: vec![],
                 maintains_heartbeat: false,
                 tmux_socket: Some("gt-acme".into()),
+                spawned_by: None,
             },
         )
         .unwrap();
@@ -1528,6 +1529,7 @@ mod tests {
                 hooks: vec![],
                 maintains_heartbeat: false,
                 tmux_socket: Some("gt-acme".into()),
+                spawned_by: None,
             },
         )
         .unwrap();
@@ -1566,6 +1568,7 @@ mod tests {
                 hooks: vec![],
                 maintains_heartbeat: false,
                 tmux_socket: Some("gt-acme".into()),
+                spawned_by: None,
             },
         )
         .unwrap();

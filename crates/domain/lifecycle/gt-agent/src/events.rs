@@ -19,6 +19,11 @@ pub enum AgentEvent {
         role: SessionRole,
         #[serde(default)]
         crew: Option<String>,
+        /// A5 (gtcore-f3a016): who triggered this spawn — the parent session id, an operator
+        /// actor name, or `"manual"` for CLI. `None` for pre-A5 events (serde default).
+        /// Enables inter-agent audit: tracing delegation chains when an agent spawns another.
+        #[serde(default)]
+        spawned_by: Option<String>,
         /// Skills the agent has loaded (its worktree `.claude/skills`), stamped by the polecat
         /// supervisor at sling (`hq-orch-sessions.2`). Empty for sessions spawned without a
         /// worktree (a manual `agent.spawn`). `#[serde(default)]` keeps pre-`.2` log entries

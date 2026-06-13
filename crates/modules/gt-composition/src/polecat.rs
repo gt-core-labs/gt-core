@@ -622,6 +622,7 @@ impl Plugin for PolecatSupervisorPlugin {
                     hooks: hooks.clone(),
                     maintains_heartbeat: true,
                     tmux_socket: None,
+                    spawned_by: Some("scheduler".into()),
                 });
                 // Mark the bead's operating agent on the issues channel (hq-agent-observability.2)
                 // so the FE shows who works it + what they loaded.

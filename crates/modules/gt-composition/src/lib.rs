@@ -895,6 +895,7 @@ mod session_minutes_tests {
                 hooks: Vec::new(),
                 maintains_heartbeat: true,
                 tmux_socket: None,
+                spawned_by: None,
             },
             "2026-06-03T12:00:00Z",
         ))

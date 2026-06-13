@@ -369,9 +369,12 @@ impl IssuesServer {
         if let Err(e) = scope.check(tool) {
             // The tenant is already resolved here (the token was verified), so an
             // out-of-scope denial is attributed to its workspace — not "default".
+            // A5 (gtcore-f3a016): stamp the actor's scopes so the audit trail shows what
+            // the actor held when it was denied — essential for RBAC forensics.
             let _ = self.audit.record(
                 AuditRecord::unauthorized(&scope.actor, tool, args.clone())
-                    .in_workspace(workspace_or_default(&workspace)),
+                    .in_workspace(workspace_or_default(&workspace))
+                    .with_scopes(scope.allow.iter().cloned().collect()),
             );
             return Err(McpError::invalid_request(e.to_string(), None));
         }
@@ -412,7 +415,9 @@ impl IssuesServer {
         match status {
             Some(s) if !s.allows_mutation() => {
                 let _ = self.audit.record(
-                    AuditRecord::unauthorized(&scope.actor, tool, args.clone()).in_workspace(ws),
+                    AuditRecord::unauthorized(&scope.actor, tool, args.clone())
+                        .in_workspace(ws)
+                        .with_scopes(scope.allow.iter().cloned().collect()),
                 );
                 Err(McpError::invalid_request(
                     format!(
@@ -689,9 +694,12 @@ impl ServerHandler for IssuesServer {
         // workspace, hq-mcp-dispatch.9) so the audit trail is per-tenant filterable
         // (hq-mt-auth.7 SOC2 dump). Absent a resolved workspace (legacy header mode
         // with no X-Workspace) it falls back to the default tenant.
+        // A5 (gtcore-f3a016): stamp scopes on both invoked and denied records so the audit
+        // trail captures the actor's full grant at dispatch time.
         let _ = self.audit.record(
             AuditRecord::invoked(&scope.actor, &tool, args)
-                .in_workspace(workspace_or_default(&workspace)),
+                .in_workspace(workspace_or_default(&workspace))
+                .with_scopes(scope.allow.iter().cloned().collect()),
         );
 
         match result {

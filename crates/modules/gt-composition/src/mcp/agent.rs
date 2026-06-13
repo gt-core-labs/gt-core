@@ -190,6 +190,8 @@ impl DomainHandler for AgentHandler {
                         hooks: Vec::new(),
                         maintains_heartbeat: a.role.maintains_heartbeat(),
                         tmux_socket: a.role.tmux_socket(ws.unwrap_or("default")),
+                        // A5 (gtcore-f3a016): the calling actor triggered this spawn.
+                        spawned_by: Some(ctx.actor.to_string()),
                     },
                     &session,
                 )?;
