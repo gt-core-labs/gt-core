@@ -52,7 +52,7 @@ use gt_composition::hooks::{hooks_router, HooksApiState};
 use gt_composition::kanban_rest::{kanban_rest_router, KanbanRestState};
 use gt_composition::notifications::{notifications_router, NotificationsApiState};
 use gt_composition::mcp::{
-    A2aDelegateHandler, AgentHandler, AnalyticsHandler, AuditHandler, CommentsHandler, ConvoyHandler, DispatchHandler, DocumentsHandler, EmailHandler, EventLog, EventLogHooks,
+    A2aDelegateHandler, AgentHandler, AnalyticsHandler, AuditHandler, CommentsHandler, ConvoyHandler, DispatchHandler, DocumentsHandler, EmailHandler, EscalateHandler, EventLog, EventLogHooks,
     EventLogIssueSink, GraphHandler, IdentityDoltMeStats, InvitesHandler, MemoryHandler, MergeHandler, NotifyHandler, ReportHandler,
     PgDocumentsResource, PgRigPrefixes, PgWorkspaceStatus, QuotaBlockGuard, QuotaHandler, RigHandler,
     WorkspaceHandler, WsPools,
@@ -2173,6 +2173,16 @@ async fn build_domain_router(
         // notify.* — operator notification channel (hq-notifications): agents write
         // via notify.send; the browser bell polls/streams the same PG table.
         .register(Arc::new(NotifyHandler::new(pool.clone(), event_log.clone())))
+        // escalate.* — human escalation for autonomous agents (A6, gtcore-46c9dc):
+        // agents call escalate.request when they need human input; operators respond
+        // via escalate.respond. Approved beads are re-dispatched via the scheduler.
+        .register(Arc::new({
+            let handler = EscalateHandler::new(event_log.clone());
+            match &dispatch_sink {
+                Some(sink) => handler.with_dispatch_channel(sink.clone()),
+                None => handler,
+            }
+        }))
         // email.* — the programmed-send outbox (hq-f24599): schedule/list/cancel;
         // the drain daemon (spawned in main, gated like the other daemons) delivers
         // through the gt-notify EmailTransport seam.
