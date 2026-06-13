@@ -52,7 +52,7 @@ use gt_composition::hooks::{hooks_router, HooksApiState};
 use gt_composition::kanban_rest::{kanban_rest_router, KanbanRestState};
 use gt_composition::notifications::{notifications_router, NotificationsApiState};
 use gt_composition::mcp::{
-    AgentHandler, AnalyticsHandler, AuditHandler, CommentsHandler, ConvoyHandler, DocumentsHandler, EmailHandler, EventLog, EventLogHooks,
+    AgentHandler, AnalyticsHandler, AuditHandler, CommentsHandler, ConvoyHandler, DispatchHandler, DocumentsHandler, EmailHandler, EventLog, EventLogHooks,
     EventLogIssueSink, GraphHandler, IdentityDoltMeStats, InvitesHandler, MemoryHandler, MergeHandler, NotifyHandler, ReportHandler,
     PgDocumentsResource, PgRigPrefixes, PgWorkspaceStatus, QuotaBlockGuard, QuotaHandler, RigHandler,
     WorkspaceHandler, WsPools,
@@ -2220,6 +2220,28 @@ async fn build_domain_router(
     // pool cache and resolves `ws_<slug>.memories` per-request from the caller's tenant
     // (hq-memory-admin.4), exactly like documents.* — no longer bound to `ws_default`.
     let router = router.register(Arc::new(MemoryHandler::new(ws_pools.clone(), embedder)));
+
+    // dispatch.* — agent-dispatch frontier probe (gtcore-7bec8c — C3): exposes
+    // ready_for_auto as an MCP tool so operators/agents can query which beads are
+    // safe for autonomous dispatch right now. Needs Dolt for the ready predicate.
+    let router = match std::env::var("GT_DOLT_URL")
+        .ok()
+        .and_then(|url| DoltIssues::connect(&url).ok())
+    {
+        Some(dispatch_dolt) => {
+            let repo_dir = std::env::var("GT_REPO_DIR")
+                .ok()
+                .map(std::path::PathBuf::from);
+            router.register(Arc::new(DispatchHandler::new(
+                Arc::new(dispatch_dolt),
+                repo_dir,
+            )))
+        }
+        None => {
+            eprintln!("[gt-mcp-server] dispatch.* off — GT_DOLT_URL unset");
+            router
+        }
+    };
 
     // comments.* dispatch (hq-57042e): threaded comments on cards (beads) + documents.
     // Card-target existence checks need the Dolt tracker, so the handler is wired only
