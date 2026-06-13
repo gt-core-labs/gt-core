@@ -72,16 +72,18 @@
 //! verifies the platform's bearer tokens (shape decision documented on
 //! [`sign_card`]).
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
-use axum::extract::Request;
+use axum::extract::{Path, Request, State};
 use axum::http::StatusCode;
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
-use axum::Router;
+use axum::routing::get;
+use axum::{Json, Router};
 use time::format_description::well_known::Rfc3339;
 use time::OffsetDateTime;
 
@@ -769,6 +771,47 @@ pub fn agent_card(public_url: &str, rigs: &[RigEntry]) -> AgentCard {
     }
 }
 
+/// Per-rig discovery card (A2, gtcore-4023de): one [`AgentCard`] scoped to
+/// a single rig, served at `GET /.well-known/agent/<rig>.json`.
+///
+/// The `name` is `gt-<rig>` to distinguish it from the platform-level card.
+/// The `url` still points to `<public_url>/a2a` — tasks/send to a per-rig
+/// card routes through the same intake; the rig discriminator is task metadata.
+pub fn rig_agent_card(public_url: &str, rig: &RigEntry) -> AgentCard {
+    AgentCard {
+        name: format!("gt-{}", rig.name),
+        description: Some(format!(
+            "gt autonomous agent for rig `{}` — tasks are dispatched directly onto this rig",
+            rig.name
+        )),
+        url: format!("{}/a2a", public_url.trim_end_matches('/')),
+        version: env!("CARGO_PKG_VERSION").into(),
+        provider: Some(AgentProvider { organization: "gt-core-labs".into(), url: None }),
+        capabilities: AgentCapabilities {
+            streaming: true,
+            push_notifications: false,
+            state_transition_history: false,
+        },
+        authentication: Some(AgentAuthentication { schemes: vec!["bearer".into()] }),
+        default_input_modes: vec!["text".into()],
+        default_output_modes: vec!["text".into()],
+        skills: vec![AgentSkill {
+            id: rig.name.clone(),
+            name: rig.name.clone(),
+            description: Some(if rig.git_url.is_empty() {
+                format!("dispatch work onto rig `{}`", rig.name)
+            } else {
+                format!(
+                    "dispatch work onto rig `{}` ({}; default branch {})",
+                    rig.name, rig.git_url, rig.default_branch
+                )
+            }),
+            tags: vec![rig.prefix.clone()],
+        }],
+        signature: None,
+    }
+}
+
 /// Sign the Agent Card with the platform's RS256 key (B5, gtcore-9039b5).
 ///
 /// **Shape decision**: the A2A v1.0 spec asks for a *signed* card but pins no
@@ -788,17 +831,43 @@ pub fn sign_card(card: AgentCard, minter: &JwtMinter) -> Result<AgentCard, AuthE
     Ok(card)
 }
 
+/// Handler for `GET /.well-known/agent/:rig` — per-rig discovery (A2, gtcore-4023de).
+/// Accepts both `/agent/gtcore` and `/agent/gtcore.json` (strips `.json` suffix).
+async fn rig_card_handler(
+    Path(rig): Path<String>,
+    State(cards): State<Arc<HashMap<String, AgentCard>>>,
+) -> Response {
+    let name = rig.trim_end_matches(".json");
+    match cards.get(name) {
+        Some(card) => Json(card).into_response(),
+        None => StatusCode::NOT_FOUND.into_response(),
+    }
+}
+
 /// The served A2A surface: public discovery + guarded RPC.
 ///
 /// `GET /.well-known/agent.json` is mounted bare — per spec the discovery
-/// document is public. `POST /a2a` is wrapped in [`authenticate`] over the
-/// SAME [`AuthState`] (RS256 verifier + PAT port) the rest of the deploy
-/// authenticates with, plus [`require_claims`] so an anonymous request — which
-/// `authenticate` deliberately passes through for public routes — is a `401`
-/// here.
-pub fn a2a_app(card: AgentCard, handler: Arc<dyn A2aHandler>, auth: AuthState) -> Router {
+/// document is public. `GET /.well-known/agent/:rig` serves per-rig cards
+/// (A2, gtcore-4023de); also public. `POST /a2a` is wrapped in [`authenticate`]
+/// over the SAME [`AuthState`] (RS256 verifier + PAT port) the rest of the
+/// deploy authenticates with, plus [`require_claims`] so an anonymous request —
+/// which `authenticate` deliberately passes through for public routes — is a
+/// `401` here.
+///
+/// `rig_cards` is a pre-built, pre-signed map from rig name → per-rig card.
+/// An empty map simply serves no per-rig routes (the global card still works).
+pub fn a2a_app(
+    card: AgentCard,
+    handler: Arc<dyn A2aHandler>,
+    auth: AuthState,
+    rig_cards: HashMap<String, AgentCard>,
+) -> Router {
     let (discovery, rpc) = gt_a2a::a2a_split_router(card, handler);
-    discovery.merge(
+    // Per-rig discovery routes (A2, gtcore-4023de).
+    let rig_discovery = Router::new()
+        .route("/.well-known/agent/:rig", get(rig_card_handler))
+        .with_state(Arc::new(rig_cards));
+    discovery.merge(rig_discovery).merge(
         rpc
             // Innermost-first: `authenticate` (outermost) resolves the bearer —
             // PAT or JWT — into claims; `require_claims` then rejects requests
@@ -1290,7 +1359,7 @@ mod tests {
             Arc::new(InMemoryAudit::new()),
         )
         .with_pat(Arc::new(OnePat));
-        a2a_app(agent_card("https://gt-dev.codecsrayo.com", &catalog()), Arc::new(gw), auth)
+        a2a_app(agent_card("https://gt-dev.codecsrayo.com", &catalog()), Arc::new(gw), auth, HashMap::new())
     }
 
     async fn post_a2a(app: Router, bearer: Option<&str>) -> (axum::http::StatusCode, serde_json::Value) {
@@ -1427,5 +1496,72 @@ mod tests {
         assert_eq!(body["bead"], "gtcore-abc123");
         assert_eq!(body["priority"], 1);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Build an app with per-rig cards populated from `catalog()`.
+    fn mounted_app_with_rig_cards() -> Router {
+        let (gw, _, _) = gateway(false);
+        let auth = AuthState::new(
+            Arc::new(InMemoryAuthenticator::new().with_token("good-jwt", test_claims("alice"))),
+            Arc::new(InMemoryAudit::new()),
+        )
+        .with_pat(Arc::new(OnePat));
+        let rig_cards: HashMap<String, AgentCard> = catalog()
+            .iter()
+            .map(|r| (r.name.clone(), rig_agent_card("https://gt-dev.codecsrayo.com", r)))
+            .collect();
+        a2a_app(agent_card("https://gt-dev.codecsrayo.com", &catalog()), Arc::new(gw), auth, rig_cards)
+    }
+
+    #[tokio::test]
+    async fn rig_card_is_served_at_well_known_agent_rig() {
+        // A2 (gtcore-4023de): GET /.well-known/agent/gtcore returns per-rig card.
+        let app = mounted_app_with_rig_cards();
+        let resp = app
+            .oneshot(
+                axum::http::Request::get("/.well-known/agent/gtcore")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), axum::http::StatusCode::OK);
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(v["name"], "gt-gtcore");
+        assert_eq!(v["skills"][0]["id"], "gtcore");
+    }
+
+    #[tokio::test]
+    async fn rig_card_is_served_with_json_suffix() {
+        // A2 (gtcore-4023de): .json suffix is stripped so both paths work.
+        let app = mounted_app_with_rig_cards();
+        let resp = app
+            .oneshot(
+                axum::http::Request::get("/.well-known/agent/gtweb.json")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), axum::http::StatusCode::OK);
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(v["name"], "gt-gtweb");
+    }
+
+    #[tokio::test]
+    async fn rig_card_unknown_rig_is_404() {
+        // A2 (gtcore-4023de): unknown rig returns 404, not panic.
+        let app = mounted_app_with_rig_cards();
+        let resp = app
+            .oneshot(
+                axum::http::Request::get("/.well-known/agent/nonexistent")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), axum::http::StatusCode::NOT_FOUND);
     }
 }

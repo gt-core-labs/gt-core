@@ -1547,8 +1547,9 @@ async fn main() -> anyhow::Result<()> {
             let card = gt_composition::a2a::agent_card(&public_url, &rigs);
             // Sign with the deploy's existing RS256 signing key; a deploy without
             // one serves the card unsigned (discovery still works, just unattested).
-            let card = match JwtMinter::from_env() {
-                Ok(minter) => match gt_composition::a2a::sign_card(card.clone(), &minter) {
+            let opt_minter = JwtMinter::from_env().ok();
+            let card = match &opt_minter {
+                Some(minter) => match gt_composition::a2a::sign_card(card.clone(), minter) {
                     Ok(signed) => {
                         eprintln!("[gt-mcp-server] A2A agent card signed (RS256 JWS)");
                         signed
@@ -1558,18 +1559,31 @@ async fn main() -> anyhow::Result<()> {
                         card
                     }
                 },
-                Err(e) => {
-                    eprintln!("[gt-mcp-server] A2A agent card UNSIGNED (no signing key: {e})");
+                None => {
+                    eprintln!("[gt-mcp-server] A2A agent card UNSIGNED (no signing key)");
                     card
                 }
             };
+            // Per-rig cards (A2, gtcore-4023de): GET /.well-known/agent/<rig>[.json].
+            // Pre-sign each with the same key (or serve unsigned when no minter).
+            let rig_cards: std::collections::HashMap<String, gt_a2a::AgentCard> = rigs
+                .iter()
+                .map(|r| {
+                    let c = gt_composition::a2a::rig_agent_card(&public_url, r);
+                    let c = match &opt_minter {
+                        Some(m) => gt_composition::a2a::sign_card(c.clone(), m).unwrap_or(c),
+                        None => c,
+                    };
+                    (r.name.clone(), c)
+                })
+                .collect();
             // tasks/cancel authenticates against the orchd agent REST surface with
             // the configured token, else a token minted with the platform key —
             // the same key that verifier accepts, so the kill rides the normal
             // auth chain. Boot-lifetime mint: ttl via GT_A2A_ORCHD_TOKEN_TTL_SECS
             // (default one year).
             let orchd_token = a2a.orchd_token.clone().or_else(|| {
-                let minter = JwtMinter::from_env().ok()?;
+                let minter = opt_minter.as_ref()?;
                 let now = SystemTime::now()
                     .duration_since(UNIX_EPOCH)
                     .map(|d| d.as_secs())
@@ -1620,13 +1634,14 @@ async fn main() -> anyhow::Result<()> {
                 a2a_auth = a2a_auth.with_pat(pv);
             }
             eprintln!(
-                "[gt-mcp-server] A2A on POST /a2a (PAT/JWT guarded) + GET /.well-known/agent.json (public; {} skill(s); intake {} → rig {}; orchd {})",
+                "[gt-mcp-server] A2A on POST /a2a (PAT/JWT guarded) + GET /.well-known/agent.json (public; {} skill(s); {} per-rig cards at /.well-known/agent/<rig>; intake {} → rig {}; orchd {})",
                 rigs.len(),
+                rig_cards.len(),
                 a2a.parent_id,
                 a2a.rig,
                 a2a.orchd_url,
             );
-            app.merge(gt_composition::a2a::a2a_app(card, Arc::new(gateway), a2a_auth))
+            app.merge(gt_composition::a2a::a2a_app(card, Arc::new(gateway), a2a_auth, rig_cards))
         }
         (env_cfg, v, channel) => {
             let mut missing: Vec<&str> = vec![];
