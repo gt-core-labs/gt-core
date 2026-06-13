@@ -69,7 +69,7 @@ pub mod witness_sweep;
 pub mod workflow_notify;
 pub mod worktree;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
@@ -528,6 +528,70 @@ pub fn replay_quota_state(log: &EventLog, ws: &str) -> Result<QuotaState, gt_sto
     )
 }
 
+/// Beads dispatched by the scheduler but not terminal (A3, gtcore-c0740a): after a
+/// pod crash these were in-flight and need re-dispatch. Replays the scheduling +
+/// merge logs and returns `(bead, priority)` pairs for beads that were dispatched
+/// but never reached `merge.merged.v1`, are not in the live `merge_board`, and are
+/// not already pending in the scheduler queue.
+///
+/// The re-enqueued beads join the pending queue inside [`daemon_root`] so the
+/// scheduler re-dispatches them when a pool slot opens — same pipeline, no special
+/// path. An empty result means no crash-orphaned work (the common case).
+pub fn replay_orphaned_inflight(
+    log: &EventLog,
+    ws: &str,
+    sched_pending: &[(String, u8)],
+    merge_board: &MergeBoard,
+) -> Result<Vec<(String, u8)>, gt_store_dolt::AppError> {
+    // Phase 1: scheduling events → dispatched set + last-known priority per bead.
+    struct SchedAccum {
+        priorities: HashMap<String, u8>,
+        dispatched: HashSet<String>,
+    }
+    let sched = log.replay_domain::<SchedAccum, SchedEvent, _>(
+        Some(ws),
+        "scheduling.",
+        SchedAccum { priorities: HashMap::new(), dispatched: HashSet::new() },
+        |acc, e| match e {
+            SchedEvent::Enqueue { bead, priority } => {
+                acc.priorities.insert(bead.clone(), *priority);
+            }
+            SchedEvent::Dispatched { bead, .. } => {
+                acc.dispatched.insert(bead.clone());
+            }
+            SchedEvent::DispatchFailed { bead, .. } | SchedEvent::DispatchTimeout { bead } => {
+                acc.dispatched.remove(bead);
+            }
+        },
+    )?;
+
+    // Phase 2: merge events → terminal beads (merged work is done).
+    let merged = log.replay_domain::<HashSet<String>, MergeEvent, _>(
+        Some(ws),
+        "merge.",
+        HashSet::new(),
+        |done, e| {
+            if let MergeEvent::Merged { bead, .. } = e {
+                done.insert(bead.clone());
+            }
+        },
+    )?;
+
+    // Phase 3: dispatched ∩ ¬merged ∩ ¬merge_board ∩ ¬sched_pending.
+    let pending: HashSet<&str> = sched_pending.iter().map(|(b, _)| b.as_str()).collect();
+    Ok(sched
+        .dispatched
+        .into_iter()
+        .filter(|b| !merged.contains(b))
+        .filter(|b| merge_board.get(b).is_none())
+        .filter(|b| !pending.contains(b.as_str()))
+        .map(|b| {
+            let p = sched.priorities.get(&b).copied().unwrap_or(1);
+            (b, p)
+        })
+        .collect())
+}
+
 /// The result is cached by the registry: a second call returns the same `Arc` without
 /// re-hydrating. `probe` is wired into the hydrated root so a caller can watch the cascade; it
 /// is ignored on a cache hit (the closure does not run).
@@ -680,8 +744,24 @@ pub async fn daemon_root(ws: WorkspaceId, log_root: PathBuf) -> DaemonRoot {
     // Boot hydration (hq-orchd.5): rebuild the pending scheduler queue + in-flight merge board
     // from the durable log before spawning the actors. A corrupt log at boot is fatal.
     let log = EventLog::new(Some(log_root.clone()));
-    let sched_pending = replay_scheduling_pending(&log, &ws_slug).expect("replay scheduling log");
+    let mut sched_pending =
+        replay_scheduling_pending(&log, &ws_slug).expect("replay scheduling log");
     let merge_board = replay_merge_board(&log, &ws_slug).expect("replay merge log");
+    // A3 (gtcore-c0740a): recover beads dispatched but not terminal. After a crash
+    // these were in-flight; re-enqueue them so the scheduler re-dispatches when a
+    // pool slot opens. Same pipeline as new work — no special crash-recovery path.
+    let orphaned = replay_orphaned_inflight(&log, &ws_slug, &sched_pending, &merge_board)
+        .expect("replay orphaned inflight");
+    if !orphaned.is_empty() {
+        eprintln!(
+            "[daemon_root] boot recovery: {} orphaned inflight bead(s) re-enqueued",
+            orphaned.len()
+        );
+        for (bead, _) in &orphaned {
+            eprintln!("[daemon_root]   re-enqueue: {bead}");
+        }
+        sched_pending.extend(orphaned);
+    }
     // Quota registry hydration (hq-quota-accounts.2): rebuild onboarded accounts + their windows
     // from the log so a restart keeps the rotation pool (and the daemon seeds its keychain from
     // `quota_state.registered`) without depending on the GT_CLAUDE_ACCOUNTS env.
@@ -852,5 +932,89 @@ mod session_minutes_tests {
             None
         );
         assert_eq!(minutes_between("not-a-ts", "2026-06-03T12:00:00Z"), None);
+    }
+
+    #[test]
+    fn orphaned_inflight_returns_dispatched_but_not_merged() {
+        // A3 (gtcore-c0740a): dispatched beads without a terminal merge event are
+        // returned for re-enqueue on boot.
+        let dir = tempfile::tempdir().unwrap();
+        let log = EventLog::new(Some(dir.path().to_path_buf()));
+
+        // Enqueue + dispatch two beads.
+        log.append(
+            Some("default"),
+            SchedEvent::Enqueue { bead: "gtcore-aaa".into(), priority: 1 },
+        )
+        .unwrap();
+        log.append(
+            Some("default"),
+            SchedEvent::Dispatched { bead: "gtcore-aaa".into(), worker: "w".into() },
+        )
+        .unwrap();
+        log.append(
+            Some("default"),
+            SchedEvent::Enqueue { bead: "gtcore-bbb".into(), priority: 2 },
+        )
+        .unwrap();
+        log.append(
+            Some("default"),
+            SchedEvent::Dispatched { bead: "gtcore-bbb".into(), worker: "w".into() },
+        )
+        .unwrap();
+        // Only gtcore-bbb merges; gtcore-aaa is orphaned.
+        log.append(
+            Some("default"),
+            MergeEvent::Ready {
+                bead: "gtcore-bbb".into(),
+                branch: "gtcore-bbb".into(),
+                channel_msg_id: String::new(),
+            },
+        )
+        .unwrap();
+        log.append(
+            Some("default"),
+            MergeEvent::Merged { bead: "gtcore-bbb".into(), sha: "abc123".into() },
+        )
+        .unwrap();
+
+        let orphaned = replay_orphaned_inflight(
+            &log,
+            "default",
+            &[],                     // no pending beads
+            &MergeBoard::default(),  // empty board
+        )
+        .unwrap();
+
+        assert_eq!(orphaned.len(), 1);
+        assert_eq!(orphaned[0].0, "gtcore-aaa");
+        assert_eq!(orphaned[0].1, 1);
+    }
+
+    #[test]
+    fn orphaned_inflight_excludes_beads_in_merge_board() {
+        // A3 (gtcore-c0740a): a bead in the merge board is being handled by the
+        // merge actor — do not re-enqueue.
+        let dir = tempfile::tempdir().unwrap();
+        let log = EventLog::new(Some(dir.path().to_path_buf()));
+
+        log.append(
+            Some("default"),
+            SchedEvent::Enqueue { bead: "gtcore-ccc".into(), priority: 1 },
+        )
+        .unwrap();
+        log.append(
+            Some("default"),
+            SchedEvent::Dispatched { bead: "gtcore-ccc".into(), worker: "w".into() },
+        )
+        .unwrap();
+
+        // The bead is in the merge board (submitted, not yet merged).
+        let mut board = MergeBoard::default();
+        board.submit("gtcore-ccc".into(), "gtcore-ccc".into()).unwrap();
+
+        let orphaned =
+            replay_orphaned_inflight(&log, "default", &[], &board).unwrap();
+        assert!(orphaned.is_empty());
     }
 }

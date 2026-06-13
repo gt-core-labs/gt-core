@@ -878,7 +878,9 @@ async fn main() -> anyhow::Result<()> {
     );
     let reconcile_timer = tokio::spawn(async move {
         let mut tick = tokio::time::interval(Duration::from_secs(reconcile_tick_secs));
-        tick.tick().await; // skip the immediate first fire
+        // A3 (gtcore-c0740a): sweep immediately at boot to kill orphaned sessions
+        // from a prior crash. The interval's first tick fires instantly; previous
+        // code skipped it, leaving ghosts for up to reconcile_tick_secs.
         loop {
             tick.tick().await;
             let n = reconciler.sweep().await;
