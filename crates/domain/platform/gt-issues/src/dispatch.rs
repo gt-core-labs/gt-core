@@ -17,8 +17,10 @@
 
 use std::collections::{HashMap, HashSet};
 
-use gt_store_dolt::IssueRow;
+use gt_store_dolt::{DepFact, IssuePhase, IssueRow};
 
+use crate::readiness::is_ready;
+use crate::surface::{parse_surface_json, SurfaceTree};
 use crate::taxonomy::Dispatch;
 
 /// Resolve the EFFECTIVE dispatch policy of bead `id`.
@@ -144,6 +146,78 @@ pub fn operator_locked(
         }
     }
     false
+}
+
+// ---------------------------------------------------------------------------
+// C3: ready_for_auto frontier (gtcore-7bec8c)
+// ---------------------------------------------------------------------------
+
+/// Collect the set of surface paths currently occupied by `working` beads.
+/// Each path is normalized (trimmed, trailing `/` stripped) so overlap checks
+/// are case-insensitive to formatting differences.
+pub fn occupied_surfaces(working: &[(String, String)]) -> HashSet<String> {
+    working
+        .iter()
+        .flat_map(|(_, sj)| {
+            parse_surface_json(sj)
+                .into_iter()
+                .map(|e| e.path.trim().trim_end_matches('/').to_string())
+        })
+        .collect()
+}
+
+/// Does `row`'s surface overlap with any path in `occupied`?
+pub fn surface_overlaps(row: &IssueRow, occupied: &HashSet<String>) -> bool {
+    if occupied.is_empty() {
+        return false;
+    }
+    parse_surface_json(&row.surface_json)
+        .iter()
+        .any(|e| occupied.contains(e.path.trim().trim_end_matches('/')))
+}
+
+/// The agent-dispatch frontier: beads that pass ALL five clauses and are safe
+/// to hand to an autonomous agent right now.
+///
+/// ```text
+/// ready_for_auto(b) :=
+///     is_ready(b)                                    -- §S4: deps + phase + surface + open
+///   ∧ resolve_dispatch(b) = Auto                     -- C1: explicit opt-in
+///   ∧ ¬operator_locked(b)                            -- C2: no human epic claim above
+///   ∧ ¬surface_overlaps(b, working_surfaces)         -- C3: no in-flight crate collision
+/// ```
+///
+/// The caller supplies the pre-fetched maps (all unscoped — an ancestor or a
+/// working bead may live outside the display scope):
+///
+/// - `deps_of(id)` — dependency edges from `issue_relations`
+/// - `dep_fact(id)` — per-dep delivery status ([`DepFact`])
+/// - `open_phase` — current phase frontier
+/// - `tree` — `main` git tree for surface existence
+/// - `parents` / `dispatch_raw` — the two `child_of` + dispatch maps
+/// - `locked` — operator lock roots (from [`locked_roots`])
+/// - `occupied` — surfaces of `working` beads (from [`occupied_surfaces`])
+pub fn ready_for_auto(
+    rows: Vec<IssueRow>,
+    deps_of: &HashMap<String, Vec<String>>,
+    dep_fact: &dyn Fn(&str) -> Option<DepFact>,
+    open_phase: IssuePhase,
+    tree: &(dyn SurfaceTree + Sync),
+    parents: &HashMap<String, String>,
+    dispatch_raw: &HashMap<String, Option<String>>,
+    locked: &HashSet<String>,
+    occupied: &HashSet<String>,
+) -> Vec<IssueRow> {
+    rows.into_iter()
+        .filter(|r| {
+            let deps = deps_of.get(&r.id).map(|v| v.as_slice()).unwrap_or(&[]);
+            is_ready(r, deps, open_phase, dep_fact, tree)
+                && resolve_dispatch(&r.id, r.dispatch.as_deref(), parents, dispatch_raw)
+                    == Dispatch::Auto
+                && !operator_locked(&r.id, parents, locked)
+                && !surface_overlaps(r, occupied)
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -349,5 +423,120 @@ mod tests {
         let (parents, _) = maps(&[("a", "b"), ("b", "a")], &[]);
         let locked: HashSet<String> = ["other".to_string()].into_iter().collect();
         assert!(!operator_locked("a", &parents, &locked), "cycle terminates, not hangs");
+    }
+
+    // --- C3: ready_for_auto frontier (gtcore-7bec8c) ---
+
+    fn auto_row(id: &str, surface: &str) -> IssueRow {
+        IssueRow {
+            id: id.to_string(),
+            title: id.to_string(),
+            status: "open".to_string(),
+            priority: 2,
+            issue_type: "task".to_string(),
+            assignee: None,
+            owner: None,
+            created_at: None,
+            updated_at: None,
+            closed_at: None,
+            spec_id: None,
+            domain_json: "[]".to_string(),
+            surface_json: surface.to_string(),
+            role_scope: None,
+            version: 0,
+            phase: "P1".to_string(),
+            delivered_sha: None,
+            rig: String::new(),
+            workspace: "default".into(),
+            board_rank: String::new(),
+            estimated_hours: None,
+            start_date: None,
+            due_date: None,
+            dispatch: Some("auto".to_string()),
+            description: None,
+            design: None,
+            acceptance_criteria: None,
+            notes: None,
+        }
+    }
+
+    struct AllowAll;
+    impl crate::surface::SurfaceTree for AllowAll {
+        fn contains(&self, _: &str) -> bool {
+            true
+        }
+    }
+
+    #[test]
+    fn occupied_surfaces_collects_working_paths() {
+        let working = vec![
+            ("b1".into(), r#"["crates/a","crates/b"]"#.into()),
+            ("b2".into(), r#"[{"path":"crates/c","planned":false}]"#.into()),
+        ];
+        let occ = occupied_surfaces(&working);
+        assert!(occ.contains("crates/a"));
+        assert!(occ.contains("crates/b"));
+        assert!(occ.contains("crates/c"));
+        assert!(!occ.contains("crates/d"));
+    }
+
+    #[test]
+    fn surface_overlap_excludes_colliding_bead() {
+        let row = auto_row("x", r#"["crates/a","crates/d"]"#);
+        let occupied: HashSet<String> = ["crates/a".to_string()].into_iter().collect();
+        assert!(surface_overlaps(&row, &occupied));
+
+        let no_overlap = auto_row("y", r#"["crates/e"]"#);
+        assert!(!surface_overlaps(&no_overlap, &occupied));
+    }
+
+    #[test]
+    fn ready_for_auto_filters_all_clauses() {
+        // Setup: two beads under an auto epic, one overlapping a working surface,
+        // one in a locked subtree.
+        let b_ok = auto_row("b-ok", r#"["crates/free"]"#);
+        let b_overlap = auto_row("b-overlap", r#"["crates/busy"]"#);
+        let b_locked = auto_row("b-locked", r#"["crates/other"]"#);
+        let b_manual = {
+            let mut r = auto_row("b-manual", r#"["crates/also-free"]"#);
+            r.dispatch = Some("manual".to_string());
+            r
+        };
+
+        let rows = vec![b_ok, b_overlap, b_locked, b_manual];
+
+        let deps_of: HashMap<String, Vec<String>> = HashMap::new();
+        let dep_fact = |_: &str| -> Option<DepFact> { None };
+        let (parents, dispatch_raw) = maps(
+            &[
+                ("b-ok", "epic-a"),
+                ("b-overlap", "epic-a"),
+                ("b-locked", "epic-b"),
+                ("b-manual", "epic-a"),
+            ],
+            &[
+                ("epic-a", Some("auto")),
+                ("epic-b", Some("auto")),
+            ],
+        );
+        let locked: HashSet<String> = ["epic-b".to_string()].into_iter().collect();
+        let occupied: HashSet<String> = ["crates/busy".to_string()].into_iter().collect();
+
+        let frontier = ready_for_auto(
+            rows,
+            &deps_of,
+            &dep_fact,
+            IssuePhase::P1,
+            &AllowAll,
+            &parents,
+            &dispatch_raw,
+            &locked,
+            &occupied,
+        );
+        assert_eq!(
+            frontier.iter().map(|r| r.id.as_str()).collect::<Vec<_>>(),
+            ["b-ok"],
+            "only the bead that passes all clauses survives"
+        );
     }
 }

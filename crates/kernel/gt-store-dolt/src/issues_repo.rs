@@ -1525,6 +1525,23 @@ impl DoltIssues {
             .collect())
     }
 
+    /// Surface paths of every bead currently in `working` status
+    /// (gtcore-7bec8c — C3). Used by the `ready_for_auto` frontier to exclude
+    /// beads whose surface overlaps with in-flight work, preventing two agents
+    /// from editing the same crate simultaneously.
+    pub async fn working_surfaces(&self) -> Result<Vec<(String, String)>, AppError> {
+        let mut conn = self.pool.get_conn().await.map_err(map_err)?;
+        let rows: Vec<(String, String)> = conn
+            .exec(
+                "SELECT id, surface_json FROM issues
+                 WHERE status = 'working' AND surface_json != '[]'",
+                (),
+            )
+            .await
+            .map_err(map_err)?;
+        Ok(rows)
+    }
+
     /// Read the current status of `id`. `None` when the row does not exist.
     /// Used by [`Self::transition`] to distinguish `NotFound` from
     /// `InvalidTransition` after a status-guarded UPDATE fails to match.
