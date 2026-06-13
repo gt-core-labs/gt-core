@@ -1470,6 +1470,61 @@ impl DoltIssues {
         }
     }
 
+    /// Release a `working` claim back to `open` (gtcore-a33952 — C2): the
+    /// patrol lease-expired reaction for a bead whose agent died. Status-guarded
+    /// CAS like [`Self::claim`]; clears owner+assignee so the bead re-enters the
+    /// frontier. Returns `false` when the CAS missed (already released, closed,
+    /// or re-claimed) — a stale expiry is a no-op, never an error.
+    pub async fn release_claim(&self, id: &str) -> Result<bool, AppError> {
+        let mut conn = self.pool.get_conn().await.map_err(map_err)?;
+        let result = conn
+            .exec_iter(
+                "UPDATE issues
+                 SET status = 'open',
+                     owner = '',
+                     assignee = '',
+                     updated_at = NOW(),
+                     version = version + 1
+                 WHERE id = :id
+                   AND status = 'working'",
+                mysql_async::params! { "id" => id },
+            )
+            .await
+            .map_err(map_err)?;
+        let affected = result.affected_rows();
+        let _ = result.drop_result().await.map_err(map_err)?;
+        if affected == 1 {
+            let commit_msg = format!("release {id} (lease expired)");
+            conn.exec_drop(
+                "CALL DOLT_COMMIT('-A', '-m', :msg)",
+                mysql_async::params! { "msg" => commit_msg },
+            )
+            .await
+            .map_err(map_err)?;
+            return Ok(true);
+        }
+        Ok(false)
+    }
+
+    /// The UNSCOPED working-epic snapshot — `(id, owner)` of every epic in
+    /// `working` (gtcore-a33952 — C2). Input of `gt_issues::locked_roots`: an
+    /// operator's lock must hold across rig/workspace boundaries, so no filter.
+    pub async fn working_epics(&self) -> Result<Vec<(String, String)>, AppError> {
+        let mut conn = self.pool.get_conn().await.map_err(map_err)?;
+        let rows: Vec<(String, Option<String>)> = conn
+            .exec(
+                "SELECT id, owner FROM issues
+                 WHERE issue_type = 'epic' AND status = 'working'",
+                (),
+            )
+            .await
+            .map_err(map_err)?;
+        Ok(rows
+            .into_iter()
+            .map(|(id, owner)| (id, owner.unwrap_or_default()))
+            .collect())
+    }
+
     /// Read the current status of `id`. `None` when the row does not exist.
     /// Used by [`Self::transition`] to distinguish `NotFound` from
     /// `InvalidTransition` after a status-guarded UPDATE fails to match.
