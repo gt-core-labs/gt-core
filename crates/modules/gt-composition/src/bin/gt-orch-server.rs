@@ -63,7 +63,7 @@ use gt_composition::quota_rotation::{self, QuotaRotationPlugin};
 use gt_composition::session_reconcile::{ReapScope, ReapSink, SessionReconciler};
 use gt_composition::witness_sweep::WitnessSweep;
 use gt_composition::workflow_notify::WorkflowNotifyPlugin;
-use gt_composition::{daemon_root, replay_quota_state, DaemonRoot};
+use gt_composition::{daemon_root_with_capacity, replay_quota_state, DaemonRoot};
 use gt_eventlog::DEFAULT_EVENTLOG_ROOT;
 use gt_plugin::{spawn_plugin_relay, PluginRegistry};
 use gt_polecat::{
@@ -258,24 +258,27 @@ async fn main() -> anyhow::Result<()> {
     // Keep a copy for the polecat heartbeat emitter (hq-e5b288): appends AgentEvent::Heartbeat
     // for each watched session after every supervisor tick so the MCP audit trail reflects liveness.
     let event_root_for_heartbeat = event_root.clone();
+    // A4 (gtcore-08a8be): read pool_size BEFORE daemon_root so the scheduler's capacity governor
+    // matches the polecat pool — prevents over-dispatching beyond what the supervisor can sling.
+    let pool_size = env_usize("GT_POOL_SIZE", 4);
     let DaemonRoot {
         handle,
         sched,
         merge,
         patrol,
         quota,
-    } = daemon_root(ws, event_root).await;
+    } = daemon_root_with_capacity(ws, event_root, pool_size).await;
     eprintln!(
-        "[gt-orch-server] daemon root up — scheduler + merge + patrol + quota actors anchored; persistence + roles + reactor arms + sheriff observer running"
+        "[gt-orch-server] daemon root up — scheduler(max={pool_size}) + merge + patrol + quota actors anchored; persistence + roles + reactor arms + sheriff observer running"
     );
     eprintln!(
         "[gt-orch-server] durable: hub records persisted to the per-workspace log; restart rehydrates pending queue + merge board"
     );
 
     // --- Autonomous polecat supervision (hq-orchd.3) ---
-    // The shared admission core: per-workspace pool size from env, host cap seeded from live
-    // metrics. The sling observer claims here before spawning; the timer refreshes the host cap.
-    let pool_size = env_usize("GT_POOL_SIZE", 4);
+    // The shared admission core: pool_size (read above for scheduler alignment), host cap seeded
+    // from live metrics. The sling observer claims here before spawning; the timer refreshes the
+    // host cap.
     let max_restarts = env_usize("GT_POLECAT_MAX_RESTARTS", 64) as u32;
     let allocator = Arc::new(Mutex::new(PoolAllocator::new(
         host_cap_from_metrics(),

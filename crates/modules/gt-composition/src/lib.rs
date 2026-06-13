@@ -735,6 +735,16 @@ pub struct DaemonRoot {
 /// re-registered as work dispatches; quota hydration is a follow-up to the `hq-orchd.5` pattern.
 /// No registry — the daemon owns one root for one workspace.
 pub async fn daemon_root(ws: WorkspaceId, log_root: PathBuf) -> DaemonRoot {
+    daemon_root_with_capacity(ws, log_root, 4).await
+}
+
+/// Like [`daemon_root`] but with an explicit scheduler capacity bound.
+///
+/// A4 (gtcore-08a8be): the scheduler's [`CapacityGovernor`](gt_scheduling::state::CapacityGovernor)
+/// must match the polecat pool size so the dispatcher never over-dispatches beyond what the
+/// supervisor can sling. The orchd binary reads `GT_POOL_SIZE` and passes it here; the default
+/// `daemon_root` keeps `max=4` for backward compat (tests, single-tenant compose).
+pub async fn daemon_root_with_capacity(ws: WorkspaceId, log_root: PathBuf, sched_max: usize) -> DaemonRoot {
     let ws_slug = ws.as_str().to_string();
     let handle = Arc::new(RootHandle::new(
         ws,
@@ -769,7 +779,7 @@ pub async fn daemon_root(ws: WorkspaceId, log_root: PathBuf) -> DaemonRoot {
 
     let (sched_tx, sched_rx) = mpsc::channel(64);
     let sched =
-        gt_scheduling::actor::spawn_hydrated(InMemoryBeads::default(), sched_tx, 4, sched_pending);
+        gt_scheduling::actor::spawn_hydrated(InMemoryBeads::default(), sched_tx, sched_max, sched_pending);
     let (merge_tx, merge_rx) = mpsc::channel(64);
     let merge =
         gt_merge::actor::spawn_hydrated(InMemoryMergeRepo::default(), merge_tx, merge_board);

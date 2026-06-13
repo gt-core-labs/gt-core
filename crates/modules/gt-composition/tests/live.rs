@@ -10,7 +10,8 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use gt_composition::mcp::eventlog::EventLog;
-use gt_composition::{daemon_root, live_root, replay_merge_board, replay_scheduling_pending};
+use gt_beads::{Bead, BeadStatus};
+use gt_composition::{daemon_root, daemon_root_with_capacity, live_root, replay_merge_board, replay_scheduling_pending};
 use gt_eventlog::{EventRecord, EventStore, JsonlWriter};
 use gt_merge::{MergeEvent, MergeSlotState};
 use gt_patrol::PatrolEvent;
@@ -308,6 +309,66 @@ async fn daemon_root_hydrates_registered_accounts_from_the_log() {
         accounts.iter().any(|a| a.id == "acctX"),
         "registered account must hydrate into the quota registry; saw {:?}",
         accounts.iter().map(|a| &a.id).collect::<Vec<_>>()
+    );
+
+    root.handle.shutdown().await;
+}
+
+/// A4 (gtcore-08a8be): the scheduler's capacity governor must honour the pool_size passed to
+/// `daemon_root_with_capacity` so the dispatcher never over-dispatches beyond what the polecat
+/// supervisor can sling. Enqueue more beads than the bound → only `sched_max` dispatched events
+/// appear (the rest stay queued, applying backpressure).
+#[tokio::test]
+async fn scheduler_capacity_aligned_with_pool_size() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let root = daemon_root_with_capacity(
+        WorkspaceId::new("acme").expect("valid slug"),
+        dir.path().to_path_buf(),
+        1, // pool_size = 1 → scheduler should dispatch at most 1
+    )
+    .await;
+
+    // Seed + enqueue 3 beads — with max=1, only the first should dispatch; the other 2 queue.
+    for id in &["bead-a", "bead-b", "bead-c"] {
+        let _ = root.sched.create_bead(Bead::new(*id, *id, BeadStatus::Pending, 1)).await;
+        root.sched.enqueue(*id, 1).await;
+    }
+
+    // Wait for the scheduler pump to settle.
+    for _ in 0..100 {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        let (queued, in_flight) = root.sched.snapshot().await;
+        if in_flight >= 1 && queued >= 2 {
+            break;
+        }
+    }
+    let (queued, in_flight) = root.sched.snapshot().await;
+    assert_eq!(
+        in_flight, 1,
+        "scheduler should dispatch exactly 1 bead (pool_size=1); got in_flight={in_flight}"
+    );
+    assert_eq!(
+        queued, 2,
+        "remaining 2 beads should stay queued; got queued={queued}"
+    );
+
+    // Free the slot → the next bead should dispatch.
+    root.sched.capacity_freed().await;
+    for _ in 0..100 {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        let (q, f) = root.sched.snapshot().await;
+        if f == 1 && q == 1 {
+            break;
+        }
+    }
+    let (queued, in_flight) = root.sched.snapshot().await;
+    assert_eq!(
+        in_flight, 1,
+        "after capacity_freed, one more bead should dispatch; got in_flight={in_flight}"
+    );
+    assert_eq!(
+        queued, 1,
+        "one bead should remain queued; got queued={queued}"
     );
 
     root.handle.shutdown().await;
