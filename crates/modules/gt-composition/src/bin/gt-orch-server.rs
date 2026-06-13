@@ -53,6 +53,7 @@ use std::time::Duration;
 use gt_auth::JwtMinter;
 use gt_channel::Channel;
 use gt_composition::git_merge::GitMergePlugin;
+use gt_composition::patrol_bridge::PatrolBridgePlugin;
 use gt_composition::mcp::eventlog::EventLog;
 use gt_composition::polecat::{
     host_cap_from_metrics, rig_routing_from_catalog, AgentTokenMinter, PolecatSupervisorPlugin,
@@ -637,6 +638,25 @@ async fn main() -> anyhow::Result<()> {
         },
         None => {
             eprintln!("[gt-orch-server] workflow notifications OFF — GT_PG_URL unset")
+        }
+    }
+    // Patrol bridge (gtcore-a33952 — C2): agent.spawned → lease, session-end/killed → close,
+    // patrol.lease-expired → release_claim (Dolt CAS). Env-gated on GT_DOLT_URL — without it,
+    // the bridge is off and crashed agents stay working until manual reconciliation.
+    match std::env::var("GT_DOLT_URL")
+        .ok()
+        .filter(|v| !v.is_empty())
+        .and_then(|url| gt_store_dolt::DoltIssues::connect(&url).ok())
+    {
+        Some(store) => {
+            pol_registry =
+                pol_registry.register(PatrolBridgePlugin::new(patrol.clone(), Arc::new(store)));
+            eprintln!(
+                "[gt-orch-server] patrol bridge on — agent leases expire into release_claim"
+            );
+        }
+        None => {
+            eprintln!("[gt-orch-server] patrol bridge OFF — GT_DOLT_URL unset (lease expiry will not auto-release claims)")
         }
     }
     let pol_registry = Arc::new(pol_registry);

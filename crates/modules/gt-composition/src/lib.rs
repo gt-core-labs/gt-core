@@ -51,6 +51,7 @@ pub mod mcp;
 pub mod notifications;
 pub mod onboard;
 pub mod operator_event;
+pub mod patrol_bridge;
 pub mod operator_resource;
 pub mod polecat;
 pub mod quota_rotation;
