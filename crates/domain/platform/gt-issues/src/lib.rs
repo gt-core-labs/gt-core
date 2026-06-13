@@ -110,7 +110,9 @@ pub use commands::{
     UpdateIssue,
 };
 pub use delivery::{CommitInfo, CommitInspector, InspectorProvider};
-pub use dispatch::{filter_dispatch, resolve_dispatch};
+pub use dispatch::{
+    filter_dispatch, locked_roots, operator_locked, resolve_dispatch, session_like_actor,
+};
 pub use events::{emit_issue_event, IssueEvent, IssueEventSink, IssueVerb};
 #[cfg(feature = "axum")]
 pub use http::{issues_router, ApiDoc, IssuesApiState};

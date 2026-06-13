@@ -15,7 +15,7 @@
 //! uses — [`parent_map`](gt_store_dolt::DoltIssues::parent_map) (unscoped) and
 //! [`dispatch_index`](gt_store_dolt::DoltIssues::dispatch_index).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use gt_store_dolt::IssueRow;
 
@@ -83,6 +83,67 @@ pub fn filter_dispatch(
     rows.into_iter()
         .filter(|r| resolve_dispatch(&r.id, r.dispatch.as_deref(), parents, raw) == want)
         .collect()
+}
+
+// ---------------------------------------------------------------------------
+// Operator locks (gtcore-a33952 — C2 of the "Control de despacho" epic)
+// ---------------------------------------------------------------------------
+
+/// Heuristic: does `actor` look like an AGENT session rather than a human?
+///
+/// Polecat MCP tokens carry `sub = <session>` (`token_for`, hq-agent-provisioning.3)
+/// and session names are dash-chains (`gt-hq-abc-1`, `gtweb-gtweb-daf156`): ≥3
+/// dash-separated tokens. Humans are short names (`admin`) or emails — neither
+/// matches. **Deliberately conservative**: an unrecognized actor is HUMAN, so
+/// its working epics lock their subtrees — the failure mode is "agents skip
+/// work", never "agents trample the operator". Until per-agent identity is
+/// universal (Fase 2 A2), shared-PAT claims (`admin`) therefore always lock.
+pub fn session_like_actor(actor: &str) -> bool {
+    if actor.contains('@') || actor.is_empty() {
+        return false;
+    }
+    actor.split('-').filter(|seg| !seg.is_empty()).count() >= 3
+}
+
+/// The lock roots: epics in `working` whose owner is a HUMAN (per `is_agent`).
+/// Feed it the unscoped working-epic snapshot
+/// ([`working_epics`](gt_store_dolt::DoltIssues::working_epics)) — an operator
+/// may hold an epic outside the rig/workspace being listed.
+pub fn locked_roots<'a>(
+    working_epics: impl IntoIterator<Item = (&'a str, &'a str)>,
+    is_agent: &dyn Fn(&str) -> bool,
+) -> HashSet<String> {
+    working_epics
+        .into_iter()
+        .filter(|(_, owner)| !is_agent(owner))
+        .map(|(id, _)| id.to_string())
+        .collect()
+}
+
+/// Is `id` inside an operator-locked subtree? True when the bead itself or ANY
+/// `child_of` ancestor is a lock root — the C2 guarantee: the operator claims
+/// ONE epic and every descendant leaves the agent frontier, even those marked
+/// `auto`. Same hop-cap cycle guard as [`resolve_dispatch`].
+pub fn operator_locked(
+    id: &str,
+    parents: &HashMap<String, String>,
+    locked: &HashSet<String>,
+) -> bool {
+    if locked.is_empty() {
+        return false;
+    }
+    const MAX_HOPS: usize = 64;
+    let mut cursor = id;
+    for _ in 0..=MAX_HOPS {
+        if locked.contains(cursor) {
+            return true;
+        }
+        match parents.get(cursor) {
+            Some(parent) => cursor = parent,
+            None => return false,
+        }
+    }
+    false
 }
 
 #[cfg(test)]
@@ -243,5 +304,50 @@ mod tests {
             manual.iter().map(|r| r.id.as_str()).collect::<Vec<_>>(),
             ["e1-b", "e2-a"]
         );
+    }
+
+    // --- C2: operator locks (gtcore-a33952) ---
+
+    #[test]
+    fn session_actors_are_agents_humans_are_not() {
+        assert!(session_like_actor("gt-hq-abc-1"));
+        assert!(session_like_actor("gtweb-gtweb-daf156"));
+        assert!(!session_like_actor("admin"));
+        assert!(!session_like_actor("ops@gt.local"));
+        assert!(!session_like_actor(""));
+        // A bare rig-bead pair (2 tokens) is ambiguous -> human (conservative).
+        assert!(!session_like_actor("gtweb-daf156"));
+    }
+
+    #[test]
+    fn human_claimed_epics_lock_agent_claimed_do_not() {
+        let epics = [("hq-epic", "admin"), ("hq-other", "gt-hq-abc-1")];
+        let locked = locked_roots(epics, &|a: &str| session_like_actor(a));
+        assert!(locked.contains("hq-epic"), "human claim locks");
+        assert!(!locked.contains("hq-other"), "agent claim does not lock");
+    }
+
+    #[test]
+    fn lock_covers_whole_subtree_and_releases() {
+        let (parents, _) = maps(
+            &[("hq-epic-1", "hq-epic"), ("hq-epic-1-a", "hq-epic-1"), ("free-1", "free")],
+            &[],
+        );
+        let locked: HashSet<String> = ["hq-epic".to_string()].into_iter().collect();
+        // Direct child, grandchild, and the root itself are all locked.
+        assert!(operator_locked("hq-epic", &parents, &locked));
+        assert!(operator_locked("hq-epic-1", &parents, &locked));
+        assert!(operator_locked("hq-epic-1-a", &parents, &locked));
+        // A sibling tree stays free.
+        assert!(!operator_locked("free-1", &parents, &locked));
+        // Releasing the claim (empty lock set) frees everything without rewrites.
+        assert!(!operator_locked("hq-epic-1-a", &parents, &HashSet::new()));
+    }
+
+    #[test]
+    fn lock_walk_survives_relation_cycles() {
+        let (parents, _) = maps(&[("a", "b"), ("b", "a")], &[]);
+        let locked: HashSet<String> = ["other".to_string()].into_iter().collect();
+        assert!(!operator_locked("a", &parents, &locked), "cycle terminates, not hangs");
     }
 }
