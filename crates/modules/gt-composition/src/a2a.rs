@@ -110,6 +110,10 @@ pub struct IntakeRequest {
     pub parent_id: String,
     pub title: String,
     pub description: String,
+    /// Attribution: which actor (session id or user id) created this bead.
+    /// Overrides the gateway's default `created_by` when set — used so
+    /// `a2a.delegate` stamps the AGENT's session id rather than the platform id.
+    pub caller: Option<String>,
 }
 
 /// Port: persist the bead and return the minted id.
@@ -268,6 +272,10 @@ impl A2aHandler for A2aGateway {
             parent_id: meta("parent_id").unwrap_or_else(|| self.config.parent_id.clone()),
             title,
             description,
+            // A2 attribution (Fase 2): `caller` in metadata overrides the
+            // platform default so the bead is stamped with the agent's session
+            // id rather than the gateway's generic `created_by`.
+            caller: meta("caller"),
         };
         let priority = params
             .metadata
@@ -507,7 +515,10 @@ impl BeadIntake for DoltIntake {
             notes: String::new(),
             priority: 2,
             issue_type: IssueType::Task,
-            created_by: self.created_by.clone(),
+            // A2 attribution (Fase 2): prefer caller from the request (set by
+            // `a2a.delegate` to the agent's MCP session id); fall back to the
+            // gateway's deploy-fixed `created_by` for external A2A calls.
+            created_by: req.caller.unwrap_or_else(|| self.created_by.clone()),
             parent_id: Some(req.parent_id),
             assignee: None,
             owner: None,

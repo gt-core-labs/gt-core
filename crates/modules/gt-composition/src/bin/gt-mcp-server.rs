@@ -52,7 +52,7 @@ use gt_composition::hooks::{hooks_router, HooksApiState};
 use gt_composition::kanban_rest::{kanban_rest_router, KanbanRestState};
 use gt_composition::notifications::{notifications_router, NotificationsApiState};
 use gt_composition::mcp::{
-    AgentHandler, AnalyticsHandler, AuditHandler, CommentsHandler, ConvoyHandler, DispatchHandler, DocumentsHandler, EmailHandler, EventLog, EventLogHooks,
+    A2aDelegateHandler, AgentHandler, AnalyticsHandler, AuditHandler, CommentsHandler, ConvoyHandler, DispatchHandler, DocumentsHandler, EmailHandler, EventLog, EventLogHooks,
     EventLogIssueSink, GraphHandler, IdentityDoltMeStats, InvitesHandler, MemoryHandler, MergeHandler, NotifyHandler, ReportHandler,
     PgDocumentsResource, PgRigPrefixes, PgWorkspaceStatus, QuotaBlockGuard, QuotaHandler, RigHandler,
     WorkspaceHandler, WsPools,
@@ -2239,6 +2239,32 @@ async fn build_domain_router(
         }
         None => {
             eprintln!("[gt-mcp-server] dispatch.* off — GT_DOLT_URL unset");
+            router
+        }
+    };
+
+    // a2a.* — agent-to-agent delegation tool (Fase 2 — A3): lets a running
+    // agent delegate a sub-task via the A2A intake pipeline without an HTTP
+    // round-trip. Gated on the same envs as the HTTP A2A surface
+    // (GT_A2A_DEFAULT_RIG + GT_A2A_INTAKE_EPIC) plus GT_DOLT_URL (intake)
+    // and a live dispatch sink (same channel convoy/agent use).
+    let router = match (
+        std::env::var("GT_A2A_DEFAULT_RIG").ok().filter(|s| !s.trim().is_empty()),
+        std::env::var("GT_A2A_INTAKE_EPIC").ok().filter(|s| !s.trim().is_empty()),
+        std::env::var("GT_DOLT_URL").ok().and_then(|url| DoltIssues::connect(&url).ok()),
+        &dispatch_sink,
+    ) {
+        (Some(a2a_rig), Some(a2a_parent), Some(delegate_dolt), Some(sink)) => {
+            eprintln!("[gt-mcp-server] a2a.delegate on — rig {a2a_rig}, parent {a2a_parent}");
+            router.register(Arc::new(A2aDelegateHandler::new(
+                Arc::new(delegate_dolt),
+                sink.clone(),
+                a2a_rig,
+                a2a_parent,
+            )))
+        }
+        _ => {
+            eprintln!("[gt-mcp-server] a2a.delegate off — GT_A2A_DEFAULT_RIG / GT_A2A_INTAKE_EPIC / GT_DOLT_URL / dispatch channel required");
             router
         }
     };

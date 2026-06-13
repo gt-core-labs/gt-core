@@ -18,6 +18,7 @@
 //!   replayed event stream — so each call rehydrates from the per-workspace event
 //!   log, executes, and appends the produced event(s) back (see [`EventLog`]).
 
+pub mod a2a_delegate;
 pub mod agent;
 pub mod analytics;
 pub mod comments;
@@ -40,6 +41,7 @@ pub mod rig;
 pub mod util;
 pub mod workspace;
 
+pub use a2a_delegate::A2aDelegateHandler;
 pub use agent::AgentHandler;
 pub use audit::AuditHandler;
 pub use convoy::ConvoyHandler;
