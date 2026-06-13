@@ -2281,12 +2281,17 @@ async fn build_domain_router(
     ) {
         (Some(a2a_rig), Some(a2a_parent), Some(delegate_dolt), Some(sink)) => {
             eprintln!("[gt-mcp-server] a2a.delegate on — rig {a2a_rig}, parent {a2a_parent}");
-            router.register(Arc::new(A2aDelegateHandler::new(
-                Arc::new(delegate_dolt),
-                sink.clone(),
-                a2a_rig,
-                a2a_parent,
-            )))
+            router.register(Arc::new(
+                A2aDelegateHandler::new(
+                    Arc::new(delegate_dolt),
+                    sink.clone(),
+                    a2a_rig,
+                    a2a_parent,
+                )
+                // A7 (gtcore-3a3557): wire the per-workspace pool cache so
+                // a2a.discover can read the rig catalog for peer discovery.
+                .with_pools(ws_pools.clone()),
+            ))
         }
         _ => {
             eprintln!("[gt-mcp-server] a2a.delegate off — GT_A2A_DEFAULT_RIG / GT_A2A_INTAKE_EPIC / GT_DOLT_URL / dispatch channel required");
