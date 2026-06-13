@@ -659,6 +659,53 @@ async fn main() -> anyhow::Result<()> {
             eprintln!("[gt-orch-server] patrol bridge OFF — GT_DOLT_URL unset (lease expiry will not auto-release claims)")
         }
     }
+    // Autonomous dispatch loop (Fase 2 — A1): polls the ready_for_auto frontier
+    // and feeds eligible beads to the scheduler. Env-gated: GT_AUTO_DISPATCH=1 +
+    // GT_DOLT_URL. The completion plugin is registered on the SAME hub relay so
+    // slot-freeing events (issues.closed.v1, patrol.lease-expired.v1) are observed.
+    let auto_dispatch_tick_secs = env_usize("GT_AUTO_DISPATCH_TICK_SECS", 30) as u64;
+    let auto_dispatch_handle: Option<Arc<gt_runtime::Dispatcher<
+        gt_composition::auto_dispatch::FrontierSource,
+        gt_composition::auto_dispatch::SchedWorker,
+    >>> = if std::env::var("GT_AUTO_DISPATCH").ok().as_deref() == Some("1") {
+        match std::env::var("GT_DOLT_URL")
+            .ok()
+            .filter(|v| !v.is_empty())
+            .and_then(|url| gt_store_dolt::DoltIssues::connect(&url).ok())
+        {
+            Some(store) => {
+                let repo_dir = std::env::var("GT_REPO_DIR")
+                    .ok()
+                    .map(std::path::PathBuf::from);
+                let source =
+                    gt_composition::auto_dispatch::FrontierSource::new(Arc::new(store), repo_dir);
+                let worker = gt_composition::auto_dispatch::SchedWorker::new(sched.clone());
+                let max = env_usize("GT_AUTO_DISPATCH_MAX", 4);
+                let dispatcher = Arc::new(gt_runtime::Dispatcher::new(source, worker, max));
+                pol_registry = pol_registry.register(
+                    gt_composition::auto_dispatch::AutoDispatchCompletionPlugin::new(
+                        dispatcher.clone(),
+                    ),
+                );
+                eprintln!(
+                    "[gt-orch-server] auto-dispatch on — tick {auto_dispatch_tick_secs}s, max_in_flight={max}"
+                );
+                Some(dispatcher)
+            }
+            None => {
+                eprintln!(
+                    "[gt-orch-server] auto-dispatch OFF — GT_AUTO_DISPATCH=1 but GT_DOLT_URL unset"
+                );
+                None
+            }
+        }
+    } else {
+        eprintln!(
+            "[gt-orch-server] auto-dispatch OFF — set GT_AUTO_DISPATCH=1 to enable"
+        );
+        None
+    };
+
     let pol_registry = Arc::new(pol_registry);
     let pol_relay = spawn_plugin_relay(handle.subscribe_events(), pol_registry);
     eprintln!(
@@ -732,6 +779,10 @@ async fn main() -> anyhow::Result<()> {
             quota_tick_handle.tick(now_secs(), quota_threshold).await;
         }
     });
+    // Spawn the auto-dispatch tick loop (if configured above).
+    let auto_dispatch_task: Option<tokio::task::JoinHandle<()>> =
+        auto_dispatch_handle.map(|d| d.spawn(Duration::from_secs(auto_dispatch_tick_secs)));
+
     eprintln!(
         "[gt-orch-server] reactor loops on — patrol tick {patrol_tick_secs}s (lease timeout {lease_timeout}s), quota tick {quota_tick_secs}s (threshold {quota_threshold}s)"
     );
@@ -1015,6 +1066,9 @@ async fn main() -> anyhow::Result<()> {
     if let Some(task) = &quota_feed_task {
         task.abort();
     }
+    if let Some(task) = &auto_dispatch_task {
+        task.abort();
+    }
     let _ = pol_timer.await;
     let _ = pol_relay.await;
     let _ = patrol_timer.await;
@@ -1030,6 +1084,9 @@ async fn main() -> anyhow::Result<()> {
         let _ = task.await;
     }
     if let Some(task) = quota_feed_task {
+        let _ = task.await;
+    }
+    if let Some(task) = auto_dispatch_task {
         let _ = task.await;
     }
     // Cancel the actor stack + stop the observer relay and the per-domain drains. The
