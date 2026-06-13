@@ -517,6 +517,10 @@ impl BeadIntake for DoltIntake {
             role_scope: None,
             phase: None,
             workspace: String::new(),
+            // A2A-minted beads carry no own policy (gtcore-1acbcf): they inherit
+            // the intake epic's via child_of, so flipping the buzón epic governs
+            // the whole external inflow with one write.
+            dispatch: None,
         };
         run_create_issue(&self.issues, &args, &NoSurfaces, false)
             .await
