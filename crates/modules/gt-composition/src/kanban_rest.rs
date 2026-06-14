@@ -88,6 +88,7 @@ pub fn kanban_rest_router(state: KanbanRestState) -> Router {
         .route("/api/v1/invites/accept", post(invites_accept))
         // a2a messaging bridge (hq-a2a-msg-rest)
         .route("/api/v1/a2a/inbox", get(a2a_inbox))
+        .route("/api/v1/a2a/threads", get(a2a_threads))
         .route("/api/v1/a2a/send", post(a2a_send))
         .route("/api/v1/a2a/ack", post(a2a_ack))
         .with_state(state)
@@ -344,6 +345,24 @@ async fn a2a_inbox(
         }
     }
     dispatch(&st, &claims, "a2a.inbox", args).await
+}
+
+/// `GET /api/v1/a2a/threads?session=<id>&limit=<n>` — all messages in the
+/// workspace (newest first). Optional `session` filters to messages involving
+/// that participant (from OR to). Returns both read and unread messages with
+/// the `to` field so the frontend can render full conversations.
+async fn a2a_threads(
+    State(st): State<KanbanRestState>,
+    headers: HeaderMap,
+    Query(q): Query<Value>,
+) -> Response {
+    let claims = match authorize(&st, &headers, "agent.read", &Method::GET, "/api/v1/a2a/threads")
+    .await
+    {
+        Ok(c) => c,
+        Err(r) => return r,
+    };
+    dispatch(&st, &claims, "a2a.threads", q).await
 }
 
 /// `POST /api/v1/a2a/send` `{ "to": "<session>", "body": "<text>", "in_reply_to": "<id>" }`

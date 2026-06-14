@@ -107,6 +107,21 @@ impl Inbox {
             .take(limit)
             .collect()
     }
+
+    /// All messages (newest first), optionally filtered by a participant
+    /// (messages where `from` or `to` matches). Used by the `a2a.threads`
+    /// REST endpoint to show the operator all conversations.
+    fn all(&self, participant: Option<&str>, limit: usize) -> Vec<&Message> {
+        self.messages
+            .iter()
+            .rev()
+            .filter(|m| match participant {
+                Some(p) => m.from == p || m.to == p,
+                None => true,
+            })
+            .take(limit)
+            .collect()
+    }
 }
 
 // ── Handler ─────────────────────────────────────────────────────────────────
@@ -183,6 +198,32 @@ impl A2aMessageHandler {
                             "from": m.from,
                             "body": m.body,
                             "in_reply_to": m.in_reply_to,
+                        })
+                    })
+                    .collect();
+                Ok(json!({ "messages": messages, "count": messages.len() }))
+            }
+
+            "a2a.threads" => {
+                let participant = ctx.args.get("session").and_then(Value::as_str);
+                let limit = ctx
+                    .args
+                    .get("limit")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(100) as usize;
+
+                let inbox = self.inbox(ctx.workspace)?;
+                let messages: Vec<Value> = inbox
+                    .all(participant, limit)
+                    .into_iter()
+                    .map(|m| {
+                        json!({
+                            "id": m.id,
+                            "from": m.from,
+                            "to": m.to,
+                            "body": m.body,
+                            "in_reply_to": m.in_reply_to,
+                            "acked": m.acked,
                         })
                     })
                     .collect();
