@@ -9,7 +9,7 @@
 
 use tokio::sync::{mpsc, oneshot};
 
-use gt_beads::{Bead, BeadRepository};
+use gt_beads::{Bead, BeadRepository, BeadStatus};
 use gt_events::{AppError, Command, Envelope};
 
 use crate::commands::SchedCommand;
@@ -163,6 +163,9 @@ where
     let (tx, mut rx) = mpsc::channel::<SchedMsg>(64);
     tokio::spawn(async move {
         let mut core = SchedCore::new(max);
+        for (bead, priority) in &pending {
+            let _ = repo.upsert(&Bead::new(bead.clone(), bead.clone(), BeadStatus::Pending, *priority)).await;
+        }
         for (bead, priority) in pending {
             core.queue.enqueue(bead, priority);
         }
