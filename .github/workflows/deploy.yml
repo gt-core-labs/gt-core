@@ -1,0 +1,82 @@
+# Deploy to the Talos dev cluster — GATED on the full CI → docker-publish chain.
+#
+# The chain is:
+#   1. CI (cargo test + contract)         — hard gate on every push/PR
+#   2. docker-publish (build+push images) — only runs on green CI + push to main
+#   3. deploy (this workflow)             — only runs on green docker-publish
+#
+# Nothing reaches the cluster unless tests pass. Branch protection on main
+# (require CI status checks) prevents direct pushes that skip the gate.
+#
+# Required secrets:
+#   TS_OAUTH_CLIENT_ID     — Tailscale OAuth client ID (tag: tag:ci)
+#   TS_OAUTH_SECRET        — Tailscale OAuth client secret
+#   KUBE_CONFIG            — base64-encoded kubeconfig for the cluster
+#   CLAUDE_CREDENTIALS     — claude CLI credentials JSON for orchd polecats
+name: deploy
+
+on:
+  workflow_run:
+    workflows: [docker-publish]
+    types: [completed]
+  workflow_dispatch: {}
+
+jobs:
+  deploy-dev:
+    runs-on: ubuntu-latest
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (github.event.workflow_run.conclusion == 'success' &&
+       github.event.workflow_run.event == 'push' &&
+       github.event.workflow_run.head_branch == 'main')
+    steps:
+      - name: Resolve commit SHA
+        id: vars
+        run: |
+          SHA="${{ github.event.workflow_run.head_sha || github.sha }}"
+          echo "sha7=${SHA:0:7}" >> "$GITHUB_OUTPUT"
+
+      - name: Connect to Tailscale
+        uses: tailscale/github-action@v3
+        with:
+          oauth-client-id: ${{ secrets.TS_OAUTH_CLIENT_ID }}
+          oauth-secret: ${{ secrets.TS_OAUTH_SECRET }}
+          tags: tag:ci
+
+      - name: Set up kubeconfig
+        run: |
+          mkdir -p ~/.kube
+          echo "${{ secrets.KUBE_CONFIG }}" | base64 -d > ~/.kube/config
+          chmod 600 ~/.kube/config
+
+      - name: Install kubectl
+        uses: azure/setup-kubectl@v4
+
+      - name: Deploy MCP server
+        run: |
+          kubectl set image deploy/gt-mcp-server -n gt \
+            mcp-server=codecsrayo/gt-core-mcp-server:sha-embeddings-${{ steps.vars.outputs.sha7 }}
+
+      - name: Deploy orchd
+        run: |
+          kubectl set image deploy/gt-orchd -n gt \
+            orchd=codecsrayo/gt-core-orchd:sha-${{ steps.vars.outputs.sha7 }}
+
+      - name: Wait for rollouts
+        run: |
+          kubectl rollout status deploy/gt-mcp-server -n gt --timeout=180s
+          kubectl rollout status deploy/gt-orchd -n gt --timeout=180s
+
+      - name: Provision claude credentials
+        run: |
+          POD=$(kubectl get pods -n gt --field-selector=status.phase=Running -o name | grep orchd | head -1)
+          POD=${POD#pod/}
+          kubectl exec "$POD" -n gt -- mkdir -p /tmp/.claude
+          echo '${{ secrets.CLAUDE_CREDENTIALS }}' > /tmp/creds.json
+          kubectl cp /tmp/creds.json "gt/$POD:/tmp/.claude/.credentials.json"
+          rm -f /tmp/creds.json
+
+      - name: Verify orchd
+        run: |
+          POD=$(kubectl get pods -n gt --field-selector=status.phase=Running -o name | grep orchd | head -1)
+          kubectl logs "${POD#pod/}" -n gt --tail=5
