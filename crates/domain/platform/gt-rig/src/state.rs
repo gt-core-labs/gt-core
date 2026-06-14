@@ -104,6 +104,81 @@ impl RigEntry {
             .clone()
             .unwrap_or_else(|| home.join("gastown-wt").join(ws).join(&self.name))
     }
+
+    /// Assess whether this rig is provisioned for autonomous, parallel polecat operation
+    /// (hq-29ea8a B2/B3). See [`RigReadiness`] for what each check means. Pure over the
+    /// catalog entry — no IO — so it is cheap to run for every rig in a readiness sweep.
+    pub fn readiness(&self) -> RigReadiness {
+        let has_clone_url = !self.git_url.trim().is_empty();
+        let has_push_url = self
+            .push_url
+            .as_deref()
+            .map(|u| !u.trim().is_empty())
+            .unwrap_or(false);
+        let worktree_root_pinned = self.worktree_root.is_some();
+
+        // Blocking gaps: anything that stops the autonomous deliver→push cycle from closing.
+        let mut gaps = Vec::new();
+        if !has_clone_url {
+            gaps.push("git_url is empty: orchd cannot clone the rig to provision worktrees".into());
+        }
+        if !has_push_url {
+            gaps.push(
+                "push_url is unset: the refinery cannot auto-push main after an ff-merge".into(),
+            );
+        }
+
+        // Advisories: surfaced but not blocking — the system still works, just on a default.
+        let mut advisories = Vec::new();
+        if !worktree_root_pinned {
+            advisories.push(
+                "worktree_root not pinned: orchd falls back to the convention default \
+                 <home>/gastown-wt/<ws>/<name>"
+                    .into(),
+            );
+        }
+
+        RigReadiness {
+            has_clone_url,
+            has_push_url,
+            worktree_root_pinned,
+            gaps,
+            advisories,
+        }
+    }
+}
+
+/// Readiness of a single rig for autonomous, parallel polecat operation (hq-29ea8a B2/B3).
+///
+/// The epic's two rig criteria — every rig must (a) provision isolated per-polecat worktrees
+/// so parallel polecats never share a checkout, and (b) let the refinery push to `main`
+/// automatically after a fast-forward merge instead of leaving a "pending push to main" note —
+/// were applied operationally (`rig.set-worktree-root`, catalog `push_url`). This type makes
+/// that state machine-checkable rather than eyeballed: a patrol or operator can assert "every
+/// rig is ready" by reading [`Self::ready`] instead of inspecting each field by hand.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RigReadiness {
+    /// `git_url` is non-empty, so orchd can clone the rig to provision worktrees.
+    pub has_clone_url: bool,
+    /// `push_url` is non-empty, so the refinery can fast-forward `main` automatically after a
+    /// merge — closing the manual-push gap the epic's B3 criterion called out.
+    pub has_push_url: bool,
+    /// An explicit `worktree_root` override is pinned. `false` is NOT a blocker — orchd falls
+    /// back to the convention default — but the epic asked every rig to pin one, so it surfaces
+    /// as an advisory in [`Self::advisories`].
+    pub worktree_root_pinned: bool,
+    /// Blocking gaps. Empty ⇔ [`Self::ready`] is true.
+    pub gaps: Vec<String>,
+    /// Non-blocking notes (e.g. relying on the convention worktree root).
+    pub advisories: Vec<String>,
+}
+
+impl RigReadiness {
+    /// True when there are no blocking [`Self::gaps`] — the rig can run the full autonomous
+    /// deliver→ff-merge→push cycle without operator intervention.
+    pub fn ready(&self) -> bool {
+        self.gaps.is_empty()
+    }
 }
 
 /// Live rig catalog (what the actor owns). `BTreeMap` so iteration is sorted and the
@@ -714,6 +789,53 @@ mod tests {
         // Replay gate: the reducer rebuilds the same catalog the live mutation produced.
         let rebuilt = RigCatalog::from_state(&state);
         assert_eq!(rebuilt, catalog);
+    }
+
+    #[test]
+    fn readiness_flags_missing_push_url_as_blocking_gap() {
+        // A freshly-added rig has git_url but no push_url / worktree_root: clonable, but the
+        // refinery cannot auto-push, so it is NOT ready and the convention-root note shows.
+        let entry = RigEntry::new("plane", "pl", "git@github.com:o/plane.git", "main", 1);
+        let r = entry.readiness();
+        assert!(r.has_clone_url);
+        assert!(!r.has_push_url);
+        assert!(!r.worktree_root_pinned);
+        assert!(!r.ready(), "missing push_url blocks readiness");
+        assert_eq!(r.gaps.len(), 1, "only push_url is a blocking gap here");
+        assert!(r.gaps[0].contains("push_url"));
+        assert_eq!(r.advisories.len(), 1, "unpinned worktree_root is advisory");
+        assert!(r.advisories[0].contains("worktree_root"));
+    }
+
+    #[test]
+    fn readiness_is_true_with_push_url_even_without_pinned_worktree_root() {
+        // push_url set + clonable ⇒ ready; an unpinned worktree_root is advisory only because
+        // orchd resolves a convention default, so parallelism still works.
+        let mut entry = RigEntry::new("plane", "pl", "git@github.com:o/plane.git", "main", 1);
+        entry.push_url = Some("https://github.com/o/plane.git".into());
+        let r = entry.readiness();
+        assert!(r.ready(), "clonable + pushable is ready");
+        assert!(r.gaps.is_empty());
+        assert_eq!(r.advisories.len(), 1, "still notes the unpinned worktree_root");
+
+        // Pinning the worktree root clears the advisory.
+        entry.worktree_root = Some(PathBuf::from("/rig-wt/plane"));
+        let r2 = entry.readiness();
+        assert!(r2.ready());
+        assert!(r2.worktree_root_pinned);
+        assert!(r2.advisories.is_empty(), "pinned root drops the advisory");
+    }
+
+    #[test]
+    fn readiness_treats_blank_urls_as_missing() {
+        // A whitespace-only push_url / git_url is not a real value — both must count as gaps.
+        let mut entry = RigEntry::new("plane", "pl", "   ", "main", 1);
+        entry.push_url = Some("  ".into());
+        let r = entry.readiness();
+        assert!(!r.has_clone_url);
+        assert!(!r.has_push_url);
+        assert_eq!(r.gaps.len(), 2, "both blank git_url and push_url are gaps");
+        assert!(!r.ready());
     }
 
     #[test]

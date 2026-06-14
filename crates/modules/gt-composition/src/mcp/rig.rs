@@ -2,8 +2,8 @@
 //!
 //! Routes the rig catalog tools — `rig.add`, `rig.adopt`, `rig.remove`,
 //! `rig.set-prefix`, `rig.set-default-branch`, `rig.set-worktree-root`, plus the
-//! `rig.list` / `rig.info` / `rig.lookup-by-prefix` reads — onto the [`RigCommand`]
-//! decide/apply layer over the PG-backed [`PgRigs`] adapter.
+//! `rig.list` / `rig.info` / `rig.lookup-by-prefix` / `rig.readiness` reads — onto the
+//! [`RigCommand`] decide/apply layer over the PG-backed [`PgRigs`] adapter.
 //!
 //! Each mutation hydrates the [`RigCatalog`] from the tenant's `rigs` table,
 //! runs the command's `execute` (validate + mutate the in-memory catalog,
@@ -23,8 +23,8 @@ use gt_events::Command;
 use gt_mcp_server::{DomainCtx, DomainHandler, WorkspaceRigPrefixes};
 use gt_module::McpTool;
 use gt_rig::{
-    AddRig, AdoptRig, PgRigs, RemoveRig, RigCatalog, RigEntry, RigRepository, SetRigDefaultBranch,
-    SetRigPrefix, SetRigTags, SetRigWorktreeRoot, RESERVED_RIG_NAMES,
+    AddRig, AdoptRig, PgRigs, RemoveRig, RigCatalog, RigEntry, RigReadiness, RigRepository,
+    SetRigDefaultBranch, SetRigPrefix, SetRigTags, SetRigWorktreeRoot, RESERVED_RIG_NAMES,
 };
 use gt_store_dolt::AppError;
 
@@ -112,6 +112,14 @@ impl DomainHandler for RigHandler {
                 "Resolve the rig owning a given bead-id prefix.",
                 &[req("prefix", "string")],
             ),
+            descriptor(
+                "rig.readiness",
+                "Check whether rigs are provisioned for autonomous, parallel polecat operation \
+                 (clonable, push_url set for auto-push, worktree_root pinned). Pass `name` for \
+                 one rig; omit it to sweep the whole catalog and get an `all_ready` verdict plus \
+                 the not-ready rigs and their gaps.",
+                &[opt("name", "string")],
+            ),
         ]
     }
 
@@ -177,6 +185,45 @@ impl DomainHandler for RigHandler {
                         None => Err(AppError::NotFound(format!("rig {name}"))),
                     },
                     None => Err(AppError::NotFound(format!("rig for prefix {prefix:?}"))),
+                }
+            }
+            "rig.readiness" => {
+                // One rig when `name` is given; otherwise a catalog-wide sweep (hq-29ea8a B2/B3)
+                // so an operator can verify "all rigs ready" in a single call instead of reading
+                // each `rig.info` by hand.
+                match ctx.args.get("name").and_then(Value::as_str) {
+                    Some(name) => match repo.get(name).await.map_err(ev_err)? {
+                        Some(entry) => Ok(json!({
+                            "rig": entry.name,
+                            "readiness": readiness_json(&entry.readiness()),
+                        })),
+                        None => Err(AppError::NotFound(format!("rig {name}"))),
+                    },
+                    None => {
+                        let rigs = repo.list().await.map_err(ev_err)?;
+                        let mut all_ready = true;
+                        let mut not_ready = Vec::new();
+                        let assessed = rigs
+                            .iter()
+                            .map(|entry| {
+                                let r = entry.readiness();
+                                if !r.ready() {
+                                    all_ready = false;
+                                    not_ready.push(entry.name.clone());
+                                }
+                                json!({
+                                    "rig": entry.name,
+                                    "readiness": readiness_json(&r),
+                                })
+                            })
+                            .collect::<Vec<_>>();
+                        Ok(json!({
+                            "all_ready": all_ready,
+                            "total": assessed.len(),
+                            "not_ready": not_ready,
+                            "rigs": assessed,
+                        }))
+                    }
                 }
             }
             other => Err(AppError::Validation(format!("unknown tool `{other}`"))),
@@ -283,6 +330,22 @@ fn entry_json(entry: &RigEntry) -> Value {
         "worktree_root": entry.worktree_root,
         "git_connection_ref": entry.git_connection_ref,
         "semantic_tags": entry.semantic_tags,
+        // hq-29ea8a B2/B3: surface autonomous-operation readiness inline so `rig.info` /
+        // `rig.list` answer "is this rig wired for parallel polecats + auto-push?" directly.
+        "readiness": readiness_json(&entry.readiness()),
+    })
+}
+
+/// Shape a [`RigReadiness`] as a dispatch payload, flattening the `ready()` verdict alongside
+/// the individual checks so callers can branch on one boolean (`ready`) or inspect the gaps.
+fn readiness_json(r: &RigReadiness) -> Value {
+    json!({
+        "ready": r.ready(),
+        "has_clone_url": r.has_clone_url,
+        "has_push_url": r.has_push_url,
+        "worktree_root_pinned": r.worktree_root_pinned,
+        "gaps": r.gaps,
+        "advisories": r.advisories,
     })
 }
 
@@ -380,6 +443,23 @@ mod tests {
             .unwrap();
         assert_eq!(info["prefix"], "dr");
         assert_eq!(info["default_branch"], "main");
+        // hq-29ea8a B2/B3: rig.info carries the readiness verdict inline. This rig was added
+        // without a push_url, so it is clonable but not ready (refinery cannot auto-push).
+        assert_eq!(info["readiness"]["has_clone_url"], true);
+        assert_eq!(info["readiness"]["has_push_url"], false);
+        assert_eq!(info["readiness"]["ready"], false);
+
+        // The dedicated readiness sweep (no `name`) flags the same rig as not-ready.
+        let sweep = handler
+            .dispatch("rig.readiness", ctx(json!({})))
+            .await
+            .unwrap();
+        assert_eq!(sweep["all_ready"], false);
+        assert!(sweep["not_ready"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|n| n == "dispatchrig"));
 
         handler
             .dispatch(

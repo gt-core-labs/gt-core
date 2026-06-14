@@ -48,7 +48,7 @@ use crate::commands::{
     AddRig, AdoptRig, RemoveRig, SetRigDefaultBranch, SetRigPrefix, SetRigTags, SetRigWorktreeRoot,
 };
 use crate::repo::RigRepository;
-use crate::state::{RigCatalog, RigEntry};
+use crate::state::{RigCatalog, RigEntry, RigReadiness};
 
 /// A per-workspace rig repository provider for the REST adapter.
 ///
@@ -476,6 +476,21 @@ fn entry_json(entry: &RigEntry) -> Value {
         "worktree_root": entry.worktree_root,
         "git_connection_ref": entry.git_connection_ref,
         "semantic_tags": entry.semantic_tags,
+        // hq-29ea8a B2/B3: same inline readiness verdict the MCP `rig.info` carries.
+        "readiness": readiness_json(&entry.readiness()),
+    })
+}
+
+/// Shape a [`RigReadiness`] as the REST payload — identical to the MCP `RigHandler`'s, so a
+/// client sees the same readiness verdict across transports.
+fn readiness_json(r: &RigReadiness) -> Value {
+    json!({
+        "ready": r.ready(),
+        "has_clone_url": r.has_clone_url,
+        "has_push_url": r.has_push_url,
+        "worktree_root_pinned": r.worktree_root_pinned,
+        "gaps": r.gaps,
+        "advisories": r.advisories,
     })
 }
 
