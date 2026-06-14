@@ -514,6 +514,45 @@ async fn main() -> anyhow::Result<()> {
         eprintln!("[gt-orch-server] re-sling account re-resolution armed (keychain-backed)");
     }
 
+    // Closed-bead re-sling guard (gtcore-177770): a polecat can die after its bead was already
+    // closed (operator or merge auto-close) — re-slinging it then burns the restart budget on
+    // delivered work and keeps the slot occupied, starving new dispatches. Wire a probe the
+    // supervisor consults before each re-sling: it reads the bead's tracker status via a sync
+    // Dolt query (the supervisor's `tick` runs inside `spawn_blocking`, so blocking on the
+    // current runtime handle is safe here). Only a positively-closed bead is dropped; an
+    // unknown bead or a query error falls through to the normal re-sling path. Env-gated on
+    // GT_DOLT_URL — without it the guard is off and dead polecats re-sling as before.
+    match std::env::var("GT_DOLT_URL")
+        .ok()
+        .filter(|v| !v.is_empty())
+        .and_then(|url| gt_store_dolt::DoltIssues::connect(&url).ok())
+    {
+        Some(store) => {
+            let store = Arc::new(store);
+            let handle = tokio::runtime::Handle::current();
+            supervisor.set_bead_closed(Box::new(move |bead: &str| {
+                let store = store.clone();
+                let bead = bead.to_string();
+                handle.block_on(async move {
+                    match store.get_detail(&bead).await {
+                        Ok(Some(detail)) => detail.status == "closed",
+                        Ok(None) => false, // unknown bead → re-sling (conservative)
+                        Err(e) => {
+                            eprintln!(
+                                "[gt-orch-server] closed-bead probe failed bead={bead}: {e} — re-slinging"
+                            );
+                            false
+                        }
+                    }
+                })
+            }));
+            eprintln!("[gt-orch-server] closed-bead re-sling guard armed (Dolt-backed)");
+        }
+        None => {
+            eprintln!("[gt-orch-server] closed-bead re-sling guard OFF — GT_DOLT_URL unset (closed beads may re-sling)")
+        }
+    }
+
     // Web onboarding (hq-quota-onboard-web) moved to the backend mcp-server in .4: claude now lives
     // IN the image, so onboarding rides the existing /api/v1/* auth chain instead of a host process
     // behind a docker→host firewall hole. The daemon no longer serves it — it only hydrates its
