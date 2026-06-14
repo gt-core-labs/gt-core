@@ -824,6 +824,8 @@ async fn main() -> anyhow::Result<()> {
 
     let pol_registry = Arc::new(pol_registry);
     let pol_relay = spawn_plugin_relay(handle.subscribe_events(), pol_registry);
+    // All observers are live — kick the scheduler so hydrated beads pump Dispatched events.
+    sched.kick().await;
     eprintln!(
         "[gt-orch-server] polecat supervision on — pool_size={pool_size}, host_cap={} (cpu+ram), max_restarts={max_restarts}",
         allocator.lock().expect("pool mutex").host_cap()

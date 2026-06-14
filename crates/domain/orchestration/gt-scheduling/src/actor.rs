@@ -32,6 +32,8 @@ pub enum SchedMsg {
     },
     /// Un worker terminó: libera capacidad y re-bombea.
     CapacityFreed,
+    /// Trigger the pump once all observers are registered.
+    Kick,
     /// (queued, in_flight)
     Snapshot(oneshot::Sender<(usize, usize)>),
     /// "Ask without doing": run `validate` against the current core. No mutation, no pump.
@@ -64,6 +66,11 @@ impl SchedHandle {
 
     pub async fn capacity_freed(&self) {
         let _ = self.tx.send(SchedMsg::CapacityFreed).await;
+    }
+
+    /// Trigger the pump after all hub observers are registered.
+    pub async fn kick(&self) {
+        let _ = self.tx.send(SchedMsg::Kick).await;
     }
 
     /// Create (or replace) a bead in the repo via the owning actor. Returns the repo result so
@@ -139,10 +146,11 @@ where
 /// with `(bead, priority)` pairs reconstructed by replaying the workspace event log, so a daemon
 /// restart restores still-pending dispatch work before the actor processes any edge message.
 /// Seeding the queue directly (rather than re-sending `Enqueue` commands) means hydration skips
-/// the `Enqueue` event — but an **initial pump** runs immediately so that hydrated beads emit
-/// `Dispatched` events and reach the polecat supervisor without waiting for an external message.
-/// The capacity governor starts empty: a restart assumes the previous run's in-flight polecats
-/// are gone, so freed slots resume from zero (polecat re-supervision is `hq-orchd.3`).
+/// the `Enqueue` event. The caller **must** send [`SchedHandle::kick`] after all hub observers
+/// are registered so the pump drains hydrated beads into `Dispatched` events that reach the
+/// polecat supervisor. The capacity governor starts empty: a restart assumes the previous run's
+/// in-flight polecats are gone, so freed slots resume from zero (polecat re-supervision is
+/// `hq-orchd.3`).
 pub fn spawn_hydrated<R>(
     repo: R,
     events: mpsc::Sender<Envelope<SchedEvent>>,
@@ -160,30 +168,6 @@ where
         }
         let mut worker_seq: u64 = 0;
 
-        // Initial pump: drain hydrated beads before blocking on the first message.
-        while core.gov.can_dispatch() {
-            let Some(bead) = core.queue.pop_highest() else {
-                break;
-            };
-            worker_seq += 1;
-            let worker = format!("w{worker_seq}");
-            let ev = match repo.cas_claim(&bead, &worker).await {
-                Ok(true) => {
-                    core.gov.acquire();
-                    SchedEvent::Dispatched { bead, worker }
-                }
-                Ok(false) => SchedEvent::DispatchFailed {
-                    bead,
-                    reason: "no longer pending".into(),
-                },
-                Err(e) => SchedEvent::DispatchFailed {
-                    bead,
-                    reason: e.to_string(),
-                },
-            };
-            let _ = events.send(Envelope::root(ev)).await;
-        }
-
         while let Some(msg) = rx.recv().await {
             // `pump` decides whether to drain the queue after handling the message. Reads
             // (Snapshot/Validate) and the manual MarkDispatched never auto-pump.
@@ -200,6 +184,7 @@ where
                     pump = false;
                 }
                 SchedMsg::CapacityFreed => core.gov.release(),
+                SchedMsg::Kick => {},
                 SchedMsg::Snapshot(reply) => {
                     let _ = reply.send((core.queue.len(), core.gov.in_flight()));
                     pump = false;
