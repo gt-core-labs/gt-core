@@ -86,6 +86,10 @@ pub fn kanban_rest_router(state: KanbanRestState) -> Router {
         .route("/api/v1/invites", get(invites_list).post(invites_create))
         .route("/api/v1/invites/:id", delete(invites_revoke))
         .route("/api/v1/invites/accept", post(invites_accept))
+        // a2a messaging bridge (hq-a2a-msg-rest)
+        .route("/api/v1/a2a/inbox", get(a2a_inbox))
+        .route("/api/v1/a2a/send", post(a2a_send))
+        .route("/api/v1/a2a/ack", post(a2a_ack))
         .with_state(state)
 }
 
@@ -314,6 +318,62 @@ async fn invites_accept(
         Err(r) => return r,
     };
     dispatch(&st, &claims, "invite.accept", body).await
+}
+
+// ─── a2a messaging ─────────────────────────────────────────────────────────
+
+/// `GET /api/v1/a2a/inbox?session=<id>&limit=<n>` — read unacknowledged
+/// messages for the given session. `session` is required; `limit` defaults to
+/// 50 (the UI wants the full conversation, not the MCP default of 10).
+async fn a2a_inbox(
+    State(st): State<KanbanRestState>,
+    headers: HeaderMap,
+    Query(q): Query<Value>,
+) -> Response {
+    let claims = match authorize(&st, &headers, "agent.read", &Method::GET, "/api/v1/a2a/inbox")
+    .await
+    {
+        Ok(c) => c,
+        Err(r) => return r,
+    };
+    let mut args = q;
+    // Default limit to 50 for the web UI (larger than the MCP default of 10).
+    if !args.get("limit").and_then(Value::as_u64).is_some() {
+        if let Value::Object(map) = &mut args {
+            map.insert("limit".into(), json!(50));
+        }
+    }
+    dispatch(&st, &claims, "a2a.inbox", args).await
+}
+
+/// `POST /api/v1/a2a/send` `{ "to": "<session>", "body": "<text>", "in_reply_to": "<id>" }`
+async fn a2a_send(
+    State(st): State<KanbanRestState>,
+    headers: HeaderMap,
+    Json(body): Json<Value>,
+) -> Response {
+    let claims = match authorize(&st, &headers, "agent.write", &Method::POST, "/api/v1/a2a/send")
+    .await
+    {
+        Ok(c) => c,
+        Err(r) => return r,
+    };
+    dispatch(&st, &claims, "a2a.send", body).await
+}
+
+/// `POST /api/v1/a2a/ack` `{ "id": "<msg-id>" }`
+async fn a2a_ack(
+    State(st): State<KanbanRestState>,
+    headers: HeaderMap,
+    Json(body): Json<Value>,
+) -> Response {
+    let claims = match authorize(&st, &headers, "agent.write", &Method::POST, "/api/v1/a2a/ack")
+    .await
+    {
+        Ok(c) => c,
+        Err(r) => return r,
+    };
+    dispatch(&st, &claims, "a2a.ack", body).await
 }
 
 fn bearer(headers: &HeaderMap) -> Option<String> {
