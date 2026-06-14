@@ -310,6 +310,20 @@ impl GraphHandler {
             self.indexer.build(repo).await.map_err(graph_err)?
         };
         let commit = head_commit(repo);
+        // Empty-build guard (hq-c69e18, acceptance #4): a refresh that yields ZERO nodes is the
+        // empty/failed-clone FALSE POSITIVE — the very symptom this bead targets, where a build over
+        // an absent/empty checkout (git_connection_ref=null, commit `unknown`) reported "built" with
+        // 0 nodes. Refuse to record it: do NOT MarkRefreshed (custody must never carry a phantom
+        // "built" + commit that `graph.status` would render as GRAFO=CONSTRUIDO), and surface an
+        // error so `graph.refresh` returns a failure state instead of `ok:true`. A graph is only
+        // reported built when it actually has nodes.
+        if stats.nodes == 0 {
+            return Err(AppError::Validation(format!(
+                "graph refresh for rig `{rig}` produced an EMPTY graph (0 nodes) at {} (commit \
+                 {commit}) — the checkout is empty or the clone failed; not marking it built",
+                repo.display()
+            )));
+        }
         self.warden_apply(
             ws,
             WardenCommand::MarkRefreshed(MarkRefreshed {
@@ -639,9 +653,44 @@ impl DomainHandler for GraphHandler {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use gt_graphindex::InMemoryGraphIndexer;
+    // `GraphError`, `GraphIndexer`, `IndexStats` already reach us via `super::*`; pull in only the
+    // value types the parent does not import.
+    use gt_graphindex::{GraphAnswer, IndexDiff, IndexStatus, InMemoryGraphIndexer};
     use gt_graphwarden::WardenEvent;
     use tempfile::TempDir;
+
+    /// A [`GraphIndexer`] whose `build` always yields a ZERO-node graph — the empty/failed-clone
+    /// shape the refresh must refuse to mark built (hq-c69e18, acceptance #4). `status` reports
+    /// not-built so a refresh always takes the `build` path.
+    #[derive(Debug, Default)]
+    struct EmptyGraphIndexer;
+
+    #[async_trait]
+    impl GraphIndexer for EmptyGraphIndexer {
+        fn tool(&self) -> &str {
+            "empty"
+        }
+        async fn build(&self, _repo: &Path) -> Result<IndexStats, GraphError> {
+            Ok(IndexStats::default()) // 0 nodes / 0 edges / 0 communities
+        }
+        async fn update(&self, _repo: &Path, _changed: &[&Path]) -> Result<IndexDiff, GraphError> {
+            Ok(IndexDiff::default())
+        }
+        async fn query(&self, _repo: &Path, _question: &str) -> Result<GraphAnswer, GraphError> {
+            Ok(GraphAnswer::default())
+        }
+        async fn explain(&self, _repo: &Path, _node: &str) -> Result<GraphAnswer, GraphError> {
+            Ok(GraphAnswer::default())
+        }
+        async fn status(&self, _repo: &Path) -> Result<IndexStatus, GraphError> {
+            Ok(IndexStatus {
+                built: false,
+                stats: None,
+                tool: self.tool().to_string(),
+                built_at_commit: None,
+            })
+        }
+    }
 
     fn ctx(args: Value) -> DomainCtx<'static> {
         DomainCtx {
@@ -901,6 +950,42 @@ mod tests {
             list["rigs"][0]["repo_dir"],
             expected.to_string_lossy().as_ref()
         );
+    }
+
+    /// A refresh that builds an EMPTY graph (0 nodes — the empty/failed-clone false positive this
+    /// bead targets) is an ERROR, not `ok:true`: the rig is NOT marked refreshed (custody carries no
+    /// phantom commit), so `graph.list` still shows it stale + never-indexed. Guards acceptance #4:
+    /// GRAFO=CONSTRUIDO is only reported when nodes>0.
+    #[tokio::test]
+    async fn refresh_empty_build_errors_and_does_not_mark_built() {
+        let (_root, _guard) = pin_graph_root();
+        let dir = TempDir::new().unwrap();
+        let log = Arc::new(EventLog::new(Some(dir.path().to_path_buf())));
+        let h = GraphHandler::new(log, Arc::new(EmptyGraphIndexer));
+
+        // The refresh must surface an error rather than a false-positive "built".
+        let err = h
+            .dispatch("graph.refresh", ctx(json!({ "rig": "alpha" })))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, AppError::Validation(_)));
+
+        // The rig was registered (ensure_custody runs before the build), but NOT marked refreshed:
+        // custody stays stale + never-indexed, so a status read renders `stale`, never `built`.
+        let list = h.dispatch("graph.list", ctx(json!({}))).await.unwrap();
+        assert_eq!(list["rigs"].as_array().unwrap().len(), 1);
+        assert_eq!(list["rigs"][0]["stale"], true);
+        assert!(
+            list["rigs"][0]["last_indexed_commit"].is_null(),
+            "an empty build must not stamp a commit"
+        );
+
+        let st = h
+            .dispatch("graph.status", ctx(json!({ "rig": "alpha" })))
+            .await
+            .unwrap();
+        assert_eq!(st["state"], "stale");
+        assert_eq!(st["built"], false);
     }
 
     /// A rig the warden never registered has no custody → NotFound on read.
