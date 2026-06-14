@@ -105,6 +105,24 @@ pub enum DelegationEvent {
         /// `completed` | `failed` | `canceled` | `timed_out`.
         state: String,
     },
+    /// A delegation was **refused** before any work was minted (A7, gtcore-3a3557).
+    /// Appended by `a2a.delegate` when an RBAC peer grant denies a direct rig→rig
+    /// hop, so the refusal is auditable with both endpoints' identities (the A7
+    /// acceptance: "rechazado y auditado — identidad origen + destino"). Purely
+    /// observational: the registry never folds it (no `child` exists), it only
+    /// leaves the durable audit trail.
+    Denied {
+        /// The delegating agent's session / actor id (origin identity).
+        origin: String,
+        /// The peer the hop targeted — its registry name (destination identity).
+        dest: String,
+        /// The resolved peer endpoint base URL, when one could be resolved.
+        peer_url: Option<String>,
+        /// Why the hop was refused (the grant-miss message).
+        reason: String,
+        /// RFC3339 stamp of the refusal.
+        at: String,
+    },
 }
 
 impl EventKind for DelegationEvent {
@@ -112,6 +130,7 @@ impl EventKind for DelegationEvent {
         match self {
             DelegationEvent::Requested { .. } => "delegation.requested.v1",
             DelegationEvent::Completed { .. } => "delegation.completed.v1",
+            DelegationEvent::Denied { .. } => "delegation.denied.v1",
         }
     }
 }
@@ -171,6 +190,9 @@ impl DelegationRegistry {
                     e.done = true;
                 }
             }
+            // A refused hop minted no child, so there is nothing to fold — the
+            // event exists only for the audit trail (A7).
+            DelegationEvent::Denied { .. } => {}
         }
     }
 
@@ -595,6 +617,49 @@ mod tests {
             },
         );
         assert!(reg.open("gtcore-a").is_none(), "completed delegation is no longer open");
+    }
+
+    #[test]
+    fn denied_event_is_auditable_and_folds_to_nothing() {
+        // A7 (gtcore-3a3557): a refused peer hop carries both endpoints' identities
+        // for the audit trail, wears the `delegation.denied.v1` kind, and — minting
+        // no child — never changes registry state.
+        let ev = DelegationEvent::Denied {
+            origin: "gtcore-sess-1".into(),
+            dest: "gtweb".into(),
+            peer_url: Some("https://gtweb.example.com".into()),
+            reason: "peer delegation from `default` to `gtweb` is not granted".into(),
+            at: rfc3339_now(),
+        };
+        assert_eq!(ev.kind(), "delegation.denied.v1");
+        // It survives a serde round-trip (it lands on the event log).
+        let json = serde_json::to_value(&ev).unwrap();
+        let back: DelegationEvent = serde_json::from_value(json).unwrap();
+        assert_eq!(back, ev);
+
+        // Folding it leaves the registry untouched (no child to open/close).
+        let mut reg = DelegationRegistry::default();
+        DelegationRegistry::apply(&mut reg, &ev);
+        assert_eq!(reg.open_all().count(), 0);
+    }
+
+    #[test]
+    fn denied_event_lands_on_the_event_log() {
+        let dir = TempDir::new().unwrap();
+        let log = log(&dir);
+        log.append(
+            None,
+            DelegationEvent::Denied {
+                origin: "gtcore-sess-1".into(),
+                dest: "gtweb".into(),
+                peer_url: None,
+                reason: "not granted".into(),
+                at: rfc3339_now(),
+            },
+        )
+        .unwrap();
+        let recs = log.read_kind(None, "delegation.denied.v1").unwrap();
+        assert_eq!(recs.len(), 1, "the refusal is durably audited");
     }
 
     #[test]

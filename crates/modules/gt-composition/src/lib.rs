@@ -42,6 +42,7 @@ pub mod bead_close;
 pub mod anthropic_proxy;
 pub mod auth;
 pub mod delegation;
+pub mod delegation_http;
 pub mod denial_audit;
 pub mod drift_reconcile;
 pub mod email_outbox_drain;

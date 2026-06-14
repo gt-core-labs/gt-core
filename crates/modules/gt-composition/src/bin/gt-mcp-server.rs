@@ -63,6 +63,7 @@ use gt_composition::mcp::{
     PgDocumentsResource, PgRigPrefixes, PgWorkspaceStatus, QuotaBlockGuard, QuotaHandler, RigHandler,
     WorkspaceHandler, WsPools,
 };
+use gt_composition::delegation_http::{A2aPeerClient, PeerRegistry};
 use gt_composition::onboard::{onboard_router, OnboardState};
 use gt_composition::operator_resource::EventLogOperatorResource;
 use gt_composition::scope_bridge::bridge_scopes;
@@ -2331,6 +2332,62 @@ async fn build_domain_router(
             if let Some(stores) = cross_ws_stores {
                 handler = handler.with_cross_ws(stores, cross_ws_grants);
             }
+
+            // A7 (gtcore-3a3557): direct rig→rig HTTP delegation. A `peer` arg on
+            // a2a.delegate routes the hop straight to that rig's own A2A endpoint
+            // (discovered via its Agent Card), with orchd NOT relaying. Deny-by-
+            // default: a hop needs an explicit `origin->peer` grant
+            // (GT_A2A_PEER_GRANTS) and a resolvable peer (a name in GT_A2A_PEERS or
+            // a bare http(s):// origin). With both envs absent, a `peer` arg is
+            // rejected and only the in-process intake path runs.
+            let peer_registry = std::env::var("GT_A2A_PEERS")
+                .ok()
+                .map(|spec| PeerRegistry::parse(&spec))
+                .unwrap_or_else(PeerRegistry::empty);
+            let peer_grants = std::env::var("GT_A2A_PEER_GRANTS")
+                .ok()
+                .map(|spec| CrossWsGrants::parse(&spec))
+                .unwrap_or_else(CrossWsGrants::empty);
+            if !peer_registry.is_empty() || !peer_grants.is_empty() {
+                // The outbound bearer the peer's guarded POST /a2a requires. Prefer
+                // an explicit GT_A2A_PEER_TOKEN; else mint a boot-lifetime token
+                // with the platform RS256 key (peers share the verifier, so a token
+                // minted here validates there). `None` only when neither is set.
+                let peer_token = std::env::var("GT_A2A_PEER_TOKEN")
+                    .ok()
+                    .filter(|s| !s.trim().is_empty())
+                    .or_else(|| {
+                        let minter = JwtMinter::from_env().ok()?;
+                        let now = SystemTime::now()
+                            .duration_since(UNIX_EPOCH)
+                            .map(|d| d.as_secs())
+                            .unwrap_or(0);
+                        let ttl = env_u64("GT_A2A_PEER_TOKEN_TTL_SECS", 31_536_000);
+                        minter
+                            .mint(&gt_auth::JwtClaims {
+                                sub: "a2a-peer-delegation".into(),
+                                workspace: std::env::var("GT_WORKSPACE")
+                                    .unwrap_or_else(|_| "default".into()),
+                                scopes: vec!["a2a.delegate".into()],
+                                exp: now + ttl,
+                                nbf: None,
+                                iat: now,
+                            })
+                            .ok()
+                    });
+                eprintln!(
+                    "[gt-mcp-server] a2a peer delegation on — {} peer(s), {} grant(s), outbound token {}",
+                    peer_registry.len(),
+                    peer_grants.len(),
+                    if peer_token.is_some() { "wired" } else { "none" },
+                );
+                handler = handler.with_peers(
+                    Arc::new(peer_registry),
+                    peer_grants,
+                    Arc::new(A2aPeerClient::new(peer_token)),
+                );
+            }
+
             router.register(Arc::new(handler))
         }
         _ => {
