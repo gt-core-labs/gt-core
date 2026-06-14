@@ -1,0 +1,64 @@
+# gt-orch-server — orchestration daemon (split from Dockerfile.embeddings).
+#
+# Builds ONLY gt-orch-server (no embeddings, no fastembed, no ONNX). The MCP
+# server stays in Dockerfile.embeddings. Splitting the images lets Tilt rebuild
+# orchd independently (~2 min vs ~6 min for the full embeddings image).
+#
+# cargo-chef: dep layer keyed on Cargo.lock, skipped on warm builds.
+FROM lukemathwalker/cargo-chef:latest-rust-1-slim-bookworm AS chef
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+       clang pkg-config libssl-dev cmake \
+    && rm -rf /var/lib/apt/lists/*
+WORKDIR /build
+
+# --- recipe: dep graph snapshot ---
+FROM chef AS planner
+COPY . .
+RUN cargo chef prepare --recipe-path recipe.json
+
+# --- cook: compile ALL deps for oauth (NO embeddings-fastembed) ---
+FROM chef AS builder
+COPY --from=planner /build/recipe.json recipe.json
+RUN cargo chef cook --release --locked \
+    --features oauth \
+    --recipe-path recipe.json
+COPY . .
+RUN cargo build --release --locked -p gt-composition \
+    --bin gt-orch-server \
+    --features oauth
+
+FROM debian:bookworm-slim
+# git: S3 readiness clause (docs/10 §S4). libssl3: TLS runtime.
+# node + claude-code: polecats run claude CLI in tmux sessions.
+# tmux: polecat sessions. jq: token usage parsing in hooks.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates git libssl3 curl gnupg tmux jq \
+    && curl -fsSL https://deb.nodesource.com/setup_20.x | bash - \
+    && apt-get install -y --no-install-recommends nodejs \
+    && npm install -g @anthropic-ai/claude-code \
+    && npm cache clean --force \
+    && apt-get purge -y gnupg \
+    && apt-get autoremove -y \
+    && rm -rf /var/lib/apt/lists/*
+# gt CLI + gtmcp client (same as embeddings image).
+RUN curl -fsSL https://github.com/gt-core-labs/gt/releases/download/latest/gt-x86_64-unknown-linux-musl.tar.gz \
+       | tar -xz -C /usr/local/bin gt \
+    && chmod 0755 /usr/local/bin/gt
+ENV GT_BIN=/usr/local/bin/gt
+RUN curl -fsSL https://github.com/gt-core-labs/gt-mcp/releases/download/latest/gtmcp-x86_64-unknown-linux-musl \
+       -o /usr/local/bin/gtmcp \
+    && chmod 0755 /usr/local/bin/gtmcp
+# graphify (graph index for per-rig knowledge graphs).
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends python3 python3-venv \
+    && python3 -m venv /opt/graphify-venv \
+    && /opt/graphify-venv/bin/pip install --no-cache-dir graphifyy \
+    && apt-get autoremove -y \
+    && rm -rf /var/lib/apt/lists/*
+ENV GT_GRAPHIFY_PYTHON=/opt/graphify-venv/bin/python
+COPY docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
+RUN chmod 0755 /usr/local/bin/docker-entrypoint.sh
+COPY --from=builder /build/target/release/gt-orch-server /usr/local/bin/gt-orch-server
+ENTRYPOINT ["/usr/local/bin/docker-entrypoint.sh"]
+CMD ["gt-orch-server"]
