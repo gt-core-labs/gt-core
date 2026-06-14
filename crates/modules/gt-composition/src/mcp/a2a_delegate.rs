@@ -24,16 +24,22 @@ use gt_a2a::AgentSkill;
 use gt_channel::DispatchSink;
 use gt_issues::handlers::run_create_issue;
 use gt_issues::{CreateIssue, Domain, IssueType, SurfaceTree};
-use gt_mcp_server::{DomainCtx, DomainHandler};
+use gt_mcp_server::{DomainCtx, DomainHandler, WorkspaceStores};
 use gt_module::McpTool;
 use gt_rig::{PgRigs, RigRepository};
 use gt_store_dolt::{AppError, DoltIssues};
 
 use crate::delegation::{rfc3339_now, DelegationEvent, DEFAULT_TIMEOUT_SECS};
 
+use super::cross_ws::CrossWsGrants;
 use super::eventlog::EventLog;
 use super::pools::WsPools;
 use super::util::{descriptor, opt, req};
+
+/// The workspace a call resolves to when its [`DomainCtx::workspace`] is `None` —
+/// the single-tenant default. Mirrors [`super::pools`]'s `DEFAULT_WORKSPACE` so the
+/// origin slug the grant check sees matches the tenant the pool cache keys on.
+const DEFAULT_WORKSPACE: &str = "default";
 
 /// Intake beads carry no surface, so existence checks are vacuous.
 struct NoSurfaces;
@@ -64,6 +70,16 @@ pub struct A2aDelegateHandler {
     /// Default completion timeout stamped on a delegation when the caller passes
     /// no `timeout_secs` (B5). `0` disables the timeout.
     default_timeout_secs: u64,
+    /// Per-workspace Dolt store resolver (B4, gtcore-3f3c57). `Some` enables
+    /// cross-workspace delegation: a `workspace` arg naming a tenant other than the
+    /// caller's mints the child bead in *that* tenant's `hq_<dest>` tracker. `None`
+    /// ⇒ a cross-workspace `workspace` arg is rejected (only same-workspace
+    /// delegation against [`store`](Self::store) works, exactly as before).
+    stores: Option<Arc<WorkspaceStores>>,
+    /// Explicit cross-workspace delegation grants (B4). Deny-by-default: a
+    /// cross-tenant hop requires a matching `origin->dest` grant. Default empty ⇒
+    /// no cross-workspace delegation, only same-workspace.
+    cross_ws_grants: CrossWsGrants,
 }
 
 impl A2aDelegateHandler {
@@ -81,6 +97,8 @@ impl A2aDelegateHandler {
             pools: None,
             delegation_log: None,
             default_timeout_secs: DEFAULT_TIMEOUT_SECS,
+            stores: None,
+            cross_ws_grants: CrossWsGrants::empty(),
         }
     }
 
@@ -106,6 +124,21 @@ impl A2aDelegateHandler {
         self.default_timeout_secs = default_timeout_secs;
         self
     }
+
+    /// Enable cross-workspace delegation (B4, gtcore-3f3c57). With a
+    /// [`WorkspaceStores`] resolver and a non-empty [`CrossWsGrants`] allow-list,
+    /// a `workspace` arg on `a2a.delegate` naming a tenant other than the caller's
+    /// mints the child bead in *that* tenant's `hq_<dest>` tracker — provided the
+    /// caller's workspace holds an explicit `origin->dest` grant. The minted bead
+    /// carries `parent_id = "<origin_ws>:<parent>"`, the lineage back to the
+    /// delegating tenant. Without this wiring (or with an empty grant set) a
+    /// cross-workspace `workspace` arg is rejected; same-workspace delegation is
+    /// unaffected.
+    pub fn with_cross_ws(mut self, stores: Arc<WorkspaceStores>, grants: CrossWsGrants) -> Self {
+        self.stores = Some(stores);
+        self.cross_ws_grants = grants;
+        self
+    }
 }
 
 #[async_trait]
@@ -123,7 +156,11 @@ impl DomainHandler for A2aDelegateHandler {
                  onto the scheduler. The calling agent's session id is stamped as `created_by`. \
                  You do NOT need to poll a2a.status: when the child reaches a terminal state the \
                  daemon pushes a callback (delegation.completed.v1 + operator bell), and a \
-                 `timeout_secs` (default applies) auto-escalates a stuck delegation.",
+                 `timeout_secs` (default applies) auto-escalates a stuck delegation. \
+                 Pass `workspace` to delegate into ANOTHER tenant (cross-workspace): the bead is \
+                 minted in that tenant's tracker and `parent_id` records the origin lineage \
+                 (`<origin>:<parent>`). Cross-workspace delegation requires an explicit operator \
+                 grant; without one it is rejected.",
                 &[
                     req("title", "string"),
                     opt("description", "string"),
@@ -131,14 +168,17 @@ impl DomainHandler for A2aDelegateHandler {
                     opt("parent_id", "string"),
                     opt("priority", "number"),
                     opt("timeout_secs", "number"),
+                    opt("workspace", "string"),
                 ],
             ),
             descriptor(
                 "a2a.discover",
                 "Discover peer agent capabilities. Returns one Agent Card skill per rig in \
                  the workspace catalog, so you can decide which peer to delegate to based on \
-                 name, tags, and repo. Pass `tag` to filter by skill tag.",
-                &[opt("tag", "string")],
+                 name, tags, and repo. Pass `tag` to filter by skill tag. Pass `workspace` to \
+                 discover the rigs of ANOTHER tenant you hold a cross-workspace delegation grant \
+                 for (an ungranted tenant is rejected).",
+                &[opt("tag", "string"), opt("workspace", "string")],
             ),
             descriptor(
                 "a2a.status",
@@ -172,12 +212,64 @@ impl DomainHandler for A2aDelegateHandler {
                     .and_then(Value::as_str)
                     .unwrap_or(&self.default_rig)
                     .to_string();
-                let parent_id = ctx
+
+                // B4 (gtcore-3f3c57): cross-workspace delegation. `origin` is the
+                // caller's authoritative tenant (resolved by the server's leak gate,
+                // so it cannot be spoofed); `dest` is the optional `workspace` arg.
+                // A `dest` other than `origin` mints the bead in that tenant's
+                // tracker — gated by an explicit grant.
+                let origin = ctx.workspace.unwrap_or(DEFAULT_WORKSPACE);
+                let dest = ctx
+                    .args
+                    .get("workspace")
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or(origin)
+                    .to_string();
+                let cross_ws = dest != origin;
+
+                // parent_id lineage: a same-workspace delegation keeps the bead-local
+                // intake epic; a cross-workspace one stamps `<origin_ws>:<parent>` so
+                // the child — living in the destination tenant — references the origin
+                // it was delegated from (B4 acceptance: "parent_id referencia al origen").
+                let parent_arg = ctx
                     .args
                     .get("parent_id")
                     .and_then(Value::as_str)
-                    .unwrap_or(&self.default_parent)
-                    .to_string();
+                    .unwrap_or(&self.default_parent);
+                let parent_id = if cross_ws {
+                    format!("{origin}:{parent_arg}")
+                } else {
+                    parent_arg.to_string()
+                };
+
+                // Resolve the tracker the bead is minted in. Same-workspace uses the
+                // wired default store unchanged; cross-workspace requires BOTH an
+                // explicit `origin->dest` grant AND a [`WorkspaceStores`] resolver,
+                // else the call is rejected (deny-by-default).
+                let dest_store: DoltIssues;
+                let store: &DoltIssues = if cross_ws {
+                    if !self.cross_ws_grants.allows(origin, &dest) {
+                        return Err(AppError::Validation(format!(
+                            "cross-workspace delegation from `{origin}` into `{dest}` is not \
+                             granted (set GT_A2A_CROSS_WS_GRANTS)"
+                        )));
+                    }
+                    let stores = self.stores.as_ref().ok_or_else(|| {
+                        AppError::Validation(
+                            "cross-workspace delegation is not configured on this server".into(),
+                        )
+                    })?;
+                    dest_store = stores
+                        .store_for(&dest)
+                        .await
+                        .map_err(|e| AppError::Other(format!("destination workspace `{dest}`: {e}")))?;
+                    &dest_store
+                } else {
+                    &*self.store
+                };
+
                 let priority = ctx
                     .args
                     .get("priority")
@@ -215,15 +307,28 @@ impl DomainHandler for A2aDelegateHandler {
                     depends_on: Vec::new(),
                     role_scope: None,
                     phase: None,
+                    // Tenant isolation is the `store` (`hq_<dest>` on a cross-ws hop,
+                    // the default store otherwise) — NOT this column, which is the
+                    // intra-DB board scope. Left empty so the card lands on the
+                    // destination tenant's default board, exactly like a normal
+                    // `issues.create` in that tenant (which never stamps the slug here).
                     workspace: String::new(),
                     dispatch: None,
                 };
 
-                let bead = run_create_issue(&self.store, &args, &NoSurfaces, false)
+                let bead = run_create_issue(store, &args, &NoSurfaces, false)
                     .await
                     .map_err(|e| AppError::Validation(e.to_string()))?;
 
-                let payload = json!({"bead": bead, "priority": priority}).to_string();
+                // The dispatch payload carries the destination workspace on a
+                // cross-workspace delegation so the scheduler/sling can route the
+                // bead to the right tenant; same-workspace stays byte-identical.
+                let payload = if cross_ws {
+                    json!({"bead": bead, "priority": priority, "workspace": dest})
+                } else {
+                    json!({"bead": bead, "priority": priority})
+                }
+                .to_string();
                 self.sink
                     .emit(payload.as_bytes())
                     .map_err(|e| AppError::Validation(format!("dispatch: {e}")))?;
@@ -231,10 +336,14 @@ impl DomainHandler for A2aDelegateHandler {
                 // B5: register the delegation so the daemon pushes the outcome
                 // back to the parent instead of the parent polling a2a.status.
                 // Best-effort — the bead is already minted + dispatched, so a
-                // tracking-log failure must not fail the delegation.
+                // tracking-log failure must not fail the delegation. The tracking
+                // event lands in the log of the workspace the bead LIVES in (the
+                // destination on a cross-workspace hop), where its terminal
+                // merge/agent facts (B5) will also appear.
+                let bead_ws = if cross_ws { Some(dest.as_str()) } else { ctx.workspace };
                 if let Some(log) = &self.delegation_log {
                     if let Err(e) = log.append(
-                        ctx.workspace,
+                        bead_ws,
                         DelegationEvent::Requested {
                             child: bead.clone(),
                             parent: ctx.actor.to_string(),
@@ -252,6 +361,11 @@ impl DomainHandler for A2aDelegateHandler {
                     "rig": rig,
                     "status": "submitted",
                     "timeout_secs": timeout_secs,
+                    // B4: echo where the bead landed so a cross-workspace caller can
+                    // confirm the destination tenant and the origin lineage.
+                    "workspace": dest,
+                    "cross_workspace": cross_ws,
+                    "parent_id": args.parent_id,
                 }))
             }
 
@@ -260,9 +374,28 @@ impl DomainHandler for A2aDelegateHandler {
             "a2a.discover" => {
                 let tag_filter = ctx.args.get("tag").and_then(Value::as_str);
 
+                // B4 (gtcore-3f3c57): optional cross-workspace discovery. Default to
+                // the caller's own tenant; a `workspace` arg naming another tenant is
+                // honoured only when the caller holds an explicit delegation grant for
+                // it, mirroring `a2a.delegate`'s gate (deny-by-default).
+                let origin = ctx.workspace.unwrap_or(DEFAULT_WORKSPACE);
+                let target = ctx
+                    .args
+                    .get("workspace")
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or(origin);
+                if target != origin && !self.cross_ws_grants.allows(origin, target) {
+                    return Err(AppError::Validation(format!(
+                        "cross-workspace discovery of `{target}` from `{origin}` is not granted \
+                         (set GT_A2A_CROSS_WS_GRANTS)"
+                    )));
+                }
+
                 let skills: Vec<Value> = match &self.pools {
                     Some(pools) => {
-                        let pool = pools.get(ctx.workspace).await?;
+                        let pool = pools.get(Some(target)).await?;
                         let repo = PgRigs::new(pool.pool().clone());
                         let rigs = repo.list().await.map_err(|e| {
                             AppError::Other(format!("rig catalog: {e}"))
@@ -296,7 +429,7 @@ impl DomainHandler for A2aDelegateHandler {
                     None => Vec::new(),
                 };
 
-                Ok(json!({ "skills": skills }))
+                Ok(json!({ "skills": skills, "workspace": target }))
             }
 
             // A7 (gtcore-3a3557): delegation status — poll a delegated bead's

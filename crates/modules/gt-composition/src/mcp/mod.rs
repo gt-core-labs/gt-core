@@ -24,6 +24,7 @@ pub mod analytics;
 pub mod comments;
 pub mod audit;
 pub mod convoy;
+pub mod cross_ws;
 pub mod dispatch;
 pub mod documents;
 pub mod email;
@@ -44,6 +45,7 @@ pub mod workspace;
 
 pub use a2a_delegate::A2aDelegateHandler;
 pub use agent::AgentHandler;
+pub use cross_ws::CrossWsGrants;
 pub use audit::AuditHandler;
 pub use convoy::ConvoyHandler;
 pub use dispatch::DispatchHandler;

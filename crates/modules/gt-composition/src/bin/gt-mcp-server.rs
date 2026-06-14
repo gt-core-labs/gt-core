@@ -30,6 +30,12 @@
 //!   pins the session-control bearer (else one is minted with the signing key,
 //!   ttl `GT_A2A_ORCHD_TOKEN_TTL_SECS`); `GT_PUBLIC_URL` names the card's
 //!   public origin (e.g. `https://gt-dev.codecsrayo.com`).
+//! - `GT_A2A_CROSS_WS_GRANTS` — cross-workspace delegation allow-list (B4,
+//!   gtcore-3f3c57): comma-separated `origin->dest` pairs (`*` wildcard on either
+//!   side), e.g. `acme->platform, ops->*`. Deny-by-default — unset ⇒ `a2a.delegate`
+//!   / `a2a.discover` only see the caller's own tenant. Cross-workspace minting
+//!   also needs `GT_DOLT_BASE_URL` (the per-tenant `hq_<dest>` routing); without it
+//!   a cross-workspace `workspace` arg is rejected.
 
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -52,7 +58,7 @@ use gt_composition::hooks::{hooks_router, HooksApiState};
 use gt_composition::kanban_rest::{kanban_rest_router, KanbanRestState};
 use gt_composition::notifications::{notifications_router, NotificationsApiState};
 use gt_composition::mcp::{
-    A2aDelegateHandler, AgentHandler, AnalyticsHandler, AuditHandler, CommentsHandler, ConvoyHandler, DispatchHandler, DocumentsHandler, EmailHandler, EscalateHandler, EventLog, EventLogHooks,
+    A2aDelegateHandler, AgentHandler, AnalyticsHandler, AuditHandler, CommentsHandler, ConvoyHandler, CrossWsGrants, DispatchHandler, DocumentsHandler, EmailHandler, EscalateHandler, EventLog, EventLogHooks,
     EventLogIssueSink, GraphHandler, IdentityDoltMeStats, InvitesHandler, MemoryHandler, MergeHandler, NotifyHandler, ReportHandler,
     PgDocumentsResource, PgRigPrefixes, PgWorkspaceStatus, QuotaBlockGuard, QuotaHandler, RigHandler,
     WorkspaceHandler, WsPools,
@@ -2286,24 +2292,45 @@ async fn build_domain_router(
                 .ok()
                 .and_then(|v| v.trim().parse::<u64>().ok())
                 .unwrap_or(gt_composition::delegation::DEFAULT_TIMEOUT_SECS);
+            // B4 (gtcore-3f3c57): cross-workspace delegation. Needs the per-tenant
+            // Dolt routing (GT_DOLT_BASE_URL — same source `with_workspaces` uses)
+            // to mint into another tenant's `hq_<dest>`, plus an explicit
+            // deny-by-default grant list (GT_A2A_CROSS_WS_GRANTS). With either
+            // absent, cross-workspace `workspace` args are rejected and only
+            // same-workspace delegation works (the legacy behaviour).
+            let cross_ws_grants = std::env::var("GT_A2A_CROSS_WS_GRANTS")
+                .ok()
+                .map(|spec| CrossWsGrants::parse(&spec))
+                .unwrap_or_else(CrossWsGrants::empty);
+            let cross_ws_stores: Option<Arc<WorkspaceStores>> = std::env::var("GT_DOLT_BASE_URL")
+                .ok()
+                .and_then(|base| WorkspaceStores::from_base_url(&base).ok())
+                .map(Arc::new);
             eprintln!(
-                "[gt-mcp-server] a2a.delegate on — rig {a2a_rig}, parent {a2a_parent}, push-callback tracking on (timeout {a2a_timeout_secs}s)"
+                "[gt-mcp-server] a2a.delegate on — rig {a2a_rig}, parent {a2a_parent}, push-callback tracking on (timeout {a2a_timeout_secs}s); cross-ws grants={} (stores {})",
+                cross_ws_grants.len(),
+                if cross_ws_stores.is_some() { "wired" } else { "off" },
             );
-            router.register(Arc::new(
-                A2aDelegateHandler::new(
-                    Arc::new(delegate_dolt),
-                    sink.clone(),
-                    a2a_rig,
-                    a2a_parent,
-                )
-                // A7 (gtcore-3a3557): wire the per-workspace pool cache so
-                // a2a.discover can read the rig catalog for peer discovery.
-                .with_pools(ws_pools.clone())
-                // B5 (gtcore-1bda00): register each delegation on the event log
-                // so the orchd callback plugin + timeout ticker push the outcome
-                // back to the parent instead of the parent polling a2a.status.
-                .with_delegation_log(event_log.clone(), a2a_timeout_secs),
-            ))
+            let mut handler = A2aDelegateHandler::new(
+                Arc::new(delegate_dolt),
+                sink.clone(),
+                a2a_rig,
+                a2a_parent,
+            )
+            // A7 (gtcore-3a3557): wire the per-workspace pool cache so
+            // a2a.discover can read the rig catalog for peer discovery.
+            .with_pools(ws_pools.clone())
+            // B5 (gtcore-1bda00): register each delegation on the event log
+            // so the orchd callback plugin + timeout ticker push the outcome
+            // back to the parent instead of the parent polling a2a.status.
+            .with_delegation_log(event_log.clone(), a2a_timeout_secs);
+            // B4: enable cross-workspace minting only when the per-tenant store
+            // resolver is available; the grant list alone (without routing) cannot
+            // reach another tenant's tracker.
+            if let Some(stores) = cross_ws_stores {
+                handler = handler.with_cross_ws(stores, cross_ws_grants);
+            }
+            router.register(Arc::new(handler))
         }
         _ => {
             eprintln!("[gt-mcp-server] a2a.delegate off — GT_A2A_DEFAULT_RIG / GT_A2A_INTAKE_EPIC / GT_DOLT_URL / dispatch channel required");
