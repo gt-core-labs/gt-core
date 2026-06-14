@@ -7,6 +7,7 @@ use std::collections::{BTreeMap, HashMap};
 
 use serde::{Deserialize, Serialize};
 
+use crate::budget::BudgetLedger;
 use crate::cost::{cost_units, ModelWeights};
 use crate::events::QuotaEvent;
 
@@ -259,6 +260,20 @@ impl AccountRegistry {
         self.predicted_in_window.remove(account);
     }
 
+    /// Normalize a token sample into cost units using this registry's configured per-model
+    /// weights (B1, gtcore-ab170f). The budget ledger calls this so live per-session spend uses
+    /// the same calibration as the account window, while replay falls back to IDENTITY.
+    pub fn cost_units(
+        &self,
+        model: &str,
+        input: u64,
+        output: u64,
+        cache_read: u64,
+        cache_creation: u64,
+    ) -> f64 {
+        cost_units(model, input, output, cache_read, cache_creation, &self.weights).0
+    }
+
     /// Fold one local usage sample: add its normalized cost to the live window and update the
     /// per-account and per-session rate EWMAs. The clock enters as `now_secs` data; no wall
     /// clock is read. Shared by `QuotaMsg::Sample` and `SampleTokens` (`commands.rs`) so both
@@ -463,6 +478,12 @@ pub struct QuotaState {
     /// `AccountRegistered`/`AccountDeregistered` (`hq-quota-accounts.1`). The daemon replays this to
     /// seed its credential keychain (`.2`), so it does not depend on the `GT_CLAUDE_ACCOUNTS` env.
     pub registered: BTreeMap<String, String>,
+    /// Per-session budget ledger (B1, gtcore-ab170f): cumulative tokens + execution minutes per
+    /// session, attributed to a bead. Rebuilt by folding `TokensSampled` (spend) and the
+    /// `SessionBudget*`/`BudgetExceeded` events (attribution + alert latch). The replay uses
+    /// IDENTITY cost weights, same as the account window above — calibration is a live-edge
+    /// concern, not a replay one.
+    pub budgets: BudgetLedger,
 }
 
 impl QuotaState {
@@ -470,13 +491,13 @@ impl QuotaState {
         match event {
             QuotaEvent::TokensSampled {
                 account,
+                session,
                 model,
                 input,
                 output,
                 cache_read,
                 cache_creation,
                 now_secs,
-                ..
             } => {
                 // Fold the sample's cost into the account's window so the rebuilt state (hence the
                 // REST `Usage`/`Window`/`Resets` columns via `AccountRegistry::from_state`) renders
@@ -516,6 +537,26 @@ impl QuotaState {
                     // replay must rebuild it byte-for-byte.
                     entry.sampled_since_probe += cost.0;
                 }
+                // B1: fold the same sample into the per-session budget ledger. The cost is
+                // recomputed with IDENTITY weights so the ledger rebuilds independently of
+                // whether the account had a window (an early sample still attributes spend).
+                let session_cost = cost_units(
+                    model,
+                    *input,
+                    *output,
+                    *cache_read,
+                    *cache_creation,
+                    &HashMap::new(),
+                );
+                self.budgets.record(
+                    session.clone(),
+                    session_cost.0,
+                    *input,
+                    *output,
+                    *cache_read,
+                    *cache_creation,
+                    *now_secs,
+                );
             }
             QuotaEvent::UsageProbed {
                 account,
@@ -642,6 +683,16 @@ impl QuotaState {
                 self.registered.remove(account);
                 self.accounts.remove(account);
             }
+            // Per-session budget lifecycle (B1, gtcore-ab170f) → fold into the ledger.
+            QuotaEvent::SessionBudgetOpened { session, bead, limit_cost, now_secs } => {
+                self.budgets.open(session.clone(), bead.clone(), *limit_cost, *now_secs);
+            }
+            QuotaEvent::BudgetExceeded { session, now_secs, .. } => {
+                self.budgets.mark_exceeded(session, *now_secs);
+            }
+            QuotaEvent::SessionBudgetClosed { session, now_secs } => {
+                self.budgets.close(session, *now_secs);
+            }
         }
     }
 }
@@ -682,6 +733,63 @@ mod tests {
         });
         assert!(s.registered.is_empty());
         assert!(!s.accounts.contains_key("acctB"));
+    }
+
+    #[test]
+    fn budget_ledger_rebuilds_from_the_log_with_attribution_and_minutes() {
+        // B1, gtcore-ab170f: replaying open + samples + close rebuilds the per-session budget,
+        // including bead attribution and the execution-minute span. Cost is IDENTITY-weighted in
+        // replay (input+output+cache), matching the account-window reducer.
+        let mut s = QuotaState::default();
+        s.apply(&QuotaEvent::SessionBudgetOpened {
+            session: "sess-a".into(),
+            bead: Some("gtcore-ab170f".into()),
+            limit_cost: Some(1000.0),
+            now_secs: 0,
+        });
+        s.apply(&QuotaEvent::TokensSampled {
+            account: "acc-1".into(),
+            session: "sess-a".into(),
+            model: "opus".into(),
+            input: 100,
+            output: 200,
+            cache_read: 0,
+            cache_creation: 0,
+            now_secs: 60,
+        });
+        s.apply(&QuotaEvent::SessionBudgetClosed {
+            session: "sess-a".into(),
+            now_secs: 300, // 5 minutes after open
+        });
+
+        let b = s.budgets.get("sess-a").expect("budget rebuilt");
+        assert_eq!(b.bead.as_deref(), Some("gtcore-ab170f"));
+        assert_eq!(b.total_tokens(), 300);
+        assert!((b.cost - 300.0).abs() < 1e-9, "IDENTITY cost = 100+200");
+        assert!((b.elapsed_minutes() - 5.0).abs() < 1e-9);
+        assert_eq!(b.limit_cost, Some(1000.0));
+        assert!(!b.exceeded, "300 < 1000");
+        // Per-bead attribution is queryable off the rebuilt ledger.
+        assert!((s.budgets.cost_for_bead("gtcore-ab170f") - 300.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn budget_exceeded_event_latches_the_session_on_replay() {
+        let mut s = QuotaState::default();
+        s.apply(&QuotaEvent::SessionBudgetOpened {
+            session: "sess-a".into(),
+            bead: Some("b".into()),
+            limit_cost: Some(50.0),
+            now_secs: 0,
+        });
+        s.apply(&QuotaEvent::BudgetExceeded {
+            session: "sess-a".into(),
+            bead: Some("b".into()),
+            consumed_cost: 80.0,
+            limit_cost: 50.0,
+            now_secs: 120,
+        });
+        assert!(s.budgets.get("sess-a").unwrap().exceeded);
     }
 
     #[test]

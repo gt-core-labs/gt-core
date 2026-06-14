@@ -98,6 +98,41 @@ pub enum QuotaEvent {
         account: String,
         now_secs: u64,
     },
+    /// A per-session budget was opened (B1, gtcore-ab170f): the edge stamps the `bead` the
+    /// session is working and an optional cost-unit `limit` at spawn. This is what makes the
+    /// accumulated `TokensSampled` spend attributable per bead, and arms the budget-exceeded
+    /// alert. Additive: a session whose budget is never opened still accumulates tokens, just
+    /// without a bead or a limit.
+    SessionBudgetOpened {
+        session: String,
+        /// Bead the session is working (`GT_HOOK_BEAD` at the edge). `None` when the session is
+        /// not bead-scoped (e.g. an interactive mayor/dog).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        bead: Option<String>,
+        /// Budget ceiling in cost units. `None` ⇒ track spend without alerting.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        limit_cost: Option<f64>,
+        now_secs: u64,
+    },
+    /// A session's accumulated spend crossed its budget for the first time (B1). Emitted once
+    /// per session (the crossing is latched), so a downstream alerting edge fires a single
+    /// budget-exceeded notification rather than one per sample past the line.
+    BudgetExceeded {
+        session: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        bead: Option<String>,
+        /// Running cost at the crossing, in cost units.
+        consumed_cost: f64,
+        /// The ceiling that was crossed, in cost units.
+        limit_cost: f64,
+        now_secs: u64,
+    },
+    /// A per-session budget was closed (B1): the session ended. Stamps the final activity instant
+    /// so the execution-minute span covers up to shutdown.
+    SessionBudgetClosed {
+        session: String,
+        now_secs: u64,
+    },
 }
 
 impl EventKind for QuotaEvent {
@@ -112,6 +147,11 @@ impl EventKind for QuotaEvent {
             QuotaEvent::Blocked { .. } => "quota.blocked.v1",
             QuotaEvent::AccountRegistered { .. } => "quota.account_registered.v1",
             QuotaEvent::AccountDeregistered { .. } => "quota.account_deregistered.v1",
+            // Per-session budget lifecycle (B1, gtcore-ab170f). Born versioned + kebab — no
+            // legacy bare-kind records exist. Still under the `quota.` NS so they replay.
+            QuotaEvent::SessionBudgetOpened { .. } => "quota.session_budget_opened.v1",
+            QuotaEvent::BudgetExceeded { .. } => "quota.budget_exceeded.v1",
+            QuotaEvent::SessionBudgetClosed { .. } => "quota.session_budget_closed.v1",
         }
     }
 }

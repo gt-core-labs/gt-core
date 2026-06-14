@@ -12,6 +12,7 @@ use tokio::sync::{mpsc, oneshot};
 
 use gt_events::{AppError, Command, Envelope};
 
+use crate::budget::{BudgetLedger, SessionBudget};
 use crate::commands::QuotaCommand;
 use crate::cost::ModelWeights;
 use crate::events::QuotaEvent;
@@ -89,6 +90,22 @@ pub enum QuotaMsg {
         account: String,
         now_secs: u64,
     },
+    /// Open (or refresh) a per-session budget (B1, gtcore-ab170f): stamp the `bead` the session
+    /// works and an optional cost-unit limit. Emits `SessionBudgetOpened`.
+    OpenBudget {
+        session: String,
+        bead: Option<String>,
+        limit_cost: Option<f64>,
+        now_secs: u64,
+    },
+    /// Close a per-session budget (B1): the session ended; finalizes the execution-minute span.
+    /// Emits `SessionBudgetClosed`.
+    CloseBudget {
+        session: String,
+        now_secs: u64,
+    },
+    /// Read-only snapshot of every per-session budget (B1) — the cost-attribution surface.
+    BudgetSnapshot(oneshot::Sender<Vec<SessionBudget>>),
     /// Diagnostics: (live accounts, predictions emitted).
     Snapshot(oneshot::Sender<(usize, usize)>),
     /// Read-only snapshot of every registered account. The edge needs this to pick a healthy
@@ -159,6 +176,47 @@ impl QuotaHandle {
                 now_secs,
             })
             .await;
+    }
+
+    /// Open (or refresh) a per-session budget (B1, gtcore-ab170f). The edge calls this at session
+    /// spawn with the bead (`GT_HOOK_BEAD`) and, when configured, a cost-unit ceiling.
+    pub async fn open_budget(
+        &self,
+        session: impl Into<String>,
+        bead: Option<String>,
+        limit_cost: Option<f64>,
+        now_secs: u64,
+    ) {
+        let _ = self
+            .tx
+            .send(QuotaMsg::OpenBudget {
+                session: session.into(),
+                bead,
+                limit_cost,
+                now_secs,
+            })
+            .await;
+    }
+
+    /// Close a per-session budget (B1) at session end, finalizing its execution-minute span.
+    pub async fn close_budget(&self, session: impl Into<String>, now_secs: u64) {
+        let _ = self
+            .tx
+            .send(QuotaMsg::CloseBudget {
+                session: session.into(),
+                now_secs,
+            })
+            .await;
+    }
+
+    /// Owned snapshot of every per-session budget (B1) — token spend, execution minutes, and
+    /// bead attribution. The cost-attribution read surface for operators / reports.
+    pub async fn budgets(&self) -> Vec<SessionBudget> {
+        let (reply, rx) = oneshot::channel();
+        if self.tx.send(QuotaMsg::BudgetSnapshot(reply)).await.is_err() {
+            return Vec::new();
+        }
+        rx.await.unwrap_or_default()
     }
 
     pub async fn probe(
@@ -348,6 +406,10 @@ pub fn spawn_hydrated(
         let mut registry = initial;
         registry.set_weights(weights);
         let mut predictions_emitted: usize = predictions_seen;
+        // B1 (gtcore-ab170f): per-session budget ledger. Starts empty and re-converges from the
+        // `TokensSampled` stream after a restart (telemetry, like the EWMA rates above); the bead
+        // attribution + limit re-arrive from the edge's `open_budget` at the next spawn.
+        let mut budgets = BudgetLedger::default();
 
         while let Some(msg) = rx.recv().await {
             match msg {
@@ -378,6 +440,22 @@ pub fn spawn_hydrated(
                         cache_creation,
                         now_secs,
                     );
+                    // B1: fold the same sample into the per-session budget ledger (cost weighted
+                    // by the registry's per-model calibration). If this sample is the one that
+                    // first crosses the budget, capture the alert fields before the event below
+                    // moves `session`/`account` out.
+                    let sample_cost = registry
+                        .cost_units(&model, input, output, cache_read, cache_creation);
+                    let crossed = budgets.record(
+                        session.clone(),
+                        sample_cost,
+                        input,
+                        output,
+                        cache_read,
+                        cache_creation,
+                        now_secs,
+                    );
+                    let budget_alert = crossed.then(|| budgets.get(&session).cloned()).flatten();
                     let _ = events
                         .send(Envelope::root(QuotaEvent::TokensSampled {
                             account,
@@ -390,6 +468,18 @@ pub fn spawn_hydrated(
                             now_secs,
                         }))
                         .await;
+                    // Emit the budget-exceeded alert once, right after the sample that crossed.
+                    if let Some(b) = budget_alert {
+                        let _ = events
+                            .send(Envelope::root(QuotaEvent::BudgetExceeded {
+                                session: b.session,
+                                bead: b.bead,
+                                consumed_cost: b.cost,
+                                limit_cost: b.limit_cost.unwrap_or(0.0),
+                                now_secs,
+                            }))
+                            .await;
+                    }
                 }
                 QuotaMsg::Probe {
                     account,
@@ -666,6 +756,34 @@ pub fn spawn_hydrated(
                         }))
                         .await;
                 }
+                QuotaMsg::OpenBudget {
+                    session,
+                    bead,
+                    limit_cost,
+                    now_secs,
+                } => {
+                    budgets.open(session.clone(), bead.clone(), limit_cost, now_secs);
+                    let _ = events
+                        .send(Envelope::root(QuotaEvent::SessionBudgetOpened {
+                            session,
+                            bead,
+                            limit_cost,
+                            now_secs,
+                        }))
+                        .await;
+                }
+                QuotaMsg::CloseBudget { session, now_secs } => {
+                    budgets.close(&session, now_secs);
+                    let _ = events
+                        .send(Envelope::root(QuotaEvent::SessionBudgetClosed {
+                            session,
+                            now_secs,
+                        }))
+                        .await;
+                }
+                QuotaMsg::BudgetSnapshot(reply) => {
+                    let _ = reply.send(budgets.snapshot());
+                }
                 QuotaMsg::Snapshot(reply) => {
                     let _ = reply.send((registry.accounts().count(), predictions_emitted));
                 }
@@ -726,5 +844,60 @@ mod tests {
         q.deregister_account("acctB", 200).await;
         let (accounts, _) = q.snapshot().await;
         assert_eq!(accounts, 0, "deregistered account dropped from the registry");
+    }
+
+    #[tokio::test]
+    async fn budget_tracks_per_session_and_emits_exceeded_once() {
+        // B1, gtcore-ab170f: opening a budget stamps the bead + limit; samples accumulate the
+        // per-session spend and execution span; the first sample past the limit emits a single
+        // BudgetExceeded. IDENTITY weights → cost == input+output.
+        let (tx, mut rx) = mpsc::channel::<Envelope<QuotaEvent>>(32);
+        let q = spawn(tx, std::collections::HashMap::new());
+
+        q.open_budget("sess-a", Some("gtcore-ab170f".into()), Some(150.0), 0).await;
+        // Drain the SessionBudgetOpened.
+        let env = rx.recv().await.expect("opened emitted");
+        assert_eq!(env.payload.kind(), "quota.session_budget_opened.v1");
+
+        // Under budget: cost 100 < 150, only a TokensSampled is emitted.
+        q.sample("acc-1", "sess-a", "opus", 60, 40, 0, 0, 60).await;
+        let env = rx.recv().await.expect("sample emitted");
+        assert_eq!(env.payload.kind(), "quota.tokens_sampled.v1");
+
+        // Over budget: cumulative 100 + 100 = 200 > 150 → TokensSampled THEN one BudgetExceeded.
+        q.sample("acc-1", "sess-a", "opus", 60, 40, 0, 0, 120).await;
+        let env = rx.recv().await.expect("second sample emitted");
+        assert_eq!(env.payload.kind(), "quota.tokens_sampled.v1");
+        let env = rx.recv().await.expect("budget exceeded emitted");
+        match env.payload {
+            QuotaEvent::BudgetExceeded { session, bead, consumed_cost, limit_cost, .. } => {
+                assert_eq!(session, "sess-a");
+                assert_eq!(bead.as_deref(), Some("gtcore-ab170f"));
+                assert!((consumed_cost - 200.0).abs() < 1e-9);
+                assert!((limit_cost - 150.0).abs() < 1e-9);
+            }
+            other => panic!("expected BudgetExceeded, got {other:?}"),
+        }
+
+        // A third over-budget sample must NOT re-emit the alert (latched): the only event is the
+        // sample itself.
+        q.sample("acc-1", "sess-a", "opus", 10, 0, 0, 0, 180).await;
+        let env = rx.recv().await.expect("third sample emitted");
+        assert_eq!(env.payload.kind(), "quota.tokens_sampled.v1");
+
+        q.close_budget("sess-a", 300).await;
+        let env = rx.recv().await.expect("closed emitted");
+        assert_eq!(env.payload.kind(), "quota.session_budget_closed.v1");
+
+        // The snapshot reflects accumulated tokens, the 5-minute span (open@0 → close@300), and
+        // the latched bead attribution.
+        let budgets = q.budgets().await;
+        assert_eq!(budgets.len(), 1);
+        let b = &budgets[0];
+        assert_eq!(b.session, "sess-a");
+        assert_eq!(b.bead.as_deref(), Some("gtcore-ab170f"));
+        assert_eq!(b.total_tokens(), 210);
+        assert!(b.exceeded);
+        assert!((b.elapsed_minutes() - 5.0).abs() < 1e-9);
     }
 }

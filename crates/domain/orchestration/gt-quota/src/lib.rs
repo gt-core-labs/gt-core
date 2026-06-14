@@ -29,11 +29,14 @@ pub mod oauth_usage;
 pub mod probe;
 pub mod repo;
 
+pub mod budget;
+
 mod cost;
 mod events;
 mod state;
 
 pub use actor::QuotaHandle;
+pub use budget::{BudgetLedger, SessionBudget};
 pub use commands::{
     ProbeWindow, QuotaCommand, RegisterAccount, RetireAccount, RotateAccount, SampleTokens,
 };
