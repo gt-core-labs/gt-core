@@ -139,6 +139,13 @@ impl Plugin for SchedulerPlugin {
                 self.sched.capacity_freed().await;
                 Ok(())
             }
+            "merge.failed.v1" => {
+                if let MergeEvent::Failed { bead, .. } = record.decode::<MergeEvent>()? {
+                    self.sched.capacity_freed().await;
+                    self.sched.enqueue(bead, 5).await;
+                }
+                Ok(())
+            }
             _ => Ok(()),
         }
     }
