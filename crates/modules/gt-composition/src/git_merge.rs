@@ -25,6 +25,7 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::time::Duration;
 
 use async_trait::async_trait;
 
@@ -260,6 +261,85 @@ fn resolve_sha(rig: &Path, branch: &str) -> MergeOutcome {
     }
 }
 
+/// Poll a PR's status until it resolves (merged or CI-failed). Runs as a background task
+/// spawned after creating a PR with auto-merge. Drives the merge slot to its terminal state
+/// and, on failure, the `merge.failed.v1` event triggers re-dispatch through the reactor.
+async fn poll_pr_until_resolved(merge: MergeHandle, rig: PathBuf, bead: String, branch: String) {
+    const POLL_INTERVAL: Duration = Duration::from_secs(60);
+    const MAX_POLLS: u32 = 30; // ~30 min max wait
+
+    for attempt in 1..=MAX_POLLS {
+        tokio::time::sleep(POLL_INTERVAL).await;
+        let rig_c = rig.clone();
+        let branch_c = branch.clone();
+        let result = tokio::task::spawn_blocking(move || {
+            cmd(
+                "gh",
+                &[
+                    "pr", "view", &branch_c,
+                    "--json", "state,mergeCommit,statusCheckRollup",
+                ],
+                &rig_c,
+            )
+        })
+        .await;
+
+        let Ok(Ok((true, json_str))) = result else {
+            eprintln!("[ci-gate] {bead}: poll {attempt}/{MAX_POLLS} — gh pr view failed, retrying");
+            continue;
+        };
+
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(&json_str) else {
+            continue;
+        };
+
+        match v["state"].as_str() {
+            Some("MERGED") => {
+                let sha = v["mergeCommit"]
+                    .get("oid")
+                    .and_then(|o| o.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                eprintln!("[ci-gate] {bead}: PR merged @ {sha}");
+                merge.complete(&bead, sha).await;
+                return;
+            }
+            Some("CLOSED") => {
+                eprintln!("[ci-gate] {bead}: PR closed without merge");
+                merge.fail(&bead, "PR closed without merge").await;
+                return;
+            }
+            _ => {}
+        }
+
+        // Check if any CI check failed (PR still open).
+        if let Some(checks) = v["statusCheckRollup"].as_array() {
+            let all_done = checks.iter().all(|c| {
+                matches!(c["status"].as_str(), Some("COMPLETED"))
+            });
+            let any_failed = checks.iter().any(|c| {
+                matches!(c["conclusion"].as_str(), Some("FAILURE") | Some("CANCELLED"))
+            });
+            if all_done && any_failed {
+                let names: Vec<&str> = checks
+                    .iter()
+                    .filter(|c| matches!(c["conclusion"].as_str(), Some("FAILURE") | Some("CANCELLED")))
+                    .filter_map(|c| c["name"].as_str())
+                    .collect();
+                let reason = format!("CI failed: {}", names.join(", "));
+                eprintln!("[ci-gate] {bead}: {reason}");
+                merge.fail(&bead, reason).await;
+                return;
+            }
+        }
+
+        eprintln!("[ci-gate] {bead}: poll {attempt}/{MAX_POLLS} — still pending");
+    }
+
+    eprintln!("[ci-gate] {bead}: gave up after {MAX_POLLS} polls");
+    merge.fail(&bead, "CI gate timed out").await;
+}
+
 /// The git-merge edge-effect observer (`hq-orchd-deploy.12`). On `merge.started.v1` it resolves
 /// the slot's branch from the live board and lands it on `main` from the rig checkout, then drives
 /// the slot to `Merged`/`Failed` through the merge actor. Registered by the bin on the hub relay
@@ -364,8 +444,17 @@ impl Plugin for GitMergePlugin {
 
         match outcome {
             Ok(ref sha_or_url) if ci_gated => {
-                // PR created — don't complete yet. The webhook will complete when CI passes.
                 eprintln!("[git-merge] {bead}: PR submitted for CI gate → {sha_or_url}");
+                let merge_for_poll = self.merge.clone();
+                let rig_for_poll = self.rig_for(&bead).to_path_buf();
+                let bead_for_poll = bead.clone();
+                let branch_for_poll = branch.clone();
+                tokio::spawn(poll_pr_until_resolved(
+                    merge_for_poll,
+                    rig_for_poll,
+                    bead_for_poll,
+                    branch_for_poll,
+                ));
             }
             Ok(sha) => {
                 eprintln!("[git-merge] {bead}: pushed {branch} → main @ {sha}");
