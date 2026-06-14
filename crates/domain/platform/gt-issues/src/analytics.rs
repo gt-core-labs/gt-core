@@ -150,10 +150,15 @@ pub struct AnalyticsSummary {
     pub workspace: String,
     /// `today` used for the date math (`YYYY-MM-DD`), echoed for reproducibility.
     pub today: String,
+    /// Progress metrics (velocity, completion rate).
     pub avance: Avance,
+    /// Error / defect metrics.
     pub errores: Errores,
+    /// Pending-work breakdown.
     pub pendientes: Pendientes,
+    /// Overdue / delay metrics.
     pub retrasos: Retrasos,
+    /// Time-tracking totals.
     pub horas: Horas,
     /// Work distribution by status (whole scope).
     pub by_status: Vec<Slice>,

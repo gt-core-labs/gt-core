@@ -722,7 +722,7 @@ mod tests {
 
     #[test]
     fn register_rejects_invalid_id_and_empty_label() {
-        let mut state = SkillCatalog::default();
+        let state = SkillCatalog::default();
         let bad_id = RegisterSkill {
             skill: "has spaces".into(),
             label: "x".into(),

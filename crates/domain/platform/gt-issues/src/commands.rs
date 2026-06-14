@@ -101,12 +101,6 @@ fn check_depends_on(id: &str, deps: &[String]) -> Result<(), AppError> {
     Ok(())
 }
 
-/// JSON-array string for a list of plain strings; `"[]"` on the (infallible)
-/// serialize error path, matching the store's NOT-NULL default.
-fn to_json_array(items: &[String]) -> String {
-    serde_json::to_string(items).unwrap_or_else(|_| "[]".to_string())
-}
-
 /// JSON-array string for the closed-set [`Domain`] values (e.g.
 /// `["orch.merge","store.dolt"]`). Same NOT-NULL `"[]"` fallback.
 fn domain_to_json(items: &[Domain]) -> String {
