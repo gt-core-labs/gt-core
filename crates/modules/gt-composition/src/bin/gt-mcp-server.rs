@@ -1142,7 +1142,7 @@ async fn main() -> anyhow::Result<()> {
     // `build_domain_router`'s gating — without Postgres they have no backing. The REST backings
     // are independent handles (their own pool / pool-cache / event-log provider) over the same
     // stores, so the MCP dispatch wired above is untouched.
-    let agent_root = std::env::var("GT_EVENTLOG_ROOT")
+    let eventlog_root = std::env::var("GT_EVENTLOG_ROOT")
         .map(std::path::PathBuf::from)
         .unwrap_or_else(|_| std::path::PathBuf::from(DEFAULT_EVENTLOG_ROOT));
     // The orchd dispatch channel dir (hq-agent-auto-dispatch.1): a POST /api/v1/agent with
@@ -1164,7 +1164,7 @@ async fn main() -> anyhow::Result<()> {
     // channel dir — captured before `agent_dispatch_channel` moves into the REST
     // module parts below.
     let a2a_dispatch_channel = agent_dispatch_channel.clone();
-    let accounts_root = gt_composition::account_dirs::accounts_root(&agent_root);
+    let accounts_root = gt_composition::account_dirs::accounts_root(&eventlog_root);
     let skills_seed_workspace =
         std::env::var("GT_WORKSPACE").unwrap_or_else(|_| "default".to_string());
 
@@ -1217,7 +1217,6 @@ async fn main() -> anyhow::Result<()> {
             meta_store,
             actor: actor.clone(),
             meta_tools,
-            agent_root,
             dispatch_channel: agent_dispatch_channel,
             event_log: event_log.clone(),
             accounts_root,
