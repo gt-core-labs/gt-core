@@ -73,6 +73,16 @@ pub enum RigEvent {
         new: PathBuf,
         now_secs: u64,
     },
+    /// The rig's semantic capability tags changed (B3, gtcore-1caa48). Carries both sides of the
+    /// transition (the full normalised sets, replace not merge) so the audit log + reducer
+    /// reconstruct it. Tag-based peer selection in `a2a.discover` is the consumer; there is no
+    /// filesystem side-effect.
+    TagsChanged {
+        rig: String,
+        old: Vec<String>,
+        new: Vec<String>,
+        now_secs: u64,
+    },
 }
 
 impl EventKind for RigEvent {
@@ -84,6 +94,7 @@ impl EventKind for RigEvent {
             RigEvent::PrefixChanged { .. } => "rig.prefix_changed.v1",
             RigEvent::DefaultBranchChanged { .. } => "rig.default_branch_changed.v1",
             RigEvent::WorktreeRootChanged { .. } => "rig.worktree_root_changed.v1",
+            RigEvent::TagsChanged { .. } => "rig.tags_changed.v1",
         }
     }
 }

@@ -38,7 +38,8 @@ pub use pg::PgRigs;
 
 pub use actor::{spawn, spawn_hydrated, RigHandle, RigMsg};
 pub use commands::{
-    AddRig, AdoptRig, RemoveRig, RigCommand, SetRigDefaultBranch, SetRigPrefix, SetRigWorktreeRoot,
+    AddRig, AdoptRig, RemoveRig, RigCommand, SetRigDefaultBranch, SetRigPrefix, SetRigTags,
+    SetRigWorktreeRoot,
 };
 pub use events::RigEvent;
 #[cfg(feature = "axum")]
@@ -49,6 +50,7 @@ pub use module::RigsModule;
 pub use repo::{InMemoryRigs, RigRepository};
 pub use rig_seed::{seed_rigs, SeedRig, SEED_JSON as RIGS_SEED_JSON};
 pub use state::{
-    validate_prefix, validate_rig_name, validate_worktree_root, RigCatalog, RigEntry, RigState,
-    MAX_PREFIX_LEN, MAX_WORKTREE_ROOT_LEN, RESERVED_RIG_NAMES,
+    normalize_semantic_tags, validate_prefix, validate_rig_name, validate_semantic_tags,
+    validate_worktree_root, RigCatalog, RigEntry, RigState, MAX_PREFIX_LEN, MAX_SEMANTIC_TAGS,
+    MAX_SEMANTIC_TAG_LEN, MAX_WORKTREE_ROOT_LEN, RESERVED_RIG_NAMES,
 };

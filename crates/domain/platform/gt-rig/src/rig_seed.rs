@@ -84,6 +84,7 @@ impl SeedRig {
             registered_at_secs: now_secs,
             worktree_root: self.worktree_root.map(std::path::PathBuf::from),
             git_connection_ref: self.git_connection_ref,
+            semantic_tags: Vec::new(),
         }
     }
 }

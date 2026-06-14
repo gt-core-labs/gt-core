@@ -24,7 +24,7 @@ use gt_mcp_server::{DomainCtx, DomainHandler, WorkspaceRigPrefixes};
 use gt_module::McpTool;
 use gt_rig::{
     AddRig, AdoptRig, PgRigs, RemoveRig, RigCatalog, RigEntry, RigRepository, SetRigDefaultBranch,
-    SetRigPrefix, SetRigWorktreeRoot, RESERVED_RIG_NAMES,
+    SetRigPrefix, SetRigTags, SetRigWorktreeRoot, RESERVED_RIG_NAMES,
 };
 use gt_store_dolt::AppError;
 
@@ -90,6 +90,13 @@ impl DomainHandler for RigHandler {
                 &[req("name", "string"), req("new_root", "string")],
             ),
             descriptor(
+                "rig.set-tags",
+                "Replace a rig's semantic capability tags (e.g. rust, frontend, infra) so peers \
+                 can find it by capability via a2a.discover. Pass the full desired set; \
+                 normalised (lowercased, deduped). An empty list clears all tags.",
+                &[req("name", "string"), opt("tags", "array")],
+            ),
+            descriptor(
                 "rig.remove",
                 "Remove a rig from the catalog.",
                 &[req("name", "string")],
@@ -131,6 +138,10 @@ impl DomainHandler for RigHandler {
             }
             "rig.set-worktree-root" => {
                 let cmd: SetRigWorktreeRoot = parse_cmd(ctx.args)?;
+                apply_and_upsert(&repo, cmd.name.clone(), &cmd).await
+            }
+            "rig.set-tags" => {
+                let cmd: SetRigTags = parse_cmd(ctx.args)?;
                 apply_and_upsert(&repo, cmd.name.clone(), &cmd).await
             }
             "rig.remove" => {
@@ -271,6 +282,7 @@ fn entry_json(entry: &RigEntry) -> Value {
         "registered_at_secs": entry.registered_at_secs,
         "worktree_root": entry.worktree_root,
         "git_connection_ref": entry.git_connection_ref,
+        "semantic_tags": entry.semantic_tags,
     })
 }
 
@@ -323,12 +335,15 @@ mod tests {
             return;
         };
         let pool = PgPool::connect(&url).await.expect("connect postgres");
-        // The module owns the `rigs` schema (ws_default template); apply it.
+        // The module owns the `rigs` schema (ws_default template); apply every migration in
+        // order so follow-on columns (worktree_root, git_connection_ref, semantic_tags) exist.
         let migs = gt_rig::RigsModule.migrations();
-        sqlx::raw_sql(&migs[0].sql)
-            .execute(&pool)
-            .await
-            .expect("apply rigs migration");
+        for mig in &migs {
+            sqlx::raw_sql(&mig.sql)
+                .execute(&pool)
+                .await
+                .unwrap_or_else(|e| panic!("apply rigs migration {}: {e}", mig.name));
+        }
         sqlx::raw_sql("DELETE FROM ws_default.rigs WHERE name = 'dispatchrig'")
             .execute(&pool)
             .await
@@ -394,6 +409,24 @@ mod tests {
         assert_eq!(
             info3["worktree_root"], "/srv/wt/dispatchrig",
             "worktree_root override persisted to PG"
+        );
+
+        // Set semantic tags (B3); they normalise + round-trip through the new TEXT[] column.
+        handler
+            .dispatch(
+                "rig.set-tags",
+                ctx(json!({ "name": "dispatchrig", "tags": [" Rust ", "infra", "RUST"] })),
+            )
+            .await
+            .unwrap();
+        let info_tags = handler
+            .dispatch("rig.info", ctx(json!({ "name": "dispatchrig" })))
+            .await
+            .unwrap();
+        assert_eq!(
+            info_tags["semantic_tags"],
+            json!(["rust", "infra"]),
+            "semantic_tags normalised + persisted to PG"
         );
 
         // Resolve the rig back from its (changed) prefix.

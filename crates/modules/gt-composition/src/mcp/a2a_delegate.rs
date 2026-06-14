@@ -8,8 +8,10 @@
 //!
 //! - **`a2a.discover`** (A7, gtcore-3a3557): returns the Agent Card skills for
 //!   every rig in the caller's workspace, so an agent can decide which peer to
-//!   delegate to based on capabilities (tags, repo, branch). Optionally filters
-//!   by a `tag` argument for skill matching.
+//!   delegate to based on capabilities (tags, repo, branch). Each skill's tags are
+//!   the rig's bead prefix plus its semantic capability tags (B3, gtcore-1caa48 —
+//!   set via `rig.set-tags`); the optional `tag` argument filters on either,
+//!   case-insensitively, for skill matching.
 //!
 //! - **`a2a.status`** (A7, gtcore-3a3557): queries the tracker for a previously
 //!   delegated bead, returning its status + title so the delegating agent can
@@ -196,9 +198,11 @@ impl DomainHandler for A2aDelegateHandler {
                 "a2a.discover",
                 "Discover peer agent capabilities. Returns one Agent Card skill per rig in \
                  the workspace catalog, so you can decide which peer to delegate to based on \
-                 name, tags, and repo. Pass `tag` to filter by skill tag. Pass `workspace` to \
-                 discover the rigs of ANOTHER tenant you hold a cross-workspace delegation grant \
-                 for (an ungranted tenant is rejected).",
+                 name, tags, and repo. Each skill's `tags` carry the rig's bead prefix plus its \
+                 semantic capability tags (e.g. rust, frontend, infra; set via rig.set-tags). \
+                 Pass `tag` to filter by prefix OR semantic tag (case-insensitive). Pass \
+                 `workspace` to discover the rigs of ANOTHER tenant you hold a cross-workspace \
+                 delegation grant for (an ungranted tenant is rejected).",
                 &[opt("tag", "string"), opt("workspace", "string")],
             ),
             descriptor(
@@ -449,6 +453,9 @@ impl DomainHandler for A2aDelegateHandler {
                         let rigs = repo.list().await.map_err(|e| {
                             AppError::Other(format!("rig catalog: {e}"))
                         })?;
+                        // B3 (gtcore-1caa48): normalise the filter the same way tags are stored
+                        // (lowercase) so `tag=Rust` matches a rig tagged `rust`.
+                        let tag_filter = tag_filter.map(|t| t.trim().to_ascii_lowercase());
                         rigs.iter()
                             .map(|r| AgentSkill {
                                 id: r.name.clone(),
@@ -461,10 +468,12 @@ impl DomainHandler for A2aDelegateHandler {
                                         r.name, r.git_url, r.default_branch
                                     )
                                 }),
-                                tags: vec![r.prefix.clone()],
+                                tags: crate::a2a::skill_tags(r),
                             })
-                            .filter(|s| match tag_filter {
-                                Some(tag) => s.tags.iter().any(|t| t == tag) || s.id == tag,
+                            .filter(|s| match &tag_filter {
+                                // Match on the bead prefix + any semantic tag (B3), or the rig
+                                // name itself; the merged `tags` already carries prefix first.
+                                Some(tag) => s.tags.iter().any(|t| t == tag) || s.id == *tag,
                                 None => true,
                             })
                             .map(|s| json!({

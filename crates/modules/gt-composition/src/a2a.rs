@@ -764,11 +764,25 @@ pub fn agent_card(public_url: &str, rigs: &[RigEntry]) -> AgentCard {
                         r.name, r.git_url, r.default_branch
                     )
                 }),
-                tags: vec![r.prefix.clone()],
+                tags: skill_tags(r),
             })
             .collect(),
         signature: None,
     }
+}
+
+/// Discovery tags for a rig's Agent Card skill (B3, gtcore-1caa48): the bead prefix first
+/// (always discoverable by prefix, as before), then the rig's semantic capability tags. The
+/// prefix is dropped from the tail if a semantic tag already equals it, so the list carries no
+/// duplicate. A rig with no semantic tags yields `[prefix]` — byte-for-byte the pre-B3 shape.
+pub(crate) fn skill_tags(rig: &RigEntry) -> Vec<String> {
+    let mut tags = vec![rig.prefix.clone()];
+    for tag in &rig.semantic_tags {
+        if tag != &rig.prefix {
+            tags.push(tag.clone());
+        }
+    }
+    tags
 }
 
 /// Per-rig discovery card (A2, gtcore-4023de): one [`AgentCard`] scoped to
@@ -806,7 +820,7 @@ pub fn rig_agent_card(public_url: &str, rig: &RigEntry) -> AgentCard {
                     rig.name, rig.git_url, rig.default_branch
                 )
             }),
-            tags: vec![rig.prefix.clone()],
+            tags: skill_tags(rig),
         }],
         signature: None,
     }
@@ -895,6 +909,21 @@ mod tests {
     use super::*;
     use gt_a2a::{Message, Role};
     use std::sync::Mutex;
+
+    #[test]
+    fn skill_tags_prefixes_then_semantic_deduped() {
+        // No semantic tags → byte-for-byte the pre-B3 shape: just the prefix.
+        let plain = RigEntry::new("gtcore", "gt", "https://x/y", "main", 0);
+        assert_eq!(skill_tags(&plain), vec!["gt".to_string()]);
+
+        // Prefix first, then semantic tags; a semantic tag equal to the prefix is not repeated.
+        let mut tagged = RigEntry::new("gtcore", "gt", "https://x/y", "main", 0);
+        tagged.semantic_tags = vec!["rust".into(), "gt".into(), "infra".into()];
+        assert_eq!(
+            skill_tags(&tagged),
+            vec!["gt".to_string(), "rust".to_string(), "infra".to_string()]
+        );
+    }
 
     struct FakeIntake {
         seen: Mutex<Vec<IntakeRequest>>,
