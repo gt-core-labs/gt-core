@@ -1591,6 +1591,7 @@ dependencies = [
  "gt-eventlog",
  "gt-events",
  "gt-module",
+ "libc",
  "schemars 0.8.22",
  "semver",
  "serde",
