@@ -19,6 +19,7 @@
 //!   log, executes, and appends the produced event(s) back (see [`EventLog`]).
 
 pub mod a2a_delegate;
+pub mod a2a_msg;
 pub mod agent;
 pub mod analytics;
 pub mod comments;
@@ -44,6 +45,7 @@ pub mod util;
 pub mod workspace;
 
 pub use a2a_delegate::A2aDelegateHandler;
+pub use a2a_msg::A2aMessageHandler;
 pub use agent::AgentHandler;
 pub use cross_ws::CrossWsGrants;
 pub use audit::AuditHandler;

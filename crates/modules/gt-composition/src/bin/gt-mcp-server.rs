@@ -2323,7 +2323,9 @@ async fn build_domain_router(
             // B5 (gtcore-1bda00): register each delegation on the event log
             // so the orchd callback plugin + timeout ticker push the outcome
             // back to the parent instead of the parent polling a2a.status.
-            .with_delegation_log(event_log.clone(), a2a_timeout_secs);
+            .with_delegation_log(event_log.clone(), a2a_timeout_secs)
+            // Inter-agent messaging (a2a.send/inbox/ack)
+            .with_event_log(event_log.clone());
             // B4: enable cross-workspace minting only when the per-tenant store
             // resolver is available; the grant list alone (without routing) cannot
             // reach another tenant's tracker.

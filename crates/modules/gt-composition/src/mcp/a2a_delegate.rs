@@ -1,4 +1,4 @@
-//! `a2a.*` MCP tools — inter-agent delegation + peer discovery (Fase 2).
+//! `a2a.*` MCP tools — inter-agent delegation, peer discovery, and messaging.
 //!
 //! ## Tools
 //!
@@ -14,8 +14,17 @@
 //! - **`a2a.status`** (A7, gtcore-3a3557): queries the tracker for a previously
 //!   delegated bead, returning its status + title so the delegating agent can
 //!   poll the outcome without leaving the MCP surface.
+//!
+//! - **`a2a.send`**: post a message to a running agent session's inbox. The
+//!   sender's MCP session id is stamped automatically.
+//!
+//! - **`a2a.inbox`**: read unacknowledged messages for the caller's session
+//!   (or an explicit target). Returns newest-first, capped at `limit`.
+//!
+//! - **`a2a.ack`**: acknowledge a message by id so it stops appearing in inbox.
 
 use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
 use serde_json::{json, Value};
@@ -31,10 +40,11 @@ use gt_store_dolt::{AppError, DoltIssues};
 
 use crate::delegation::{rfc3339_now, DelegationEvent, DEFAULT_TIMEOUT_SECS};
 
+use super::a2a_msg::{A2aMessageHandler, MessageEvent};
 use super::cross_ws::CrossWsGrants;
 use super::eventlog::EventLog;
 use super::pools::WsPools;
-use super::util::{descriptor, opt, req};
+use super::util::{descriptor, opt, req, str_arg};
 
 /// The workspace a call resolves to when its [`DomainCtx::workspace`] is `None` —
 /// the single-tenant default. Mirrors [`super::pools`]'s `DEFAULT_WORKSPACE` so the
@@ -80,6 +90,9 @@ pub struct A2aDelegateHandler {
     /// cross-tenant hop requires a matching `origin->dest` grant. Default empty ⇒
     /// no cross-workspace delegation, only same-workspace.
     cross_ws_grants: CrossWsGrants,
+    /// Event-log backed message channel. `None` when the event log is not
+    /// wired — `a2a.send`/`a2a.inbox`/`a2a.ack` return errors.
+    msg: Option<A2aMessageHandler>,
 }
 
 impl A2aDelegateHandler {
@@ -99,6 +112,7 @@ impl A2aDelegateHandler {
             default_timeout_secs: DEFAULT_TIMEOUT_SECS,
             stores: None,
             cross_ws_grants: CrossWsGrants::empty(),
+            msg: None,
         }
     }
 
@@ -137,6 +151,13 @@ impl A2aDelegateHandler {
     pub fn with_cross_ws(mut self, stores: Arc<WorkspaceStores>, grants: CrossWsGrants) -> Self {
         self.stores = Some(stores);
         self.cross_ws_grants = grants;
+        self
+    }
+
+    /// Wire the event log so `a2a.send`/`a2a.inbox`/`a2a.ack` work. Without
+    /// this, the message tools return an error.
+    pub fn with_event_log(mut self, log: Arc<EventLog>) -> Self {
+        self.msg = Some(A2aMessageHandler::new(log));
         self
     }
 }
@@ -186,6 +207,34 @@ impl DomainHandler for A2aDelegateHandler {
                  timestamps. Polling is no longer required: a2a.delegate registers a push \
                  callback that reports the terminal outcome (delegation.completed.v1 / bell). \
                  Use this only for an on-demand check.",
+                &[req("id", "string")],
+            ),
+            descriptor(
+                "a2a.send",
+                "Send a message to a running agent session. The message appears in \
+                 the target's inbox (polled via `a2a.inbox`). Use this for operator \
+                 instructions, clarifications, or inter-agent coordination without \
+                 killing the session.",
+                &[
+                    req("to", "string"),
+                    req("body", "string"),
+                    opt("in_reply_to", "string"),
+                ],
+            ),
+            descriptor(
+                "a2a.inbox",
+                "Read unacknowledged messages for a session. Defaults to the caller's \
+                 own session; pass `session` to read another agent's inbox (operator \
+                 use). Returns newest-first, capped at `limit` (default 10).",
+                &[
+                    opt("session", "string"),
+                    opt("limit", "integer"),
+                ],
+            ),
+            descriptor(
+                "a2a.ack",
+                "Acknowledge a message by id so it no longer appears in the inbox. \
+                 Idempotent: acknowledging an already-acked message is a no-op.",
                 &[req("id", "string")],
             ),
         ]
@@ -454,6 +503,17 @@ impl DomainHandler for A2aDelegateHandler {
                     Ok(None) => Err(AppError::NotFound(format!("bead {id}"))),
                     Err(e) => Err(AppError::Other(format!("tracker: {e}"))),
                 }
+            }
+
+            // Inter-agent messaging: send/inbox/ack. Delegated to the
+            // A2aMessageHandler when an event log is wired.
+            "a2a.send" | "a2a.inbox" | "a2a.ack" => {
+                let msg = self.msg.as_ref().ok_or_else(|| {
+                    AppError::Validation(
+                        "a2a messaging not available (event log not wired)".into(),
+                    )
+                })?;
+                msg.dispatch(tool, ctx).await
             }
 
             other => Err(AppError::Validation(format!("unknown tool `{other}`"))),
