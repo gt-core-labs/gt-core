@@ -6,7 +6,9 @@
    "label": "Bead Comms",
    "description": "Genera 3P updates (Progress/Plans/Problems) y pipeline health digests desde el tracker.",
    "group": "workflow",
-   "default_scopes": [],
+   "default_scopes": [
+    "issues.read"
+   ],
    "body": "---\nname: bead-comms\ndescription: >\n  Genera 3P updates (Progress/Plans/Problems) y pipeline health digests desde el tracker.\n  Úsala cuando alguien pide un status, reporte semanal o update para stakeholders.\n---\n\n# Bead Comms — comunicación de estado del pipeline\n\n## 3P Update (Progress / Plans / Problems)\n\nFormato estándar para reportes a stakeholders (semanales, ante escalaciones, o cuando alguien pregunta \"¿cómo vamos?\"):\n\n```\n**Progress** (lo que se completó desde el último update)\n- [bead-id] Título del bead — impacto en una línea\n- [bead-id] ...\n\n**Plans** (lo que se va a completar antes del próximo update)\n- [bead-id] Título — estimación de completitud\n- [bead-id] ...\n\n**Problems** (bloqueantes activos, riesgos, escalaciones pendientes)\n- [bead-id o epic] Descripción del problema — owner o siguiente acción\n```\n\nReglas:\n- Progress: solo beads cerrados en el período (no \"trabajando en\").\n- Plans: solo lo realista dado el WIP actual y la quota disponible.\n- Problems: si no hay ninguno, escribir \"Ninguno\" (no omitir la sección).\n\n## Pipeline Health Digest\n\nPara el reporte semanal de salud del sistema de orquestación:\n\n```\n**Semana [fecha]**\nThroughput: N beads cerrados (vs N semana anterior, ↑/↓%)\nCycle time: P50=Xh / P85=Yh\nWIP al corte: N en working / M polecats activos\nQuota: N cuentas Healthy / N en Cooldown / próxima rotación estimada en Xh\nEpics activas: [VERDE X / ÁMBAR Y / ROJO Z]\n  - [ROJO] Epic-name: razón + próxima acción\n```\n\n## Escalation notice\n\nCuando un problema requiere atención inmediata (no puede esperar al próximo update semanal):\n\n```\n[ESCALACIÓN] <título en una línea>\nQué: descripción concisa del problema\nImpacto: qué se está bloqueando y desde cuándo\nDatos: métricas relevantes (WIP, stuck beads, quota %)\nAcción solicitada: qué decisión o acción necesita el destinatario\n```\n\n## Anti-patrones\n\n- \"Todo bien\" sin datos → no usar. Si todo bien, mostrar métricas que lo confirmen.\n- Mencionar trabajo en progreso como \"completado\" → solo closed cuenta como done.\n- Omitir Problems porque son incómodos → es la sección más valiosa del 3P.\n"
   },
   {
@@ -14,7 +16,10 @@
    "label": "Bead Intake",
    "description": "Descompone requerimientos no estructurados en beads bien formados con acceptance criteria medibles.",
    "group": "workflow",
-   "default_scopes": [],
+   "default_scopes": [
+    "issues.read",
+    "issues.write"
+   ],
    "body": "---\nname: bead-intake\ndescription: >\n  Descompone requerimientos no estructurados en beads bien formados con acceptance criteria\n  medibles. Produce título, descripción, criterios GIVEN/WHEN/THEN y estimación de esfuerzo.\n  Úsala siempre antes de abrir un bead si el input viene como texto libre.\n---\n\n# Bead Intake — requerimiento → bead estructurado\n\nConvierte texto libre en un bead listo para el tracker. Un bead mal formado vuelve como\nre-trabajo; uno bien formado va de `open` a `closed` sin preguntas.\n\n## Proceso\n\n1. **Extraer intención** — ¿qué problema resuelve? ¿quién lo pide? ¿cuándo es urgente?\n2. **Descomponer** — si hay más de una unidad de trabajo independiente, separarlas en beads distintos (un bead = una cosa deployable).\n3. **Escribir cada bead** con esta estructura:\n\n```\nTítulo: <verbo imperativo> + <objeto> (≤60 chars)\nDescripción: contexto + motivación (2-3 frases)\nAcceptance criteria:\n  - DADO <estado inicial> CUANDO <acción> ENTONCES <resultado verificable>\n  - (uno por dimensión clave: happy path, edge case, error)\nEstimación: XS / S / M / L  (XS=horas, S=1d, M=2-3d, L=1 semana+)\nDependencias: lista de bead-ids o \"ninguna\"\n```\n\n4. **Validar** — cada criterio debe ser binario (pasó / no pasó), no ambiguo (\"funciona bien\" NO es un criterio; \"retorna 200 con {id} en el body\" SÍ lo es).\n\n## Anti-patrones\n\n- Un bead que toca >3 archivos no relacionados → partir.\n- \"Refactorizar X\" sin criterio de done → agregar \"el comportamiento externo no cambia, tests existentes siguen verdes\".\n- Dependencia implícita → hacerla explícita en el campo Dependencias.\n\n## Output\n\nDevolver los beads listos para copiar al tracker. Si el requerimiento era claro y es una sola\nunidad, devolver un solo bead. Si había ambigüedad, listar las asunciones que tomaste.\n"
   },
   {
@@ -101,7 +106,9 @@
    "label": "Tracker Flow",
    "description": "Métricas de flujo: cycle time, throughput, WIP, beads stuck. Para revisión diaria del pipeline.",
    "group": "workflow",
-   "default_scopes": [],
+   "default_scopes": [
+    "issues.read"
+   ],
    "body": "---\nname: tracker-flow\ndescription: >\n  Métricas de flujo del pipeline: cycle time, throughput semanal, WIP, beads stuck.\n  Úsala en la revisión diaria para detectar cuellos de botella y escalar temprano.\n---\n\n# Tracker Flow — métricas de flujo del pipeline\n\n## Las 4 métricas clave\n\n### 1. Cycle time\nTiempo desde `open` hasta `closed` por bead. Calcular:\n- **P50** (mediana): el \"caso típico\"\n- **P85**: el \"peor caso real\" (sin outliers extremos)\n- Alertar si P85 > 3× P50 (alta varianza = riesgo oculto)\n\n### 2. Throughput\nBeads cerrados por semana. Tendencia importa más que el número absoluto.\n- Caída >30% semana a semana sin motivo conocido → investigar (quota exhausted? polecats stuck?)\n\n### 3. WIP (Work In Progress)\nBeads en estado `working` en un momento dado.\n- WIP ideal ≤ pool_size × 1.5 (margen para handoffs)\n- WIP > pool_size × 3 → cuello de botella en el refinery o merge failures acumulados\n\n### 4. Beads stuck\nBead en `working` con heartbeat inactivo >presupuesto o sin polecat vivo asociado.\n- Stuck <12h: normal (claude puede estar en medio de un run largo)\n- Stuck 12-48h: escalar al witness\n- Stuck >48h: re-despachar (resetear a `open`)\n\n## Revisión diaria (checklist)\n\n```\n1. mcp__gt__issues.list.execute  →  contar open/working/closed (últimas 24h)\n2. agent.list                    →  polecats vivos y sus heartbeats\n3. merge.list                    →  cola de merges pendientes\n4. Beads en working sin agente   →  candidatos a stuck\n5. Cycle time P50/P85            →  comparar con baseline de la semana pasada\n```\n\n## Señales de alarma\n\n| Señal | Umbral | Acción |\n|-------|--------|--------|\n| Merge queue profundidad | >5 en espera | Verificar CI y sheriff |\n| WIP / pool_size ratio | >3 | Frenar despacho nuevo |\n| Throughput caída | >40% semana | Revisar quota + heartbeats |\n| Bead stuck | >48h | Re-despachar |\n\n## Output de revisión\n\nUna línea por dimensión:\n```\nCycle time P50 4h / P85 18h. Throughput 12 beads/semana (↓15%). WIP 3/4 slots. Sin stuck.\n```\n"
   },
   {
@@ -110,8 +117,12 @@
    "description": "Operational gt MCP tracker access (file + dispatch beads)",
    "group": "tracker",
    "default_scopes": [
-    "workspace.member",
-    "graph.read"
+    "agent.read",
+    "agent.write",
+    "graph.read",
+    "merge.read",
+    "merge.write",
+    "workspace.member"
    ],
    "body": "# Tracker ops — operate the gt MCP tracker\n\nGrants operational access to the gt MCP tools so this role can file and dispatch beads.\n\n## Tools (gt MCP)\n- `issues.*` — read bead state, create, transition (open/working/closed).\n- `agent.*` — list live sessions, spawn dogs/workers.\n- `convoy.*` — list + launch dispatched work.\n- `merge.*` — read merges in flight, submit merge-ready.\n- `quota.*` — read claude-account quota state.\n- `graph.read` — query the knowledge graph.\n\nStates are open/working/closed (not in_progress). Coordinate through shared state (event log, tracker, channels), never directly."
   },
@@ -120,7 +131,10 @@
    "label": "Tracker PM",
    "description": "Priorización ICE/WSJF, health score de epics (RAG), descomposición de iniciativas.",
    "group": "workflow",
-   "default_scopes": [],
+   "default_scopes": [
+    "issues.read",
+    "issues.write"
+   ],
    "body": "---\nname: tracker-pm\ndescription: >\n  Priorización de backlog con ICE/WSJF, health score de epics (RAG), descomposición de\n  iniciativas complejas. Úsala antes de despachar para ordenar el trabajo por valor/riesgo.\n---\n\n# Tracker PM — priorización y salud de epics\n\n## Scoring rápido: ICE\n\nPara una lista de beads sin dependencias complejas:\n\n```\nICE = Impact × Confidence × Ease   (cada factor 1-10)\n```\n\n- **Impact**: ¿cuánto mueve la métrica que importa si esto se hace?\n- **Confidence**: ¿cuán seguro estás del Impact y el Ease? (10 = certeza, 1 = wild guess)\n- **Ease**: ¿cuán fácil es implementar? (10 = horas, 1 = semanas + riesgo)\n\nOrdenar descendiente por ICE. Atar en ICE → elegir el que tiene dependencias bloqueantes resueltas.\n\n## Scoring profundo: WSJF\n\nCuando hay múltiples epics compitiendo por el mismo pool de polecats:\n\n```\nWSJF = Valor del negocio + Criticidad temporal + Reducción de riesgo / Esfuerzo (T-shirt: XS=1 S=2 M=3 L=5 XL=8)\n```\n\nCada numerador 1-10. El resultado ordena features/epics. Usar cuando el stakeholder pregunta \"¿por qué esto antes que aquello?\".\n\n## Health score de epics: RAG\n\nPara cada epic activa:\n\n```\nVerde  — >60% beads closed, ninguno stuck >3d, velocity sostenida\nÁmbar  — 30-60% closed O al menos un bead stuck >3d O velocity cayó >40%\nRojo   — <30% closed O múltiples stuck O bloqueada por dependencia no resuelta\n```\n\nReportar: `Epic X [ROJO] — 2/8 beads closed, 2 stuck >5d (bead-42, bead-45). Bloqueante: bead-38 abierto.`\n\n## Descomponer iniciativas complejas\n\nSi un requerimiento es demasiado grande para un solo bead (>L):\n\n1. Identificar la capa de valor mínima desplegable (el \"steel thread\").\n2. Partir en beads donde cada uno es independientemente deployable.\n3. Mapear dependencias explícitas (usar campo Dependencias en cada bead).\n4. Ordenar por el grafo de dependencias, no por comodidad de implementación.\n\n## Anti-patrones\n\n- Más de 6 beads abiertos sin despachar → WIP excess. Despachar o cerrar antes de abrir nuevos.\n- Epic con un solo bead gigante → síntoma de análisis incompleto. Descomponer.\n- Priorizar por \"lo más reciente que pidieron\" sin scoring → no usar WSJF te va a costar.\n"
   }
  ],

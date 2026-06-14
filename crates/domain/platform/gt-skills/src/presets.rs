@@ -89,6 +89,7 @@ fn enable(s: &mut SkillState, role: &str, skill: &str) {
 /// scope set its work needs. No role is granted `*`; an unbound role (e.g. `overseer`) gets nothing.
 ///
 /// - `polecat` → `issues.read`, `issues.write`, `merge.write` (work + claim + transition + submit merge).
+/// - `mayor` → `issues.read`, `issues.write`, `agent.read`, `agent.write`, `merge.read`, `merge.write` (coordinate + dispatch).
 /// - `sheriff` → `merge.read`, `merge.write` (drive merges / github).
 /// - `refinery` → `merge.write` (submit MERGE_READY).
 /// - `witness` → `issues.read` (observe only).
@@ -96,12 +97,14 @@ fn enable(s: &mut SkillState, role: &str, skill: &str) {
 pub fn agent_least_privilege_catalog() -> SkillCatalog {
     let mut s = SkillState::default();
     register(&mut s, "bead-work", &["issues.read", "issues.write"]);
+    register(&mut s, "bead-coordinate", &["issues.read", "issues.write", "agent.read", "agent.write", "merge.read", "merge.write"]);
     register(&mut s, "merge-ops", &["merge.read", "merge.write"]);
     register(&mut s, "merge-submit", &["merge.write"]);
     register(&mut s, "observe", &["issues.read"]);
 
     enable(&mut s, "polecat", "bead-work");
     enable(&mut s, "polecat", "merge-submit");
+    enable(&mut s, "mayor", "bead-coordinate");
     enable(&mut s, "sheriff", "merge-ops");
     enable(&mut s, "refinery", "merge-submit");
     enable(&mut s, "witness", "observe");
@@ -205,13 +208,14 @@ mod tests {
     fn each_role_gets_its_minimal_scopes_and_never_the_wildcard() {
         let c = agent_least_privilege_catalog();
         assert_eq!(scopes(&c, "polecat"), vec!["issues.read", "issues.write", "merge.write"]);
+        assert_eq!(scopes(&c, "mayor"), vec!["issues.read", "issues.write", "agent.read", "agent.write", "merge.read", "merge.write"]);
         assert_eq!(scopes(&c, "sheriff"), vec!["merge.read", "merge.write"]);
         assert_eq!(scopes(&c, "refinery"), vec!["merge.write"]);
         assert_eq!(scopes(&c, "witness"), vec!["issues.read"]);
         assert_eq!(scopes(&c, "deacon"), vec!["issues.read"]);
         // No automatic role is ever the operator wildcard.
         for role in [
-            "polecat", "sheriff", "refinery", "witness", "deacon", "overseer",
+            "polecat", "mayor", "sheriff", "refinery", "witness", "deacon", "overseer",
         ] {
             assert!(
                 !scopes(&c, role).iter().any(|s| s == "*"),
@@ -246,17 +250,17 @@ mod tests {
         };
 
         // Scopes derive from the enabled skills' `default_scopes`, exactly as the live deploy resolved
-        // them: notify-ops → notifications.write, tracker-ops → workspace.member + graph.read,
-        // crew-commit → workspace.member, memory-access → memory.{read,write}.
+        // them: bead-intake/tracker-pm → issues.{read,write}, tracker-ops → agent/merge/graph/workspace,
+        // notify-ops → notifications.write, crew-commit → workspace.member, memory-access → memory.{read,write}.
         assert_eq!(
             scopes(&c, "mayor"),
-            vec!["notifications.write", "workspace.member", "graph.read"],
+            vec!["issues.read", "issues.write", "notifications.write", "agent.read", "agent.write", "graph.read", "merge.read", "merge.write", "workspace.member"],
         );
         assert_eq!(
             scopes(&c, "polecat"),
             vec!["workspace.member", "memory.read", "memory.write"],
         );
-        assert_eq!(scopes(&c, "dog"), vec!["workspace.member"]);
+        assert_eq!(scopes(&c, "dog"), vec!["issues.read", "issues.write", "workspace.member"]);
         assert_eq!(scopes(&c, "refinery"), vec!["workspace.member"]);
 
         // Every role carries a non-empty system prompt + model config — the functional payload a
