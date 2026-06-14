@@ -337,7 +337,8 @@ async fn ready_filter_matches_the_mcp_resource_sound_set() {
     let rows = read_issues(&repo, &filter).await.expect("rows");
     let open_phase = repo.open_phase().await.expect("phase");
     let deps = repo.dep_index().await.expect("deps");
-    let want: Vec<String> = filter_ready(rows, open_phase, &deps, &gt_issues::AllowAllTree)
+    let deps_map = repo.depends_on_edges(&filter).await.expect("deps_map");
+    let want: Vec<String> = filter_ready(rows, &deps_map, open_phase, &deps, &gt_issues::AllowAllTree)
         .into_iter()
         .map(|r| r.id)
         .collect();

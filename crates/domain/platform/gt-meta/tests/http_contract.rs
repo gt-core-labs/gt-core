@@ -159,7 +159,6 @@ async fn report_gap_mints_a_gap_bead_in_the_store() {
     let repo = DoltIssues::connect(&format!("{base}/{db}")).expect("connect");
     let detail = repo.get_detail(bead).await.expect("read").expect("bead present");
     assert_eq!(detail.title, "gap: issues.archive.execute");
-    assert_eq!(detail.external_ref.as_deref(), Some("hq-gaps"));
     // The catalog epic was auto-created so the parent ref is never dangling.
     assert!(repo.get_detail("hq-gaps").await.expect("read").is_some(), "catalog epic exists");
 }

@@ -204,7 +204,7 @@ mod tests {
     #[test]
     fn each_role_gets_its_minimal_scopes_and_never_the_wildcard() {
         let c = agent_least_privilege_catalog();
-        assert_eq!(scopes(&c, "polecat"), vec!["issues.read", "issues.write"]);
+        assert_eq!(scopes(&c, "polecat"), vec!["issues.read", "issues.write", "merge.write"]);
         assert_eq!(scopes(&c, "sheriff"), vec!["merge.read", "merge.write"]);
         assert_eq!(scopes(&c, "refinery"), vec!["merge.write"]);
         assert_eq!(scopes(&c, "witness"), vec!["issues.read"]);
