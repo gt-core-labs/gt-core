@@ -516,7 +516,7 @@ impl DomainHandler for A2aDelegateHandler {
 
             // Inter-agent messaging: send/inbox/ack. Delegated to the
             // A2aMessageHandler when an event log is wired.
-            "a2a.send" | "a2a.inbox" | "a2a.ack" => {
+            "a2a.send" | "a2a.inbox" | "a2a.ack" | "a2a.threads" => {
                 let msg = self.msg.as_ref().ok_or_else(|| {
                     AppError::Validation(
                         "a2a messaging not available (event log not wired)".into(),
