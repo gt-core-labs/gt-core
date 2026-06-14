@@ -316,6 +316,12 @@ pub fn seed_claude_onboarding(config_dir: &Path, worktree: &Path) {
         "bypassPermissionsModeAccepted".into(),
         serde_json::Value::Bool(true),
     );
+    // Disable auto-updater: polecats run in worktrees/containers where npm
+    // prefix is read-only, causing noisy "no write permission" warnings.
+    obj.insert(
+        "autoUpdaterStatus".into(),
+        serde_json::Value::String("disabled".into()),
+    );
     obj.entry("theme")
         .or_insert_with(|| serde_json::Value::String("dark".into()));
     // Folder trust is per-project: mark THIS worktree path trusted + onboarded, and pre-enable the
