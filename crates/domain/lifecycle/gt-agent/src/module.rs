@@ -243,7 +243,9 @@ mod tests {
         // Built with HTTP state, the module documents its REST routes and returns a non-empty
         // OpenAPI spec the builder mounts under `/api/v1/agent`. (The router itself is exercised
         // by the http module's own tests + the contract test; here we assert the wiring flips on.)
-        let m = AgentModule::with_http(crate::http::AgentApiState::new("/tmp/gt-agent-rest-test"));
+        let m = AgentModule::with_http(crate::http::AgentApiState::new(
+            std::sync::Arc::new(crate::http::FileAgentLog::new("/tmp/gt-agent-rest-test")),
+        ));
         assert!(m.openapi().is_some());
     }
 }

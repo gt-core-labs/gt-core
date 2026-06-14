@@ -45,8 +45,8 @@ use gt_store_blob::BlobStore;
 use gt_workspace::{PgWorkspaces, WorkspaceApiState, WorkspaceModule};
 
 use crate::mcp::{
-    CompositionTenantProvisioner, EventLog, EventLogConvoy, EventLogFeed, EventLogGraph,
-    EventLogMerges, EventLogQuota, EventLogSkills, FsAccountCatalog, GraphHandler,
+    CompositionTenantProvisioner, EventLog, EventLogAgentEvents, EventLogConvoy, EventLogFeed,
+    EventLogGraph, EventLogMerges, EventLogQuota, EventLogSkills, FsAccountCatalog, GraphHandler,
     GraphHandlerRefresher, RigProvisioner, WsPoolRigs, WsPools,
 };
 
@@ -88,8 +88,6 @@ pub struct RestModuleParts {
     pub actor: String,
     /// The full served `tools/list` for `meta.help` (issues+meta+domain descriptors).
     pub meta_tools: Vec<McpTool>,
-    /// The agent event-log root the agent REST state replays sessions from.
-    pub agent_root: PathBuf,
     /// The orchd dispatch-channel dir (`GT_CHANNEL_ROOT`/`GT_DISPATCH_CHANNEL` in
     /// `main()`); `Some` bridges `POST /api/v1/agent` to the scheduler, `None` not.
     pub dispatch_channel: Option<PathBuf>,
@@ -130,7 +128,6 @@ pub async fn build_rest_modules(
         meta_store,
         actor,
         meta_tools,
-        agent_root,
         dispatch_channel,
         event_log,
         accounts_root,
@@ -146,10 +143,11 @@ pub async fn build_rest_modules(
             actor.clone(),
             meta_tools,
         )))
-        // agent.*: bridge POST /api/v1/agent to the orchd scheduler when a dispatch
-        // channel is configured.
+        // agent.*: the REST surface now delegates to the SAME EventLog the MCP handler uses
+        // (gtcore-8c3823), so both transports always agree on session state regardless of
+        // whether the backend is file or Postgres.
         .module(AgentModule::with_http({
-            let agent_state = AgentApiState::new(agent_root);
+            let agent_state = AgentApiState::new(Arc::new(EventLogAgentEvents::new(event_log.clone())));
             match dispatch_channel {
                 Some(channel_dir) => agent_state.with_dispatch_channel(channel_dir),
                 None => agent_state,

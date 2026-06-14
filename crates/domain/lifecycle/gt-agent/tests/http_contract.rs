@@ -16,11 +16,11 @@ use axum::http::{Request, StatusCode};
 use serde_json::{json, Value};
 use tower::ServiceExt; // oneshot
 
-use gt_agent::http::{agent_router, AgentApiState};
+use gt_agent::http::{agent_router, AgentApiState, FileAgentLog};
 
 /// Build the REST router over a throwaway event-log root.
 fn router(root: &std::path::Path) -> axum::Router {
-    agent_router(AgentApiState::new(root.to_path_buf()))
+    agent_router(AgentApiState::new(std::sync::Arc::new(FileAgentLog::new(root.to_path_buf()))))
 }
 
 /// Send a request and return `(status, parsed-json-or-null)`.

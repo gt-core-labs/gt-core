@@ -156,6 +156,24 @@ impl EventLog {
         }
     }
 
+    /// Append a pre-built [`EventRecord`] to the workspace log — the raw-record counterpart of
+    /// [`append`](Self::append). Used by REST adapters that construct the record themselves (the
+    /// agent REST surface builds one from `AgentEvent` via `Envelope::root` before appending).
+    pub fn append_raw(
+        &self,
+        workspace: Option<&str>,
+        record: &EventRecord,
+    ) -> Result<(), AppError> {
+        let ws = workspace.unwrap_or(DEFAULT_WORKSPACE);
+        match &self.backend {
+            Backend::File(root) => JsonlWriter::for_workspace_in(root, ws)
+                .map_err(ev_err)?
+                .append(record)
+                .map_err(ev_err),
+            Backend::Pg(store) => store.append(ws, record).map_err(ev_err),
+        }
+    }
+
     /// Read a workspace's log records for the SSE feed (`hq-mcp-dispatch.10`),
     /// newest-bounded, in chronological order.
     ///
