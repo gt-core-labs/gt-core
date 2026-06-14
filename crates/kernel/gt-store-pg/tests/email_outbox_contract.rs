@@ -63,8 +63,11 @@ async fn schedule_claim_and_settlements_round_trip() {
     let due_id = format!("e-{n}-due");
     let future_id = format!("e-{n}-future");
 
-    // One immediately-due row (1s in the past to avoid now() timing edge), one scheduled into the future.
-    let due = repo.enqueue(new_email(&due_id, &ws, Some(Utc::now() - Duration::seconds(1)))).await.expect("enqueue due");
+    // One immediately-due row, one scheduled into the future.
+    let due = repo.enqueue(new_email(&due_id, &ws, None)).await.expect("enqueue due");
+    // Force send_at into the past using PG's own clock to avoid Rust/PG clock skew.
+    sqlx::query("UPDATE email_outbox SET send_at = now() - interval '2 seconds' WHERE id = $1")
+        .bind(&due_id).execute(&_pool).await.expect("force past");
     assert_eq!(due.status, "pending");
     assert_eq!(due.attempts, 0);
     repo.enqueue(new_email(&future_id, &ws, Some(Utc::now() + Duration::hours(2))))
@@ -139,6 +142,8 @@ async fn failed_settlement_records_the_terminal_state() {
     let id = format!("e-{n}-fail");
 
     repo.enqueue(new_email(&id, &ws, None)).await.expect("enqueue");
+    sqlx::query("UPDATE email_outbox SET send_at = now() - interval '2 seconds' WHERE id = $1")
+        .bind(&id).execute(&_pool).await.expect("force past");
     let claimed = repo.claim_due(500).await.expect("claim");
     assert!(claimed.iter().any(|e| e.id == id));
     repo.mark_failed(&id, "attempts exhausted").await.expect("fail");
