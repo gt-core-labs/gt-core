@@ -63,8 +63,8 @@ async fn schedule_claim_and_settlements_round_trip() {
     let due_id = format!("e-{n}-due");
     let future_id = format!("e-{n}-future");
 
-    // One immediately-due row, one scheduled into the future.
-    let due = repo.enqueue(new_email(&due_id, &ws, None)).await.expect("enqueue due");
+    // One immediately-due row (1s in the past to avoid now() timing edge), one scheduled into the future.
+    let due = repo.enqueue(new_email(&due_id, &ws, Some(Utc::now() - Duration::seconds(1)))).await.expect("enqueue due");
     assert_eq!(due.status, "pending");
     assert_eq!(due.attempts, 0);
     repo.enqueue(new_email(&future_id, &ws, Some(Utc::now() + Duration::hours(2))))

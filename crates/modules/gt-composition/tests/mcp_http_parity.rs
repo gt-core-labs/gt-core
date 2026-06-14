@@ -260,6 +260,8 @@ fn is_routable(tool: &str) -> bool {
         // Vector-store retrieval (documents.retrieve.*): MCP-only semantic search over the document
         // embedding index — no REST equivalent; streaming bytes use GET /{id}/download instead (hq-c488cb).
         && tool != "documents.retrieve.execute"
+        // Rig readiness probe: MCP-only diagnostic — no REST equivalent.
+        && tool != "rig.readiness"
 }
 
 /// The `(METHOD, path)` set a module's OpenAPI actually declares.
