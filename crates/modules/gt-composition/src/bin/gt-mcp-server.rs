@@ -2280,7 +2280,15 @@ async fn build_domain_router(
         &dispatch_sink,
     ) {
         (Some(a2a_rig), Some(a2a_parent), Some(delegate_dolt), Some(sink)) => {
-            eprintln!("[gt-mcp-server] a2a.delegate on — rig {a2a_rig}, parent {a2a_parent}");
+            // B5 (gtcore-1bda00): default completion timeout for delegations
+            // (0 disables). The daemon escalates a delegation stuck past this.
+            let a2a_timeout_secs = std::env::var("GT_A2A_TIMEOUT_SECS")
+                .ok()
+                .and_then(|v| v.trim().parse::<u64>().ok())
+                .unwrap_or(gt_composition::delegation::DEFAULT_TIMEOUT_SECS);
+            eprintln!(
+                "[gt-mcp-server] a2a.delegate on — rig {a2a_rig}, parent {a2a_parent}, push-callback tracking on (timeout {a2a_timeout_secs}s)"
+            );
             router.register(Arc::new(
                 A2aDelegateHandler::new(
                     Arc::new(delegate_dolt),
@@ -2290,7 +2298,11 @@ async fn build_domain_router(
                 )
                 // A7 (gtcore-3a3557): wire the per-workspace pool cache so
                 // a2a.discover can read the rig catalog for peer discovery.
-                .with_pools(ws_pools.clone()),
+                .with_pools(ws_pools.clone())
+                // B5 (gtcore-1bda00): register each delegation on the event log
+                // so the orchd callback plugin + timeout ticker push the outcome
+                // back to the parent instead of the parent polling a2a.status.
+                .with_delegation_log(event_log.clone(), a2a_timeout_secs),
             ))
         }
         _ => {

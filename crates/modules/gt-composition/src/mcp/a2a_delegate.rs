@@ -29,6 +29,9 @@ use gt_module::McpTool;
 use gt_rig::{PgRigs, RigRepository};
 use gt_store_dolt::{AppError, DoltIssues};
 
+use crate::delegation::{rfc3339_now, DelegationEvent, DEFAULT_TIMEOUT_SECS};
+
+use super::eventlog::EventLog;
 use super::pools::WsPools;
 use super::util::{descriptor, opt, req};
 
@@ -53,6 +56,14 @@ pub struct A2aDelegateHandler {
     /// Per-workspace Postgres pool cache for rig discovery (A7). `None` when
     /// `GT_PG_URL` is unset — `a2a.discover` returns an empty skill list.
     pools: Option<Arc<WsPools>>,
+    /// Event log a `delegation.requested.v1` is appended to so the daemon-side
+    /// callback/timeout machinery (B5) can push the outcome back to the parent
+    /// instead of the parent polling `a2a.status`. `None` ⇒ delegations still
+    /// dispatch, just without push-callback tracking.
+    delegation_log: Option<Arc<EventLog>>,
+    /// Default completion timeout stamped on a delegation when the caller passes
+    /// no `timeout_secs` (B5). `0` disables the timeout.
+    default_timeout_secs: u64,
 }
 
 impl A2aDelegateHandler {
@@ -68,6 +79,8 @@ impl A2aDelegateHandler {
             default_rig: default_rig.into(),
             default_parent: default_parent.into(),
             pools: None,
+            delegation_log: None,
+            default_timeout_secs: DEFAULT_TIMEOUT_SECS,
         }
     }
 
@@ -75,6 +88,22 @@ impl A2aDelegateHandler {
     /// catalog. Without this, discovery returns an empty skill list.
     pub fn with_pools(mut self, pools: Arc<WsPools>) -> Self {
         self.pools = Some(pools);
+        self
+    }
+
+    /// Wire push-callback tracking (B5): a successful `a2a.delegate` appends a
+    /// `delegation.requested.v1` to `log`, which the daemon-side
+    /// [`DelegationCallbackPlugin`](crate::delegation::DelegationCallbackPlugin)
+    /// and [`DelegationTimeoutTicker`](crate::delegation::DelegationTimeoutTicker)
+    /// consume to push the outcome back to the parent. `default_timeout_secs`
+    /// (0 disables) applies when the caller passes no `timeout_secs`.
+    pub fn with_delegation_log(
+        mut self,
+        log: Arc<EventLog>,
+        default_timeout_secs: u64,
+    ) -> Self {
+        self.delegation_log = Some(log);
+        self.default_timeout_secs = default_timeout_secs;
         self
     }
 }
@@ -91,13 +120,17 @@ impl DomainHandler for A2aDelegateHandler {
                 "a2a.delegate",
                 "Delegate a sub-task to another agent via the A2A intake pipeline. \
                  Mints a tracker bead (child of the default intake epic) and dispatches it \
-                 onto the scheduler. The calling agent's session id is stamped as `created_by`.",
+                 onto the scheduler. The calling agent's session id is stamped as `created_by`. \
+                 You do NOT need to poll a2a.status: when the child reaches a terminal state the \
+                 daemon pushes a callback (delegation.completed.v1 + operator bell), and a \
+                 `timeout_secs` (default applies) auto-escalates a stuck delegation.",
                 &[
                     req("title", "string"),
                     opt("description", "string"),
                     opt("rig", "string"),
                     opt("parent_id", "string"),
                     opt("priority", "number"),
+                    opt("timeout_secs", "number"),
                 ],
             ),
             descriptor(
@@ -109,8 +142,10 @@ impl DomainHandler for A2aDelegateHandler {
             ),
             descriptor(
                 "a2a.status",
-                "Check the status of a previously delegated bead. Returns the bead's \
-                 current status, title, and timestamps.",
+                "One-shot read of a previously delegated bead's current status, title, and \
+                 timestamps. Polling is no longer required: a2a.delegate registers a push \
+                 callback that reports the terminal outcome (delegation.completed.v1 / bell). \
+                 Use this only for an on-demand check.",
                 &[req("id", "string")],
             ),
         ]
@@ -149,6 +184,13 @@ impl DomainHandler for A2aDelegateHandler {
                     .and_then(Value::as_u64)
                     .map(|p| p.min(2) as u8)
                     .unwrap_or(1);
+                // B5: per-delegation completion timeout (0 disables). Defaults to
+                // the deploy default when the caller omits it.
+                let timeout_secs = ctx
+                    .args
+                    .get("timeout_secs")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(self.default_timeout_secs);
 
                 let args = CreateIssue {
                     id: None,
@@ -186,7 +228,31 @@ impl DomainHandler for A2aDelegateHandler {
                     .emit(payload.as_bytes())
                     .map_err(|e| AppError::Validation(format!("dispatch: {e}")))?;
 
-                Ok(json!({ "id": bead, "rig": rig, "status": "submitted" }))
+                // B5: register the delegation so the daemon pushes the outcome
+                // back to the parent instead of the parent polling a2a.status.
+                // Best-effort — the bead is already minted + dispatched, so a
+                // tracking-log failure must not fail the delegation.
+                if let Some(log) = &self.delegation_log {
+                    if let Err(e) = log.append(
+                        ctx.workspace,
+                        DelegationEvent::Requested {
+                            child: bead.clone(),
+                            parent: ctx.actor.to_string(),
+                            rig: rig.clone(),
+                            at: rfc3339_now(),
+                            timeout_secs,
+                        },
+                    ) {
+                        eprintln!("[a2a.delegate] delegation tracking append failed for {bead}: {e}");
+                    }
+                }
+
+                Ok(json!({
+                    "id": bead,
+                    "rig": rig,
+                    "status": "submitted",
+                    "timeout_secs": timeout_secs,
+                }))
             }
 
             // A7 (gtcore-3a3557): peer discovery — list rig capabilities as Agent

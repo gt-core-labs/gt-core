@@ -661,6 +661,50 @@ async fn main() -> anyhow::Result<()> {
             eprintln!("[gt-orch-server] workflow notifications OFF — GT_PG_URL unset")
         }
     }
+    // A2A delegation push-callbacks (B5, gtcore-1bda00): replace the parent's
+    // `a2a.status` poll with a push. `DelegationCallbackPlugin` observes the hub's
+    // terminal facts (merge.merged/merge.failed/agent.killed) and, for an OPEN
+    // delegation (registered by a2a.delegate as `delegation.requested.v1`), emits
+    // a durable `delegation.completed.v1` callback (+ operator bell when GT_PG_URL
+    // is set). The timeout ticker auto-escalates a delegation stuck past its
+    // `timeout_secs`. The plugin is always on (the registry lives on the shared
+    // event log); the bell is the only GT_PG_URL-gated part.
+    let deleg_ws = (ws_slug != "default").then(|| ws_slug.clone());
+    let deleg_bell_pool = std::env::var("GT_PG_URL")
+        .ok()
+        .filter(|v| !v.is_empty())
+        .and_then(|pg_url| {
+            sqlx::postgres::PgPoolOptions::new()
+                .max_connections(2)
+                .connect_lazy(&pg_url)
+                .map_err(|e| eprintln!("[gt-orch-server] delegation bell OFF (pg pool: {e})"))
+                .ok()
+        });
+    {
+        let mut plugin = gt_composition::delegation::DelegationCallbackPlugin::new(
+            knowledge_log.clone(),
+            deleg_ws.clone(),
+        );
+        if let Some(pool) = &deleg_bell_pool {
+            plugin = plugin.with_bell(pool.clone(), ws_slug.clone());
+        }
+        pol_registry = pol_registry.register(plugin);
+        eprintln!(
+            "[gt-orch-server] a2a delegation callbacks on — terminal beads push delegation.completed.v1{}",
+            if deleg_bell_pool.is_some() { " + operator bell" } else { "" }
+        );
+    }
+    // Built here, spawned alongside the other reactor ticks below.
+    let delegation_ticker = {
+        let mut ticker = gt_composition::delegation::DelegationTimeoutTicker::new(
+            knowledge_log.clone(),
+            deleg_ws.clone(),
+        );
+        if let Some(pool) = &deleg_bell_pool {
+            ticker = ticker.with_bell(pool.clone(), ws_slug.clone());
+        }
+        Arc::new(ticker)
+    };
     // Patrol bridge (gtcore-a33952 — C2): agent.spawned → lease, session-end/killed → close,
     // patrol.lease-expired → release_claim (Dolt CAS). Env-gated on GT_DOLT_URL — without it,
     // the bridge is off and crashed agents stay working until manual reconciliation.
@@ -803,6 +847,19 @@ async fn main() -> anyhow::Result<()> {
     // Spawn the auto-dispatch tick loop (if configured above).
     let auto_dispatch_task: Option<tokio::task::JoinHandle<()>> =
         auto_dispatch_handle.map(|d| d.spawn(Duration::from_secs(auto_dispatch_tick_secs)));
+
+    // A2A delegation timeout sweep (B5, gtcore-1bda00): auto-escalate any open
+    // delegation stuck past its `timeout_secs`. GT_A2A_TIMEOUT_TICK_SECS (default
+    // 60) sets the cadence; the per-delegation timeout is carried on each event.
+    let delegation_tick_secs = env_usize("GT_A2A_TIMEOUT_TICK_SECS", 60) as u64;
+    let delegation_timer = tokio::spawn(async move {
+        let mut tick = tokio::time::interval(Duration::from_secs(delegation_tick_secs));
+        tick.tick().await; // skip the immediate first fire (no delegations yet)
+        loop {
+            tick.tick().await;
+            delegation_ticker.tick().await;
+        }
+    });
 
     eprintln!(
         "[gt-orch-server] reactor loops on — patrol tick {patrol_tick_secs}s (lease timeout {lease_timeout}s), quota tick {quota_tick_secs}s (threshold {quota_threshold}s)"
@@ -1076,6 +1133,7 @@ async fn main() -> anyhow::Result<()> {
     pol_relay.abort();
     patrol_timer.abort();
     quota_timer.abort();
+    delegation_timer.abort();
     reconcile_timer.abort();
     if let Some(task) = &witness_task {
         task.abort();
@@ -1096,6 +1154,7 @@ async fn main() -> anyhow::Result<()> {
     let _ = pol_relay.await;
     let _ = patrol_timer.await;
     let _ = quota_timer.await;
+    let _ = delegation_timer.await;
     let _ = reconcile_timer.await;
     if let Some(task) = witness_task {
         let _ = task.await;
