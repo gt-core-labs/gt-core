@@ -52,6 +52,7 @@ use std::time::Duration;
 
 use gt_auth::JwtMinter;
 use gt_channel::Channel;
+use gt_composition::bead_close::BeadClosePlugin;
 use gt_composition::git_merge::GitMergePlugin;
 use gt_composition::patrol_bridge::PatrolBridgePlugin;
 use gt_composition::mcp::eventlog::EventLog;
@@ -610,6 +611,23 @@ async fn main() -> anyhow::Result<()> {
         "[gt-orch-server] git-merge edge on — branches land on main from rig checkout {} (+ per-rig routing)",
         rig_path.display()
     );
+    // Bead auto-close on merge (Fase 2 bug fix): when a branch lands on main
+    // (`merge.merged.v1`), close the bead in Dolt so its surfaces are freed for
+    // new dispatch. Without this, merged beads stay `status='working'` and block
+    // `working_surfaces()` / `occupied_surfaces` indefinitely.
+    match std::env::var("GT_DOLT_URL")
+        .ok()
+        .filter(|v| !v.is_empty())
+        .and_then(|url| gt_store_dolt::DoltIssues::connect(&url).ok())
+    {
+        Some(store) => {
+            pol_registry = pol_registry.register(BeadClosePlugin::new(Arc::new(store)));
+            eprintln!("[gt-orch-server] bead auto-close on — merged beads transition to closed");
+        }
+        None => {
+            eprintln!("[gt-orch-server] bead auto-close OFF — GT_DOLT_URL unset (merged beads stay working)")
+        }
+    }
     // Workflow notifications (hq-b7f7c1, epic hq-bb12a2): mirror dispatch / merge-landed /
     // merge-failed onto the operator's notification bell — same write surfaces as notify.send
     // (public.notifications + the SSE event log). Armed only with GT_PG_URL; best-effort inside.

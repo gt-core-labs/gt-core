@@ -38,6 +38,7 @@
 pub mod a2a;
 pub mod account_dirs;
 pub mod auto_dispatch;
+pub mod bead_close;
 pub mod anthropic_proxy;
 pub mod auth;
 pub mod denial_audit;
