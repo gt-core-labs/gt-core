@@ -622,6 +622,22 @@ async fn main() -> anyhow::Result<()> {
     let knowledge_log = Arc::new(EventLog::new(Some(event_root_for_polecat)));
     pol_plugin = pol_plugin.with_event_log(knowledge_log.clone());
     eprintln!("[gt-orch-server] Knowledge role prompt on — polecat CLAUDE.md from skills.* log");
+    // Dolt issues store for the polecat sling → working transition + bead auto-close. Resolved
+    // once and shared across both plugins. Env-gated on GT_DOLT_URL — without it the bead stays
+    // `open` until the polecat self-transitions and merged beads stay `working`.
+    let dolt_issues: Option<Arc<gt_store_dolt::DoltIssues>> = std::env::var("GT_DOLT_URL")
+        .ok()
+        .filter(|v| !v.is_empty())
+        .and_then(|url| gt_store_dolt::DoltIssues::connect(&url).ok())
+        .map(Arc::new);
+    // Transition beads open→working at sling time (gtcore-orchd-working): the frontend and the
+    // auto-dispatch frontier see the state change immediately, not after the polecat self-transitions.
+    if let Some(issues) = &dolt_issues {
+        pol_plugin = pol_plugin.with_issues(issues.clone());
+        eprintln!("[gt-orch-server] sling→working transition on — beads flip to working at spawn");
+    } else {
+        eprintln!("[gt-orch-server] sling→working transition OFF — GT_DOLT_URL unset (beads stay open until agent self-transitions)");
+    }
     // Register the polecat supervisor and — when a keychain exists — the predictive rotation
     // observer on the same relay: a `quota.block_predicted.v1` / `quota.account_limited.v1` flips
     // the keychain's active pointer so the NEXT sling lands on a healthy account.
@@ -654,13 +670,9 @@ async fn main() -> anyhow::Result<()> {
     // (`merge.merged.v1`), close the bead in Dolt so its surfaces are freed for
     // new dispatch. Without this, merged beads stay `status='working'` and block
     // `working_surfaces()` / `occupied_surfaces` indefinitely.
-    match std::env::var("GT_DOLT_URL")
-        .ok()
-        .filter(|v| !v.is_empty())
-        .and_then(|url| gt_store_dolt::DoltIssues::connect(&url).ok())
-    {
+    match &dolt_issues {
         Some(store) => {
-            pol_registry = pol_registry.register(BeadClosePlugin::new(Arc::new(store)));
+            pol_registry = pol_registry.register(BeadClosePlugin::new(store.clone()));
             eprintln!("[gt-orch-server] bead auto-close on — merged beads transition to closed");
         }
         None => {

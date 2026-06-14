@@ -40,6 +40,7 @@ use gt_polecat::{
 use gt_quota::Keychain;
 use gt_scheduling::SchedEvent;
 use gt_skills::{ModelConfig, SkillState};
+use gt_store_dolt::{DoltIssues, IssueStatus};
 
 use crate::mcp::EventLog;
 use crate::operator_event::IssueOperatorEvent;
@@ -165,6 +166,11 @@ pub struct PolecatSupervisorPlugin {
     /// prefix falls back to the legacy single `template`/`worktree_root` — so a deployment that
     /// never calls [`Self::with_rig_configs`] behaves exactly as before.
     rig_configs: HashMap<String, RigConfig>,
+    /// Dolt issues store for transitioning beads to `working` at sling time (`gtcore-orchd-working`).
+    /// When set, a successful spawn immediately flips the bead `open → working` in Dolt so the
+    /// frontend and frontier see the state change without waiting for the polecat to self-transition.
+    /// `None` ⇒ the bead stays `open` until the polecat calls `issues.transition` itself (legacy).
+    issues: Option<Arc<DoltIssues>>,
 }
 
 impl PolecatSupervisorPlugin {
@@ -194,6 +200,7 @@ impl PolecatSupervisorPlugin {
             anthropic_proxy_url: None,
             event_log: None,
             rig_configs: HashMap::new(),
+            issues: None,
         }
     }
 
@@ -202,6 +209,15 @@ impl PolecatSupervisorPlugin {
     /// Beads with a prefix not in the map keep the legacy single-template path.
     pub fn with_rig_configs(mut self, configs: HashMap<String, RigConfig>) -> Self {
         self.rig_configs = configs;
+        self
+    }
+
+    /// Transition beads to `working` in Dolt at sling time (`gtcore-orchd-working`): a successful
+    /// spawn immediately flips `open → working` so the frontend sees the state change and the
+    /// auto-dispatch frontier excludes the bead. Without it, the bead stays `open` until the
+    /// polecat self-transitions (if it does at all — the gap this closes).
+    pub fn with_issues(mut self, issues: Arc<DoltIssues>) -> Self {
+        self.issues = Some(issues);
         self
     }
 
@@ -597,6 +613,22 @@ impl Plugin for PolecatSupervisorPlugin {
                         .release(&self.workspace);
                     eprintln!("[polecat] sling failed for {bead}: {e}");
                     return Ok(());
+                }
+                // Transition the bead open→working in Dolt (gtcore-orchd-working): the polecat is
+                // slung, so the bead IS being worked. Without this the bead stays `open` in the
+                // tracker until the polecat self-transitions — which may never happen, leaving the
+                // auto-dispatch frontier stale and the frontend showing no movement. Best-effort:
+                // a Dolt failure logs but does not kill the sling (the polecat still works the bead).
+                if let Some(issues) = &self.issues {
+                    let bead_id = bead.clone();
+                    let issues = issues.clone();
+                    tokio::spawn(async move {
+                        if let Err(e) = issues.transition(&bead_id, IssueStatus::Working).await {
+                            eprintln!(
+                                "[polecat] open→working transition for {bead_id} failed: {e} — bead stays open until agent self-transitions"
+                            );
+                        }
+                    });
                 }
                 // Compute the agent manifest once (hq-orch-sessions.2): skills from the FINAL
                 // workdir (the per-bead worktree when provisioned, else the shared checkout) + the
