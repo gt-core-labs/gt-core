@@ -657,15 +657,25 @@ async fn main() -> anyhow::Result<()> {
     // same hub relay as the polecat sling (both are real I/O, kept out of pure-state daemon_root).
     // Routed by bead prefix (hq-c846f5): a gtweb bead's ff-merge runs from the gtweb checkout;
     // unknown prefixes (or an empty catalog) fall back to the boot rig checkout.
-    pol_registry = pol_registry.register(GitMergePlugin::with_rig_paths(
-        merge.clone(),
-        rig_paths,
-        rig_path.clone(),
-    ));
-    eprintln!(
-        "[gt-orch-server] git-merge edge on — branches land on main from rig checkout {} (+ per-rig routing)",
-        rig_path.display()
+    let ci_gated = std::env::var("GT_CI_GATED_MERGE")
+        .ok()
+        .filter(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .is_some();
+    pol_registry = pol_registry.register(
+        GitMergePlugin::with_rig_paths(merge.clone(), rig_paths, rig_path.clone())
+            .with_ci_gated(ci_gated),
     );
+    if ci_gated {
+        eprintln!(
+            "[gt-orch-server] git-merge edge on — CI-gated PRs from rig checkout {} (+ per-rig routing)",
+            rig_path.display()
+        );
+    } else {
+        eprintln!(
+            "[gt-orch-server] git-merge edge on — branches land on main from rig checkout {} (+ per-rig routing)",
+            rig_path.display()
+        );
+    }
     // Bead auto-close on merge (Fase 2 bug fix): when a branch lands on main
     // (`merge.merged.v1`), close the bead in Dolt so its surfaces are freed for
     // new dispatch. Without this, merged beads stay `status='working'` and block

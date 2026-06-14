@@ -40,6 +40,11 @@ fn fetch_argv() -> Vec<String> {
     vec!["fetch".into(), "origin".into()]
 }
 
+/// `git -C <rig> push origin <branch>` argv — pushes the branch to origin so a PR can be created.
+fn push_branch_argv(branch: &str) -> Vec<String> {
+    vec!["push".into(), "origin".into(), branch.into()]
+}
+
 /// `git -C <rig> push origin <branch>:main` argv — a pure fast-forward of the remote `main`
 /// (the repo config forces `merge.ff=only`; a non-ff push fails and we rebase + retry). Flat
 /// history, no merge commit (CLAUDE.md).
@@ -111,6 +116,17 @@ fn worktree_for_branch(porcelain: &str, branch: &str) -> Option<PathBuf> {
     None
 }
 
+/// Run a non-git command, returning (success, output).
+fn cmd(program: &str, args: &[&str], dir: &Path) -> std::io::Result<(bool, String)> {
+    let out = Command::new(program).args(args).current_dir(dir).output()?;
+    let text = if out.status.success() {
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    } else {
+        String::from_utf8_lossy(&out.stderr).trim().to_string()
+    };
+    Ok((out.status.success(), text))
+}
+
 /// The outcome of a real merge attempt: the sha now on `main`, or a human reason for the failure.
 type MergeOutcome = Result<String, String>;
 
@@ -163,6 +179,76 @@ fn merge_branch_to_main(rig: &Path, branch: &str) -> MergeOutcome {
     }
 }
 
+/// CI-gated merge: push the branch, create a PR with auto-merge enabled.
+/// Returns immediately with the PR URL — the actual merge happens when CI passes.
+/// If CI fails, a GitHub webhook notifies orchd to re-dispatch.
+fn merge_branch_via_pr(rig: &Path, branch: &str, bead: &str) -> MergeOutcome {
+    // 1) Fetch so rebase has the latest origin/main.
+    match run(rig, &fetch_argv()) {
+        Ok((true, _)) => {}
+        Ok((false, err)) => return Err(format!("git fetch origin failed: {err}")),
+        Err(e) => return Err(format!("git fetch origin error: {e}")),
+    }
+
+    // 2) Rebase onto origin/main so the PR is clean.
+    let porcelain = match run(rig, &worktree_list_argv()) {
+        Ok((true, out)) => out,
+        Ok((false, err)) => return Err(format!("git worktree list failed: {err}")),
+        Err(e) => return Err(format!("git worktree list error: {e}")),
+    };
+    if let Some(worktree) = worktree_for_branch(&porcelain, branch) {
+        match run(&worktree, &rebase_argv()) {
+            Ok((true, _)) => {}
+            Ok((false, err)) => {
+                let _ = run(&worktree, &rebase_abort_argv());
+                return Err(format!("rebase onto origin/main conflicted: {err}"));
+            }
+            Err(e) => return Err(format!("git rebase error: {e}")),
+        }
+    }
+
+    // 3) Push the branch to origin.
+    match run(rig, &push_branch_argv(branch)) {
+        Ok((true, _)) => {}
+        Ok((false, err)) => return Err(format!("git push origin {branch} failed: {err}")),
+        Err(e) => return Err(format!("git push origin {branch} error: {e}")),
+    }
+
+    // 4) Create PR with auto-merge (rebase strategy for flat history).
+    let title = format!("{bead}: {branch}");
+    match cmd(
+        "gh",
+        &[
+            "pr", "create",
+            "--base", "main",
+            "--head", branch,
+            "--title", &title,
+            "--body", &format!("Automated PR for bead `{bead}`.\n\nAuto-merge enabled — merges when CI passes."),
+        ],
+        rig,
+    ) {
+        Ok((true, url)) => {
+            // Enable auto-merge with rebase strategy (flat history per CLAUDE.md).
+            let _ = cmd("gh", &["pr", "merge", "--auto", "--rebase", &url], rig);
+            eprintln!("[git-merge] {bead}: PR created with auto-merge → {url}");
+            // Return the PR URL as the "sha" — the real sha comes when the PR merges.
+            Ok(url)
+        }
+        Ok((false, err)) => {
+            // PR might already exist (re-dispatch). Try to find it.
+            match cmd("gh", &["pr", "view", branch, "--json", "url", "--jq", ".url"], rig) {
+                Ok((true, url)) => {
+                    let _ = cmd("gh", &["pr", "merge", "--auto", "--rebase", &url], rig);
+                    eprintln!("[git-merge] {bead}: existing PR found, auto-merge enabled → {url}");
+                    Ok(url)
+                }
+                _ => Err(format!("gh pr create failed: {err}")),
+            }
+        }
+        Err(e) => Err(format!("gh pr create error: {e}")),
+    }
+}
+
 /// The sha at the tip of `branch` (now on `main`) after a successful push.
 fn resolve_sha(rig: &Path, branch: &str) -> MergeOutcome {
     match run(rig, &rev_parse_argv(branch)) {
@@ -186,6 +272,9 @@ pub struct GitMergePlugin {
     /// checkout; an unknown prefix falls back to `rig` — legacy single-rig deployments
     /// (constructed via [`GitMergePlugin::new`]) are unchanged.
     rig_paths: HashMap<String, PathBuf>,
+    /// When true, merges go through a PR with auto-merge instead of pushing directly to main.
+    /// CI must pass before the PR merges. Failed CI triggers re-dispatch via webhook.
+    ci_gated: bool,
 }
 
 impl GitMergePlugin {
@@ -196,6 +285,7 @@ impl GitMergePlugin {
             merge,
             rig,
             rig_paths: HashMap::new(),
+            ci_gated: false,
         }
     }
 
@@ -210,7 +300,15 @@ impl GitMergePlugin {
             merge,
             rig: fallback_rig,
             rig_paths,
+            ci_gated: false,
         }
+    }
+
+    /// Enable CI-gated merges: branches go through PRs with auto-merge instead of
+    /// pushing directly to main. Set `GT_CI_GATED_MERGE=1` to activate.
+    pub fn with_ci_gated(mut self, enabled: bool) -> Self {
+        self.ci_gated = enabled;
+        self
     }
 
     /// The checkout the ff-merge for `bead` runs from: its prefix's rig, else the fallback.
@@ -252,12 +350,23 @@ impl Plugin for GitMergePlugin {
         // Routed by bead prefix (hq-c846f5): a gtweb bead's merge runs from the gtweb checkout.
         let rig = self.rig_for(&bead).to_path_buf();
         let branch_for_git = branch.clone();
-        let outcome =
-            tokio::task::spawn_blocking(move || merge_branch_to_main(&rig, &branch_for_git))
-                .await
-                .unwrap_or_else(|e| Err(format!("merge task panicked: {e}")));
+        let ci_gated = self.ci_gated;
+        let bead_for_git = bead.clone();
+        let outcome = tokio::task::spawn_blocking(move || {
+            if ci_gated {
+                merge_branch_via_pr(&rig, &branch_for_git, &bead_for_git)
+            } else {
+                merge_branch_to_main(&rig, &branch_for_git)
+            }
+        })
+        .await
+        .unwrap_or_else(|e| Err(format!("merge task panicked: {e}")));
 
         match outcome {
+            Ok(ref sha_or_url) if ci_gated => {
+                // PR created — don't complete yet. The webhook will complete when CI passes.
+                eprintln!("[git-merge] {bead}: PR submitted for CI gate → {sha_or_url}");
+            }
             Ok(sha) => {
                 eprintln!("[git-merge] {bead}: pushed {branch} → main @ {sha}");
                 self.merge.complete(bead, sha).await;
