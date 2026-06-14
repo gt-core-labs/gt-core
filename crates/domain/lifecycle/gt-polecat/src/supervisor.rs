@@ -279,10 +279,18 @@ pub struct PolecatSupervisor {
     /// keychain's CURRENT active pointer, so the re-sling lands on a healthy account while
     /// the bead's branch/worktree survive untouched. `None` ⇒ verbatim re-sling (legacy).
     respec: Mutex<Option<RespecFn>>,
+    /// Optional predicate: returns `true` when the bead has been closed. When set, `tick()`
+    /// checks each dead polecat's `hook_bead` before re-slinging; a closed bead is unwatched
+    /// instead of restarted, preventing zombie re-slings on already-delivered work.
+    bead_closed: Mutex<Option<BeadClosedFn>>,
 }
 
 /// Spec rewriter applied before a re-sling (see [`PolecatSupervisor::set_respec`]).
 pub type RespecFn = Box<dyn Fn(SpawnSpec) -> SpawnSpec + Send + Sync>;
+
+/// Predicate that checks whether a bead is closed (see [`PolecatSupervisor::set_bead_closed`]).
+/// Takes the bead id and returns `true` when the bead has reached `status = closed`.
+pub type BeadClosedFn = Box<dyn Fn(&str) -> bool + Send + Sync>;
 
 struct SupervisorState {
     /// session id -> spec to re-sling it from.
@@ -305,6 +313,7 @@ impl PolecatSupervisor {
                 max_restarts,
             }),
             respec: Mutex::new(None),
+            bead_closed: Mutex::new(None),
         }
     }
 
@@ -312,6 +321,12 @@ impl PolecatSupervisor {
     /// composition root builds the supervisor before the keychain exists. See [`RespecFn`].
     pub fn set_respec(&self, f: RespecFn) {
         *self.respec.lock().unwrap() = Some(f);
+    }
+
+    /// Install the bead-closed predicate so `tick()` skips re-slinging dead polecats whose
+    /// bead has already been closed. Settable post-`Arc` (same reason as `set_respec`).
+    pub fn set_bead_closed(&self, f: BeadClosedFn) {
+        *self.bead_closed.lock().unwrap() = Some(f);
     }
 
     /// Register a freshly-slung polecat so its death is detected and recovered. Keyed by
@@ -388,7 +403,18 @@ impl PolecatSupervisor {
                 st.tracker.record_success(&session, now);
                 continue;
             }
-            // Dead. Check the hard cap and the tracker's backoff / crash-loop gate.
+            // Dead. If the bead is already closed, unwatch instead of re-slinging.
+            if let Some(bead) = st.watched.get(&session).and_then(|s| s.hook_bead.as_deref()) {
+                let is_closed = self.bead_closed.lock().unwrap().as_ref().map_or(false, |f| f(bead));
+                if is_closed {
+                    eprintln!(
+                        "[polecat-supervisor] skipping re-sling session={session}: bead {bead} is closed"
+                    );
+                    to_drop.push(session);
+                    continue;
+                }
+            }
+            // Check the hard cap and the tracker's backoff / crash-loop gate.
             let count = *st.restarts.get(&session).unwrap_or(&0);
             if count >= st.max_restarts || !st.tracker.can_restart(&session, now) {
                 to_drop.push(session);
@@ -582,5 +608,58 @@ mod polecat_supervisor_tests {
         assert_eq!(found, vec!["sess-1", "sess-3"], "both acct-a sessions returned");
         assert!(sup.sessions_for_account("acct-b") == vec!["sess-2"]);
         assert!(sup.sessions_for_account("acct-x").is_empty(), "unknown account → empty");
+    }
+
+    #[test]
+    fn closed_bead_is_not_reslung() {
+        // hq-bugfix-resling-closed: a dead polecat whose bead is closed must be unwatched
+        // instead of re-slung — prevents zombie polecats working on already-delivered beads.
+        let tmux: Arc<FakeTmux> = Arc::new(FakeTmux::new());
+        let sup = PolecatSupervisor::new(
+            tmux.clone(),
+            RestartConfig {
+                initial_backoff_secs: 1,
+                crash_loop_count: 100,
+                ..RestartConfig::default()
+            },
+            u32::MAX,
+        );
+        let s = spec("gt-witness", "hq-closed-1");
+        spawn_tmux(tmux.as_ref(), &s).unwrap();
+        sup.watch(s);
+
+        // Wire a bead_closed predicate that says hq-closed-1 is closed.
+        sup.set_bead_closed(Box::new(|bead| bead == "hq-closed-1"));
+
+        // Kill the session — next tick should NOT re-sling (bead is closed).
+        tmux.kill_session("gt-witness").unwrap();
+        assert_eq!(sup.tick(1000), 0, "closed bead must not be re-slung");
+        assert_eq!(sup.watched_count(), 0, "closed bead's session unwatched");
+        assert!(!tmux.has_session("gt-witness"), "no zombie session");
+    }
+
+    #[test]
+    fn open_bead_still_reslung_with_bead_closed_wired() {
+        // Sanity: when bead_closed returns false, normal re-sling proceeds.
+        let tmux: Arc<FakeTmux> = Arc::new(FakeTmux::new());
+        let sup = PolecatSupervisor::new(
+            tmux.clone(),
+            RestartConfig {
+                initial_backoff_secs: 1,
+                crash_loop_count: 100,
+                ..RestartConfig::default()
+            },
+            u32::MAX,
+        );
+        let s = spec("gt-alive", "hq-open-1");
+        spawn_tmux(tmux.as_ref(), &s).unwrap();
+        sup.watch(s);
+
+        // Wire a bead_closed predicate that says hq-open-1 is NOT closed.
+        sup.set_bead_closed(Box::new(|_| false));
+
+        tmux.kill_session("gt-alive").unwrap();
+        assert_eq!(sup.tick(1000), 1, "open bead must be re-slung");
+        assert!(tmux.has_session("gt-alive"), "session resurrected");
     }
 }

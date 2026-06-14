@@ -514,6 +514,37 @@ async fn main() -> anyhow::Result<()> {
         eprintln!("[gt-orch-server] re-sling account re-resolution armed (keychain-backed)");
     }
 
+    // Bead-closed guard for re-sling (hq-bugfix-resling-closed): prevent the supervisor from
+    // re-slinging polecats whose bead has already been closed. tick() runs in spawn_blocking,
+    // so we block_on the async pool query inside the callback.
+    if let Ok(dolt_url) = std::env::var("GT_DOLT_URL").as_deref().map(|v| v.to_string()) {
+        if let Ok(store) = gt_store_dolt::DoltIssues::connect(&dolt_url) {
+            let pool = store.pool().clone();
+            supervisor.set_bead_closed(Box::new(move |bead_id: &str| {
+                use mysql_async::prelude::*;
+                let pool = pool.clone();
+                let bead_id = bead_id.to_string();
+                // tick() runs inside spawn_blocking, so we can block_on the async query.
+                let rt = match tokio::runtime::Handle::try_current() {
+                    Ok(h) => h,
+                    Err(_) => return false,
+                };
+                rt.block_on(async {
+                    let mut conn = match pool.get_conn().await {
+                        Ok(c) => c,
+                        Err(_) => return false,
+                    };
+                    let row: Option<String> = conn
+                        .exec_first("SELECT status FROM hq.issues WHERE id = ?", (&bead_id,))
+                        .await
+                        .unwrap_or(None);
+                    row.as_deref() == Some("closed")
+                })
+            }));
+            eprintln!("[gt-orch-server] re-sling bead-closed guard armed (Dolt-backed)");
+        }
+    }
+
     // Web onboarding (hq-quota-onboard-web) moved to the backend mcp-server in .4: claude now lives
     // IN the image, so onboarding rides the existing /api/v1/* auth chain instead of a host process
     // behind a docker→host firewall hole. The daemon no longer serves it — it only hydrates its
