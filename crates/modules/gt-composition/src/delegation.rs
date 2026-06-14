@@ -56,7 +56,7 @@ use gt_plugin::Plugin;
 // `gt_events::AppError` the `Plugin` trait returns — alias it to keep them apart.
 use gt_store_dolt::AppError as StoreError;
 
-use crate::mcp::escalate::EscalationEvent;
+use crate::mcp::escalate::{EscalationEvent, EscalationMode};
 use crate::mcp::eventlog::EventLog;
 
 /// The event-log namespace prefix every delegation event shares (`delegation.`).
@@ -496,6 +496,9 @@ impl DelegationTimeoutTicker {
                     session: session_of(&d.rig, &d.child),
                     bead: Some(d.child.clone()),
                     reason: reason.clone(),
+                    // A delegated bead is a headless polecat: kill-and-re-sling is the right
+                    // disposition (pause-in-place is for interactive sessions). (B2, gtcore-5731e9)
+                    mode: EscalationMode::Kill,
                 },
             ) {
                 eprintln!("[delegation-timeout] escalation append failed for {}: {e}", d.child);

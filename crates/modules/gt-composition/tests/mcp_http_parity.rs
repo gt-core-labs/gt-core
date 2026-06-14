@@ -157,6 +157,9 @@ fn parity_map(ns: &str) -> Vec<Route> {
             rt("POST", "/{id}/heartbeat", Some("agent.heartbeat")),
             rt("POST", "/{id}/end", Some("agent.end")),
             rt("POST", "/{id}/kill", Some("agent.kill")),
+            // Pause-in-place (B2, gtcore-5731e9).
+            rt("POST", "/{id}/pause", Some("agent.pause")),
+            rt("POST", "/{id}/resume", Some("agent.resume")),
         ],
         "quota" => vec![
             // Token window history (quota.window_reset.v1 log scan) — REST-only chart data.

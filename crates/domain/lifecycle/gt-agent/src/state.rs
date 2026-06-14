@@ -14,6 +14,10 @@ use crate::events::AgentEvent;
 pub enum SessionState {
     Spawned,
     Working,
+    /// Suspended in place (B2, gtcore-5731e9): the coding-agent process has been stopped with
+    /// `SIGSTOP` (pause-in-place) but its context is intact. Non-terminal — a `Resumed` event
+    /// (`SIGCONT`) returns it to [`Working`](SessionState::Working); a `Killed` may still end it.
+    Paused,
     Done,
     Killed,
 }
@@ -188,12 +192,20 @@ impl Session {
 
     /// Aplica una transición o la rechaza. Reglas (corrige el ejemplo incompleto del doc):
     /// `Spawned→Working→Done`, y `Killed` admisible desde cualquier estado **activo**.
-    /// `Done`/`Killed` son terminales.
+    /// `Done`/`Killed` son terminales. Pause-in-place (B2, gtcore-5731e9) añade un par
+    /// reversible `Working↔Paused`; una sesión pausada sigue siendo activa, así que `Killed`
+    /// también es admisible desde `Paused`.
     pub fn transition(&mut self, to: SessionState) -> Result<(), AppError> {
         use SessionState::*;
         let legal = matches!(
             (self.state, to),
-            (Spawned, Working) | (Working, Done) | (Spawned, Killed) | (Working, Killed)
+            (Spawned, Working)
+                | (Working, Done)
+                | (Spawned, Killed)
+                | (Working, Killed)
+                | (Working, Paused)
+                | (Paused, Working)
+                | (Paused, Killed)
         );
         if legal {
             self.state = to;
@@ -298,6 +310,19 @@ impl SessionRegistry {
                     s.state = SessionState::Killed;
                 }
             }
+            // Pause-in-place (B2): fold the suspend/resume facts as state, unconditionally — the
+            // reducer derives, it does not validate (legality is the write path's job). A `Resumed`
+            // returns the session to `Working`, the state it was suspended from.
+            AgentEvent::Paused { session, .. } => {
+                if let Some(s) = self.sessions.get_mut(session) {
+                    s.state = SessionState::Paused;
+                }
+            }
+            AgentEvent::Resumed { session } => {
+                if let Some(s) = self.sessions.get_mut(session) {
+                    s.state = SessionState::Working;
+                }
+            }
         }
     }
 
@@ -349,6 +374,62 @@ mod tests {
         let mut s = Session::new("p1", "granite");
         s.transition(SessionState::Killed).unwrap(); // desde Spawned
         assert!(s.transition(SessionState::Working).is_err()); // terminal, ya no se mueve
+    }
+
+    #[test]
+    fn pause_resume_is_a_reversible_working_loop() {
+        // B2: Working↔Paused is reversible and Paused stays active (non-terminal); a paused
+        // session can still be killed, but cannot jump straight to Done.
+        let mut s = Session::new("p1", "granite");
+        s.transition(SessionState::Working).unwrap();
+        s.transition(SessionState::Paused).unwrap();
+        assert_eq!(s.state, SessionState::Paused);
+        assert!(!s.is_terminal(), "paused session is still active");
+        // No skipping a resume to reach Done.
+        assert!(s.transition(SessionState::Done).is_err());
+        s.transition(SessionState::Working).unwrap();
+        assert_eq!(s.state, SessionState::Working);
+        s.transition(SessionState::Done).unwrap();
+        assert!(s.is_terminal());
+    }
+
+    #[test]
+    fn pause_is_illegal_from_spawned() {
+        // Pause-in-place suspends a *running* agent; a session that never reached Working has no
+        // live turn to stop.
+        let mut s = Session::new("p1", "granite");
+        assert!(s.transition(SessionState::Paused).is_err());
+        assert_eq!(s.state, SessionState::Spawned, "estado intacto tras rechazo");
+    }
+
+    #[test]
+    fn paused_session_can_still_be_killed() {
+        let mut s = Session::new("p1", "granite");
+        s.transition(SessionState::Working).unwrap();
+        s.transition(SessionState::Paused).unwrap();
+        s.transition(SessionState::Killed).unwrap();
+        assert!(s.is_terminal());
+    }
+
+    #[test]
+    fn apply_folds_pause_then_resume_back_to_working() {
+        // The pure reducer derives suspend/resume as state: Paused → Paused, Resumed → Working.
+        let mut reg = SessionRegistry::default();
+        reg.apply(&AgentEvent::Spawned {
+            session: "p1".into(),
+            rig: "r".into(),
+            role: SessionRole::Dog(DogKind::Dog),
+            crew: None,
+            skills: Vec::new(),
+            hooks: Vec::new(),
+            maintains_heartbeat: false,
+            tmux_socket: Some("gt-default".into()),
+            spawned_by: None,
+        });
+        reg.apply(&AgentEvent::Paused { session: "p1".into(), reason: "escalation".into() });
+        assert_eq!(reg.get("p1").unwrap().state, SessionState::Paused);
+        reg.apply(&AgentEvent::Resumed { session: "p1".into() });
+        assert_eq!(reg.get("p1").unwrap().state, SessionState::Working);
     }
 
     #[test]

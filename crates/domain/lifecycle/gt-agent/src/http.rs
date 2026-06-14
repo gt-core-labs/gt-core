@@ -144,6 +144,8 @@ impl AgentApiState {
 /// | `POST /:id/heartbeat`| `agent.heartbeat`  |
 /// | `POST /:id/end`      | `agent.end`        |
 /// | `POST /:id/kill`     | `agent.kill`       |
+/// | `POST /:id/pause`    | `agent.pause`      |
+/// | `POST /:id/resume`   | `agent.resume`     |
 pub fn agent_router(state: AgentApiState) -> Router {
     Router::new()
         .route("/", get(list_sessions).post(spawn_session))
@@ -151,6 +153,8 @@ pub fn agent_router(state: AgentApiState) -> Router {
         .route("/:id/heartbeat", post(heartbeat_session))
         .route("/:id/end", post(end_session))
         .route("/:id/kill", post(kill_session))
+        .route("/:id/pause", post(pause_session))
+        .route("/:id/resume", post(resume_session))
         .with_state(state)
 }
 
@@ -175,6 +179,14 @@ struct SpawnArgs {
 #[derive(Debug, Deserialize)]
 struct KillArgs {
     /// Why the session was killed (recorded on the `Killed` event).
+    reason: String,
+}
+
+/// `agent.pause` body: the reason the session is being suspended in place (B2). Recorded on the
+/// `Paused` event so the operator/audit trail shows why context was frozen rather than killed.
+#[derive(Debug, Deserialize)]
+struct PauseArgs {
+    /// Why the session was paused (recorded on the `Paused` event).
     reason: String,
 }
 
@@ -351,6 +363,63 @@ async fn kill_session(
     Ok(Json(body))
 }
 
+/// `POST /:id/pause` — suspend a session **in place** (`agent.pause`, B2 gtcore-5731e9). Records
+/// `agent.paused.v1`, folding the session to `paused`, then sends `SIGSTOP` to the tmux pane's
+/// process group so the coding agent stops with its context intact (no kill, no re-sling). `404`
+/// on an unknown id; a missing `reason` is a `422`. The opposite of `/:id/kill`: this is the
+/// kill-preserving door for interactive sessions (mayor, dog) the bead targets.
+#[cfg_attr(feature = "axum", utoipa::path(
+    post, path = "/{id}/pause",
+    params(("id" = String, Path, description = "Session id")),
+    responses(
+        (status = 200, description = "Session paused in place"),
+        (status = 404, description = "No session with that id"),
+        (status = 422, description = "Missing pause reason"),
+    ),
+))]
+async fn pause_session(
+    State(st): State<AgentApiState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Json(a): Json<PauseArgs>,
+) -> Result<Json<Value>, ApiError> {
+    let ws = workspace_of(&headers);
+    let ws = ws.as_deref();
+    st.require_session(ws, &id)?;
+    let body = st.record(ws, AgentEvent::Paused { session: id.clone(), reason: a.reason }, &id)?;
+    // SIGSTOP the agent in place. Interactive sessions (mayor, dog) live on the per-workspace
+    // tmux server (`gt-<workspace>`), the same server the kill endpoint targets.
+    let server = format!("gt-{}", ws.unwrap_or("default"));
+    signal_tmux_panes(&server, &id, libc::SIGSTOP);
+    Ok(Json(body))
+}
+
+/// `POST /:id/resume` — resume a suspended session (`agent.resume`, B2 gtcore-5731e9). Records
+/// `agent.resumed.v1`, folding the session back to `working`, then sends `SIGCONT` to the tmux
+/// pane's process group so the coding agent picks up exactly where it was stopped. `404` on an
+/// unknown id.
+#[cfg_attr(feature = "axum", utoipa::path(
+    post, path = "/{id}/resume",
+    params(("id" = String, Path, description = "Session id")),
+    responses(
+        (status = 200, description = "Session resumed"),
+        (status = 404, description = "No session with that id"),
+    ),
+))]
+async fn resume_session(
+    State(st): State<AgentApiState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> Result<Json<Value>, ApiError> {
+    let ws = workspace_of(&headers);
+    let ws = ws.as_deref();
+    st.require_session(ws, &id)?;
+    let body = st.record(ws, AgentEvent::Resumed { session: id.clone() }, &id)?;
+    let server = format!("gt-{}", ws.unwrap_or("default"));
+    signal_tmux_panes(&server, &id, libc::SIGCONT);
+    Ok(Json(body))
+}
+
 /// The combined OpenAPI document for the agent REST surface (`hq-fe-api-orch.1`). The builder
 /// mounts it under the module prefix and rewrites its relative paths to `/api/v1/agent/...`, so
 /// the `#[utoipa::path]` annotations stay prefix-free.
@@ -362,6 +431,8 @@ async fn kill_session(
     heartbeat_session,
     end_session,
     kill_session,
+    pause_session,
+    resume_session,
 ))]
 pub struct ApiDoc;
 
@@ -388,11 +459,41 @@ fn drop_dispatch_event(channel: &std::path::Path, bead: &str, priority: u8) {
     }
 }
 
+/// Send `signal` (e.g. `SIGSTOP`/`SIGCONT`) to the process group of every pane in tmux session
+/// `session` on server `server` — the pause-in-place primitive (B2, gtcore-5731e9).
+///
+/// tmux runs each pane's command as its own session/process-group leader, so `#{pane_pid}` is the
+/// group id; signalling the **negative** pid reaches the shell *and* the coding agent (and any
+/// `bd`/tool subprocesses) it spawned, so `SIGSTOP` freezes the whole turn and `SIGCONT` thaws it.
+/// Best-effort, mirroring [`kill_session`]'s tmux call: the lifecycle event is already durable, so
+/// a missing tmux/pane is swallowed rather than failing the request.
+fn signal_tmux_panes(server: &str, session: &str, signal: libc::c_int) {
+    let out = std::process::Command::new("tmux")
+        .args(["-L", server, "list-panes", "-t", session, "-F", "#{pane_pid}"])
+        .output();
+    let Ok(out) = out else { return };
+    if !out.status.success() {
+        return;
+    }
+    for line in String::from_utf8_lossy(&out.stdout).lines() {
+        if let Ok(pid) = line.trim().parse::<i32>() {
+            if pid > 0 {
+                // Negative pid → the pane's whole process group (SAFETY: `kill(2)` is a plain
+                // syscall with no memory effects; we ignore the return — a reaped pane is fine).
+                unsafe {
+                    libc::kill(-pid, signal);
+                }
+            }
+        }
+    }
+}
+
 /// Stable spelling of a session state (matches the MCP dispatch payload).
 fn state_str(state: SessionState) -> &'static str {
     match state {
         SessionState::Spawned => "spawned",
         SessionState::Working => "working",
+        SessionState::Paused => "paused",
         SessionState::Done => "done",
         SessionState::Killed => "killed",
     }
@@ -453,7 +554,15 @@ mod tests {
         // rewrite them. Every declared route must be present so the combined document is complete.
         let doc = ApiDoc::openapi();
         let paths: Vec<&str> = doc.paths.paths.keys().map(String::as_str).collect();
-        for expected in ["/", "/{id}", "/{id}/heartbeat", "/{id}/end", "/{id}/kill"] {
+        for expected in [
+            "/",
+            "/{id}",
+            "/{id}/heartbeat",
+            "/{id}/end",
+            "/{id}/kill",
+            "/{id}/pause",
+            "/{id}/resume",
+        ] {
             assert!(paths.contains(&expected), "missing {expected} in {paths:?}");
         }
         // Prefix-free: the module builder, not the annotation, owns `/api/v1/agent`.
