@@ -573,6 +573,13 @@ impl PolecatSupervisor {
         self.state.lock().unwrap().watched.len()
     }
 
+    /// The stored [`SpawnSpec`] for `session`, cloned, or `None` if it is not (or no longer)
+    /// supervised. The context-exhaustion re-sling (gtcore-3b2a68) reads it to derive the bead +
+    /// worktree of the dead polecat, then re-watches a continuation spec built from it.
+    pub fn spec_for_session(&self, session: &str) -> Option<SpawnSpec> {
+        self.state.lock().unwrap().watched.get(session).cloned()
+    }
+
     /// Session ids of every supervised polecat whose env carries `GT_HOOK_ACCOUNT == account`.
     /// All session ids currently watched by the supervisor — alive or pending re-sling.
     /// Used to emit MCP agent heartbeats after each tick without changing tick's return type.
