@@ -31,6 +31,16 @@
 //!
 //! Default-branch-only is the epic's explicit decision: the warden is keyed by `rig` (not
 //! `(rig, branch)`), so a push to a non-default branch carries no graph meaning here.
+//!
+//! ## CI-gate forwarding (gtcore-52c9ec)
+//!
+//! Besides `push`, this receiver also forwards `pull_request.closed` and `check_suite.completed`
+//! deliveries to orchd's CI-gate endpoint ([`crate::ci_gate`]) — the signal that replaces orchd's
+//! old 60s `poll_pr_until_resolved` loop. When an agent PR merges (CI passed) it `POST`s
+//! `/ci-gate/merged`; when it closes unmerged or a check suite concludes in failure it `POST`s
+//! `/ci-gate/failed`. orchd then drives the merge slot to its terminal state. Forwarding is enabled
+//! only when a target URL is configured ([`GithubWebhookState::with_ci_forward`]); otherwise these
+//! events are acknowledged `204` and ignored, exactly as before.
 
 use std::sync::Arc;
 
@@ -40,7 +50,7 @@ use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::post;
 use axum::Router;
-use serde_json::Value;
+use serde_json::{json, Value};
 
 use gt_graphwarden::{MarkStale, WardenCommand, WardenState};
 use gt_rig::{PgRigs, RigEntry, RigRepository};
@@ -71,12 +81,38 @@ pub struct GithubWebhookState {
     pools: Arc<WsPools>,
     connections: Arc<dyn VcsConnectionRepo>,
     log: Arc<EventLog>,
+    /// CI-gate forward target (gtcore-52c9ec). `Some` ⇒ `pull_request.closed` /
+    /// `check_suite.completed` deliveries are POSTed to orchd's `/ci-gate/{merged,failed}`. `None` ⇒
+    /// those events are acknowledged and ignored (backward-compatible default).
+    forward: Option<CiForward>,
+}
+
+/// In-cluster HTTP target for forwarding CI-gate notifications to orchd. Cheap to clone (the
+/// `reqwest::Client` is internally `Arc`-shared).
+#[derive(Clone)]
+struct CiForward {
+    client: reqwest::Client,
+    /// orchd's metrics/CI-gate base, e.g. `http://gt-orch-server:9099`.
+    base_url: String,
+    /// Optional shared bearer token, mirrored from orchd's `GT_CI_GATE_TOKEN`.
+    token: Option<String>,
+}
+
+/// The terminal CI outcome a forwarded delivery distils to. Pure data — produced by the decision
+/// functions, consumed by the forwarder (so the GitHub-payload parsing is unit-testable without HTTP).
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum CiNotification {
+    /// The agent PR merged: drive the slot to `Merged` with the sha now on `main`.
+    Merged { bead: String, sha: String },
+    /// CI failed (or the PR closed unmerged): drive the slot to `Failed`; the reactor re-enqueues.
+    Failed { bead: String, reason: String },
 }
 
 impl GithubWebhookState {
     /// Build the receiver state. `source` resolves the App webhook secret (the value GitHub HMACs
     /// each delivery with); `pools` resolves a tenant's `ws_<slug>` rig catalog; `connections` maps
-    /// an installation id to its workspace; `log` is the warden event log.
+    /// an installation id to its workspace; `log` is the warden event log. CI-gate forwarding is off
+    /// until [`with_ci_forward`](Self::with_ci_forward) is called.
     pub fn new(
         source: gt_vcs::GithubAppSource,
         pools: Arc<WsPools>,
@@ -88,7 +124,24 @@ impl GithubWebhookState {
             pools,
             connections,
             log,
+            forward: None,
         }
+    }
+
+    /// Enable CI-gate forwarding to orchd at `base_url` (e.g. `http://gt-orch-server:9099`) with an
+    /// optional shared bearer `token`. A blank `base_url` leaves forwarding off. Called by the
+    /// binary from `GT_CI_GATE_URL` / `GT_CI_GATE_TOKEN` (gtcore-52c9ec).
+    pub fn with_ci_forward(mut self, base_url: impl Into<String>, token: Option<String>) -> Self {
+        let base_url = base_url.into().trim().trim_end_matches('/').to_string();
+        if base_url.is_empty() {
+            return self;
+        }
+        self.forward = Some(CiForward {
+            client: reqwest::Client::new(),
+            base_url,
+            token: token.map(|t| t.trim().to_string()).filter(|t| !t.is_empty()),
+        });
+        self
     }
 }
 
@@ -145,19 +198,142 @@ async fn receive(
         Ok(d) => d,
         Err(_) => return (StatusCode::BAD_REQUEST, "malformed payload").into_response(),
     };
-    if delivery.event != "push" {
-        // Other events (installation, ping, …) are acknowledged but carry no graph meaning here.
-        return StatusCode::NO_CONTENT.into_response();
-    }
 
-    match handle_push(&st, &delivery.payload).await {
-        Ok(Some(rig)) => (StatusCode::OK, format!("marked rig `{rig}` stale")).into_response(),
-        // Verified but not actionable: unmapped installation/repo, non-default branch, or a head we
-        // already indexed. A 204 so GitHub records a successful delivery without a redelivery storm.
-        Ok(None) => StatusCode::NO_CONTENT.into_response(),
-        // A backend fault (PG/event-log). 500 so GitHub retries — the push really did happen.
-        Err(_) => (StatusCode::INTERNAL_SERVER_ERROR, "internal error").into_response(),
+    match delivery.event.as_str() {
+        // The graph-staleness path (the original responsibility): a push to a rig's default branch.
+        "push" => match handle_push(&st, &delivery.payload).await {
+            Ok(Some(rig)) => (StatusCode::OK, format!("marked rig `{rig}` stale")).into_response(),
+            // Verified but not actionable: unmapped installation/repo, non-default branch, or a head
+            // we already indexed. A 204 so GitHub records a successful delivery without a storm.
+            Ok(None) => StatusCode::NO_CONTENT.into_response(),
+            // A backend fault (PG/event-log). 500 so GitHub retries — the push really did happen.
+            Err(_) => (StatusCode::INTERNAL_SERVER_ERROR, "internal error").into_response(),
+        },
+        // The CI-gate path (gtcore-52c9ec): forward a resolved merge/CI outcome to orchd.
+        "pull_request" => forward_notification(&st, pr_notification(&delivery.payload)).await,
+        "check_suite" => {
+            forward_notification(&st, check_suite_notification(&delivery.payload)).await
+        }
+        // Other events (installation, ping, …) are acknowledged but carry no meaning here.
+        _ => StatusCode::NO_CONTENT.into_response(),
     }
+}
+
+/// Forward a CI-gate `notif` to orchd, or acknowledge `204` when there is nothing to forward (the
+/// event was verified but not a terminal outcome) or no forward target is configured.
+///
+/// Returns `202` on a delivered forward, `204` on a verified-but-ignored delivery, and `502` when
+/// the forward target is unreachable (a 5xx so GitHub redelivers — `complete`/`fail` are idempotent
+/// no-ops once the slot is terminal, so a retried forward is safe).
+async fn forward_notification(st: &GithubWebhookState, notif: Option<CiNotification>) -> Response {
+    let Some(notif) = notif else {
+        return StatusCode::NO_CONTENT.into_response();
+    };
+    let Some(fwd) = st.forward.as_ref() else {
+        // No target configured: acknowledge so GitHub doesn't retry a delivery we intentionally drop.
+        return StatusCode::NO_CONTENT.into_response();
+    };
+    match forward(fwd, &notif).await {
+        Ok(()) => StatusCode::ACCEPTED.into_response(),
+        Err(e) => {
+            eprintln!("[ci-gate-webhook] forward failed: {e}");
+            (StatusCode::BAD_GATEWAY, "ci-gate forward failed").into_response()
+        }
+    }
+}
+
+/// POST a CI-gate notification to orchd's `/ci-gate/{merged,failed}`. Adds the shared bearer token
+/// when configured. A non-2xx response (or transport error) is an `Err` surfaced as a `502`.
+async fn forward(fwd: &CiForward, notif: &CiNotification) -> Result<(), String> {
+    let (path, body) = match notif {
+        CiNotification::Merged { bead, sha } => {
+            ("/ci-gate/merged", json!({ "bead": bead, "sha": sha }))
+        }
+        CiNotification::Failed { bead, reason } => {
+            ("/ci-gate/failed", json!({ "bead": bead, "reason": reason }))
+        }
+    };
+    let url = format!("{}{}", fwd.base_url, path);
+    let mut req = fwd.client.post(&url).json(&body);
+    if let Some(tok) = &fwd.token {
+        req = req.bearer_auth(tok);
+    }
+    let resp = req.send().await.map_err(|e| format!("POST {url}: {e}"))?;
+    if resp.status().is_success() {
+        Ok(())
+    } else {
+        Err(format!("POST {url}: orchd returned {}", resp.status()))
+    }
+}
+
+/// Distil a `pull_request` delivery to a CI-gate outcome, or `None` when it is not a terminal close.
+/// A `closed` PR that merged → [`CiNotification::Merged`] (sha = `merge_commit_sha`); a `closed` PR
+/// that did NOT merge (auto-merge can't land it, e.g. abandoned) → [`CiNotification::Failed`]. Any
+/// other action (opened, synchronize, …) is `None`. Pure, so the bead/sha extraction is unit-tested.
+fn pr_notification(payload: &Value) -> Option<CiNotification> {
+    if payload.get("action").and_then(Value::as_str) != Some("closed") {
+        return None;
+    }
+    let pr = payload.get("pull_request")?;
+    let bead = bead_from_pr(pr)?;
+    let merged = pr.get("merged").and_then(Value::as_bool).unwrap_or(false);
+    if merged {
+        let sha = pr
+            .get("merge_commit_sha")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string();
+        Some(CiNotification::Merged { bead, sha })
+    } else {
+        Some(CiNotification::Failed {
+            bead,
+            reason: "PR closed without merge".to_string(),
+        })
+    }
+}
+
+/// Distil a `check_suite` delivery to a CI-gate outcome. Only a `completed` suite whose conclusion
+/// is NOT a pass (`success`/`neutral`/`skipped`) forwards — as [`CiNotification::Failed`] so the
+/// bead re-dispatches. A passing suite is `None`: the actual merge arrives later as a
+/// `pull_request.closed` (merged=true), so forwarding `merged` from here would be premature.
+fn check_suite_notification(payload: &Value) -> Option<CiNotification> {
+    if payload.get("action").and_then(Value::as_str) != Some("completed") {
+        return None;
+    }
+    let cs = payload.get("check_suite")?;
+    let bead = cs
+        .get("head_branch")
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())?
+        .to_string();
+    match cs.get("conclusion").and_then(Value::as_str) {
+        // Passing (or not-yet-conclusive) suites carry no failure signal here.
+        Some("success") | Some("neutral") | Some("skipped") | None => None,
+        // failure / cancelled / timed_out / action_required / stale / startup_failure / …
+        Some(conclusion) => Some(CiNotification::Failed {
+            bead,
+            reason: format!("CI failed: {conclusion}"),
+        }),
+    }
+}
+
+/// The bead a PR belongs to. The merge edge titles agent PRs `"{bead}: {branch}"`
+/// ([`crate::git_merge`]), so the bead is the prefix before the first `": "`; failing that (a
+/// hand-opened PR), the head branch — polecat branches are named after the bead.
+fn bead_from_pr(pr: &Value) -> Option<String> {
+    if let Some(title) = pr.get("title").and_then(Value::as_str) {
+        if let Some((bead, _)) = title.split_once(": ") {
+            let bead = bead.trim();
+            if !bead.is_empty() {
+                return Some(bead.to_string());
+            }
+        }
+    }
+    pr.get("head")
+        .and_then(|h| h.get("ref"))
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
 }
 
 /// The decision core for a verified `push` delivery: resolve installation → workspace, map repo →
@@ -537,5 +713,136 @@ mod tests {
             })
             .unwrap();
         assert!(state.rigs.contains_key("inactivas-chain"));
+    }
+
+    // --- CI-gate forwarding (gtcore-52c9ec). The `pull_request` / `check_suite` deliveries are
+    // distilled to a `CiNotification` by pure decision functions, so the bead/sha extraction and the
+    // pass/fail classification are unit-testable without an HTTP round-trip. ---
+
+    /// A `pull_request.closed` that merged forwards `Merged` with the merge sha; the bead comes from
+    /// the `"{bead}: {branch}"` PR title the merge edge writes.
+    #[test]
+    fn pr_merged_forwards_merged_with_sha() {
+        let payload = json!({
+            "action": "closed",
+            "pull_request": {
+                "title": "gtcore-52c9ec: gtcore-52c9ec",
+                "merged": true,
+                "merge_commit_sha": "deadbeefcafe",
+                "head": { "ref": "gtcore-52c9ec" }
+            }
+        });
+        assert_eq!(
+            pr_notification(&payload),
+            Some(CiNotification::Merged {
+                bead: "gtcore-52c9ec".into(),
+                sha: "deadbeefcafe".into(),
+            })
+        );
+    }
+
+    /// A `closed` PR that did NOT merge forwards `Failed` so the bead re-dispatches. With no title
+    /// the bead falls back to the head branch (polecat branches are named after the bead).
+    #[test]
+    fn pr_closed_unmerged_forwards_failed_via_branch_fallback() {
+        let payload = json!({
+            "action": "closed",
+            "pull_request": {
+                "merged": false,
+                "head": { "ref": "gtcore-52c9ec" }
+            }
+        });
+        assert_eq!(
+            pr_notification(&payload),
+            Some(CiNotification::Failed {
+                bead: "gtcore-52c9ec".into(),
+                reason: "PR closed without merge".into(),
+            })
+        );
+    }
+
+    /// Non-terminal PR actions (opened, synchronize, …) and a closed PR with no resolvable bead
+    /// carry nothing to forward.
+    #[test]
+    fn pr_non_close_and_unidentifiable_are_none() {
+        assert_eq!(
+            pr_notification(&json!({ "action": "synchronize", "pull_request": {} })),
+            None
+        );
+        // closed, but no title and no head ref → cannot name a bead.
+        assert_eq!(
+            pr_notification(&json!({ "action": "closed", "pull_request": { "merged": true } })),
+            None
+        );
+    }
+
+    /// A `check_suite.completed` with a failing conclusion forwards `Failed` keyed by the suite's
+    /// head branch, with the conclusion surfaced in the reason.
+    #[test]
+    fn check_suite_failure_forwards_failed() {
+        let payload = json!({
+            "action": "completed",
+            "check_suite": { "head_branch": "gtcore-52c9ec", "conclusion": "failure" }
+        });
+        assert_eq!(
+            check_suite_notification(&payload),
+            Some(CiNotification::Failed {
+                bead: "gtcore-52c9ec".into(),
+                reason: "CI failed: failure".into(),
+            })
+        );
+    }
+
+    /// A passing (or not-yet-conclusive) check suite forwards nothing — the real merge arrives later
+    /// as `pull_request.closed` (merged=true), so emitting `merged` here would be premature.
+    #[test]
+    fn check_suite_pass_and_pending_are_none() {
+        for conclusion in [json!("success"), json!("neutral"), json!("skipped"), Value::Null] {
+            let payload = json!({
+                "action": "completed",
+                "check_suite": { "head_branch": "b", "conclusion": conclusion }
+            });
+            assert_eq!(check_suite_notification(&payload), None, "{conclusion:?}");
+        }
+        // A non-`completed` action is also ignored.
+        assert_eq!(
+            check_suite_notification(&json!({
+                "action": "requested",
+                "check_suite": { "head_branch": "b", "conclusion": "failure" }
+            })),
+            None
+        );
+    }
+
+    /// With no forward target configured, a real CI outcome is acknowledged `204` (intentionally
+    /// dropped) rather than retried — the backward-compatible default before `with_ci_forward`.
+    #[tokio::test]
+    async fn forward_without_target_acknowledges_204() {
+        let (st, _dir) = state_with(conn("12345", Some("acme")));
+        let resp = forward_notification(
+            &st,
+            Some(CiNotification::Merged {
+                bead: "b".into(),
+                sha: "s".into(),
+            }),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+    }
+
+    /// `with_ci_forward` normalizes a trailing slash and treats a blank URL / blank token as unset.
+    #[test]
+    fn with_ci_forward_normalizes_and_ignores_blank() {
+        let (st, _dir) = state_with(conn("12345", Some("acme")));
+        let st = st.with_ci_forward("http://orchd:9099/", Some("  ".into()));
+        let fwd = st.forward.expect("forward configured");
+        assert_eq!(fwd.base_url, "http://orchd:9099");
+        assert!(fwd.token.is_none(), "blank token collapses to None");
+
+        let (st2, _dir2) = state_with(conn("12345", Some("acme")));
+        assert!(
+            st2.with_ci_forward("   ", None).forward.is_none(),
+            "blank base_url leaves forwarding off"
+        );
     }
 }
