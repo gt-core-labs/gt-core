@@ -11,9 +11,10 @@
 
 use std::collections::HashMap;
 use std::io;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
+use regex::Regex;
 use tokio::sync::mpsc;
 
 use gt_agent::AgentEvent;
@@ -23,21 +24,52 @@ use crate::lifecycle::{heartbeat_is_stale, spawn_process, spawn_tmux, SpawnSpec,
 use crate::restart::{RestartConfig, RestartTracker};
 use crate::tmux::Tmux;
 
+/// Context-usage percentage at or above which a polecat's self-exit is read as a death by
+/// context exhaustion rather than a clean completion (gtcore-91fdde). Claude Code surfaces an
+/// `N% context used` indicator in its TUI; once the window is nearly full the agent can no
+/// longer make progress and bails, which looks identical to a normal exit unless we inspect
+/// the pane.
+const CONTEXT_EXHAUSTION_THRESHOLD: u8 = 85;
+
 /// Why a watched polecat stopped.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WatchOutcome {
     /// The process exited on its own — normal completion or an external `kill -9`.
     Exited,
+    /// The process exited on its own, but its pane showed claude at or above
+    /// [`CONTEXT_EXHAUSTION_THRESHOLD`]% context used — the death is presumed to be context
+    /// exhaustion, not a clean finish (gtcore-91fdde). `context_pct` is the parsed percentage,
+    /// so the layer above can distinguish "ran out of room" from a normal `Exited`.
+    ContextExhausted { context_pct: u8 },
     /// The heartbeat went stale; the supervisor killed the (hung) process.
     StaleKilled,
 }
 
 impl WatchOutcome {
-    /// The death event to record for this outcome.
+    /// Classify a self-exit from the last lines captured off the polecat's tmux pane: if the
+    /// pane carries an `N% context used` marker with `N >=` [`CONTEXT_EXHAUSTION_THRESHOLD`],
+    /// the exit is [`WatchOutcome::ContextExhausted`]; otherwise (no marker, or below the
+    /// threshold) it is a plain [`WatchOutcome::Exited`].
+    fn classify_exit(pane_tail: &str) -> WatchOutcome {
+        match parse_context_pct(pane_tail) {
+            Some(pct) if pct >= CONTEXT_EXHAUSTION_THRESHOLD => {
+                WatchOutcome::ContextExhausted { context_pct: pct }
+            }
+            _ => WatchOutcome::Exited,
+        }
+    }
+
+    /// The death event to record for this outcome. A context-exhaustion death is recorded as a
+    /// [`AgentEvent::Killed`] whose reason carries the parsed percentage, so the audit log keeps
+    /// the context figure (gtcore-91fdde) without a new event kind.
     fn end_event(self, session: &str) -> AgentEvent {
         match self {
             WatchOutcome::Exited => AgentEvent::SessionEnd {
                 session: session.to_string(),
+            },
+            WatchOutcome::ContextExhausted { context_pct } => AgentEvent::Killed {
+                session: session.to_string(),
+                reason: format!("context exhausted: {context_pct}% context used"),
             },
             WatchOutcome::StaleKilled => AgentEvent::Killed {
                 session: session.to_string(),
@@ -47,16 +79,52 @@ impl WatchOutcome {
     }
 }
 
+/// Parse the highest-line `N% context used` indicator out of captured pane text, returning the
+/// percentage (clamped to 100). Scans every match and keeps the **last** one — captured
+/// scrollback is oldest-first, so the final occurrence is claude's most recent context reading.
+/// `None` when the text carries no such marker.
+fn parse_context_pct(output: &str) -> Option<u8> {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    let re = RE.get_or_init(|| {
+        // Case-insensitive; tolerant of the spacing tmux/claude may render between the figure
+        // and the label. The percentage is 1–3 digits.
+        Regex::new(r"(?i)(\d{1,3})%\s*context used").expect("static regex compiles")
+    });
+    let pct = re
+        .captures_iter(output)
+        .filter_map(|c| c.get(1)?.as_str().parse::<u32>().ok())
+        .last()?;
+    Some(pct.min(100) as u8)
+}
+
 /// Watch a spawned polecat until it dies. Polls the heartbeat every `poll`; if it is older
 /// than `stale_after` the process is presumed hung and killed. Removes the heartbeat file
 /// before returning so a re-spawn starts clean.
-pub async fn watch(p: &mut SpawnedPolecat, stale_after: Duration, poll: Duration) -> WatchOutcome {
+///
+/// When the process exits on its own, `capture_pane` is invoked once to read the last lines of
+/// the polecat's tmux pane (`tmux capture-pane`); the captured text is classified by
+/// [`WatchOutcome::classify_exit`] so a death by context exhaustion is told apart from a clean
+/// finish (gtcore-91fdde). Callers with no pane to inspect (the direct-child path, whose stdout
+/// is `/dev/null`) pass a closure returning `None`, which collapses to a plain
+/// [`WatchOutcome::Exited`] — no behavior change. The closure is only called on the self-exit
+/// branch, never when the heartbeat-stale kill fires.
+pub async fn watch(
+    p: &mut SpawnedPolecat,
+    stale_after: Duration,
+    poll: Duration,
+    capture_pane: impl Fn() -> Option<String>,
+) -> WatchOutcome {
     let hb = p.heartbeat.clone();
     let child = p.child_mut();
     let mut tick = tokio::time::interval(poll);
     let outcome = loop {
         tokio::select! {
-            _ = child.wait() => break WatchOutcome::Exited,
+            _ = child.wait() => {
+                break match capture_pane() {
+                    Some(tail) => WatchOutcome::classify_exit(&tail),
+                    None => WatchOutcome::Exited,
+                };
+            }
             _ = tick.tick() => {
                 if heartbeat_is_stale(&hb, stale_after) {
                     let _ = child.start_kill();
@@ -117,7 +185,11 @@ where
         let mut p = spawn_process(&spec).await?;
         let _ = events.send(spec.spawned_envelope()).await;
 
-        let outcome = watch(&mut p, policy.stale_after, policy.poll).await;
+        // The direct-child path runs the polecat with stdout/stderr → /dev/null (no tmux pane),
+        // so there is nothing to inspect for a context marker: capture yields `None` and the
+        // self-exit stays a plain `Exited`. The tmux-backed production path (`PolecatSupervisor`)
+        // is where a real `capture_pane` would be wired.
+        let outcome = watch(&mut p, policy.stale_after, policy.poll, || None).await;
         let _ = events
             .send(Envelope::root(outcome.end_event(&session)))
             .await;
@@ -175,6 +247,130 @@ pub async fn supervise_daemon<F, Fut, N>(
             tokio::time::sleep(Duration::from_secs(backoff)).await;
         }
         restarts += 1;
+    }
+}
+
+#[cfg(test)]
+mod context_exhaustion_tests {
+    use super::*;
+    use crate::lifecycle::{spawn_process, SpawnSpec};
+
+    #[test]
+    fn parses_context_percentage_from_status_line() {
+        assert_eq!(parse_context_pct("23% context used"), Some(23));
+        // Embedded in a larger line, with leading text.
+        assert_eq!(
+            parse_context_pct("  ⏵⏵ accept edits on · 92% context used"),
+            Some(92)
+        );
+        // Case-insensitive and tolerant of the spacing around the label.
+        assert_eq!(parse_context_pct("88%  Context Used"), Some(88));
+        assert_eq!(parse_context_pct("88%context used"), Some(88));
+    }
+
+    #[test]
+    fn keeps_the_last_marker_in_scrollback() {
+        // Captured scrollback is oldest-first; the final reading is claude's most recent. A
+        // session that climbed 10% → 47% → 96% must classify on the 96%.
+        let pane = "10% context used\nworking…\n47% context used\nmore work\n96% context used\n";
+        assert_eq!(parse_context_pct(pane), Some(96));
+    }
+
+    #[test]
+    fn no_marker_is_none_and_oversized_is_clamped() {
+        assert_eq!(parse_context_pct("just a shell prompt $ "), None);
+        assert_eq!(parse_context_pct(""), None);
+        // A nonsensical >100 reading is clamped rather than overflowing the u8.
+        assert_eq!(parse_context_pct("150% context used"), Some(100));
+    }
+
+    #[test]
+    fn classify_exit_thresholds_at_85() {
+        // At/above the threshold → ContextExhausted carrying the percentage.
+        assert_eq!(
+            WatchOutcome::classify_exit("85% context used"),
+            WatchOutcome::ContextExhausted { context_pct: 85 }
+        );
+        assert_eq!(
+            WatchOutcome::classify_exit("99% context used"),
+            WatchOutcome::ContextExhausted { context_pct: 99 }
+        );
+        // Below it → a plain Exited (lots of room left, normal completion).
+        assert_eq!(
+            WatchOutcome::classify_exit("84% context used"),
+            WatchOutcome::Exited
+        );
+        // No marker at all → Exited (e.g. the direct-child path or a session that closed clean).
+        assert_eq!(WatchOutcome::classify_exit("done.\n"), WatchOutcome::Exited);
+    }
+
+    #[test]
+    fn context_exhausted_end_event_records_the_percentage() {
+        let ev = WatchOutcome::ContextExhausted { context_pct: 91 }.end_event("gt-max");
+        match ev {
+            AgentEvent::Killed { session, reason } => {
+                assert_eq!(session, "gt-max");
+                assert!(reason.contains("91"), "reason carries the pct: {reason}");
+                assert!(reason.contains("context"), "reason names the cause: {reason}");
+            }
+            other => panic!("expected Killed, got {other:?}"),
+        }
+    }
+
+    fn quick_spec(command: &str, args: &[&str]) -> SpawnSpec {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        static SEQ: AtomicU32 = AtomicU32::new(0);
+        let dir = std::env::temp_dir();
+        // Unique per call so parallel tests never share a heartbeat file.
+        let session = format!(
+            "gt-ctx-test-{}-{}",
+            std::process::id(),
+            SEQ.fetch_add(1, Ordering::SeqCst)
+        );
+        SpawnSpec {
+            session: session.clone(),
+            rig: "granite".to_string(),
+            polecat: session.clone(),
+            crew: None,
+            workdir: dir.clone(),
+            command: command.to_string(),
+            args: args.iter().map(|s| s.to_string()).collect(),
+            env: vec![],
+            hook_bead: None,
+            issue: None,
+            heartbeat: dir.join(format!("{session}.heartbeat")),
+        }
+    }
+
+    #[tokio::test]
+    async fn watch_classifies_a_self_exit_from_the_captured_pane() {
+        // A child that exits immediately; the capture closure stands in a near-full pane, so
+        // watch() must report ContextExhausted rather than a bare Exited (gtcore-91fdde).
+        let spec = quick_spec("true", &[]);
+        let mut p = spawn_process(&spec).await.expect("spawn true");
+        let outcome = watch(
+            &mut p,
+            Duration::from_secs(60),
+            Duration::from_millis(10),
+            || Some("⏵ 90% context used".to_string()),
+        )
+        .await;
+        assert_eq!(outcome, WatchOutcome::ContextExhausted { context_pct: 90 });
+    }
+
+    #[tokio::test]
+    async fn watch_without_a_pane_is_a_plain_exit() {
+        // No pane to inspect (the direct-child path passes `|| None`) → unchanged Exited.
+        let spec = quick_spec("true", &[]);
+        let mut p = spawn_process(&spec).await.expect("spawn true");
+        let outcome = watch(
+            &mut p,
+            Duration::from_secs(60),
+            Duration::from_millis(10),
+            || None,
+        )
+        .await;
+        assert_eq!(outcome, WatchOutcome::Exited);
     }
 }
 
