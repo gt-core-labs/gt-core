@@ -214,20 +214,27 @@ impl QuotaRotationPlugin {
             .rotated(at_risk.to_string(), target.clone(), now_secs())
             .await;
         eprintln!("[quota-rotation] active claude account rotated {at_risk} → {target}");
-        // Signal risk for any polecat that was in-flight on the rotated account
-        // (hq-quota-refinement.3). These sessions were slung with the old credentials; they will
-        // continue consuming the exhausting account until they finish. The operator must decide
-        // whether to let them complete (they may succeed before the limit) or kill and re-sling.
-        // New slings after the keychain flip above will pick `target` automatically.
+        // Hot credential swap: copy the NEW account's .credentials.json into every
+        // in-flight polecat's CLAUDE_CONFIG_DIR so claude CLI picks up the fresh token
+        // without restarting. The polecat keeps running — only the underlying account changes.
         if let Some(sup) = &self.supervisor {
-            let at_risk_sessions = sup.sessions_for_account(at_risk);
-            for session in &at_risk_sessions {
-                eprintln!(
-                    "[quota-rotation] WARN kind=polecat.account_rotated_while_active \
-                     account={at_risk} session={session} new_account={target} \
-                     — polecat still in-flight on the rotated account; \
-                     new slings will use {target}; kill+re-sling to recover immediately"
-                );
+            if let Ok(Some(target_cred)) = self.keychain.get(&target) {
+                let src = std::path::Path::new(&target_cred.secret)
+                    .join(".credentials.json");
+                let at_risk_dirs = sup.config_dirs_for_account(at_risk);
+                for (session, config_dir) in &at_risk_dirs {
+                    let dst = std::path::Path::new(config_dir).join(".credentials.json");
+                    match std::fs::copy(&src, &dst) {
+                        Ok(_) => eprintln!(
+                            "[quota-rotation] hot-swapped credentials for {session}: \
+                             {at_risk} → {target}"
+                        ),
+                        Err(e) => eprintln!(
+                            "[quota-rotation] WARN credential swap failed for {session}: {e} \
+                             — polecat stays on {at_risk}"
+                        ),
+                    }
+                }
             }
         }
         Ok(())

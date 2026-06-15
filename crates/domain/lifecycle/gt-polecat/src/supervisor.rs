@@ -394,6 +394,30 @@ impl PolecatSupervisor {
             .collect()
     }
 
+    /// Return `(session, CLAUDE_CONFIG_DIR)` pairs for every polecat backed by `account`.
+    /// Used by hot credential rotation to copy the new account's credentials in-place.
+    pub fn config_dirs_for_account(&self, account: &str) -> Vec<(String, String)> {
+        self.state
+            .lock()
+            .unwrap()
+            .watched
+            .values()
+            .filter(|spec| {
+                spec.env
+                    .iter()
+                    .any(|(k, v)| k == crate::GT_HOOK_ACCOUNT && v == account)
+            })
+            .filter_map(|spec| {
+                let dir = spec
+                    .env
+                    .iter()
+                    .find(|(k, _)| k == "CLAUDE_CONFIG_DIR")
+                    .map(|(_, v)| v.clone())?;
+                Some((spec.session.clone(), dir))
+            })
+            .collect()
+    }
+
     /// One supervision pass. For each watched session: alive (tmux has-session) → reset its
     /// restart budget; dead → re-sling if budget + backoff allow, else drop. Returns how many
     /// were re-slung this pass. `now` is edge-stamped unix seconds (same discipline as the
