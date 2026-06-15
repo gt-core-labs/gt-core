@@ -766,6 +766,50 @@ async fn main() -> anyhow::Result<()> {
         }
         Arc::new(ticker)
     };
+    // Human-escalation operator notifications (A6, gtcore-46c9dc, epic hq-bb12a2): a blocked
+    // agent's `escalation.requested.v1` reaches the operator bell + email with a direct link, and
+    // a periodic ticker re-pings escalations still pending past N hours. Both ride the same
+    // GT_PG_URL-gated pool the delegation bell uses (no bell ⇒ no operator surface ⇒ skip). The
+    // reminder ticker is built here, spawned alongside the delegation timer below.
+    let escalation_ticker = match &deleg_bell_pool {
+        Some(pool) => {
+            let notifier = gt_composition::escalation_notify::OperatorNotifier::new(
+                pool.clone(),
+                knowledge_log.clone(),
+                ws_slug.clone(),
+            )
+            .with_email(std::env::var("GT_NOTIFY_EMAIL").unwrap_or_default())
+            .with_public_url(std::env::var("GT_PUBLIC_URL").unwrap_or_default());
+            // Observer: each new escalation rings the operator the moment it lands.
+            pol_registry = pol_registry.register(
+                gt_composition::escalation_notify::EscalationNotifyPlugin::new(notifier.clone()),
+            );
+            let reminder_secs = env_usize(
+                "GT_ESCALATION_REMINDER_SECS",
+                gt_composition::escalation_notify::DEFAULT_REMINDER_SECS as usize,
+            ) as u64;
+            eprintln!(
+                "[gt-orch-server] escalation notifications on — operator bell/email on escalate.request; reminders every {reminder_secs}s ({})",
+                if std::env::var("GT_NOTIFY_EMAIL").ok().filter(|v| !v.trim().is_empty()).is_some() {
+                    "bell + email"
+                } else {
+                    "bell only"
+                }
+            );
+            Some(Arc::new(
+                gt_composition::escalation_notify::EscalationReminderTicker::new(
+                    knowledge_log.clone(),
+                    deleg_ws.clone(),
+                    notifier,
+                    reminder_secs,
+                ),
+            ))
+        }
+        None => {
+            eprintln!("[gt-orch-server] escalation notifications OFF — GT_PG_URL unset (no operator bell)");
+            None
+        }
+    };
     // Patrol bridge (gtcore-a33952 — C2): agent.spawned → lease, session-end/killed → close,
     // patrol.lease-expired → release_claim (Dolt CAS). Env-gated on GT_DOLT_URL — without it,
     // the bridge is off and crashed agents stay working until manual reconciliation.
@@ -922,6 +966,22 @@ async fn main() -> anyhow::Result<()> {
             tick.tick().await;
             delegation_ticker.tick().await;
         }
+    });
+
+    // Escalation reminder sweep (A6, gtcore-46c9dc): re-ping the operator about escalations
+    // still pending past their window. GT_ESCALATION_TICK_SECS (default 300) sets the cadence;
+    // the per-escalation window is GT_ESCALATION_REMINDER_SECS (read above). Only spawned when
+    // the operator bell is wired (GT_PG_URL).
+    let escalation_timer = escalation_ticker.map(|ticker| {
+        let escalation_tick_secs = env_usize("GT_ESCALATION_TICK_SECS", 300) as u64;
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(Duration::from_secs(escalation_tick_secs));
+            tick.tick().await; // skip the immediate first fire (no escalations yet)
+            loop {
+                tick.tick().await;
+                ticker.tick().await;
+            }
+        })
     });
 
     eprintln!(
@@ -1197,6 +1257,9 @@ async fn main() -> anyhow::Result<()> {
     patrol_timer.abort();
     quota_timer.abort();
     delegation_timer.abort();
+    if let Some(task) = &escalation_timer {
+        task.abort();
+    }
     reconcile_timer.abort();
     if let Some(task) = &witness_task {
         task.abort();
@@ -1218,6 +1281,9 @@ async fn main() -> anyhow::Result<()> {
     let _ = patrol_timer.await;
     let _ = quota_timer.await;
     let _ = delegation_timer.await;
+    if let Some(task) = escalation_timer {
+        let _ = task.await;
+    }
     let _ = reconcile_timer.await;
     if let Some(task) = witness_task {
         let _ = task.await;
