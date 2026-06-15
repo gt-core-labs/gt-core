@@ -521,6 +521,9 @@ impl DelegationTimeoutTicker {
                     // A delegated bead is a headless polecat: kill-and-re-sling is the right
                     // disposition (pause-in-place is for interactive sessions). (B2, gtcore-5731e9)
                     mode: EscalationMode::Kill,
+                    // The delegation's age is the timeout clock; the escalation inherits "now" as
+                    // its own reminder-clock zero (A6, gtcore-46c9dc).
+                    at: crate::mcp::escalate::rfc3339_now(),
                 },
             ) {
                 eprintln!("[delegation-timeout] escalation append failed for {}: {e}", d.child);
