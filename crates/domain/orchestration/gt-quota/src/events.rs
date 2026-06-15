@@ -133,6 +133,21 @@ pub enum QuotaEvent {
         session: String,
         now_secs: u64,
     },
+    /// A session's spend crossed its HARD ceiling (A5, gtcore-f3a016): the platform hard gate
+    /// tripped. Distinct from `BudgetExceeded` (B1's soft alert) — this is the *enforcement*
+    /// event: from here the anthropic proxy refuses the session's further model calls, so the
+    /// runaway freezes itself. Emitted once (the crossing is latched); the replay reducer marks
+    /// the session `gated` so a restart restores the freeze.
+    BudgetGateTripped {
+        session: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        bead: Option<String>,
+        /// Running cost at the trip, in cost units.
+        consumed_cost: f64,
+        /// The hard ceiling that was crossed, in cost units.
+        hard_limit_cost: f64,
+        now_secs: u64,
+    },
 }
 
 impl EventKind for QuotaEvent {
@@ -152,6 +167,7 @@ impl EventKind for QuotaEvent {
             QuotaEvent::SessionBudgetOpened { .. } => "quota.session_budget_opened.v1",
             QuotaEvent::BudgetExceeded { .. } => "quota.budget_exceeded.v1",
             QuotaEvent::SessionBudgetClosed { .. } => "quota.session_budget_closed.v1",
+            QuotaEvent::BudgetGateTripped { .. } => "quota.budget_gate_tripped.v1",
         }
     }
 }

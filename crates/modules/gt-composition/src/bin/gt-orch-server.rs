@@ -439,6 +439,28 @@ async fn main() -> anyhow::Result<()> {
         })
     });
 
+    // A5 (gtcore-f3a016): per-session HARD spend cap. When GT_SESSION_HARD_CAP_COST is set (in
+    // cost units), a session whose cumulative spend crosses it is FROZEN at the anthropic proxy —
+    // every further model call is refused, so a runaway agent stops itself ("hard gate, no
+    // soft-fail silencioso"). Unset/0 ⇒ no hard gate: spend is still tracked + soft-alerted (B1),
+    // just never enforced. Configured on the quota actor the proxy consults below.
+    match std::env::var("GT_SESSION_HARD_CAP_COST")
+        .ok()
+        .and_then(|v| v.trim().parse::<f64>().ok())
+    {
+        Some(cap) if cap > 0.0 => {
+            quota.configure_budget_gate(Some(cap)).await;
+            eprintln!(
+                "[gt-orch-server] per-session hard spend cap armed at {cap} cost units (GT_SESSION_HARD_CAP_COST) — runaways freeze at the proxy"
+            );
+        }
+        _ => {
+            eprintln!(
+                "[gt-orch-server] per-session hard spend cap disabled (GT_SESSION_HARD_CAP_COST unset) — spend tracked, not gated"
+            );
+        }
+    }
+
     // Anthropic passthrough proxy (hq-284842): polecats' claude points here via
     // ANTHROPIC_BASE_URL; every response feeds per-call quota truth (unified-status verdicts,
     // tokens-family probe, API-reported usage samples) with zero extra requests. Listener is
