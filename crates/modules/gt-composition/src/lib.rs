@@ -41,6 +41,7 @@ pub mod auto_dispatch;
 pub mod bead_close;
 pub mod ci_gate;
 pub mod anthropic_proxy;
+pub mod continuation;
 pub mod auth;
 pub mod delegation;
 pub mod delegation_http;
