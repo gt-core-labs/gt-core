@@ -58,6 +58,7 @@ pub mod operator_event;
 pub mod patrol_bridge;
 pub mod operator_resource;
 pub mod polecat;
+pub mod polecat_event;
 pub mod quota_rotation;
 pub mod report_scheduler;
 pub mod rest_modules;
