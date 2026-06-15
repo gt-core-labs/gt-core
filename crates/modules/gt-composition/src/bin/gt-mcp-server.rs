@@ -575,6 +575,15 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
+    // Server→agent push over the live MCP session (gtcore-d366ff). The registry binds each
+    // authenticated connection's peer to its actor + `Mcp-Session-Id`; the push observer
+    // (spawned below) tails the event log and delivers `notifications/resources/updated` to
+    // the agent's open GET stream when an A2A message or a delegation result lands — replacing
+    // the agent's `a2a.inbox` / `a2a.status` poll. Additive: an agent with no open session is
+    // never in the registry, so the push is a no-op and polling still works.
+    let push_registry = Arc::new(gt_mcp_server::SessionRegistry::with_default_ttl());
+    service = service.with_session_registry(push_registry.clone());
+
     // Streamable-HTTP Host allow-list (rmcp's DNS-rebinding guard). The default only
     // accepts loopback authorities (localhost/127.0.0.1/::1), so a public deploy behind a
     // reverse proxy — where the inbound `Host` is the served domain — would have every /mcp
@@ -598,6 +607,13 @@ async fn main() -> anyhow::Result<()> {
         Arc::new(LocalSessionManager::default()),
         http_config,
     );
+
+    // Push observer (gtcore-d366ff): poll-tail the event log and push inbox/delegation/
+    // escalation notifications to open MCP sessions, plus reap idle sessions on a timer.
+    // Shares the same `event_log` handle the SSE feed streams from, so it sees both this
+    // server's `a2a.send` writes and the orchd daemon's `delegation.completed.v1`.
+    gt_composition::mcp_push::spawn(event_log.clone(), push_registry);
+    eprintln!("[gt-mcp-server] session push observer on (event-log tail → MCP resource notifications)");
 
     // Per-workspace SSE event feed (hq-mcp-dispatch.10): GET /stream fans the
     // caller's workspace log out as Server-Sent Events, keyed per (workspace,
