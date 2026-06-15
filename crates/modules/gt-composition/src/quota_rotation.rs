@@ -26,7 +26,8 @@
 //!   folds the per-response token sample (so the consumption-rate EWMA grows). Without this feed
 //!   the predictor stays flat (rate 0 ⇒ no `BlockPredicted`); with it, `tick` projects the block.
 
-use std::sync::Arc;
+use std::collections::HashSet;
+use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
@@ -149,13 +150,24 @@ pub struct QuotaRotationPlugin {
     /// (`hq-quota-refinement.3`). When wired, `rotate_away_from` emits a structured warning for
     /// every supervised polecat that was backed by the rotated account so the operator can act.
     supervisor: Option<Arc<PolecatSupervisor>>,
+    /// Accounts whose in-flight polecats are currently SIGSTOP'd because rotation found no healthy
+    /// target — pause-on-exhaustion (gtcore-6f449f). The set gates recovery: a probe lifting one of
+    /// these accounts back to `Healthy` triggers the matching resume exactly once. Interior
+    /// mutability because the plugin is shared behind `Arc` on the daemon hub; the lock is never
+    /// held across an `.await`.
+    paused_accounts: Mutex<HashSet<String>>,
 }
 
 impl QuotaRotationPlugin {
     /// Wire the quota command handle (for the account snapshot + the `rotated` record) and the
     /// keychain (whose live pointer the rotation flips).
     pub fn new(quota: QuotaHandle, keychain: Arc<dyn Keychain>) -> Self {
-        Self { quota, keychain, supervisor: None }
+        Self {
+            quota,
+            keychain,
+            supervisor: None,
+            paused_accounts: Mutex::new(HashSet::new()),
+        }
     }
 
     /// Wire the polecat supervisor so in-flight session risk is surfaced on rotation
@@ -201,9 +213,11 @@ impl QuotaRotationPlugin {
         }
         let accounts = self.quota.accounts().await;
         let Some(target) = Self::pick_target(&accounts, at_risk) else {
-            eprintln!(
-                "[quota-rotation] {at_risk} at risk but no healthy alternative — staying put"
-            );
+            // No healthy account anywhere (every alternative is Blocked or ≥ hard). Letting the
+            // in-flight polecats keep running just feeds them 429s until they crash or spin
+            // retrying. Instead, suspend them in place (SIGSTOP) so their context survives until an
+            // account recovers (gtcore-6f449f); the matching resume fires from the recovery probe.
+            self.pause_on_exhaustion(at_risk).await;
             return Ok(());
         };
         // Flip the live credential pointer FIRST: if the target has no stored credential the
@@ -283,6 +297,84 @@ impl QuotaRotationPlugin {
         );
         Ok(())
     }
+
+    /// Pause-on-exhaustion (gtcore-6f449f): rotation found no healthy alternative for `at_risk`, so
+    /// suspend its in-flight polecats in place and emit `quota.all_exhausted.v1` with the paused
+    /// session list. Idempotent — once an account is recorded paused, a repeat trigger (another
+    /// `BlockPredicted`/`Blocked` for the same account) is a no-op so the event is not spammed and
+    /// already-frozen polecats are not re-signalled.
+    async fn pause_on_exhaustion(&self, at_risk: &str) {
+        // Idempotency guard: already paused for this account?
+        {
+            let paused = self.paused_accounts.lock().unwrap();
+            if paused.contains(at_risk) {
+                return;
+            }
+        }
+        let paused_sessions = match &self.supervisor {
+            Some(sup) => sup.pause_account(at_risk),
+            None => Vec::new(),
+        };
+        // Record the account as paused so the recovery probe knows to resume it. We mark it even
+        // when no sessions were paused (no supervisor / no in-flight work) so the all_exhausted →
+        // account_recovered pairing stays symmetric; resume on an empty set is a cheap no-op.
+        self.paused_accounts
+            .lock()
+            .unwrap()
+            .insert(at_risk.to_string());
+        eprintln!(
+            "[quota-rotation] {at_risk} at risk but no healthy alternative — pausing {} in-flight \
+             polecat(s) in place (quota.all_exhausted.v1)",
+            paused_sessions.len()
+        );
+        self.quota
+            .all_exhausted(at_risk.to_string(), paused_sessions, now_secs())
+            .await;
+    }
+
+    /// Resume-on-recovery (gtcore-6f449f): a probe named `account`; if we had paused it under
+    /// [`Self::pause_on_exhaustion`] and it is now back to `Healthy`, resume its suspended polecats
+    /// and emit `quota.account_recovered.v1` with the resumed session list. No-op when the account
+    /// was never paused or has not recovered yet. Runs on every `quota.usage_probed.v1`, so the
+    /// account-paused gate keeps it cheap for the common (nothing-paused) case.
+    async fn resume_if_recovered(&self, account: &str) {
+        // Fast path: nothing paused for this account.
+        {
+            let paused = self.paused_accounts.lock().unwrap();
+            if !paused.contains(account) {
+                return;
+            }
+        }
+        // Confirm the probe actually lifted it back to Healthy before thawing.
+        let recovered = self
+            .quota
+            .accounts()
+            .await
+            .iter()
+            .any(|a| a.id == account && a.status == AccountQuotaStatus::Healthy);
+        if !recovered {
+            return;
+        }
+        // Clear the gate first (so a concurrent probe does not double-resume), then thaw. Bind in
+        // its own statement so the guard drops before the await below (never held across `.await`).
+        let was_paused = self.paused_accounts.lock().unwrap().remove(account);
+        if !was_paused {
+            // Lost the race to another probe — it already handled the resume.
+            return;
+        }
+        let resumed_sessions = match &self.supervisor {
+            Some(sup) => sup.resume_account(account),
+            None => Vec::new(),
+        };
+        eprintln!(
+            "[quota-rotation] {account} recovered to Healthy — resuming {} paused polecat(s) \
+             (quota.account_recovered.v1)",
+            resumed_sessions.len()
+        );
+        self.quota
+            .account_recovered(account.to_string(), resumed_sessions, now_secs())
+            .await;
+    }
 }
 
 #[async_trait]
@@ -334,6 +426,12 @@ impl Plugin for QuotaRotationPlugin {
                     QuotaEvent::UsageProbed { account, .. } => account,
                     _ => return Ok(()),
                 };
+                // Recovery first (gtcore-6f449f): if this probe lifted a paused-on-exhaustion
+                // account back to Healthy, resume its suspended polecats. This is exactly the path
+                // the synthetic unblock probe (`schedule_unblock`) lands on after a Retry-After
+                // expires. Runs regardless of the live pointer — the recovered account may not be
+                // active yet.
+                self.resume_if_recovered(&account).await;
                 // Only the live pointer gates assignment; probes for parked accounts are
                 // recovery signals, not draining triggers.
                 if self.keychain.active()?.as_deref() != Some(account.as_str()) {
@@ -1255,5 +1353,224 @@ mod tests {
             }
         }
         assert!(alerted, "quota.soft_drain_stalled.v1 alert fired");
+    }
+
+    // gtcore-6f449f: pause-on-exhaustion ----------------------------------------------------
+
+    use gt_polecat::{
+        spawn_tmux, FakeTmux, PolecatSupervisor, RestartConfig, SpawnSpec, GT_HOOK_ACCOUNT,
+    };
+
+    /// A supervised, alive polecat backed by `account`, ready for the plugin to pause. Returns the
+    /// supervisor (sharing `tmux`) so the test can assert pause/resume against the same fake.
+    fn supervisor_with_polecat(
+        tmux: Arc<FakeTmux>,
+        session: &str,
+        account: &str,
+    ) -> Arc<PolecatSupervisor> {
+        let sup = Arc::new(PolecatSupervisor::new(
+            tmux.clone(),
+            RestartConfig::default(),
+            u32::MAX,
+        ));
+        let spec = SpawnSpec {
+            session: session.to_string(),
+            rig: "granite".to_string(),
+            polecat: session.to_string(),
+            crew: None,
+            workdir: std::env::temp_dir(),
+            command: "sleep".to_string(),
+            args: vec!["30".to_string()],
+            env: vec![(GT_HOOK_ACCOUNT.to_string(), account.to_string())],
+            hook_bead: Some(format!("bead-{session}")),
+            issue: None,
+            heartbeat: std::env::temp_dir().join(format!("{session}.hb")),
+        };
+        spawn_tmux(tmux.as_ref(), &spec).unwrap();
+        sup.watch(spec);
+        sup
+    }
+
+    /// Seed quota with `a` (active, at-risk) and a Blocked `b`, so a rotation away from `a` finds no
+    /// healthy target. Returns the handle + relay receiver.
+    async fn quota_a_active_b_blocked() -> (QuotaHandle, mpsc::Receiver<Envelope<QuotaEvent>>) {
+        let (tx, rx) = mpsc::channel(64);
+        let q = gt_quota::actor::spawn(tx, std::collections::HashMap::new());
+        q.upsert_account(Account::new("a")).await;
+        q.upsert_account(Account::new("b")).await;
+        q.blocked("b", Some(10_000), 1_000).await; // b is unavailable → no rotation target
+        let _ = q.snapshot().await; // sync barrier
+        (q, rx)
+    }
+
+    #[tokio::test]
+    async fn all_exhausted_pauses_in_flight_polecats_and_emits_event() {
+        // Acceptance: rotate_away_from finds no healthy account → the at-risk account's in-flight
+        // polecats are SIGSTOP'd and quota.all_exhausted.v1 carries the paused session list.
+        let (quota, mut rx) = quota_a_active_b_blocked().await;
+        let keychain = Arc::new(InMemoryKeychain::seeded([("a", "/cfg/a"), ("b", "/cfg/b")]));
+        keychain.set_active("a").unwrap();
+        let tmux = Arc::new(FakeTmux::new());
+        let sup = supervisor_with_polecat(tmux.clone(), "sess-a", "a");
+        let plugin = QuotaRotationPlugin::new(quota.clone(), keychain.clone())
+            .with_supervisor(sup.clone());
+
+        // The provider limited `a`; with `b` blocked there is nowhere to rotate.
+        plugin
+            .on_event(&record(QuotaEvent::AccountLimited {
+                account: "a".into(),
+                now_secs: 2_000,
+            }))
+            .await
+            .unwrap();
+
+        assert!(tmux.is_paused("sess-a"), "the in-flight polecat was suspended in place");
+        assert_eq!(sup.paused_sessions(), vec!["sess-a"]);
+        // The pointer never moved (no target).
+        assert_eq!(keychain.active().unwrap().as_deref(), Some("a"));
+
+        let _ = quota.snapshot().await; // sync barrier for the emit
+        let mut found = None;
+        while let Ok(env) = rx.try_recv() {
+            if let QuotaEvent::AllExhausted { account, paused_sessions, .. } = env.payload {
+                found = Some((account, paused_sessions));
+            }
+        }
+        assert_eq!(
+            found,
+            Some(("a".to_string(), vec!["sess-a".to_string()])),
+            "quota.all_exhausted.v1 named the account and the paused session"
+        );
+    }
+
+    #[tokio::test]
+    async fn exhaustion_is_idempotent_no_double_pause_or_event() {
+        // A second BlockPredicted for the same already-exhausted account must not re-pause or
+        // re-emit (no thrash).
+        let (quota, mut rx) = quota_a_active_b_blocked().await;
+        let keychain = Arc::new(InMemoryKeychain::seeded([("a", "/cfg/a"), ("b", "/cfg/b")]));
+        keychain.set_active("a").unwrap();
+        let tmux = Arc::new(FakeTmux::new());
+        let sup = supervisor_with_polecat(tmux.clone(), "sess-a", "a");
+        let plugin = QuotaRotationPlugin::new(quota.clone(), keychain.clone())
+            .with_supervisor(sup.clone());
+
+        let limited = || {
+            record(QuotaEvent::AccountLimited {
+                account: "a".into(),
+                now_secs: 2_000,
+            })
+        };
+        plugin.on_event(&limited()).await.unwrap();
+        plugin.on_event(&limited()).await.unwrap();
+        let _ = quota.snapshot().await;
+
+        let exhausted_events = {
+            let mut n = 0;
+            while let Ok(env) = rx.try_recv() {
+                if matches!(env.payload, QuotaEvent::AllExhausted { .. }) {
+                    n += 1;
+                }
+            }
+            n
+        };
+        assert_eq!(exhausted_events, 1, "all_exhausted emitted exactly once");
+        assert_eq!(sup.paused_sessions(), vec!["sess-a"]);
+    }
+
+    #[tokio::test]
+    async fn recovery_probe_resumes_paused_polecats_and_emits_event() {
+        // Acceptance end-to-end: all accounts blocked → polecat paused; an account recovers to
+        // Healthy → the paused polecat is resumed and quota.account_recovered.v1 fires.
+        let (quota, mut rx) = quota_a_active_b_blocked().await;
+        let keychain = Arc::new(InMemoryKeychain::seeded([("a", "/cfg/a"), ("b", "/cfg/b")]));
+        keychain.set_active("a").unwrap();
+        let tmux = Arc::new(FakeTmux::new());
+        let sup = supervisor_with_polecat(tmux.clone(), "sess-a", "a");
+        let plugin = QuotaRotationPlugin::new(quota.clone(), keychain.clone())
+            .with_supervisor(sup.clone());
+
+        // Step 1: exhaustion pauses the polecat.
+        plugin
+            .on_event(&record(QuotaEvent::AccountLimited {
+                account: "a".into(),
+                now_secs: 2_000,
+            }))
+            .await
+            .unwrap();
+        assert!(tmux.is_paused("sess-a"), "paused after exhaustion");
+
+        // Step 2: the synthetic unblock probe lifts `a` back to Healthy. Send it to the actor
+        // first (so its state reflects Healthy), then route the resulting event to the plugin —
+        // exactly the production order (actor probe → emit → plugin reacts).
+        quota.probe("a", 1_000_000, FAR_FUTURE, None, None, 9_000).await;
+        let _ = quota.snapshot().await; // sync: probe applied (a → Healthy)
+
+        plugin
+            .on_event(&record(QuotaEvent::UsageProbed {
+                account: "a".into(),
+                remaining: 1_000_000,
+                resets_at_secs: FAR_FUTURE,
+                weekly_remaining: None,
+                weekly_resets_at_secs: None,
+                now_secs: 9_000,
+            }))
+            .await
+            .unwrap();
+
+        assert!(!tmux.is_paused("sess-a"), "the recovered account's polecat was resumed");
+        assert!(sup.paused_sessions().is_empty(), "pause set cleared on recovery");
+
+        let _ = quota.snapshot().await; // sync barrier for the emit
+        let mut found = None;
+        while let Ok(env) = rx.try_recv() {
+            if let QuotaEvent::AccountRecovered { account, resumed_sessions, .. } = env.payload {
+                found = Some((account, resumed_sessions));
+            }
+        }
+        assert_eq!(
+            found,
+            Some(("a".to_string(), vec!["sess-a".to_string()])),
+            "quota.account_recovered.v1 named the account and the resumed session"
+        );
+    }
+
+    #[tokio::test]
+    async fn probe_for_a_never_paused_account_is_a_noop() {
+        // A usage probe for an account we never paused must not emit account_recovered.
+        let (quota, mut rx) = quota_with_two().await;
+        let keychain = Arc::new(InMemoryKeychain::seeded([("a", "/cfg/a"), ("b", "/cfg/b")]));
+        keychain.set_active("a").unwrap();
+        let tmux = Arc::new(FakeTmux::new());
+        let sup = supervisor_with_polecat(tmux.clone(), "sess-a", "a");
+        let plugin = QuotaRotationPlugin::new(quota.clone(), keychain.clone())
+            .with_supervisor(sup);
+
+        quota.probe("a", 1_000_000, FAR_FUTURE, None, None, 9_000).await;
+        let _ = quota.snapshot().await;
+        plugin
+            .on_event(&record(QuotaEvent::UsageProbed {
+                account: "a".into(),
+                remaining: 1_000_000,
+                resets_at_secs: FAR_FUTURE,
+                weekly_remaining: None,
+                weekly_resets_at_secs: None,
+                now_secs: 9_000,
+            }))
+            .await
+            .unwrap();
+        let _ = quota.snapshot().await;
+
+        let recovered = {
+            let mut any = false;
+            while let Ok(env) = rx.try_recv() {
+                if matches!(env.payload, QuotaEvent::AccountRecovered { .. }) {
+                    any = true;
+                }
+            }
+            any
+        };
+        assert!(!recovered, "no recovery event for an account that was never paused");
+        assert!(!tmux.is_paused("sess-a"));
     }
 }

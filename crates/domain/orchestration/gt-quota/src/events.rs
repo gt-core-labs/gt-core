@@ -96,6 +96,27 @@ pub enum QuotaEvent {
         account: String,
         now_secs: u64,
     },
+    /// Every account is exhausted (gtcore-6f449f): a rotation away from `account` found no healthy
+    /// alternative (all others are `Blocked` or at/above the hard threshold), so the in-flight
+    /// polecats backed by `account` were suspended **in place** (`SIGSTOP`) to preserve their
+    /// context instead of letting them die against the rate limit. `paused_sessions` is the exact
+    /// set the edge stopped. The pause is lifted by [`Self::AccountRecovered`] once a synthetic
+    /// unblock probe restores an account to `Healthy`.
+    AllExhausted {
+        account: String,
+        paused_sessions: Vec<String>,
+        now_secs: u64,
+    },
+    /// A previously-exhausted account recovered to `Healthy` (gtcore-6f449f): the synthetic unblock
+    /// probe (or a real /usage sweep) lifted `account` back, so the polecats paused under
+    /// [`Self::AllExhausted`] were resumed (`SIGCONT`) and continue from exactly where they were
+    /// frozen. `resumed_sessions` is the set the edge thawed (a polecat that died while paused is
+    /// no longer watched and is simply absent — the supervisor recovers it normally).
+    AccountRecovered {
+        account: String,
+        resumed_sessions: Vec<String>,
+        now_secs: u64,
+    },
     /// The account is fully blocked (quota exhausted or suspension).
     Blocked {
         account: String,
@@ -181,6 +202,8 @@ impl EventKind for QuotaEvent {
             QuotaEvent::Rotated { .. } => "quota.rotated.v1",
             QuotaEvent::SoftDrained { .. } => "quota.soft_drain.v1",
             QuotaEvent::SoftDrainStalled { .. } => "quota.soft_drain_stalled.v1",
+            QuotaEvent::AllExhausted { .. } => "quota.all_exhausted.v1",
+            QuotaEvent::AccountRecovered { .. } => "quota.account_recovered.v1",
             QuotaEvent::Blocked { .. } => "quota.blocked.v1",
             QuotaEvent::AccountRegistered { .. } => "quota.account_registered.v1",
             QuotaEvent::AccountDeregistered { .. } => "quota.account_deregistered.v1",

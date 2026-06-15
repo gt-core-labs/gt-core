@@ -64,6 +64,18 @@ pub trait Tmux: Send + Sync {
     /// Returns `None` when the session is gone or the read fails — a missing capture is
     /// non-fatal (the caller falls back to a plain exit).
     fn capture_pane(&self, session: &str) -> Option<String>;
+
+    /// Suspend the session **in place** with `SIGSTOP` to every pane's process group — the
+    /// pause-in-place primitive (gtcore-5731e9) the quota subsystem uses to freeze in-flight
+    /// polecats when every account is exhausted instead of letting them die against the rate
+    /// limit (gtcore-6f449f). The coding agent stops with its context intact; [`Self::resume`]
+    /// (`SIGCONT`) thaws it. Idempotent at the OS level: `SIGSTOP` on an already-stopped process
+    /// is a no-op.
+    fn pause(&self, session: &str) -> io::Result<()>;
+
+    /// Resume a session suspended by [`Self::pause`] with `SIGCONT` to every pane's process
+    /// group (gtcore-6f449f). The coding agent picks up exactly where it was frozen.
+    fn resume(&self, session: &str) -> io::Result<()>;
 }
 
 /// Real adapter: shells out to the `tmux` binary. Mirrors the flag shape of
@@ -328,6 +340,47 @@ impl Tmux for TmuxCli {
         self.run_retry(&["capture-pane", "-p", "-t", session, "-S", &start])
             .ok()
     }
+
+    fn pause(&self, session: &str) -> io::Result<()> {
+        self.signal_panes(session, libc::SIGSTOP)
+    }
+
+    fn resume(&self, session: &str) -> io::Result<()> {
+        self.signal_panes(session, libc::SIGCONT)
+    }
+}
+
+impl TmuxCli {
+    /// Send `signal` (`SIGSTOP`/`SIGCONT`) to the process group of every pane in `session` — the
+    /// pause-in-place primitive (gtcore-5731e9), ported from the agent HTTP surface so the polecat
+    /// supervisor can freeze/thaw the tmux polecats it owns (gtcore-6f449f).
+    ///
+    /// tmux runs each pane's command as its own session/process-group leader, so `#{pane_pid}` is
+    /// the group id; signalling the **negative** pid reaches the shell *and* the coding agent (and
+    /// any `bd`/tool subprocesses) it spawned, so `SIGSTOP` freezes the whole turn and `SIGCONT`
+    /// thaws it. A gone session (`list-panes` exits non-zero) is `Ok(())` — there is nothing to
+    /// signal, and the caller treats a vanished polecat as normal supervision territory.
+    fn signal_panes(&self, session: &str, signal: libc::c_int) -> io::Result<()> {
+        // `list-panes` exiting non-zero means the session is simply absent — not a transient
+        // failure to retry. `run_retry` would burn its budget on a gone session, so use a single
+        // capture and map a non-zero exit to "nothing to signal".
+        let out = self.capture_once(&["list-panes", "-t", session, "-F", "#{pane_pid}"])?;
+        if !out.status.success() {
+            return Ok(());
+        }
+        for line in String::from_utf8_lossy(&out.stdout).lines() {
+            if let Ok(pid) = line.trim().parse::<i32>() {
+                if pid > 0 {
+                    // Negative pid → the pane's whole process group (SAFETY: `kill(2)` is a plain
+                    // syscall with no memory effects; the return is ignored — a reaped pane is fine).
+                    unsafe {
+                        libc::kill(-pid, signal);
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
 }
 
 /// How many lines of pane scrollback [`Tmux::capture_pane`] reaches back for. Enough to keep
@@ -361,6 +414,9 @@ pub struct FakeTmux {
     sessions: Mutex<HashMap<String, HashMap<String, String>>>,
     /// Canned pane contents returned by [`Tmux::capture_pane`], seeded via [`FakeTmux::set_pane`].
     panes: Mutex<HashMap<String, String>>,
+    /// Sessions currently SIGSTOP'd via [`Tmux::pause`] (gtcore-6f449f). In-memory stand-in for
+    /// the real `SIGSTOP`/`SIGCONT` so gates can assert the supervisor froze/thawed the right set.
+    paused: Mutex<std::collections::HashSet<String>>,
 }
 
 impl FakeTmux {
@@ -375,6 +431,12 @@ impl FakeTmux {
             .lock()
             .unwrap()
             .insert(session.to_string(), contents.to_string());
+    }
+
+    /// Whether `session` is currently paused (gtcore-6f449f) — test observability for the
+    /// pause/resume primitive.
+    pub fn is_paused(&self, session: &str) -> bool {
+        self.paused.lock().unwrap().contains(session)
     }
 }
 
@@ -430,6 +492,19 @@ impl Tmux for FakeTmux {
 
     fn capture_pane(&self, session: &str) -> Option<String> {
         self.panes.lock().unwrap().get(session).cloned()
+    }
+
+    fn pause(&self, session: &str) -> io::Result<()> {
+        // A gone session is a no-op (mirrors the real adapter: nothing to signal).
+        if self.sessions.lock().unwrap().contains_key(session) {
+            self.paused.lock().unwrap().insert(session.to_string());
+        }
+        Ok(())
+    }
+
+    fn resume(&self, session: &str) -> io::Result<()> {
+        self.paused.lock().unwrap().remove(session);
+        Ok(())
     }
 }
 

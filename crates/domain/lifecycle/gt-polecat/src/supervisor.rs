@@ -9,7 +9,7 @@
 //! Like `gt_agent::supervisor`, it never touches the (sync, `!Send`) bus directly: it pushes
 //! envelopes to an `mpsc` the bus-owning task drains.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
@@ -500,6 +500,10 @@ struct SupervisorState {
     /// cap so a permanently-broken polecat is eventually abandoned.
     restarts: HashMap<String, u32>,
     max_restarts: u32,
+    /// Sessions currently suspended in place (`SIGSTOP`) by pause-on-exhaustion (gtcore-6f449f).
+    /// A paused polecat keeps its tmux session, so `tick`'s `has_session` check still sees it alive
+    /// (no spurious re-sling); the set is what [`PolecatSupervisor::resume_account`] thaws.
+    paused: HashSet<String>,
 }
 
 impl PolecatSupervisor {
@@ -511,6 +515,7 @@ impl PolecatSupervisor {
                 tracker: RestartTracker::new(config),
                 restarts: HashMap::new(),
                 max_restarts,
+                paused: HashSet::new(),
             }),
             respec: Mutex::new(None),
             bead_closed: Mutex::new(None),
@@ -543,6 +548,7 @@ impl PolecatSupervisor {
         let mut st = self.state.lock().unwrap();
         st.watched.remove(session);
         st.restarts.remove(session);
+        st.paused.remove(session);
     }
 
     /// Stop supervising whatever polecat was slung for `member` (its `hook_bead`). Called when
@@ -558,6 +564,7 @@ impl PolecatSupervisor {
         for session in drop {
             st.watched.remove(&session);
             st.restarts.remove(&session);
+            st.paused.remove(&session);
         }
     }
 
@@ -614,6 +621,81 @@ impl PolecatSupervisor {
             .collect()
     }
 
+    /// Suspend in place (`SIGSTOP`) every watched polecat backed by `account` — pause-on-exhaustion
+    /// (gtcore-6f449f): when the quota rotation finds no healthy alternative, freezing the in-flight
+    /// polecats preserves their context instead of letting them burn against the rate limit. Returns
+    /// the session ids actually paused (sorted, deterministic). A paused session keeps its tmux
+    /// session, so [`Self::tick`] does not treat it as dead; [`Self::resume_account`] thaws it.
+    /// Idempotent: re-pausing an already-paused session re-sends a (harmless) `SIGSTOP`.
+    pub fn pause_account(&self, account: &str) -> Vec<String> {
+        let mut st = self.state.lock().unwrap();
+        let mut sessions: Vec<String> = st
+            .watched
+            .values()
+            .filter(|spec| {
+                spec.env
+                    .iter()
+                    .any(|(k, v)| k == crate::GT_HOOK_ACCOUNT && v == account)
+            })
+            .map(|spec| spec.session.clone())
+            .collect();
+        sessions.sort();
+        let mut paused = Vec::new();
+        for session in sessions {
+            match self.tmux.pause(&session) {
+                Ok(()) => {
+                    st.paused.insert(session.clone());
+                    paused.push(session);
+                }
+                Err(e) => {
+                    eprintln!("[polecat-supervisor] pause failed session={session}: {e}")
+                }
+            }
+        }
+        paused
+    }
+
+    /// Resume (`SIGCONT`) every paused polecat backed by `account` (gtcore-6f449f): called when a
+    /// previously-exhausted account recovers to `Healthy`. Returns the session ids resumed (sorted).
+    /// Only sessions this supervisor paused AND still watches are thawed — a polecat that died while
+    /// paused is no longer watched, so it is silently skipped and recovered by normal supervision.
+    pub fn resume_account(&self, account: &str) -> Vec<String> {
+        let mut st = self.state.lock().unwrap();
+        let mut sessions: Vec<String> = st
+            .watched
+            .values()
+            .filter(|spec| {
+                spec.env
+                    .iter()
+                    .any(|(k, v)| k == crate::GT_HOOK_ACCOUNT && v == account)
+            })
+            .map(|spec| spec.session.clone())
+            .filter(|s| st.paused.contains(s))
+            .collect();
+        sessions.sort();
+        let mut resumed = Vec::new();
+        for session in sessions {
+            match self.tmux.resume(&session) {
+                Ok(()) => {
+                    st.paused.remove(&session);
+                    resumed.push(session);
+                }
+                Err(e) => {
+                    eprintln!("[polecat-supervisor] resume failed session={session}: {e}")
+                }
+            }
+        }
+        resumed
+    }
+
+    /// Session ids currently suspended by [`Self::pause_account`] (gtcore-6f449f). Test/diagnostic
+    /// view of the pause set.
+    pub fn paused_sessions(&self) -> Vec<String> {
+        let mut v: Vec<String> = self.state.lock().unwrap().paused.iter().cloned().collect();
+        v.sort();
+        v
+    }
+
     /// One supervision pass. For each watched session: alive (tmux has-session) → reset its
     /// restart budget; dead → re-sling if budget + backoff allow, else drop. Returns how many
     /// were re-slung this pass. `now` is edge-stamped unix seconds (same discipline as the
@@ -629,7 +711,11 @@ impl PolecatSupervisor {
                 st.tracker.record_success(&session, now);
                 continue;
             }
-            // Dead. If the bead this polecat was slung for has already closed (operator or
+            // Dead. A paused polecat that died (killed while suspended) is gone — drop it from the
+            // pause set so a later resume does not thaw a stale id and any re-sling below starts a
+            // fresh, un-paused session (gtcore-6f449f).
+            st.paused.remove(&session);
+            // If the bead this polecat was slung for has already closed (operator or
             // merge auto-close), the work is delivered — unwatch instead of burning restart
             // budget re-slinging finished work and blocking the slot (gtcore-177770). Only the
             // positively-closed case drops; an unknown bead or a probe error falls through to
@@ -884,6 +970,69 @@ mod polecat_supervisor_tests {
         let mut s = spec(session, member);
         s.env.push(("GT_HOOK_ACCOUNT".to_string(), account.to_string()));
         s
+    }
+
+    #[test]
+    fn pause_account_suspends_only_that_accounts_polecats() {
+        // gtcore-6f449f: pause_account SIGSTOPs every watched polecat backed by the account and
+        // leaves the others running; resume_account thaws exactly the paused ones.
+        let tmux = Arc::new(FakeTmux::new());
+        let sup = PolecatSupervisor::new(tmux.clone(), RestartConfig::default(), 3);
+        for (s, m, a) in [
+            ("sess-1", "hq-1", "acct-a"),
+            ("sess-2", "hq-2", "acct-b"),
+            ("sess-3", "hq-3", "acct-a"),
+        ] {
+            let spec = spec_with_account(s, m, a);
+            spawn_tmux(tmux.as_ref(), &spec).unwrap();
+            sup.watch(spec);
+        }
+
+        let paused = sup.pause_account("acct-a");
+        assert_eq!(paused, vec!["sess-1", "sess-3"], "both acct-a sessions paused");
+        assert!(tmux.is_paused("sess-1") && tmux.is_paused("sess-3"));
+        assert!(!tmux.is_paused("sess-2"), "acct-b polecat keeps running");
+        assert_eq!(sup.paused_sessions(), vec!["sess-1", "sess-3"]);
+
+        // A paused polecat keeps its tmux session → tick must NOT treat it as dead.
+        assert_eq!(sup.tick(1000), 0, "paused sessions are not re-slung");
+        assert!(tmux.has_session("sess-1") && tmux.has_session("sess-3"));
+
+        let resumed = sup.resume_account("acct-a");
+        assert_eq!(resumed, vec!["sess-1", "sess-3"], "both acct-a sessions resumed");
+        assert!(!tmux.is_paused("sess-1") && !tmux.is_paused("sess-3"));
+        assert!(sup.paused_sessions().is_empty(), "pause set cleared");
+    }
+
+    #[test]
+    fn resume_skips_a_polecat_that_died_while_paused() {
+        // gtcore-6f449f: a polecat killed (tmux gone) while paused is no longer watched after
+        // tick re-slings or drops it; resume_account must only thaw the sessions still paused.
+        let tmux = Arc::new(FakeTmux::new());
+        let sup = PolecatSupervisor::new(
+            tmux.clone(),
+            RestartConfig {
+                initial_backoff_secs: 1,
+                crash_loop_count: 100,
+                ..RestartConfig::default()
+            },
+            u32::MAX,
+        );
+        let s1 = spec_with_account("sess-1", "hq-1", "acct-a");
+        let s2 = spec_with_account("sess-2", "hq-2", "acct-a");
+        spawn_tmux(tmux.as_ref(), &s1).unwrap();
+        spawn_tmux(tmux.as_ref(), &s2).unwrap();
+        sup.watch(s1);
+        sup.watch(s2);
+        assert_eq!(sup.pause_account("acct-a"), vec!["sess-1", "sess-2"]);
+
+        // sess-1 dies while paused → next tick re-slings it (a fresh, un-paused session).
+        tmux.kill_session("sess-1").unwrap();
+        assert_eq!(sup.tick(1000), 1, "dead paused polecat re-slung");
+
+        // Resume: sess-2 is still paused; sess-1 was re-slung fresh (not in the pause set).
+        let resumed = sup.resume_account("acct-a");
+        assert_eq!(resumed, vec!["sess-2"], "only the still-paused session is thawed");
     }
 
     #[test]
