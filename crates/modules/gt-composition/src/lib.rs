@@ -46,6 +46,7 @@ pub mod delegation_http;
 pub mod denial_audit;
 pub mod drift_reconcile;
 pub mod email_outbox_drain;
+pub mod escalation_notify;
 pub mod git_merge;
 pub mod hooks;
 pub mod inbound_email;
