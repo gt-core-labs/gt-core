@@ -2192,6 +2192,7 @@ dependencies = [
  "gt-agent",
  "gt-events",
  "gt-module",
+ "regex",
  "semver",
  "serde",
  "serde_json",
