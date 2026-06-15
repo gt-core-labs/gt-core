@@ -54,6 +54,7 @@ pub mod inbound_email;
 pub mod kanban_rest;
 pub mod mailbox;
 pub mod mcp;
+pub mod mcp_push;
 pub mod notifications;
 pub mod onboard;
 pub mod operator_event;
