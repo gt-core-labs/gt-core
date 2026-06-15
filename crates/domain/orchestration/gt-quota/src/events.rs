@@ -76,6 +76,26 @@ pub enum QuotaEvent {
         to_account: String,
         now_secs: u64,
     },
+    /// Proactive soft-drain rotation (gtcore-df3319): the ACTIVE account crossed the soft
+    /// threshold (≥ `soft_pct`, default 80%) while still usable, so the keychain pointer moved to
+    /// a healthier account **before** the predictor emitted `BlockPredicted`. In-flight polecats
+    /// finish naturally on `from_account` (no credential swap, no kill — the "drain, don't kill"
+    /// contract); only new slings land on `to_account`. Parks the source in `Cooldown` like
+    /// [`Self::Rotated`], but records the proactive soft trigger distinctly so operators can tell a
+    /// soft-drain from a reactive (`AccountLimited`/`Blocked`) or predictive (`BlockPredicted`)
+    /// rotation.
+    SoftDrained {
+        from_account: String,
+        to_account: String,
+        now_secs: u64,
+    },
+    /// A soft-drain was warranted — the active account reached `soft_pct` — but every alternative
+    /// is at or above the hard threshold (≥ `hard_pct`, default 90%), so rotating would only move
+    /// the wall closer. The pointer stays put and this alert fires instead (gtcore-df3319).
+    SoftDrainStalled {
+        account: String,
+        now_secs: u64,
+    },
     /// The account is fully blocked (quota exhausted or suspension).
     Blocked {
         account: String,
@@ -159,6 +179,8 @@ impl EventKind for QuotaEvent {
             QuotaEvent::BlockPredicted { .. } => "quota.block_predicted.v1",
             QuotaEvent::AccountLimited { .. } => "quota.account_limited.v1",
             QuotaEvent::Rotated { .. } => "quota.rotated.v1",
+            QuotaEvent::SoftDrained { .. } => "quota.soft_drain.v1",
+            QuotaEvent::SoftDrainStalled { .. } => "quota.soft_drain_stalled.v1",
             QuotaEvent::Blocked { .. } => "quota.blocked.v1",
             QuotaEvent::AccountRegistered { .. } => "quota.account_registered.v1",
             QuotaEvent::AccountDeregistered { .. } => "quota.account_deregistered.v1",
