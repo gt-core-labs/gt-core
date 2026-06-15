@@ -12,10 +12,15 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use sqlx::types::chrono::Utc;
 use chrono::Duration;
+use tokio::sync::Mutex;
 
 use gt_store_pg::{
     email_migrations, EmailOutboxRepository, NewEmail, OutboxError, PgEmailOutbox,
 };
+
+// claim_due is table-wide (no workspace filter), so concurrent tests steal
+// each other's rows via SKIP LOCKED. Serialize all outbox tests.
+static OUTBOX_LOCK: Mutex<()> = Mutex::const_new(());
 
 fn nonce() -> u128 {
     SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos()
@@ -57,6 +62,7 @@ fn new_email(id: &str, ws: &str, send_at: Option<sqlx::types::chrono::DateTime<U
 
 #[tokio::test]
 async fn schedule_claim_and_settlements_round_trip() {
+    let _guard = OUTBOX_LOCK.lock().await;
     let Some((repo, _pool)) = repo_or_skip("outbox pipeline contract").await else { return };
     let n = nonce();
     let ws = format!("wstest{n}");
@@ -113,6 +119,7 @@ async fn schedule_claim_and_settlements_round_trip() {
 
 #[tokio::test]
 async fn cancel_recalls_pending_but_never_sent() {
+    let _guard = OUTBOX_LOCK.lock().await;
     let Some((repo, _pool)) = repo_or_skip("outbox cancel contract").await else { return };
     let n = nonce();
     let ws = format!("wstest{n}");
@@ -136,6 +143,7 @@ async fn cancel_recalls_pending_but_never_sent() {
 
 #[tokio::test]
 async fn failed_settlement_records_the_terminal_state() {
+    let _guard = OUTBOX_LOCK.lock().await;
     let Some((repo, _pool)) = repo_or_skip("outbox failed contract").await else { return };
     let n = nonce();
     let ws = format!("wstest{n}");
