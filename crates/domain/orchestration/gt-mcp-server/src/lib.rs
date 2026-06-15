@@ -25,6 +25,7 @@ pub mod health;
 pub mod pg_audit;
 pub mod prefixes;
 pub mod server;
+pub mod session_push;
 pub mod workspace;
 pub mod ws_status;
 
@@ -35,5 +36,6 @@ pub use health::HealthState;
 pub use pg_audit::PgAuditSink;
 pub use prefixes::{bead_prefix, WorkspaceRigPrefixes};
 pub use server::{IssuesServer, PatAuthenticator};
+pub use session_push::{McpNotifier, PeerNotifier, SessionRegistry, DEFAULT_SESSION_TTL};
 pub use workspace::{workspace_from_ext, WorkspaceStores, WORKSPACE_HEADER};
 pub use ws_status::{GateStatus, WorkspaceStatusGate};
