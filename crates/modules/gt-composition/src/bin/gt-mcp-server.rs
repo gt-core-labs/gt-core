@@ -1645,7 +1645,15 @@ async fn main() -> anyhow::Result<()> {
                     domain: vec![gt_issues::Domain::MetaGap],
                     poll: std::time::Duration::from_secs(1),
                 },
-            );
+            )
+            // A6 (gtcore-46c9dc): wire the human-escalation view over the SAME event log the
+            // escalate.* tools write. tasks/get projects input-required while a session is
+            // blocked; a tasks/send on a blocked task id resolves the escalation and re-activates
+            // the SAME bead instead of minting a new one.
+            .with_escalations(Arc::new(gt_composition::a2a::EventLogEscalations::new(
+                event_log.clone(),
+                Some(a2a_ws.clone()),
+            )));
             // The SAME PAT port the /mcp transport and /api/v1/* authenticate
             // gtpat_… bearers through; the card route stays outside the guard.
             let mut a2a_auth = AuthState::new(v.clone(), audit.clone());
