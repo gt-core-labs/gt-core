@@ -102,6 +102,15 @@ pub struct A2aDelegateHandler {
     /// deny-by-default RBAC grant list (`origin -> peer`), and the HTTP client
     /// that POSTs `tasks/send` straight to the peer — orchd never relaying.
     peers: Option<PeerDelegation>,
+    /// Rig-level RBAC for the in-process intake path (A5, gtcore-f3a016). An
+    /// `origin -> rig` allow-list (same grant syntax as the cross-workspace /
+    /// peer grants, but matched WITHOUT the same-name self-allow): when `Some`,
+    /// an agent may only delegate work onto a rig its origin holds a grant for —
+    /// an ungranted rig is rejected and audited with the origin identity
+    /// (acceptance: "agente sin permiso RBAC para un rig recibe rechazo; el audit
+    /// lo registra con identidad origen"). `None` ⇒ no rig gate (the legacy
+    /// behaviour, byte-for-byte) so existing single-rig deploys are unaffected.
+    rig_grants: Option<CrossWsGrants>,
 }
 
 /// The wiring a direct rig→rig hop needs: where peers live, who may reach them,
@@ -133,6 +142,7 @@ impl A2aDelegateHandler {
             cross_ws_grants: CrossWsGrants::empty(),
             msg: None,
             peers: None,
+            rig_grants: None,
         }
     }
 
@@ -195,6 +205,15 @@ impl A2aDelegateHandler {
         client: Arc<A2aPeerClient>,
     ) -> Self {
         self.peers = Some(PeerDelegation { registry, grants, client });
+        self
+    }
+
+    /// Enable rig-level RBAC on the in-process intake path (A5, gtcore-f3a016). With a non-empty
+    /// `origin -> rig` allow-list, an agent may only delegate work onto a rig its origin holds a
+    /// grant for; an ungranted rig is rejected before any bead is minted and audited with the
+    /// origin identity. An empty grant set is treated as "no gate" (legacy behaviour).
+    pub fn with_rig_grants(mut self, grants: CrossWsGrants) -> Self {
+        self.rig_grants = (!grants.is_empty()).then_some(grants);
         self
     }
 
@@ -486,6 +505,33 @@ impl DomainHandler for A2aDelegateHandler {
                 // A `dest` other than `origin` mints the bead in that tenant's
                 // tracker — gated by an explicit grant.
                 let origin = ctx.workspace.unwrap_or(DEFAULT_WORKSPACE);
+
+                // A5 (gtcore-f3a016): rig-level RBAC. When rig grants are wired, an agent may
+                // only delegate work onto a rig its origin holds an explicit `origin -> rig`
+                // grant for. Deny-by-default among the configured rules: an ungranted rig is
+                // rejected BEFORE any bead is minted and audited with the origin identity + the
+                // rig as destination (acceptance: "agente sin permiso RBAC para un rig recibe
+                // rechazo; el audit lo registra con identidad origen"). Unconfigured ⇒ no gate.
+                if let Some(grants) = &self.rig_grants {
+                    if !grants.allows_target(origin, &rig) {
+                        let reason = format!(
+                            "delegation from `{origin}` onto rig `{rig}` is not granted \
+                             (set GT_A2A_RIG_GRANTS)"
+                        );
+                        self.audit(
+                            ctx.workspace,
+                            DelegationEvent::Denied {
+                                origin: ctx.actor.to_string(),
+                                dest: rig.clone(),
+                                peer_url: None,
+                                reason: reason.clone(),
+                                at: rfc3339_now(),
+                            },
+                        );
+                        return Err(AppError::Validation(reason));
+                    }
+                }
+
                 let dest = ctx
                     .args
                     .get("workspace")

@@ -103,11 +103,35 @@ impl CrossWsGrants {
     pub fn len(&self) -> usize {
         self.grants.len()
     }
+
+    /// Like [`allows`](Self::allows) but **without** the same-name auto-allow (A5, gtcore-f3a016).
+    /// Used for rig-level RBAC, where `origin` is a workspace/actor and `target` is a *rig* name:
+    /// an agent must hold an explicit `origin->rig` grant to delegate work onto that rig — there
+    /// is no implicit "you may target the rig that happens to share your name". Deny-by-default
+    /// among the configured rules (wildcards on either side still apply).
+    pub fn allows_target(&self, origin: &str, target: &str) -> bool {
+        self.grants.iter().any(|g| g.matches(origin, target))
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn allows_target_gates_rigs_with_no_self_shortcut() {
+        // A5, gtcore-f3a016: rig-level RBAC reuses the grant syntax but DROPS the same-name
+        // auto-allow — an agent needs an explicit `workspace->rig` grant to delegate onto a rig.
+        let g = CrossWsGrants::parse("default->gtcore, ops->*");
+        assert!(g.allows_target("default", "gtcore"));
+        assert!(g.allows_target("ops", "anything"), "wildcard target still applies");
+        // A rig sharing the origin's name is NOT implicitly allowed (unlike `allows`).
+        assert!(!g.allows_target("gtcore", "gtcore"));
+        assert!(g.allows("gtcore", "gtcore"), "the workspace variant still self-allows");
+        // Ungranted pairs stay denied; an empty grant set denies everything.
+        assert!(!g.allows_target("default", "gtweb"));
+        assert!(!CrossWsGrants::empty().allows_target("a", "a"));
+    }
 
     #[test]
     fn empty_grants_deny_cross_ws_but_allow_self() {
