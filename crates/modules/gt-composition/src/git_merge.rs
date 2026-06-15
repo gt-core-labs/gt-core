@@ -628,4 +628,51 @@ branch refs/heads/hq-z.1
         // The detached tree's HEAD is not a branch — nothing resolves to it.
         assert_eq!(worktree_for_branch(porcelain, ""), None);
     }
+
+    /// A5 (gtcore-f3a016) — **the merge queue is the only path to `main`**, from the edge's
+    /// side. `GitMergePlugin` is the sole code that runs `git push origin <branch>:main`, and it
+    /// fires EXCLUSIVELY on `merge.started.v1` — the event the merge actor emits when the queue
+    /// admits a slot (`Ready → Merging`). Any other event is a no-op: there is no path that pushes
+    /// to main without the queue's `Started` signal. We feed `merge.ready.v1` (which carries the
+    /// very same bead+branch a naive impl might merge directly) and an unrelated `merge.merged.v1`,
+    /// and assert the slot is never advanced off-queue — the edge never touched git.
+    #[tokio::test]
+    async fn only_merge_started_drives_a_push_to_main() {
+        use gt_events::Envelope;
+
+        let (tx, _rx) = tokio::sync::mpsc::channel(8);
+        let merge = gt_merge::actor::spawn(gt_merge::InMemoryMergeRepo::default(), tx);
+        // A slot sitting in the queue at `Ready` — submitted but NOT yet started.
+        merge.submit("hq-x.1", "hq-x.1", "01ABC").await;
+        // A nonexistent rig: were the edge to (wrongly) run git, the push would fail and flip the
+        // slot to `Failed` — so "still Ready" proves the edge stayed its hand.
+        let plugin = GitMergePlugin::new(merge, PathBuf::from("/nonexistent-rig-a5"));
+
+        // `merge.ready.v1` — the queue OBSERVATION, not the admit. Must NOT trigger a merge.
+        let ready = EventRecord::from_envelope(&Envelope::root(MergeEvent::Ready {
+            bead: "hq-x.1".into(),
+            branch: "hq-x.1".into(),
+            channel_msg_id: "01ABC".into(),
+        }))
+        .unwrap();
+        plugin.on_event(&ready).await.unwrap();
+
+        // An unrelated terminal event likewise no-ops.
+        let merged = EventRecord::from_envelope(&Envelope::root(MergeEvent::Merged {
+            bead: "hq-x.1".into(),
+            sha: "deadbeef".into(),
+        }))
+        .unwrap();
+        plugin.on_event(&merged).await.unwrap();
+
+        // The slot is untouched: still `Ready` in the queue. No off-queue event advanced it, so
+        // the only path to main remains the queue's `Started`.
+        let snap = plugin.merge.snapshot().await;
+        let slot = snap.iter().find(|s| s.bead == "hq-x.1").expect("slot present");
+        assert_eq!(
+            slot.state,
+            gt_merge::MergeSlotState::Ready,
+            "non-Started events never advance the slot — the queue is the only path to main"
+        );
+    }
 }

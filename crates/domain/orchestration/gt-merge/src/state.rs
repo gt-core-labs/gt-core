@@ -292,4 +292,53 @@ mod tests {
             ]
         );
     }
+
+    /// A5 (gtcore-f3a016) — **the merge queue is the only path to `main`**, codified as a slot
+    /// state-machine invariant. `Merged` is the "landed on main" terminal; a branch can only
+    /// reach it by passing through the queue: `submit` (→ `Ready`) → `start` (→ `Merging`) →
+    /// `complete` (→ `Merged`). This test pins that there is NO transition that jumps the queue:
+    /// `Merged` is reachable *exclusively* from `Merging`, `Merging` *exclusively* from `Ready`,
+    /// and a slot is *born* `Ready` (so no `Merging`/`Merged` slot can be fabricated off-queue).
+    #[test]
+    fn merge_queue_is_the_only_path_to_main() {
+        use MergeSlotState::{Failed, Merged, Merging, Ready};
+
+        // The ONLY legal transition into `Merged` (≙ on main) is `Merging → Merged`.
+        for from in [Ready, Merging, Merged, Failed] {
+            let mut s = MergeSlot { bead: "b".into(), branch: "x".into(), state: from };
+            assert_eq!(
+                s.transition(Merged).is_ok(),
+                from == Merging,
+                "Merged reachable only from Merging, never from {from:?}"
+            );
+        }
+        // The ONLY legal transition into `Merging` (the queue admit) is `Ready → Merging`.
+        for from in [Ready, Merging, Merged, Failed] {
+            let mut s = MergeSlot { bead: "b".into(), branch: "x".into(), state: from };
+            assert_eq!(
+                s.transition(Merging).is_ok(),
+                from == Ready,
+                "Merging reachable only from a Ready (submitted/queued) slot, never from {from:?}"
+            );
+        }
+
+        // A slot is always born `Ready`: both the public constructor and the queue's `submit`
+        // start there, so a `Merging`/`Merged` slot can never be conjured outside the queue.
+        assert_eq!(MergeSlot::new("b", "x").state, Ready);
+        let mut board = MergeBoard::default();
+        board.submit("b".into(), "x".into()).unwrap();
+        assert_eq!(board.get("b").unwrap().state, Ready);
+
+        // You cannot start (or complete) a merge for a bead the queue never admitted — there is
+        // no back door that lands an unsubmitted branch on main.
+        let mut empty = MergeBoard::default();
+        assert!(
+            empty.start("ghost").is_err(),
+            "cannot start a merge for a bead the queue never admitted"
+        );
+        assert!(
+            empty.complete("ghost").is_err(),
+            "cannot complete a merge for a bead the queue never admitted"
+        );
+    }
 }
