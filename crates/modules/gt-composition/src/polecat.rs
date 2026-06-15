@@ -342,6 +342,91 @@ impl PolecatSupervisorPlugin {
             }
         }
     }
+    /// Re-sling a polecat that died of context exhaustion, handing the next agent a continuation
+    /// prompt instead of the original kickoff (gtcore-3b2a68).
+    ///
+    /// The dead polecat checkpointed its progress into the bead notes (gtcore-2467b4) and left
+    /// its work committed on the branch. The bead is NOT failed or bounced to `open` — it stays
+    /// `working` (this method performs NO transition) and is re-slung directly: the same session
+    /// id, the same per-bead worktree, but a prompt assembled from the checkpoint notes, the
+    /// branch diff, and the acceptance criteria ([`crate::continuation`]). The continuator thus
+    /// boots with a clean context window but full knowledge of the prior work.
+    ///
+    /// Every step is best-effort: a missing spec (the polecat is no longer supervised), an
+    /// unreadable bead, or an empty diff degrades the prompt rather than aborting — liveness over
+    /// completeness, matching the rest of the sling path. The pool slot is left as-is: it was
+    /// claimed at the original sling and is only released when the bead merges, so re-slinging
+    /// into the same slot needs no new claim.
+    async fn resling_on_context_exhaustion(&self, session: &str, reason: &str) {
+        let Some(mut spec) = self.supervisor.spec_for_session(session) else {
+            eprintln!(
+                "[polecat] context-exhaustion re-sling skipped for {session}: not supervised here"
+            );
+            return;
+        };
+        let bead = spec
+            .hook_bead
+            .clone()
+            .unwrap_or_else(|| session.to_string());
+
+        // Read the previous agent's checkpoint notes + the acceptance criteria from Dolt. Without
+        // an issues handle (or on a read error) the continuation prompt falls back to the diff +
+        // whatever the agent can read via its own `gt` MCP tools.
+        let (notes, acceptance_criteria) = match &self.issues {
+            Some(issues) => match issues.get_detail(&bead).await {
+                Ok(Some(detail)) => (detail.notes, detail.acceptance_criteria),
+                Ok(None) => (String::new(), String::new()),
+                Err(e) => {
+                    eprintln!(
+                        "[polecat] context-exhaustion re-sling: get_detail({bead}) failed: {e} — continuing with diff only"
+                    );
+                    (String::new(), String::new())
+                }
+            },
+            None => (String::new(), String::new()),
+        };
+
+        // Read what the dead polecat already committed on its branch (vs main) from its worktree.
+        let diff = crate::continuation::read_branch_diff(&spec.workdir, "main");
+        let prompt = crate::continuation::build_continuation_prompt(
+            &bead,
+            &notes,
+            &diff,
+            &acceptance_criteria,
+        );
+
+        // The bead prompt is always the final positional arg (spec_for pushes it last; the
+        // dispatch path inserts `--settings` BEFORE it), so swapping the last element retargets
+        // claude's kickoff at the continuation prompt without disturbing any flags.
+        if spec.args.is_empty() {
+            spec.args.push(prompt);
+        } else {
+            let last = spec.args.len() - 1;
+            spec.args[last] = prompt;
+        }
+
+        // Re-sling directly: spawn a fresh polecat for the SAME session/bead. No bead transition —
+        // it stays `working`. The deterministic session id + per-bead worktree are reused.
+        if let Err(e) = spawn_tmux(self.tmux.as_ref(), &spec) {
+            eprintln!(
+                "[polecat] context-exhaustion re-sling spawn failed for {bead}: {e} — supervisor tick will retry"
+            );
+            return;
+        }
+        self.supervisor.watch(spec);
+        eprintln!("[polecat] re-slung {bead} with a continuation prompt ({reason})");
+    }
+}
+
+/// Does this `AgentEvent::Killed` reason mark a death by context exhaustion (gtcore-91fdde)?
+/// The polecat supervisor records such a death as a `Killed` whose reason begins
+/// `context exhausted: …` (no dedicated event kind), distinguishing it from a heartbeat-stale
+/// kill or an operator kill — only the exhaustion case warrants a continuation re-sling.
+fn is_context_exhaustion(reason: &str) -> bool {
+    reason
+        .trim_start()
+        .to_ascii_lowercase()
+        .starts_with("context exhaust")
 }
 
 #[async_trait]
@@ -727,6 +812,19 @@ impl Plugin for PolecatSupervisorPlugin {
                 self.emit_operator(IssueOperatorEvent::Cleared { bead });
                 Ok(())
             }
+            // A polecat died of context exhaustion → re-sling it with a continuation prompt
+            // (gtcore-3b2a68). The supervisor records this death as an `AgentEvent::Killed` whose
+            // reason begins `context exhausted` (gtcore-91fdde) — only that reason re-slings; a
+            // heartbeat-stale kill or an operator kill is left to the normal supervisor path.
+            "agent.killed.v1" => {
+                let AgentEvent::Killed { session, reason } = record.decode::<AgentEvent>()? else {
+                    return Ok(());
+                };
+                if is_context_exhaustion(&reason) {
+                    self.resling_on_context_exhaustion(&session, &reason).await;
+                }
+                Ok(())
+            }
             _ => Ok(()),
         }
     }
@@ -923,6 +1021,77 @@ mod tests {
         .unwrap();
         assert_eq!(sup.watched_count(), 0, "merged bead is unwatched");
         assert_eq!(alloc.lock().unwrap().in_flight("acme"), 0, "slot released");
+    }
+
+    #[tokio::test]
+    async fn context_exhaustion_reslings_with_a_continuation_prompt_without_transition() {
+        // gtcore-3b2a68: a polecat death by context exhaustion (an AgentEvent::Killed whose
+        // reason begins `context exhausted`, gtcore-91fdde) re-slings the SAME bead — still
+        // `working`, no transition — with a continuation prompt in place of the original kickoff.
+        let alloc = Arc::new(Mutex::new(PoolAllocator::new(10, 5)));
+        let (p, sup) = plugin(alloc.clone());
+
+        // Sling the bead so the supervisor holds its spec (carrying the original kickoff prompt).
+        p.on_event(&record(SchedEvent::Dispatched {
+            bead: "gg-1".into(),
+            worker: "w1".into(),
+        }))
+        .await
+        .unwrap();
+        let original = sup.spec_for_session("hq-gg-1").expect("watched after sling");
+        assert!(
+            original
+                .args
+                .last()
+                .unwrap()
+                .contains("You are a gt polecat in workspace"),
+            "the original kickoff prompt is stored"
+        );
+
+        // A heartbeat-stale kill is NOT context exhaustion → the prompt is left untouched.
+        p.on_event(&record(AgentEvent::Killed {
+            session: "hq-gg-1".into(),
+            reason: "heartbeat stale".into(),
+        }))
+        .await
+        .unwrap();
+        assert!(
+            sup.spec_for_session("hq-gg-1")
+                .unwrap()
+                .args
+                .last()
+                .unwrap()
+                .contains("You are a gt polecat in workspace"),
+            "a non-exhaustion kill does not rewrite the prompt"
+        );
+
+        // A context-exhaustion kill re-slings with the continuation prompt. The bead is never
+        // transitioned to `open` on this path — it stays `working` (no transition call exists in
+        // resling_on_context_exhaustion), and the polecat stays supervised under the same session.
+        p.on_event(&record(AgentEvent::Killed {
+            session: "hq-gg-1".into(),
+            reason: "context exhausted: 92% context used".into(),
+        }))
+        .await
+        .unwrap();
+        assert_eq!(sup.watched_count(), 1, "still supervised after re-sling");
+        let cont = sup.spec_for_session("hq-gg-1").expect("re-watched after re-sling");
+        let prompt = cont.args.last().expect("continuation prompt arg");
+        assert!(
+            prompt.contains("CONTINUING work on bead `gg-1`"),
+            "continuation prompt injected: {prompt}"
+        );
+        // The continuator still learns how to signal completion.
+        assert!(prompt.contains("mcp__gt__merge_submit"));
+    }
+
+    #[test]
+    fn is_context_exhaustion_only_matches_the_exhaustion_reason() {
+        assert!(is_context_exhaustion("context exhausted: 90% context used"));
+        assert!(is_context_exhaustion("  Context Exhausted: 88% context used"));
+        assert!(!is_context_exhaustion("heartbeat stale"));
+        assert!(!is_context_exhaustion("operator killed"));
+        assert!(!is_context_exhaustion(""));
     }
 
     #[tokio::test]
