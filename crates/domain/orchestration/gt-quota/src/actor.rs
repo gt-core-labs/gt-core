@@ -77,6 +77,20 @@ pub enum QuotaMsg {
         to_account: String,
         now_secs: u64,
     },
+    /// Proactive soft-drain (gtcore-df3319): park the source in Cooldown and emit
+    /// `quota.soft_drain.v1`. Mirrors [`Self::Rotated`] but records the proactive soft trigger
+    /// distinctly.
+    SoftDrained {
+        from_account: String,
+        to_account: String,
+        now_secs: u64,
+    },
+    /// Soft-drain warranted but no healthy target (all ≥ hard) — emit `quota.soft_drain_stalled.v1`
+    /// as an alert, no state mutation (gtcore-df3319).
+    SoftDrainStalled {
+        account: String,
+        now_secs: u64,
+    },
     /// Onboard a claude account with its credential dir (`hq-quota-accounts.1`): adds it as a
     /// rotation candidate and emits `AccountRegistered` so the daemon's keychain hydrates from the
     /// log. Idempotent.
@@ -304,6 +318,37 @@ impl QuotaHandle {
             .send(QuotaMsg::Rotated {
                 from_account: from_account.into(),
                 to_account: to_account.into(),
+                now_secs,
+            })
+            .await;
+    }
+
+    /// Record a proactive soft-drain rotation (gtcore-df3319): parks `from_account` in Cooldown and
+    /// emits `quota.soft_drain.v1`. The keychain pointer flip + the "no credential swap" contract
+    /// live at the edge ([`crate`] caller); this only carries the durable record.
+    pub async fn soft_drained(
+        &self,
+        from_account: impl Into<String>,
+        to_account: impl Into<String>,
+        now_secs: u64,
+    ) {
+        let _ = self
+            .tx
+            .send(QuotaMsg::SoftDrained {
+                from_account: from_account.into(),
+                to_account: to_account.into(),
+                now_secs,
+            })
+            .await;
+    }
+
+    /// Record that a soft-drain was warranted but no healthy alternative exists (gtcore-df3319):
+    /// emits `quota.soft_drain_stalled.v1` as an operator alert. No rotation took place.
+    pub async fn soft_drain_stalled(&self, account: impl Into<String>, now_secs: u64) {
+        let _ = self
+            .tx
+            .send(QuotaMsg::SoftDrainStalled {
+                account: account.into(),
                 now_secs,
             })
             .await;
@@ -729,6 +774,28 @@ pub fn spawn_hydrated(
                             to_account,
                             now_secs,
                         }))
+                        .await;
+                }
+                QuotaMsg::SoftDrained {
+                    from_account,
+                    to_account,
+                    now_secs,
+                } => {
+                    // Same registry effect as a rotation (park the source in Cooldown), distinct
+                    // event so the proactive soft trigger is observable (gtcore-df3319).
+                    registry.apply_rotation(&from_account);
+                    let _ = events
+                        .send(Envelope::root(QuotaEvent::SoftDrained {
+                            from_account,
+                            to_account,
+                            now_secs,
+                        }))
+                        .await;
+                }
+                QuotaMsg::SoftDrainStalled { account, now_secs } => {
+                    // Alert only: the pointer stayed put, so no registry mutation (gtcore-df3319).
+                    let _ = events
+                        .send(Envelope::root(QuotaEvent::SoftDrainStalled { account, now_secs }))
                         .await;
                 }
                 QuotaMsg::RegisterAccount {

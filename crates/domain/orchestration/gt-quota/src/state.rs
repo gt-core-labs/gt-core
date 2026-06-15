@@ -665,6 +665,17 @@ impl QuotaState {
                     a.status = AccountQuotaStatus::Cooldown;
                 }
             }
+            // A soft-drain IS a rotation for state purposes (gtcore-df3319): record it and park the
+            // source in Cooldown so it stops being assigned/picked while it drains in-flight work.
+            QuotaEvent::SoftDrained { from_account, to_account, .. } => {
+                self.rotations
+                    .push((from_account.clone(), to_account.clone()));
+                if let Some(a) = self.accounts.get_mut(from_account) {
+                    a.status = AccountQuotaStatus::Cooldown;
+                }
+            }
+            // Pure operator alert (gtcore-df3319): the pointer did not move, so replay is a no-op.
+            QuotaEvent::SoftDrainStalled { .. } => {}
             QuotaEvent::Blocked { account, .. } => {
                 self.blocked.push(account.clone());
                 if let Some(a) = self.accounts.get_mut(account) {
