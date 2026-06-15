@@ -91,6 +91,22 @@ pub enum QuotaMsg {
         account: String,
         now_secs: u64,
     },
+    /// Every account is exhausted (gtcore-6f449f): record that the edge suspended the in-flight
+    /// polecats backed by `account`. Notification only — emits `quota.all_exhausted.v1`, no registry
+    /// mutation (the source's `Blocked` status is set by the `Blocked` message that precedes it).
+    AllExhausted {
+        account: String,
+        paused_sessions: Vec<String>,
+        now_secs: u64,
+    },
+    /// A paused account recovered (gtcore-6f449f): record that the edge resumed the suspended
+    /// polecats. Notification only — emits `quota.account_recovered.v1`; the lift back to `Healthy`
+    /// is already applied by the `Probe` that triggered it.
+    AccountRecovered {
+        account: String,
+        resumed_sessions: Vec<String>,
+        now_secs: u64,
+    },
     /// Onboard a claude account with its credential dir (`hq-quota-accounts.1`): adds it as a
     /// rotation candidate and emits `AccountRegistered` so the daemon's keychain hydrates from the
     /// log. Idempotent.
@@ -388,6 +404,42 @@ impl QuotaHandle {
             .tx
             .send(QuotaMsg::SoftDrainStalled {
                 account: account.into(),
+                now_secs,
+            })
+            .await;
+    }
+
+    /// Record that every account is exhausted and the edge suspended `account`'s in-flight polecats
+    /// in place (gtcore-6f449f): emits `quota.all_exhausted.v1` carrying the paused session list.
+    pub async fn all_exhausted(
+        &self,
+        account: impl Into<String>,
+        paused_sessions: Vec<String>,
+        now_secs: u64,
+    ) {
+        let _ = self
+            .tx
+            .send(QuotaMsg::AllExhausted {
+                account: account.into(),
+                paused_sessions,
+                now_secs,
+            })
+            .await;
+    }
+
+    /// Record that a paused account recovered and the edge resumed its suspended polecats
+    /// (gtcore-6f449f): emits `quota.account_recovered.v1` carrying the resumed session list.
+    pub async fn account_recovered(
+        &self,
+        account: impl Into<String>,
+        resumed_sessions: Vec<String>,
+        now_secs: u64,
+    ) {
+        let _ = self
+            .tx
+            .send(QuotaMsg::AccountRecovered {
+                account: account.into(),
+                resumed_sessions,
                 now_secs,
             })
             .await;
@@ -855,6 +907,36 @@ pub fn spawn_hydrated(
                     // Alert only: the pointer stayed put, so no registry mutation (gtcore-df3319).
                     let _ = events
                         .send(Envelope::root(QuotaEvent::SoftDrainStalled { account, now_secs }))
+                        .await;
+                }
+                QuotaMsg::AllExhausted {
+                    account,
+                    paused_sessions,
+                    now_secs,
+                } => {
+                    // Notification only (gtcore-6f449f): the edge already SIGSTOP'd the polecats and
+                    // the source's Blocked status was set by the preceding Blocked message.
+                    let _ = events
+                        .send(Envelope::root(QuotaEvent::AllExhausted {
+                            account,
+                            paused_sessions,
+                            now_secs,
+                        }))
+                        .await;
+                }
+                QuotaMsg::AccountRecovered {
+                    account,
+                    resumed_sessions,
+                    now_secs,
+                } => {
+                    // Notification only (gtcore-6f449f): the lift back to Healthy was applied by the
+                    // Probe that triggered this, and the edge already SIGCONT'd the polecats.
+                    let _ = events
+                        .send(Envelope::root(QuotaEvent::AccountRecovered {
+                            account,
+                            resumed_sessions,
+                            now_secs,
+                        }))
                         .await;
                 }
                 QuotaMsg::RegisterAccount {

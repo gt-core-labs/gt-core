@@ -676,6 +676,12 @@ impl QuotaState {
             }
             // Pure operator alert (gtcore-df3319): the pointer did not move, so replay is a no-op.
             QuotaEvent::SoftDrainStalled { .. } => {}
+            // Pause/resume-on-exhaustion (gtcore-6f449f) are edge lifecycle signals over the
+            // polecats, not account-registry mutations: the source account's `Blocked`/`Healthy`
+            // status is already carried by the `Blocked`/`UsageProbed` events around them, so the
+            // reducer keeps no extra state and replay is a no-op.
+            QuotaEvent::AllExhausted { .. } => {}
+            QuotaEvent::AccountRecovered { .. } => {}
             QuotaEvent::Blocked { account, .. } => {
                 self.blocked.push(account.clone());
                 if let Some(a) = self.accounts.get_mut(account) {

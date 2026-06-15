@@ -18,6 +18,8 @@ serde.workspace = true
 serde_json.workspace = true
 # Parse claude's "N% context used" status line out of a dead polecat's pane (gtcore-91fdde).
 regex = "1"
+# `SIGSTOP`/`SIGCONT` to a polecat's pane process group for pause-in-place (gtcore-6f449f).
+libc = { workspace = true }
 
 [dev-dependencies]
 tempfile.workspace = true
