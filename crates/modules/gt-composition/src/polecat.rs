@@ -44,6 +44,7 @@ use gt_store_dolt::{DoltIssues, IssueStatus};
 
 use crate::mcp::EventLog;
 use crate::operator_event::IssueOperatorEvent;
+use crate::polecat_event::PolecatEvent;
 
 /// Resolves the least-privilege scope set for an agent role (`hq-agent-provisioning.3`). The
 /// production resolver delegates to `gt_skills::SkillCatalog::scopes_for_roles`; tests pass a
@@ -329,6 +330,18 @@ impl PolecatSupervisorPlugin {
             }
         }
     }
+
+    /// Publish a [`PolecatEvent`] (sling skipped / failed) onto the hub so the workflow-notify
+    /// observer turns it into an operator notification (`gtcore-7e19fe`). Same best-effort path as
+    /// [`emit`](Self::emit): a closed hub or an encode failure only costs the notification — the
+    /// sling decision (skip / release) has already been made by the caller.
+    fn emit_polecat(&self, event: PolecatEvent) {
+        if let Some(tx) = &self.events {
+            if let Ok(record) = EventRecord::from_envelope(&Envelope::root(event)) {
+                let _ = tx.send(record);
+            }
+        }
+    }
 }
 
 #[async_trait]
@@ -357,6 +370,12 @@ impl Plugin for PolecatSupervisorPlugin {
                         "[polecat] sling skipped for {bead}: pool/host cap reached (workspace {})",
                         self.workspace
                     );
+                    // Surface the backpressure to the operator (gtcore-7e19fe): the bead is in limbo
+                    // until a slot frees, which is invisible from the log alone.
+                    self.emit_polecat(PolecatEvent::SlingSkipped {
+                        bead: bead.clone(),
+                        workspace: self.workspace.clone(),
+                    });
                     return Ok(());
                 }
                 // Route to the bead's rig by prefix (hq-0ecfec): matched ⇒ that rig's template +
@@ -612,6 +631,12 @@ impl Plugin for PolecatSupervisorPlugin {
                         .expect("pool mutex")
                         .release(&self.workspace);
                     eprintln!("[polecat] sling failed for {bead}: {e}");
+                    // Surface the fault to the operator (gtcore-7e19fe): the slot is freed but the
+                    // bead made no progress, so it needs a human to look (dead tmux / corrupt tree).
+                    self.emit_polecat(PolecatEvent::SlingFailed {
+                        bead: bead.clone(),
+                        reason: e.to_string(),
+                    });
                     return Ok(());
                 }
                 // Transition the bead open→working in Dolt (gtcore-orchd-working): the polecat is
