@@ -106,6 +106,17 @@ pub enum QuotaMsg {
     },
     /// Read-only snapshot of every per-session budget (B1) — the cost-attribution surface.
     BudgetSnapshot(oneshot::Sender<Vec<SessionBudget>>),
+    /// Configure the default per-session HARD spend ceiling (A5, gtcore-f3a016). Sent once at
+    /// startup from `GT_SESSION_HARD_CAP_COST`; `None` disables the hard gate.
+    ConfigureBudgetGate {
+        hard_cap: Option<f64>,
+    },
+    /// Read whether a session is frozen by the hard gate (A5). The anthropic proxy asks this
+    /// before forwarding a model call.
+    IsSessionGated {
+        session: String,
+        reply: oneshot::Sender<bool>,
+    },
     /// Diagnostics: (live accounts, predictions emitted).
     Snapshot(oneshot::Sender<(usize, usize)>),
     /// Read-only snapshot of every registered account. The edge needs this to pick a healthy
@@ -217,6 +228,34 @@ impl QuotaHandle {
             return Vec::new();
         }
         rx.await.unwrap_or_default()
+    }
+
+    /// Configure the default per-session HARD spend ceiling (A5, gtcore-f3a016). The composition
+    /// root calls this once at startup from `GT_SESSION_HARD_CAP_COST`; `None` disables the gate.
+    pub async fn configure_budget_gate(&self, hard_cap: Option<f64>) {
+        let _ = self
+            .tx
+            .send(QuotaMsg::ConfigureBudgetGate { hard_cap })
+            .await;
+    }
+
+    /// Whether a session is frozen by the per-session hard gate (A5). The anthropic proxy asks
+    /// this before forwarding a model call; `false` (fail-open) if the actor is gone or the
+    /// session is unknown — the gate only ever *adds* a refusal, never a spurious one.
+    pub async fn is_session_gated(&self, session: impl Into<String>) -> bool {
+        let (reply, rx) = oneshot::channel();
+        if self
+            .tx
+            .send(QuotaMsg::IsSessionGated {
+                session: session.into(),
+                reply,
+            })
+            .await
+            .is_err()
+        {
+            return false;
+        }
+        rx.await.unwrap_or(false)
     }
 
     pub async fn probe(
@@ -456,6 +495,12 @@ pub fn spawn_hydrated(
                         now_secs,
                     );
                     let budget_alert = crossed.then(|| budgets.get(&session).cloned()).flatten();
+                    // A5 (gtcore-f3a016): latch the HARD gate. If this sample is the one that
+                    // trips the hard ceiling, capture the budget for the enforcement event —
+                    // again before `session` is moved out below.
+                    let hard_tripped = budgets.gate_check(&session);
+                    let gate_trip =
+                        hard_tripped.then(|| budgets.get(&session).cloned()).flatten();
                     let _ = events
                         .send(Envelope::root(QuotaEvent::TokensSampled {
                             account,
@@ -476,6 +521,20 @@ pub fn spawn_hydrated(
                                 bead: b.bead,
                                 consumed_cost: b.cost,
                                 limit_cost: b.limit_cost.unwrap_or(0.0),
+                                now_secs,
+                            }))
+                            .await;
+                    }
+                    // A5: emit the HARD gate event once, when the hard ceiling is first crossed.
+                    // From here the proxy refuses this session's further model calls (the runaway
+                    // freezes itself — "no soft-fail silencioso").
+                    if let Some(b) = gate_trip {
+                        let _ = events
+                            .send(Envelope::root(QuotaEvent::BudgetGateTripped {
+                                session: b.session,
+                                bead: b.bead,
+                                consumed_cost: b.cost,
+                                hard_limit_cost: b.hard_limit_cost.unwrap_or(0.0),
                                 now_secs,
                             }))
                             .await;
@@ -784,6 +843,12 @@ pub fn spawn_hydrated(
                 QuotaMsg::BudgetSnapshot(reply) => {
                     let _ = reply.send(budgets.snapshot());
                 }
+                QuotaMsg::ConfigureBudgetGate { hard_cap } => {
+                    budgets.set_default_hard_limit(hard_cap);
+                }
+                QuotaMsg::IsSessionGated { session, reply } => {
+                    let _ = reply.send(budgets.is_session_gated(&session));
+                }
                 QuotaMsg::Snapshot(reply) => {
                     let _ = reply.send((registry.accounts().count(), predictions_emitted));
                 }
@@ -899,5 +964,45 @@ mod tests {
         assert_eq!(b.total_tokens(), 210);
         assert!(b.exceeded);
         assert!((b.elapsed_minutes() - 5.0).abs() < 1e-9);
+    }
+
+    #[tokio::test]
+    async fn hard_gate_trips_once_and_freezes_the_session() {
+        // A5, gtcore-f3a016: with a default HARD cap configured, a session that burns past it
+        // emits exactly one BudgetGateTripped and `is_session_gated` flips true — the proxy then
+        // refuses its further model calls. The freeze is sticky; a session with no cap is free.
+        let (tx, mut rx) = mpsc::channel::<Envelope<QuotaEvent>>(32);
+        let q = spawn(tx, std::collections::HashMap::new());
+        q.configure_budget_gate(Some(100.0)).await;
+
+        // Under cap (cost 60 < 100): only a TokensSampled, no gate, not frozen.
+        q.sample("acc-1", "run", "opus", 60, 0, 0, 0, 60).await;
+        let env = rx.recv().await.expect("sample emitted");
+        assert_eq!(env.payload.kind(), "quota.tokens_sampled.v1");
+        assert!(!q.is_session_gated("run").await, "under cap — not frozen");
+
+        // Over cap (cumulative 60 + 90 = 150 > 100): TokensSampled THEN one BudgetGateTripped.
+        q.sample("acc-1", "run", "opus", 90, 0, 0, 0, 120).await;
+        let env = rx.recv().await.expect("second sample emitted");
+        assert_eq!(env.payload.kind(), "quota.tokens_sampled.v1");
+        let env = rx.recv().await.expect("hard gate tripped emitted");
+        match env.payload {
+            QuotaEvent::BudgetGateTripped { session, consumed_cost, hard_limit_cost, .. } => {
+                assert_eq!(session, "run");
+                assert!((consumed_cost - 150.0).abs() < 1e-9);
+                assert!((hard_limit_cost - 100.0).abs() < 1e-9);
+            }
+            other => panic!("expected BudgetGateTripped, got {other:?}"),
+        }
+        assert!(q.is_session_gated("run").await, "over hard cap — the session is frozen");
+
+        // A further over-cap sample does NOT re-trip (latched): the only event is the sample.
+        q.sample("acc-1", "run", "opus", 50, 0, 0, 0, 180).await;
+        let env = rx.recv().await.expect("third sample emitted");
+        assert_eq!(env.payload.kind(), "quota.tokens_sampled.v1");
+        assert!(q.is_session_gated("run").await, "still frozen");
+
+        // An unknown session is never reported gated.
+        assert!(!q.is_session_gated("never-seen").await);
     }
 }

@@ -46,6 +46,17 @@ pub struct SessionBudget {
     /// Latched once the running cost first crosses `limit_cost`, so the alert fires exactly
     /// once. Stays `true` for the rest of the session.
     pub exceeded: bool,
+    /// Hard spend ceiling in cost units (A5, gtcore-f3a016). Distinct from `limit_cost` (B1's
+    /// SOFT alert line): crossing THIS latches [`gated`](Self::gated) and trips the platform
+    /// hard gate — the anthropic proxy then refuses the session's further model calls, so a
+    /// runaway freezes itself. `None` ⇒ no hard gate for this session (the default; spend is
+    /// still tracked and may trip the soft alert, but the session is never frozen).
+    #[serde(default)]
+    pub hard_limit_cost: Option<f64>,
+    /// Latched once the running cost first crosses `hard_limit_cost` (A5). Sticky for the rest
+    /// of the session — a later (e.g. refunded) sample can never un-freeze a runaway.
+    #[serde(default)]
+    pub gated: bool,
 }
 
 impl SessionBudget {
@@ -62,6 +73,8 @@ impl SessionBudget {
             last_activity_secs: now_secs,
             limit_cost: None,
             exceeded: false,
+            hard_limit_cost: None,
+            gated: false,
         }
     }
 
@@ -84,6 +97,15 @@ impl SessionBudget {
             None => false,
         }
     }
+
+    /// Whether the running cost is over the HARD ceiling (A5, gtcore-f3a016). Always `false`
+    /// when no hard limit is set — a session with no hard cap is never frozen.
+    pub fn is_over_hard_cap(&self) -> bool {
+        match self.hard_limit_cost {
+            Some(limit) => self.cost > limit,
+            None => false,
+        }
+    }
 }
 
 /// The owned registry of per-session budgets (`BTreeMap` keyed by session id → stable, sorted
@@ -92,6 +114,12 @@ impl SessionBudget {
 #[derive(Debug, Default, Clone, PartialEq, Serialize, Deserialize)]
 pub struct BudgetLedger {
     budgets: BTreeMap<String, SessionBudget>,
+    /// Default hard spend ceiling stamped onto each session's budget (A5, gtcore-f3a016). Set
+    /// once at startup from `GT_SESSION_HARD_CAP_COST`; `None` ⇒ no hard gate anywhere (the
+    /// default, byte-for-byte the B1 behaviour). Applied lazily when a budget is opened or first
+    /// sampled, so it governs every session without the edge threading a per-session value.
+    #[serde(default)]
+    default_hard_limit: Option<f64>,
 }
 
 impl BudgetLedger {
@@ -107,6 +135,7 @@ impl BudgetLedger {
         now_secs: u64,
     ) {
         let session = session.into();
+        let default_hard = self.default_hard_limit;
         let b = self
             .budgets
             .entry(session.clone())
@@ -116,6 +145,10 @@ impl BudgetLedger {
         }
         if limit_cost.is_some() {
             b.limit_cost = limit_cost;
+        }
+        // A5: inherit the configured hard ceiling unless this budget already carries one.
+        if b.hard_limit_cost.is_none() {
+            b.hard_limit_cost = default_hard;
         }
         if now_secs > b.last_activity_secs {
             b.last_activity_secs = now_secs;
@@ -138,10 +171,15 @@ impl BudgetLedger {
         now_secs: u64,
     ) -> bool {
         let session = session.into();
+        let default_hard = self.default_hard_limit;
         let b = self
             .budgets
             .entry(session.clone())
             .or_insert_with(|| SessionBudget::new(session, now_secs));
+        // A5: a session first seen via a sample (auto-open) inherits the configured hard ceiling.
+        if b.hard_limit_cost.is_none() {
+            b.hard_limit_cost = default_hard;
+        }
         b.input += input;
         b.output += output;
         b.cache_read += cache_read;
@@ -172,6 +210,44 @@ impl BudgetLedger {
     pub fn mark_exceeded(&mut self, session: &str, now_secs: u64) {
         if let Some(b) = self.budgets.get_mut(session) {
             b.exceeded = true;
+            if now_secs > b.last_activity_secs {
+                b.last_activity_secs = now_secs;
+            }
+        }
+    }
+
+    /// Configure the default hard spend ceiling (A5, gtcore-f3a016). Applied to budgets opened
+    /// or first sampled AFTER this call (and inherited lazily by an already-open budget that has
+    /// no hard limit yet). `None` disables the hard gate entirely.
+    pub fn set_default_hard_limit(&mut self, limit: Option<f64>) {
+        self.default_hard_limit = limit;
+    }
+
+    /// After folding a sample, latch the per-session HARD gate (A5, gtcore-f3a016). Returns
+    /// `true` iff THIS call is the one that first trips the hard cap (running cost crossed
+    /// `hard_limit_cost`), so the caller emits exactly one `BudgetGateTripped`. Sticky: a session
+    /// already `gated` returns `false`, and a session with no hard limit never trips.
+    pub fn gate_check(&mut self, session: &str) -> bool {
+        if let Some(b) = self.budgets.get_mut(session) {
+            if !b.gated && b.is_over_hard_cap() {
+                b.gated = true;
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Whether a session is frozen by the hard gate (A5). The anthropic proxy consults this
+    /// before forwarding a model call; `false` for an unknown or un-gated session.
+    pub fn is_session_gated(&self, session: &str) -> bool {
+        self.budgets.get(session).map(|b| b.gated).unwrap_or(false)
+    }
+
+    /// Latch a session as hard-gated from a replayed `BudgetGateTripped` event (A5, idempotent),
+    /// so a restart restores the freeze without re-deriving the crossing.
+    pub fn mark_gated(&mut self, session: &str, now_secs: u64) {
+        if let Some(b) = self.budgets.get_mut(session) {
+            b.gated = true;
             if now_secs > b.last_activity_secs {
                 b.last_activity_secs = now_secs;
             }
@@ -286,6 +362,50 @@ mod tests {
         // huge spend, but no ceiling configured.
         assert!(!led.record("s1", 1_000_000.0, 0, 0, 0, 0, 60));
         assert!(!led.get("s1").unwrap().is_over_budget());
+    }
+
+    #[test]
+    fn hard_gate_latches_once_and_freezes_the_session() {
+        // A5, gtcore-f3a016: with a default hard ceiling configured, a session that burns past
+        // it is latched `gated` (the platform hard gate). `gate_check` reports the FIRST trip
+        // exactly once; the freeze is sticky and `is_session_gated` answers the proxy.
+        let mut led = BudgetLedger::default();
+        led.set_default_hard_limit(Some(100.0));
+
+        // First sample auto-opens the budget and inherits the hard cap; under cap ⇒ no trip.
+        assert!(!led.record("run", 60.0, 0, 0, 0, 0, 60));
+        assert!(!led.gate_check("run"));
+        assert!(!led.is_session_gated("run"));
+        assert_eq!(led.get("run").unwrap().hard_limit_cost, Some(100.0));
+
+        // This sample pushes cost to 160 > 100: the gate trips exactly once.
+        assert!(!led.record("run", 100.0, 0, 0, 0, 0, 120));
+        assert!(led.gate_check("run"), "first crossing trips the hard gate");
+        assert!(led.is_session_gated("run"));
+
+        // Sticky: a further over-cap sample does NOT re-trip (one event only), and the session
+        // stays frozen.
+        assert!(!led.record("run", 50.0, 0, 0, 0, 0, 180));
+        assert!(!led.gate_check("run"), "already gated — no second trip");
+        assert!(led.is_session_gated("run"));
+
+        // A session with no hard cap is never frozen, however much it spends.
+        let mut uncapped = BudgetLedger::default();
+        uncapped.record("free", 1_000_000.0, 0, 0, 0, 0, 60);
+        assert!(!uncapped.gate_check("free"));
+        assert!(!uncapped.is_session_gated("free"));
+        assert!(!uncapped.is_session_gated("never-seen"));
+    }
+
+    #[test]
+    fn mark_gated_latches_idempotently_for_replay() {
+        // A5: a replayed BudgetGateTripped restores the freeze without re-deriving the crossing.
+        let mut led = BudgetLedger::default();
+        led.open("s1", Some("b".into()), None, 0);
+        led.mark_gated("s1", 50);
+        assert!(led.is_session_gated("s1"));
+        led.mark_gated("s1", 50); // replaying the same fact is harmless
+        assert!(led.is_session_gated("s1"));
     }
 
     #[test]
