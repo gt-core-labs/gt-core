@@ -57,6 +57,13 @@ pub trait Tmux: Send + Sync {
     /// argument list tmux expects (e.g. `&["Escape"]` or `&["C-c"]`); the adapter does
     /// not encode literals — callers stay in tmux's key-name vocabulary.
     fn send_keys(&self, session: &str, keys: &[&str]) -> io::Result<()>;
+
+    /// Capture the last lines of a session's active pane (`tmux capture-pane -p -t <session>`).
+    /// The supervisor reads this when a polecat dies to look for claude's `N% context used`
+    /// marker and tell a context-exhaustion death apart from a clean exit (gtcore-91fdde).
+    /// Returns `None` when the session is gone or the read fails — a missing capture is
+    /// non-fatal (the caller falls back to a plain exit).
+    fn capture_pane(&self, session: &str) -> Option<String>;
 }
 
 /// Real adapter: shells out to the `tmux` binary. Mirrors the flag shape of
@@ -311,7 +318,21 @@ impl Tmux for TmuxCli {
         self.run_checked(&argv)?;
         Ok(())
     }
+
+    fn capture_pane(&self, session: &str) -> Option<String> {
+        // Idempotent read → retry on transient failure (same posture as show-environment).
+        // `-p` prints to stdout; `-S -<N>` reaches back N lines of scrollback so the context
+        // marker is captured even if a shell prompt scrolled it off the visible pane. A gone
+        // session / wedged server surfaces as `Err` → `None` (a missing capture is non-fatal).
+        let start = format!("-{PANE_CAPTURE_LINES}");
+        self.run_retry(&["capture-pane", "-p", "-t", session, "-S", &start])
+            .ok()
+    }
 }
+
+/// How many lines of pane scrollback [`Tmux::capture_pane`] reaches back for. Enough to keep
+/// claude's `N% context used` status line even when a post-exit shell prompt has scrolled it up.
+const PANE_CAPTURE_LINES: u32 = 200;
 
 /// Parse `tmux show-environment -t <s> <key>` output. tmux prints `KEY=value` when set and
 /// `-KEY` (leading dash) when explicitly unset; anything else → not present.
@@ -338,11 +359,22 @@ fn parse_show_environment(out: &str, key: &str) -> Option<String> {
 #[derive(Default)]
 pub struct FakeTmux {
     sessions: Mutex<HashMap<String, HashMap<String, String>>>,
+    /// Canned pane contents returned by [`Tmux::capture_pane`], seeded via [`FakeTmux::set_pane`].
+    panes: Mutex<HashMap<String, String>>,
 }
 
 impl FakeTmux {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Seed the pane text [`Tmux::capture_pane`] will return for `session` — lets a test stand
+    /// in claude's `N% context used` status line without a real tmux server (gtcore-91fdde).
+    pub fn set_pane(&self, session: &str, contents: &str) {
+        self.panes
+            .lock()
+            .unwrap()
+            .insert(session.to_string(), contents.to_string());
     }
 }
 
@@ -394,6 +426,10 @@ impl Tmux for FakeTmux {
         let entry = map.entry(session.to_string()).or_default();
         entry.insert("__SEND_KEYS__".to_string(), value);
         Ok(())
+    }
+
+    fn capture_pane(&self, session: &str) -> Option<String> {
+        self.panes.lock().unwrap().get(session).cloned()
     }
 }
 
@@ -470,6 +506,15 @@ mod tests {
         let err = cli.capture_once(&["30"]).unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::TimedOut);
         assert!(start.elapsed() < Duration::from_secs(2), "killed promptly");
+    }
+
+    #[test]
+    fn fake_capture_pane_roundtrips_seeded_contents() {
+        let t = FakeTmux::new();
+        // Unseeded session → None (mirrors a gone session / failed read on the real adapter).
+        assert!(t.capture_pane("s1").is_none());
+        t.set_pane("s1", "⏵ 88% context used");
+        assert_eq!(t.capture_pane("s1").as_deref(), Some("⏵ 88% context used"));
     }
 
     #[test]
