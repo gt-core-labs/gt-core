@@ -239,6 +239,50 @@ impl QuotaRotationPlugin {
         }
         Ok(())
     }
+
+    /// Proactive soft-drain (gtcore-df3319): the ACTIVE account crossed the soft threshold while
+    /// still usable. Flip the keychain pointer to the healthiest alternative so NEW slings land
+    /// there, and record `quota.soft_drain.v1` (source → target). Unlike [`Self::rotate_away_from`]
+    /// this does NOT hot-swap in-flight polecats' credentials: they finish naturally on the
+    /// draining account — the bead's "drain, don't kill, don't rotate creds" contract. When no
+    /// healthy alternative exists (every other account is at or above the hard threshold) the
+    /// pointer stays put and `quota.soft_drain_stalled.v1` fires as an operator alert instead of
+    /// rotating into an almost-exhausted account. Idempotent: a probe arriving once the pointer has
+    /// already moved off `at_risk` is a no-op (no thrash, no duplicate record).
+    async fn soft_drain_away_from(&self, at_risk: &str) -> Result<(), AppError> {
+        // Already drained off this account? The live pointer moved → nothing to do.
+        if let Some(active) = self.keychain.active()? {
+            if active != at_risk {
+                return Ok(());
+            }
+        }
+        let accounts = self.quota.accounts().await;
+        let Some(target) = Self::pick_target(&accounts, at_risk) else {
+            eprintln!(
+                "[quota-rotation] {at_risk} at soft threshold but every alternative is ≥ {:.0}% \
+                 (hard) — staying put, alerting (quota.soft_drain_stalled.v1)",
+                hard_pct()
+            );
+            self.quota
+                .soft_drain_stalled(at_risk.to_string(), now_secs())
+                .await;
+            return Ok(());
+        };
+        // Flip the live credential pointer FIRST: if the target has no stored credential the
+        // keychain refuses (NotFound), and we must not record a drain that did not take.
+        self.keychain.set_active(&target)?;
+        // Record it: parks `at_risk` in Cooldown + emits `quota.soft_drain.v1` on the hub (durable).
+        self.quota
+            .soft_drained(at_risk.to_string(), target.clone(), now_secs())
+            .await;
+        // No credential hot-swap here (cf. rotate_away_from): in-flight polecats keep running on
+        // `at_risk` and drain it naturally; only the pointer for new slings moved to `target`.
+        eprintln!(
+            "[quota-rotation] soft-drain {at_risk} → {target}: new slings use {target}, \
+             in-flight work drains on {at_risk}"
+        );
+        Ok(())
+    }
 }
 
 #[async_trait]
@@ -322,7 +366,10 @@ impl Plugin for QuotaRotationPlugin {
                             "[quota-rotation] {account} probed at {pct:.0}% (soft {:.0}%) — draining",
                             soft_pct()
                         );
-                        self.rotate_away_from(&account).await?;
+                        // Proactive soft-drain: move the pointer for NEW slings, record
+                        // `quota.soft_drain.v1`, and (unlike a reactive rotation) leave in-flight
+                        // polecats on `account` to drain — no credential hot-swap (gtcore-df3319).
+                        self.soft_drain_away_from(&account).await?;
                     }
                 }
                 Ok(())
@@ -1065,5 +1112,148 @@ mod tests {
             .unwrap();
 
         assert_eq!(keychain.active().unwrap().as_deref(), Some("a"), "no drain below soft");
+    }
+
+    // gtcore-df3319: proactive soft-drain at 80% --------------------------------------------
+
+    #[tokio::test]
+    async fn probe_at_exactly_soft_threshold_rotates() {
+        // Acceptance: a probe at exactly 80% (== soft_pct) drains — the gate is `>=`, so the
+        // boundary itself triggers rotation.
+        let (tx, _rx) = mpsc::channel(64);
+        let quota = gt_quota::actor::spawn(tx, std::collections::HashMap::new());
+        quota.upsert_account(acct_with_util("a", 80.0, 100)).await; // exactly soft(80)
+        quota.upsert_account(acct_with_util("b", 10.0, 100)).await;
+        let keychain = Arc::new(InMemoryKeychain::seeded([("a", "/cfg/a"), ("b", "/cfg/b")]));
+        keychain.set_active("a").unwrap();
+        let plugin = QuotaRotationPlugin::new(quota, keychain.clone());
+
+        plugin
+            .on_event(&record(QuotaEvent::UsageProbed {
+                account: "a".into(),
+                remaining: 20,
+                resets_at_secs: FAR_FUTURE,
+                weekly_remaining: None,
+                weekly_resets_at_secs: None,
+                now_secs: 1_000,
+            }))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            keychain.active().unwrap().as_deref(),
+            Some("b"),
+            "80% (== soft) drains: pointer moved to the healthy standby"
+        );
+    }
+
+    #[tokio::test]
+    async fn probe_just_below_soft_does_not_rotate() {
+        // Acceptance: a probe at 79% (< soft_pct) leaves the pointer put.
+        let (tx, _rx) = mpsc::channel(64);
+        let quota = gt_quota::actor::spawn(tx, std::collections::HashMap::new());
+        quota.upsert_account(acct_with_util("a", 79.0, 100)).await; // just below soft(80)
+        quota.upsert_account(acct_with_util("b", 10.0, 100)).await;
+        let keychain = Arc::new(InMemoryKeychain::seeded([("a", "/cfg/a"), ("b", "/cfg/b")]));
+        keychain.set_active("a").unwrap();
+        let plugin = QuotaRotationPlugin::new(quota, keychain.clone());
+
+        plugin
+            .on_event(&record(QuotaEvent::UsageProbed {
+                account: "a".into(),
+                remaining: 21,
+                resets_at_secs: FAR_FUTURE,
+                weekly_remaining: None,
+                weekly_resets_at_secs: None,
+                now_secs: 1_000,
+            }))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            keychain.active().unwrap().as_deref(),
+            Some("a"),
+            "79% (< soft) does not drain"
+        );
+    }
+
+    #[tokio::test]
+    async fn soft_drain_emits_soft_drain_event_naming_source_and_target() {
+        // Acceptance: the proactive rotation is recorded as quota.soft_drain.v1 carrying the
+        // source + destination accounts (distinct from the reactive quota.rotated.v1).
+        let (tx, mut rx) = mpsc::channel::<Envelope<QuotaEvent>>(64);
+        let quota = gt_quota::actor::spawn(tx, std::collections::HashMap::new());
+        quota.upsert_account(acct_with_util("a", 85.0, 100)).await; // ≥ soft(80)
+        quota.upsert_account(acct_with_util("b", 10.0, 100)).await;
+        let keychain = Arc::new(InMemoryKeychain::seeded([("a", "/cfg/a"), ("b", "/cfg/b")]));
+        keychain.set_active("a").unwrap();
+        let plugin = QuotaRotationPlugin::new(quota.clone(), keychain.clone());
+
+        plugin
+            .on_event(&record(QuotaEvent::UsageProbed {
+                account: "a".into(),
+                remaining: 15,
+                resets_at_secs: FAR_FUTURE,
+                weekly_remaining: None,
+                weekly_resets_at_secs: None,
+                now_secs: 1_000,
+            }))
+            .await
+            .unwrap();
+        // Sync barrier: the SoftDrained emit happens inside the actor tick; a snapshot round-trip
+        // guarantees the actor processed it (and put it on the relay) before we drain.
+        let _ = quota.snapshot().await;
+
+        let mut found = None;
+        while let Ok(env) = rx.try_recv() {
+            if let QuotaEvent::SoftDrained { from_account, to_account, .. } = env.payload {
+                found = Some((from_account, to_account));
+            }
+        }
+        assert_eq!(
+            found,
+            Some(("a".to_string(), "b".to_string())),
+            "quota.soft_drain.v1 recorded the proactive rotation a → b"
+        );
+    }
+
+    #[tokio::test]
+    async fn all_alternatives_at_or_above_hard_alerts_without_rotation() {
+        // Acceptance: when every alternative is ≥ hard (90%) there is no healthy target — the
+        // pointer stays put and quota.soft_drain_stalled.v1 fires as an alert.
+        let (tx, mut rx) = mpsc::channel::<Envelope<QuotaEvent>>(64);
+        let quota = gt_quota::actor::spawn(tx, std::collections::HashMap::new());
+        quota.upsert_account(acct_with_util("a", 95.0, 100)).await; // active, hot
+        quota.upsert_account(acct_with_util("b", 92.0, 100)).await; // ≥ hard(90) → not a target
+        let keychain = Arc::new(InMemoryKeychain::seeded([("a", "/cfg/a"), ("b", "/cfg/b")]));
+        keychain.set_active("a").unwrap();
+        let plugin = QuotaRotationPlugin::new(quota.clone(), keychain.clone());
+
+        plugin
+            .on_event(&record(QuotaEvent::UsageProbed {
+                account: "a".into(),
+                remaining: 5,
+                resets_at_secs: FAR_FUTURE,
+                weekly_remaining: None,
+                weekly_resets_at_secs: None,
+                now_secs: 1_000,
+            }))
+            .await
+            .unwrap();
+        let _ = quota.snapshot().await; // sync barrier
+
+        assert_eq!(
+            keychain.active().unwrap().as_deref(),
+            Some("a"),
+            "no healthy target ⇒ pointer untouched"
+        );
+        let mut alerted = false;
+        while let Ok(env) = rx.try_recv() {
+            if let QuotaEvent::SoftDrainStalled { account, .. } = env.payload {
+                assert_eq!(account, "a");
+                alerted = true;
+            }
+        }
+        assert!(alerted, "quota.soft_drain_stalled.v1 alert fired");
     }
 }
