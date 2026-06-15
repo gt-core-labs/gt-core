@@ -20,6 +20,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 
 use gt_channel::DispatchSink;
 use gt_events::EventKind;
@@ -32,7 +33,16 @@ use super::eventlog::EventLog;
 use super::util::{descriptor, opt, req, str_arg};
 
 /// The event-log kind prefix for every escalation event (`escalation.*`).
-const NS: &str = "escalation.";
+pub(crate) const NS: &str = "escalation.";
+
+/// RFC3339 "now" — the timeout clock's zero for a request and a reminder. Stamped
+/// here (not in the contract) so an escalation carries its own age, the way each
+/// delegation does (see [`crate::delegation::rfc3339_now`]).
+pub fn rfc3339_now() -> String {
+    OffsetDateTime::now_utc()
+        .format(&Rfc3339)
+        .unwrap_or_default()
+}
 
 // ── Events ──────────────────────────────────────────────────────────────────
 
@@ -66,12 +76,24 @@ pub enum EscalationEvent {
         /// → `Kill` for pre-B2 logged events, preserving their kill-and-re-sling behaviour.
         #[serde(default)]
         mode: EscalationMode,
+        /// RFC3339 request stamp — the reminder clock's zero (A6, gtcore-46c9dc).
+        /// `#[serde(default)]` → empty for pre-A6 events, which then never reminder-fire
+        /// (an unparseable age is treated as "not overdue").
+        #[serde(default)]
+        at: String,
     },
     /// A human resolved the escalation.
     Resolved {
         id: String,
         response: String,
         approved: bool,
+    },
+    /// The operator was re-pinged about a still-pending escalation (A6). Recorded so the
+    /// reminder ticker resets its clock and never spams the same request every tick.
+    Reminded {
+        id: String,
+        /// RFC3339 stamp of this reminder — the next reminder is measured from here.
+        at: String,
     },
 }
 
@@ -80,6 +102,7 @@ impl EventKind for EscalationEvent {
         match self {
             EscalationEvent::Requested { .. } => "escalation.requested.v1",
             EscalationEvent::Resolved { .. } => "escalation.resolved.v1",
+            EscalationEvent::Reminded { .. } => "escalation.reminded.v1",
         }
     }
 }
@@ -88,34 +111,39 @@ impl EventKind for EscalationEvent {
 
 /// One escalation request's projected state.
 #[derive(Debug, Clone, Serialize)]
-struct Escalation {
-    id: String,
-    session: String,
-    bead: Option<String>,
-    reason: String,
+pub struct Escalation {
+    pub id: String,
+    pub session: String,
+    pub bead: Option<String>,
+    pub reason: String,
     /// Requested disposition for the waiting session (B2): pause-in-place vs kill.
-    mode: EscalationMode,
-    state: EscalationState,
-    response: Option<String>,
-    approved: Option<bool>,
+    pub mode: EscalationMode,
+    pub state: EscalationState,
+    pub response: Option<String>,
+    pub approved: Option<bool>,
+    /// RFC3339 request stamp (A6) — the reminder clock's zero. Empty for pre-A6 events.
+    pub at: String,
+    /// RFC3339 stamp of the most recent operator reminder, if any (A6). Once set, the next
+    /// reminder is measured from here rather than from `at`.
+    pub reminded_at: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
-enum EscalationState {
+pub enum EscalationState {
     Pending,
     Resolved,
 }
 
 /// In-memory projection rebuilt by folding the escalation event stream.
 #[derive(Debug, Default)]
-struct EscalationRegistry {
-    entries: Vec<Escalation>,
+pub struct EscalationRegistry {
+    pub entries: Vec<Escalation>,
 }
 
 impl EscalationRegistry {
     /// Event-sourced reducer: fold one event into the registry.
-    fn apply(reg: &mut Self, event: &EscalationEvent) {
+    pub fn apply(reg: &mut Self, event: &EscalationEvent) {
         match event {
             EscalationEvent::Requested {
                 id,
@@ -123,6 +151,7 @@ impl EscalationRegistry {
                 bead,
                 reason,
                 mode,
+                at,
             } => {
                 reg.entries.push(Escalation {
                     id: id.clone(),
@@ -133,6 +162,8 @@ impl EscalationRegistry {
                     state: EscalationState::Pending,
                     response: None,
                     approved: None,
+                    at: at.clone(),
+                    reminded_at: None,
                 });
             }
             EscalationEvent::Resolved {
@@ -146,18 +177,31 @@ impl EscalationRegistry {
                     e.approved = Some(*approved);
                 }
             }
+            EscalationEvent::Reminded { id, at } => {
+                if let Some(e) = reg.entries.iter_mut().find(|e| e.id == *id) {
+                    e.reminded_at = Some(at.clone());
+                }
+            }
         }
     }
 
-    fn get(&self, id: &str) -> Option<&Escalation> {
+    pub fn get(&self, id: &str) -> Option<&Escalation> {
         self.entries.iter().find(|e| e.id == id)
     }
 
-    fn pending(&self) -> Vec<&Escalation> {
+    pub fn pending(&self) -> Vec<&Escalation> {
         self.entries
             .iter()
             .filter(|e| e.state == EscalationState::Pending)
             .collect()
+    }
+
+    /// The pending escalation a given session is waiting on, if any (A6). Used by the A2A
+    /// gateway to project `input-required` and to route a multi-turn operator reply.
+    pub fn pending_for_session(&self, session: &str) -> Option<&Escalation> {
+        self.entries
+            .iter()
+            .find(|e| e.state == EscalationState::Pending && e.session == session)
     }
 }
 
@@ -310,6 +354,7 @@ impl DomainHandler for EscalateHandler {
                         bead,
                         reason,
                         mode,
+                        at: rfc3339_now(),
                     },
                     &id,
                 )
@@ -391,6 +436,8 @@ fn escalation_json(e: &Escalation) -> Value {
         "state": e.state,
         "response": e.response,
         "approved": e.approved,
+        "at": e.at,
+        "reminded_at": e.reminded_at,
     })
 }
 
