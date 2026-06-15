@@ -53,6 +53,7 @@ use std::time::Duration;
 use gt_auth::JwtMinter;
 use gt_channel::Channel;
 use gt_composition::bead_close::BeadClosePlugin;
+use gt_composition::ci_gate::CiGateState;
 use gt_composition::git_merge::GitMergePlugin;
 use gt_composition::patrol_bridge::PatrolBridgePlugin;
 use gt_composition::mcp::eventlog::EventLog;
@@ -220,16 +221,10 @@ async fn main() -> anyhow::Result<()> {
     // golden event/dead-letter metrics record from boot onward (mirrors gt-mcp-server).
     gt_telemetry::metrics::ensure_registered();
 
-    // Prometheus scrape endpoint (hq-orchd.6): expose THIS process's registry — including
-    // gt_workspace_session_minutes, bumped by the session-minutes projector — so the per-tenant
-    // cost dashboard scrapes the daemon (a separate process from gt-mcp-server's /metrics).
-    // Detached + best-effort: a bind failure logs but never aborts the orchestrator.
+    // The Prometheus + CI-gate HTTP listener is spawned AFTER `daemon_root` below, because the
+    // CI-gate routes need the merge handle it produces (gtcore-52c9ec). Resolve the bind here so an
+    // invalid value surfaces early in the log.
     let metrics_bind = std::env::var("GT_METRICS_BIND").unwrap_or_else(|_| "127.0.0.1:9099".into());
-    tokio::spawn(async move {
-        if let Err(e) = serve_metrics(&metrics_bind).await {
-            eprintln!("[gt-orch-server] metrics http server stopped: {e}");
-        }
-    });
 
     // The daemon always persists — durability is its whole point — so an unset
     // GT_EVENTLOG_ROOT falls back to the production volume, never to the in-memory
@@ -275,6 +270,21 @@ async fn main() -> anyhow::Result<()> {
     eprintln!(
         "[gt-orch-server] durable: hub records persisted to the per-workspace log; restart rehydrates pending queue + merge board"
     );
+
+    // Prometheus scrape endpoint (hq-orchd.6) + CI-gate receiver (gtcore-52c9ec) on one listener.
+    // The metrics half exposes THIS process's registry (gt_workspace_session_minutes etc.) for the
+    // per-tenant cost dashboard; the CI-gate half receives the MCP-server webhook forward and drives
+    // a merge slot to Merged/Failed via the merge handle — replacing orchd's old 60s PR poll.
+    // Detached + best-effort: a bind failure logs but never aborts the orchestrator.
+    let ci_gate_token = std::env::var("GT_CI_GATE_TOKEN").ok();
+    let ci_gate_state = CiGateState::new(merge.clone(), ci_gate_token);
+    let metrics_bind_owned = metrics_bind.clone();
+    tokio::spawn(async move {
+        if let Err(e) = serve_metrics(&metrics_bind_owned, Some(ci_gate_state)).await {
+            eprintln!("[gt-orch-server] metrics/ci-gate http server stopped: {e}");
+        }
+    });
+    eprintln!("[gt-orch-server] CI-gate receiver on POST {metrics_bind}/ci-gate/{{merged,failed}}");
 
     // --- Autonomous polecat supervision (hq-orchd.3) ---
     // The shared admission core: pool_size (read above for scheduler alignment), host cap seeded
@@ -1242,11 +1252,17 @@ async fn main() -> anyhow::Result<()> {
 }
 
 /// Serve the Prometheus text exposition of this process's registry on `GET /metrics`
-/// (`hq-orchd.6`). Bound to `GT_METRICS_BIND` (default `127.0.0.1:9099`).
-async fn serve_metrics(bind: &str) -> anyhow::Result<()> {
+/// (`hq-orchd.6`), and — when `ci_gate` is `Some` — the CI-gate receiver
+/// (`POST /ci-gate/{merged,failed}`, gtcore-52c9ec) on the same listener. Bound to `GT_METRICS_BIND`
+/// (default `127.0.0.1:9099`). The CI-gate routes are how the MCP-server webhook drives a merge slot
+/// to its terminal state without orchd polling the PR.
+async fn serve_metrics(bind: &str, ci_gate: Option<CiGateState>) -> anyhow::Result<()> {
     use axum::routing::get;
     use axum::Router;
-    let app = Router::new().route("/metrics", get(metrics_text));
+    let mut app = Router::new().route("/metrics", get(metrics_text));
+    if let Some(state) = ci_gate {
+        app = app.merge(gt_composition::ci_gate::ci_gate_router(state));
+    }
     let listener = tokio::net::TcpListener::bind(bind).await?;
     eprintln!(
         "[gt-orch-server] metrics on http://{}/metrics",

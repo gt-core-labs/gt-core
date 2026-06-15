@@ -944,13 +944,26 @@ async fn main() -> anyhow::Result<()> {
                 ));
                 let connections: Arc<dyn VcsConnectionRepo> =
                     Arc::new(gt_vcs::PgVcsConnections::new(conn_pool));
+                // CI-gate forwarding (gtcore-52c9ec): when GT_CI_GATE_URL points at orchd's
+                // metrics/CI-gate listener (e.g. http://gt-orch-server:9099), `pull_request.closed`
+                // / `check_suite.completed` deliveries are forwarded to /ci-gate/{merged,failed} so
+                // orchd drives the merge slot to its terminal state — replacing the old 60s PR poll.
+                // Unset ⇒ those events are acknowledged and ignored (backward-compatible).
+                let mut webhook_state = gt_composition::webhook::GithubWebhookState::new(
+                    source,
+                    Arc::new(WsPools::new(pg_url.clone())),
+                    connections,
+                    event_log.clone(),
+                );
+                if let Ok(ci_gate_url) = std::env::var("GT_CI_GATE_URL") {
+                    webhook_state = webhook_state
+                        .with_ci_forward(ci_gate_url, std::env::var("GT_CI_GATE_TOKEN").ok());
+                    eprintln!(
+                        "[gt-mcp-server] CI-gate forwarding on (pull_request.closed / check_suite.completed → orchd /ci-gate)"
+                    );
+                }
                 Some(gt_composition::webhook::github_webhook_router(
-                    gt_composition::webhook::GithubWebhookState::new(
-                        source,
-                        Arc::new(WsPools::new(pg_url.clone())),
-                        connections,
-                        event_log.clone(),
-                    ),
+                    webhook_state,
                 ))
             }
             Err(e) => {
