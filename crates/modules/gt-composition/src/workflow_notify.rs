@@ -9,10 +9,24 @@
 //! relay as the polecat supervisor and the git-merge edge, it mirrors three hub events into
 //! operator notifications:
 //!
-//! - `scheduling.dispatched.v1` → `info` — a polecat was assigned to the bead.
-//! - `merge.merged.v1`          → `info` — the bead's work landed on main (short sha).
-//! - `merge.failed.v1`          → `alert` — the merge failed, with the reason (actionable from
+//! - `scheduling.dispatched.v1`  → `info`  — a polecat was assigned to the bead.
+//! - `merge.merged.v1`           → `info`  — the bead's work landed on main (short sha).
+//! - `merge.failed.v1`           → `alert` — the merge failed, with the reason (actionable from
 //!   the bell, which can open a tracker issue from a notification).
+//!
+//! `gtcore-7e19fe` adds the operational events that previously only reached `eprintln`, so the
+//! operator no longer has to tail daemon logs to learn the autonomous loop is stuck:
+//!
+//! - `quota.block_predicted.v1`  → `alert` — a claude account is about to block; rotation moves on.
+//! - `quota.account_limited.v1`  → `alert` — the provider returned 429 for an account.
+//! - `patrol.lease-expired.v1`   → `alert` — an agent crashed; the patrol freed its claim.
+//! - `polecat.sling-skipped.v1`  → `info`  — the pool/host cap is reached; the bead waits (bell-only
+//!   backpressure — routine under load, deliberately off the email path).
+//! - `polecat.sling-failed.v1`   → `info`  — `spawn_tmux` errored; the slot freed but the bead made
+//!   no progress.
+//!
+//! Severity follows the bead's AC: the capacity faults (quota/lease) are `alert` and ride the
+//! optional `GT_NOTIFY_EMAIL` path (like `merge.failed`); the sling outcomes are `info` (bell).
 //!
 //! Everything is best-effort: a PG outage or a log-append failure is logged and never breaks the
 //! relay — notifications are observational, the workflow itself is the source of truth.
@@ -26,10 +40,13 @@ use sqlx::PgPool;
 use gt_eventlog::EventRecord;
 use gt_events::{AppError, Envelope, EventKind};
 use gt_merge::MergeEvent;
+use gt_patrol::PatrolEvent;
 use gt_plugin::Plugin;
+use gt_quota::QuotaEvent;
 use gt_scheduling::SchedEvent;
 
 use crate::mcp::eventlog::EventLog;
+use crate::polecat_event::PolecatEvent;
 
 /// The workspace whose SSE stream is the unscoped (`None`) log scope — mirrors
 /// `mcp/notify.rs::DEFAULT_WORKSPACE` so the bell's feed sees both writers the same way.
@@ -83,6 +100,88 @@ pub fn draft_for(record: &EventRecord) -> Option<NotificationDraft> {
                 title: format!("Merge de {bead} falló"),
                 body: reason,
                 kind: "alert",
+            })
+        }
+        // A claude account crossed the block-prediction threshold (gtcore-7e19fe): rotation moves to
+        // another account, but if all are blocked there's no capacity — worth an alert.
+        "quota.block_predicted.v1" => {
+            let QuotaEvent::BlockPredicted {
+                account,
+                eta_to_block_secs,
+                ..
+            } = record.decode::<QuotaEvent>().ok()?
+            else {
+                return None;
+            };
+            Some(NotificationDraft {
+                title: format!("Cuenta {account} bloqueada, rotando"),
+                body: format!(
+                    "El predictor de quota proyecta que {account} se bloquea en ~{eta_to_block_secs}s; la rotación cambia a otra cuenta. Si todas están bloqueadas no hay capacidad."
+                ),
+                kind: "alert",
+            })
+        }
+        // Reactive rate-limit: the provider returned 429 for this account (gtcore-7e19fe).
+        "quota.account_limited.v1" => {
+            let QuotaEvent::AccountLimited { account, .. } = record.decode::<QuotaEvent>().ok()?
+            else {
+                return None;
+            };
+            Some(NotificationDraft {
+                title: format!("Cuenta {account} rate-limited"),
+                body: format!(
+                    "El proveedor devolvió 429 para {account}; la rotación buscará otra cuenta disponible."
+                ),
+                kind: "alert",
+            })
+        }
+        // An agent crashed without closing its session: the patrol detected the stale lease and
+        // released the claim (gtcore-7e19fe). The bead is re-enqueued, but the crash is worth a look.
+        "patrol.lease-expired.v1" => {
+            let PatrolEvent::LeaseExpired { bead, worker, .. } =
+                record.decode::<PatrolEvent>().ok()?
+            else {
+                return None;
+            };
+            Some(NotificationDraft {
+                title: format!("Agente {bead} crash — lease expirado"),
+                body: format!(
+                    "El patrol liberó el claim de {bead} (worker {worker}) tras un lease expirado; se re-encolará para otro polecat."
+                ),
+                kind: "alert",
+            })
+        }
+        // The supervisor refused a sling because the pool/host cap is reached (gtcore-7e19fe): the
+        // bead waits in limbo until a slot frees. This is recoverable backpressure — capacity frees
+        // as live polecats finish — so it's a bell (`info`), not an alert: a pool-full skip is
+        // routine under load and must NOT page/email the operator on every occurrence.
+        "polecat.sling-skipped.v1" => {
+            let PolecatEvent::SlingSkipped { bead, workspace } =
+                record.decode::<PolecatEvent>().ok()?
+            else {
+                return None;
+            };
+            Some(NotificationDraft {
+                title: format!("Sling de {bead} omitido: pool lleno"),
+                body: format!(
+                    "No hay slots libres en el workspace {workspace}; {bead} espera a que se libere capacidad."
+                ),
+                kind: "info",
+            })
+        }
+        // The sling spawn errored (gtcore-7e19fe): the slot was released but the bead made no
+        // progress — needs a human (dead tmux, corrupt worktree, …). A bell (`info`) per the AC:
+        // the operator sees it in the bell, but it stays off the alert/email path that the capacity
+        // faults (quota/lease) ride.
+        "polecat.sling-failed.v1" => {
+            let PolecatEvent::SlingFailed { bead, reason } = record.decode::<PolecatEvent>().ok()?
+            else {
+                return None;
+            };
+            Some(NotificationDraft {
+                title: format!("Sling de {bead} falló"),
+                body: reason,
+                kind: "info",
             })
         }
         _ => None,
@@ -191,9 +290,10 @@ impl Plugin for WorkflowNotifyPlugin {
         if let Err(e) = self.log.append(ws_opt, ev) {
             eprintln!("[workflow-notify] SSE emit failed: {e}");
         }
-        // Phase 2 (hq-80e92c): a merge FAILURE also lands in the operator's inbox via the
-        // existing email_outbox (the scheduling drain + EmailTransport deliver it). Only the
-        // alert kind emails — dispatched/merged stay bell-only. Best-effort like the rest.
+        // Phase 2 (hq-80e92c) + gtcore-7e19fe: an ALERT also lands in the operator's inbox via the
+        // existing email_outbox (the scheduling drain + EmailTransport deliver it). Only the alert
+        // kind emails — merge.failed plus the quota/lease capacity faults; the info-kind events
+        // (dispatched/merged, sling skipped/failed) stay bell-only. Best-effort like the rest.
         if draft.kind == "alert" {
             if let Some(recipient) = &self.failure_email {
                 use gt_store_pg::{EmailOutboxRepository, NewEmail, PgEmailOutbox};
@@ -259,6 +359,73 @@ mod tests {
         assert_eq!(d.kind, "alert");
         assert!(d.title.contains("gtweb-1"));
         assert!(d.body.contains("conflicted"));
+    }
+
+    #[test]
+    fn block_predicted_renders_an_alert_naming_the_account() {
+        let d = draft_for(&record(QuotaEvent::BlockPredicted {
+            account: "acct-a".into(),
+            eta_to_block_secs: 120,
+            consumed: 900,
+            limit: 1000,
+            rate_per_min: 8.0,
+            now_secs: 0,
+        }))
+        .expect("block-predicted warrants a notification");
+        assert_eq!(d.kind, "alert");
+        assert!(d.title.contains("acct-a"));
+        assert!(d.body.contains("120"), "body carries the eta: {}", d.body);
+    }
+
+    #[test]
+    fn account_limited_renders_an_alert_naming_the_account() {
+        let d = draft_for(&record(QuotaEvent::AccountLimited {
+            account: "acct-b".into(),
+            now_secs: 0,
+        }))
+        .expect("account-limited warrants a notification");
+        assert_eq!(d.kind, "alert");
+        assert!(d.title.contains("acct-b"));
+        assert!(d.title.contains("rate-limited"));
+    }
+
+    #[test]
+    fn lease_expired_renders_an_alert_naming_the_bead_and_worker() {
+        let d = draft_for(&record(PatrolEvent::LeaseExpired {
+            bead: "gtcore-9".into(),
+            worker: "w7".into(),
+            priority: 1,
+        }))
+        .expect("lease-expired warrants a notification");
+        assert_eq!(d.kind, "alert");
+        assert!(d.title.contains("gtcore-9"));
+        assert!(d.body.contains("w7"), "body names the crashed worker: {}", d.body);
+    }
+
+    #[test]
+    fn sling_skipped_renders_a_bell_naming_the_bead() {
+        let d = draft_for(&record(PolecatEvent::SlingSkipped {
+            bead: "gtweb-3".into(),
+            workspace: "default".into(),
+        }))
+        .expect("sling-skipped warrants a notification");
+        // Bell (`info`), not alert: recoverable backpressure stays off the email path.
+        assert_eq!(d.kind, "info");
+        assert!(d.title.contains("gtweb-3"));
+        assert!(d.title.contains("pool"), "title says why it was skipped: {}", d.title);
+    }
+
+    #[test]
+    fn sling_failed_renders_a_bell_carrying_the_reason() {
+        let d = draft_for(&record(PolecatEvent::SlingFailed {
+            bead: "gtweb-4".into(),
+            reason: "tmux: no server running".into(),
+        }))
+        .expect("sling-failed warrants a notification");
+        // Bell (`info`) per the AC — visible in the bell, off the alert/email path.
+        assert_eq!(d.kind, "info");
+        assert!(d.title.contains("gtweb-4"));
+        assert!(d.body.contains("no server running"));
     }
 
     #[test]
