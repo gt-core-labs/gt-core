@@ -693,6 +693,11 @@ impl QuotaState {
             QuotaEvent::SessionBudgetClosed { session, now_secs } => {
                 self.budgets.close(session, *now_secs);
             }
+            // A5 (gtcore-f3a016): the hard gate tripped — latch the session `gated` so a restart
+            // restores the freeze the proxy enforces.
+            QuotaEvent::BudgetGateTripped { session, now_secs, .. } => {
+                self.budgets.mark_gated(session, *now_secs);
+            }
         }
     }
 }
