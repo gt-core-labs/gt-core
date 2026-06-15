@@ -177,8 +177,8 @@ mod tests {
         assert!(!authorized(tok, &HeaderMap::new()));
     }
 
-    #[test]
-    fn blank_env_token_collapses_to_open() {
+    #[tokio::test]
+    async fn blank_env_token_collapses_to_open() {
         // An empty/whitespace GT_CI_GATE_TOKEN must NOT produce a token that rejects every caller.
         let st = CiGateState::new(dummy_merge().0, Some("   ".into()));
         assert!(st.token.is_none());
@@ -190,19 +190,18 @@ mod tests {
         (spawn(InMemoryMergeRepo::default(), tx), rx)
     }
 
-    /// Drain the relay until an event whose `kind` matches is seen, or the channel empties.
-    async fn next_kind(rx: &mut mpsc::Receiver<Envelope<MergeEvent>>) -> Vec<String> {
-        let mut kinds = Vec::new();
-        while let Ok(env) = rx.try_recv() {
-            kinds.push(env.kind().to_string());
-        }
-        // Give the actor a tick to flush if nothing was buffered yet.
-        if kinds.is_empty() {
-            if let Some(env) = rx.recv().await {
-                kinds.push(env.kind().to_string());
+    /// Wait (bounded) for a relay event of exactly `target`, ignoring any earlier events
+    /// (`submitted`/`ready`/`started`). Event emission is async relative to the command `await`, so a
+    /// drain-what's-buffered approach races the actor; this blocks per event until the one we want
+    /// arrives, the channel goes idle, or the 2s ceiling trips.
+    async fn wait_for_kind(rx: &mut mpsc::Receiver<Envelope<MergeEvent>>, target: &str) -> bool {
+        loop {
+            match tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv()).await {
+                Ok(Some(env)) if env.kind() == target => return true,
+                Ok(Some(_)) => continue,
+                _ => return false,
             }
         }
-        kinds
     }
 
     #[tokio::test]
@@ -211,7 +210,6 @@ mod tests {
         // Seed a slot in `Merging` (Ready → Started) so `complete` is a legal transition.
         merge.submit("b1", "b1", "01ABC").await;
         merge.start("b1").await;
-        let _ = next_kind(&mut rx).await; // drain Ready/Started
 
         let st = CiGateState::new(merge.clone(), None);
         let resp = merged(
@@ -222,10 +220,9 @@ mod tests {
         .await;
         assert_eq!(resp.status(), StatusCode::ACCEPTED);
 
-        let kinds = next_kind(&mut rx).await;
         assert!(
-            kinds.iter().any(|k| k == "merge.merged.v1"),
-            "expected merge.merged.v1, saw {kinds:?}"
+            wait_for_kind(&mut rx, "merge.merged.v1").await,
+            "expected merge.merged.v1 on the relay"
         );
     }
 
@@ -234,7 +231,6 @@ mod tests {
         let (merge, mut rx) = dummy_merge();
         merge.submit("b2", "b2", "01ABC").await;
         merge.start("b2").await;
-        let _ = next_kind(&mut rx).await;
 
         let st = CiGateState::new(merge.clone(), None);
         let resp = failed(
@@ -245,10 +241,9 @@ mod tests {
         .await;
         assert_eq!(resp.status(), StatusCode::ACCEPTED);
 
-        let kinds = next_kind(&mut rx).await;
         assert!(
-            kinds.iter().any(|k| k == "merge.failed.v1"),
-            "expected merge.failed.v1, saw {kinds:?}"
+            wait_for_kind(&mut rx, "merge.failed.v1").await,
+            "expected merge.failed.v1 on the relay"
         );
     }
 
