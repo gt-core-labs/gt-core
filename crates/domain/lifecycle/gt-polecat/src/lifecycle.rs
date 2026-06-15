@@ -386,6 +386,11 @@ pub fn polecat_prompt(workspace: &str, bead: &str, branch: &str) -> String {
     format!(
         "You are a gt polecat in workspace `{workspace}`. Your assigned bead is `{bead}`. \
          Begin your duties per CLAUDE.md. Work autonomously and do not ask for confirmation. \
+         Before you start, recall durable team memory by calling the MCP tool \
+         `mcp__gt__memory_recall` with context relevant to your bead; treat every memory of kind \
+         `feedback` as a hard rule you must obey. As you work and learn something durable \
+         (a decision, gotcha, or convention worth keeping across sessions), persist it with \
+         the MCP tool `mcp__gt__memory_save` — never write memory to local files. \
          When your work is committed on branch `{branch}`, signal completion by calling \
          the MCP tool `mcp__gt__merge_submit` with arguments \
          {{\"bead\":\"{bead}\",\"branch\":\"{branch}\"}}. \
@@ -584,6 +589,20 @@ mod lifecycle_tests {
     fn polecat_prompt_names_workspace_bead_and_branch() {
         let p = polecat_prompt("acme", "hq-9.2", "feat/x");
         assert!(p.contains("acme") && p.contains("hq-9.2") && p.contains("feat/x"));
+    }
+
+    #[test]
+    fn polecat_prompt_instructs_memory_recall_and_save() {
+        // gtcore-bad8d9: the prompt must steer the polecat to the durable gt MCP memory so
+        // knowledge carries across sessions instead of being re-derived from zero each time.
+        let p = polecat_prompt("acme", "hq-9.2", "feat/x");
+        // Recall at start, with `feedback` memories treated as hard rules.
+        assert!(p.contains("mcp__gt__memory_recall"));
+        assert!(p.contains("feedback"));
+        assert!(p.contains("hard rule"));
+        // Persist durable findings via MCP — never to local files.
+        assert!(p.contains("mcp__gt__memory_save"));
+        assert!(p.contains("never write memory to local files"));
     }
 
     #[test]
