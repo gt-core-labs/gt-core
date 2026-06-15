@@ -2333,6 +2333,22 @@ async fn build_domain_router(
                 handler = handler.with_cross_ws(stores, cross_ws_grants);
             }
 
+            // A5 (gtcore-f3a016): rig-level RBAC on the in-process intake path. With
+            // GT_A2A_RIG_GRANTS set (same `origin->rig` syntax as the cross-ws/peer
+            // grants), an agent may only delegate work onto a rig it holds a grant
+            // for; an ungranted rig is rejected + audited with the origin identity.
+            // Unset/empty ⇒ no rig gate (legacy: any rig is delegable).
+            let rig_grants = std::env::var("GT_A2A_RIG_GRANTS")
+                .ok()
+                .map(|spec| CrossWsGrants::parse(&spec))
+                .unwrap_or_else(CrossWsGrants::empty);
+            eprintln!(
+                "[gt-mcp-server] a2a.delegate rig RBAC: {} grant(s) ({})",
+                rig_grants.len(),
+                if rig_grants.is_empty() { "no rig gate" } else { "deny-by-default" },
+            );
+            handler = handler.with_rig_grants(rig_grants);
+
             // A7 (gtcore-3a3557): direct rig→rig HTTP delegation. A `peer` arg on
             // a2a.delegate routes the hop straight to that rig's own A2A endpoint
             // (discovered via its Agent Card), with orchd NOT relaying. Deny-by-
