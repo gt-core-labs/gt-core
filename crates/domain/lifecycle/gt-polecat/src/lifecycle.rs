@@ -398,7 +398,51 @@ pub fn polecat_prompt(workspace: &str, bead: &str, branch: &str) -> String {
          `d=\"$GT_CHANNEL_ROOT/merge-ready\"; mkdir -p \"$d\"; i=$(cat /proc/sys/kernel/random/uuid \
          2>/dev/null || date +%s%N); printf '{{\"bead\":\"%s\",\"branch\":\"%s\"}}' \"$GT_HOOK_BEAD\" \
          \"$GT_BRANCH\" > \"$d/.$i.tmp\" && mv \"$d/.$i.tmp\" \"$d/$i.event\"` \
-         Then stop."
+         Then stop.{}",
+        checkpoint_protocol(bead)
+    )
+}
+
+/// Checkpoint-on-context protocol appended to every sling prompt (`gtcore-2467b4`).
+///
+/// A polecat is never killed mid-bead; instead it cooperates voluntarily when it senses its context
+/// window filling up (~80%). At that point it must (1) commit ALL partial work, (2) persist a
+/// continuation summary onto the bead's notes via `mcp__gt__issues_update`, and (3) deliberately NOT
+/// emit merge-ready — the bead is not done, so signalling completion would have the refinery merge a
+/// half-finished branch. The next polecat slung for the same bead reads these notes and resumes.
+///
+/// The notes use a fixed, machine-parseable shape so the continuation can split it deterministically:
+///
+/// ```text
+/// ## Checkpoint
+/// ### Completado
+/// - <what landed, with file paths / commit subjects>
+/// ### Pendiente
+/// - <what remains, concrete next steps>
+/// ```
+///
+/// Kept as its own `fn` (not inlined into [`polecat_prompt`]) so the contract — the literal section
+/// headers and the three rules — is unit-testable in isolation.
+pub fn checkpoint_protocol(bead: &str) -> String {
+    format!(
+        " CHECKPOINT PROTOCOL: you are never force-killed, so you must hand off cleanly before \
+         your context runs out. When your context usage approaches ~80%, STOP taking on new work \
+         and check point instead: \
+         (1) commit ALL partial work on branch with a conventional commit (`git add -A` then \
+         `git commit`); \
+         (2) record a continuation summary on the bead's notes by calling the MCP tool \
+         `mcp__gt__issues_update` with arguments {{\"id\":\"{bead}\",\"notes\":\"<summary>\"}}, where \
+         <summary> uses EXACTLY this Markdown format so the next polecat can parse it: \
+         `## Checkpoint\\n### Completado\\n- <each thing already done, one bullet per line, name the \
+         files/commits>\\n### Pendiente\\n- <each thing still to do, one bullet per line, concrete \
+         next steps>`; \
+         (3) do NOT emit merge-ready and do NOT call `mcp__gt__merge_submit` — the bead is not \
+         finished, and signalling completion would merge an incomplete branch. After updating the \
+         notes, stop. A fresh polecat will be slung for `{bead}`, read the `## Checkpoint` notes, and \
+         resume from the `### Pendiente` list. \
+         If you instead are resuming a bead whose notes already contain a `## Checkpoint` section, \
+         read its `### Completado` and `### Pendiente` lists first and continue from there rather than \
+         restarting the work."
     )
 }
 
@@ -603,6 +647,65 @@ mod lifecycle_tests {
         // Persist durable findings via MCP — never to local files.
         assert!(p.contains("mcp__gt__memory_save"));
         assert!(p.contains("never write memory to local files"));
+    }
+
+    #[test]
+    fn polecat_prompt_carries_checkpoint_protocol() {
+        // gtcore-2467b4: the sling prompt must teach the polecat the context-checkpoint protocol —
+        // commit partial work, persist a parseable continuation summary on the bead notes via
+        // issues_update, and explicitly NOT emit merge-ready while unfinished.
+        let p = polecat_prompt("acme", "hq-9.2", "feat/x");
+
+        // (0) The protocol is triggered by context pressure (~80%).
+        assert!(
+            p.contains("CHECKPOINT PROTOCOL") && p.contains("80%"),
+            "prompt explains the context-checkpoint trigger"
+        );
+        // (1) Commit all partial work.
+        assert!(
+            p.contains("commit ALL partial work"),
+            "prompt instructs committing partial work before handoff"
+        );
+        // (2) Update the bead notes via the issues_update MCP tool, naming the bead.
+        assert!(
+            p.contains("mcp__gt__issues_update") && p.contains("hq-9.2"),
+            "prompt instructs persisting continuation notes via issues_update for this bead"
+        );
+        // (2b) The continuation notes use the fixed, parseable format the next polecat reads.
+        assert!(
+            p.contains("## Checkpoint")
+                && p.contains("### Completado")
+                && p.contains("### Pendiente"),
+            "prompt pins the parseable Checkpoint/Completado/Pendiente notes format"
+        );
+        // (3) Do NOT emit merge-ready while the bead is unfinished.
+        assert!(
+            p.contains("do NOT emit merge-ready")
+                && p.contains("do NOT call `mcp__gt__merge_submit`"),
+            "prompt forbids signalling completion on an unfinished checkpoint"
+        );
+    }
+
+    #[test]
+    fn checkpoint_protocol_format_is_parseable_by_a_continuation() {
+        // The continuation half of gtcore-2467b4: a resuming polecat splits the notes the prior
+        // polecat wrote on `## Checkpoint` / `### Completado` / `### Pendiente`. Prove the literal
+        // headers the prompt dictates partition into exactly those three sections.
+        let text = checkpoint_protocol("hq-9.2");
+        // The prompt must reference each header by its literal Markdown so the parse is deterministic.
+        for header in ["## Checkpoint", "### Completado", "### Pendiente"] {
+            assert!(
+                text.contains(header),
+                "checkpoint protocol names the `{header}` section header"
+            );
+        }
+        // Completado is documented before Pendiente — the order the continuation reads them in.
+        let done = text.find("### Completado").expect("Completado section");
+        let todo = text.find("### Pendiente").expect("Pendiente section");
+        assert!(
+            done < todo,
+            "Completado is described before Pendiente, matching the parse order"
+        );
     }
 
     #[test]

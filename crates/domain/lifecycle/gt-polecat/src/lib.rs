@@ -32,8 +32,8 @@ pub use manifest::{hooks_from_settings, skills_from_worktree};
 pub use pool::{AllocError, ExhaustedScope, PoolAllocator};
 pub use module::SessionsModule;
 pub use lifecycle::{
-    polecat_prompt, spawn_process, spawn_tmux, PolecatLifecycle, SpawnSpec, SpawnTemplate,
-    SpawnedPolecat, GT_WORKSPACE,
+    checkpoint_protocol, polecat_prompt, spawn_process, spawn_tmux, PolecatLifecycle, SpawnSpec,
+    SpawnTemplate, SpawnedPolecat, GT_WORKSPACE,
 };
 pub use restart::{RestartConfig, RestartTracker};
 pub use supervisor::{
