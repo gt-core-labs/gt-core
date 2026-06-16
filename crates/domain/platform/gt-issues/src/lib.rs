@@ -131,7 +131,9 @@ pub use policy::{
     Invariant, PolicyVerdict, Violation, INVARIANTS, MIN_CONTEXT_LEN,
 };
 pub use readiness::is_ready;
-pub use report::{build_report, to_csv, to_xlsx, OperatorReport, ReportRow, ReportSection};
+pub use report::{
+    build_report, to_csv, to_xlsx, OperatorReport, ReportComment, ReportRow, ReportSection,
+};
 pub use report_html::render_digest;
 pub use stats::{MeStatsResponse, WorkspaceStats};
 pub use surface::{AllowAllProvider, AllowAllTree, SurfaceEntry, SurfaceProvider, SurfaceTree};

@@ -23,14 +23,15 @@ use serde::{Deserialize, Serialize};
 use sqlx::PgPool;
 
 use gt_issues::analytics::{summarize, AnalyticsSummary};
-use gt_issues::report::{build_report, OperatorReport};
+use gt_issues::report::{build_report, OperatorReport, ReportComment};
 use gt_issues::report_html::render_digest;
 use gt_store_dolt::{DoltIssues, IssueFilter, WorkspacePools};
 use gt_store_pg::{
-    EmailOutboxRepository, NewEmail, PgEmailOutbox, PgReportSubscriptions,
+    EmailOutboxRepository, NewEmail, PgComments, PgEmailOutbox, PgReportSubscriptions,
     ReportSubscriptionsRepository,
 };
 
+use crate::mcp::WsPools;
 use crate::system::SharedArchiveConfig;
 
 /// When a schedule fires.
@@ -395,6 +396,10 @@ pub struct ReportService {
     /// own workspace DB; `None` ⇒ single-tenant, everything reads `dolt`.
     dolt_workspaces: Option<Arc<WorkspacePools>>,
     pool: PgPool,
+    /// Per-workspace Postgres pools (gtcore-01bcf2) — the source of the bead/epic
+    /// comments the digest folds into the report. `None` ⇒ no PG (comments are
+    /// skipped, the digest renders without them rather than failing).
+    ws_pools: Option<Arc<WsPools>>,
     /// The persisted system config (`report_schedules` is ours).
     pub config: SharedArchiveConfig,
     config_path: Option<PathBuf>,
@@ -405,10 +410,54 @@ impl ReportService {
         dolt: Arc<DoltIssues>,
         dolt_workspaces: Option<Arc<WorkspacePools>>,
         pool: PgPool,
+        ws_pools: Option<Arc<WsPools>>,
         config: SharedArchiveConfig,
         config_path: Option<PathBuf>,
     ) -> Self {
-        Self { dolt, dolt_workspaces, pool, config, config_path }
+        Self { dolt, dolt_workspaces, pool, ws_pools, config, config_path }
+    }
+
+    /// Load the bead/epic comments for the report rows from the schedule's
+    /// per-workspace Postgres schema, mapped to [`ReportComment`] keyed by bead
+    /// id (gtcore-01bcf2). Best-effort: with no PG pools, or on a query error,
+    /// returns an empty map so the digest still sends (comments are additive).
+    async fn comments_for(
+        &self,
+        workspace: &str,
+        rows: &[gt_store_dolt::IssueRow],
+    ) -> std::collections::HashMap<String, Vec<ReportComment>> {
+        let Some(ws_pools) = &self.ws_pools else {
+            return std::collections::HashMap::new();
+        };
+        let ids: Vec<String> = rows.iter().map(|r| r.id.clone()).collect();
+        let pool = match ws_pools.get(Some(workspace)).await {
+            Ok(p) => p,
+            Err(e) => {
+                eprintln!("[report-scheduler] comments pool for `{workspace}`: {e}");
+                return std::collections::HashMap::new();
+            }
+        };
+        let loaded = match PgComments::new(pool).list_for_cards(&ids).await {
+            Ok(m) => m,
+            Err(e) => {
+                eprintln!("[report-scheduler] load comments for `{workspace}`: {e}");
+                return std::collections::HashMap::new();
+            }
+        };
+        loaded
+            .into_iter()
+            .map(|(id, cs)| {
+                let mapped = cs
+                    .into_iter()
+                    .map(|c| ReportComment {
+                        author: c.author,
+                        fecha: c.created_at.format("%Y-%m-%d").to_string(),
+                        body: c.body,
+                    })
+                    .collect();
+                (id, mapped)
+            })
+            .collect()
     }
 
     /// Resolve the Dolt tracker for a schedule's workspace — the per-workspace
@@ -552,7 +601,11 @@ impl ReportService {
             .parent_map(&schedule.rig, &schedule.workspace)
             .await
             .map_err(|e| format!("parent_map: {e}"))?;
-        let report = build_report(&schedule.rig, &schedule.workspace, &rows, &parent_map);
+        // Bead/epic comments live in the per-workspace PG schema (gtcore-01bcf2),
+        // folded into the report so the digest's Notas column carries them.
+        let comments = self.comments_for(&schedule.workspace, &rows).await;
+        let report =
+            build_report(&schedule.rig, &schedule.workspace, &rows, &parent_map, &comments);
         let (today, _) = local_now(schedule.tz_offset_minutes);
         // reopens=0: the audit-derived count lives with the analytics handler;
         // the digest tolerates the conservative zero (defects still counted).
@@ -822,6 +875,7 @@ mod tests {
             dolt.clone(),
             dolt_workspaces,
             PgPool::connect_lazy("postgres://gt@127.0.0.1:1/none").expect("lazy pg pool"),
+            None,
             Arc::new(tokio::sync::RwLock::new(crate::system::ArchiveConfig::default())),
             None,
         );

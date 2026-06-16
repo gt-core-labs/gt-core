@@ -2488,6 +2488,9 @@ async fn build_domain_router(
                 report_dolt.clone(),
                 dolt_pools.clone(),
                 pool.clone(),
+                // Per-workspace PG pools: the source of the bead/epic comments the
+                // digest folds into the report (gtcore-01bcf2).
+                Some(ws_pools.clone()),
                 system_config,
                 system_config_path,
             ));

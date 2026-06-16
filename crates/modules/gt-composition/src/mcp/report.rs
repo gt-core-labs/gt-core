@@ -249,7 +249,15 @@ impl DomainHandler for ReportHandler {
                     })
                     .await?;
                 let parent_map = tracker.parent_map(&rig, &workspace).await?;
-                let report = build_report(&rig, &workspace, &rows, &parent_map);
+                // Comments are wired into the planning-digest only (gtcore-01bcf2);
+                // the xlsx/csv export keeps its pure row→sheet projection.
+                let report = build_report(
+                    &rig,
+                    &workspace,
+                    &rows,
+                    &parent_map,
+                    &std::collections::HashMap::new(),
+                );
 
                 // Serialize + attach as a document of the board's report owner.
                 let docs = PgDocuments::new(self.pools.get(ctx.workspace).await?);

@@ -11,11 +11,42 @@
 //! navy aesthetic as the xlsx report.
 
 use crate::analytics::AnalyticsSummary;
-use crate::report::OperatorReport;
+use crate::report::{OperatorReport, ReportComment};
 
 /// Minimal HTML escaping for text nodes/attributes.
 fn esc(s: &str) -> String {
     s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;").replace('"', "&quot;")
+}
+
+/// Render a bead/epic's comments as an inline block (gtcore-01bcf2): one line
+/// per comment, `[fecha autor] cuerpo`, all escaped. Empty input → empty string
+/// (no markup, so a comment-less cell stays unchanged). `compact=true` drops the
+/// top divider for the section-header variant.
+fn render_comments(comments: &[ReportComment], compact: bool) -> String {
+    if comments.is_empty() {
+        return String::new();
+    }
+    let items: String = comments
+        .iter()
+        .map(|c| {
+            format!(
+                "<div style=\"font-size:11px;color:#555;margin-top:2px;\">\
+                 <span style=\"color:{NAVY};font-weight:bold;\">[{fecha} {autor}]</span> {body}</div>",
+                fecha = esc(&c.fecha),
+                autor = esc(&c.author),
+                body = esc(&c.body),
+            )
+        })
+        .collect();
+    let wrap = if compact {
+        "margin-top:2px;"
+    } else {
+        "margin-top:4px;border-top:1px dashed #c9c9c9;padding-top:3px;"
+    };
+    format!(
+        "<div style=\"{wrap}\"><div style=\"font-size:10px;color:#888;\
+         text-transform:uppercase;letter-spacing:.5px;\">Comentarios</div>{items}</div>"
+    )
 }
 
 fn fmt_horas(h: Option<f64>) -> String {
@@ -115,6 +146,14 @@ pub fn render_digest(report: &OperatorReport, summary: &AnalyticsSummary, fecha:
             title = esc(&section.module_title),
             horas = section.horas,
         ));
+        // Epic-level comments: the epic is a section header, not a row, so its
+        // comments render in a full-width band under the title (gtcore-01bcf2).
+        if !section.comentarios.is_empty() {
+            html.push_str(&format!(
+                "<tr><td colspan=\"9\" style=\"{TD}background:#ffffff;\">{}</td></tr>",
+                render_comments(&section.comentarios, true),
+            ));
+        }
         html.push_str(&format!(
             "<tr>{}</tr>",
             ["Tarea", "Proceso", "Nivel", "Horas Est.", "Estado", "Responsable",
@@ -135,7 +174,7 @@ pub fn render_digest(report: &OperatorReport, summary: &AnalyticsSummary, fecha:
                  <td style=\"{TD}{bg}\">{resp}</td>\
                  <td style=\"{TD}{bg}white-space:nowrap;\">{ini}</td>\
                  <td style=\"{TD}{bg}white-space:nowrap;\">{fin}</td>\
-                 <td style=\"{TD}{bg}\">{notas}</td></tr>",
+                 <td style=\"{TD}{bg}\">{notas}{comentarios}</td></tr>",
                 tarea = esc(&row.tarea),
                 id = esc(&row.id),
                 proceso = esc(&row.proceso),
@@ -147,6 +186,7 @@ pub fn render_digest(report: &OperatorReport, summary: &AnalyticsSummary, fecha:
                 ini = esc(&row.fecha_inicio),
                 fin = esc(&row.fecha_fin),
                 notas = esc(&row.notas),
+                comentarios = render_comments(&row.comentarios, false),
             ));
         }
         html.push_str("</table>");
@@ -197,7 +237,26 @@ mod tests {
         let mut parent_map = std::collections::HashMap::new();
         parent_map.insert("hq-1".to_string(), "hq-e1".to_string());
         parent_map.insert("hq-2".to_string(), "hq-e1".to_string());
-        let report = build_report("hq", "default", &rows, &parent_map);
+        // A comment on a bead (renders in its Notas cell) and one on the epic
+        // (renders in the section header) — gtcore-01bcf2.
+        let mut comments = std::collections::HashMap::new();
+        comments.insert(
+            "hq-1".to_string(),
+            vec![crate::report::ReportComment {
+                author: "ana".into(),
+                fecha: "2026-06-10".into(),
+                body: "revisar <edge> case".into(),
+            }],
+        );
+        comments.insert(
+            "hq-e1".to_string(),
+            vec![crate::report::ReportComment {
+                author: "leo".into(),
+                fecha: "2026-06-11".into(),
+                body: "modulo bloqueado".into(),
+            }],
+        );
+        let report = build_report("hq", "default", &rows, &parent_map, &comments);
         let summary = summarize("hq", "default", &rows, 0, "2026-06-12", 7, 30, &parent_map);
         let html = render_digest(&report, &summary, "2026-06-12");
 
@@ -219,5 +278,11 @@ mod tests {
         assert!(html.contains(&format!("{:.1}", report.total_horas)));
         // Escaping: the raw note must not inject markup.
         assert!(html.contains("nota &lt;x&gt;") && !html.contains("nota <x>"));
+        // Comments render with [fecha autor] and stay escaped (gtcore-01bcf2).
+        assert!(html.contains("Comentarios"), "missing comments block");
+        assert!(html.contains("[2026-06-10 ana]"), "missing bead comment meta");
+        assert!(html.contains("revisar &lt;edge&gt; case"), "bead comment not escaped/rendered");
+        assert!(html.contains("[2026-06-11 leo]"), "missing epic comment meta");
+        assert!(html.contains("modulo bloqueado"), "missing epic comment body");
     }
 }

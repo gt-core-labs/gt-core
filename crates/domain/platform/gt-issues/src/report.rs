@@ -13,10 +13,27 @@
 //! (document attach + optional outbox email) is the composition handler's job.
 
 use std::collections::BTreeMap;
+use std::collections::HashMap;
 
 use serde::Serialize;
 
 use gt_store_dolt::IssueRow;
+
+/// One comment on a bead/epic, projected for the report (gtcore-01bcf2).
+///
+/// The comments themselves live in a SEPARATE store (Postgres `comments`, keyed
+/// by bead id); the composition layer loads them and maps each to this plain
+/// struct so this domain crate stays free of the PG/clock dependency. `fecha` is
+/// the pre-formatted `YYYY-MM-DD` creation date.
+#[derive(Debug, Clone, Serialize)]
+pub struct ReportComment {
+    /// Authoring actor (server-injected at creation).
+    pub author: String,
+    /// Creation date, pre-formatted `YYYY-MM-DD`.
+    pub fecha: String,
+    /// The comment body (rendered/escaped by the consumer).
+    pub body: String,
+}
 
 /// One task row of the report, mockup column order.
 #[derive(Debug, Clone, Serialize)]
@@ -41,6 +58,9 @@ pub struct ReportRow {
     pub fecha_fin: String,
     /// Notas — the card's free-form notes.
     pub notas: String,
+    /// Comentarios — the bead's threaded comments (gtcore-01bcf2). Empty when
+    /// the board carries none; rendered inside the Notas column by the digest.
+    pub comentarios: Vec<ReportComment>,
 }
 
 /// One module section: the epic the cards hang on (ADR D5).
@@ -54,6 +74,10 @@ pub struct ReportSection {
     pub rows: Vec<ReportRow>,
     /// The section's Horas Est. subtotal.
     pub horas: f64,
+    /// Comentarios on the module epic itself (gtcore-01bcf2). The epic is a
+    /// section header, not a row, so its comments render in the section header.
+    /// Empty for the "Sin módulo" tail (no backing epic).
+    pub comentarios: Vec<ReportComment>,
 }
 
 /// The whole operator report.
@@ -92,11 +116,16 @@ fn nivel_label(priority: i32) -> &'static str {
 /// `board.list` projects. Epics title the module sections (D5) and are not
 /// task rows; everything else groups under its parent epic from `parent_map`
 /// (`issue_relations` `child_of` rows, keyed by child id).
+///
+/// `comments` is keyed by bead/epic id (gtcore-01bcf2): a task row's comments
+/// attach to its [`ReportRow`], an epic's to the [`ReportSection`] it titles.
+/// Pass an empty map when comments are not loaded (xlsx/csv paths).
 pub fn build_report(
     rig: &str,
     workspace: &str,
     rows: &[IssueRow],
-    parent_map: &std::collections::HashMap<String, String>,
+    parent_map: &HashMap<String, String>,
+    comments: &HashMap<String, Vec<ReportComment>>,
 ) -> OperatorReport {
     // Module titles: the epics present in the row set.
     let mut titles: BTreeMap<&str, &str> = BTreeMap::new();
@@ -124,6 +153,7 @@ pub fn build_report(
             fecha_inicio: row.start_date.clone().unwrap_or_default(),
             fecha_fin: row.due_date.clone().unwrap_or_default(),
             notas: row.notes.clone().unwrap_or_default(),
+            comentarios: comments.get(&row.id).cloned().unwrap_or_default(),
         });
     }
 
@@ -131,6 +161,8 @@ pub fn build_report(
     let mut tail: Option<ReportSection> = None;
     for (module_id, rows) in buckets {
         let horas: f64 = rows.iter().filter_map(|r| r.horas).sum();
+        // Epic-level comments hang on the module epic id (empty for "Sin módulo").
+        let comentarios = comments.get(&module_id).cloned().unwrap_or_default();
         let section = ReportSection {
             module_title: if module_id.is_empty() {
                 "Sin módulo".to_string()
@@ -145,6 +177,7 @@ pub fn build_report(
             module_id,
             rows,
             horas,
+            comentarios,
         };
         if section.module_id.is_empty() {
             tail = Some(section);
@@ -385,7 +418,7 @@ mod tests {
         let mut parent_map = HashMap::new();
         parent_map.insert("hq-1".to_string(), "hq-mod-a".to_string());
         parent_map.insert("hq-2".to_string(), "hq-mod-a".to_string());
-        build_report("hq", "default", &rows, &parent_map)
+        build_report("hq", "default", &rows, &parent_map, &HashMap::new())
     }
 
     #[test]
