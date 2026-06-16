@@ -11,8 +11,6 @@
 //! own; the binary supplies the live adapter. `validate_only` short-circuits
 //! before any state change, exactly as the `*.validate` tools do.
 
-use std::time::{SystemTime, UNIX_EPOCH};
-
 use gt_store_dolt::{AppError, ClaimOutcome, DoltIssues};
 
 use crate::commands::{
@@ -119,7 +117,8 @@ pub async fn run_update_issue(
 /// - **Pass** (context present) → record it as a note *before* the flip, the same
 ///   breadcrumb-before-write order `run_close_issue` uses for the sha.
 /// - **Deferred** (no context, quota confirmed blocked) → flip, then stamp a
-///   `context-deferred: <reason> @ <ts>` debt note.
+///   `context-deferred: <reason>` debt note (no timestamp — the row's
+///   `updated_at`/Dolt commit already date it).
 ///
 /// `open`/`closed` moves carry no context contract and pass straight through.
 pub async fn run_transition_issue(
@@ -149,12 +148,11 @@ pub async fn run_transition_issue(
             }
         }
         PolicyVerdict::Deferred(reason) => {
-            let ts = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .map(|d| d.as_secs())
-                .unwrap_or(0);
+            // No timestamp in the note: `append_notes` stamps `updated_at = NOW()`
+            // and each append is its own Dolt commit, so an inline `@ {ts}` only
+            // adds redundant noise to the planning-digest Notas column.
             issues
-                .append_notes(&args.id, &format!("context-deferred: {reason} @ {ts}"))
+                .append_notes(&args.id, &format!("context-deferred: {reason}"))
                 .await?;
         }
     }
