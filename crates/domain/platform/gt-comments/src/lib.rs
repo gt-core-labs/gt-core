@@ -73,6 +73,13 @@ pub struct CreateComment {
     /// Reply threading: the parent comment's id. Omit for a top-level comment.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parent_id: Option<String>,
+    /// Board workspace override (gtcore-… comments-workspace-arg): when set,
+    /// targets that workspace's schema instead of the caller's session scope —
+    /// mirrors the `workspace` wire field the `issues.*` tools carry, so a
+    /// default-scoped caller can comment on another workspace's bead. Absent ⇒
+    /// the caller's session workspace.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace: Option<String>,
 }
 
 impl CreateComment {
@@ -94,6 +101,10 @@ pub struct ListComments {
     pub target_kind: String,
     /// The bead id (`card`) or document id (`doc`).
     pub target_id: String,
+    /// Board workspace override (mirrors `issues.*`): the workspace whose
+    /// comment schema to read. Absent ⇒ the caller's session workspace.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace: Option<String>,
 }
 
 impl ListComments {
@@ -110,6 +121,11 @@ pub struct UpdateComment {
     pub id: String,
     /// The new body. Newly-added `@handle` tokens notify on edit too.
     pub body: String,
+    /// Board workspace override (mirrors `issues.*`): the workspace whose
+    /// comment schema the comment lives in. Absent ⇒ the caller's session
+    /// workspace.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace: Option<String>,
 }
 
 impl UpdateComment {
@@ -127,6 +143,11 @@ impl UpdateComment {
 pub struct DeleteComment {
     /// The comment id.
     pub id: String,
+    /// Board workspace override (mirrors `issues.*`): the workspace whose
+    /// comment schema the comment lives in. Absent ⇒ the caller's session
+    /// workspace.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace: Option<String>,
 }
 
 impl DeleteComment {
@@ -277,6 +298,7 @@ mod tests {
             target_id: "hq-1".into(),
             body: "hola".into(),
             parent_id: None,
+            workspace: None,
         };
         assert!(c.validate().is_ok());
         c.target_kind = "doc".into();
@@ -295,11 +317,11 @@ mod tests {
 
     #[test]
     fn update_and_delete_require_id() {
-        assert!(UpdateComment { id: "c1".into(), body: "x".into() }.validate().is_ok());
-        assert!(UpdateComment { id: "".into(), body: "x".into() }.validate().is_err());
-        assert!(UpdateComment { id: "c1".into(), body: " ".into() }.validate().is_err());
-        assert!(DeleteComment { id: "c1".into() }.validate().is_ok());
-        assert!(DeleteComment { id: "".into() }.validate().is_err());
+        assert!(UpdateComment { id: "c1".into(), body: "x".into(), workspace: None }.validate().is_ok());
+        assert!(UpdateComment { id: "".into(), body: "x".into(), workspace: None }.validate().is_err());
+        assert!(UpdateComment { id: "c1".into(), body: " ".into(), workspace: None }.validate().is_err());
+        assert!(DeleteComment { id: "c1".into(), workspace: None }.validate().is_ok());
+        assert!(DeleteComment { id: "".into(), workspace: None }.validate().is_err());
     }
 
     #[test]

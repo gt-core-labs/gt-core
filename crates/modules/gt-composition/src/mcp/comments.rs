@@ -316,9 +316,14 @@ impl DomainHandler for CommentsHandler {
             "comments.create.execute" => {
                 let cmd = parse::<CreateComment>(ctx.args)?;
                 cmd.validate().map_err(val)?;
-                self.check_target(ctx.workspace, &cmd.target_kind, &cmd.target_id)
+                // Optional `workspace` arg overrides the session scope (mirrors
+                // issues.*), so a default-scoped caller can target another
+                // workspace's bead. Held in a local to outlive the moved `cmd`.
+                let ws_override = cmd.workspace.clone();
+                let ws = ws_override.as_deref().or(ctx.workspace);
+                self.check_target(ws, &cmd.target_kind, &cmd.target_id)
                     .await?;
-                let repo = self.repo(ctx.workspace).await?;
+                let repo = self.repo(ws).await?;
                 // A reply must thread under a live comment of the SAME target.
                 if let Some(parent_id) = &cmd.parent_id {
                     let parent = repo.get(parent_id).await.map_err(comment_err)?;
@@ -340,8 +345,8 @@ impl DomainHandler for CommentsHandler {
                     })
                     .await
                     .map_err(comment_err)?;
-                self.emit_comment_event(ctx.workspace, "created", &comment, ctx.actor, true);
-                self.dispatch_mentions(ctx.workspace, &repo, ctx.actor, &comment)
+                self.emit_comment_event(ws, "created", &comment, ctx.actor, true);
+                self.dispatch_mentions(ws, &repo, ctx.actor, &comment)
                     .await;
                 Ok(comment_json(&comment))
             }
@@ -352,7 +357,8 @@ impl DomainHandler for CommentsHandler {
             "comments.list.execute" => {
                 let cmd = parse::<ListComments>(ctx.args)?;
                 cmd.validate().map_err(val)?;
-                let repo = self.repo(ctx.workspace).await?;
+                let ws = cmd.workspace.as_deref().or(ctx.workspace);
+                let repo = self.repo(ws).await?;
                 let comments = repo
                     .list_for_target(&cmd.target_kind, &cmd.target_id)
                     .await
@@ -370,7 +376,8 @@ impl DomainHandler for CommentsHandler {
             "comments.update.execute" => {
                 let cmd = parse::<UpdateComment>(ctx.args)?;
                 cmd.validate().map_err(val)?;
-                let repo = self.repo(ctx.workspace).await?;
+                let ws = cmd.workspace.as_deref().or(ctx.workspace);
+                let repo = self.repo(ws).await?;
                 let existing = repo.get(&cmd.id).await.map_err(comment_err)?;
                 Self::check_author(ctx.actor, &existing)?;
                 let updated = repo
@@ -379,8 +386,8 @@ impl DomainHandler for CommentsHandler {
                     .map_err(comment_err)?;
                 // Handles newly added by the edit notify too; resolution dedup
                 // is acceptable noise (best-effort, mirrors live chat tools).
-                self.emit_comment_event(ctx.workspace, "updated", &updated, ctx.actor, true);
-                self.dispatch_mentions(ctx.workspace, &repo, ctx.actor, &updated)
+                self.emit_comment_event(ws, "updated", &updated, ctx.actor, true);
+                self.dispatch_mentions(ws, &repo, ctx.actor, &updated)
                     .await;
                 Ok(comment_json(&updated))
             }
@@ -391,11 +398,12 @@ impl DomainHandler for CommentsHandler {
             "comments.delete.execute" => {
                 let cmd = parse::<DeleteComment>(ctx.args)?;
                 cmd.validate().map_err(val)?;
-                let repo = self.repo(ctx.workspace).await?;
+                let ws = cmd.workspace.as_deref().or(ctx.workspace);
+                let repo = self.repo(ws).await?;
                 let existing = repo.get(&cmd.id).await.map_err(comment_err)?;
                 Self::check_author(ctx.actor, &existing)?;
                 repo.soft_delete(&cmd.id).await.map_err(comment_err)?;
-                self.emit_comment_event(ctx.workspace, "deleted", &existing, ctx.actor, false);
+                self.emit_comment_event(ws, "deleted", &existing, ctx.actor, false);
                 Ok(json!({ "ok": true, "id": cmd.id, "removed": true }))
             }
             other => Err(AppError::Validation(format!("unknown tool `{other}`"))),
