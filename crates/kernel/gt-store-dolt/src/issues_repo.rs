@@ -607,6 +607,27 @@ fn split_database(url: &str) -> (String, Option<String>) {
     }
 }
 
+/// SQL `SET` fragment (trailing comma included) that stamps the lifecycle dates
+/// for a status `target`, so every status-change path stamps them the same way:
+///
+/// - `Working`: fill `start_date` ("Fecha Inicio") with today if still unset —
+///   `COALESCE` respects an already-populated date.
+/// - `Closed`: stamp `closed_at` AND fill `due_date` ("Fecha Fin") with today if
+///   unset (the actual completion date), again respecting a populated plan date.
+/// - `Open`: clear `closed_at` (re-open), leaving the planning dates alone.
+///
+/// `DATE(NOW())` (not `CURDATE()`) keeps the date in lockstep with the `NOW()`
+/// the same UPDATE uses for `closed_at`/`updated_at`.
+fn lifecycle_date_set(target: IssueStatus) -> &'static str {
+    match target {
+        IssueStatus::Working => "start_date = COALESCE(start_date, DATE(NOW())),",
+        IssueStatus::Closed => {
+            "closed_at = NOW(), due_date = COALESCE(due_date, DATE(NOW())),"
+        }
+        IssueStatus::Open => "closed_at = NULL,",
+    }
+}
+
 impl DoltIssues {
     pub fn new(pool: Pool) -> Self {
         Self { pool }
@@ -1422,6 +1443,7 @@ impl DoltIssues {
                  SET status = 'working',
                      owner = :owner,
                      assignee = :owner,
+                     start_date = COALESCE(start_date, DATE(NOW())),
                      updated_at = NOW(),
                      version = version + 1
                  WHERE id = :id
@@ -1661,11 +1683,7 @@ impl DoltIssues {
             params_vec.push((format!("src_{i}"), mysql_async::Value::from(s.to_string())));
         }
 
-        let closed_at_set = match target {
-            IssueStatus::Closed => "closed_at = NOW(),",
-            IssueStatus::Open => "closed_at = NULL,",
-            IssueStatus::Working => "",
-        };
+        let date_set = lifecycle_date_set(target);
 
         let where_status = if placeholders.is_empty() {
             // No legal source -> impossible to satisfy. Skip the UPDATE.
@@ -1677,7 +1695,7 @@ impl DoltIssues {
         let sql = format!(
             "UPDATE issues
              SET status = :target,
-                 {closed_at_set}
+                 {date_set}
                  updated_at = NOW(),
                  version = version + 1
              WHERE id = :id AND {where_status}"
@@ -1763,17 +1781,13 @@ impl DoltIssues {
                     "target".to_string(),
                     mysql_async::Value::from(target.as_str().to_string()),
                 ));
-                let closed_at_set = match target {
-                    IssueStatus::Closed => "closed_at = NOW(),",
-                    IssueStatus::Open => "closed_at = NULL,",
-                    IssueStatus::Working => "",
-                };
+                let date_set = lifecycle_date_set(target);
                 let guard = if placeholders.is_empty() {
                     "AND 1 = 0".to_string()
                 } else {
                     format!("AND status IN ({})", placeholders.join(", "))
                 };
-                (format!("status = :target, {closed_at_set}"), guard)
+                (format!("status = :target, {date_set}"), guard)
             }
             None => (String::new(), String::new()),
         };
@@ -1900,6 +1914,10 @@ impl DoltIssues {
     /// close — a row already `closed` rejects as `InvalidTransition` rather
     /// than silently bumping the timestamp.
     ///
+    /// Also fills `due_date` ("Fecha Fin") with the close date when it was unset,
+    /// so the planning report carries the real completion date; a populated
+    /// (planned) `due_date` is respected via `COALESCE`.
+    ///
     /// Differs from `transition(id, IssueStatus::Closed)`: that path leaves
     /// `closed_by_session` untouched. The dedicated `close` tool exists so the
     /// attribution column gets populated atomically with the lifecycle move.
@@ -1911,6 +1929,7 @@ impl DoltIssues {
                 "UPDATE issues
                  SET status = 'closed',
                      closed_at = NOW(),
+                     due_date = COALESCE(due_date, DATE(NOW())),
                      closed_by_session = :session,
                      updated_at = NOW(),
                      version = version + 1
