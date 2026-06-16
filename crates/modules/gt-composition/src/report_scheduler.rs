@@ -25,7 +25,7 @@ use sqlx::PgPool;
 use gt_issues::analytics::{summarize, AnalyticsSummary};
 use gt_issues::report::{build_report, OperatorReport};
 use gt_issues::report_html::render_digest;
-use gt_store_dolt::{DoltIssues, IssueFilter};
+use gt_store_dolt::{DoltIssues, IssueFilter, WorkspacePools};
 use gt_store_pg::{
     EmailOutboxRepository, NewEmail, PgEmailOutbox, PgReportSubscriptions,
     ReportSubscriptionsRepository,
@@ -387,7 +387,13 @@ pub fn is_due(s: &ReportSchedule, local_date: &str, minutes_now: i64) -> bool {
 /// The digest pipeline + subscriber store, shared by the daemon, the MCP
 /// `report.*` tools and the System REST surface.
 pub struct ReportService {
+    /// Shared single-tenant tracker AND the multi-tenant fallback (the row
+    /// source for a schedule whose workspace has no dedicated pool).
     dolt: Arc<DoltIssues>,
+    /// Per-workspace Dolt pools for multi-tenant routing (mirrors
+    /// `ReportHandler`'s `dolt_workspaces`). `Some` ⇒ each schedule reads its
+    /// own workspace DB; `None` ⇒ single-tenant, everything reads `dolt`.
+    dolt_workspaces: Option<Arc<WorkspacePools>>,
     pool: PgPool,
     /// The persisted system config (`report_schedules` is ours).
     pub config: SharedArchiveConfig,
@@ -397,11 +403,34 @@ pub struct ReportService {
 impl ReportService {
     pub fn new(
         dolt: Arc<DoltIssues>,
+        dolt_workspaces: Option<Arc<WorkspacePools>>,
         pool: PgPool,
         config: SharedArchiveConfig,
         config_path: Option<PathBuf>,
     ) -> Self {
-        Self { dolt, pool, config, config_path }
+        Self { dolt, dolt_workspaces, pool, config, config_path }
+    }
+
+    /// Resolve the Dolt tracker for a schedule's workspace — the per-workspace
+    /// pool when multi-tenant routing is on, else the shared `dolt`. This makes
+    /// the digest read the SAME database `report.generate` routes to
+    /// (gtcore-252885: scheduled/test digests for a non-default workspace were
+    /// reading the shared default DB → empty).
+    ///
+    /// Uses the lazy [`WorkspacePools::pool_for`] (not `ensured_pool`): the
+    /// digest is a READ over an existing board, whose schema was already
+    /// provisioned by the `report.generate`/`board.list` path — so there is no
+    /// schema to self-heal here, and the lazy handle keeps this offline-safe.
+    fn tracker(&self, workspace: &str) -> Result<Arc<DoltIssues>, String> {
+        match &self.dolt_workspaces {
+            Some(pools) => {
+                let pool = pools
+                    .pool_for(workspace)
+                    .map_err(|e| format!("dolt pool for `{workspace}`: {e}"))?;
+                Ok(Arc::new(DoltIssues::new(pool)))
+            }
+            None => Ok(self.dolt.clone()),
+        }
     }
 
     /// The global subscribers store over the shared public pool.
@@ -506,9 +535,10 @@ impl ReportService {
             return Ok(0);
         }
 
-        // The same rows board.list / report.generate read (full=true for Notas).
-        let rows = self
-            .dolt
+        // The same rows board.list / report.generate read (full=true for Notas),
+        // from the SAME per-workspace Dolt DB report.generate routes to.
+        let tracker = self.tracker(&schedule.workspace)?;
+        let rows = tracker
             .list(&IssueFilter {
                 rig: Some(schedule.rig.clone()),
                 workspace: Some(schedule.workspace.clone()),
@@ -518,8 +548,7 @@ impl ReportService {
             })
             .await
             .map_err(|e| format!("tracker rows: {e}"))?;
-        let parent_map = self
-            .dolt
+        let parent_map = tracker
             .parent_map(&schedule.rig, &schedule.workspace)
             .await
             .map_err(|e| format!("parent_map: {e}"))?;
@@ -779,5 +808,45 @@ mod tests {
         assert!(render_for("planning-digest").is_some());
         assert!(render_for("nope").is_none());
         assert_eq!(kinds(), vec!["planning-digest"]);
+    }
+
+    // --- per-workspace tracker routing (gtcore-252885) -----------------------
+    // Both pure: mysql_async + sqlx pools are lazy, so no socket opens — the
+    // same "lazy pool handle" seam multitenant_rbac.rs exercises.
+
+    fn service(dolt_workspaces: Option<Arc<WorkspacePools>>) -> (ReportService, Arc<DoltIssues>) {
+        let dolt = Arc::new(
+            DoltIssues::connect("mysql://root@127.0.0.1:3307/hq").expect("lazy dolt pool"),
+        );
+        let svc = ReportService::new(
+            dolt.clone(),
+            dolt_workspaces,
+            PgPool::connect_lazy("postgres://gt@127.0.0.1:1/none").expect("lazy pg pool"),
+            Arc::new(tokio::sync::RwLock::new(crate::system::ArchiveConfig::default())),
+            None,
+        );
+        (svc, dolt)
+    }
+
+    // `#[tokio::test]`: sqlx's `connect_lazy` spawns the pool keeper, so it
+    // needs a runtime in scope even though no socket is opened.
+    #[tokio::test]
+    async fn tracker_without_pools_reuses_the_shared_dolt() {
+        let (svc, dolt) = service(None);
+        let got = svc.tracker("cotrafa").expect("tracker");
+        // Single-tenant: every workspace reads the one shared tracker.
+        assert!(Arc::ptr_eq(&got, &dolt));
+    }
+
+    #[tokio::test]
+    async fn tracker_with_pools_routes_per_workspace_not_the_shared_default() {
+        let pools = Arc::new(
+            WorkspacePools::from_url("mysql://root@127.0.0.1:3307/").expect("base url"),
+        );
+        let (svc, dolt) = service(Some(pools));
+        // The gtcore-252885 bug: a non-default workspace fell through to the
+        // shared default DB → empty digest. It must now route to its own pool.
+        let got = svc.tracker("cotrafa").expect("tracker");
+        assert!(!Arc::ptr_eq(&got, &dolt));
     }
 }

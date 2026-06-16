@@ -2486,6 +2486,7 @@ async fn build_domain_router(
             // schedule edits land without a restart.
             let service = Arc::new(gt_composition::report_scheduler::ReportService::new(
                 report_dolt.clone(),
+                dolt_pools.clone(),
                 pool.clone(),
                 system_config,
                 system_config_path,
