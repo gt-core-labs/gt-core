@@ -68,12 +68,20 @@ pub const COSTS_REPORT_CMD: &str = concat!(
     r#"start=$(cat "$off" 2>/dev/null || echo 0); "#,
     r#"end=$(wc -l < "$tp" 2>/dev/null || echo 0); "#,
     r#"if [ "$end" -gt "$start" ]; then "#,
-    r#"s=$(tail -n +$((start+1)) "$tp" | jq -sc '[.[]|select(.type=="assistant" and .message.usage!=null)] as $a | if ($a|length)==0 then empty else {model:($a[-1].message.model//"unknown"),input:([$a[].message.usage.input_tokens//0]|add),output:([$a[].message.usage.output_tokens//0]|add),cache_read:([$a[].message.usage.cache_read_input_tokens//0]|add),cache_creation:([$a[].message.usage.cache_creation_input_tokens//0]|add)} end' 2>/dev/null); "#,
+    // Attribute by model: group the turn's assistant messages by `message.model` and emit ONE
+    // sample per model present (compact, one object per line). Summing every message but labelling
+    // the lot with `$a[-1]`'s model mis-attributes a turn that ends on a sub-agent/compaction
+    // message. The daemon's `quota.sample` collapses the raw id to its family, so the chart groups
+    // cleanly. Empty turn -> `group_by([])[]` yields nothing -> no sample, as before.
+    r#"s=$(tail -n +$((start+1)) "$tp" | jq -sc '[.[]|select(.type=="assistant" and .message.usage!=null)]|group_by(.message.model)[]|{model:(.[0].message.model//"unknown"),input:([.[].message.usage.input_tokens//0]|add),output:([.[].message.usage.output_tokens//0]|add),cache_read:([.[].message.usage.cache_read_input_tokens//0]|add),cache_creation:([.[].message.usage.cache_creation_input_tokens//0]|add)}' 2>/dev/null); "#,
     r#"if [ -n "$s" ]; then "#,
     r#"d="$GT_CHANNEL_ROOT/quota-feed"; mkdir -p "$d"; "#,
+    r#"printf '%s\n' "$s" | while IFS= read -r sm; do "#,
+    r#"[ -n "$sm" ] || continue; "#,
     r#"id=$(cat /proc/sys/kernel/random/uuid 2>/dev/null || date +%s%N); "#,
-    r#"printf '{"account":"%s","session":"%s","sample":%s}' "$GT_HOOK_ACCOUNT" "${sid:-$GT_HOOK_ACCOUNT}" "$s" "#,
-    r#"> "$d/.$id.tmp" && mv "$d/.$id.tmp" "$d/$id.event"; fi; "#,
+    r#"printf '{"account":"%s","session":"%s","sample":%s}' "$GT_HOOK_ACCOUNT" "${sid:-$GT_HOOK_ACCOUNT}" "$sm" "#,
+    r#"> "$d/.$id.tmp" && mv "$d/.$id.tmp" "$d/$id.event"; "#,
+    r#"done; fi; "#,
     r#"printf '%s' "$end" > "$off"; fi; fi; fi"#,
 );
 

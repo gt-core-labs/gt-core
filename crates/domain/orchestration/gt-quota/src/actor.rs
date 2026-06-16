@@ -13,7 +13,7 @@ use tokio::sync::{mpsc, oneshot};
 use gt_events::{AppError, Command, Envelope};
 
 use crate::budget::{BudgetLedger, SessionBudget};
-use crate::commands::QuotaCommand;
+use crate::commands::{normalize_model, QuotaCommand};
 use crate::cost::ModelWeights;
 use crate::events::QuotaEvent;
 use crate::expectations::predict;
@@ -566,6 +566,13 @@ pub fn spawn_hydrated(
                     cache_creation,
                     now_secs,
                 } => {
+                    // Collapse the model id to its canonical family at the single point the live
+                    // quota-feed folds samples (the hook feeds full ids like `claude-opus-4-8`,
+                    // synthetic/MCP samples feed short aliases). Every downstream consumer — cost
+                    // weights, the per-session budget ledger, and the emitted TokensSampled event
+                    // the chart groups by — then sees one bucket per model. Mirrors the same
+                    // normalization on the MCP `SampleTokens` command path.
+                    let model = normalize_model(&model);
                     registry.apply_sample(
                         &account,
                         &session,
@@ -1113,6 +1120,22 @@ mod tests {
         assert_eq!(b.total_tokens(), 210);
         assert!(b.exceeded);
         assert!((b.elapsed_minutes() - 5.0).abs() < 1e-9);
+    }
+
+    #[tokio::test]
+    async fn sample_normalizes_model_in_emitted_event() {
+        // gtcore-1f5112: the live quota-feed folds the hook's full model ids through this actor.
+        // A turn that is 100% opus (`claude-opus-4-8`) must emit `model=opus` so the burn chart
+        // groups it into a single bucket instead of splitting it from synthetic `opus` samples.
+        let (tx, mut rx) = mpsc::channel::<Envelope<QuotaEvent>>(8);
+        let q = spawn(tx, std::collections::HashMap::new());
+
+        q.sample("acc-1", "sess-a", "claude-opus-4-8", 100, 50, 0, 0, 60).await;
+        let env = rx.recv().await.expect("sample emitted");
+        match env.payload {
+            QuotaEvent::TokensSampled { model, .. } => assert_eq!(model, "opus"),
+            other => panic!("expected TokensSampled, got {other:?}"),
+        }
     }
 
     #[tokio::test]
