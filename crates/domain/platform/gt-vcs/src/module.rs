@@ -53,19 +53,22 @@ impl VcsModule {
 #[derive(Clone)]
 pub struct VcsHttpModule {
     http: crate::http::ConnectionApiState,
-    /// The optional GitHub App install-flow state (hq-vcs-connections.2). When present, the
-    /// install/callback/repos routes nest under `github/` (so they sit at
-    /// `/api/v1/connection/github/*`) sharing the `connection.*` scopes. `None` when no platform
-    /// GitHub App is configured (the connection CRUD + PAT fallback still work).
+    /// The GitHub App install-flow state (hq-vcs-connections.2). When present, the
+    /// install/callback/repos/config routes nest under `github/` (so they sit at
+    /// `/api/v1/connection/github/*`) sharing the `connection.*` scopes. Since hq-61ea43 the
+    /// composition root ALWAYS attaches it with a DB-backed [`GithubAppSource`](crate::GithubAppSource):
+    /// the App identity lives in `public.github_app_config`, resolved per request, so the routes are
+    /// mounted regardless of whether a row exists yet (an unconfigured App answers `503`, never `404`).
     github: Option<crate::github_http::GithubApiState>,
 }
 
 #[cfg(feature = "axum")]
 impl VcsHttpModule {
     /// Attach the GitHub App install-flow surface (hq-vcs-connections.2). The
-    /// install/callback/repos routes mount under `/api/v1/connection/github/*` behind the SAME
-    /// `connection.*` scope guard. Call it only when [`crate::github::GithubAppConfig::from_env`]
-    /// yielded a configured App.
+    /// install/callback/repos/config routes mount under `/api/v1/connection/github/*` behind the SAME
+    /// `connection.*` scope guard. The supplied [`GithubApiState`](crate::github_http::GithubApiState)
+    /// carries a [`GithubAppSource`](crate::GithubAppSource) that resolves the App from the DB per
+    /// request (hq-61ea43), so this is attached unconditionally — no env var, no `from_env` gate.
     pub fn with_github(mut self, github: crate::github_http::GithubApiState) -> Self {
         self.github = Some(github);
         self
