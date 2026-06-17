@@ -118,7 +118,7 @@ pub fn resolve_for_sling_with(
         };
     };
 
-    let health = classify_credentials(Some(&active_raw), now_ms, REFRESH_SKEW_MS);
+    let health = classify_credentials(Some(active_raw.as_str()), now_ms, REFRESH_SKEW_MS);
     if health.is_slingable() {
         return CredOutcome::Resolved {
             resolved: ResolvedCredentials {
