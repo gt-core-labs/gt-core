@@ -228,30 +228,36 @@ impl QuotaRotationPlugin {
             .rotated(at_risk.to_string(), target.clone(), now_secs())
             .await;
         eprintln!("[quota-rotation] active claude account rotated {at_risk} → {target}");
-        // Hot credential swap: copy the NEW account's .credentials.json into every
-        // in-flight polecat's CLAUDE_CONFIG_DIR so claude CLI picks up the fresh token
-        // without restarting. The polecat keeps running — only the underlying account changes.
-        if let Some(sup) = &self.supervisor {
-            if let Ok(Some(target_cred)) = self.keychain.get(&target) {
-                let src = std::path::Path::new(&target_cred.secret)
-                    .join(".credentials.json");
-                let at_risk_dirs = sup.config_dirs_for_account(at_risk);
-                for (session, config_dir) in &at_risk_dirs {
-                    let dst = std::path::Path::new(config_dir).join(".credentials.json");
-                    match std::fs::copy(&src, &dst) {
-                        Ok(_) => eprintln!(
-                            "[quota-rotation] hot-swapped credentials for {session}: \
-                             {at_risk} → {target}"
-                        ),
-                        Err(e) => eprintln!(
-                            "[quota-rotation] WARN credential swap failed for {session}: {e} \
-                             — polecat stays on {at_risk}"
-                        ),
-                    }
-                }
+        // Hot credential swap: copy the NEW account's .credentials.json into every in-flight
+        // polecat's CLAUDE_CONFIG_DIR so claude CLI picks up the fresh token without restarting. The
+        // polecat keeps running — only the underlying account changes.
+        self.hot_swap_in_flight(at_risk, &target);
+        Ok(())
+    }
+
+    /// Copy `to`'s `.credentials.json` into every in-flight polecat still backed by `from`, so the
+    /// `claude` CLI there picks up the new account's token WITHOUT restarting the session (the
+    /// hot-swap half of the rotation contract). Best-effort per session: a copy failure logs and
+    /// leaves that polecat on the old credentials. No-op when no supervisor is wired or the target
+    /// has no stored credential dir.
+    fn hot_swap_in_flight(&self, from: &str, to: &str) {
+        let Some(sup) = &self.supervisor else {
+            return;
+        };
+        let Ok(Some(to_cred)) = self.keychain.get(to) else {
+            return;
+        };
+        for (session, config_dir) in sup.config_dirs_for_account(from) {
+            match crate::credential_guard::seed_credentials(&to_cred.secret, &config_dir) {
+                Ok(()) => eprintln!(
+                    "[quota-rotation] hot-swapped credentials for {session}: {from} → {to}"
+                ),
+                Err(e) => eprintln!(
+                    "[quota-rotation] WARN credential swap failed for {session}: {e} \
+                     — polecat stays on {from}"
+                ),
             }
         }
-        Ok(())
     }
 
     /// Proactive soft-drain (gtcore-df3319): the ACTIVE account crossed the soft threshold while
@@ -414,6 +420,40 @@ impl Plugin for QuotaRotationPlugin {
                     if let Some(until) = until_secs {
                         schedule_unblock(self.quota.clone(), account, until);
                     }
+                }
+                Ok(())
+            }
+            // A rotation was RECORDED (gtcore-bf4acd / BUG2). The MANUAL `quota.rotate` MCP tool
+            // moves quota accounting and emits this, but — unlike the predictive/reactive arms above
+            // — it never touched the keychain's live pointer or in-flight credentials, so orchd kept
+            // slinging onto the OLD account-dir and live polecats kept their stale token. Couple the
+            // two pointers here: flip the live pointer to `to_account` so the NEXT sling uses it, and
+            // hot-swap creds into every in-flight polecat still backed by `from_account` so the CLI
+            // re-reads the new token without a restart. Idempotent with the automatic arms (which
+            // already did both before emitting): set_active to the current target is a no-op and the
+            // copy is overwrite-identical.
+            "quota.rotated.v1" => {
+                if let QuotaEvent::Rotated { from_account, to_account, .. } =
+                    record.decode::<QuotaEvent>()?
+                {
+                    if from_account == to_account {
+                        return Ok(());
+                    }
+                    // Only flip when the live pointer is not already there — avoids a redundant
+                    // keychain write on the automatic path that emitted this event after flipping.
+                    if self.keychain.active()?.as_deref() != Some(to_account.as_str()) {
+                        if let Err(e) = self.keychain.set_active(&to_account) {
+                            // Unknown/credential-less target: leave the pointer rather than strand it.
+                            eprintln!(
+                                "[quota-rotation] rotated.v1 set_active({to_account}) failed: {e} — pointer unchanged"
+                            );
+                        } else {
+                            eprintln!(
+                                "[quota-rotation] rotated.v1 coupled live pointer {from_account} → {to_account} (manual rotate)"
+                            );
+                        }
+                    }
+                    self.hot_swap_in_flight(&from_account, &to_account);
                 }
                 Ok(())
             }
@@ -695,6 +735,84 @@ mod tests {
             Some("b"),
             "the live credential pointer flipped to the healthy standby"
         );
+    }
+
+    #[tokio::test]
+    async fn rotated_event_couples_pointer_and_hot_swaps_n_in_flight_polecats() {
+        // gtcore-bf4acd / BUG2 + T2: a recorded rotation (e.g. a MANUAL quota.rotate) must flip the
+        // live pointer AND propagate the new account's creds to EVERY in-flight polecat still on the
+        // old account — N live polecats ⇒ N config dirs updated, without a restart.
+        use gt_polecat::{FakeTmux, PolecatSupervisor, RestartConfig, SpawnSpec, Tmux};
+        use std::path::PathBuf;
+
+        let uniq = format!(
+            "{}-{}",
+            std::process::id(),
+            SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos()
+        );
+        // Source account `b` carries the fresh credential file the swap copies out.
+        let b_dir = std::env::temp_dir().join(format!("gt-rot-b-{uniq}"));
+        std::fs::create_dir_all(&b_dir).unwrap();
+        let fresh = r#"{"claudeAiOauth":{"accessToken":"at-NEW","refreshToken":"rt-NEW"}}"#;
+        std::fs::write(b_dir.join(".credentials.json"), fresh).unwrap();
+
+        // Three in-flight polecats backed by account `a`, each with its own CLAUDE_CONFIG_DIR.
+        let tmux: Arc<dyn Tmux> = Arc::new(FakeTmux::new());
+        let sup = Arc::new(PolecatSupervisor::new(tmux, RestartConfig::default(), 8));
+        let mut in_flight_dirs = Vec::new();
+        for i in 0..3 {
+            let dir = std::env::temp_dir().join(format!("gt-rot-pol{i}-{uniq}"));
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join(".credentials.json"), "stale").unwrap();
+            let session = format!("hq-pol{i}-{uniq}");
+            sup.watch(SpawnSpec {
+                session: session.clone(),
+                rig: "hq".into(),
+                polecat: session,
+                crew: None,
+                workdir: PathBuf::from("/tmp"),
+                command: "true".into(),
+                args: vec![],
+                env: vec![
+                    (gt_polecat::GT_HOOK_ACCOUNT.to_string(), "a".to_string()),
+                    ("CLAUDE_CONFIG_DIR".to_string(), dir.to_string_lossy().to_string()),
+                ],
+                hook_bead: None,
+                issue: None,
+                heartbeat: std::env::temp_dir().join(format!("gt-rot-pol{i}-{uniq}.hb")),
+            });
+            in_flight_dirs.push(dir);
+        }
+
+        let (quota, _rx) = quota_with_two().await;
+        let keychain = Arc::new(InMemoryKeychain::seeded([
+            ("a", "/cfg/a".to_string()),
+            ("b", b_dir.to_string_lossy().to_string()),
+        ]));
+        keychain.set_active("a").unwrap();
+        let plugin = QuotaRotationPlugin::new(quota, keychain.clone()).with_supervisor(sup);
+
+        plugin
+            .on_event(&record(QuotaEvent::Rotated {
+                from_account: "a".into(),
+                to_account: "b".into(),
+                now_secs: 1000,
+            }))
+            .await
+            .unwrap();
+
+        // Pointer coupled to the rotation target.
+        assert_eq!(keychain.active().unwrap().as_deref(), Some("b"));
+        // Every in-flight polecat's credentials now hold the NEW token.
+        for dir in &in_flight_dirs {
+            let got = std::fs::read_to_string(dir.join(".credentials.json")).unwrap();
+            assert_eq!(got, fresh, "in-flight dir {} should hold the rotated creds", dir.display());
+        }
+
+        let _ = std::fs::remove_dir_all(&b_dir);
+        for dir in &in_flight_dirs {
+            let _ = std::fs::remove_dir_all(dir);
+        }
     }
 
     #[tokio::test]
