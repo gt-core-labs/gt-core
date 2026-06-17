@@ -41,6 +41,7 @@ pub mod auto_dispatch;
 pub mod bead_close;
 pub mod checkpoint_push;
 pub mod ci_gate;
+pub mod credential_guard;
 pub mod anthropic_proxy;
 pub mod continuation;
 pub mod auth;
