@@ -29,6 +29,9 @@
 //! - `GT_POLECAT_MEM_MB` — per-polecat RAM budget for the host cap (default 1024).
 //! - `GT_POLECAT_MAX_RESTARTS` — re-sling cap per session (default 64).
 //! - `GT_POLECAT_TICK_SECS` — supervision + capacity timer interval (default 15).
+//! - `GT_CHECKPOINT_PUSH_SECS` — checkpoint-push timer interval (default 120): every N seconds the
+//!   daemon pushes each in-flight polecat branch to origin so a committed-but-unmerged branch is
+//!   durable before merge-ready (`gtcore-4cea57`). `0` ⇒ disabled.
 //! - `GT_RIG` / `GT_RIG_PATH` / `GT_POLECAT_CMD` / `GT_POLECAT_PREFIX` / `GT_HEARTBEAT_DIR` —
 //!   the rig's [`SpawnTemplate`] (see [`SpawnTemplate::from_env`]).
 //! - `GT_PATROL_TICK_SECS` (30) / `GT_LEASE_TIMEOUT_SECS` (300) — patrol lease-expiry ticker.
@@ -53,6 +56,7 @@ use std::time::Duration;
 use gt_auth::JwtMinter;
 use gt_channel::Channel;
 use gt_composition::bead_close::BeadClosePlugin;
+use gt_composition::checkpoint_push::checkpoint_push_pass;
 use gt_composition::ci_gate::CiGateState;
 use gt_composition::git_merge::GitMergePlugin;
 use gt_composition::patrol_bridge::PatrolBridgePlugin;
@@ -693,6 +697,14 @@ async fn main() -> anyhow::Result<()> {
         .ok()
         .filter(|v| v == "1" || v.eq_ignore_ascii_case("true"))
         .is_some();
+    // The distinct rig checkouts the checkpoint-push timer (below) sweeps for in-flight branches:
+    // every routed rig path plus the boot rig fallback. Captured before `rig_paths` is moved into
+    // the merge plugin; the pass dedups, so an overlap with `rig_path` is harmless.
+    let checkpoint_rigs: Vec<PathBuf> = rig_paths
+        .values()
+        .cloned()
+        .chain(std::iter::once(rig_path.clone()))
+        .collect();
     pol_registry = pol_registry.register(
         GitMergePlugin::with_rig_paths(merge.clone(), rig_paths, rig_path.clone())
             .with_ci_gated(ci_gated),
@@ -955,6 +967,32 @@ async fn main() -> anyhow::Result<()> {
             }
         }
     });
+
+    // Checkpoint-push timer (gtcore-4cea57): every GT_CHECKPOINT_PUSH_SECS (default 120s) push each
+    // in-flight polecat branch to origin, so a committed-but-unmerged branch is durable BEFORE
+    // merge-ready. Closes the last-leg leak from the 2026-06-15 incident — an agent death after a
+    // commit can no longer hide work on the node-local PVC. Idempotent + best-effort: a no-op when
+    // nothing changed, a per-branch log on failure. `0` disables it. Blocking git → spawn_blocking.
+    let checkpoint_secs = env_usize("GT_CHECKPOINT_PUSH_SECS", 120) as u64;
+    let checkpoint_timer = if checkpoint_secs > 0 && !checkpoint_rigs.is_empty() {
+        eprintln!(
+            "[gt-orch-server] checkpoint-push on — every {checkpoint_secs}s over {} rig checkout(s)",
+            checkpoint_rigs.len()
+        );
+        Some(tokio::spawn(async move {
+            let mut tick = tokio::time::interval(Duration::from_secs(checkpoint_secs));
+            tick.tick().await; // skip the immediate first fire (no commits yet)
+            loop {
+                tick.tick().await;
+                let rigs = checkpoint_rigs.clone();
+                // Shelling `git push` is blocking I/O — keep it off the runtime workers.
+                let _ = tokio::task::spawn_blocking(move || checkpoint_push_pass(&rigs)).await;
+            }
+        }))
+    } else {
+        eprintln!("[gt-orch-server] checkpoint-push OFF (GT_CHECKPOINT_PUSH_SECS=0 or no rig checkout)");
+        None
+    };
 
     // --- Reactor loops (hq-orchd.4) ---
     // Patrol lease-expiry ticker: a pure timer drives PatrolHandle::tick; an expired lease emits
@@ -1286,6 +1324,9 @@ async fn main() -> anyhow::Result<()> {
     // during teardown. Live tmux polecats keep running — the daemon is going down, not the town.
     pol_timer.abort();
     pol_relay.abort();
+    if let Some(task) = &checkpoint_timer {
+        task.abort();
+    }
     patrol_timer.abort();
     quota_timer.abort();
     delegation_timer.abort();
@@ -1310,6 +1351,9 @@ async fn main() -> anyhow::Result<()> {
     }
     let _ = pol_timer.await;
     let _ = pol_relay.await;
+    if let Some(task) = checkpoint_timer {
+        let _ = task.await;
+    }
     let _ = patrol_timer.await;
     let _ = quota_timer.await;
     let _ = delegation_timer.await;
