@@ -3,8 +3,9 @@
 //!
 //! The system config carries a LIST of [`ReportSchedule`]s. Each one scopes a
 //! board (rig, workspace), names a report [`kind`](ReportSchedule::kind) from
-//! the render REGISTRY, fires under one of three modes —
+//! the render REGISTRY, fires under one of five modes —
 //! [`Daily`](ScheduleMode::Daily), [`EveryNDays`](ScheduleMode::EveryNDays),
+//! [`Weekly`](ScheduleMode::Weekly), [`Monthly`](ScheduleMode::Monthly),
 //! [`Once`](ScheduleMode::Once) (auto-disables after sending) — and can carry
 //! its OWN recipient list (`subscribers`), falling back to the workspace's
 //! global enabled `report_subscriptions` when absent.
@@ -43,6 +44,11 @@ pub enum ScheduleMode {
     /// When at least `n_days` local days passed since the last send (first
     /// send = first tick with the time reached).
     EveryNDays,
+    /// Every week on `weekday` (0=Sunday..6=Saturday) at `hour:minute`.
+    Weekly,
+    /// Every month on `day_of_month` (1..=31, clamped to the month's last day)
+    /// at `hour:minute`.
+    Monthly,
     /// Exactly once on `date` at `hour:minute` (catch-up if the process was
     /// down that day); auto-disables after sending.
     Once,
@@ -65,6 +71,16 @@ pub struct ReportSchedule {
     /// `Once` target local date (`YYYY-MM-DD`).
     #[serde(default)]
     pub date: Option<String>,
+    /// `Weekly` send day, 0=Sunday..6=Saturday.
+    #[serde(default = "default_weekday")]
+    pub weekday: u8,
+    /// `Monthly` send day, 1..=31 (clamped to the month's last day).
+    #[serde(default = "default_day_of_month")]
+    pub day_of_month: u8,
+    /// Optional start gate (`YYYY-MM-DD`): recurring modes stay silent while
+    /// the local date is before it.
+    #[serde(default)]
+    pub start_date: Option<String>,
     /// Local wall-clock send time.
     #[serde(default = "default_hour")]
     pub hour: u8,
@@ -103,6 +119,12 @@ fn default_mode() -> ScheduleMode {
 fn default_n_days() -> u32 {
     1
 }
+fn default_weekday() -> u8 {
+    1 // Monday
+}
+fn default_day_of_month() -> u8 {
+    1
+}
 fn default_hour() -> u8 {
     8
 }
@@ -127,6 +149,9 @@ impl Default for ReportSchedule {
             mode: default_mode(),
             n_days: default_n_days(),
             date: None,
+            weekday: default_weekday(),
+            day_of_month: default_day_of_month(),
+            start_date: None,
             hour: default_hour(),
             minute: 0,
             tz_offset_minutes: default_tz_offset(),
@@ -223,6 +248,9 @@ pub struct SchedulePatch {
     pub mode: Option<ScheduleMode>,
     pub n_days: Option<u32>,
     pub date: Option<String>,
+    pub weekday: Option<u8>,
+    pub day_of_month: Option<u8>,
+    pub start_date: Option<String>,
     pub hour: Option<u8>,
     pub minute: Option<u8>,
     pub tz_offset_minutes: Option<i64>,
@@ -249,6 +277,15 @@ pub fn apply_patch(s: &mut ReportSchedule, patch: SchedulePatch) -> Result<(), S
     }
     if let Some(v) = patch.date {
         c.date = if v.trim().is_empty() { None } else { Some(v.trim().to_string()) };
+    }
+    if let Some(v) = patch.weekday {
+        c.weekday = v;
+    }
+    if let Some(v) = patch.day_of_month {
+        c.day_of_month = v;
+    }
+    if let Some(v) = patch.start_date {
+        c.start_date = if v.trim().is_empty() { None } else { Some(v.trim().to_string()) };
     }
     if let Some(v) = patch.hour {
         c.hour = v;
@@ -303,7 +340,22 @@ pub fn validate(s: &ReportSchedule) -> Result<(), String> {
                 return Err("mode `every_n_days` requires n_days >= 1".into());
             }
         }
+        ScheduleMode::Weekly => {
+            if s.weekday > 6 {
+                return Err("mode `weekly` requires weekday 0-6 (0=Sunday)".into());
+            }
+        }
+        ScheduleMode::Monthly => {
+            if !(1..=31).contains(&s.day_of_month) {
+                return Err("mode `monthly` requires day_of_month 1-31".into());
+            }
+        }
         ScheduleMode::Daily => {}
+    }
+    if let Some(start) = s.start_date.as_deref() {
+        if epoch_days(start).is_none() {
+            return Err(format!("`start_date` must be YYYY-MM-DD, got `{start}`"));
+        }
     }
     if let Some(list) = &s.subscribers {
         if let Some(bad) = list.iter().find(|e| !e.contains('@')) {
@@ -341,6 +393,39 @@ fn epoch_days(date: &str) -> Option<i64> {
     Some(era * 146097 + doe - 719468)
 }
 
+/// Local weekday of a `YYYY-MM-DD` date, 0=Sunday..6=Saturday. Epoch
+/// 1970-01-01 was a Thursday (=4), so `(epoch_days + 4) mod 7` indexes it.
+fn weekday_of(date: &str) -> Option<u8> {
+    epoch_days(date).map(|d| ((d + 4).rem_euclid(7)) as u8)
+}
+
+/// Number of days in `month` (1..=12) of `year`, honoring leap years
+/// (proleptic Gregorian).
+fn days_in_month(year: i64, month: u32) -> u8 {
+    match month {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 => {
+            let leap = (year % 4 == 0 && year % 100 != 0) || year % 400 == 0;
+            if leap {
+                29
+            } else {
+                28
+            }
+        }
+        _ => 30,
+    }
+}
+
+/// Parse the `(year, month, day)` of a `YYYY-MM-DD` date.
+fn ymd(date: &str) -> Option<(i64, u32, u32)> {
+    let mut it = date.split('-');
+    let y: i64 = it.next()?.parse().ok()?;
+    let m: u32 = it.next()?.parse().ok()?;
+    let d: u32 = it.next()?.parse().ok()?;
+    Some((y, m, d))
+}
+
 /// Fire decision, pure for tests.
 pub fn is_due(s: &ReportSchedule, local_date: &str, minutes_now: i64) -> bool {
     if !s.enabled {
@@ -348,9 +433,21 @@ pub fn is_due(s: &ReportSchedule, local_date: &str, minutes_now: i64) -> bool {
     }
     let time_reached = minutes_now >= i64::from(s.hour) * 60 + i64::from(s.minute);
     let sent_today = s.last_sent_date.as_deref() == Some(local_date);
+    // Optional start gate, applied to the recurring modes only (`once` carries
+    // its own target date). Silent while the local date is before it.
+    let before_start = |local_date: &str| match s.start_date.as_deref() {
+        Some(start) => match (epoch_days(local_date), epoch_days(start)) {
+            (Some(today), Some(s0)) => today < s0,
+            _ => false,
+        },
+        None => false,
+    };
     match s.mode {
-        ScheduleMode::Daily => time_reached && !sent_today,
+        ScheduleMode::Daily => time_reached && !sent_today && !before_start(local_date),
         ScheduleMode::EveryNDays => {
+            if before_start(local_date) {
+                return false;
+            }
             if !time_reached || sent_today {
                 return false;
             }
@@ -360,6 +457,35 @@ pub fn is_due(s: &ReportSchedule, local_date: &str, minutes_now: i64) -> bool {
                     .map(|l| today - l >= i64::from(s.n_days.max(1)))
                     .unwrap_or(true),
                 _ => false,
+            }
+        }
+        ScheduleMode::Weekly => {
+            if !time_reached || sent_today || before_start(local_date) {
+                return false;
+            }
+            // Fire when today's weekday matches the configured one (the
+            // sent-today guard above prevents a second send the same day).
+            weekday_of(local_date) == Some(s.weekday)
+        }
+        ScheduleMode::Monthly => {
+            if !time_reached || sent_today || before_start(local_date) {
+                return false;
+            }
+            let Some((year, month, day)) = ymd(local_date) else {
+                return false;
+            };
+            // Clamp the target day to the month's length: day 31 in a 30-day
+            // month (or 29/30/31 in February) fires on the last day instead.
+            let last = days_in_month(year, month);
+            let target = u32::from(s.day_of_month.min(last));
+            if day != target {
+                return false;
+            }
+            // Guard against a second send within the same calendar month
+            // (e.g. clamp made several days "the target"): compare year-month.
+            match s.last_sent_date.as_deref().and_then(ymd) {
+                Some((ly, lm, _)) => (ly, lm) != (year, month),
+                None => true,
             }
         }
         ScheduleMode::Once => {
@@ -751,6 +877,132 @@ mod tests {
         // Already sent: never again, any day.
         s.last_sent_date = Some("2026-06-10".into());
         assert!(!is_due(&s, "2026-07-01", 23 * 60));
+    }
+
+    #[test]
+    fn weekly_fires_on_its_weekday_once() {
+        // TODAY (2026-06-12) is a Friday → weekday 5 (0=Sunday).
+        assert_eq!(weekday_of(TODAY), Some(5));
+        let mut s = sched(ScheduleMode::Weekly);
+        s.weekday = 5;
+        // Matching weekday, time reached: fires.
+        assert!(!is_due(&s, TODAY, AT - 1)); // time not reached
+        assert!(is_due(&s, TODAY, AT));
+        // Already sent today: no second send.
+        s.last_sent_date = Some(TODAY.into());
+        assert!(!is_due(&s, TODAY, 23 * 60));
+        // Wrong weekday: silent (2026-06-14 is a Sunday → weekday 0).
+        s.last_sent_date = None;
+        assert_eq!(weekday_of("2026-06-14"), Some(0));
+        assert!(!is_due(&s, "2026-06-14", 23 * 60));
+        // Configure for Sunday: now that day fires.
+        s.weekday = 0;
+        assert!(is_due(&s, "2026-06-14", AT));
+    }
+
+    #[test]
+    fn monthly_fires_on_day_with_end_of_month_clamp_and_same_month_guard() {
+        let mut s = sched(ScheduleMode::Monthly);
+        // Normal day: fires only on that day, once time is reached.
+        s.day_of_month = 12;
+        assert!(!is_due(&s, TODAY, AT - 1));
+        assert!(is_due(&s, TODAY, AT)); // 2026-06-12
+        assert!(!is_due(&s, "2026-06-11", AT));
+        // Same-month guard: already sent this month → no second send even on
+        // the target day.
+        s.last_sent_date = Some("2026-06-01".into());
+        assert!(!is_due(&s, TODAY, AT));
+        s.last_sent_date = None;
+        // End-of-month clamp: day 31 in a 30-day month (April) → fires on the
+        // 30th, not the (nonexistent) 31st.
+        s.day_of_month = 31;
+        assert!(is_due(&s, "2026-04-30", AT));
+        assert!(!is_due(&s, "2026-04-29", AT));
+        // February clamp (non-leap 2026 has 28 days): day 31 → the 28th.
+        assert!(is_due(&s, "2026-02-28", AT));
+        // Leap February (2024 has 29 days): day 31 → the 29th.
+        assert!(is_due(&s, "2024-02-29", AT));
+        assert!(!is_due(&s, "2024-02-28", AT));
+    }
+
+    #[test]
+    fn start_date_gates_the_recurring_modes() {
+        // Daily silent before start_date, due on/after it.
+        let mut s = sched(ScheduleMode::Daily);
+        s.start_date = Some("2026-06-15".into());
+        assert!(!is_due(&s, TODAY, AT)); // 2026-06-12 < start
+        assert!(is_due(&s, "2026-06-15", AT)); // == start
+        assert!(is_due(&s, "2026-06-16", AT)); // > start
+        // every_n_days honors the gate too.
+        let mut s = sched(ScheduleMode::EveryNDays);
+        s.n_days = 1;
+        s.start_date = Some("2026-06-15".into());
+        assert!(!is_due(&s, TODAY, AT));
+        assert!(is_due(&s, "2026-06-15", AT));
+        // Weekly honors the gate: matching weekday but before start → silent.
+        let mut s = sched(ScheduleMode::Weekly);
+        s.weekday = 5; // Friday, matches 2026-06-12
+        s.start_date = Some("2026-06-15".into());
+        assert!(!is_due(&s, TODAY, AT));
+        // Monthly honors the gate.
+        let mut s = sched(ScheduleMode::Monthly);
+        s.day_of_month = 12;
+        s.start_date = Some("2026-07-01".into());
+        assert!(!is_due(&s, TODAY, AT));
+        assert!(is_due(&s, "2026-07-12", AT));
+    }
+
+    #[test]
+    fn weekly_monthly_validate_and_round_trip() {
+        // Validation rejects out-of-range weekday / day_of_month.
+        let base = ReportSchedule::default();
+        let try_patch = |p: SchedulePatch| {
+            let mut s = base.clone();
+            apply_patch(&mut s, p)
+        };
+        assert!(try_patch(SchedulePatch {
+            mode: Some(ScheduleMode::Weekly),
+            weekday: Some(7),
+            ..Default::default()
+        })
+        .unwrap_err()
+        .contains("weekday 0-6"));
+        assert!(try_patch(SchedulePatch {
+            mode: Some(ScheduleMode::Monthly),
+            day_of_month: Some(0),
+            ..Default::default()
+        })
+        .unwrap_err()
+        .contains("day_of_month 1-31"));
+        // Bad start_date format is rejected.
+        assert!(try_patch(SchedulePatch {
+            start_date: Some("06/2026".into()),
+            ..Default::default()
+        })
+        .unwrap_err()
+        .contains("start_date"));
+        // Serde round-trip of the new fields.
+        let s = ReportSchedule {
+            mode: ScheduleMode::Weekly,
+            weekday: 3,
+            day_of_month: 28,
+            start_date: Some("2026-06-15".into()),
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&s).expect("encode");
+        let back: ReportSchedule = serde_json::from_str(&json).expect("decode");
+        assert_eq!(back.mode, ScheduleMode::Weekly);
+        assert_eq!(back.weekday, 3);
+        assert_eq!(back.day_of_month, 28);
+        assert_eq!(back.start_date.as_deref(), Some("2026-06-15"));
+        // Wire values are snake_case.
+        assert!(serde_json::to_string(&ScheduleMode::Weekly).unwrap().contains("weekly"));
+        assert!(serde_json::to_string(&ScheduleMode::Monthly).unwrap().contains("monthly"));
+        // Defaults for an empty object hold the new fields.
+        let d: ReportSchedule = serde_json::from_str("{}").expect("empty");
+        assert_eq!(d.weekday, 1);
+        assert_eq!(d.day_of_month, 1);
+        assert!(d.start_date.is_none());
     }
 
     #[test]
