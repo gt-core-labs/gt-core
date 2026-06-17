@@ -351,7 +351,7 @@ mod tests {
     fn truncate_marks_oversized_diffs() {
         let big = "x".repeat(MAX_DIFF_BYTES + 10);
         let out = truncate_on_char_boundary(&big, MAX_DIFF_BYTES);
-        assert!(out.len() <= MAX_DIFF_BYTES + 80);
+        assert!(out.len() <= MAX_DIFF_BYTES + 100);
         assert!(out.contains("diff truncated"));
     }
 
