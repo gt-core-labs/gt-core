@@ -26,6 +26,7 @@ use gt_module_mcp::taxonomy::{validate as taxonomy_validate, BeadTaxonomy};
 use gt_store_dolt::{AppError, IssuePatch, IssuePhase, IssueStatus, NewIssue};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
+use time::{Date, Month};
 
 use crate::surface::{
     check_surface_existence, check_surface_shape, surface_to_json, SurfaceEntry, SurfaceTree,
@@ -39,9 +40,14 @@ fn taxonomy_err(e: gt_module_mcp::taxonomy::TaxonomyError) -> AppError {
     AppError::Validation(e.to_string())
 }
 
-/// Reject a planning date that is neither empty (the clear sentinel) nor
-/// `YYYY-MM-DD`-shaped (hq-62130a). Shape-only — calendar validity (e.g. a
-/// month 13) is left to the DATE column, which rejects it at execute.
+/// Reject a planning date that is neither empty (the clear sentinel) nor a real
+/// `YYYY-MM-DD` calendar date (hq-62130a, gtcore-9c95d3). The shape guard runs
+/// first (exactly ten `YYYY-MM-DD` bytes) so the report never sees a loosely
+/// formatted date; then [`Date::from_calendar_date`] rejects an *impossible* one
+/// — `2026-02-31`, `2026-13-01`, `2026-00-10` — that the shape-only check let
+/// through. start_date/due_date feed the planning report ("Fecha Inicio"/"Fecha
+/// Fin") and the retrasos metric and are auto-filled on transitions
+/// (gtcore-fdc175), so a calendar-invalid value would corrupt the report.
 fn check_date(field: &str, value: &str) -> Result<(), AppError> {
     if value.is_empty() {
         return Ok(()); // clear-to-NULL sentinel, mirrors assignee/external_ref
@@ -56,6 +62,18 @@ fn check_date(field: &str, value: &str) -> Result<(), AppError> {
             "{field} must be YYYY-MM-DD (or empty to clear), got `{value}`"
         )));
     }
+    // Shape guarantees ASCII digits at these positions, so the slices parse and
+    // we only need `time` to reject the calendar-impossible combinations.
+    let calendar_invalid = || {
+        AppError::Validation(format!(
+            "{field} must be a real calendar date (YYYY-MM-DD), got `{value}`"
+        ))
+    };
+    let year: i32 = value[0..4].parse().expect("shape guarantees 4 ascii digits");
+    let month: u8 = value[5..7].parse().expect("shape guarantees 2 ascii digits");
+    let day: u8 = value[8..10].parse().expect("shape guarantees 2 ascii digits");
+    let month = Month::try_from(month).map_err(|_| calendar_invalid())?;
+    Date::from_calendar_date(year, month, day).map_err(|_| calendar_invalid())?;
     Ok(())
 }
 
@@ -1286,6 +1304,49 @@ mod tests {
         let mut u = base_update();
         u.dispatch = Some("manual".into());
         assert!(!u.to_patch().is_empty());
+    }
+
+    #[test]
+    fn update_accepts_real_dates_and_clear_but_rejects_bad_shape_and_calendar() {
+        // A real calendar date passes, on either planning field.
+        let mut u = base_update();
+        u.start_date = Some("2026-06-17".into());
+        assert!(u.validate().is_ok());
+        let mut u = base_update();
+        u.due_date = Some("2026-06-17".into());
+        assert!(u.validate().is_ok());
+
+        // Empty string is the clear-to-NULL sentinel (carried into the patch).
+        let mut u = base_update();
+        u.start_date = Some(String::new());
+        assert!(u.validate().is_ok());
+        assert_eq!(u.to_patch().start_date.as_deref(), Some(""));
+
+        // Wrong shape (not YYYY-MM-DD) is rejected.
+        for bad in ["2026-6-17", "2026/06/17", "17-06-2026", "not-a-date", "2026-06-17 "] {
+            let mut u = base_update();
+            u.due_date = Some(bad.into());
+            assert!(
+                matches!(u.validate(), Err(AppError::Validation(_))),
+                "expected bad shape `{bad}` to be rejected"
+            );
+        }
+
+        // Right shape but calendar-impossible is now rejected too (the bead's
+        // core fix): month 13, day 00, and Feb 31 all fail.
+        for bad in ["2026-13-01", "2026-00-10", "2026-02-31", "2026-04-31", "2025-02-29"] {
+            let mut u = base_update();
+            u.start_date = Some(bad.into());
+            assert!(
+                matches!(u.validate(), Err(AppError::Validation(_))),
+                "expected calendar-invalid `{bad}` to be rejected"
+            );
+        }
+
+        // A leap day in a real leap year is a valid calendar date.
+        let mut u = base_update();
+        u.due_date = Some("2024-02-29".into());
+        assert!(u.validate().is_ok());
     }
 
     #[test]
