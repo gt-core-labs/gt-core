@@ -30,7 +30,7 @@ use serde::{Deserialize, Serialize};
 use crate::surface::{
     check_surface_existence, check_surface_shape, surface_to_json, SurfaceEntry, SurfaceTree,
 };
-use crate::taxonomy::{Dispatch, Domain, IssueType};
+use crate::taxonomy::{Dispatch, Domain, IssueType, RoleScope};
 
 /// Map a [`gt_module_mcp::taxonomy::TaxonomyError`] onto the store's
 /// [`AppError::Validation`] so the NN-16 rejection surfaces with the same
@@ -184,9 +184,12 @@ pub struct CreateIssue {
     /// closes). Self-edges and duplicates are rejected at [`Self::validate`].
     #[serde(default)]
     pub depends_on: Vec<String>,
-    /// Responsible role discriminator. Free-form; persisted verbatim.
+    /// Responsible role discriminator. Closed set ([`RoleScope`]): an out-of-set
+    /// value is rejected at deserialization, mirroring `issue_type`/`dispatch`
+    /// (gtcore-b45a2d). Optional — `None` stores SQL `NULL` (not every bead pins
+    /// a role).
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub role_scope: Option<String>,
+    pub role_scope: Option<RoleScope>,
     /// Lifecycle phase (`P1..P4`, hq-core-mcp.7 / docs/10 S1). `None` lets the
     /// column default to `P1`; `Some(_)` is a scalar overwrite validated against
     /// the closed set. Stamp `P4` on a bead gated behind the kernel migration so
@@ -319,7 +322,7 @@ impl CreateIssue {
             owner: self.owner.clone(),
             domain_json: domain_to_json(&self.domain),
             surface_json: surface_to_json(&self.surface),
-            role_scope: self.role_scope.clone(),
+            role_scope: self.role_scope.map(|r| r.as_str().to_string()),
             phase: self.phase.clone(),
             rig,
             workspace: self.workspace.clone(),
@@ -385,6 +388,12 @@ pub struct UpdateIssue {
     /// detection runs at execute in the store.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub depends_on: Option<Vec<String>>,
+    /// New responsible-role discriminator (closed set [`RoleScope`]). `None`
+    /// leaves the column untouched; `Some(_)` overwrites with the role's bare
+    /// lowercase token; an out-of-set value is rejected at deserialization
+    /// (gtcore-b45a2d).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub role_scope: Option<RoleScope>,
     /// New lifecycle phase (`P1..P4`, hq-core-mcp.7). `None` leaves the column
     /// untouched; `Some(_)` is a scalar overwrite validated against the closed
     /// set (it also re-stamps `phase_ratified_at`). This is how a prose-blocked
@@ -539,6 +548,7 @@ impl UpdateIssue {
             parent_id: self.parent_id.clone(),
             domain_json: self.domain.as_deref().map(domain_to_json),
             surface_json: self.surface.as_deref().map(surface_to_json),
+            role_scope: self.role_scope.map(|r| r.as_str().to_string()),
             phase: self.phase.clone(),
             expected_version: self.expected_version,
             estimated_hours: self.estimated_hours,
@@ -812,6 +822,7 @@ mod tests {
             domain: None,
             surface: None,
             depends_on: None,
+            role_scope: None,
             phase: None,
             expected_version: None,
             estimated_hours: None,
@@ -994,6 +1005,7 @@ mod tests {
             domain: None,
             surface: None,
             depends_on: None,
+            role_scope: None,
             phase: None,
             expected_version: None,
             estimated_hours: None,
@@ -1022,6 +1034,7 @@ mod tests {
             domain: None,
             surface: None,
             depends_on: None,
+            role_scope: None,
             phase: None,
             expected_version: Some(7),
             estimated_hours: None,
@@ -1054,6 +1067,7 @@ mod tests {
             domain: None,
             surface: None,
             depends_on: None,
+            role_scope: None,
             phase: None,
             expected_version: None,
             estimated_hours: None,
@@ -1221,6 +1235,7 @@ mod tests {
             domain: None,
             surface: None,
             depends_on: None,
+            role_scope: None,
             phase: Some("P4".into()),
             expected_version: None,
             estimated_hours: None,
@@ -1271,6 +1286,44 @@ mod tests {
         let mut u = base_update();
         u.dispatch = Some("manual".into());
         assert!(!u.to_patch().is_empty());
+    }
+
+    #[test]
+    fn create_carries_role_scope_through_to_new_and_rejects_out_of_set_wire() {
+        // Typed field: to_new serializes the bare lowercase role token.
+        let mut c = base_create();
+        c.role_scope = Some(RoleScope::Sheriff);
+        assert!(c.validate().is_ok());
+        assert_eq!(c.to_new().role_scope.as_deref(), Some("sheriff"));
+        // Omitted ⇒ NULL (not every bead pins a role).
+        assert_eq!(base_create().to_new().role_scope, None);
+        // The closed set bites at deserialization, same plumbing as issue_type.
+        let mut wire = serde_json::to_value(base_create()).unwrap();
+        wire["role_scope"] = serde_json::json!("banana");
+        assert!(serde_json::from_value::<CreateIssue>(wire.clone()).is_err());
+        // The dotted Domain form is not the role_scope wire form.
+        wire["role_scope"] = serde_json::json!("role.sheriff");
+        assert!(serde_json::from_value::<CreateIssue>(wire.clone()).is_err());
+        wire["role_scope"] = serde_json::json!("graphwarden");
+        let parsed: CreateIssue = serde_json::from_value(wire).unwrap();
+        assert_eq!(parsed.role_scope, Some(RoleScope::Graphwarden));
+    }
+
+    #[test]
+    fn update_accepts_role_scope_overwrite_and_rejects_bad() {
+        // Overwrite with a closed-set token.
+        let mut u = base_update();
+        u.role_scope = Some(RoleScope::Refinery);
+        assert!(u.validate().is_ok());
+        assert_eq!(u.to_patch().role_scope.as_deref(), Some("refinery"));
+        // A role_scope-only patch is a non-empty patch.
+        assert!(!u.to_patch().is_empty());
+        // Omitted ⇒ column untouched.
+        assert_eq!(base_update().to_patch().role_scope, None);
+        // Out-of-set rejected at deserialization (the boundary), like issue_type.
+        let mut wire = serde_json::to_value(base_update()).unwrap();
+        wire["role_scope"] = serde_json::json!("banana");
+        assert!(serde_json::from_value::<UpdateIssue>(wire).is_err());
     }
 
     #[test]

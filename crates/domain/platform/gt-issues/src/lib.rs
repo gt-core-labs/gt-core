@@ -137,4 +137,4 @@ pub use report::{
 pub use report_html::render_digest;
 pub use stats::{MeStatsResponse, WorkspaceStats};
 pub use surface::{AllowAllProvider, AllowAllTree, SurfaceEntry, SurfaceProvider, SurfaceTree};
-pub use taxonomy::{Dispatch, Domain, IssueType};
+pub use taxonomy::{Dispatch, Domain, IssueType, RoleScope};

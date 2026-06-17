@@ -220,9 +220,63 @@ impl Dispatch {
     }
 }
 
+/// A bead's `role_scope` — the responsible-role discriminator, a CLOSED set
+/// (gtcore-b45a2d), same rationale as [`IssueType`]/[`Dispatch`]: the field was
+/// free-form (`"Responsible role discriminator. Free-form; persisted verbatim."`),
+/// so any value (`"banana"`) passed shape validation. Typing it rejects an
+/// out-of-set value at deserialization and surfaces the allowed variants as a
+/// JSON-schema `enum`, so an MCP client offers a role picker instead of a blank
+/// text box.
+///
+/// The variants are the system's agent-role catalog, the union of two sources:
+/// the `role.*` discriminators of [`Domain`] (sheriff/deacon/refinery/witness/
+/// mayor/graphwarden) and the session roles `SessionRole`/`DogKind` enumerate in
+/// gt-agent (which add `polecat`, `dog`, `overseer`). The wire/store form is the
+/// bare lowercase role name (e.g. `sheriff`) — NOT the dotted `role.sheriff`
+/// `Domain` form — matching `SessionRole::as_str` and the legacy column values.
+///
+/// `role_scope` is OPTIONAL (not every bead pins a role): the wire field stays
+/// `Option<RoleScope>`, an omitted/`None` value storing SQL `NULL`. Existing rows
+/// keep whatever legacy string they carry — the read path (`IssueRow`/
+/// `IssueDetail`) stays `String`; only `issues.create` / `issues.update` narrow.
+#[allow(missing_docs)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
+#[cfg_attr(feature = "axum", derive(utoipa::ToSchema))]
+#[serde(rename_all = "lowercase")]
+pub enum RoleScope {
+    Mayor,
+    Polecat,
+    Sheriff,
+    Refinery,
+    Witness,
+    Deacon,
+    Overseer,
+    Dog,
+    Graphwarden,
+}
+
+impl RoleScope {
+    /// The lowercase wire/store form (the `hq.issues.role_scope` column value).
+    /// Matches `gt_agent::SessionRole::as_str` so the tracker and the agent
+    /// runtime agree on a role's canonical name.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Mayor => "mayor",
+            Self::Polecat => "polecat",
+            Self::Sheriff => "sheriff",
+            Self::Refinery => "refinery",
+            Self::Witness => "witness",
+            Self::Deacon => "deacon",
+            Self::Overseer => "overseer",
+            Self::Dog => "dog",
+            Self::Graphwarden => "graphwarden",
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{Dispatch, Domain, IssueType};
+    use super::{Dispatch, Domain, IssueType, RoleScope};
 
     #[test]
     fn round_trips_dotted_wire_form() {
@@ -294,6 +348,41 @@ mod tests {
         assert_eq!(login, Domain::OrchLogin);
         let terminal: Domain = serde_json::from_str("\"platform.terminal\"").unwrap();
         assert_eq!(terminal, Domain::PlatformTerminal);
+    }
+
+    #[test]
+    fn role_scope_round_trips_lowercase_wire_form() {
+        let r: RoleScope = serde_json::from_str("\"sheriff\"").unwrap();
+        assert_eq!(r, RoleScope::Sheriff);
+        assert_eq!(serde_json::to_string(&r).unwrap(), "\"sheriff\"");
+        // The catalog covers both Domain's role.* set and gt-agent's session roles.
+        assert_eq!(RoleScope::Graphwarden.as_str(), "graphwarden");
+        assert_eq!(RoleScope::Polecat.as_str(), "polecat");
+        assert_eq!(RoleScope::Overseer.as_str(), "overseer");
+        assert_eq!(RoleScope::Dog.as_str(), "dog");
+        for token in [
+            "mayor",
+            "polecat",
+            "sheriff",
+            "refinery",
+            "witness",
+            "deacon",
+            "overseer",
+            "dog",
+            "graphwarden",
+        ] {
+            let parsed: RoleScope = serde_json::from_str(&format!("\"{token}\"")).unwrap();
+            assert_eq!(parsed.as_str(), token);
+        }
+    }
+
+    #[test]
+    fn role_scope_rejects_out_of_set_value() {
+        assert!(serde_json::from_str::<RoleScope>("\"banana\"").is_err());
+        // Wire form is lowercase only — capitalized rejected too.
+        assert!(serde_json::from_str::<RoleScope>("\"Sheriff\"").is_err());
+        // The dotted Domain form is NOT the role_scope wire form.
+        assert!(serde_json::from_str::<RoleScope>("\"role.sheriff\"").is_err());
     }
 
     #[test]

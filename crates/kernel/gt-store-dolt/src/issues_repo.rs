@@ -444,6 +444,10 @@ pub struct IssuePatch {
     /// New `surface_json` — raw JSON array string of crate names / repo paths.
     /// `None` leaves the column alone; `Some(_)` overwrites verbatim.
     pub surface_json: Option<String>,
+    /// New `role_scope` discriminator (gtcore-b45a2d). `None` leaves the column
+    /// untouched; `Some(_)` overwrites with the role's bare lowercase token,
+    /// validated against the closed `RoleScope` set upstream.
+    pub role_scope: Option<String>,
     /// New lifecycle phase token (`"P1".."P4"`, hq-core-mcp.7). `None` leaves
     /// the column untouched; `Some(_)` is a scalar overwrite the frontier
     /// validates against [`IssuePhase`] before the write.
@@ -489,6 +493,7 @@ impl IssuePatch {
             && self.parent_id.is_none()
             && self.domain_json.is_none()
             && self.surface_json.is_none()
+            && self.role_scope.is_none()
             && self.phase.is_none()
             && self.estimated_hours.is_none()
             && self.start_date.is_none()
@@ -1257,6 +1262,13 @@ impl DoltIssues {
         if let Some(v) = &patch.surface_json {
             set_parts.push("surface_json = :surface_json");
             params_vec.push(("surface_json".to_string(), mysql_async::Value::from(v.clone())));
+        }
+        // gtcore-b45a2d — role_scope discriminator, validated against the closed
+        // `RoleScope` set upstream. The typed enum never yields an empty token,
+        // so this is a plain overwrite (no clear-to-NULL sentinel).
+        if let Some(v) = &patch.role_scope {
+            set_parts.push("role_scope = :role_scope");
+            params_vec.push(("role_scope".to_string(), mysql_async::Value::from(v.clone())));
         }
         // hq-core-mcp.7 — a phase overwrite also stamps `phase_ratified_at` so the
         // last ratification is auditable, mirroring the frontier's `ratified_at`.
