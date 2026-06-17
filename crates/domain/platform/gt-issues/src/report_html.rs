@@ -71,6 +71,19 @@ const TD: &str = "padding:6px 8px;border:1px solid #d9e2f3;font-size:13px;vertic
 /// wrap, since they hold long text + comments.
 const NOWRAP: &str = "white-space:nowrap;";
 
+/// Per-module palette `(row_tint, band_tint)`: each module group paints its task
+/// rows with a tenuous tint and its separator band with a slightly stronger
+/// shade, cycling so adjacent modules are visually distinct (operator request:
+/// "una fila por submódulo + colores tenues por módulo").
+const MODULE_TINTS: &[(&str, &str)] = &[
+    ("#f2f6fc", "#dbe6f6"), // blue
+    ("#f1f8f1", "#dcefdc"), // green
+    ("#fdf6ee", "#f8e6d2"), // orange
+    ("#f7f2fb", "#e7dbf3"), // purple
+    ("#fbf2f3", "#f6dcdf"), // pink
+    ("#eef9f8", "#d4efec"), // teal
+];
+
 /// One KPI card cell.
 fn kpi(label: &str, value: String, detail: String) -> String {
     format!(
@@ -153,19 +166,28 @@ pub fn render_digest(report: &OperatorReport, summary: &AnalyticsSummary, fecha:
             ))
             .join("")
     ));
-    let mut ri = 0usize;
-    for section in &report.sections {
-        // Epic-level comments (rare): a full-width row under the module name.
+    for (mi, section) in report.sections.iter().enumerate() {
+        let (row_tint, band_tint) = MODULE_TINTS[mi % MODULE_TINTS.len()];
+        // Group separator row per module (epic) — a full-width band with the
+        // module title and its hours subtotal.
+        html.push_str(&format!(
+            "<tr><td colspan=\"10\" style=\"{TD}background:{band_tint};color:{NAVY};\
+             font-weight:bold;\">🏢 {title}\
+             <span style=\"float:right;font-weight:normal;color:#5b6b8c;\">{horas:.1} h</span>\
+             </td></tr>",
+            title = esc(&section.module_title),
+            horas = section.horas,
+        ));
+        // Epic-level comments (rare): a full-width row under the band.
         if !section.comentarios.is_empty() {
             html.push_str(&format!(
-                "<tr><td style=\"{TD}\">{m}</td><td colspan=\"9\" style=\"{TD}background:#ffffff;\">{c}</td></tr>",
-                m = esc(&section.module_title),
-                c = render_comments(&section.comentarios, true),
+                "<tr><td colspan=\"10\" style=\"{TD}background:{row_tint};\">{}</td></tr>",
+                render_comments(&section.comentarios, true),
             ));
         }
         for row in &section.rows {
-            let bg = if ri % 2 == 1 { format!("background:{ROW_ALT};") } else { String::new() };
-            ri += 1;
+            // Subtle per-module tint on every row of the group.
+            let bg = format!("background:{row_tint};");
             html.push_str(&format!(
                 "<tr><td style=\"{TD}{bg}{NOWRAP}\">{modulo}</td>\
                  <td style=\"{TD}{bg}\">{tarea}<div style=\"font-size:11px;color:#6c757d;\">\
@@ -276,6 +298,10 @@ mod tests {
         }
         // Flat table: the Modulo column is a real header (not a section band).
         assert!(html.contains(">Modulo</th>"), "missing flat Modulo column header");
+        // Per-module separator band + tenuous module tint on the rows.
+        assert!(html.contains("🏢 Modulo Uno"), "missing module separator band");
+        assert!(html.contains("background:#dbe6f6"), "missing module band tint");
+        assert!(html.contains("background:#f2f6fc"), "missing module row tint");
         // Reconciles with the summary by construction.
         assert!(html.contains(&format!("{:.0}%", summary.avance.pct)));
         assert!(html.contains("3 tareas"), "missing task count in header");
