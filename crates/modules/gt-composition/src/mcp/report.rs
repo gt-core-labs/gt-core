@@ -151,7 +151,8 @@ impl DomainHandler for ReportHandler {
         descriptor(
             "report.schedules.list",
             "List every report schedule: id, kind, mode (daily | every_n_days | \
-             once), n_days/date, hour/minute (local wall clock), tz_offset_minutes, \
+             weekly | monthly | once), n_days/date/weekday/day_of_month, optional \
+             start_date, hour/minute (local wall clock), tz_offset_minutes, \
              board scope (rig/workspace), enabled, last_sent_date, per-schedule \
              subscribers (absent = the workspace's global enabled list).",
             &[],
@@ -159,14 +160,20 @@ impl DomainHandler for ReportHandler {
         descriptor(
             "report.schedules.create",
             "Create a schedule. mode daily (default) | every_n_days (requires \
-             n_days>=1) | once (requires date YYYY-MM-DD; auto-disables after \
-             sending). kind from report.kinds.list (default planning-digest). \
-             subscribers optional (own recipient list; absent = global fallback).",
+             n_days>=1) | weekly (requires weekday 0-6, 0=Sunday) | monthly \
+             (requires day_of_month 1-31, clamped to the month's last day) | once \
+             (requires date YYYY-MM-DD; auto-disables after sending). Optional \
+             start_date (YYYY-MM-DD) gates the recurring modes until that day. \
+             kind from report.kinds.list (default planning-digest). subscribers \
+             optional (own recipient list; absent = global fallback).",
             &[
                 opt("kind", "string"),
                 opt("mode", "string"),
                 opt("n_days", "integer"),
                 opt("date", "string"),
+                opt("weekday", "integer"),
+                opt("day_of_month", "integer"),
+                opt("start_date", "string"),
                 opt("hour", "integer"),
                 opt("minute", "integer"),
                 opt("tz_offset_minutes", "integer"),
@@ -187,6 +194,9 @@ impl DomainHandler for ReportHandler {
                 opt("mode", "string"),
                 opt("n_days", "integer"),
                 opt("date", "string"),
+                opt("weekday", "integer"),
+                opt("day_of_month", "integer"),
+                opt("start_date", "string"),
                 opt("hour", "integer"),
                 opt("minute", "integer"),
                 opt("tz_offset_minutes", "integer"),
