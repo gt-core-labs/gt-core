@@ -19,9 +19,15 @@ fn esc(s: &str) -> String {
 }
 
 /// Render a bead/epic's comments as an inline block (gtcore-01bcf2): one line
-/// per comment, `[fecha autor] cuerpo`, all escaped. Empty input → empty string
+/// per comment, `[autor] cuerpo`, all escaped. Empty input → empty string
 /// (no markup, so a comment-less cell stays unchanged). `compact=true` drops the
 /// top divider for the section-header variant.
+///
+/// The comment's `fecha` (its `created_at`) is intentionally NOT rendered
+/// (gtcore-abc0ae): the report already carries the date in its Fecha Inicio /
+/// Fecha Fin columns, so a per-comment timestamp inside Notas only duplicates
+/// information already on the row. The underlying `created_at` is untouched —
+/// this is a presentation-only omission.
 fn render_comments(comments: &[ReportComment], compact: bool) -> String {
     if comments.is_empty() {
         return String::new();
@@ -31,8 +37,7 @@ fn render_comments(comments: &[ReportComment], compact: bool) -> String {
         .map(|c| {
             format!(
                 "<div style=\"font-size:11px;color:#555;margin-top:2px;\">\
-                 <span style=\"color:{NAVY};font-weight:bold;\">[{fecha} {autor}]</span> {body}</div>",
-                fecha = esc(&c.fecha),
+                 <span style=\"color:{NAVY};font-weight:bold;\">[{autor}]</span> {body}</div>",
                 autor = esc(&c.author),
                 body = esc(&c.body),
             )
@@ -310,11 +315,52 @@ mod tests {
         assert!(html.contains(&format!("{:.1}", report.total_horas)));
         // Escaping: the raw note must not inject markup.
         assert!(html.contains("nota &lt;x&gt;") && !html.contains("nota <x>"));
-        // Comments render with [fecha autor] and stay escaped (gtcore-01bcf2).
+        // Comments render with [autor] (no timestamp) and stay escaped
+        // (gtcore-01bcf2 + gtcore-abc0ae: the per-comment fecha/hora is dropped
+        // since the date already lives in the Fecha columns).
         assert!(html.contains("Comentarios"), "missing comments block");
-        assert!(html.contains("[2026-06-10 ana]"), "missing bead comment meta");
+        assert!(html.contains("[ana]"), "missing bead comment author");
         assert!(html.contains("revisar &lt;edge&gt; case"), "bead comment not escaped/rendered");
-        assert!(html.contains("[2026-06-11 leo]"), "missing epic comment meta");
+        assert!(html.contains("[leo]"), "missing epic comment author");
         assert!(html.contains("modulo bloqueado"), "missing epic comment body");
+        // The redundant timestamp prefix must NOT appear inside the folded
+        // Notas text (gtcore-abc0ae). The comment dates were 2026-06-10/11.
+        assert!(!html.contains("[2026-06-10 ana]"), "bead comment must not carry a timestamp prefix");
+        assert!(!html.contains("[2026-06-11 leo]"), "epic comment must not carry a timestamp prefix");
+        // Guard the general timestamp-in-fold pattern: no `[YYYY-MM-DD ...]`
+        // bracket where a comment is rendered.
+        assert!(
+            !has_dated_comment_bracket(&html),
+            "Notas fold must not contain a [date author] timestamp bracket"
+        );
+    }
+
+    /// True when `html` contains a `[YYYY-MM-DD …]` bracket — the timestamp
+    /// prefix the digest used to put in front of folded comments. The render
+    /// test (gtcore-abc0ae AC) asserts this is absent from the Notas fold.
+    pub(crate) fn has_dated_comment_bracket(html: &str) -> bool {
+        // Scan for "[dddd-dd-dd" (4-2-2 digits with dashes, right after a `[`).
+        let bytes = html.as_bytes();
+        let is_digit = |i: usize| bytes.get(i).is_some_and(u8::is_ascii_digit);
+        for (i, &b) in bytes.iter().enumerate() {
+            if b != b'[' {
+                continue;
+            }
+            let d = i + 1;
+            if is_digit(d)
+                && is_digit(d + 1)
+                && is_digit(d + 2)
+                && is_digit(d + 3)
+                && bytes.get(d + 4) == Some(&b'-')
+                && is_digit(d + 5)
+                && is_digit(d + 6)
+                && bytes.get(d + 7) == Some(&b'-')
+                && is_digit(d + 8)
+                && is_digit(d + 9)
+            {
+                return true;
+            }
+        }
+        false
     }
 }
