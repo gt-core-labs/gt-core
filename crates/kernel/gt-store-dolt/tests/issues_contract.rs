@@ -505,6 +505,212 @@ async fn close_stamps_attribution_and_rejects_double() {
     );
 }
 
+/// The DB's own `DATE(NOW())` as `YYYY-MM-DD` — the same value the store stamps
+/// via `COALESCE(.., DATE(NOW()))`. Read it from Dolt (not the test host clock)
+/// so the comparison never races a midnight rollover or a host/server tz skew.
+async fn dolt_today(base: &str) -> String {
+    use mysql_async::prelude::*;
+    let pool = gt_store_dolt::connect(&format!("{base}/{TEST_DB}")).expect("pool");
+    let mut conn = pool.get_conn().await.expect("conn");
+    conn.exec_first::<String, _, _>("SELECT DATE_FORMAT(DATE(NOW()), '%Y-%m-%d')", ())
+        .await
+        .expect("query today")
+        .expect("one row")
+}
+
+#[tokio::test]
+async fn transition_to_working_autofills_start_date_unless_planned() {
+    // gtcore-fdc175: the move to `working` derives "Fecha Inicio" from the real
+    // lifecycle — an UNSET start_date is filled with the event date, an
+    // already-populated (planned) start_date is RESPECTED, never overwritten.
+    let Ok(base) = std::env::var("GT_DOLT_URL") else {
+        eprintln!("GT_DOLT_URL unset — skipping start_date auto-fill contract");
+        return;
+    };
+    let base = base.trim_end_matches('/').to_string();
+    seed(&base).await.expect("seed");
+
+    let repo = DoltIssues::connect(&format!("{base}/{TEST_DB}")).expect("connect");
+
+    // --- empty start_date auto-fills with the event date -------------------
+    let empty = format!("hq-sd-empty-{}", ulid::Ulid::new());
+    repo.insert(&NewIssue {
+        id: empty.clone(),
+        title: "start auto-fill".into(),
+        issue_type: "task".into(),
+        created_by: "test".into(),
+        ..Default::default()
+    })
+    .await
+    .expect("seed insert");
+    assert_eq!(
+        repo.get_detail(&empty).await.unwrap().unwrap().start_date,
+        None,
+        "fresh row has no start_date",
+    );
+
+    repo.transition(&empty, IssueStatus::Working).await.expect("open->working");
+    let today = dolt_today(&base).await;
+    assert_eq!(
+        repo.get_detail(&empty).await.unwrap().unwrap().start_date.as_deref(),
+        Some(today.as_str()),
+        "unset start_date filled with the event date on the working move",
+    );
+
+    // --- a populated start_date is respected -------------------------------
+    let planned = format!("hq-sd-plan-{}", ulid::Ulid::new());
+    repo.insert(&NewIssue {
+        id: planned.clone(),
+        title: "start respected".into(),
+        issue_type: "task".into(),
+        created_by: "test".into(),
+        ..Default::default()
+    })
+    .await
+    .expect("seed insert");
+    repo.update(
+        &planned,
+        &IssuePatch { start_date: Some("2020-01-02".into()), ..Default::default() },
+    )
+    .await
+    .expect("seed planned start_date");
+
+    repo.transition(&planned, IssueStatus::Working).await.expect("open->working");
+    assert_eq!(
+        repo.get_detail(&planned).await.unwrap().unwrap().start_date.as_deref(),
+        Some("2020-01-02"),
+        "a hand-planned start_date is never overwritten by the working move",
+    );
+}
+
+#[tokio::test]
+async fn claim_autofills_start_date_unless_planned() {
+    // gtcore-fdc175: `claim` is the other path onto `working`, so it stamps
+    // "Fecha Inicio" the same way — unset is filled, planned is respected.
+    let Ok(base) = std::env::var("GT_DOLT_URL") else {
+        eprintln!("GT_DOLT_URL unset — skipping claim start_date auto-fill contract");
+        return;
+    };
+    let base = base.trim_end_matches('/').to_string();
+    seed(&base).await.expect("seed");
+
+    let repo = DoltIssues::connect(&format!("{base}/{TEST_DB}")).expect("connect");
+
+    // --- empty start_date auto-fills on claim ------------------------------
+    let empty = format!("hq-cl-empty-{}", ulid::Ulid::new());
+    repo.insert(&NewIssue {
+        id: empty.clone(),
+        title: "claim auto-fill".into(),
+        issue_type: "task".into(),
+        created_by: "test".into(),
+        ..Default::default()
+    })
+    .await
+    .expect("seed insert");
+    assert!(matches!(
+        repo.claim(&empty, "alice").await.expect("claim ok"),
+        ClaimOutcome::Won,
+    ));
+    let today = dolt_today(&base).await;
+    assert_eq!(
+        repo.get_detail(&empty).await.unwrap().unwrap().start_date.as_deref(),
+        Some(today.as_str()),
+        "unset start_date filled with the event date on claim",
+    );
+
+    // --- a populated start_date is respected on claim ----------------------
+    let planned = format!("hq-cl-plan-{}", ulid::Ulid::new());
+    repo.insert(&NewIssue {
+        id: planned.clone(),
+        title: "claim respected".into(),
+        issue_type: "task".into(),
+        created_by: "test".into(),
+        ..Default::default()
+    })
+    .await
+    .expect("seed insert");
+    repo.update(
+        &planned,
+        &IssuePatch { start_date: Some("2019-03-04".into()), ..Default::default() },
+    )
+    .await
+    .expect("seed planned start_date");
+    assert!(matches!(
+        repo.claim(&planned, "bob").await.expect("claim ok"),
+        ClaimOutcome::Won,
+    ));
+    assert_eq!(
+        repo.get_detail(&planned).await.unwrap().unwrap().start_date.as_deref(),
+        Some("2019-03-04"),
+        "a hand-planned start_date is never overwritten by claim",
+    );
+}
+
+#[tokio::test]
+async fn close_autofills_due_date_unless_planned() {
+    // gtcore-fdc175: closing a bead derives "Fecha Fin" from the real close
+    // date — an UNSET due_date is filled with the close date, an
+    // already-populated (planned) due_date is RESPECTED, never overwritten.
+    let Ok(base) = std::env::var("GT_DOLT_URL") else {
+        eprintln!("GT_DOLT_URL unset — skipping due_date auto-fill contract");
+        return;
+    };
+    let base = base.trim_end_matches('/').to_string();
+    seed(&base).await.expect("seed");
+
+    let repo = DoltIssues::connect(&format!("{base}/{TEST_DB}")).expect("connect");
+
+    // --- empty due_date auto-fills with the close date ---------------------
+    let empty = format!("hq-dd-empty-{}", ulid::Ulid::new());
+    repo.insert(&NewIssue {
+        id: empty.clone(),
+        title: "due auto-fill".into(),
+        issue_type: "task".into(),
+        created_by: "test".into(),
+        ..Default::default()
+    })
+    .await
+    .expect("seed insert");
+    assert_eq!(
+        repo.get_detail(&empty).await.unwrap().unwrap().due_date,
+        None,
+        "fresh row has no due_date",
+    );
+
+    repo.close(&empty, "claude-host").await.expect("close ok");
+    let today = dolt_today(&base).await;
+    assert_eq!(
+        repo.get_detail(&empty).await.unwrap().unwrap().due_date.as_deref(),
+        Some(today.as_str()),
+        "unset due_date filled with the close date",
+    );
+
+    // --- a populated due_date is respected ---------------------------------
+    let planned = format!("hq-dd-plan-{}", ulid::Ulid::new());
+    repo.insert(&NewIssue {
+        id: planned.clone(),
+        title: "due respected".into(),
+        issue_type: "task".into(),
+        created_by: "test".into(),
+        ..Default::default()
+    })
+    .await
+    .expect("seed insert");
+    repo.update(
+        &planned,
+        &IssuePatch { due_date: Some("2030-12-31".into()), ..Default::default() },
+    )
+    .await
+    .expect("seed planned due_date");
+
+    repo.close(&planned, "claude-host").await.expect("close ok");
+    assert_eq!(
+        repo.get_detail(&planned).await.unwrap().unwrap().due_date.as_deref(),
+        Some("2030-12-31"),
+        "a hand-planned due_date is never overwritten on close",
+    );
+}
+
 #[tokio::test]
 async fn update_optimistic_concurrency_blocks_stale_writes() {
     let Ok(base) = std::env::var("GT_DOLT_URL") else {
