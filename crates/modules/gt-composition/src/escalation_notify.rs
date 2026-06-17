@@ -172,6 +172,7 @@ impl OperatorNotifier {
             id: ulid::Ulid::new().to_string(),
             workspace: self.workspace.clone(),
             recipient: recipient.clone(),
+            cc: vec![],
             subject: subject.to_string(),
             body: body.to_string(),
             template_ref: None,

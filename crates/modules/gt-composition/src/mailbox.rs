@@ -231,6 +231,7 @@ impl Mailbox {
                 id: ulid::Ulid::new().to_string(),
                 workspace: self.workspace.clone(),
                 recipient: msg.from.clone(),
+                cc: vec![],
                 subject: format!("Re: {subject}"),
                 body: body.to_string(),
                 template_ref: Some(format!("reply:{}", msg.message_id)),
@@ -531,6 +532,7 @@ impl Mailbox {
                             id: ulid::Ulid::new().to_string(),
                             workspace: self.workspace.clone(),
                             recipient: email,
+                            cc: vec![],
                             subject: format!("[gt] {} · {kind} {id}", record.kind),
                             body: format!(
                                 "Cambio en {kind} {id}: {}\n\n{}\n\nResponde a este correo para comentar.",
