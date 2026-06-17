@@ -525,23 +525,31 @@ async fn main() -> anyhow::Result<()> {
                     None => env.push((key.to_string(), value)),
                 }
             }
-            let resolved = kc
-                .active()
-                .ok()
-                .flatten()
-                .and_then(|a| kc.get(&a).ok().flatten().map(|c| (a, c.secret)));
-            if let Some((account, config_dir)) = resolved {
-                set_env(&mut spec.env, "CLAUDE_CONFIG_DIR", config_dir);
+            // gtcore-bf4acd: re-resolve through the credential guard, not a raw active()+get() —
+            // a re-sling must VALIDATE the active account's creds (and rotate off a dead one) so a
+            // polecat that died is not re-slung straight back into 401. A NoValidAccount / host
+            // default outcome leaves the stored env untouched (legacy behaviour).
+            let now_ms = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis() as u64)
+                .unwrap_or(0);
+            if let gt_composition::credential_guard::CredOutcome::Resolved { resolved, .. } =
+                gt_composition::credential_guard::resolve_for_sling(&kc, now_ms)
+            {
+                set_env(&mut spec.env, "CLAUDE_CONFIG_DIR", resolved.config_dir);
                 set_env(
                     &mut spec.env,
                     gt_polecat::GT_HOOK_ACCOUNT,
-                    account.clone(),
+                    resolved.account.clone(),
                 );
                 if proxy.is_some() {
                     set_env(
                         &mut spec.env,
                         "ANTHROPIC_CUSTOM_HEADERS",
-                        format!("x-gt-account: {account}\nx-gt-session: {}", spec.session),
+                        format!(
+                            "x-gt-account: {}\nx-gt-session: {}",
+                            resolved.account, spec.session
+                        ),
                     );
                 }
             }

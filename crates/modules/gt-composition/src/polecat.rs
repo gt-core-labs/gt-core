@@ -487,36 +487,76 @@ impl Plugin for PolecatSupervisorPlugin {
                 // Point the polecat's claude at the ACTIVE account's credentials dir
                 // (hq-agent-provisioning.7): the keychain's live pointer is what predictive
                 // rotation flips, so reading it here is what hands the next sling the rotated
-                // account. The stored secret IS the account's CLAUDE_CONFIG_DIR. Best-effort: any
-                // miss leaves the polecat on the host default ~/.claude (logged).
+                // account. The stored secret IS the account's CLAUDE_CONFIG_DIR.
+                //
+                // gtcore-bf4acd: the active account's `.credentials.json` is VALIDATED here (expiry,
+                // not just quota status) before stamping it. A credential-dead active account (token
+                // expired ~12h with no refresh — quota-`Healthy` but unauthable) is rotated to a
+                // credential-valid account; if NO account can authenticate, the sling is BLOCKED and
+                // the operator alerted rather than birthing the polecat into `401`. A missing
+                // credential file stays permissive (fresh/seeded dirs), and any keychain miss leaves
+                // the polecat on the host default ~/.claude.
                 let mut active_config_dir: Option<String> = None;
                 if let Some(kc) = &self.keychain {
-                    match kc.active() {
-                        Ok(Some(account)) => match kc.get(&account) {
-                            Ok(Some(cred)) => {
-                                active_config_dir = Some(cred.secret.clone());
-                                spec.env
-                                    .push(("CLAUDE_CONFIG_DIR".to_string(), cred.secret));
-                                // Stamp the account id so the polecat's Stop costs-report hook can
-                                // label its quota-feed sample (hq-agent-provisioning.8): the feed
-                                // message needs `{account}`, and only the daemon knows which
-                                // keychain account this sling resolved to.
-                                spec.env.push((
-                                    gt_polecat::GT_HOOK_ACCOUNT.to_string(),
-                                    account.clone(),
-                                ));
+                    match crate::credential_guard::resolve_for_sling(kc, now_ms()) {
+                        crate::credential_guard::CredOutcome::Resolved {
+                            resolved,
+                            dead,
+                            rotated_from,
+                        } => {
+                            active_config_dir = Some(resolved.config_dir.clone());
+                            spec.env
+                                .push(("CLAUDE_CONFIG_DIR".to_string(), resolved.config_dir));
+                            // Stamp the account id so the polecat's Stop costs-report hook can label
+                            // its quota-feed sample (hq-agent-provisioning.8): the feed message needs
+                            // `{account}`, and only the daemon knows which keychain account this sling
+                            // resolved to.
+                            spec.env.push((
+                                gt_polecat::GT_HOOK_ACCOUNT.to_string(),
+                                resolved.account.clone(),
+                            ));
+                            // Rotated off a credential-dead account → alert the operator (bell +
+                            // email) so they re-onboard/rotate it. The sling itself proceeds on the
+                            // healthy account picked above.
+                            if let Some(from) = &rotated_from {
+                                eprintln!(
+                                    "[polecat] sling for {bead}: active account {from} credential-dead — using {} instead",
+                                    resolved.account
+                                );
+                                for d in &dead {
+                                    self.emit_polecat(PolecatEvent::CredentialDead {
+                                        account: d.account.clone(),
+                                        reason: d.reason().to_string(),
+                                    });
+                                }
                             }
-                            Ok(None) => eprintln!(
-                                "[polecat] active claude account {account} has no stored credential — host default ~/.claude"
-                            ),
-                            Err(e) => eprintln!(
-                                "[polecat] keychain get({account}) failed: {e} — host default ~/.claude"
-                            ),
-                        },
-                        Ok(None) => {} // no active pointer yet → host default, no log noise
-                        Err(e) => eprintln!(
-                            "[polecat] keychain active() failed: {e} — host default ~/.claude"
-                        ),
+                        }
+                        crate::credential_guard::CredOutcome::NoValidAccount { dead } => {
+                            // No account can authenticate: blocking the sling (and freeing the slot)
+                            // is strictly better than a polecat born in 401 that latches a false
+                            // heartbeat and produces nothing (gtcore-bf4acd).
+                            self.allocator
+                                .lock()
+                                .expect("pool mutex")
+                                .release(&self.workspace);
+                            for d in &dead {
+                                self.emit_polecat(PolecatEvent::CredentialDead {
+                                    account: d.account.clone(),
+                                    reason: d.reason().to_string(),
+                                });
+                            }
+                            self.emit_polecat(PolecatEvent::SlingAuthBlocked {
+                                bead: bead.clone(),
+                                workspace: self.workspace.clone(),
+                            });
+                            eprintln!(
+                                "[polecat] sling BLOCKED for {bead}: no keychain account has valid credentials — alerting operator, not slinging into 401"
+                            );
+                            return Ok(());
+                        }
+                        // No keychain rotation configured (no active pointer / no cred record) →
+                        // host default ~/.claude, unchanged from before the guard.
+                        crate::credential_guard::CredOutcome::HostDefault => {}
                     }
                 }
                 // Route claude through the Anthropic passthrough proxy (hq-284842) so EVERY call
@@ -920,6 +960,16 @@ pub fn rig_routing_from_catalog(
     (configs, paths)
 }
 
+/// Wall-clock epoch milliseconds, for the sling-time credential guard (gtcore-bf4acd). Mirrors the
+/// `now_ms` discipline in `usage_probe.rs`; `0` on a pre-epoch clock (the guard then treats every
+/// expiry as in the future, i.e. fails open — liveness over a spurious credential block).
+fn now_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
 /// Compute the host-wide polecat admission cap from live metrics (`hq-orchd.3`): the lesser of the
 /// CPU-core count and `MemAvailable / per-polecat budget`, floored at 1 so the daemon can always
 /// make progress. Linux-native (`/proc/meminfo` + std), no external dependency — keeping the
@@ -1215,6 +1265,133 @@ mod tests {
             .unwrap()
             .expect("GT_HOOK_ACCOUNT injected from the active account");
         assert_eq!(acct, "acct-b");
+    }
+
+    /// gtcore-bf4acd: write a `.credentials.json` into `config_dir`, with a controllable expiry.
+    fn write_creds(config_dir: &std::path::Path, expires_at_ms: Option<u64>, refresh: bool) {
+        std::fs::create_dir_all(config_dir).unwrap();
+        let rt = if refresh { r#","refreshToken":"rt-1""# } else { "" };
+        let exp = expires_at_ms
+            .map(|e| format!(r#","expiresAt":{e}"#))
+            .unwrap_or_default();
+        let body = format!(r#"{{"claudeAiOauth":{{"accessToken":"at-1"{rt}{exp}}}}}"#);
+        std::fs::write(config_dir.join(".credentials.json"), body).unwrap();
+    }
+
+    #[tokio::test]
+    async fn dispatch_skips_a_credential_dead_active_account_no_polecat_born_in_401() {
+        // gtcore-bf4acd / AC1+T1: the active account's token expired (no refresh) — quota status is
+        // irrelevant. The sling must NOT stamp the dead account; it rotates to the credential-valid
+        // account, stamps THAT, and flips the live pointer so future slings follow.
+        use gt_quota::InMemoryKeychain;
+        let uniq = format!(
+            "{}-{}",
+            std::process::id(),
+            SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos()
+        );
+        let dead_dir = std::env::temp_dir().join(format!("gt-cred-dead-{uniq}"));
+        let fresh_dir = std::env::temp_dir().join(format!("gt-cred-fresh-{uniq}"));
+        let now = now_ms();
+        write_creds(&dead_dir, Some(now.saturating_sub(1)), false); // expired, no refresh
+        write_creds(&fresh_dir, Some(now + 3_600_000), true); // valid
+
+        let fake = Arc::new(FakeTmux::new());
+        let tmux: Arc<dyn Tmux> = fake.clone();
+        let supervisor = Arc::new(PolecatSupervisor::new(tmux.clone(), RestartConfig::default(), 8));
+        let template = SpawnTemplate {
+            rig: "hq".into(),
+            prefix: "hq".into(),
+            workdir: "/tmp".into(),
+            command: "true".into(),
+            args: vec![],
+            base_env: vec![],
+            heartbeat_dir: std::env::temp_dir(),
+        };
+        let keychain = Arc::new(InMemoryKeychain::seeded([
+            ("dead", dead_dir.to_string_lossy().to_string()),
+            ("fresh", fresh_dir.to_string_lossy().to_string()),
+        ]));
+        keychain.set_active("dead").unwrap();
+        let alloc = Arc::new(Mutex::new(PoolAllocator::new(10, 5)));
+        let p = PolecatSupervisorPlugin::new("acme", tmux, template, supervisor, alloc)
+            .with_keychain(keychain.clone());
+
+        p.on_event(&record(SchedEvent::Dispatched {
+            bead: "gg-2".into(),
+            worker: "w1".into(),
+        }))
+        .await
+        .unwrap();
+
+        // The polecat was slung onto the FRESH account, not the credential-dead one.
+        let cfg = fake
+            .show_environment("hq-gg-2", "CLAUDE_CONFIG_DIR")
+            .unwrap()
+            .expect("CLAUDE_CONFIG_DIR injected from the rotated-to healthy account");
+        assert_eq!(cfg, fresh_dir.to_string_lossy());
+        let acct = fake
+            .show_environment("hq-gg-2", gt_polecat::GT_HOOK_ACCOUNT)
+            .unwrap()
+            .unwrap();
+        assert_eq!(acct, "fresh");
+        // The live pointer was persisted so the NEXT sling also lands on the healthy account.
+        assert_eq!(keychain.active().unwrap().as_deref(), Some("fresh"));
+
+        let _ = std::fs::remove_dir_all(&dead_dir);
+        let _ = std::fs::remove_dir_all(&fresh_dir);
+    }
+
+    #[tokio::test]
+    async fn dispatch_blocks_the_sling_when_no_account_has_valid_credentials() {
+        // gtcore-bf4acd / AC2: every account's creds are dead → block the sling and free the slot
+        // instead of birthing a polecat into 401.
+        use gt_quota::InMemoryKeychain;
+        let uniq = format!(
+            "{}-{}",
+            std::process::id(),
+            SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos()
+        );
+        let dead_dir = std::env::temp_dir().join(format!("gt-cred-alldead-{uniq}"));
+        let now = now_ms();
+        write_creds(&dead_dir, Some(now.saturating_sub(1)), false); // expired, no refresh
+
+        let fake = Arc::new(FakeTmux::new());
+        let tmux: Arc<dyn Tmux> = fake.clone();
+        let supervisor = Arc::new(PolecatSupervisor::new(tmux.clone(), RestartConfig::default(), 8));
+        let template = SpawnTemplate {
+            rig: "hq".into(),
+            prefix: "hq".into(),
+            workdir: "/tmp".into(),
+            command: "true".into(),
+            args: vec![],
+            base_env: vec![],
+            heartbeat_dir: std::env::temp_dir(),
+        };
+        let keychain = Arc::new(InMemoryKeychain::seeded([(
+            "dead",
+            dead_dir.to_string_lossy().to_string(),
+        )]));
+        keychain.set_active("dead").unwrap();
+        let alloc = Arc::new(Mutex::new(PoolAllocator::new(10, 5)));
+        let p = PolecatSupervisorPlugin::new("acme", tmux, template, supervisor, alloc.clone())
+            .with_keychain(keychain);
+
+        p.on_event(&record(SchedEvent::Dispatched {
+            bead: "gg-3".into(),
+            worker: "w1".into(),
+        }))
+        .await
+        .unwrap();
+
+        // No tmux session was spawned, and the admission slot was released (not leaked).
+        assert!(!fake.has_session("hq-gg-3"), "no polecat should be slung into 401");
+        assert_eq!(
+            alloc.lock().unwrap().in_flight("acme"),
+            0,
+            "the claimed slot must be released when the sling is blocked"
+        );
+
+        let _ = std::fs::remove_dir_all(&dead_dir);
     }
 
     #[tokio::test]
