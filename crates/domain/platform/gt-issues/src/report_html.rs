@@ -71,17 +71,18 @@ const TD: &str = "padding:6px 8px;border:1px solid #d9e2f3;font-size:13px;vertic
 /// wrap, since they hold long text + comments.
 const NOWRAP: &str = "white-space:nowrap;";
 
-/// Per-module palette `(row_tint, band_tint)`: each module group paints its task
-/// rows with a tenuous tint and its separator band with a slightly stronger
-/// shade, cycling so adjacent modules are visually distinct (operator request:
-/// "una fila por submódulo + colores tenues por módulo").
-const MODULE_TINTS: &[(&str, &str)] = &[
-    ("#f2f6fc", "#dbe6f6"), // blue
-    ("#f1f8f1", "#dcefdc"), // green
-    ("#fdf6ee", "#f8e6d2"), // orange
-    ("#f7f2fb", "#e7dbf3"), // purple
-    ("#fbf2f3", "#f6dcdf"), // pink
-    ("#eef9f8", "#d4efec"), // teal
+/// Per-module palette `(row_tint, band_tint, icon)`: each module group paints
+/// its task rows with a tenuous tint, its separator band with a slightly
+/// stronger shade, and carries its own icon — all cycling by module index so
+/// adjacent modules are visually distinct (operator request: "una fila por
+/// submódulo + colores tenues por módulo + iconos variados").
+const MODULE_TINTS: &[(&str, &str, &str)] = &[
+    ("#f2f6fc", "#dbe6f6", "🏢"), // blue
+    ("#f1f8f1", "#dcefdc", "🧩"), // green
+    ("#fdf6ee", "#f8e6d2", "⚙️"), // orange
+    ("#f7f2fb", "#e7dbf3", "📊"), // purple
+    ("#fbf2f3", "#f6dcdf", "🗄️"), // pink
+    ("#eef9f8", "#d4efec", "🗂️"), // teal
 ];
 
 /// One KPI card cell.
@@ -167,12 +168,12 @@ pub fn render_digest(report: &OperatorReport, summary: &AnalyticsSummary, fecha:
             .join("")
     ));
     for (mi, section) in report.sections.iter().enumerate() {
-        let (row_tint, band_tint) = MODULE_TINTS[mi % MODULE_TINTS.len()];
+        let (row_tint, band_tint, icon) = MODULE_TINTS[mi % MODULE_TINTS.len()];
         // Group separator row per module (epic) — a full-width band with the
-        // module title and its hours subtotal.
+        // module title, its own icon, and its hours subtotal.
         html.push_str(&format!(
             "<tr><td colspan=\"10\" style=\"{TD}background:{band_tint};color:{NAVY};\
-             font-weight:bold;\">🏢 {title}\
+             font-weight:bold;\">{icon} {title}\
              <span style=\"float:right;font-weight:normal;color:#5b6b8c;\">{horas:.1} h</span>\
              </td></tr>",
             title = esc(&section.module_title),
