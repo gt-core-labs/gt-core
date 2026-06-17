@@ -123,46 +123,41 @@ pub fn select_slingable(
     skew_ms: u64,
 ) -> (Selection, Vec<DeadAccount>) {
     let mut dead = Vec::new();
-    let mut healths: Vec<(&Candidate, CredentialHealth)> = Vec::with_capacity(candidates.len());
-    for c in candidates {
+    let mut first_slingable: Option<usize> = None;
+    let mut preferred_idx: Option<usize> = None;
+    for (i, c) in candidates.iter().enumerate() {
         let health = classify_credentials(c.creds.as_deref(), now_ms, skew_ms);
-        if !health.is_slingable() {
+        if health.is_slingable() {
+            if first_slingable.is_none() {
+                first_slingable = Some(i);
+            }
+            // Prefer the active pointer when it is slingable — no gratuitous rotation.
+            if preferred == Some(c.account.as_str()) {
+                preferred_idx = Some(i);
+            }
+        } else {
             dead.push(DeadAccount {
                 account: c.account.clone(),
                 health,
             });
         }
-        healths.push((c, health));
     }
 
-    // Prefer the active pointer when it is slingable — no gratuitous rotation.
-    if let Some(pref) = preferred {
-        if let Some((c, health)) = healths
-            .iter()
-            .find(|(c, h)| c.account == pref && h.is_slingable())
-        {
-            return (
+    // The active pointer wins when slingable; otherwise the first slingable candidate in order.
+    match preferred_idx.or(first_slingable) {
+        Some(i) => {
+            let c = &candidates[i];
+            let health = classify_credentials(c.creds.as_deref(), now_ms, skew_ms);
+            (
                 Selection::Use {
                     account: c.account.clone(),
-                    health: *health,
+                    health,
                 },
                 dead,
-            );
+            )
         }
+        None => (Selection::NoValidAccount, dead),
     }
-
-    // Otherwise the first slingable candidate in caller order.
-    if let Some((c, health)) = healths.iter().find(|(_, h)| h.is_slingable()) {
-        return (
-            Selection::Use {
-                account: c.account.clone(),
-                health: *health,
-            },
-            dead,
-        );
-    }
-
-    (Selection::NoValidAccount, dead)
 }
 
 #[cfg(test)]
