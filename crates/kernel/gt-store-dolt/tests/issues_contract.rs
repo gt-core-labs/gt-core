@@ -1151,6 +1151,85 @@ async fn dispatch_column_round_trips_and_migration_is_idempotent() {
     );
 }
 
+/// gtcore-b45a2d: the `role_scope` column round-trips through insert/update/
+/// get_detail. Omitted stores NULL; a patch overwrites; and a LEGACY row that
+/// carries an arbitrary string (the column was free-form before the closed
+/// `RoleScope` set) still reads back verbatim — the read path stays `String`,
+/// only create/update narrow.
+#[tokio::test]
+async fn role_scope_column_round_trips_and_legacy_value_reads() {
+    let Ok(base) = std::env::var("GT_DOLT_URL") else {
+        eprintln!("GT_DOLT_URL unset — skipping DoltIssues role_scope contract");
+        return;
+    };
+    let base = base.trim_end_matches('/').to_string();
+    seed(&base).await.expect("seed");
+    let repo = DoltIssues::connect(&format!("{base}/{TEST_DB}")).expect("connect");
+
+    // Omitted role_scope → NULL (not every bead pins a role).
+    let plain = format!("hq-role-{}", ulid::Ulid::new());
+    repo.insert(&NewIssue {
+        id: plain.clone(),
+        title: "no role".into(),
+        issue_type: "task".into(),
+        created_by: "test".into(),
+        ..Default::default()
+    })
+    .await
+    .expect("insert plain");
+    assert_eq!(
+        repo.get_detail(&plain).await.expect("d").expect("row").role_scope,
+        None,
+        "omitted role_scope stores NULL"
+    );
+
+    // Explicit role_scope on insert surfaces on read.
+    let scoped = format!("hq-role-{}", ulid::Ulid::new());
+    repo.insert(&NewIssue {
+        id: scoped.clone(),
+        title: "sheriff bead".into(),
+        issue_type: "task".into(),
+        created_by: "test".into(),
+        role_scope: Some("sheriff".into()),
+        ..Default::default()
+    })
+    .await
+    .expect("insert scoped");
+    assert_eq!(
+        repo.get_detail(&scoped).await.expect("d").expect("row").role_scope.as_deref(),
+        Some("sheriff")
+    );
+
+    // Patch overwrites the discriminator with another closed-set token.
+    repo.update(&scoped, &IssuePatch { role_scope: Some("refinery".into()), ..Default::default() })
+        .await
+        .expect("patch role_scope");
+    assert_eq!(
+        repo.get_detail(&scoped).await.expect("d").expect("row").role_scope.as_deref(),
+        Some("refinery")
+    );
+
+    // BACK-COMPAT: a legacy row carrying an out-of-set arbitrary value (written
+    // when the column was free-form) reads back verbatim — the closed set guards
+    // only the create/update boundary, never the read path.
+    let legacy = format!("hq-role-{}", ulid::Ulid::new());
+    repo.insert(&NewIssue {
+        id: legacy.clone(),
+        title: "legacy free-form".into(),
+        issue_type: "task".into(),
+        created_by: "test".into(),
+        role_scope: Some("archivist-emeritus".into()),
+        ..Default::default()
+    })
+    .await
+    .expect("insert legacy");
+    assert_eq!(
+        repo.get_detail(&legacy).await.expect("d").expect("row").role_scope.as_deref(),
+        Some("archivist-emeritus"),
+        "legacy free-form role_scope reads without breaking"
+    );
+}
+
 /// hq-docs-archive-sync: `archive_old_closed` returns the archived set (id + issue_type), not a
 /// bare count — the shape the archive interceptor reads to soft-delete an archived epic's docs.
 #[tokio::test]
