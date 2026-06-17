@@ -136,37 +136,35 @@ pub fn render_digest(report: &OperatorReport, summary: &AnalyticsSummary, fecha:
     ));
     html.push_str("</tr></table>");
 
-    // Bitácora: one table per module section, mockup column order.
+    // Bitácora: ONE flat table — every task row carries the complete column set
+    // (Modulo first, CSV/Excel-style), no per-section bands. Rows stay grouped by
+    // module because the sections are emitted in order.
+    html.push_str("<table style=\"border-collapse:collapse;width:100%;margin-top:16px;\">");
+    html.push_str(&format!(
+        "<tr>{}</tr>",
+        ["Modulo", "Tarea", "Proceso", "Nivel", "Horas Est.", "Estado", "Responsable",
+         "Fecha Inicio", "Fecha Fin", "Notas"]
+            .map(|h| format!(
+                "<th style=\"{TD}background:{HEADER_BG};color:#ffffff;text-align:left;\">{h}</th>"
+            ))
+            .join("")
+    ));
+    let mut ri = 0usize;
     for section in &report.sections {
-        html.push_str(&format!(
-            "<table style=\"border-collapse:collapse;width:100%;\
-             margin-top:16px;\"><tr><td colspan=\"9\" style=\"background:{HEADER_BG};\
-             color:#ffffff;padding:8px 10px;font-weight:bold;font-size:14px;\">{title}\
-             <span style=\"float:right;font-weight:normal;\">{horas:.1} h</span></td></tr>",
-            title = esc(&section.module_title),
-            horas = section.horas,
-        ));
-        // Epic-level comments: the epic is a section header, not a row, so its
-        // comments render in a full-width band under the title (gtcore-01bcf2).
+        // Epic-level comments (rare): a full-width row under the module name.
         if !section.comentarios.is_empty() {
             html.push_str(&format!(
-                "<tr><td colspan=\"9\" style=\"{TD}background:#ffffff;\">{}</td></tr>",
-                render_comments(&section.comentarios, true),
+                "<tr><td style=\"{TD}\">{m}</td><td colspan=\"9\" style=\"{TD}background:#ffffff;\">{c}</td></tr>",
+                m = esc(&section.module_title),
+                c = render_comments(&section.comentarios, true),
             ));
         }
-        html.push_str(&format!(
-            "<tr>{}</tr>",
-            ["Tarea", "Proceso", "Nivel", "Horas Est.", "Estado", "Responsable",
-             "Fecha Inicio", "Fecha Fin", "Notas"]
-                .map(|h| format!(
-                    "<th style=\"{TD}background:{ROW_ALT};color:{NAVY};text-align:left;\">{h}</th>"
-                ))
-                .join("")
-        ));
-        for (i, row) in section.rows.iter().enumerate() {
-            let bg = if i % 2 == 1 { format!("background:{ROW_ALT};") } else { String::new() };
+        for row in &section.rows {
+            let bg = if ri % 2 == 1 { format!("background:{ROW_ALT};") } else { String::new() };
+            ri += 1;
             html.push_str(&format!(
-                "<tr><td style=\"{TD}{bg}\">{tarea}<div style=\"font-size:11px;color:#6c757d;\">\
+                "<tr><td style=\"{TD}{bg}\">{modulo}</td>\
+                 <td style=\"{TD}{bg}\">{tarea}<div style=\"font-size:11px;color:#6c757d;\">\
                  {id}</div></td><td style=\"{TD}{bg}\">{proceso}</td>\
                  <td style=\"{TD}{bg}\">{nivel}</td>\
                  <td style=\"{TD}{bg}text-align:right;\">{horas}</td>\
@@ -175,6 +173,7 @@ pub fn render_digest(report: &OperatorReport, summary: &AnalyticsSummary, fecha:
                  <td style=\"{TD}{bg}white-space:nowrap;\">{ini}</td>\
                  <td style=\"{TD}{bg}white-space:nowrap;\">{fin}</td>\
                  <td style=\"{TD}{bg}\">{notas}{comentarios}</td></tr>",
+                modulo = esc(&section.module_title),
                 tarea = esc(&row.tarea),
                 id = esc(&row.id),
                 proceso = esc(&row.proceso),
@@ -189,8 +188,8 @@ pub fn render_digest(report: &OperatorReport, summary: &AnalyticsSummary, fecha:
                 comentarios = render_comments(&row.comentarios, false),
             ));
         }
-        html.push_str("</table>");
     }
+    html.push_str("</table>");
 
     // TOTAL HORAS footer (xlsx parity).
     html.push_str(&format!(
@@ -271,6 +270,8 @@ mod tests {
         for kpi in ["Avance", "Errores", "Pendientes", "Retrasos", "Horas"] {
             assert!(html.contains(kpi), "missing KPI {kpi}");
         }
+        // Flat table: the Modulo column is a real header (not a section band).
+        assert!(html.contains(">Modulo</th>"), "missing flat Modulo column header");
         // Reconciles with the summary by construction.
         assert!(html.contains(&format!("{:.0}%", summary.avance.pct)));
         assert!(html.contains("3 tareas"), "missing task count in header");
