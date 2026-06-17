@@ -184,6 +184,41 @@ pub fn draft_for(record: &EventRecord) -> Option<NotificationDraft> {
                 kind: "info",
             })
         }
+        // A claude account's stored credentials are expired/dead (gtcore-bf4acd): selection skipped
+        // it (validating credential expiry, not just quota status). An ALERT (bell + email) so the
+        // operator re-onboards/rotates the account before more slings hit it — exactly the signal
+        // that was missing during the incident where polecats were born in 401 for ~1h.
+        "polecat.credential-dead.v1" => {
+            let PolecatEvent::CredentialDead { account, reason } =
+                record.decode::<PolecatEvent>().ok()?
+            else {
+                return None;
+            };
+            Some(NotificationDraft {
+                title: format!("Cuenta {account}: credenciales muertas"),
+                body: format!(
+                    "Las credenciales de {account} están {reason}; la selección la saltó para no slingear en 401. Re-onboardea o rota la cuenta."
+                ),
+                kind: "alert",
+            })
+        }
+        // No account could authenticate, so the bead's sling was blocked rather than born in 401
+        // (gtcore-bf4acd). An ALERT (bell + email): the autonomous loop is stuck on this bead until
+        // a valid credential exists — the operator must act.
+        "polecat.sling-auth-blocked.v1" => {
+            let PolecatEvent::SlingAuthBlocked { bead, workspace } =
+                record.decode::<PolecatEvent>().ok()?
+            else {
+                return None;
+            };
+            Some(NotificationDraft {
+                title: format!("Sling de {bead} bloqueado: sin credenciales válidas"),
+                body: format!(
+                    "Ninguna cuenta del keychain tiene credenciales válidas en el workspace {workspace}; {bead} no se slingó para evitar un 401. Onboardea o refresca una cuenta."
+                ),
+                kind: "alert",
+            })
+        }
         _ => None,
     }
 }
@@ -427,6 +462,31 @@ mod tests {
         assert_eq!(d.kind, "info");
         assert!(d.title.contains("gtweb-4"));
         assert!(d.body.contains("no server running"));
+    }
+
+    #[test]
+    fn credential_dead_renders_an_alert_naming_the_account() {
+        let d = draft_for(&record(PolecatEvent::CredentialDead {
+            account: "acct-z".into(),
+            reason: "credenciales expiradas sin refresh token".into(),
+        }))
+        .expect("credential-dead warrants a notification");
+        // Alert (bell + email) — the operator must re-onboard/rotate.
+        assert_eq!(d.kind, "alert");
+        assert!(d.title.contains("acct-z"));
+        assert!(d.body.contains("expiradas"), "body carries the reason: {}", d.body);
+    }
+
+    #[test]
+    fn sling_auth_blocked_renders_an_alert_naming_the_bead() {
+        let d = draft_for(&record(PolecatEvent::SlingAuthBlocked {
+            bead: "gtcore-5".into(),
+            workspace: "default".into(),
+        }))
+        .expect("sling-auth-blocked warrants a notification");
+        assert_eq!(d.kind, "alert");
+        assert!(d.title.contains("gtcore-5"));
+        assert!(d.title.contains("sin credenciales"), "title says why: {}", d.title);
     }
 
     #[test]
