@@ -302,6 +302,7 @@ impl Plugin for WorkflowNotifyPlugin {
                     id: ulid::Ulid::new().to_string(),
                     workspace: self.workspace.clone(),
                     recipient: recipient.clone(),
+                    cc: vec![],
                     subject: format!("[gt] {}", title_for_email),
                     body: body_for_email,
                     template_ref: None,

@@ -52,6 +52,7 @@ fn new_email(id: &str, ws: &str, send_at: Option<sqlx::types::chrono::DateTime<U
         id: id.into(),
         workspace: ws.into(),
         recipient: "ops@example.com".into(),
+        cc: vec![],
         subject: "reporte".into(),
         body: "hola".into(),
         template_ref: None,

@@ -138,6 +138,7 @@ impl DomainHandler for EmailHandler {
                         id: ulid::Ulid::new().to_string(),
                         workspace: workspace.to_string(),
                         recipient: to,
+                        cc: vec![],
                         subject,
                         body,
                         template_ref,

@@ -13,8 +13,9 @@
 //! Adding a new report type = registering one render fn in [`render_for`];
 //! the daemon, CRUD surface and UI pick it up from [`kinds`] untouched.
 //!
-//! Delivery stays outbox-first (ADR hq-423a4b D8): one row per recipient, the
-//! drain owns the transport. Manual sends never touch `last_sent_date`.
+//! Delivery stays outbox-first (ADR hq-423a4b D8): ONE row per send — To: the
+//! configured sender, every registered recipient in CC (gtcore-ecf70d) — and
+//! the drain owns the transport. Manual sends never touch `last_sent_date`.
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -686,9 +687,10 @@ impl ReportService {
         }
     }
 
-    /// Build + render ONE schedule's report and enqueue an outbox row per
-    /// recipient (the schedule's own list, else the workspace's enabled
-    /// globals). Returns how many were queued. Never touches
+    /// Build + render ONE schedule's report and enqueue a SINGLE outbox row —
+    /// To: the configured sender, every recipient (the schedule's own list,
+    /// else the workspace's enabled globals) in CC. Returns the number of
+    /// emails queued (0 with no recipients, else 1). Never touches
     /// `last_sent_date` — that is the daemon's bookkeeping.
     pub async fn send_schedule(
         &self,
@@ -738,27 +740,37 @@ impl ReportService {
         let summary = summarize(&schedule.rig, &schedule.workspace, &rows, 0, &today, 7, 30, &parent_map);
         let (subject, html) = render(&report, &summary, &today);
 
-        let outbox = PgEmailOutbox::new(self.pool.clone());
-        let mut queued = 0;
-        for to in recipients {
-            match outbox
-                .enqueue(NewEmail {
-                    id: ulid::Ulid::new().to_string(),
-                    workspace: schedule.workspace.clone(),
-                    recipient: to,
-                    subject: subject.clone(),
-                    body: html.clone(),
-                    template_ref: Some(format!("report:{}", schedule.kind)),
-                    send_at: None,
-                    created_by: created_by.to_string(),
-                })
-                .await
-            {
-                Ok(_) => queued += 1,
-                Err(e) => eprintln!("[report-scheduler] outbox enqueue failed: {e}"),
+        // One email To: the configured sender (`GT_SMTP_FROM`) with every
+        // registered recipient in CC (gtcore-ecf70d) — instead of one outbox row
+        // per recipient. Without an SMTP sender (dev/log transport) fall back to
+        // the first recipient as To and the rest in CC, so the single-email
+        // shape still holds.
+        let (to, cc): (String, Vec<String>) = match std::env::var("GT_SMTP_FROM") {
+            Ok(from) if !from.trim().is_empty() => (from.trim().to_string(), recipients),
+            _ => {
+                let mut it = recipients.into_iter();
+                let first = it.next().expect("recipients checked non-empty above");
+                (first, it.collect())
             }
-        }
-        Ok(queued)
+        };
+
+        let outbox = PgEmailOutbox::new(self.pool.clone());
+        outbox
+            .enqueue(NewEmail {
+                id: ulid::Ulid::new().to_string(),
+                workspace: schedule.workspace.clone(),
+                recipient: to,
+                cc,
+                subject,
+                body: html,
+                template_ref: Some(format!("report:{}", schedule.kind)),
+                send_at: None,
+                created_by: created_by.to_string(),
+            })
+            .await
+            .map_err(|e| format!("outbox enqueue failed: {e}"))?;
+        // One email queued (carrying the whole CC list), not one per recipient.
+        Ok(1)
     }
 }
 

@@ -196,12 +196,15 @@ const EMAIL_0001_SQL: &str = include_str!("../migrations/email/0001_email_outbox
 const EMAIL_0002_SQL: &str = include_str!("../migrations/email/0002_email_subscriptions.sql");
 /// Migration #3: `report_subscriptions` — scheduled-report recipients (hq-562e0b).
 const EMAIL_0003_SQL: &str = include_str!("../migrations/email/0003_report_subscriptions.sql");
+/// Migration #4: `email_outbox.cc` — carbon-copy recipients (gtcore-ecf70d).
+const EMAIL_0004_SQL: &str = include_str!("../migrations/email/0004_email_outbox_cc.sql");
 
 pub fn email_migrations() -> Vec<Migration> {
     vec![
         Migration::new(1, "0001_email_outbox", EMAIL_0001_SQL),
         Migration::new(2, "0002_email_subscriptions", EMAIL_0002_SQL),
         Migration::new(3, "0003_report_subscriptions", EMAIL_0003_SQL),
+        Migration::new(4, "0004_email_outbox_cc", EMAIL_0004_SQL),
     ]
 }
 

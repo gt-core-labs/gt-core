@@ -21,8 +21,11 @@ use std::sync::Mutex;
 /// One outbound email, transport-agnostic.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EmailMessage {
-    /// Recipient address.
+    /// Primary recipient (the To: header).
     pub to: String,
+    /// Carbon-copy recipients. Empty = a plain single-recipient send; the
+    /// report digest fills this with every registered subscriber (gtcore-ecf70d).
+    pub cc: Vec<String>,
     /// Subject line.
     pub subject: String,
     /// Plain-text body (templating happens upstream of the transport).
@@ -63,8 +66,9 @@ impl LogTransport {
 impl EmailTransport for LogTransport {
     fn send(&self, msg: &EmailMessage) -> Result<(), String> {
         eprintln!(
-            "[email-outbox] LOG transport delivered: to={} subject={:?} ({} bytes)",
+            "[email-outbox] LOG transport delivered: to={} cc={} subject={:?} ({} bytes)",
             msg.to,
+            msg.cc.len(),
             msg.subject,
             msg.body.len()
         );
@@ -167,15 +171,22 @@ impl EmailTransport for SmtpTransport {
         use lettre::transport::smtp::authentication::Credentials;
         use lettre::{Message, Transport};
 
-        let builder = Message::builder()
+        let mut builder = Message::builder()
             .from(
                 self.config
                     .from
                     .parse()
                     .map_err(|e| format!("invalid GT_SMTP_FROM {:?}: {e}", self.config.from))?,
             )
-            .to(msg.to.parse().map_err(|e| format!("invalid recipient {:?}: {e}", msg.to))?)
-            .subject(msg.subject.clone());
+            .to(msg.to.parse().map_err(|e| format!("invalid recipient {:?}: {e}", msg.to))?);
+        // Every registered subscriber rides in CC (gtcore-ecf70d): one email,
+        // all in copy. A bad address fails the row loud rather than silently
+        // dropping a recipient.
+        for addr in &msg.cc {
+            builder =
+                builder.cc(addr.parse().map_err(|e| format!("invalid cc {addr:?}: {e}"))?);
+        }
+        let builder = builder.subject(msg.subject.clone());
         // HTML bodies (the report digest) ride as text/html so the client
         // renders instead of showing source; everything else stays plain.
         let email = if body_is_html(&msg.body) {
@@ -239,6 +250,7 @@ mod tests {
     fn msg() -> EmailMessage {
         EmailMessage {
             to: "ops@example.com".into(),
+            cc: vec![],
             subject: "reporte".into(),
             body: "hola".into(),
         }
@@ -316,6 +328,12 @@ mod tests {
         bad_to.to = "nope".into();
         let err = t("smtp://mail:587", "gt@example.com").send(&bad_to).expect_err("bad to");
         assert!(err.contains("recipient"), "{err}");
+
+        // A bad CC address fails the row loud (named "cc"), not silently dropped.
+        let mut bad_cc = msg();
+        bad_cc.cc = vec!["ok@example.com".into(), "nope".into()];
+        let err = t("smtp://mail:587", "gt@example.com").send(&bad_cc).expect_err("bad cc");
+        assert!(err.contains("cc"), "{err}");
 
         let err = t("ftp://mail:21", "gt@example.com").send(&msg()).expect_err("bad scheme");
         assert!(err.contains("GT_SMTP_URL"), "{err}");

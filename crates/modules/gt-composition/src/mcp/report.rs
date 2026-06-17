@@ -374,6 +374,7 @@ impl DomainHandler for ReportHandler {
                             id: ulid::Ulid::new().to_string(),
                             workspace: ctx.workspace.unwrap_or("default").to_string(),
                             recipient: to.to_string(),
+                            cc: vec![],
                             subject: format!("Reporte tracker {rig}/{workspace}"),
                             body: format!(
                                 "Reporte generado ({} módulos, TOTAL HORAS {}).\nDescarga: {link}",

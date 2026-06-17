@@ -73,6 +73,7 @@ impl InvitesHandler {
             id: ulid::Ulid::new().to_string(),
             workspace: invite.workspace.clone(),
             recipient: invite.email.clone(),
+            cc: vec![],
             subject: format!(
                 "Invitación al tablero del workspace {} (rol {})",
                 invite.workspace, invite.role
