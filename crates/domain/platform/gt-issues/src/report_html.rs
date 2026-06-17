@@ -65,7 +65,11 @@ fn estado_color(estado: &str) -> &'static str {
 const NAVY: &str = "#1f3864";
 const HEADER_BG: &str = "#2e5395";
 const ROW_ALT: &str = "#f2f6fc";
-const TD: &str = "padding:6px 8px;border:1px solid #d9e2f3;font-size:13px;";
+const TD: &str = "padding:6px 8px;border:1px solid #d9e2f3;font-size:13px;vertical-align:top;";
+/// Short-column cells stay on one line (the operator asked for nowrap) so the
+/// narrow columns get their own width and stop bunching up; only Tarea/Notas
+/// wrap, since they hold long text + comments.
+const NOWRAP: &str = "white-space:nowrap;";
 
 /// One KPI card cell.
 fn kpi(label: &str, value: String, detail: String) -> String {
@@ -145,7 +149,7 @@ pub fn render_digest(report: &OperatorReport, summary: &AnalyticsSummary, fecha:
         ["Modulo", "Tarea", "Proceso", "Nivel", "Horas Est.", "Estado", "Responsable",
          "Fecha Inicio", "Fecha Fin", "Notas"]
             .map(|h| format!(
-                "<th style=\"{TD}background:{HEADER_BG};color:#ffffff;text-align:left;\">{h}</th>"
+                "<th style=\"{TD}{NOWRAP}background:{HEADER_BG};color:#ffffff;text-align:left;\">{h}</th>"
             ))
             .join("")
     ));
@@ -163,15 +167,15 @@ pub fn render_digest(report: &OperatorReport, summary: &AnalyticsSummary, fecha:
             let bg = if ri % 2 == 1 { format!("background:{ROW_ALT};") } else { String::new() };
             ri += 1;
             html.push_str(&format!(
-                "<tr><td style=\"{TD}{bg}\">{modulo}</td>\
+                "<tr><td style=\"{TD}{bg}{NOWRAP}\">{modulo}</td>\
                  <td style=\"{TD}{bg}\">{tarea}<div style=\"font-size:11px;color:#6c757d;\">\
-                 {id}</div></td><td style=\"{TD}{bg}\">{proceso}</td>\
-                 <td style=\"{TD}{bg}\">{nivel}</td>\
-                 <td style=\"{TD}{bg}text-align:right;\">{horas}</td>\
-                 <td style=\"{TD}{bg}color:{estado_color};font-weight:bold;\">{estado}</td>\
-                 <td style=\"{TD}{bg}\">{resp}</td>\
-                 <td style=\"{TD}{bg}white-space:nowrap;\">{ini}</td>\
-                 <td style=\"{TD}{bg}white-space:nowrap;\">{fin}</td>\
+                 {id}</div></td><td style=\"{TD}{bg}{NOWRAP}\">{proceso}</td>\
+                 <td style=\"{TD}{bg}{NOWRAP}\">{nivel}</td>\
+                 <td style=\"{TD}{bg}{NOWRAP}text-align:right;\">{horas}</td>\
+                 <td style=\"{TD}{bg}{NOWRAP}color:{estado_color};font-weight:bold;\">{estado}</td>\
+                 <td style=\"{TD}{bg}{NOWRAP}\">{resp}</td>\
+                 <td style=\"{TD}{bg}{NOWRAP}\">{ini}</td>\
+                 <td style=\"{TD}{bg}{NOWRAP}\">{fin}</td>\
                  <td style=\"{TD}{bg}\">{notas}{comentarios}</td></tr>",
                 modulo = esc(&section.module_title),
                 tarea = esc(&row.tarea),
