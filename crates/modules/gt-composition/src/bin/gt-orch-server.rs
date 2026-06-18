@@ -780,7 +780,7 @@ async fn main() -> anyhow::Result<()> {
                 }
                 pol_registry = pol_registry.register(notify_plugin);
                 eprintln!(
-                    "[gt-orch-server] workflow notifications on — dispatch/merged/failed reach the operator bell"
+                    "[gt-orch-server] workflow notifications on — dispatch/merged/failed + operational alerts (all-accounts-exhausted, lease-expired, pool-cap sling-skipped, sling-failed) reach the operator bell"
                 );
             }
             Err(e) => eprintln!("[gt-orch-server] workflow notifications OFF (pg pool: {e})"),

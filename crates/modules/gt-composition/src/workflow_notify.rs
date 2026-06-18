@@ -14,19 +14,33 @@
 //! - `merge.failed.v1`           → `alert` — the merge failed, with the reason (actionable from
 //!   the bell, which can open a tracker issue from a notification).
 //!
-//! `gtcore-7e19fe` adds the operational events that previously only reached `eprintln`, so the
-//! operator no longer has to tail daemon logs to learn the autonomous loop is stuck:
+//! `gtcore-7e19fe` added the operational events that previously only reached `eprintln`, so the
+//! operator no longer has to tail daemon logs to learn the autonomous loop is stuck. `gtcore-bc7dd2`
+//! then corrected the quota mapping: the per-account predictive/reactive events
+//! (`quota.block_predicted` / `quota.account_limited`) are ROUTINE — rotation self-heals by moving
+//! the keychain pointer to a healthy account — so notifying (and emailing!) on each one was exactly
+//! the noise the AC forbids. What the operator actually needs is the high-level *saturation* fact:
+//! every account is exhausted at once, which is its own event. The operational set is therefore:
 //!
-//! - `quota.block_predicted.v1`  → `alert` — a claude account is about to block; rotation moves on.
-//! - `quota.account_limited.v1`  → `alert` — the provider returned 429 for an account.
+//! - `quota.all_exhausted.v1`    → `alert` — EVERY account is blocked; the in-flight polecats were
+//!   SIGSTOP'd to preserve their context. No capacity remains — the operator must add/unblock an
+//!   account. This is the "todas las cuentas bloqueadas" signal the bead calls out.
+//! - `quota.account_recovered.v1`→ `info`  — an exhausted account recovered and the paused polecats
+//!   resumed (SIGCONT); closes the all-exhausted loop in the bell without paging.
 //! - `patrol.lease-expired.v1`   → `alert` — an agent crashed; the patrol freed its claim.
 //! - `polecat.sling-skipped.v1`  → `info`  — the pool/host cap is reached; the bead waits (bell-only
 //!   backpressure — routine under load, deliberately off the email path).
 //! - `polecat.sling-failed.v1`   → `info`  — `spawn_tmux` errored; the slot freed but the bead made
 //!   no progress.
 //!
-//! Severity follows the bead's AC: the capacity faults (quota/lease) are `alert` and ride the
-//! optional `GT_NOTIFY_EMAIL` path (like `merge.failed`); the sling outcomes are `info` (bell).
+//! Routine rotations deliberately warrant NO notification — they self-heal and would only be noise
+//! (gtcore-bc7dd2 AC): `quota.block_predicted`, `quota.account_limited`, `quota.rotated`,
+//! `quota.soft_drain` and a single-account `quota.blocked` all stay silent; only the aggregate
+//! all-exhausted fact (and its recovery) reach the bell.
+//!
+//! Severity follows the bead's AC: the capacity faults (all-exhausted/lease) are `alert` and ride
+//! the optional `GT_NOTIFY_EMAIL` path (like `merge.failed`); recovery and the sling outcomes are
+//! `info` (bell).
 //!
 //! Everything is best-effort: a PG outage or a log-append failure is logged and never breaks the
 //! relay — notifications are observational, the workflow itself is the source of truth.
@@ -102,37 +116,50 @@ pub fn draft_for(record: &EventRecord) -> Option<NotificationDraft> {
                 kind: "alert",
             })
         }
-        // A claude account crossed the block-prediction threshold (gtcore-7e19fe): rotation moves to
-        // another account, but if all are blocked there's no capacity — worth an alert.
-        "quota.block_predicted.v1" => {
-            let QuotaEvent::BlockPredicted {
+        // Every claude account is exhausted at once (gtcore-6f449f): a rotation away from `account`
+        // found no healthy alternative, so the in-flight polecats were SIGSTOP'd to preserve their
+        // context instead of dying against the rate limit. This is the high-level "todas las cuentas
+        // bloqueadas" fact the operator MUST act on (add/unblock an account) — an alert, bell + email.
+        // The routine per-account predictive (`block_predicted`) / reactive (`account_limited`)
+        // rotations that precede it self-heal and stay silent, so this is signal, not noise
+        // (gtcore-bc7dd2).
+        "quota.all_exhausted.v1" => {
+            let QuotaEvent::AllExhausted {
                 account,
-                eta_to_block_secs,
+                paused_sessions,
                 ..
             } = record.decode::<QuotaEvent>().ok()?
             else {
                 return None;
             };
+            let paused = paused_sessions.len();
             Some(NotificationDraft {
-                title: format!("Cuenta {account} bloqueada, rotando"),
+                title: "Todas las cuentas de quota bloqueadas".to_string(),
                 body: format!(
-                    "El predictor de quota proyecta que {account} se bloquea en ~{eta_to_block_secs}s; la rotación cambia a otra cuenta. Si todas están bloqueadas no hay capacidad."
+                    "La rotación no encontró ninguna cuenta sana al agotarse {account}; {paused} polecat(s) en vuelo quedaron suspendidos (SIGSTOP) para preservar su contexto. No hay capacidad — añade o desbloquea una cuenta."
                 ),
                 kind: "alert",
             })
         }
-        // Reactive rate-limit: the provider returned 429 for this account (gtcore-7e19fe).
-        "quota.account_limited.v1" => {
-            let QuotaEvent::AccountLimited { account, .. } = record.decode::<QuotaEvent>().ok()?
+        // A previously-exhausted account recovered (gtcore-6f449f): the paused polecats resumed
+        // (SIGCONT) and continue from where they froze. A bell (`info`) that closes the all-exhausted
+        // loop without paging — the operator sees the saturation cleared on its own.
+        "quota.account_recovered.v1" => {
+            let QuotaEvent::AccountRecovered {
+                account,
+                resumed_sessions,
+                ..
+            } = record.decode::<QuotaEvent>().ok()?
             else {
                 return None;
             };
+            let resumed = resumed_sessions.len();
             Some(NotificationDraft {
-                title: format!("Cuenta {account} rate-limited"),
+                title: format!("Cuenta {account} recuperada"),
                 body: format!(
-                    "El proveedor devolvió 429 para {account}; la rotación buscará otra cuenta disponible."
+                    "{account} volvió a estado sano; {resumed} polecat(s) suspendidos por agotamiento total se reanudaron (SIGCONT) y continúan desde donde quedaron."
                 ),
-                kind: "alert",
+                kind: "info",
             })
         }
         // An agent crashed without closing its session: the patrol detected the stale lease and
@@ -398,31 +425,60 @@ mod tests {
     }
 
     #[test]
-    fn block_predicted_renders_an_alert_naming_the_account() {
-        let d = draft_for(&record(QuotaEvent::BlockPredicted {
+    fn all_exhausted_renders_an_alert_counting_paused_polecats() {
+        let d = draft_for(&record(QuotaEvent::AllExhausted {
             account: "acct-a".into(),
+            paused_sessions: vec!["s1".into(), "s2".into()],
+            now_secs: 0,
+        }))
+        .expect("all-exhausted warrants a notification");
+        // The high-level "todas bloqueadas" fact — alert (bell + email), the operator must add capacity.
+        assert_eq!(d.kind, "alert");
+        assert!(d.title.to_lowercase().contains("todas"), "title flags the all-blocked fact: {}", d.title);
+        assert!(d.body.contains("acct-a"));
+        assert!(d.body.contains('2'), "body counts the suspended polecats: {}", d.body);
+    }
+
+    #[test]
+    fn account_recovered_renders_an_info_counting_resumed_polecats() {
+        let d = draft_for(&record(QuotaEvent::AccountRecovered {
+            account: "acct-b".into(),
+            resumed_sessions: vec!["s1".into()],
+            now_secs: 0,
+        }))
+        .expect("account-recovered warrants a notification");
+        // Bell (`info`): the saturation cleared on its own — no need to page the operator.
+        assert_eq!(d.kind, "info");
+        assert!(d.title.contains("acct-b"));
+        assert!(d.body.contains('1'), "body counts the resumed polecats: {}", d.body);
+    }
+
+    #[test]
+    fn routine_quota_rotations_warrant_no_notification() {
+        // gtcore-bc7dd2 AC: the per-account predictive/reactive rotations self-heal (rotation moves
+        // to a healthy account), so notifying on each one is noise — only the aggregate
+        // all-exhausted fact alerts. A single-account block precedes a rotation, so it stays silent
+        // too.
+        assert!(draft_for(&record(QuotaEvent::BlockPredicted {
+            account: "a".into(),
             eta_to_block_secs: 120,
             consumed: 900,
             limit: 1000,
             rate_per_min: 8.0,
             now_secs: 0,
         }))
-        .expect("block-predicted warrants a notification");
-        assert_eq!(d.kind, "alert");
-        assert!(d.title.contains("acct-a"));
-        assert!(d.body.contains("120"), "body carries the eta: {}", d.body);
-    }
-
-    #[test]
-    fn account_limited_renders_an_alert_naming_the_account() {
-        let d = draft_for(&record(QuotaEvent::AccountLimited {
-            account: "acct-b".into(),
+        .is_none());
+        assert!(draft_for(&record(QuotaEvent::AccountLimited {
+            account: "a".into(),
             now_secs: 0,
         }))
-        .expect("account-limited warrants a notification");
-        assert_eq!(d.kind, "alert");
-        assert!(d.title.contains("acct-b"));
-        assert!(d.title.contains("rate-limited"));
+        .is_none());
+        assert!(draft_for(&record(QuotaEvent::Blocked {
+            account: "a".into(),
+            until_secs: None,
+            now_secs: 0,
+        }))
+        .is_none());
     }
 
     #[test]
