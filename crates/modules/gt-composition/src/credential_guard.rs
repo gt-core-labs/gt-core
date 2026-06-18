@@ -29,8 +29,8 @@ use std::path::Path;
 use std::sync::Arc;
 
 use gt_quota::{
-    classify_credentials, select_slingable, Candidate, CredentialHealth, DeadAccount, Keychain,
-    Selection, REFRESH_SKEW_MS,
+    classify_credentials, select_slingable, AccountQuotaStatus, Candidate, CredentialHealth,
+    DeadAccount, Keychain, Selection, REFRESH_SKEW_MS,
 };
 
 /// A resolved, slingable account and the `CLAUDE_CONFIG_DIR` to stamp.
@@ -66,20 +66,35 @@ fn read_credentials(config_dir: &str) -> Option<String> {
     std::fs::read_to_string(Path::new(config_dir).join(".credentials.json")).ok()
 }
 
-/// Resolve the account a sling should authenticate as, validating the active account's credentials.
-/// Reads files via [`read_credentials`]; see [`resolve_for_sling_with`] for the pure-ish core that
-/// tests drive with an injected reader.
-pub fn resolve_for_sling(keychain: &Arc<dyn Keychain>, now_ms: u64) -> CredOutcome {
-    resolve_for_sling_with(keychain, now_ms, read_credentials)
+/// Resolve the account a sling should authenticate as, validating the active account's credentials
+/// AND its quota status. `status_of(account)` returns the account's quota status (`None` ⇒ unknown,
+/// treated as slingable so an un-probed account is not blocked). Reads files via [`read_credentials`];
+/// see [`resolve_for_sling_with`] for the pure-ish core that tests drive with injected closures.
+pub fn resolve_for_sling(
+    keychain: &Arc<dyn Keychain>,
+    now_ms: u64,
+    status_of: impl Fn(&str) -> Option<AccountQuotaStatus>,
+) -> CredOutcome {
+    resolve_for_sling_with(keychain, now_ms, read_credentials, status_of)
 }
 
-/// Core of [`resolve_for_sling`] with the file reader injected so tests exercise every health path
-/// without touching disk. `read(config_dir) -> Some(raw)` for a present file, `None` for
-/// missing/unreadable.
+/// Whether an account is usable for a NEW sling on BOTH axes: its quota status is slingable (Healthy,
+/// or unknown/un-probed) AND its credentials authenticate. `status_of` `None` ⇒ unknown ⇒ permissive
+/// on the quota axis (the first probe corrects it). This is the gtcore-2836bb gate: an account that
+/// is quota-`Limited`/`Blocked` is rejected even when its credentials are perfectly valid, because a
+/// polecat slung onto it is born straight into the rate-limit dialog.
+fn quota_slingable(account: &str, status_of: &impl Fn(&str) -> Option<AccountQuotaStatus>) -> bool {
+    status_of(account).map(|s| s.is_slingable()).unwrap_or(true)
+}
+
+/// Core of [`resolve_for_sling`] with the file reader + quota-status lookup injected so tests
+/// exercise every path without touching disk or a live quota actor. `read(config_dir) -> Some(raw)`
+/// for a present file, `None` for missing/unreadable. `status_of(account)` reports the quota status.
 pub fn resolve_for_sling_with(
     keychain: &Arc<dyn Keychain>,
     now_ms: u64,
     read: impl Fn(&str) -> Option<String>,
+    status_of: impl Fn(&str) -> Option<AccountQuotaStatus>,
 ) -> CredOutcome {
     // No live pointer → nothing to validate; legacy host-default path.
     let active = match keychain.active() {
@@ -105,21 +120,21 @@ pub fn resolve_for_sling_with(
         }
     };
 
-    // Missing credential FILE is permissive: a fresh/seeded dir or host-managed auth. Only an
-    // EXPIRED (or present-but-garbage) file is the incident's failure mode.
-    let Some(active_raw) = read(&active_dir) else {
-        return CredOutcome::Resolved {
-            resolved: ResolvedCredentials {
-                account: active,
-                config_dir: active_dir,
-            },
-            dead: Vec::new(),
-            rotated_from: None,
-        };
+    let active_quota_ok = quota_slingable(&active, &status_of);
+
+    // Missing credential FILE is permissive on the credential axis (a fresh/seeded dir or
+    // host-managed auth). But the QUOTA axis still applies: an active account that is Limited/Blocked
+    // must NOT receive a new sling even with a missing/seeded creds file — that is exactly the
+    // incident where polecats were born into the rate-limit dialog (gtcore-2836bb). Use the active
+    // account as-is only when its quota is also slingable; otherwise fall through to rotation.
+    let active_raw = read(&active_dir);
+    let active_cred_ok = match &active_raw {
+        // Missing file is credential-permissive.
+        None => true,
+        Some(raw) => classify_credentials(Some(raw.as_str()), now_ms, REFRESH_SKEW_MS).is_slingable(),
     };
 
-    let health = classify_credentials(Some(active_raw.as_str()), now_ms, REFRESH_SKEW_MS);
-    if health.is_slingable() {
+    if active_cred_ok && active_quota_ok {
         return CredOutcome::Resolved {
             resolved: ResolvedCredentials {
                 account: active,
@@ -130,18 +145,28 @@ pub fn resolve_for_sling_with(
         };
     }
 
-    // Active account is credential-dead. Try to rotate to another account whose `.credentials.json`
-    // is present and slingable. Accounts with a MISSING file are skipped here (we only rotate ONTO
-    // a credential we can positively validate — the incident recovery copied a *valid* file in).
+    // Active account cannot receive a sling — credential-dead, quota-limited/blocked, or both. Try
+    // to rotate to another account that is slingable on BOTH axes. Accounts with a MISSING creds
+    // file are skipped here (we only rotate ONTO a credential we can positively validate). The
+    // skipped active is reported as `dead` so the operator is alerted; its `health` carries the
+    // credential reason (Valid when the block was purely quota — the rotation message names that).
+    let active_health = match &active_raw {
+        None => CredentialHealth::Valid,
+        Some(raw) => classify_credentials(Some(raw.as_str()), now_ms, REFRESH_SKEW_MS),
+    };
     let active_dead = DeadAccount {
         account: active.clone(),
-        health,
+        health: active_health,
     };
     let accounts = keychain.accounts().unwrap_or_default();
     let mut dirs: Vec<(String, String)> = Vec::new(); // (account, config_dir)
     let mut candidates: Vec<Candidate> = Vec::new();
     for acc in &accounts {
         if *acc == active {
+            continue;
+        }
+        // Quota gate first: never rotate ONTO a Limited/Blocked account (gtcore-2836bb).
+        if !quota_slingable(acc, &status_of) {
             continue;
         }
         let Ok(Some(cred)) = keychain.get(acc) else {
@@ -166,13 +191,17 @@ pub fn resolve_for_sling_with(
             // active()) also land on the healthy account — couple the pointer to the selection.
             if let Err(e) = keychain.set_active(&account) {
                 eprintln!(
-                    "[cred-guard] set_active({account}) failed after credential rotation: {e} — \
+                    "[cred-guard] set_active({account}) failed after sling rotation: {e} — \
                      stamping its config dir for this sling anyway"
                 );
             }
+            let reason = if !active_quota_ok && active_cred_ok {
+                "quota Limited/Blocked"
+            } else {
+                active_dead_reason(active_health)
+            };
             eprintln!(
-                "[cred-guard] active account {active} credential-dead ({}) — rotated to {account}",
-                active_dead_reason(health)
+                "[cred-guard] active account {active} not slingable ({reason}) — rotated to {account}"
             );
             CredOutcome::Resolved {
                 resolved: ResolvedCredentials { account, config_dir },
@@ -231,10 +260,16 @@ mod tests {
         ))
     }
 
+    /// Quota-status closure that reports every account `Healthy` — the common case where only the
+    /// credential axis is under test.
+    fn all_healthy(_: &str) -> Option<AccountQuotaStatus> {
+        Some(AccountQuotaStatus::Healthy)
+    }
+
     #[test]
     fn no_active_pointer_is_host_default() {
         let kc = keychain(&[("a", "/dir/a")]);
-        let out = resolve_for_sling_with(&kc, NOW, |_| None);
+        let out = resolve_for_sling_with(&kc, NOW, |_| None, all_healthy);
         assert_eq!(out, CredOutcome::HostDefault);
     }
 
@@ -244,7 +279,7 @@ mod tests {
         // this is exactly the existing dispatch test's shape and must not regress.
         let kc = keychain(&[("a", "/dir/a")]);
         kc.set_active("a").unwrap();
-        let out = resolve_for_sling_with(&kc, NOW, |_| None);
+        let out = resolve_for_sling_with(&kc, NOW, |_| None, all_healthy);
         assert_eq!(
             out,
             CredOutcome::Resolved {
@@ -263,7 +298,7 @@ mod tests {
         let kc = keychain(&[("a", "/dir/a")]);
         kc.set_active("a").unwrap();
         let valid = creds(Some(NOW + 3_600_000), true);
-        let out = resolve_for_sling_with(&kc, NOW, |_| Some(valid.clone()));
+        let out = resolve_for_sling_with(&kc, NOW, |_| Some(valid.clone()), all_healthy);
         match out {
             CredOutcome::Resolved { resolved, rotated_from, .. } => {
                 assert_eq!(resolved.account, "a");
@@ -285,7 +320,7 @@ mod tests {
             "/dir/dead" => Some(dead_raw.clone()),
             "/dir/fresh" => Some(fresh_raw.clone()),
             _ => None,
-        });
+        }, all_healthy);
         match out {
             CredOutcome::Resolved { resolved, dead, rotated_from } => {
                 assert_eq!(resolved.account, "fresh");
@@ -311,7 +346,7 @@ mod tests {
             "/dir/dead" => Some(dead_raw.clone()),
             "/dir/also" => Some(also_raw.clone()),
             _ => None,
-        });
+        }, all_healthy);
         match out {
             CredOutcome::NoValidAccount { dead } => {
                 assert_eq!(dead.len(), 1);
@@ -321,5 +356,101 @@ mod tests {
         }
         // Pointer stays put — nothing valid to move to.
         assert_eq!(kc.active().unwrap().as_deref(), Some("dead"));
+    }
+
+    #[test]
+    fn quota_limited_active_rotates_to_a_healthy_account_even_with_valid_creds() {
+        // gtcore-2836bb AC#1: the active account's credentials are perfectly VALID, but its quota
+        // is Limited — a polecat slung onto it is born into the rate-limit dialog. The guard must
+        // rotate to the Healthy account and flip the pointer, exactly like the credential-dead path.
+        let kc = keychain(&[("limited", "/dir/limited"), ("fresh", "/dir/fresh")]);
+        kc.set_active("limited").unwrap();
+        let valid = creds(Some(NOW + 3_600_000), true);
+        let v2 = valid.clone();
+        let out = resolve_for_sling_with(
+            &kc,
+            NOW,
+            move |_| Some(v2.clone()),
+            |acc| {
+                Some(match acc {
+                    "limited" => AccountQuotaStatus::Limited,
+                    _ => AccountQuotaStatus::Healthy,
+                })
+            },
+        );
+        match out {
+            CredOutcome::Resolved { resolved, rotated_from, dead } => {
+                assert_eq!(resolved.account, "fresh", "rotated off the Limited account");
+                assert_eq!(rotated_from.as_deref(), Some("limited"));
+                assert_eq!(dead.len(), 1);
+                assert_eq!(dead[0].account, "limited");
+            }
+            other => panic!("expected Resolved, got {other:?}"),
+        }
+        assert_eq!(kc.active().unwrap().as_deref(), Some("fresh"), "pointer flipped");
+        let _ = valid;
+    }
+
+    #[test]
+    fn never_rotates_onto_a_blocked_account() {
+        // Active is credential-dead; the only alternative is quota-Blocked → no valid target, so
+        // the sling is blocked rather than landing on the Blocked account (gtcore-2836bb).
+        let kc = keychain(&[("dead", "/dir/dead"), ("blocked", "/dir/blocked")]);
+        kc.set_active("dead").unwrap();
+        let dead_raw = creds(Some(NOW - 1), false);
+        let blocked_raw = creds(Some(NOW + 3_600_000), true);
+        let out = resolve_for_sling_with(
+            &kc,
+            NOW,
+            move |dir| match dir {
+                "/dir/dead" => Some(dead_raw.clone()),
+                "/dir/blocked" => Some(blocked_raw.clone()),
+                _ => None,
+            },
+            |acc| {
+                Some(match acc {
+                    "blocked" => AccountQuotaStatus::Blocked,
+                    _ => AccountQuotaStatus::Healthy,
+                })
+            },
+        );
+        match out {
+            CredOutcome::NoValidAccount { dead } => assert_eq!(dead[0].account, "dead"),
+            other => panic!("expected NoValidAccount (Blocked is not a target), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn healthy_active_with_valid_creds_is_used_directly_under_the_quota_gate() {
+        // No-regression: a Healthy + credential-valid active account is used as-is (no rotation),
+        // even with the quota gate active.
+        let kc = keychain(&[("a", "/dir/a"), ("b", "/dir/b")]);
+        kc.set_active("a").unwrap();
+        let valid = creds(Some(NOW + 3_600_000), true);
+        let out = resolve_for_sling_with(&kc, NOW, move |_| Some(valid.clone()), all_healthy);
+        match out {
+            CredOutcome::Resolved { resolved, rotated_from, .. } => {
+                assert_eq!(resolved.account, "a");
+                assert!(rotated_from.is_none());
+            }
+            other => panic!("expected Resolved, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn unknown_quota_status_is_permissive() {
+        // An un-probed account (status_of → None) must not be blocked on the quota axis — the first
+        // probe corrects it. Active with valid creds + unknown status is used directly.
+        let kc = keychain(&[("a", "/dir/a")]);
+        kc.set_active("a").unwrap();
+        let valid = creds(Some(NOW + 3_600_000), true);
+        let out = resolve_for_sling_with(&kc, NOW, move |_| Some(valid.clone()), |_| None);
+        match out {
+            CredOutcome::Resolved { resolved, rotated_from, .. } => {
+                assert_eq!(resolved.account, "a");
+                assert!(rotated_from.is_none());
+            }
+            other => panic!("expected Resolved, got {other:?}"),
+        }
     }
 }

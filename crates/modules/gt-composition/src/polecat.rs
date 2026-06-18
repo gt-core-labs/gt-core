@@ -37,7 +37,7 @@ use gt_polecat::{
     hooks_from_settings, skills_from_worktree, spawn_tmux, PolecatSupervisor, PoolAllocator,
     SpawnTemplate, Tmux,
 };
-use gt_quota::Keychain;
+use gt_quota::{Keychain, QuotaHandle};
 use gt_scheduling::SchedEvent;
 use gt_skills::{ModelConfig, SkillState};
 use gt_store_dolt::{DoltIssues, IssueStatus};
@@ -172,6 +172,11 @@ pub struct PolecatSupervisorPlugin {
     /// frontend and frontier see the state change without waiting for the polecat to self-transition.
     /// `None` ⇒ the bead stays `open` until the polecat calls `issues.transition` itself (legacy).
     issues: Option<Arc<DoltIssues>>,
+    /// Quota actor handle for the sling-time quota-status gate (gtcore-2836bb). When set, the
+    /// credential guard also rejects an active account that is quota-`Limited`/`Blocked` — even with
+    /// valid credentials — and rotates to a `Healthy` one, so a polecat is never born into the
+    /// rate-limit dialog. `None` ⇒ the guard checks credential validity only (legacy).
+    quota: Option<QuotaHandle>,
 }
 
 impl PolecatSupervisorPlugin {
@@ -202,7 +207,17 @@ impl PolecatSupervisorPlugin {
             event_log: None,
             rig_configs: HashMap::new(),
             issues: None,
+            quota: None,
         }
+    }
+
+    /// Wire the quota actor so sling-time selection also rejects quota-`Limited`/`Blocked` accounts
+    /// (gtcore-2836bb): the credential guard rotates off a non-`Healthy` active account onto a
+    /// `Healthy` one. Without it, an account that is credential-valid but rate-limited still receives
+    /// slings and the polecat is born into the usage-limit dialog.
+    pub fn with_quota(mut self, quota: QuotaHandle) -> Self {
+        self.quota = Some(quota);
+        self
     }
 
     /// Route dispatched beads to their rig by bead prefix (`hq-0ecfec`, epic hq-554308): a
@@ -498,7 +513,24 @@ impl Plugin for PolecatSupervisorPlugin {
                 // the polecat on the host default ~/.claude.
                 let mut active_config_dir: Option<String> = None;
                 if let Some(kc) = &self.keychain {
-                    match crate::credential_guard::resolve_for_sling(kc, now_ms()) {
+                    // Snapshot quota status per account for the sling-time quota gate (gtcore-2836bb).
+                    // A pre-fetched map keeps the guard's `status_of` closure synchronous (the guard
+                    // is pure-ish and must not await). No quota handle ⇒ empty map ⇒ the guard treats
+                    // every account's status as unknown (permissive), i.e. the legacy credential-only
+                    // behaviour.
+                    let quota_status: HashMap<String, gt_quota::AccountQuotaStatus> =
+                        match &self.quota {
+                            Some(q) => q
+                                .accounts()
+                                .await
+                                .into_iter()
+                                .map(|a| (a.id, a.status))
+                                .collect(),
+                            None => HashMap::new(),
+                        };
+                    match crate::credential_guard::resolve_for_sling(kc, now_ms(), |acc| {
+                        quota_status.get(acc).copied()
+                    }) {
                         crate::credential_guard::CredOutcome::Resolved {
                             resolved,
                             dead,
