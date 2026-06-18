@@ -67,6 +67,7 @@ pub mod operator_resource;
 pub mod polecat;
 pub mod polecat_event;
 pub mod quota_rotation;
+pub mod relogin;
 pub mod report_scheduler;
 pub mod rest_modules;
 pub mod scope_bridge;

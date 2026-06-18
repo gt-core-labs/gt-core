@@ -383,6 +383,72 @@ pub fn seed_global_claude_flags(config_dir: &Path) {
     }
 }
 
+/// Seed the FULL onboarding-complete state into a relogged-in account's `CLAUDE_CONFIG_DIR` so the
+/// dir is immediately consumable by the sling, pre-authenticated — the same shape the working
+/// `01KTWX*` accounts carry (gtcore-1fe9b4).
+///
+/// The wedge incident (`orchd-sling-provisioning-wedge-recovery`): an operator relogin left a dir
+/// with a fresh `.credentials.json` but NO `oauthAccount` nor `hasCompletedOnboarding` in
+/// `.claude.json`, so the slung polecat ran the first-run onboarding TUI → OAuth prompt → wedge.
+/// After `quota.relogin` mints fresh creds, this seeds the missing IDENTITY/onboarding markers:
+///
+/// - `oauthAccount.emailAddress = email` — the identity the sling/quota registry keys by. Only the
+///   email is forced; any richer `oauthAccount` object `claude /login` already wrote is preserved
+///   (we merge into the existing object, never replace it).
+/// - `hasCompletedOnboarding = true` + `bypassPermissionsModeAccepted = true` + a default `theme`
+///   (via [`seed_global_claude_flags`]'s flags, applied here so one call leaves the dir complete).
+///
+/// Best-effort: any IO/parse failure logs and the relogin still reports success (the operator can
+/// re-run; a missing marker only re-shows the TUI, it does not lose the fresh credential).
+pub fn seed_account_onboarding_complete(config_dir: &Path, email: &str) {
+    let _ = std::fs::create_dir_all(config_dir);
+    let path = config_dir.join(".claude.json");
+    let mut root = std::fs::read_to_string(&path)
+        .ok()
+        .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
+        .unwrap_or_else(|| serde_json::json!({}));
+    let Some(obj) = root.as_object_mut() else {
+        eprintln!(
+            "[relogin] .claude.json at {} is not an object — onboarding seed skipped",
+            path.display()
+        );
+        return;
+    };
+    obj.insert("hasCompletedOnboarding".into(), serde_json::Value::Bool(true));
+    obj.insert(
+        "bypassPermissionsModeAccepted".into(),
+        serde_json::Value::Bool(true),
+    );
+    obj.insert(
+        "autoUpdaterStatus".into(),
+        serde_json::Value::String("disabled".into()),
+    );
+    obj.entry("theme")
+        .or_insert_with(|| serde_json::Value::String("dark".into()));
+    // Ensure the oauthAccount carries the email (the id the system keys by). Merge into whatever
+    // object `claude /login` already wrote — never clobber the richer identity it may have set.
+    let oauth = obj
+        .entry("oauthAccount")
+        .or_insert_with(|| serde_json::json!({}));
+    if let Some(oobj) = oauth.as_object_mut() {
+        oobj.insert(
+            "emailAddress".into(),
+            serde_json::Value::String(email.to_string()),
+        );
+    }
+    match serde_json::to_string(&root) {
+        Ok(s) => {
+            if let Err(e) = std::fs::write(&path, s) {
+                eprintln!(
+                    "[relogin] onboarding seed write {} skipped: {e}",
+                    path.display()
+                );
+            }
+        }
+        Err(e) => eprintln!("[relogin] onboarding seed serialize skipped: {e}"),
+    }
+}
+
 /// `chown -R <user> <path>` argv, as data so it can be asserted without shelling.
 fn chown_argv(path: &Path, user: &str) -> Vec<String> {
     vec![
@@ -487,6 +553,43 @@ mod tests {
         .unwrap();
         assert_eq!(v["hasCompletedOnboarding"], serde_json::json!(true));
         assert_eq!(v["theme"], serde_json::json!("dark")); // default when none
+    }
+
+    #[test]
+    fn seed_account_onboarding_complete_sets_identity_and_flags_preserving_oauth() {
+        // gtcore-1fe9b4: after a relogin, the dir must carry oauthAccount.emailAddress +
+        // hasCompletedOnboarding so the sling skips the first-run TUI — and any richer oauthAccount
+        // claude already wrote (org, uuid) must be preserved, not clobbered.
+        let cfg = tempfile::tempdir().unwrap();
+        std::fs::write(
+            cfg.path().join(".claude.json"),
+            r#"{"oauthAccount":{"organizationName":"Org","accountUuid":"u-1"},"theme":"light"}"#,
+        )
+        .unwrap();
+        seed_account_onboarding_complete(cfg.path(), "user@x.com");
+        let v: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(cfg.path().join(".claude.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(v["hasCompletedOnboarding"], serde_json::json!(true));
+        assert_eq!(v["bypassPermissionsModeAccepted"], serde_json::json!(true));
+        assert_eq!(v["theme"], serde_json::json!("light")); // preserved
+        assert_eq!(v["oauthAccount"]["emailAddress"], serde_json::json!("user@x.com"));
+        assert_eq!(v["oauthAccount"]["organizationName"], serde_json::json!("Org")); // preserved
+        assert_eq!(v["oauthAccount"]["accountUuid"], serde_json::json!("u-1")); // preserved
+    }
+
+    #[test]
+    fn seed_account_onboarding_complete_creates_config_when_absent() {
+        let cfg = tempfile::tempdir().unwrap();
+        seed_account_onboarding_complete(cfg.path(), "fresh@x.com");
+        let v: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(cfg.path().join(".claude.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(v["hasCompletedOnboarding"], serde_json::json!(true));
+        assert_eq!(v["theme"], serde_json::json!("dark")); // default when none
+        assert_eq!(v["oauthAccount"]["emailAddress"], serde_json::json!("fresh@x.com"));
     }
 
     #[test]
