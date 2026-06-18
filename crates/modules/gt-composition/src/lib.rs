@@ -148,13 +148,12 @@ impl Plugin for SchedulerPlugin {
                 self.sched.capacity_freed().await;
                 Ok(())
             }
-            "merge.failed.v1" => {
-                if let MergeEvent::Failed { bead, .. } = record.decode::<MergeEvent>()? {
-                    self.sched.capacity_freed().await;
-                    self.sched.enqueue(bead, 5).await;
-                }
-                Ok(())
-            }
+            // `merge.failed.v1` is intentionally NOT handled here anymore (gtcore-3a1bd4). It used to
+            // free capacity + blindly re-enqueue the bead, which re-dispatched a FRESH polecat with
+            // the original kickoff prompt and no CI context, and looped forever. The CI-failure
+            // recovery now lives in `PolecatSupervisorPlugin`, which re-slings the SAME slot with a
+            // fix-and-re-push prompt under a retry cap (and frees capacity itself only when the cap
+            // is exhausted). Re-enqueuing here too would double-sling into the same session.
             _ => Ok(()),
         }
     }

@@ -38,7 +38,7 @@ use gt_polecat::{
     SpawnTemplate, Tmux,
 };
 use gt_quota::{Keychain, QuotaHandle};
-use gt_scheduling::SchedEvent;
+use gt_scheduling::{SchedEvent, SchedHandle};
 use gt_skills::{ModelConfig, SkillState};
 use gt_store_dolt::{DoltIssues, IssueStatus};
 
@@ -187,7 +187,27 @@ pub struct PolecatSupervisorPlugin {
     /// workspace's session never decrements the wrong pool. Without this set, the slot leaked
     /// until the patrol lease expired (~300s), wedging all new slings on a phantom `pool cap`.
     claimed: Mutex<HashSet<String>>,
+    /// Scheduler handle for releasing dispatch capacity when a bead's CI-retry budget is exhausted
+    /// (gtcore-3a1bd4). The CI-failure re-sling keeps the slot held across retries (the bead is
+    /// still in flight); only on cap-exhaustion is the bead abandoned, so the scheduler governor
+    /// must be told the slot freed (mirroring `merge.merged.v1`). `None` ⇒ only the pool allocator
+    /// is freed (tests without a scheduler).
+    sched: Option<SchedHandle>,
+    /// Per-bead count of CI-failure re-slings (gtcore-3a1bd4). A bead whose PR fails CI is
+    /// re-dispatched with a fix-and-re-push prompt; this counts the attempts so the loop stops at
+    /// [`Self::ci_max_retries`] instead of burning quota forever. In-memory (a daemon restart resets
+    /// it — acceptable: a restart is itself a fresh start, and the merge slot's `failed` state
+    /// survives in the log for the operator). Cleared for a bead when it merges or is escalated.
+    ci_retries: Arc<Mutex<HashMap<String, u32>>>,
+    /// Hard cap on CI-failure re-slings before escalating to the operator (gtcore-3a1bd4,
+    /// `GT_CI_MAX_RETRIES`). After this many failed attempts the bead is abandoned with an alert
+    /// rather than re-slung again — the "no infinite loop" half of the AC.
+    ci_max_retries: u32,
 }
+
+/// Default CI-failure retry cap when `GT_CI_MAX_RETRIES` is unset (gtcore-3a1bd4): three automated
+/// fix-and-re-push attempts before escalating to a human.
+pub const DEFAULT_CI_MAX_RETRIES: u32 = 3;
 
 impl PolecatSupervisorPlugin {
     /// Wire the dispatch→sling observer for `workspace`. `tmux` is the edge adapter (real
@@ -219,7 +239,26 @@ impl PolecatSupervisorPlugin {
             issues: None,
             quota: None,
             claimed: Mutex::new(HashSet::new()),
+            sched: None,
+            ci_retries: Arc::new(Mutex::new(HashMap::new())),
+            ci_max_retries: DEFAULT_CI_MAX_RETRIES,
         }
+    }
+
+    /// Wire the scheduler handle so a CI-retry-exhausted bead frees its dispatch capacity
+    /// (gtcore-3a1bd4). Without it, an abandoned bead's slot is only returned to the pool allocator,
+    /// not the scheduler governor — fine for tests, but the daemon wires both.
+    pub fn with_scheduler(mut self, sched: SchedHandle) -> Self {
+        self.sched = Some(sched);
+        self
+    }
+
+    /// Set the CI-failure retry cap (gtcore-3a1bd4, `GT_CI_MAX_RETRIES`). A bead whose PR keeps
+    /// failing CI is re-slung up to this many times before being escalated to the operator. `0`
+    /// disables auto-retry (the first CI failure escalates immediately).
+    pub fn with_ci_max_retries(mut self, max: u32) -> Self {
+        self.ci_max_retries = max;
+        self
     }
 
     /// Wire the quota actor so sling-time selection also rejects quota-`Limited`/`Blocked` accounts
@@ -472,6 +511,83 @@ impl PolecatSupervisorPlugin {
         }
         self.supervisor.watch(spec);
         eprintln!("[polecat] re-slung {bead} with a continuation prompt ({reason})");
+    }
+
+    /// Re-sling a bead whose PR failed CI, handing the next polecat a fix-and-re-push prompt
+    /// (gtcore-3a1bd4). This closes the CI loop: instead of leaving the merge slot terminally
+    /// `failed` for a human, the bead — its work already committed on the branch and its PR open
+    /// with auto-merge armed — is re-dispatched to fix what CI flagged and push to the SAME branch,
+    /// re-running CI. `attempt` is this re-sling's 1-based index in the retry budget; the caller has
+    /// already gated it under [`Self::ci_max_retries`].
+    ///
+    /// Like [`resling_on_context_exhaustion`](Self::resling_on_context_exhaustion) it reuses the
+    /// bead's deterministic session + per-bead worktree (so the pool slot, claimed at the original
+    /// sling and held until merge, is reused — no new claim), swapping only the kickoff prompt. The
+    /// bead is NOT transitioned (it stays `working`). Best-effort throughout: a session that is no
+    /// longer supervised, an unreadable bead, or an empty diff/CI snapshot degrades the prompt
+    /// rather than aborting — the retry counter still advances toward escalation.
+    async fn resling_on_ci_failure(&self, bead: &str, reason: &str, attempt: u32) {
+        // The session id is deterministic per bead (route by prefix → `spec_for`), the same
+        // derivation the `merge.merged.v1` teardown uses — so we find the supervised spec without
+        // the failed event carrying it.
+        let (template, _root) = self.route(bead);
+        let session = template.spec_for(&self.workspace, bead).session;
+        let Some(mut spec) = self.supervisor.spec_for_session(&session) else {
+            eprintln!(
+                "[polecat] CI-failure re-sling skipped for {bead}: session {session} not supervised here"
+            );
+            return;
+        };
+
+        // Acceptance criteria from Dolt orient the fix; absent issues handle / read error degrades
+        // to the diff + the agent's own `gt` MCP tools.
+        let acceptance_criteria = match &self.issues {
+            Some(issues) => match issues.get_detail(bead).await {
+                Ok(Some(detail)) => detail.acceptance_criteria,
+                Ok(None) => String::new(),
+                Err(e) => {
+                    eprintln!(
+                        "[polecat] CI-failure re-sling: get_detail({bead}) failed: {e} — continuing without AC"
+                    );
+                    String::new()
+                }
+            },
+            None => String::new(),
+        };
+
+        // The work already on the branch + a best-effort snapshot of the failing checks.
+        let diff = crate::continuation::read_branch_diff(&spec.workdir, "main");
+        let ci_checks = crate::continuation::read_ci_checks(&spec.workdir, bead);
+        let prompt = crate::continuation::build_ci_fix_prompt(
+            bead,
+            reason,
+            &ci_checks,
+            &diff,
+            &acceptance_criteria,
+            attempt,
+            self.ci_max_retries,
+        );
+
+        // The bead prompt is always the last positional arg — swap it for the CI-fix prompt without
+        // disturbing any preceding flags (same mechanism as the context-exhaustion re-sling).
+        if spec.args.is_empty() {
+            spec.args.push(prompt);
+        } else {
+            let last = spec.args.len() - 1;
+            spec.args[last] = prompt;
+        }
+
+        if let Err(e) = spawn_tmux(self.tmux.as_ref(), &spec) {
+            eprintln!(
+                "[polecat] CI-failure re-sling spawn failed for {bead}: {e} — supervisor tick will retry"
+            );
+            return;
+        }
+        self.supervisor.watch(spec);
+        eprintln!(
+            "[polecat] re-slung {bead} to fix CI (attempt {attempt}/{}): {reason}",
+            self.ci_max_retries
+        );
     }
 }
 
@@ -927,7 +1043,61 @@ impl Plugin for PolecatSupervisorPlugin {
                 self.emit(AgentEvent::SessionEnd { session });
                 // Clear the bead's operator marker (hq-agent-observability.2): its work landed, so
                 // the FE drops the agent chip. One agent per bead → the id alone identifies it.
-                self.emit_operator(IssueOperatorEvent::Cleared { bead });
+                self.emit_operator(IssueOperatorEvent::Cleared { bead: bead.clone() });
+                // Forget any CI-retry tally for this bead (gtcore-3a1bd4): it merged, clean slate.
+                self.ci_retries
+                    .lock()
+                    .expect("ci_retries mutex")
+                    .remove(&bead);
+                Ok(())
+            }
+            // The bead's PR failed CI → close the loop instead of leaving the slot terminally
+            // `failed` for a human (gtcore-3a1bd4). Under the retry cap, re-sling the SAME bead with
+            // a fix-and-re-push prompt carrying the CI failure context; at the cap, escalate to the
+            // operator and abandon the slot (free capacity, stop supervising) so the loop is finite.
+            // A `merge.failed.v1` arrives from the CI-gate webhook (CI red / PR closed unmerged) or
+            // the git-merge edge (local rebase conflict); both warrant the same fix-and-re-push.
+            "merge.failed.v1" => {
+                let MergeEvent::Failed { bead, reason } = record.decode::<MergeEvent>()? else {
+                    return Ok(());
+                };
+                // Count this failure as one attempt against the bead's budget.
+                let attempt = {
+                    let mut tally = self.ci_retries.lock().expect("ci_retries mutex");
+                    let c = tally.entry(bead.clone()).or_insert(0);
+                    *c += 1;
+                    *c
+                };
+                if attempt <= self.ci_max_retries {
+                    self.resling_on_ci_failure(&bead, &reason, attempt).await;
+                } else {
+                    // Budget exhausted: escalate and abandon rather than loop forever burning quota.
+                    self.ci_retries
+                        .lock()
+                        .expect("ci_retries mutex")
+                        .remove(&bead);
+                    self.emit_polecat(PolecatEvent::CiRetriesExhausted {
+                        bead: bead.clone(),
+                        reason,
+                        attempts: self.ci_max_retries,
+                    });
+                    // Free the slot in both capacity systems (mirroring the merged teardown) and stop
+                    // supervising so the dead session is not re-slung by the supervisor tick.
+                    self.allocator
+                        .lock()
+                        .expect("pool mutex")
+                        .release(&self.workspace);
+                    let (template, _root) = self.route(&bead);
+                    let session = template.spec_for(&self.workspace, &bead).session;
+                    self.supervisor.unwatch(&session);
+                    if let Some(sched) = &self.sched {
+                        sched.capacity_freed().await;
+                    }
+                    eprintln!(
+                        "[polecat] {bead}: CI retries exhausted ({}) — escalated, slot abandoned",
+                        self.ci_max_retries
+                    );
+                }
                 Ok(())
             }
             // A polecat died (operator kill, heartbeat-stale, reconciler reap, or context
@@ -1436,6 +1606,93 @@ mod tests {
         assert!(!is_context_exhaustion("heartbeat stale"));
         assert!(!is_context_exhaustion("operator killed"));
         assert!(!is_context_exhaustion(""));
+    }
+
+    #[tokio::test]
+    async fn ci_failure_under_cap_reslings_with_a_fix_prompt_without_transition() {
+        // gtcore-3a1bd4: a `merge.failed.v1` (PR CI red) re-slings the SAME bead — still `working`,
+        // no transition, same held slot — with a fix-and-re-push prompt in place of the kickoff.
+        let alloc = Arc::new(Mutex::new(PoolAllocator::new(10, 5)));
+        let (p, sup) = plugin(alloc.clone());
+        let p = p.with_ci_max_retries(2);
+
+        // Sling the bead so the supervisor holds its spec (the original kickoff prompt).
+        p.on_event(&record(SchedEvent::Dispatched {
+            bead: "gg-1".into(),
+            worker: "w1".into(),
+        }))
+        .await
+        .unwrap();
+        assert!(sup
+            .spec_for_session("hq-gg-1")
+            .unwrap()
+            .args
+            .last()
+            .unwrap()
+            .contains("You are a gt polecat in workspace"));
+
+        // First CI failure → re-sling with the CI-fix prompt.
+        p.on_event(&record(MergeEvent::Failed {
+            bead: "gg-1".into(),
+            reason: "CI failed: failure".into(),
+        }))
+        .await
+        .unwrap();
+        assert_eq!(sup.watched_count(), 1, "still supervised after CI re-sling");
+        let prompt = sup
+            .spec_for_session("hq-gg-1")
+            .expect("re-watched after CI re-sling")
+            .args
+            .last()
+            .expect("ci-fix prompt arg")
+            .clone();
+        assert!(
+            prompt.contains("RESUMING work on bead `gg-1`"),
+            "ci-fix prompt injected: {prompt}"
+        );
+        assert!(prompt.contains("CI failed: failure"), "carries the CI reason");
+        assert!(prompt.contains("retry 1 of 2"), "carries the retry budget");
+        assert!(prompt.contains("mcp__gt__merge_submit"));
+    }
+
+    #[tokio::test]
+    async fn ci_failures_past_the_cap_escalate_and_abandon_the_slot() {
+        // gtcore-3a1bd4: after the retry cap is exhausted the bead is NOT re-slung again — it is
+        // escalated (the loop is finite) and its slot freed + unwatched so the supervisor tick does
+        // not resurrect it. With cap=1: failure #1 re-slings, failure #2 escalates.
+        let alloc = Arc::new(Mutex::new(PoolAllocator::new(10, 5)));
+        let (p, sup) = plugin(alloc.clone());
+        let p = p.with_ci_max_retries(1);
+
+        p.on_event(&record(SchedEvent::Dispatched {
+            bead: "gg-2".into(),
+            worker: "w1".into(),
+        }))
+        .await
+        .unwrap();
+        assert_eq!(sup.watched_count(), 1);
+
+        // Failure #1 (attempt 1 ≤ cap 1) → re-sling.
+        p.on_event(&record(MergeEvent::Failed {
+            bead: "gg-2".into(),
+            reason: "CI failed: failure".into(),
+        }))
+        .await
+        .unwrap();
+        assert_eq!(sup.watched_count(), 1, "re-slung within budget");
+
+        // Failure #2 (attempt 2 > cap 1) → escalate + abandon: no longer supervised.
+        p.on_event(&record(MergeEvent::Failed {
+            bead: "gg-2".into(),
+            reason: "CI failed: failure".into(),
+        }))
+        .await
+        .unwrap();
+        assert_eq!(
+            sup.watched_count(),
+            0,
+            "the bead is unwatched once its CI-retry budget is exhausted"
+        );
     }
 
     #[tokio::test]

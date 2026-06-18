@@ -106,14 +106,20 @@ pub fn draft_for(record: &EventRecord) -> Option<NotificationDraft> {
                 kind: "info",
             })
         }
+        // A merge failed — in CI-gated mode this is the PR's CI going red (gtcore-3a1bd4). It is now
+        // auto-recovered: the bead is re-slung to fix and re-push, up to the retry cap. So a single
+        // `merge.failed` is no longer the operator's call to action — it's routine, a bell (`info`),
+        // not an alert. The actionable escalation is `polecat.ci-retries-exhausted.v1` (below), which
+        // fires only when the auto-retry loop gives up. This keeps the loop self-healing and quiet
+        // (the gtcore-bc7dd2 "no noise" principle) while still surfacing the give-up to a human.
         "merge.failed.v1" => {
             let MergeEvent::Failed { bead, reason } = record.decode::<MergeEvent>().ok()? else {
                 return None;
             };
             Some(NotificationDraft {
-                title: format!("Merge de {bead} falló"),
+                title: format!("CI de {bead} falló — reintentando"),
                 body: reason,
-                kind: "alert",
+                kind: "info",
             })
         }
         // Every claude account is exhausted at once (gtcore-6f449f): a rotation away from `account`
@@ -242,6 +248,27 @@ pub fn draft_for(record: &EventRecord) -> Option<NotificationDraft> {
                 title: format!("Sling de {bead} bloqueado: sin credenciales válidas"),
                 body: format!(
                     "Ninguna cuenta del keychain tiene credenciales válidas en el workspace {workspace}; {bead} no se slingó para evitar un 401. Onboardea o refresca una cuenta."
+                ),
+                kind: "alert",
+            })
+        }
+        // A bead's PR exhausted the CI-failure retry budget (gtcore-3a1bd4): the auto fix-and-re-push
+        // loop ran out of retries with CI still red, so it was abandoned to avoid an infinite
+        // quota-burning loop. An ALERT (bell + email): a human must read the CI log and unblock the
+        // PR — this is the explicit escalation the bead's AC requires when retries run out.
+        "polecat.ci-retries-exhausted.v1" => {
+            let PolecatEvent::CiRetriesExhausted {
+                bead,
+                reason,
+                attempts,
+            } = record.decode::<PolecatEvent>().ok()?
+            else {
+                return None;
+            };
+            Some(NotificationDraft {
+                title: format!("{bead}: CI sigue roja tras {attempts} reintentos"),
+                body: format!(
+                    "El re-despacho automático por fallo de CI agotó {attempts} reintentos y la CI de {bead} sigue fallando ({reason}). Se abandonó el lazo para no quemar quota; revisa el log de CI y desbloquea el PR a mano."
                 ),
                 kind: "alert",
             })
@@ -413,13 +440,15 @@ mod tests {
     }
 
     #[test]
-    fn failed_renders_an_alert_carrying_the_reason() {
+    fn failed_renders_an_info_since_it_auto_retries() {
+        // gtcore-3a1bd4: a CI failure is auto-recovered (re-sling to fix), so a single merge.failed
+        // is a bell (`info`, "reintentando"), not an alert. The alert is ci-retries-exhausted.
         let d = draft_for(&record(MergeEvent::Failed {
             bead: "gtweb-1".into(),
             reason: "rebase onto origin/main conflicted: f".into(),
         }))
         .expect("failed warrants a notification");
-        assert_eq!(d.kind, "alert");
+        assert_eq!(d.kind, "info");
         assert!(d.title.contains("gtweb-1"));
         assert!(d.body.contains("conflicted"));
     }
@@ -543,6 +572,21 @@ mod tests {
         assert_eq!(d.kind, "alert");
         assert!(d.title.contains("gtcore-5"));
         assert!(d.title.contains("sin credenciales"), "title says why: {}", d.title);
+    }
+
+    #[test]
+    fn ci_retries_exhausted_renders_an_alert_with_attempts_and_reason() {
+        let d = draft_for(&record(PolecatEvent::CiRetriesExhausted {
+            bead: "gtcore-3a1bd4".into(),
+            reason: "CI failed: failure".into(),
+            attempts: 3,
+        }))
+        .expect("ci-retries-exhausted warrants a notification");
+        // Alert (bell + email) — a human must unblock the PR.
+        assert_eq!(d.kind, "alert");
+        assert!(d.title.contains("gtcore-3a1bd4"));
+        assert!(d.title.contains('3'), "title counts the retries: {}", d.title);
+        assert!(d.body.contains("CI failed: failure"), "body carries the reason: {}", d.body);
     }
 
     #[test]
