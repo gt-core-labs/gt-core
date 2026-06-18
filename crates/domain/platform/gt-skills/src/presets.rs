@@ -88,12 +88,23 @@ fn enable(s: &mut SkillState, role: &str, skill: &str) {
 /// Build the canonical least-privilege catalog binding each automatic agent role to the minimal
 /// scope set its work needs. No role is granted `*`; an unbound role (e.g. `overseer`) gets nothing.
 ///
-/// - `polecat` → `issues.read`, `issues.write`, `merge.write` (work + claim + transition + submit merge).
+/// - `polecat` → `issues.read`, `issues.write`, `merge.write`, `memory.read`, `memory.write`,
+///   `a2a.read`, `a2a.write` (work + claim + transition + submit merge + durable memory + P2P).
 /// - `mayor` → `issues.read`, `issues.write`, `agent.read`, `agent.write`, `merge.read`, `merge.write` (coordinate + dispatch).
 /// - `sheriff` → `merge.read`, `merge.write` (drive merges / github).
 /// - `refinery` → `merge.write` (submit MERGE_READY).
 /// - `witness` → `issues.read` (observe only).
 /// - `deacon` → `issues.read` (read-only supervisory).
+///
+/// `memory.*` and `a2a.*` close two grants that shipped inert (`gtcore-abf278`): a slung polecat's
+/// prompt tells it to recall/persist durable memory (`memory.recall`/`memory.save`, `gtcore-bad8d9`)
+/// and to coordinate peer-to-peer over A2A (`a2a.inbox`/`a2a.delegate`/…, `gtcore-3a3557`), but the
+/// daemon-minted token granted only `issues.*`+`merge.*`, so every such call returned `unauthorized`.
+/// The MCP grant is per-namespace (any granular `<resource>.<verb>` folds to `<resource>.*` in
+/// [`Scope::from_workspace_claim`](gt_rbac::Scope::from_workspace_claim)), and the a2a tool verbs
+/// (`inbox`/`send`/`delegate`/…) are NOT in the closed `SCOPE_VERBS` vocabulary — so the grant rides
+/// the known `read`/`write` verbs (`a2a.read`+`a2a.write` → the whole `a2a.*` namespace), exactly as
+/// `issues.read`+`issues.write` authorizes `issues.*`. Still least-privilege: no role gets `*`.
 pub fn agent_least_privilege_catalog() -> SkillCatalog {
     let mut s = SkillState::default();
     register(&mut s, "bead-work", &["issues.read", "issues.write"]);
@@ -101,9 +112,15 @@ pub fn agent_least_privilege_catalog() -> SkillCatalog {
     register(&mut s, "merge-ops", &["merge.read", "merge.write"]);
     register(&mut s, "merge-submit", &["merge.write"]);
     register(&mut s, "observe", &["issues.read"]);
+    // gtcore-abf278: durable memory (gtcore-bad8d9) and peer-to-peer A2A (gtcore-3a3557) were
+    // mergeable features left inert because the polecat token never carried their scopes.
+    register(&mut s, "memory-access", &["memory.read", "memory.write"]);
+    register(&mut s, "a2a-coordinate", &["a2a.read", "a2a.write"]);
 
     enable(&mut s, "polecat", "bead-work");
     enable(&mut s, "polecat", "merge-submit");
+    enable(&mut s, "polecat", "memory-access");
+    enable(&mut s, "polecat", "a2a-coordinate");
     enable(&mut s, "mayor", "bead-coordinate");
     enable(&mut s, "sheriff", "merge-ops");
     enable(&mut s, "refinery", "merge-submit");
@@ -207,7 +224,15 @@ mod tests {
     #[test]
     fn each_role_gets_its_minimal_scopes_and_never_the_wildcard() {
         let c = agent_least_privilege_catalog();
-        assert_eq!(scopes(&c, "polecat"), vec!["issues.read", "issues.write", "merge.write"]);
+        // gtcore-abf278: the polecat grant carries memory.* and a2a.* so the durable-memory
+        // (gtcore-bad8d9) and P2P-delegation (gtcore-3a3557) features its prompt relies on are
+        // actually authorized — not just issues.*+merge.*. Order is the legacy union's: enabled
+        // skills walked alphabetically by id (a2a-coordinate, bead-work, memory-access, merge-submit),
+        // each contributing its `default_scopes` in registered order.
+        assert_eq!(
+            scopes(&c, "polecat"),
+            vec!["a2a.read", "a2a.write", "issues.read", "issues.write", "memory.read", "memory.write", "merge.write"]
+        );
         assert_eq!(scopes(&c, "mayor"), vec!["issues.read", "issues.write", "agent.read", "agent.write", "merge.read", "merge.write"]);
         assert_eq!(scopes(&c, "sheriff"), vec!["merge.read", "merge.write"]);
         assert_eq!(scopes(&c, "refinery"), vec!["merge.write"]);
@@ -222,6 +247,37 @@ mod tests {
                 "{role} must not carry '*'"
             );
         }
+    }
+
+    /// gtcore-abf278 (AC): the polecat's daemon-minted grant, expanded the way the MCP boundary
+    /// expands a JWT claim ([`gt_rbac::Scope::from_workspace_claim`]), must AUTHORIZE the memory and
+    /// a2a tools its prompt drives — `memory.recall`/`memory.save` (gtcore-bad8d9) and
+    /// `a2a.inbox`/`a2a.delegate`/… (gtcore-3a3557) — while still DENYING a namespace it was never
+    /// granted, so the fix is a grant widening, not an enforcement weakening.
+    #[test]
+    fn polecat_grant_reaches_memory_and_a2a_but_not_ungranted_namespaces() {
+        let c = agent_least_privilege_catalog();
+        let scope = gt_rbac::Scope::from_workspace_claim("polecat", &scopes(&c, "polecat"));
+
+        // The two formerly-inert capabilities are now authorized end-to-end.
+        scope.check("memory.recall").expect("memory.recall authorized");
+        scope.check("memory.save.execute").expect("memory.save authorized");
+        scope.check("a2a.inbox").expect("a2a.inbox authorized");
+        scope.check("a2a.discover").expect("a2a.discover authorized");
+        scope.check("a2a.delegate.execute").expect("a2a.delegate authorized");
+        scope.check("a2a.send.execute").expect("a2a.send authorized");
+
+        // The original grant still works.
+        scope.check("issues.read.execute").expect("issues still authorized");
+        scope.check("merge.submit.execute").expect("merge still authorized");
+
+        // Enforcement is NOT weakened: a namespace the polecat was never granted stays denied.
+        assert!(scope.check("workspace.create").is_err(), "no workspace admin");
+        assert!(scope.check("agent.add.execute").is_err(), "no agent dispatch");
+        assert!(scope.check("quota.set.execute").is_err(), "no quota control");
+
+        // Still least-privilege: never the wildcard.
+        assert!(!scope.allow.iter().any(|s| s == "*"), "polecat must not carry '*'");
     }
 
     #[test]
