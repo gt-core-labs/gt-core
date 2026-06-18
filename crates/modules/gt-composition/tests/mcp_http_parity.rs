@@ -261,6 +261,10 @@ fn is_routable(tool: &str) -> bool {
         // embedding index — no REST equivalent; streaming bytes use GET /{id}/download instead (hq-c488cb).
         && tool != "documents.retrieve.execute"
         // Rig readiness probe: MCP-only diagnostic — no REST equivalent.
+        // Credential health (gtcore-1fe9b4): MCP-only on gt-mcp-server; its REST sibling
+        // GET /api/v1/quota/cred-health is a gt-orch-server DAEMON route (host process behind
+        // Traefik, reads the accounts dirs), not the quota module ApiDoc.
+        && tool != "quota.cred_health"
         && tool != "rig.readiness"
 }
 
