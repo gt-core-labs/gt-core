@@ -19,7 +19,7 @@ use crate::oauth_usage::parse_credentials_json;
 
 /// How usable an account's stored `.credentials.json` is RIGHT NOW (at the `now_ms` the edge
 /// stamped), independent of quota.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum CredentialHealth {
     /// Access token valid past the refresh skew — usable as-is.
     Valid,
