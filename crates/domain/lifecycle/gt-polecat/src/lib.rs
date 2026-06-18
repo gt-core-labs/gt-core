@@ -19,6 +19,7 @@ pub mod pool;
 pub mod restart;
 pub mod supervisor;
 pub mod tmux;
+pub mod wedge;
 
 pub use hooks::{hook_bead_for_spawn, hook_env, resolve_env_hook_bead, GT_HOOK_ACCOUNT, GT_HOOK_BEAD};
 pub use install::{
@@ -40,3 +41,4 @@ pub use supervisor::{
     supervise_daemon, supervise_polecat, watch, PolecatSupervisor, RespawnPolicy, WatchOutcome,
 };
 pub use tmux::{tmux_server_name, FakeTmux, Tmux, TmuxCli};
+pub use wedge::{classify_wedge, WedgeDialog, WedgeRecovery};
