@@ -149,6 +149,14 @@ fn git_output(workdir: &Path, args: &[&str]) -> String {
 }
 
 /// Truncate `s` to at most `max` bytes without splitting a UTF-8 char, appending a marker when
+/// anything was dropped so the reader knows the text is partial. Public so the CI-loop
+/// ([`crate::ci_loop`]) can cap a CI log against the same [`MAX_DIFF_BYTES`] budget the branch
+/// diff uses, keeping the kickoff prompt within argv limits.
+pub fn truncate_for_prompt(s: &str, max: usize) -> String {
+    truncate_on_char_boundary(s, max)
+}
+
+/// Truncate `s` to at most `max` bytes without splitting a UTF-8 char, appending a marker when
 /// anything was dropped so the continuator knows the diff is partial.
 fn truncate_on_char_boundary(s: &str, max: usize) -> String {
     if s.len() <= max {

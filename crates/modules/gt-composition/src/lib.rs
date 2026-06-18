@@ -41,6 +41,7 @@ pub mod auto_dispatch;
 pub mod bead_close;
 pub mod checkpoint_push;
 pub mod ci_gate;
+pub mod ci_loop;
 pub mod credential_guard;
 pub mod anthropic_proxy;
 pub mod continuation;
@@ -114,17 +115,56 @@ use crate::mcp::eventlog::EventLog;
 
 /// Observer that drives the scheduler from other domains' events — the scheduler reactor arm:
 /// `patrol.lease-expired.v1` → re-enqueue the freed bead (`SchedHandle::enqueue`);
-/// `merge.merged.v1` → release the dispatch slot (`SchedHandle::capacity_freed`). The scheduler
-/// actor owns its queue/governor and emits its own `SchedEvent`s, so this is a read-only
-/// observer of OTHER domains.
+/// `merge.merged.v1` → release the dispatch slot (`SchedHandle::capacity_freed`); `merge.failed.v1`
+/// → free the slot and (under the CI-fix retry budget) re-enqueue the bead with its CI log
+/// recorded for the next sling (gtcore-3a1bd4). The scheduler actor owns its queue/governor and
+/// emits its own `SchedEvent`s, so this is a read-only observer of OTHER domains.
 pub struct SchedulerPlugin {
     sched: SchedHandle,
+    /// Per-bead CI-failure context + retry budget (gtcore-3a1bd4). When wired, a `merge.failed.v1`
+    /// records the CI log and bumps the bead's attempt count; the bead is re-enqueued only while
+    /// under the cap, and the recorded context is picked up by the sling path to build a CI-fix
+    /// prompt. `None` ⇒ legacy behaviour: every failure re-enqueues blind, no cap, no escalation.
+    ci_failures: Option<Arc<crate::ci_loop::CiFailureStore>>,
+    /// Hub sender for the cap-exhausted escalation (`polecat.ci-retries-exhausted.v1`). Best-effort,
+    /// like the polecat plugin's emitter; a closed hub only costs the operator notification.
+    events: Option<tokio::sync::broadcast::Sender<EventRecord>>,
 }
 
 impl SchedulerPlugin {
     /// Wrap a scheduler command handle as a cross-domain observer.
     pub fn new(sched: SchedHandle) -> Self {
-        Self { sched }
+        Self {
+            sched,
+            ci_failures: None,
+            events: None,
+        }
+    }
+
+    /// Wire the CI-fix retry loop (gtcore-3a1bd4): a shared [`CiFailureStore`](crate::ci_loop::CiFailureStore)
+    /// records each `merge.failed.v1`'s CI log and caps re-slings, and `events` carries the
+    /// cap-exhausted escalation onto the hub for [`workflow_notify`](crate::workflow_notify). The
+    /// SAME store must be handed to the [`PolecatSupervisorPlugin`](crate::polecat::PolecatSupervisorPlugin)
+    /// so the sling picks up the recorded context. Without this call, the plugin keeps the legacy
+    /// blind re-enqueue.
+    pub fn with_ci_loop(
+        mut self,
+        ci_failures: Arc<crate::ci_loop::CiFailureStore>,
+        events: tokio::sync::broadcast::Sender<EventRecord>,
+    ) -> Self {
+        self.ci_failures = Some(ci_failures);
+        self.events = Some(events);
+        self
+    }
+
+    /// Publish a [`PolecatEvent`](crate::polecat_event::PolecatEvent) onto the hub if a sender is
+    /// wired. Best-effort: a closed hub or an encode failure is swallowed.
+    fn emit_polecat(&self, event: crate::polecat_event::PolecatEvent) {
+        if let Some(tx) = &self.events {
+            if let Ok(record) = EventRecord::from_envelope(&Envelope::root(event)) {
+                let _ = tx.send(record);
+            }
+        }
     }
 }
 
@@ -146,12 +186,50 @@ impl Plugin for SchedulerPlugin {
             }
             "merge.merged.v1" => {
                 self.sched.capacity_freed().await;
+                // The bead landed green: forget any CI-fix budget so a future, unrelated failure
+                // starts fresh (gtcore-3a1bd4). No-op when the loop isn't wired.
+                if let Some(store) = &self.ci_failures {
+                    if let MergeEvent::Merged { bead, .. } = record.decode::<MergeEvent>()? {
+                        store.clear(&bead);
+                    }
+                }
                 Ok(())
             }
             "merge.failed.v1" => {
-                if let MergeEvent::Failed { bead, .. } = record.decode::<MergeEvent>()? {
+                if let MergeEvent::Failed { bead, reason } = record.decode::<MergeEvent>()? {
+                    // The slot is terminal either way — free the dispatch capacity first.
                     self.sched.capacity_freed().await;
-                    self.sched.enqueue(bead, 5).await;
+                    match &self.ci_failures {
+                        // CI-fix loop wired (gtcore-3a1bd4): record the failure log + bump the
+                        // attempt count, then re-enqueue ONLY under the cap. At the cap, escalate
+                        // to the operator instead of re-slinging into an infinite quota-burning
+                        // loop.
+                        Some(store) => match store.record_failure(&bead, &reason) {
+                            crate::ci_loop::RetryDecision::Retry { attempt } => {
+                                eprintln!(
+                                    "[scheduler] {bead}: CI failed (attempt {attempt}/{}) — re-slinging with CI log as context",
+                                    store.max_retries()
+                                );
+                                self.sched.enqueue(bead, 5).await;
+                            }
+                            crate::ci_loop::RetryDecision::Exhausted { attempts, reason } => {
+                                eprintln!(
+                                    "[scheduler] {bead}: CI failed {attempts}x — retry cap reached, escalating to operator (NOT re-slinging)"
+                                );
+                                self.emit_polecat(
+                                    crate::polecat_event::PolecatEvent::CiRetriesExhausted {
+                                        bead,
+                                        attempts,
+                                        reason,
+                                    },
+                                );
+                            }
+                        },
+                        // Legacy: no loop wired ⇒ re-enqueue blind, unchanged.
+                        None => {
+                            self.sched.enqueue(bead, 5).await;
+                        }
+                    }
                 }
                 Ok(())
             }
@@ -737,6 +815,12 @@ pub struct DaemonRoot {
     pub patrol: PatrolHandle,
     /// Quota command handle — the auto-rotation ticker drives [`QuotaHandle::tick`].
     pub quota: QuotaHandle,
+    /// Shared CI-fix retry store (gtcore-3a1bd4): the root's [`SchedulerPlugin`] records each
+    /// `merge.failed.v1`'s CI log here and caps re-slings. The bin MUST hand this SAME store to
+    /// the [`PolecatSupervisorPlugin`](crate::polecat::PolecatSupervisorPlugin) (via
+    /// [`with_ci_failures`](crate::polecat::PolecatSupervisorPlugin::with_ci_failures)) so the
+    /// sling picks up the recorded context and builds the CI-fix prompt.
+    pub ci_failures: Arc<crate::ci_loop::CiFailureStore>,
 }
 
 /// Assemble the autonomous daemon's per-workspace root over the durable log (`hq-orchd.4`,
@@ -855,13 +939,25 @@ pub async fn daemon_root_with_capacity(ws: WorkspaceId, log_root: PathBuf, sched
     .await
     .expect("role stack registers while the supervisor is Built");
 
+    // CI-fix retry loop (gtcore-3a1bd4): one store shared between the root's SchedulerPlugin
+    // (records merge.failed CI logs + caps re-slings) and the bin's PolecatSupervisorPlugin
+    // (reads the recorded log at sling to build a CI-fix prompt). Cap from GT_CI_MAX_RETRIES.
+    let ci_max_retries = std::env::var("GT_CI_MAX_RETRIES")
+        .ok()
+        .and_then(|v| v.trim().parse::<u32>().ok())
+        .unwrap_or(crate::ci_loop::DEFAULT_MAX_CI_RETRIES);
+    let ci_failures = Arc::new(crate::ci_loop::CiFailureStore::new(ci_max_retries));
+
     let registry = roles
         .plugin_registry()
         .register(
             EventLogPlugin::for_workspace_in(&log_root, &ws_slug)
                 .expect("event log root is writable"),
         )
-        .register(SchedulerPlugin::new(sched.clone()))
+        .register(
+            SchedulerPlugin::new(sched.clone())
+                .with_ci_loop(ci_failures.clone(), handle.events_sender()),
+        )
         .register(MergePlugin::new(merge.clone()))
         .register(BranchGcPlugin::new(
             merge.clone(),
@@ -878,6 +974,7 @@ pub async fn daemon_root_with_capacity(ws: WorkspaceId, log_root: PathBuf, sched
         merge,
         patrol,
         quota,
+        ci_failures,
     }
 }
 
@@ -1046,5 +1143,112 @@ mod session_minutes_tests {
         let orphaned =
             replay_orphaned_inflight(&log, "default", &[], &board).unwrap();
         assert!(orphaned.is_empty());
+    }
+}
+
+/// CI-fix loop wiring on the [`SchedulerPlugin`] (gtcore-3a1bd4): a `merge.failed.v1` records the
+/// CI log against the bead under the retry cap, and escalates (instead of re-slinging) once the cap
+/// is spent; a `merge.merged.v1` clears the budget.
+#[cfg(test)]
+mod ci_loop_plugin_tests {
+    use super::*;
+    use gt_plugin::Plugin;
+    use tokio::sync::broadcast;
+
+    /// Wire a SchedulerPlugin with the CI-fix loop over a real (in-memory) scheduler actor and a
+    /// fresh hub sender we can observe. Returns the plugin, the shared store (to assert recorded
+    /// context), and a hub receiver (to catch the escalation event).
+    fn wired() -> (
+        SchedulerPlugin,
+        Arc<crate::ci_loop::CiFailureStore>,
+        broadcast::Receiver<EventRecord>,
+    ) {
+        let (sched_tx, _sched_rx) = mpsc::channel(64);
+        let sched = gt_scheduling::actor::spawn(InMemoryBeads::default(), sched_tx, 4);
+        let store = Arc::new(crate::ci_loop::CiFailureStore::new(2));
+        let (tx, rx) = broadcast::channel(16);
+        let plugin = SchedulerPlugin::new(sched).with_ci_loop(store.clone(), tx);
+        (plugin, store, rx)
+    }
+
+    fn merge_record(event: MergeEvent) -> EventRecord {
+        EventRecord::from_envelope(&Envelope::root(event)).expect("encode merge event")
+    }
+
+    #[tokio::test]
+    async fn failed_ci_records_the_log_under_the_cap() {
+        let (plugin, store, _rx) = wired();
+        plugin
+            .on_event(&merge_record(MergeEvent::Failed {
+                bead: "gtcore-x".into(),
+                reason: "error[E0277]: trait bound `T: Serialize` not satisfied".into(),
+            }))
+            .await
+            .expect("plugin handles the event");
+        // The CI log is now recorded against the bead so the next sling can build a CI-fix prompt.
+        let ctx = store.peek("gtcore-x").expect("failure recorded");
+        assert_eq!(ctx.attempt, 1);
+        assert!(ctx.reason.contains("E0277"));
+    }
+
+    #[tokio::test]
+    async fn cap_exhaustion_escalates_instead_of_re_slinging() {
+        let (plugin, store, mut rx) = wired(); // cap = 2
+        let fail = |n: u32| {
+            merge_record(MergeEvent::Failed {
+                bead: "gtcore-y".into(),
+                reason: format!("CI fail #{n}"),
+            })
+        };
+        // Two failures stay under the cap (recorded, no escalation).
+        plugin.on_event(&fail(1)).await.unwrap();
+        plugin.on_event(&fail(2)).await.unwrap();
+        // The third failure spends the budget → escalation event, and the context is dropped.
+        plugin.on_event(&fail(3)).await.unwrap();
+        assert!(
+            store.peek("gtcore-y").is_none(),
+            "context cleared once the cap is spent"
+        );
+
+        // Drain the hub for the escalation event (the only PolecatEvent we emit here).
+        let mut saw_escalation = false;
+        while let Ok(rec) = rx.try_recv() {
+            if rec.kind == "polecat.ci-retries-exhausted.v1" {
+                if let crate::polecat_event::PolecatEvent::CiRetriesExhausted {
+                    bead, attempts, ..
+                } = rec.decode::<crate::polecat_event::PolecatEvent>().unwrap()
+                {
+                    assert_eq!(bead, "gtcore-y");
+                    assert_eq!(attempts, 2, "two retries burned before giving up");
+                    saw_escalation = true;
+                }
+            }
+        }
+        assert!(saw_escalation, "expected a ci-retries-exhausted escalation");
+    }
+
+    #[tokio::test]
+    async fn merged_clears_the_budget() {
+        let (plugin, store, _rx) = wired();
+        plugin
+            .on_event(&merge_record(MergeEvent::Failed {
+                bead: "gtcore-z".into(),
+                reason: "boom".into(),
+            }))
+            .await
+            .unwrap();
+        assert!(store.peek("gtcore-z").is_some());
+        // The bead later lands green → its CI-fix budget is forgotten.
+        plugin
+            .on_event(&merge_record(MergeEvent::Merged {
+                bead: "gtcore-z".into(),
+                sha: "deadbeef".into(),
+            }))
+            .await
+            .unwrap();
+        assert!(
+            store.peek("gtcore-z").is_none(),
+            "merge clears the CI-fix budget"
+        );
     }
 }

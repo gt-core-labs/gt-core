@@ -267,6 +267,7 @@ async fn main() -> anyhow::Result<()> {
         merge,
         patrol,
         quota,
+        ci_failures,
     } = daemon_root_with_capacity(ws, event_root, pool_size).await;
     eprintln!(
         "[gt-orch-server] daemon root up — scheduler(max={pool_size}) + merge + patrol + quota actors anchored; persistence + roles + reactor arms + sheriff observer running"
@@ -713,6 +714,14 @@ async fn main() -> anyhow::Result<()> {
     } else {
         eprintln!("[gt-orch-server] sling→working transition OFF — GT_DOLT_URL unset (beads stay open until agent self-transitions)");
     }
+    // CI-fix loop (gtcore-3a1bd4): hand the polecat plugin the SAME store the daemon root's
+    // SchedulerPlugin records merge.failed CI logs into, so a re-dispatched bead whose PR failed CI
+    // is slung with the CI log + branch diff + AC as its kickoff (instead of a blind fresh prompt).
+    pol_plugin = pol_plugin.with_ci_failures(ci_failures.clone());
+    eprintln!(
+        "[gt-orch-server] CI-fix loop on — failed-CI PRs re-sling with the CI log as context (cap {} retries, then escalate)",
+        ci_failures.max_retries()
+    );
     // Register the polecat supervisor and — when a keychain exists — the predictive rotation
     // observer on the same relay: a `quota.block_predicted.v1` / `quota.account_limited.v1` flips
     // the keychain's active pointer so the NEXT sling lands on a healthy account.

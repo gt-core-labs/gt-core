@@ -246,6 +246,28 @@ pub fn draft_for(record: &EventRecord) -> Option<NotificationDraft> {
                 kind: "alert",
             })
         }
+        // A bead's PR failed CI more times than the retry cap (gtcore-3a1bd4): the CI-fix loop
+        // re-slung the bead with its CI log a few times, never went green, and gave up rather than
+        // burn quota forever. An ALERT (bell + email): the loop is exhausted on this bead — a human
+        // must read the log and take over. The body carries the last CI failure so the operator can
+        // triage from the notification without opening the PR.
+        "polecat.ci-retries-exhausted.v1" => {
+            let PolecatEvent::CiRetriesExhausted {
+                bead,
+                attempts,
+                reason,
+            } = record.decode::<PolecatEvent>().ok()?
+            else {
+                return None;
+            };
+            Some(NotificationDraft {
+                title: format!("CI de {bead} sigue roja tras {attempts} intentos"),
+                body: format!(
+                    "El lazo de CI re-despachó {bead} {attempts} vez/veces con el log de fallo como contexto y nunca pasó CI; se detuvo para no quemar quota. Revisá el PR y arreglá a mano.\n\nÚltimo log de CI:\n{reason}"
+                ),
+                kind: "alert",
+            })
+        }
         _ => None,
     }
 }

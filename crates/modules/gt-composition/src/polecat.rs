@@ -177,6 +177,12 @@ pub struct PolecatSupervisorPlugin {
     /// valid credentials — and rotates to a `Healthy` one, so a polecat is never born into the
     /// rate-limit dialog. `None` ⇒ the guard checks credential validity only (legacy).
     quota: Option<QuotaHandle>,
+    /// Per-bead CI-failure context for the CI-fix loop (gtcore-3a1bd4). When wired (the SAME store
+    /// the [`SchedulerPlugin`](crate::SchedulerPlugin) records into on `merge.failed.v1`), a sling
+    /// whose bead has a recorded CI failure swaps its fresh kickoff for a CI-fix prompt carrying
+    /// the CI log + branch diff + acceptance criteria. `None` ⇒ every sling uses the fresh kickoff
+    /// (legacy: a re-dispatched bead never sees why its PR failed).
+    ci_failures: Option<Arc<crate::ci_loop::CiFailureStore>>,
 }
 
 impl PolecatSupervisorPlugin {
@@ -208,7 +214,18 @@ impl PolecatSupervisorPlugin {
             rig_configs: HashMap::new(),
             issues: None,
             quota: None,
+            ci_failures: None,
         }
+    }
+
+    /// Wire the CI-fix loop store (gtcore-3a1bd4) so a re-dispatched bead whose PR failed CI is
+    /// slung with the CI log + branch diff + acceptance criteria as its kickoff, instead of a
+    /// blind fresh prompt. MUST be the SAME [`CiFailureStore`](crate::ci_loop::CiFailureStore)
+    /// handed to [`SchedulerPlugin::with_ci_loop`](crate::SchedulerPlugin::with_ci_loop), which
+    /// records the failures this reader consumes. Without it, slings are unchanged.
+    pub fn with_ci_failures(mut self, store: Arc<crate::ci_loop::CiFailureStore>) -> Self {
+        self.ci_failures = Some(store);
+        self
     }
 
     /// Wire the quota actor so sling-time selection also rejects quota-`Limited`/`Blocked` accounts
@@ -768,6 +785,48 @@ impl Plugin for PolecatSupervisorPlugin {
                 // Load the polecat hooks via claude's `--settings <file>` flag (hq-orchd-deploy.16):
                 // claude does NOT apply the project/user settings.json hooks on its own in this
                 // headless/container setup (verified: heartbeat + Stop→merge-ready never fired), but
+                // CI-fix loop (gtcore-3a1bd4): if this bead's PR failed CI, the scheduler reactor
+                // recorded the CI log against it. Swap the fresh kickoff (still the trailing
+                // positional arg here — apply_role_model inserts flags BEFORE it, never after) for
+                // a CI-fix prompt that leads with the failure log, the branch diff (from the now-
+                // final worktree), and the acceptance criteria. `take` drains the log so a later,
+                // unrelated dispatch of the same bead doesn't re-show it, while keeping the attempt
+                // counter for the budget. Best-effort throughout: a missing issues handle or an
+                // unreadable bead degrades the prompt rather than aborting the sling.
+                if let Some(store) = &self.ci_failures {
+                    if let Some(ctx) = store.take(&bead) {
+                        // Only the acceptance criteria is needed here (unlike the context-exhaustion
+                        // continuation, the CI-fix prompt's "what's left" IS the CI failure, not a
+                        // checkpoint). Best-effort: a missing issues handle or read error → empty AC.
+                        let ac = match &self.issues {
+                            Some(issues) => match issues.get_detail(&bead).await {
+                                Ok(Some(detail)) => detail.acceptance_criteria,
+                                _ => String::new(),
+                            },
+                            None => String::new(),
+                        };
+                        let diff = crate::continuation::read_branch_diff(&spec.workdir, "main");
+                        let ci_log = crate::ci_loop::truncate_ci_log(&ctx.reason);
+                        let prompt = crate::ci_loop::build_ci_fix_prompt(
+                            &bead,
+                            &ci_log,
+                            &diff,
+                            &ac,
+                            ctx.attempt,
+                            store.max_retries(),
+                        );
+                        if let Some(last) = spec.args.last_mut() {
+                            *last = prompt;
+                        } else {
+                            spec.args.push(prompt);
+                        }
+                        eprintln!(
+                            "[polecat] {bead}: re-slinging with CI-fix prompt (attempt {}/{})",
+                            ctx.attempt,
+                            store.max_retries()
+                        );
+                    }
+                }
                 // an explicit `--settings` path is loaded deterministically — this is exactly how the
                 // upstream gastown launcher wires polecat hooks. The worktree already carries the
                 // gt-managed settings (install_polecat_hooks above). Insert before the trailing

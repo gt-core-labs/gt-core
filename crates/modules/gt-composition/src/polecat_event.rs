@@ -41,6 +41,15 @@ pub enum PolecatEvent {
     /// the sling is blocked, the pool slot is released, and the operator is alerted to fix
     /// credentials. `workspace` is the pool the slot was released to.
     SlingAuthBlocked { bead: String, workspace: String },
+    /// A bead's PR failed CI more times than the retry cap (`GT_CI_MAX_RETRIES`, gtcore-3a1bd4):
+    /// the CI-fix loop gave up re-slinging rather than burn quota on a structurally-red PR. An
+    /// ALERT so a human reads the log and takes over. `attempts` is how many CI-fix tries were
+    /// burned; `reason` is the last CI failure log.
+    CiRetriesExhausted {
+        bead: String,
+        attempts: u32,
+        reason: String,
+    },
 }
 
 impl EventKind for PolecatEvent {
@@ -52,6 +61,7 @@ impl EventKind for PolecatEvent {
             PolecatEvent::SlingFailed { .. } => "polecat.sling-failed.v1",
             PolecatEvent::CredentialDead { .. } => "polecat.credential-dead.v1",
             PolecatEvent::SlingAuthBlocked { .. } => "polecat.sling-auth-blocked.v1",
+            PolecatEvent::CiRetriesExhausted { .. } => "polecat.ci-retries-exhausted.v1",
         }
     }
 }
@@ -88,6 +98,13 @@ mod tests {
             workspace: "default".into(),
         };
         assert_eq!(blocked.kind(), "polecat.sling-auth-blocked.v1");
+
+        let exhausted = PolecatEvent::CiRetriesExhausted {
+            bead: "hq-1".into(),
+            attempts: 3,
+            reason: "cargo build failed".into(),
+        };
+        assert_eq!(exhausted.kind(), "polecat.ci-retries-exhausted.v1");
     }
 
     #[test]
@@ -108,6 +125,11 @@ mod tests {
             PolecatEvent::SlingAuthBlocked {
                 bead: "gtweb-1".into(),
                 workspace: "default".into(),
+            },
+            PolecatEvent::CiRetriesExhausted {
+                bead: "gtweb-1".into(),
+                attempts: 3,
+                reason: "error[E0277] trait bound not satisfied".into(),
             },
         ] {
             let json = serde_json::to_string(&ev).unwrap();
