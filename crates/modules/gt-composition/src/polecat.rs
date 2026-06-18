@@ -38,7 +38,8 @@ use gt_polecat::{
     SpawnTemplate, Tmux,
 };
 use gt_quota::{Keychain, QuotaHandle};
-use gt_scheduling::{SchedEvent, SchedHandle};
+use gt_scheduling::actor::SchedHandle;
+use gt_scheduling::SchedEvent;
 use gt_skills::{ModelConfig, SkillState};
 use gt_store_dolt::{DoltIssues, IssueStatus};
 
