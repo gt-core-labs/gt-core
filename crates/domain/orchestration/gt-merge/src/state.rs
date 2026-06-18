@@ -73,11 +73,22 @@ pub struct MergeBoard {
 impl MergeBoard {
     /// Registra un nuevo slot en estado `Ready`. Re-submit del mismo bead = `Validation`
     /// (la refinery ya marcó este como pendiente; no se duplica).
+    ///
+    /// EXCEPCIÓN (gtcore-3a1bd4): un slot ya `Failed` SÍ puede re-entrar la cola — se sobrescribe
+    /// de vuelta a `Ready`. Cuando la CI del PR de un bead falla, el bead se re-despacha, el agente
+    /// arregla el fallo y vuelve a llamar `merge_submit` sobre la MISMA rama; sin esta excepción ese
+    /// re-submit chocaría con "already submitted" y el lazo no cerraría. La rama arreglada vuelve a
+    /// pasar por la cola (`Ready → Merging → Merged`), respetando la invariante A5 (la cola es el
+    /// único camino a `main`). En replay, `MergeEvent::Ready` ya hace `upsert` a `Ready`, así que
+    /// la secuencia `…Failed, Ready` reconstruye un slot `Ready` sin evento nuevo. Un slot en
+    /// `Ready`/`Merging` (en vuelo) o `Merged` (terminal) sigue rechazando el duplicado.
     pub fn submit(&mut self, bead: String, branch: String) -> Result<(), AppError> {
-        if self.slots.contains_key(&bead) {
-            return Err(AppError::Validation(format!(
-                "merge slot for {bead} already submitted"
-            )));
+        if let Some(existing) = self.slots.get(&bead) {
+            if existing.state != MergeSlotState::Failed {
+                return Err(AppError::Validation(format!(
+                    "merge slot for {bead} already submitted"
+                )));
+            }
         }
         self.slots.insert(bead.clone(), MergeSlot::new(bead, branch));
         Ok(())
@@ -248,6 +259,40 @@ mod tests {
         b.start("b1").unwrap();
         b.fail("b1").unwrap();
         assert_eq!(b.get("b1").unwrap().state, MergeSlotState::Failed);
+    }
+
+    #[test]
+    fn failed_slot_may_resubmit_into_the_queue() {
+        // gtcore-3a1bd4: a CI-failed slot re-enters the queue when the bead is re-dispatched and the
+        // agent re-submits the fixed branch. The re-submit overwrites the Failed slot back to Ready
+        // (born-again through the queue), then drives Ready → Merging → Merged cleanly — so the
+        // eventual `complete` is legal (it would be illegal on the terminal Failed slot).
+        let mut b = MergeBoard::default();
+        b.submit("b1".into(), "feat/x".into()).unwrap();
+        b.start("b1").unwrap();
+        b.fail("b1").unwrap();
+        assert_eq!(b.get("b1").unwrap().state, MergeSlotState::Failed);
+
+        // Re-submit of the FAILED slot is allowed and resets it to Ready.
+        b.submit("b1".into(), "feat/x".into()).unwrap();
+        assert_eq!(b.get("b1").unwrap().state, MergeSlotState::Ready);
+        // The fixed branch goes through the queue to Merged.
+        b.start("b1").unwrap();
+        b.complete("b1").unwrap();
+        assert_eq!(b.get("b1").unwrap().state, MergeSlotState::Merged);
+    }
+
+    #[test]
+    fn in_flight_and_merged_slots_still_reject_resubmit() {
+        // The Failed exception is narrow: a slot in flight (Ready/Merging) or terminal (Merged) is a
+        // genuine duplicate and stays rejected, so a stray re-submit never disturbs a live merge.
+        let mut b = MergeBoard::default();
+        b.submit("b1".into(), "feat/x".into()).unwrap();
+        assert!(b.submit("b1".into(), "feat/x".into()).is_err(), "Ready rejects re-submit");
+        b.start("b1").unwrap();
+        assert!(b.submit("b1".into(), "feat/x".into()).is_err(), "Merging rejects re-submit");
+        b.complete("b1").unwrap();
+        assert!(b.submit("b1".into(), "feat/x".into()).is_err(), "Merged rejects re-submit");
     }
 
     #[test]
