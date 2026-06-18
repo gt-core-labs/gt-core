@@ -40,6 +40,17 @@ pub enum AccountQuotaStatus {
     Cooldown,
 }
 
+impl AccountQuotaStatus {
+    /// Whether a NEW polecat may be slung onto an account in this quota state (gtcore-2836bb).
+    /// Only `Healthy` accounts receive new work: `Limited`/`Blocked` have hit their wall (the
+    /// polecat would be born into the rate-limit dialog), and `Cooldown` is a rotation parking
+    /// state that should drain, not receive. This is the quota axis of sling selection — orthogonal
+    /// to credential validity (`credential_select::CredentialHealth`), which a separate gate covers.
+    pub fn is_slingable(self) -> bool {
+        matches!(self, AccountQuotaStatus::Healthy)
+    }
+}
+
 /// The live window: when it started, when it releases, the budget and the cost consumed so
 /// far in cost units (see `cost.rs`).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

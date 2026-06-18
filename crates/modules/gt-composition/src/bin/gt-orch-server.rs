@@ -533,6 +533,8 @@ async fn main() -> anyhow::Result<()> {
     if let Some(kc) = &keychain {
         let kc = kc.clone();
         let proxy = anthropic_proxy_url.clone();
+        let respec_quota = quota.clone();
+        let respec_handle = tokio::runtime::Handle::current();
         supervisor.set_respec(Box::new(move |mut spec| {
             fn set_env(env: &mut Vec<(String, String)>, key: &str, value: String) {
                 match env.iter_mut().find(|(k, _)| k == key) {
@@ -544,12 +546,23 @@ async fn main() -> anyhow::Result<()> {
             // a re-sling must VALIDATE the active account's creds (and rotate off a dead one) so a
             // polecat that died is not re-slung straight back into 401. A NoValidAccount / host
             // default outcome leaves the stored env untouched (legacy behaviour).
+            // gtcore-2836bb: ALSO snapshot quota status so the re-sling rotates off a
+            // Limited/Blocked active account — a re-sling onto a rate-limited account births the
+            // polecat into the usage-limit dialog. The respec runs inside the supervisor's
+            // spawn_blocking tick, so block_on the snapshot is safe (same posture as bead_closed).
             let now_ms = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|d| d.as_millis() as u64)
                 .unwrap_or(0);
+            let q = respec_quota.clone();
+            let quota_status: std::collections::HashMap<String, gt_quota::AccountQuotaStatus> =
+                respec_handle.block_on(async move {
+                    q.accounts().await.into_iter().map(|a| (a.id, a.status)).collect()
+                });
             if let gt_composition::credential_guard::CredOutcome::Resolved { resolved, .. } =
-                gt_composition::credential_guard::resolve_for_sling(&kc, now_ms)
+                gt_composition::credential_guard::resolve_for_sling(&kc, now_ms, |acc| {
+                    quota_status.get(acc).copied()
+                })
             {
                 set_env(&mut spec.env, "CLAUDE_CONFIG_DIR", resolved.config_dir);
                 set_env(
@@ -638,6 +651,9 @@ async fn main() -> anyhow::Result<()> {
     if let Some(kc) = &keychain {
         pol_plugin = pol_plugin.with_keychain(kc.clone());
     }
+    // Sling-time quota-status gate (gtcore-2836bb): the credential guard also rotates off an active
+    // account that is quota-Limited/Blocked, so a polecat is never slung into the rate-limit dialog.
+    pol_plugin = pol_plugin.with_quota(quota.clone());
     if let Some(url) = &anthropic_proxy_url {
         pol_plugin = pol_plugin.with_anthropic_proxy(url.clone());
     }
