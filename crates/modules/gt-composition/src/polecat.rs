@@ -19,7 +19,7 @@
 //! Eviction on a shrunk cap is *not* done — admission is side-effect-free, running polecats finish
 //! naturally (NN#2, mirrored from [`gt_polecat::pool`]).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -177,6 +177,16 @@ pub struct PolecatSupervisorPlugin {
     /// valid credentials — and rotates to a `Healthy` one, so a polecat is never born into the
     /// rate-limit dialog. `None` ⇒ the guard checks credential validity only (legacy).
     quota: Option<QuotaHandle>,
+    /// Session ids whose pool slot this plugin currently holds (gtcore-b05dbc). A slot is added
+    /// here when a sling succeeds (the claim landed AND the spawn landed) and removed when it is
+    /// released — at merge, OR when the session dies by any path (operator kill, heartbeat-stale,
+    /// reconciler reap, clean self-exit) WITHOUT a merge. Membership is what makes
+    /// [`release_slot_for`](Self::release_slot_for) idempotent and correctly scoped: a slot is
+    /// released exactly once (a duplicate or post-merge death event is a no-op), and only for a
+    /// session THIS workspace's plugin actually claimed — so a death event for some other
+    /// workspace's session never decrements the wrong pool. Without this set, the slot leaked
+    /// until the patrol lease expired (~300s), wedging all new slings on a phantom `pool cap`.
+    claimed: Mutex<HashSet<String>>,
 }
 
 impl PolecatSupervisorPlugin {
@@ -208,6 +218,7 @@ impl PolecatSupervisorPlugin {
             rig_configs: HashMap::new(),
             issues: None,
             quota: None,
+            claimed: Mutex::new(HashSet::new()),
         }
     }
 
@@ -357,6 +368,37 @@ impl PolecatSupervisorPlugin {
             }
         }
     }
+
+    /// Record that `session`'s pool slot is held by this plugin (gtcore-b05dbc). Called right after
+    /// a sling succeeds (claim + spawn both landed), so a later death/merge of that session can
+    /// release exactly the one slot it holds.
+    fn mark_claimed(&self, session: &str) {
+        self.claimed
+            .lock()
+            .expect("claimed mutex")
+            .insert(session.to_string());
+    }
+
+    /// Release the pool slot held for `session`, idempotently (gtcore-b05dbc).
+    ///
+    /// Returns `true` if a slot was actually released. The release is gated on the session being
+    /// in [`claimed`](Self::claimed): only a session this workspace's plugin claimed is released,
+    /// and a second call for the same session (a duplicate death event, or a death that arrives
+    /// after the merge already released it) is a harmless no-op. This is what ends the pool leak —
+    /// any path that ends a session (kill / heartbeat-stale / reconciler reap / clean exit) frees
+    /// the slot at once instead of waiting out the ~300s patrol lease — while keeping the count
+    /// exact (no double-release, no releasing another workspace's slot).
+    fn release_slot_for(&self, session: &str) -> bool {
+        if !self.claimed.lock().expect("claimed mutex").remove(session) {
+            return false;
+        }
+        self.allocator
+            .lock()
+            .expect("pool mutex")
+            .release(&self.workspace);
+        true
+    }
+
     /// Re-sling a polecat that died of context exhaustion, handing the next agent a continuation
     /// prompt instead of the original kickoff (gtcore-3b2a68).
     ///
@@ -796,6 +838,11 @@ impl Plugin for PolecatSupervisorPlugin {
                     });
                     return Ok(());
                 }
+                // The sling landed (claim + spawn both succeeded): record the slot against the
+                // session so any later death of this session releases it immediately, not only a
+                // merge (gtcore-b05dbc). A re-sling of the SAME session (continuation) keeps the
+                // same id, so this is idempotent — it never double-claims.
+                self.mark_claimed(&spec.session);
                 // Transition the bead open→working in Dolt (gtcore-orchd-working): the polecat is
                 // slung, so the bead IS being worked. Without this the bead stays `open` in the
                 // tracker until the polecat self-transitions — which may never happen, leaving the
@@ -856,16 +903,15 @@ impl Plugin for PolecatSupervisorPlugin {
                     return Ok(());
                 };
                 self.supervisor.unwatch_member(&bead);
-                self.allocator
-                    .lock()
-                    .expect("pool mutex")
-                    .release(&self.workspace);
-                // Close the agent session for that bead (hq-orchd.6): the session id is the
-                // deterministic `spec_for` session, so it matches the `Spawned` emitted at sling.
-                // Routed by bead prefix (hq-0ecfec) so a gtweb bead's session/worktree derive from
-                // the SAME template the sling used — else teardown would miss the tree.
+                // The session id is the deterministic `spec_for` session, so it matches the
+                // `Spawned` emitted at sling and the slot recorded in `claimed`. Routed by bead
+                // prefix (hq-0ecfec) so a gtweb bead's session/worktree derive from the SAME
+                // template the sling used — else teardown would miss the tree.
                 let (template, worktree_root) = self.route(&bead);
                 let session = template.spec_for(&self.workspace, &bead).session;
+                // Free the slot keyed by session (gtcore-b05dbc): idempotent, so a merge that
+                // follows an already-counted death (or vice versa) never double-releases.
+                self.release_slot_for(&session);
                 // Tear down the per-bead worktree now its work has landed (hq-orchd-deploy.9):
                 // best-effort, mirrors the deterministic `<root>/<session>` path used at sling. The
                 // branch itself is reaped by the branch-GC reactor on this same event.
@@ -884,17 +930,40 @@ impl Plugin for PolecatSupervisorPlugin {
                 self.emit_operator(IssueOperatorEvent::Cleared { bead });
                 Ok(())
             }
-            // A polecat died of context exhaustion → re-sling it with a continuation prompt
-            // (gtcore-3b2a68). The supervisor records this death as an `AgentEvent::Killed` whose
-            // reason begins `context exhausted` (gtcore-91fdde) — only that reason re-slings; a
-            // heartbeat-stale kill or an operator kill is left to the normal supervisor path.
+            // A polecat died (operator kill, heartbeat-stale, reconciler reap, or context
+            // exhaustion). The supervisor/reaper records every death as an `AgentEvent::Killed`;
+            // the `reason` tells the two apart (gtcore-91fdde).
+            //
+            // - Context exhaustion (reason begins `context exhausted`) → re-sling the SAME session
+            //   with a continuation prompt (gtcore-3b2a68). The slot is REUSED, not freed: the
+            //   session id is unchanged and stays in `claimed`, so a later merge/death releases it
+            //   exactly once.
+            // - Any other death → the work stopped without a merge. Free the slot IMMEDIATELY
+            //   (gtcore-b05dbc) instead of waiting out the ~300s patrol lease — that wait is what
+            //   wedged all new slings behind a phantom `pool cap reached` with zero live sessions.
+            //   `release_slot_for` is idempotent, so a duplicate kill (or a kill that races the
+            //   merge) is a harmless no-op.
             "agent.killed.v1" => {
                 let AgentEvent::Killed { session, reason } = record.decode::<AgentEvent>()? else {
                     return Ok(());
                 };
                 if is_context_exhaustion(&reason) {
                     self.resling_on_context_exhaustion(&session, &reason).await;
+                } else {
+                    self.release_slot_for(&session);
                 }
+                Ok(())
+            }
+            // A polecat exited cleanly on its own without a merge (gtcore-b05dbc). The supervisor's
+            // direct-child path and the session reconciler both emit `agent.session-end.v1` for a
+            // self-exit; the merge path emits its own `SessionEnd` AFTER it has already released the
+            // slot, so this handler's idempotent release is a no-op there (the session is no longer
+            // in `claimed`). A self-exit that was NOT preceded by a merge frees the slot here.
+            "agent.session-end.v1" => {
+                let AgentEvent::SessionEnd { session } = record.decode::<AgentEvent>()? else {
+                    return Ok(());
+                };
+                self.release_slot_for(&session);
                 Ok(())
             }
             _ => Ok(()),
@@ -1103,6 +1172,199 @@ mod tests {
         .unwrap();
         assert_eq!(sup.watched_count(), 0, "merged bead is unwatched");
         assert_eq!(alloc.lock().unwrap().in_flight("acme"), 0, "slot released");
+    }
+
+    #[tokio::test]
+    async fn killing_a_working_polecat_frees_its_slot_immediately() {
+        // gtcore-b05dbc: a non-exhaustion death (operator kill / heartbeat-stale / reconciler reap,
+        // all recorded as AgentEvent::Killed) must release the pool slot AT ONCE — not wait for a
+        // merge that will never come, nor the ~300s patrol lease. With the slot freed, a brand-new
+        // dispatch slings without hitting the phantom `pool cap reached`.
+        let alloc = Arc::new(Mutex::new(PoolAllocator::new(1, 1)));
+        let (p, sup) = plugin(alloc.clone());
+
+        p.on_event(&record(SchedEvent::Dispatched {
+            bead: "gg-1".into(),
+            worker: "w1".into(),
+        }))
+        .await
+        .unwrap();
+        assert_eq!(alloc.lock().unwrap().in_flight("acme"), 1, "slot claimed at sling");
+        // The host cap is 1 and it is full — a second dispatch would be refused right now.
+        assert!(!alloc.lock().unwrap().can_claim("acme"), "pool is full while the polecat lives");
+
+        // Operator kills the working session (no merge). The slot is freed immediately.
+        p.on_event(&record(AgentEvent::Killed {
+            session: "hq-gg-1".into(),
+            reason: "operator killed".into(),
+        }))
+        .await
+        .unwrap();
+        assert_eq!(
+            alloc.lock().unwrap().in_flight("acme"),
+            0,
+            "killed session releases its slot without waiting for merge/lease"
+        );
+
+        // A fresh dispatch now proceeds — no `pool cap reached`.
+        p.on_event(&record(SchedEvent::Dispatched {
+            bead: "gg-2".into(),
+            worker: "w2".into(),
+        }))
+        .await
+        .unwrap();
+        assert_eq!(alloc.lock().unwrap().in_flight("acme"), 1, "new sling admitted into the freed slot");
+        assert!(sup.spec_for_session("hq-gg-2").is_some(), "the new polecat is supervised");
+    }
+
+    #[tokio::test]
+    async fn clean_self_exit_without_merge_frees_its_slot() {
+        // gtcore-b05dbc: a polecat that exits on its own without a merge emits
+        // agent.session-end.v1 (the reconciler / direct-child path). That, too, must free the slot.
+        let alloc = Arc::new(Mutex::new(PoolAllocator::new(1, 1)));
+        let (p, _sup) = plugin(alloc.clone());
+
+        p.on_event(&record(SchedEvent::Dispatched {
+            bead: "gg-1".into(),
+            worker: "w1".into(),
+        }))
+        .await
+        .unwrap();
+        assert_eq!(alloc.lock().unwrap().in_flight("acme"), 1, "slot claimed at sling");
+
+        p.on_event(&record(AgentEvent::SessionEnd {
+            session: "hq-gg-1".into(),
+        }))
+        .await
+        .unwrap();
+        assert_eq!(
+            alloc.lock().unwrap().in_flight("acme"),
+            0,
+            "a self-exit without merge frees the slot"
+        );
+    }
+
+    #[tokio::test]
+    async fn slot_release_is_idempotent_no_double_count() {
+        // gtcore-b05dbc: the slot must be released EXACTLY once per session, however many
+        // death/merge events arrive. A kill followed by a (late) merge — or two kills, or a
+        // merge then a self-exit — must never drive the count negative or steal another
+        // workspace's slot. PoolAllocator saturates at 0 per workspace, so a stray double-release
+        // would silently under-count a co-tenant; the `claimed` gate prevents that entirely.
+        let alloc = Arc::new(Mutex::new(PoolAllocator::new(2, 2)));
+        let (p, _sup) = plugin(alloc.clone());
+
+        // Two live polecats in the same workspace.
+        for bead in ["gg-1", "gg-2"] {
+            p.on_event(&record(SchedEvent::Dispatched {
+                bead: bead.into(),
+                worker: "w".into(),
+            }))
+            .await
+            .unwrap();
+        }
+        assert_eq!(alloc.lock().unwrap().in_flight("acme"), 2, "both slots claimed");
+
+        // Kill gg-1, then a late merge for gg-1 arrives, then a duplicate kill: only the FIRST
+        // event releases; the rest are no-ops.
+        p.on_event(&record(AgentEvent::Killed {
+            session: "hq-gg-1".into(),
+            reason: "heartbeat stale".into(),
+        }))
+        .await
+        .unwrap();
+        p.on_event(&record(MergeEvent::Merged {
+            bead: "gg-1".into(),
+            sha: "abc".into(),
+        }))
+        .await
+        .unwrap();
+        p.on_event(&record(AgentEvent::Killed {
+            session: "hq-gg-1".into(),
+            reason: "operator killed".into(),
+        }))
+        .await
+        .unwrap();
+
+        assert_eq!(
+            alloc.lock().unwrap().in_flight("acme"),
+            1,
+            "gg-1 released exactly once; gg-2's slot is untouched (no double-count)"
+        );
+    }
+
+    #[tokio::test]
+    async fn context_exhaustion_resling_keeps_the_slot_claimed() {
+        // gtcore-b05dbc + gtcore-3b2a68: a context-exhaustion death re-slings the SAME session and
+        // must REUSE the slot — never release it (the work continues) and never re-claim it (no
+        // double-count). The slot is freed only by the eventual merge or a real death.
+        let alloc = Arc::new(Mutex::new(PoolAllocator::new(1, 1)));
+        let (p, sup) = plugin(alloc.clone());
+
+        p.on_event(&record(SchedEvent::Dispatched {
+            bead: "gg-1".into(),
+            worker: "w1".into(),
+        }))
+        .await
+        .unwrap();
+        assert_eq!(alloc.lock().unwrap().in_flight("acme"), 1, "slot claimed at sling");
+
+        // Context-exhaustion kill → continuation re-sling on the same session.
+        p.on_event(&record(AgentEvent::Killed {
+            session: "hq-gg-1".into(),
+            reason: "context exhausted: 92% context used".into(),
+        }))
+        .await
+        .unwrap();
+        assert_eq!(sup.watched_count(), 1, "still supervised after re-sling");
+        assert_eq!(
+            alloc.lock().unwrap().in_flight("acme"),
+            1,
+            "the slot is reused by the continuation — neither freed nor doubled"
+        );
+
+        // The continuation later merges → now the slot frees, exactly once.
+        p.on_event(&record(MergeEvent::Merged {
+            bead: "gg-1".into(),
+            sha: "abc".into(),
+        }))
+        .await
+        .unwrap();
+        assert_eq!(
+            alloc.lock().unwrap().in_flight("acme"),
+            0,
+            "merge of the continuation frees the (single) slot"
+        );
+    }
+
+    #[tokio::test]
+    async fn death_event_for_an_unclaimed_session_is_a_noop() {
+        // gtcore-b05dbc: a death event for a session this plugin never slung (e.g. another
+        // workspace's polecat on a shared hub, or a stale id) must NOT touch this workspace's
+        // count. The `claimed` gate scopes the release to sessions we actually hold.
+        let alloc = Arc::new(Mutex::new(PoolAllocator::new(2, 2)));
+        let (p, _sup) = plugin(alloc.clone());
+
+        p.on_event(&record(SchedEvent::Dispatched {
+            bead: "gg-1".into(),
+            worker: "w1".into(),
+        }))
+        .await
+        .unwrap();
+        assert_eq!(alloc.lock().unwrap().in_flight("acme"), 1);
+
+        // A kill for a session we never claimed.
+        p.on_event(&record(AgentEvent::Killed {
+            session: "hq-someone-elses-session".into(),
+            reason: "operator killed".into(),
+        }))
+        .await
+        .unwrap();
+        assert_eq!(
+            alloc.lock().unwrap().in_flight("acme"),
+            1,
+            "a foreign session's death does not steal our slot"
+        );
     }
 
     #[tokio::test]
