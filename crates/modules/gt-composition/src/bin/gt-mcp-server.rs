@@ -693,6 +693,27 @@ async fn main() -> anyhow::Result<()> {
         ))
     });
 
+    // Per-account relogin + cred-health (gtcore-1fe9b4): POST /api/v1/quota/relogin/{start,complete}
+    // relogs an EXISTING keychain account's creds dir via `claude /login`, seeds the dir
+    // onboarding-complete so the sling consumes it without a first-run TUI/OAuth wedge, and dedups
+    // duplicate dirs for the same email. GET /api/v1/quota/cred-health reports per-account
+    // {refresh, expiry, onboarding, needs_relogin}. Mounted only with an RS256 verifier; relogin
+    // needs `quota.write`, cred-health `quota.read` (audited on denial). See `gt_composition::relogin`.
+    let relogin = verifier.as_ref().map(|v| {
+        eprintln!(
+            "[gt-mcp-server] relogin on POST /api/v1/quota/relogin/{{start,complete}} + GET /api/v1/quota/cred-health (cookie/bearer auth, scope quota.write/read)"
+        );
+        let relogin_eventlog_root = std::env::var("GT_EVENTLOG_ROOT")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|_| std::path::PathBuf::from(DEFAULT_EVENTLOG_ROOT));
+        let accounts_root = gt_composition::account_dirs::accounts_root(&relogin_eventlog_root);
+        gt_composition::relogin::relogin_router(gt_composition::relogin::ReloginState::new(
+            v.clone(),
+            audit.clone(),
+            accounts_root,
+        ))
+    });
+
     // Global Claude Code hook registry (hq-hooks): GET/POST/DELETE /api/v1/hooks list/register/
     // retire the global hook set the terminal materialises into a launching session's
     // .claude/settings.json (filtered by the session's workspace/rig/role target). Mounted with an
@@ -1134,6 +1155,9 @@ async fn main() -> anyhow::Result<()> {
     }
     if let Some(onboard) = onboard {
         app = app.merge(onboard);
+    }
+    if let Some(relogin) = relogin {
+        app = app.merge(relogin);
     }
     if let Some(hooks) = hooks {
         app = app.merge(hooks);
@@ -2212,7 +2236,13 @@ async fn build_domain_router(
                 None => handler,
             }
         }))
-        .register(Arc::new(QuotaHandler::new(event_log.clone())))
+        .register(Arc::new(QuotaHandler::new(event_log.clone()).with_accounts_root(
+            gt_composition::account_dirs::accounts_root(
+                &std::env::var("GT_EVENTLOG_ROOT")
+                    .map(std::path::PathBuf::from)
+                    .unwrap_or_else(|_| std::path::PathBuf::from(DEFAULT_EVENTLOG_ROOT)),
+            ),
+        )))
         // notify.* — operator notification channel (hq-notifications): agents write
         // via notify.send; the browser bell polls/streams the same PG table.
         .register(Arc::new(NotifyHandler::new(pool.clone(), event_log.clone())))
