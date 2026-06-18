@@ -310,6 +310,21 @@ async fn main() -> anyhow::Result<()> {
     // before `template` is moved into the polecat supervisor plugin below.
     let rig_path = template.workdir.clone();
 
+    // Seed `gh` auth before the merge edge can fire (gtcore-4c9c85). `gh`'s login lives in
+    // $HOME/.config/gh, but the orchd's HOME=/tmp is wiped on every pod restart — so without this,
+    // the GitMergePlugin's `gh pr create`/`gh pr merge` fail with "please run: gh auth login" after
+    // every redeploy and no merge closes until an operator re-seeds by hand. Setting GH_TOKEN (from
+    // GT_RIG_GIT_TOKEN or the rig remote's embedded token) makes `gh` authenticated for the process
+    // lifetime with no file on disk, surviving any restart. Best-effort: a missing token only logs.
+    {
+        let seed = gt_composition::gh_auth::seed_gh_auth(&rig_path);
+        if seed.authenticated() {
+            eprintln!("[gt-orch-server] {}", seed.describe());
+        } else {
+            eprintln!("[gt-orch-server] WARN: {}", seed.describe());
+        }
+    }
+
     // Install the polecat hook settings into the rig checkout (hq-agent-provisioning.2) so a slung
     // claude reports back: heartbeat touches + a merge-ready drop on Stop. Best-effort + marker-safe
     // — it never clobbers a human's `.claude/settings.json` (returns AlreadyExists, logged + skipped).

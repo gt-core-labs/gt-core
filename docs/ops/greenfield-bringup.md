@@ -249,6 +249,31 @@ The daemon is gated by **`GT_RUN_DAEMONS`** (default ON; only `GT_RUN_DAEMONS=0`
 set `0` on scaled API replicas so a single tier owns each daemon tick). Confirm it logged
 `claude keychain seeded with N account(s)`.
 
+### `gh` auth seed (autonomous merges) — `gtcore-4c9c85`
+
+The git-merge edge lands branches with a PR (`gh pr create` + `gh pr merge --auto`). `gh` stores
+its login under `$HOME/.config/gh`, but the orchd's **`HOME=/tmp` is wiped on every pod
+restart/redeploy** — so without a seed, *every* autonomous merge fails right after a restart with
+`To get started with GitHub CLI, please run: gh auth login`, even though `git push` still works (the
+rig remote carries an embedded token). Same systemic shape as the keychain creds.
+
+The orchd self-seeds at boot: it sets **`GH_TOKEN`** in its own process env (no `gh auth login`, no
+file on disk, survives any restart), resolving a token in priority order:
+
+1. an already-present **`GH_TOKEN`** / **`GH_ENTERPRISE_TOKEN`** — left untouched (the
+   chart-mounted-Secret hardening path; recommended, lives in a k8s Secret, never in the image);
+2. **`GT_RIG_GIT_TOKEN`** — the same PAT used for the boot clone;
+3. the token embedded in the rig checkout's `origin` remote (what an operator reads off a worktree
+   by hand today).
+
+Because `GT_RIG_GIT_TOKEN` is already set for the orchd boot clone, **no extra config is required** —
+the seed works out of the box. For the cleanest hardening, mount a k8s Secret as `GH_TOKEN` on the
+`gt-daemons` Deployment (a `gt-app-proxy` chart follow-up) so the token is decoupled from the rig
+clone token. Confirm at boot with the log line `gh auth seeded — GH_TOKEN set from …`, and verify
+`gh auth status` reports *Logged in to github.com … (GH_TOKEN)* with no manual `gh auth login`.
+The seed touches only `gh`; `git push` (embedded remote token) and the keychain creds flow are
+unaffected.
+
 > **Bootstrap shortcut (first account, no restart):** pre-create a `CLAUDE_CONFIG_DIR` on the
 > accounts-root volume, run `CLAUDE_CONFIG_DIR=<dir> claude auth login` (still the one human
 > handshake), and set `GT_CLAUDE_ACCOUNTS=email=<dir>` before the daemon boots — it's promoted to
