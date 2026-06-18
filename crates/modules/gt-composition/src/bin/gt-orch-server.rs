@@ -630,6 +630,16 @@ async fn main() -> anyhow::Result<()> {
     // behind a docker→host firewall hole. The daemon no longer serves it — it only hydrates its
     // rotation keychain from the accounts the backend registers into the shared quota log.
 
+    // Snapshot the boot template's shared launch fields BEFORE it is moved into the polecat
+    // supervisor plugin below — mayor-mode auto-dispatch (gtcore-d72302) reuses them to launch the
+    // per-rig MAYOR session the same way (same agent command/args/env, same checkout).
+    let mayor_launch = (
+        template.command.clone(),
+        template.args.clone(),
+        template.base_env.clone(),
+        template.workdir.clone(),
+    );
+
     // Observe the SAME hub the root drains actor output onto: a fresh broadcast receiver, so the
     // sling observer runs independently of the root's own plugin relay (durability/roles/reactor).
     let mut pol_plugin = PolecatSupervisorPlugin::new(
@@ -930,7 +940,25 @@ async fn main() -> anyhow::Result<()> {
     // and feeds eligible beads to the scheduler. Env-gated: GT_AUTO_DISPATCH=1 +
     // GT_DOLT_URL. The completion plugin is registered on the SAME hub relay so
     // slot-freeing events (issues.closed.v1, patrol.lease-expired.v1) are observed.
+    //
+    // Two dispatch shapes share the same env gate + ready frontier (gtcore-d72302):
+    //
+    //   * DIRECT (default, GT_DISPATCH_VIA_MAYOR unset/0): the orchd owns the
+    //     bead-by-bead decision — every ready bead is seeded + enqueued on the
+    //     scheduler, which slings a polecat per bead. Current behavior, untouched.
+    //   * MAYOR (GT_DISPATCH_VIA_MAYOR=1): the orchd stops deciding which bead runs.
+    //     It keeps one supervised MAYOR session alive per rig and wakes it with the
+    //     ready frontier; the mayor decides the bead-by-bead dispatch. Wake-on-task:
+    //     an idle rig (empty frontier) is never woken, so it burns ~0 tokens. A
+    //     downed mayor is re-slung on the next tick its rig has ready work. The
+    //     pool / host_cap arbitration stays with the orchd (the mayor asks, the
+    //     polecat supervisor bounds), so this loop never sizes capacity itself.
+    //
+    // The mayor loop tracks no in-flight set (the mayor + pool own capacity), so it
+    // registers no completion plugin and is spawned directly into `mayor_dispatch_task`.
     let auto_dispatch_tick_secs = env_usize("GT_AUTO_DISPATCH_TICK_SECS", 30) as u64;
+    let dispatch_via_mayor = std::env::var("GT_DISPATCH_VIA_MAYOR").ok().as_deref() == Some("1");
+    let mut mayor_dispatch_task: Option<tokio::task::JoinHandle<()>> = None;
     let auto_dispatch_handle: Option<Arc<gt_runtime::Dispatcher<
         gt_composition::auto_dispatch::FrontierSource,
         gt_composition::auto_dispatch::SchedWorker,
@@ -946,18 +974,42 @@ async fn main() -> anyhow::Result<()> {
                     .map(std::path::PathBuf::from);
                 let source =
                     gt_composition::auto_dispatch::FrontierSource::new(Arc::new(store), repo_dir);
-                let worker = gt_composition::auto_dispatch::SchedWorker::new(sched.clone());
-                let max = env_usize("GT_AUTO_DISPATCH_MAX", 4);
-                let dispatcher = Arc::new(gt_runtime::Dispatcher::new(source, worker, max));
-                pol_registry = pol_registry.register(
-                    gt_composition::auto_dispatch::AutoDispatchCompletionPlugin::new(
-                        dispatcher.clone(),
-                    ),
-                );
-                eprintln!(
-                    "[gt-orch-server] auto-dispatch on — tick {auto_dispatch_tick_secs}s, max_in_flight={max}"
-                );
-                Some(dispatcher)
+                if dispatch_via_mayor {
+                    let (command, args, base_env, workdir) = mayor_launch;
+                    let channel_root = std::env::var("GT_CHANNEL_ROOT")
+                        .unwrap_or_else(|_| "/gt/.channels".to_string());
+                    let waker = gt_composition::mayor_dispatch::TmuxMayorWaker::new(
+                        tmux.clone(),
+                        ws_slug.clone(),
+                        gt_composition::mayor_dispatch::DEFAULT_MAYOR_PREFIX,
+                        workdir,
+                        command,
+                        args,
+                        base_env,
+                        std::path::PathBuf::from(channel_root),
+                    );
+                    let dispatcher =
+                        Arc::new(gt_composition::mayor_dispatch::MayorDispatcher::new(source, waker));
+                    mayor_dispatch_task =
+                        Some(dispatcher.spawn(Duration::from_secs(auto_dispatch_tick_secs)));
+                    eprintln!(
+                        "[gt-orch-server] auto-dispatch on — MAYOR mode (GT_DISPATCH_VIA_MAYOR=1), tick {auto_dispatch_tick_secs}s; per-rig mayor woken with the ready frontier — no direct polecat sling"
+                    );
+                    None
+                } else {
+                    let worker = gt_composition::auto_dispatch::SchedWorker::new(sched.clone());
+                    let max = env_usize("GT_AUTO_DISPATCH_MAX", 4);
+                    let dispatcher = Arc::new(gt_runtime::Dispatcher::new(source, worker, max));
+                    pol_registry = pol_registry.register(
+                        gt_composition::auto_dispatch::AutoDispatchCompletionPlugin::new(
+                            dispatcher.clone(),
+                        ),
+                    );
+                    eprintln!(
+                        "[gt-orch-server] auto-dispatch on — DIRECT mode, tick {auto_dispatch_tick_secs}s, max_in_flight={max}"
+                    );
+                    Some(dispatcher)
+                }
             }
             None => {
                 eprintln!(
@@ -1402,6 +1454,9 @@ async fn main() -> anyhow::Result<()> {
     if let Some(task) = &auto_dispatch_task {
         task.abort();
     }
+    if let Some(task) = &mayor_dispatch_task {
+        task.abort();
+    }
     let _ = pol_timer.await;
     let _ = pol_relay.await;
     if let Some(task) = checkpoint_timer {
@@ -1427,6 +1482,9 @@ async fn main() -> anyhow::Result<()> {
         let _ = task.await;
     }
     if let Some(task) = auto_dispatch_task {
+        let _ = task.await;
+    }
+    if let Some(task) = mayor_dispatch_task {
         let _ = task.await;
     }
     // Cancel the actor stack + stop the observer relay and the per-domain drains. The
