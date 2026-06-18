@@ -63,7 +63,7 @@ use gt_composition::patrol_bridge::PatrolBridgePlugin;
 use gt_composition::mcp::eventlog::EventLog;
 use gt_composition::polecat::{
     host_cap_from_metrics, rig_routing_from_catalog, AgentTokenMinter, PolecatSupervisorPlugin,
-    RigConfig, ScopeResolver,
+    RigConfig, ScopeResolver, DEFAULT_CI_MAX_RETRIES,
 };
 use gt_composition::quota_rotation::{self, QuotaRotationPlugin};
 use gt_composition::session_reconcile::{ReapScope, ReapSink, SessionReconciler};
@@ -654,6 +654,20 @@ async fn main() -> anyhow::Result<()> {
     // Sling-time quota-status gate (gtcore-2836bb): the credential guard also rotates off an active
     // account that is quota-Limited/Blocked, so a polecat is never slung into the rate-limit dialog.
     pol_plugin = pol_plugin.with_quota(quota.clone());
+    // CI-failure recovery (gtcore-3a1bd4): on `merge.failed.v1` the supervisor re-slings the bead
+    // with a fix-and-re-push prompt (carrying the CI failure context) up to GT_CI_MAX_RETRIES times,
+    // then escalates to the operator. The scheduler handle lets it free dispatch capacity when the
+    // budget is exhausted (the slot is held across retries, like a crash re-sling).
+    let ci_max_retries = std::env::var("GT_CI_MAX_RETRIES")
+        .ok()
+        .and_then(|s| s.parse::<u32>().ok())
+        .unwrap_or(DEFAULT_CI_MAX_RETRIES);
+    pol_plugin = pol_plugin
+        .with_scheduler(sched.clone())
+        .with_ci_max_retries(ci_max_retries);
+    eprintln!(
+        "[gt-orch-server] CI-failure auto re-sling on — up to {ci_max_retries} retries before escalation (GT_CI_MAX_RETRIES)"
+    );
     if let Some(url) = &anthropic_proxy_url {
         pol_plugin = pol_plugin.with_anthropic_proxy(url.clone());
     }
