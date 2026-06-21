@@ -70,10 +70,20 @@ jobs:
           kubectl set image deploy/gt-orchd -n gt \
             orchd=codecsrayo/gt-core-orchd:sha-${{ steps.vars.outputs.sha7 }}
 
+      # Graceful drain on redeploy (gtcore-0179f8): the orchd SIGTERM handler commits + pushes every
+      # in-flight worktree's pending work before exit (GT_DRAIN_TIMEOUT_SECS=90). k8s's default 30s
+      # grace would SIGKILL it mid-drain, so widen it to 180s (> drain timeout + actor-stack teardown)
+      # so the push completes. The chart (gt-app-proxy) is the long-term home; this patch enforces it
+      # from the deploy that sets the image, and is idempotent.
+      - name: Ensure orchd termination grace for drain
+        run: |
+          kubectl patch deploy/gt-orchd -n gt --type=strategic \
+            -p '{"spec":{"template":{"spec":{"terminationGracePeriodSeconds":180}}}}'
+
       - name: Wait for rollouts
         run: |
           kubectl rollout status deploy/gt-mcp-server -n gt --timeout=180s
-          kubectl rollout status deploy/gt-orchd -n gt --timeout=180s
+          kubectl rollout status deploy/gt-orchd -n gt --timeout=300s
 
       - name: Provision claude credentials
         run: |
@@ -128,7 +138,14 @@ jobs:
           kubectl set image deploy/gt-prod-orchd -n gt-prod \
             orchd=codecsrayo/gt-core-mcp-server:sha-embeddings-${{ steps.vars.outputs.sha7 }}
 
+      # Graceful drain on redeploy (gtcore-0179f8) — same as dev: widen the grace so the orchd's
+      # SIGTERM drain (commit + push of in-flight worktrees) is not SIGKILLed mid-push.
+      - name: Ensure prod orchd termination grace for drain
+        run: |
+          kubectl patch deploy/gt-prod-orchd -n gt-prod --type=strategic \
+            -p '{"spec":{"template":{"spec":{"terminationGracePeriodSeconds":180}}}}'
+
       - name: Wait for rollouts (prod)
         run: |
           kubectl rollout status deploy/gt-prod-mcp-server -n gt-prod --timeout=180s
-          kubectl rollout status deploy/gt-prod-orchd -n gt-prod --timeout=180s
+          kubectl rollout status deploy/gt-prod-orchd -n gt-prod --timeout=300s
