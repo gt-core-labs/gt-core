@@ -107,17 +107,26 @@ pub fn session_like_actor(actor: &str) -> bool {
     actor.split('-').filter(|seg| !seg.is_empty()).count() >= 3
 }
 
-/// The lock roots: epics in `working` whose owner is a HUMAN (per `is_agent`).
-/// Feed it the unscoped working-epic snapshot
+/// The lock roots: epics in `working` whose owner is an EXPLICIT HUMAN claim
+/// (a non-empty owner that `is_agent` rejects). Feed it the unscoped
+/// working-epic snapshot
 /// ([`working_epics`](gt_store_dolt::DoltIssues::working_epics)) — an operator
 /// may hold an epic outside the rig/workspace being listed.
+///
+/// An EMPTY owner does NOT lock (gtcore-bf0fc9): `working_epics` maps a
+/// `NULL`/unset owner to `""`, and a container epic flipped to `working` with
+/// no owner is NOT "a human claiming the subtree" — treating it as one
+/// silently freezes the whole auto-dispatch frontier beneath it (a bead like
+/// `gtcore-0179f8`, `open` + `dispatch=auto`, never gets slung). C2 is an
+/// OPT-IN operator lock, so it requires an explicit human owner; an orphaned
+/// `working` epic is left to the frontier rather than locking it.
 pub fn locked_roots<'a>(
     working_epics: impl IntoIterator<Item = (&'a str, &'a str)>,
     is_agent: &dyn Fn(&str) -> bool,
 ) -> HashSet<String> {
     working_epics
         .into_iter()
-        .filter(|(_, owner)| !is_agent(owner))
+        .filter(|(_, owner)| !owner.is_empty() && !is_agent(owner))
         .map(|(id, _)| id.to_string())
         .collect()
 }
@@ -402,6 +411,29 @@ mod tests {
     }
 
     #[test]
+    fn empty_owner_working_epic_does_not_lock() {
+        // gtcore-bf0fc9: a container epic flipped to `working` with NO owner
+        // (working_epics maps NULL → "") must NOT lock its subtree — only an
+        // EXPLICIT human claim does. Otherwise the whole auto-dispatch frontier
+        // beneath an orphaned working epic freezes.
+        let epics = [
+            ("epic-orphan", ""),                  // empty owner → NOT a lock
+            ("epic-human", "ops@gt.local"),       // explicit human email → lock
+            ("epic-agent", "gtcore-gtcore-d72302"), // agent session → NOT a lock
+        ];
+        let locked = locked_roots(epics, &|a: &str| session_like_actor(a));
+        assert!(
+            !locked.contains("epic-orphan"),
+            "empty-owner working epic must not lock its subtree"
+        );
+        assert!(locked.contains("epic-human"), "explicit human claim locks");
+        assert!(
+            !locked.contains("epic-agent"),
+            "agent-session claim does not lock"
+        );
+    }
+
+    #[test]
     fn lock_covers_whole_subtree_and_releases() {
         let (parents, _) = maps(
             &[("hq-epic-1", "hq-epic"), ("hq-epic-1-a", "hq-epic-1"), ("free-1", "free")],
@@ -537,6 +569,54 @@ mod tests {
             frontier.iter().map(|r| r.id.as_str()).collect::<Vec<_>>(),
             ["b-ok"],
             "only the bead that passes all clauses survives"
+        );
+    }
+
+    #[test]
+    fn frontier_reaches_bead_under_orphaned_working_epic() {
+        // gtcore-bf0fc9 regression: an open + dispatch=auto bead nested under a
+        // container epic that is `working` with NO owner must reach the DIRECT
+        // auto-dispatch frontier. The pre-fix `locked_roots` treated the empty
+        // owner as a human claim and froze the whole subtree, so the bead was
+        // never slung despite spare pool/host/quota capacity.
+        let bead = auto_row("gtcore-0179f8", r#"["crates/free"]"#);
+        let rows = vec![bead];
+
+        let deps_of: HashMap<String, Vec<String>> = HashMap::new();
+        let dep_fact = |_: &str| -> Option<DepFact> { None };
+        // child_of chain: bead → child epic (auto) → orphaned working epic.
+        let (parents, dispatch_raw) = maps(
+            &[
+                ("gtcore-0179f8", "epic-child"),
+                ("epic-child", "epic-orphan"),
+            ],
+            &[("epic-child", Some("auto"))],
+        );
+        // The lock set is computed exactly as FrontierSource::ready does: the
+        // container epic is `working` with an empty owner.
+        let working_epics = [("epic-orphan", "")];
+        let locked = locked_roots(working_epics, &|a: &str| session_like_actor(a));
+        assert!(
+            locked.is_empty(),
+            "orphaned working epic must not produce a lock root"
+        );
+        let occupied: HashSet<String> = HashSet::new();
+
+        let frontier = ready_for_auto(
+            rows,
+            &deps_of,
+            &dep_fact,
+            IssuePhase::P1,
+            &AllowAll,
+            &parents,
+            &dispatch_raw,
+            &locked,
+            &occupied,
+        );
+        assert_eq!(
+            frontier.iter().map(|r| r.id.as_str()).collect::<Vec<_>>(),
+            ["gtcore-0179f8"],
+            "bead under an orphaned working epic reaches the frontier"
         );
     }
 }
