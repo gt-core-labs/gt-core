@@ -4,7 +4,8 @@
 //! Tokio runtime (the domain crates never create one — `tokio::spawn` is forbidden in
 //! the kernel; the bin owns the runtime, docs/03), resolves the **durable hydrated**
 //! [`live_root`] for the configured workspace, and stays alive running the reactor
-//! loops until SIGTERM/SIGINT, when it drains the actor stack and exits cleanly.
+//! loops until SIGTERM/SIGINT, when it drains every in-flight worktree (a final commit + push of
+//! pending work, `gtcore-0179f8`), then drains the actor stack and exits cleanly.
 //!
 //! Like `gt-mcp-server`, this bin lives in `gt-composition` (the `modules` tier)
 //! because composing the per-workspace root names every `domain/*` crate, which only
@@ -32,6 +33,11 @@
 //! - `GT_CHECKPOINT_PUSH_SECS` — checkpoint-push timer interval (default 120): every N seconds the
 //!   daemon pushes each in-flight polecat branch to origin so a committed-but-unmerged branch is
 //!   durable before merge-ready (`gtcore-4cea57`). `0` ⇒ disabled.
+//! - `GT_DRAIN_ON_TERM` (default on) / `GT_DRAIN_TIMEOUT_SECS` (default 90) — on SIGTERM/preStop
+//!   (redeploy), force a final checkpoint: commit any UNCOMMITTED changes in every active worktree
+//!   and push the branch to origin before draining the actor stack, so a `Recreate` redeploy never
+//!   loses committable work (`gtcore-0179f8`). Bounded by the timeout (keep it under the pod's
+//!   `terminationGracePeriodSeconds`); `GT_DRAIN_ON_TERM=0` disables it.
 //! - `GT_RIG` / `GT_RIG_PATH` / `GT_POLECAT_CMD` / `GT_POLECAT_PREFIX` / `GT_HEARTBEAT_DIR` —
 //!   the rig's [`SpawnTemplate`] (see [`SpawnTemplate::from_env`]).
 //! - `GT_PATROL_TICK_SECS` (30) / `GT_LEASE_TIMEOUT_SECS` (300) — patrol lease-expiry ticker.
@@ -56,7 +62,7 @@ use std::time::Duration;
 use gt_auth::JwtMinter;
 use gt_channel::Channel;
 use gt_composition::bead_close::BeadClosePlugin;
-use gt_composition::checkpoint_push::checkpoint_push_pass;
+use gt_composition::checkpoint_push::{checkpoint_push_pass, drain_pass};
 use gt_composition::ci_gate::CiGateState;
 use gt_composition::git_merge::GitMergePlugin;
 use gt_composition::patrol_bridge::PatrolBridgePlugin;
@@ -768,6 +774,10 @@ async fn main() -> anyhow::Result<()> {
         .cloned()
         .chain(std::iter::once(rig_path.clone()))
         .collect();
+    // The same rig set, captured for the final drain on SIGTERM/preStop (gtcore-0179f8): the periodic
+    // checkpoint timer below MOVES `checkpoint_rigs` into its closure, so the shutdown path needs its
+    // own copy to commit + push every worktree's pending work before the pod dies.
+    let drain_rigs = checkpoint_rigs.clone();
     pol_registry = pol_registry.register(
         GitMergePlugin::with_rig_paths(merge.clone(), rig_paths, rig_path.clone())
             .with_ci_gated(ci_gated),
@@ -1432,6 +1442,42 @@ async fn main() -> anyhow::Result<()> {
     if let Some(task) = &checkpoint_timer {
         task.abort();
     }
+
+    // --- Final drain on shutdown (gtcore-0179f8) ---
+    // k8s redeploys orchd with a `Recreate` strategy: it SIGTERMs this pod (and every in-flight
+    // polecat) here, then SIGKILLs after `terminationGracePeriodSeconds`. The periodic checkpoint
+    // above only saved COMMITTED work; UNCOMMITTED edits in a live worktree would die with the pod.
+    // Now that the slings + periodic push are stopped (the lines above), this is the sole writer to
+    // the worktree branches: force a final checkpoint — commit pending changes in every active
+    // worktree and push the branch to origin — so nothing committable is lost. Bounded by
+    // GT_DRAIN_TIMEOUT_SECS (kept under the grace period) so it can never be SIGKILLed mid-push and
+    // never wedges a clean shutdown. GT_DRAIN_ON_TERM=0 disables it. With no dirty worktrees the
+    // drain is a couple of fast `git` calls, so a clean shutdown stays fast (the happy-path AC).
+    let drain_on_term = std::env::var("GT_DRAIN_ON_TERM")
+        .map(|v| v != "0" && !v.eq_ignore_ascii_case("false"))
+        .unwrap_or(true);
+    if drain_on_term && !drain_rigs.is_empty() {
+        let drain_secs = env_usize("GT_DRAIN_TIMEOUT_SECS", 90) as u64;
+        eprintln!(
+            "[gt-orch-server] final drain — commit+push pending work across {} rig checkout(s), ≤{drain_secs}s",
+            drain_rigs.len()
+        );
+        let rigs = drain_rigs.clone();
+        // Shelling `git add`/`commit`/`push` is blocking I/O — keep it off the runtime workers.
+        let drain = tokio::task::spawn_blocking(move || drain_pass(&rigs));
+        match tokio::time::timeout(Duration::from_secs(drain_secs), drain).await {
+            Ok(Ok(())) => eprintln!("[gt-orch-server] final drain complete"),
+            Ok(Err(e)) => eprintln!("[gt-orch-server] final drain task panicked: {e}"),
+            Err(_) => eprintln!(
+                "[gt-orch-server] final drain timed out after {drain_secs}s — proceeding to shutdown"
+            ),
+        }
+    } else if drain_rigs.is_empty() {
+        eprintln!("[gt-orch-server] final drain skipped — no rig checkout to sweep");
+    } else {
+        eprintln!("[gt-orch-server] final drain OFF (GT_DRAIN_ON_TERM=0)");
+    }
+
     patrol_timer.abort();
     quota_timer.abort();
     delegation_timer.abort();
