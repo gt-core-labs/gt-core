@@ -91,6 +91,11 @@ pub type ScopeResolver = Arc<dyn Fn(&str) -> Vec<String> + Send + Sync>;
 /// inheriting the operator's admin (`*`) config. The token is RS256-signed by [`JwtMinter`] (the
 /// daemon holds the private key); the gateway verifies it with the matching public key. A short
 /// `ttl_secs` bounds exposure — a polecat that outlives it is re-slung with a fresh token.
+///
+/// `Clone` (all fields are: [`JwtMinter`] is `Clone`, [`ScopeResolver`] is an `Arc`) so the daemon
+/// can hand the same configured minter to both the polecat supervisor and the role-agent launcher
+/// (`gtcore-999795`) without rebuilding the role→scopes policy twice.
+#[derive(Clone)]
 pub struct AgentTokenMinter {
     minter: JwtMinter,
     scopes_for_role: ScopeResolver,
@@ -117,7 +122,10 @@ impl AgentTokenMinter {
 
     /// Mint a token for `session` running as `role`. `sub` is the session id, scopes come from the
     /// resolver (least-privilege; never `*`), and `exp` is `now + ttl_secs`.
-    fn token_for(&self, session: &str, role: &str) -> Result<String, gt_auth::AuthError> {
+    ///
+    /// `pub(crate)` so the role-agent launcher ([`crate::role_agent`]) can mint the same kind of
+    /// least-privilege token for a triggered sheriff/witness/deacon session.
+    pub(crate) fn token_for(&self, session: &str, role: &str) -> Result<String, gt_auth::AuthError> {
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_secs())
