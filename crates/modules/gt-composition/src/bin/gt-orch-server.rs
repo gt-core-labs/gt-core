@@ -1367,7 +1367,7 @@ async fn main() -> anyhow::Result<()> {
         match Channel::open(&channel_root, &dispatch_channel) {
             Ok(channel) => {
                 eprintln!(
-                    "[gt-orch-server] dispatch: file channel {} — drop {{\"bead\",\"priority\"}} to dispatch (set GT_EVENTLOG_PG=1 + GT_PG_URL for the Postgres queue)",
+                    "[gt-orch-server] dispatch: file channel {} — drop a {{\"bead\",\"priority\"}} JSON as a `<id>.event` file (atomic: write `.<id>.tmp` then rename; a bare `.json` is IGNORED — only the `.event` extension is consumed) to dispatch (set GT_EVENTLOG_PG=1 + GT_PG_URL for the Postgres queue)",
                     channel.dir().display()
                 );
                 let sched = sched.clone();
