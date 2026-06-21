@@ -72,6 +72,9 @@ use gt_composition::polecat::{
     RigConfig, ScopeResolver, DEFAULT_CI_MAX_RETRIES,
 };
 use gt_composition::quota_rotation::{self, QuotaRotationPlugin};
+use gt_composition::role_agent::{
+    RoleAgentDispatcher, RoleAgentPlugin, RoleTrigger, SpecRoleLauncher,
+};
 use gt_composition::session_reconcile::{ReapScope, ReapSink, SessionReconciler};
 use gt_composition::witness_sweep::WitnessSweep;
 use gt_composition::workflow_notify::WorkflowNotifyPlugin;
@@ -316,6 +319,16 @@ async fn main() -> anyhow::Result<()> {
     // before `template` is moved into the polecat supervisor plugin below.
     let rig_path = template.workdir.clone();
 
+    // Trigger-driven role agents (gtcore-999795): sheriff/witness/deacon as AGENTS WITH CRITERION,
+    // slung single-shot only when their trigger fires. Gated on GT_ROLE_AGENTS. Capture the template
+    // clone the role launcher needs BEFORE `template` is moved into the polecat supervisor plugin —
+    // only when the feature is on, so an unused clone never lingers when it's off.
+    let role_agents_on = std::env::var("GT_ROLE_AGENTS")
+        .ok()
+        .filter(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .is_some();
+    let role_template = role_agents_on.then(|| template.clone());
+
     // Seed `gh` auth before the merge edge can fire (gtcore-4c9c85). `gh`'s login lives in
     // $HOME/.config/gh, but the orchd's HOME=/tmp is wiped on every pod restart — so without this,
     // the GitMergePlugin's `gh pr create`/`gh pr merge` fail with "please run: gh auth login" after
@@ -431,6 +444,13 @@ async fn main() -> anyhow::Result<()> {
             None
         }
     };
+
+    // The role-agent launcher mints the same kind of least-privilege per-agent token as the polecat
+    // path; clone the configured minter before `agent_token` is moved into the polecat plugin below
+    // (only when role agents are on, so the clone is never built needlessly).
+    let role_agent_token = role_agents_on
+        .then(|| agent_token.clone())
+        .flatten();
 
     // Claude-account keychain for predictive rotation (hq-agent-provisioning.7). GT_CLAUDE_ACCOUNTS
     // is a comma list of `account=CLAUDE_CONFIG_DIR` pairs; the first is the boot-active account.
@@ -1029,6 +1049,51 @@ async fn main() -> anyhow::Result<()> {
         None
     };
 
+    // --- Trigger-driven role agents (gtcore-999795) ---
+    // sheriff/witness/deacon run as AGENTS WITH CRITERION — slung single-shot ONLY when their trigger
+    // fires (sheriff ← merge.failed.v1/merge.ready.v1; witness ← issues.closed.v1; deacon ← a health
+    // tick), with single-flight per role so a burst can't sling a racing herd. Between triggers there
+    // is no live session, so idle cost is ≈0 tokens. The launcher gives each agent its own per-session
+    // workdir (under the polecat worktree root) with a least-privilege `.mcp.json`, so concurrent role
+    // agents never race on a shared token. Registered on the SAME relay as the polecat sling so it
+    // observes the same hub. GT_ROLE_AGENTS off ⇒ the legacy in-process loops + witness safety-net
+    // stand unchanged. The returned dispatcher is shared with the deacon health-tick timer below.
+    let role_dispatcher: Option<Arc<RoleAgentDispatcher>> = match role_template {
+        Some(role_template) => {
+            let mut launcher = SpecRoleLauncher::new(role_template, tmux.clone())
+                .with_workspace(ws_slug.clone())
+                .with_session_events(handle.events_sender());
+            if let Some(tm) = role_agent_token {
+                launcher = launcher.with_agent_token(tm);
+            }
+            if let Some(kc) = &keychain {
+                launcher = launcher.with_keychain(kc.clone());
+            }
+            match std::env::var("GT_SELF_URL").ok().filter(|v| !v.is_empty()) {
+                Some(url) => launcher = launcher.with_server_url(url),
+                None => eprintln!(
+                    "[gt-orch-server] role agents: GT_SELF_URL unset — role sessions get no .mcp.json (gt MCP tools unavailable)"
+                ),
+            }
+            if let Some(root) = &polecat_worktree_root {
+                launcher = launcher.with_session_root(root.clone());
+            }
+            let dispatcher =
+                Arc::new(RoleAgentDispatcher::new(ws_slug.clone(), Arc::new(launcher)));
+            pol_registry = pol_registry.register(RoleAgentPlugin::new(dispatcher.clone()));
+            eprintln!(
+                "[gt-orch-server] role agents ON — sheriff←merge.failed/ready, witness←issues.closed, deacon←health tick (single-shot, single-flight, idle≈0 tokens)"
+            );
+            Some(dispatcher)
+        }
+        None => {
+            eprintln!(
+                "[gt-orch-server] role agents OFF — set GT_ROLE_AGENTS=1 (sheriff/witness/deacon stay in-process loops + witness safety-net)"
+            );
+            None
+        }
+    };
+
     let pol_registry = Arc::new(pol_registry);
     let pol_relay = spawn_plugin_relay(handle.subscribe_events(), pol_registry);
     // All observers are live — kick the scheduler so hydrated beads pump Dispatched events.
@@ -1159,6 +1224,25 @@ async fn main() -> anyhow::Result<()> {
             loop {
                 tick.tick().await;
                 ticker.tick().await;
+            }
+        })
+    });
+
+    // Deacon health-tick timer (gtcore-999795): the deacon trigger is time-driven, not event-driven,
+    // so a timer drives it on the SAME shared dispatcher the relay plugin holds. Each fire slings a
+    // single-shot deacon (single-flight absorbs a fire while one is still live), which scans flow
+    // health read-only and escalates. Only spawned when role agents are on. Default 900s (15 min) —
+    // a health sweep, not a hot loop — and the first fire is skipped (nothing to scan at boot).
+    let deacon_timer = role_dispatcher.as_ref().map(|dispatcher| {
+        let dispatcher = dispatcher.clone();
+        let deacon_tick_secs = env_usize("GT_DEACON_TICK_SECS", 900) as u64;
+        eprintln!("[gt-orch-server] deacon health tick every {deacon_tick_secs}s");
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(Duration::from_secs(deacon_tick_secs));
+            tick.tick().await; // skip the immediate first fire (nothing to scan at boot)
+            loop {
+                tick.tick().await;
+                dispatcher.on_trigger(&RoleTrigger::HealthTick);
             }
         })
     });
@@ -1474,6 +1558,9 @@ async fn main() -> anyhow::Result<()> {
 
     patrol_timer.abort();
     quota_timer.abort();
+    if let Some(task) = &deacon_timer {
+        task.abort();
+    }
     delegation_timer.abort();
     if let Some(task) = &escalation_timer {
         task.abort();
@@ -1504,6 +1591,9 @@ async fn main() -> anyhow::Result<()> {
     }
     let _ = patrol_timer.await;
     let _ = quota_timer.await;
+    if let Some(task) = deacon_timer {
+        let _ = task.await;
+    }
     let _ = delegation_timer.await;
     if let Some(task) = escalation_timer {
         let _ = task.await;
