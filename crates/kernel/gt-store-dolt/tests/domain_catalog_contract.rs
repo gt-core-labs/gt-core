@@ -32,7 +32,7 @@ async fn fresh_pool(base: &str) -> Result<mysql_async::Pool, Box<dyn std::error:
             let authority = rest.split('/').next().unwrap_or(rest);
             format!("{scheme}://{authority}/{TEST_DB}")
         }
-        None => base.clone(),
+        None => base.to_string(),
     };
     Ok(gt_store_dolt::connect(&db_url)?)
 }
