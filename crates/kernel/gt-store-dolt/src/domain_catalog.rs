@@ -230,6 +230,33 @@ impl DoltDomainCatalog {
             .collect())
     }
 
+    /// Like [`list`](Self::list), but tolerant of an ABSENT table: returns
+    /// `Ok(None)` when this workspace has no `domain_catalog` table at all (a
+    /// tenant provisioned before H1, or a bare test DB that only ran the issues
+    /// schema), and `Ok(Some(rows))` when the table exists (possibly empty).
+    ///
+    /// The write-path domain validation (gtcore-d81e77 H2) needs this to tell
+    /// "un-provisioned, fall back to the enum" apart from a hard query failure —
+    /// `list` would surface a missing table as an error and break every bead
+    /// create in such a workspace. Read-only: it never creates the table (unlike
+    /// [`ensure_schema`](Self::ensure_schema)), so it is safe on a validate-only
+    /// path that must not mutate.
+    pub async fn list_opt(&self) -> Result<Option<Vec<DomainEntry>>, AppError> {
+        let mut conn = self.pool.get_conn().await.map_err(map_err)?;
+        let present: Option<i64> = conn
+            .query_first(
+                "SELECT 1 FROM information_schema.tables
+                 WHERE table_schema = DATABASE() AND table_name = 'domain_catalog' LIMIT 1",
+            )
+            .await
+            .map_err(map_err)?;
+        if present.is_none() {
+            return Ok(None);
+        }
+        drop(conn);
+        Ok(Some(self.list().await?))
+    }
+
     /// Fetch one entry by key, or `None` when absent.
     pub async fn get(&self, key: &str) -> Result<Option<DomainEntry>, AppError> {
         let mut conn = self.pool.get_conn().await.map_err(map_err)?;
