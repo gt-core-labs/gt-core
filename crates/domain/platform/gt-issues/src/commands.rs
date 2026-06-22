@@ -336,6 +336,7 @@ impl CreateIssue {
             issue_type: self.issue_type.as_str().to_string(),
             created_by: self.created_by.clone(),
             parent_id: self.parent_id.clone(),
+            depends_on: self.depends_on.clone(),
             assignee: self.assignee.clone(),
             owner: self.owner.clone(),
             domain_json: domain_to_json(&self.domain),
@@ -564,6 +565,7 @@ impl UpdateIssue {
             assignee: self.assignee.clone(),
             owner: self.owner.clone(),
             parent_id: self.parent_id.clone(),
+            depends_on: self.depends_on.clone(),
             domain_json: self.domain.as_deref().map(domain_to_json),
             surface_json: self.surface.as_deref().map(surface_to_json),
             role_scope: self.role_scope.map(|r| r.as_str().to_string()),
@@ -963,6 +965,27 @@ mod tests {
         assert_eq!(n.rig, "hq"); // derived from id prefix (backward compat)
         assert_eq!(n.domain_json, "[\"store.dolt\"]");
         assert_eq!(n.surface_json, "[]");
+    }
+
+    #[test]
+    fn create_to_new_carries_depends_on() {
+        // gtcore-13738c: the wire `depends_on` must reach the store row, not be
+        // validated and dropped. (The repo then persists it into issue_relations.)
+        let mut c = base_create();
+        c.depends_on = vec!["hq-dep-a".into(), "hq-dep-b".into()];
+        let n = c.to_new();
+        assert_eq!(n.depends_on, vec!["hq-dep-a".to_string(), "hq-dep-b".to_string()]);
+    }
+
+    #[test]
+    fn update_to_patch_carries_depends_on() {
+        // gtcore-13738c: issues.update's whole-list `depends_on` overwrite must
+        // reach the patch (None = leave untouched, Some(list) = replace).
+        let mut u = base_update();
+        u.depends_on = Some(vec!["hq-dep-a".into()]);
+        assert_eq!(u.to_patch().depends_on, Some(vec!["hq-dep-a".to_string()]));
+        u.depends_on = None;
+        assert_eq!(u.to_patch().depends_on, None);
     }
 
     #[test]
