@@ -744,6 +744,49 @@ impl ReportService {
         }
     }
 
+    /// One-shot migration (gtcore-8ff13e): seed the durable DB-backed store from
+    /// a legacy `system_config.json` schedule list, ONCE, when the table is still
+    /// empty. Pre-DB deployments persisted the schedule list to that file on an
+    /// ephemeral path (the bead's root cause), so on the first boot against the
+    /// Postgres store we import whatever the file still holds rather than silently
+    /// lose it. Gated on an EMPTY store, which makes it:
+    ///   - idempotent across redeploys — every boot after the first finds rows and
+    ///     does nothing, so it never double-inserts;
+    ///   - non-destructive — it never resurrects a schedule an operator later
+    ///     deleted (that leaves the store non-empty, or empty-by-intent which an
+    ///     absent/empty file then leaves alone).
+    /// Each schedule is inserted verbatim — `id`, `workspace` and `last_sent_date`
+    /// preserved — so the per-workspace placement and the at-most-once send guard
+    /// migrate intact. Unscoped (`None`): the operator file may span tenants.
+    /// Returns the number imported (0 when the store already holds rows or the
+    /// file carried none).
+    pub async fn import_file_schedules(
+        &self,
+        schedules: &[ReportSchedule],
+    ) -> Result<usize, String> {
+        if schedules.is_empty() {
+            return Ok(0);
+        }
+        // One-shot gate: only ever seed a still-empty store.
+        let existing = self
+            .schedules
+            .list(None)
+            .await
+            .map_err(|e| format!("import: probe store: {e}"))?;
+        if !existing.is_empty() {
+            return Ok(0);
+        }
+        let mut imported = 0;
+        for s in schedules {
+            self.schedules
+                .insert(&s.to_row())
+                .await
+                .map_err(|e| format!("import schedule `{}`: {e}", s.id))?;
+            imported += 1;
+        }
+        Ok(imported)
+    }
+
     /// Create a schedule from a patch over the defaults; persisted to the DB on
     /// success. When `scope` is `Some(ws)` (the tenant-bound MCP surface) the
     /// schedule's workspace is STAMPED to the session's — a cross-tenant
@@ -1397,6 +1440,42 @@ mod tests {
         // shared default DB → empty digest. It must now route to its own pool.
         let got = svc.tracker("cotrafa").expect("tracker");
         assert!(!Arc::ptr_eq(&got, &dolt));
+    }
+
+    // --- one-shot file→DB migration (gtcore-8ff13e) --------------------------
+
+    #[tokio::test]
+    async fn import_seeds_empty_store_then_is_idempotent_across_redeploys() {
+        let (svc, _dolt) = service(None);
+        let legacy = vec![
+            ReportSchedule {
+                id: "sched-a".into(),
+                workspace: "default".into(),
+                last_sent_date: Some("2026-06-20".into()),
+                ..Default::default()
+            },
+            ReportSchedule { id: "sched-b".into(), workspace: "cotrafa".into(), ..Default::default() },
+        ];
+        // First boot: empty store ⇒ both imported.
+        assert_eq!(svc.import_file_schedules(&legacy).await.expect("import"), 2);
+        let all = svc.list_schedules(None).await;
+        assert_eq!(all.len(), 2);
+        // The at-most-once guard migrated with the row…
+        let a = all.iter().find(|s| s.id == "sched-a").expect("sched-a present");
+        assert_eq!(a.last_sent_date.as_deref(), Some("2026-06-20"));
+        // …and each schedule landed in its OWN tenant (multi-tenant preserved).
+        assert_eq!(svc.list_schedules(Some("cotrafa")).await.len(), 1);
+        assert_eq!(svc.list_schedules(Some("default")).await.len(), 1);
+        // Redeploy: store non-empty ⇒ no-op, no duplicates.
+        assert_eq!(svc.import_file_schedules(&legacy).await.expect("re-import"), 0);
+        assert_eq!(svc.list_schedules(None).await.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn import_with_no_legacy_schedules_is_a_noop() {
+        let (svc, _dolt) = service(None);
+        assert_eq!(svc.import_file_schedules(&[]).await.expect("noop"), 0);
+        assert!(svc.list_schedules(None).await.is_empty());
     }
 
     // --- per-workspace CRUD scoping (gtcore-00325f H3) -----------------------
