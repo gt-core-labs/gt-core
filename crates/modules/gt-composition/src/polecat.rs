@@ -610,6 +610,24 @@ impl PolecatSupervisorPlugin {
             spec.args[last] = prompt;
         }
 
+        // Unlike the context-exhaustion re-sling (driven BY a tmux death, so the session is already
+        // gone), a CI failure arrives from the CI-gate webhook independently of session liveness:
+        // the original polecat commonly lingers idle after signalling merge-ready instead of
+        // exiting, so its tmux session is still alive — heartbeat recent — when `merge.failed.v1`
+        // lands. `tmux new-session` then rejects the duplicate name and the supervisor retries
+        // forever, since the lingering session never dies on its own (gtcore-8701c4). Tear it down
+        // first, guarded by `has_session` so the common clean case (polecat already exited) skips a
+        // pointless `kill-session` that the real adapter would error-and-retry on. The re-sling then
+        // always lands a fresh session and converges.
+        if self.tmux.has_session(&session) {
+            if let Err(e) = self.tmux.kill_session(&session) {
+                eprintln!(
+                    "[polecat] CI-failure re-sling: kill-session({session}) failed for {bead}: {e} — supervisor tick will retry"
+                );
+                return;
+            }
+        }
+
         if let Err(e) = spawn_tmux(self.tmux.as_ref(), &spec) {
             eprintln!(
                 "[polecat] CI-failure re-sling spawn failed for {bead}: {e} — supervisor tick will retry"
@@ -1746,6 +1764,83 @@ mod tests {
             sup.watched_count(),
             0,
             "the bead is unwatched once its CI-retry budget is exhausted"
+        );
+    }
+
+    #[tokio::test]
+    async fn ci_failure_reslings_over_a_still_live_session_by_killing_it_first() {
+        // gtcore-8701c4: a `merge.failed.v1` arrives from the CI-gate webhook independently of
+        // session liveness, and the original polecat commonly lingers idle (tmux session alive,
+        // heartbeat recent) after signalling merge-ready rather than exiting. A naive re-sling then
+        // hits `tmux new-session: duplicate session` and the supervisor retries forever, since the
+        // lingering session never dies on its own. The CI re-sling must tear the live session down
+        // first (idempotent) so the respawn lands a fresh session and the loop converges.
+        let fake = Arc::new(FakeTmux::new());
+        let tmux: Arc<dyn Tmux> = fake.clone();
+        let supervisor = Arc::new(PolecatSupervisor::new(
+            tmux.clone(),
+            RestartConfig::default(),
+            8,
+        ));
+        let template = SpawnTemplate {
+            rig: "hq".into(),
+            prefix: "hq".into(),
+            workdir: "/tmp".into(),
+            command: "true".into(),
+            args: vec![],
+            base_env: vec![],
+            heartbeat_dir: std::env::temp_dir(),
+        };
+        let alloc = Arc::new(Mutex::new(PoolAllocator::new(10, 5)));
+        let p = PolecatSupervisorPlugin::new("acme", tmux, template, supervisor.clone(), alloc)
+            .with_ci_max_retries(2);
+
+        // Sling the bead → its tmux session is created and (unlike a context-exhaustion death) stays
+        // alive: the polecat has not exited when CI fails.
+        p.on_event(&record(SchedEvent::Dispatched {
+            bead: "gg-1".into(),
+            worker: "w1".into(),
+        }))
+        .await
+        .unwrap();
+        assert!(
+            fake.has_session("hq-gg-1"),
+            "polecat session is live before CI fails"
+        );
+        assert!(fake.kills().is_empty(), "no teardown on the initial sling");
+
+        // CI fails while that session is still alive.
+        p.on_event(&record(MergeEvent::Failed {
+            bead: "gg-1".into(),
+            reason: "CI failed: failure".into(),
+        }))
+        .await
+        .unwrap();
+
+        // The live session was torn down exactly once before the respawn — so the real adapter's
+        // `new-session` never collides with a duplicate and the loop converges.
+        assert_eq!(
+            fake.kills(),
+            vec!["hq-gg-1".to_string()],
+            "the still-live session is killed once before the re-sling respawn"
+        );
+        // The re-sling still landed: a fresh session, supervised, carrying the CI-fix prompt.
+        assert!(fake.has_session("hq-gg-1"), "respawned after the teardown");
+        assert_eq!(
+            supervisor.watched_count(),
+            1,
+            "still supervised after the CI re-sling"
+        );
+        let prompt = supervisor
+            .spec_for_session("hq-gg-1")
+            .expect("re-watched after CI re-sling")
+            .args
+            .last()
+            .expect("ci-fix prompt arg")
+            .clone();
+        assert!(
+            prompt.contains("RESUMING work on bead `gg-1`"),
+            "ci-fix prompt injected: {prompt}"
         );
     }
 
