@@ -27,6 +27,11 @@ gt-store-dolt = { workspace = true, optional = true }
 # Closed scope vocabulary (hq-scope-catalog): `GET /meta/scopes` derives the grantable scope catalog
 # from `gt_rbac::SCOPE_VERBS` × the registered namespaces. Pulled only with the REST adapter.
 gt-rbac = { workspace = true, optional = true }
+# Per-workspace domain catalog endpoint (gtcore-d81e77 H2): `GET /meta/domains`
+# resolves the ACTIVE workspace from the `WorkspaceContext` extractor and lists its
+# `domain_catalog`, so the FE domain selector is populated per workspace instead of
+# from the global enum. Pulled only with the REST adapter, like gt-issues' adapter.
+gt-workspace = { workspace = true, optional = true, features = ["axum"] }
 
 [features]
 # Compile the axum REST adapter + OpenAPI spec (`http.rs`), the transport-free
