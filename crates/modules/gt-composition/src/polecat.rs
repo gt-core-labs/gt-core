@@ -30,6 +30,7 @@ use gt_agent::{AgentEvent, SessionRole};
 use gt_auth::{JwtClaims, JwtMinter};
 use gt_eventlog::EventRecord;
 use gt_events::{AppError, Envelope};
+use gt_issues::{resolve_dispatch, should_sling};
 use gt_mcp_server::bead_prefix;
 use gt_merge::MergeEvent;
 use gt_plugin::Plugin;
@@ -46,6 +47,37 @@ use gt_store_dolt::{DoltIssues, IssueStatus};
 use crate::mcp::EventLog;
 use crate::operator_event::IssueOperatorEvent;
 use crate::polecat_event::PolecatEvent;
+
+/// Re-read `bead`'s CURRENT tracker state and decide whether a polecat should be (re-)slung for it
+/// (gtcore-db99e0) — the unified slingability gate shared by the dispatch→sling path (which, at
+/// boot, replays `replay_orphaned_inflight`'s crash-orphaned beads) and the supervisor's
+/// dead-polecat re-sling probe.
+///
+/// Reads the bead detail plus the unscoped `child_of` + dispatch maps so the dispatch policy is
+/// resolved through inheritance EXACTLY as [`gt_issues::ready_for_auto`] does, then applies the pure
+/// [`gt_issues::should_sling`] predicate (status ∈ {open,working} ∧ ¬epic ∧ dispatch=auto). An
+/// unknown bead or any read error is treated as SLINGABLE (permissive) so a transient Dolt hiccup
+/// never silently abandons live work — the same conservative degradation as the closed-bead guard
+/// this generalizes.
+pub async fn bead_should_sling(issues: &DoltIssues, bead: &str) -> bool {
+    let detail = match issues.get_detail(bead).await {
+        Ok(Some(d)) => d,
+        Ok(None) => return true, // unknown bead → permissive (sling)
+        Err(e) => {
+            eprintln!(
+                "[polecat] slingability probe: get_detail({bead}) failed: {e} — treating as slingable"
+            );
+            return true;
+        }
+    };
+    // Unscoped maps (empty rig + ws) — an ancestor epic may live outside any one rig/workspace,
+    // exactly the inputs `resolve_dispatch` expects. A map read error degrades to an empty map,
+    // which resolves to the bead's own dispatch value (or Manual) — never a panic.
+    let parents = issues.parent_map("", "").await.unwrap_or_default();
+    let raw = issues.dispatch_index().await.unwrap_or_default();
+    let dispatch = resolve_dispatch(bead, detail.dispatch.as_deref(), &parents, &raw);
+    should_sling(&detail.status, &detail.issue_type, dispatch)
+}
 
 /// Resolves the least-privilege scope set for an agent role (`hq-agent-provisioning.3`). The
 /// production resolver delegates to `gt_skills::SkillCatalog::scopes_for_roles`; tests pass a
@@ -616,6 +648,27 @@ impl Plugin for PolecatSupervisorPlugin {
                 let SchedEvent::Dispatched { bead, .. } = record.decode::<SchedEvent>()? else {
                     return Ok(());
                 };
+                // Slingability gate (gtcore-db99e0): re-validate the bead's CURRENT state before
+                // claiming a pool slot or spawning. A `dispatched` event can name a bead that is no
+                // longer slingable — most acutely at BOOT, where `replay_orphaned_inflight`
+                // re-enqueues every dispatched-but-unmerged bead WITHOUT re-checking it, so a
+                // since-closed bead, an epic container, or a dispatch=manual bead would otherwise
+                // be re-slung (gtcore-e7a851). When `should_sling` says no, free the scheduler
+                // governor slot the dispatch just `acquire`d (so it does not leak — the same
+                // capacity teardown the CI-retry-exhaustion abandon does) and return WITHOUT
+                // claiming the pool. No issues handle ⇒ the gate is permissive (legacy: every
+                // dispatch slings), matching the rest of the sling path's degradation.
+                if let Some(issues) = &self.issues {
+                    if !bead_should_sling(issues, &bead).await {
+                        eprintln!(
+                            "[polecat] sling skipped for {bead}: not slingable (closed/epic/manual) — boot re-hydration / stale dispatch"
+                        );
+                        if let Some(sched) = &self.sched {
+                            sched.capacity_freed().await;
+                        }
+                        return Ok(());
+                    }
+                }
                 // Admission first: a refused claim is backpressure, not an error — the bead stays
                 // queued/dispatched in the log; capacity will free up as live polecats finish.
                 if self
