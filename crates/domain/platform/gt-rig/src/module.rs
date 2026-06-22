@@ -13,10 +13,10 @@
 //! - **Identity** ([`GtModule::meta`]) — id `rig`, semver, description.
 //! - **Capability** ([`GtModule::capability`]) — the `rig.read` / `rig.write` scopes the
 //!   module owns and the six versioned event kinds it emits.
-//! - **MCP tools** ([`GtModule::register_mcp_tools`]) — the twelve `rig.*` validate/execute
+//! - **MCP tools** ([`GtModule::register_mcp_tools`]) — the fourteen `rig.*` validate/execute
 //!   tools, named and described verbatim from the current `gt-mcp` service.
-//! - **Migrations** ([`GtModule::migrations`]) — the `rigs` table + its `worktree_root`
-//!   column, owned by the module.
+//! - **Migrations** ([`GtModule::migrations`]) — the `rigs` table plus its `worktree_root`,
+//!   `git_connection_ref`, and `semantic_tags` columns, owned by the module.
 //!
 //! - **HTTP routes + OpenAPI** (on the sibling [`RigsHttpModule`]) — under the off-by-default
 //!   `axum` feature (`hq-fe-api-platform.2`), the platform sibling of the issues HTTP surface:
@@ -158,6 +158,7 @@ impl GtModule for RigsModule {
                 EventKind::new("rig.prefix-changed.v1").expect("valid event kind"),
                 EventKind::new("rig.default-branch-changed.v1").expect("valid event kind"),
                 EventKind::new("rig.worktree-root-changed.v1").expect("valid event kind"),
+                EventKind::new("rig.semantic-tags-changed.v1").expect("valid event kind"),
             ])
     }
 
@@ -224,6 +225,19 @@ impl GtModule for RigsModule {
                 "Pin the absolute worktree root the orchestrator carves a rig's polecat \
                  checkouts under (the filesystem move is a deploy-edge side-effect). Emits \
                  rig.worktree_root_changed.",
+            )
+            .tool(
+                "rig.set-semantic-tags.validate",
+                "Check whether replacing a rig's semantic capability tags would be accepted \
+                 (each tag alphanumeric + hyphens, <= 40 chars, <= 32 tags, not a no-op). No \
+                 state change.",
+            )
+            .tool(
+                "rig.set-semantic-tags.execute",
+                "Replace the semantic capability tags a rig advertises (e.g. rust, backend, \
+                 frontend) for capability-based peer selection in a2a.discover and the Agent \
+                 Card skills. Input is normalized (trim/lowercase/dedupe). Emits \
+                 rig.semantic_tags_changed.",
             );
     }
 
@@ -247,6 +261,11 @@ impl GtModule for RigsModule {
                 "add_git_connection_ref",
                 include_str!("../migrations/rig/0003__add_git_connection_ref.sql"),
             ),
+            Migration::new(
+                4,
+                "add_semantic_tags",
+                include_str!("../migrations/rig/0004__add_semantic_tags.sql"),
+            ),
         ]
     }
 }
@@ -263,7 +282,7 @@ mod tests {
     }
 
     #[test]
-    fn capability_owns_rig_scopes_and_six_versioned_kinds() {
+    fn capability_owns_rig_scopes_and_seven_versioned_kinds() {
         let cap = RigsModule.capability();
 
         let scopes: Vec<&str> = cap.scopes().iter().map(Scope::as_str).collect();
@@ -279,6 +298,7 @@ mod tests {
                 "rig.prefix-changed.v1",
                 "rig.default-branch-changed.v1",
                 "rig.worktree-root-changed.v1",
+                "rig.semantic-tags-changed.v1",
             ]
         );
         // Every declared kind is owned by this module (prefix == meta id).
@@ -288,7 +308,7 @@ mod tests {
     }
 
     #[test]
-    fn registers_the_twelve_existing_rig_tools() {
+    fn registers_the_fourteen_existing_rig_tools() {
         let mut reg = McpRegistry::new();
         RigsModule.register_mcp_tools(&mut reg);
         let names: Vec<&str> = reg.tools().iter().map(|t| t.name.as_str()).collect();
@@ -307,6 +327,8 @@ mod tests {
                 "rig.set-default-branch.execute",
                 "rig.set-worktree-root.validate",
                 "rig.set-worktree-root.execute",
+                "rig.set-semantic-tags.validate",
+                "rig.set-semantic-tags.execute",
             ]
         );
     }
@@ -314,7 +336,7 @@ mod tests {
     #[test]
     fn owns_the_rigs_table_migration() {
         let migs = RigsModule.migrations();
-        assert_eq!(migs.len(), 3);
+        assert_eq!(migs.len(), 4);
         assert_eq!(migs[0].version, 1);
         assert_eq!(migs[0].name, "create_rigs");
         // The worktree_root column override (hq-mt-rigs.5) is a follow-on migration, never
@@ -331,6 +353,13 @@ mod tests {
         assert!(migs[2]
             .sql
             .contains("ADD COLUMN IF NOT EXISTS git_connection_ref"));
+        // The semantic_tags column (B3, gtcore-dd3763) carries the rig's capability tags for
+        // capability-based peer selection — another follow-on migration on the same template.
+        assert_eq!(migs[3].version, 4);
+        assert_eq!(migs[3].name, "add_semantic_tags");
+        assert!(migs[3]
+            .sql
+            .contains("ADD COLUMN IF NOT EXISTS semantic_tags"));
         // Schema-per-ws (hq-mt-data.3, docs/04 §15): the table is created in the
         // `ws_default` template schema so `gt_create_workspace_schema` clones it per
         // tenant — not in `public` (which holds only cross-tenant catalogs).
@@ -390,6 +419,6 @@ mod tests {
         );
         let mut reg = McpRegistry::new();
         m.register_mcp_tools(&mut reg);
-        assert_eq!(reg.tools().len(), 12, "the twelve rig tools still register");
+        assert_eq!(reg.tools().len(), 14, "the fourteen rig tools still register");
     }
 }

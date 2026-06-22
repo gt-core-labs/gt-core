@@ -23,6 +23,15 @@ pub const MAX_PREFIX_LEN: usize = 20;
 /// reaching the deploy edge; 256 covers any sane filesystem layout.
 pub const MAX_WORKTREE_ROOT_LEN: usize = 256;
 
+/// Maximum length of a single semantic capability tag (e.g. `rust`, `backend`). A guard
+/// against an unbounded string reaching the discovery card; 40 covers any sane capability
+/// label.
+pub const MAX_SEMANTIC_TAG_LEN: usize = 40;
+
+/// Maximum number of semantic tags a rig may advertise. Capability tags are a small, curated
+/// set per rig; 32 is generous headroom while still bounding the discovery card payload.
+pub const MAX_SEMANTIC_TAGS: usize = 32;
+
 /// A rig entry in the catalog. Identity is `name`; the rest is what the orchestrator needs
 /// to route work and reason about the rig's git topology. Mirrors the orchestrator-relevant
 /// subset of Go `RigConfig` (drops filesystem-only fields like `local_repo`, polecat pool
@@ -50,6 +59,14 @@ pub struct RigEntry {
     /// validated at the application layer (hq-vcs-connections.3).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub git_connection_ref: Option<String>,
+    /// Semantic capability tags the rig advertises (e.g. `rust`, `backend`, `frontend`).
+    /// Orthogonal to the beads `prefix`: where the prefix is the rig's routing identity, these
+    /// are free-form capability labels a peer-discovery caller filters on to pick *who* can do a
+    /// kind of work (`a2a.discover` filters skills by capability, not just prefix — B3). Empty
+    /// by default; set via [`crate::SetRigSemanticTags`]. `#[serde(default)]` so events/rows
+    /// logged before this field existed replay as an empty set.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub semantic_tags: Vec<String>,
 }
 
 impl RigEntry {
@@ -70,6 +87,7 @@ impl RigEntry {
             registered_at_secs,
             worktree_root: None,
             git_connection_ref: None,
+            semantic_tags: Vec::new(),
         }
     }
 
@@ -184,6 +202,18 @@ impl RigCatalog {
         }
     }
 
+    /// Replace the semantic capability tags advertised by a rig (B3). Mirrors the actor's
+    /// mutation so the command path and direct messages stay in lockstep.
+    pub fn apply_semantic_tags_change(&mut self, name: &str, new_tags: Vec<String>) -> bool {
+        match self.rigs.get_mut(name) {
+            Some(entry) => {
+                entry.semantic_tags = new_tags;
+                true
+            }
+            None => false,
+        }
+    }
+
     /// Snapshot of the catalog as a sorted vector. Cheap clone; used by the actor's
     /// `Snapshot` reply path.
     pub fn snapshot(&self) -> Vec<RigEntry> {
@@ -214,6 +244,8 @@ pub struct RigState {
     pub default_branch_changes: Vec<(String, String, String)>,
     /// Sequence of `(rig, old_root, new_root)` worktree-root override transitions.
     pub worktree_root_changes: Vec<(String, Option<PathBuf>, PathBuf)>,
+    /// Sequence of `(rig, old_tags, new_tags)` semantic-tag transitions.
+    pub semantic_tags_changes: Vec<(String, Vec<String>, Vec<String>)>,
 }
 
 impl RigState {
@@ -251,6 +283,7 @@ impl RigState {
                         registered_at_secs: *now_secs,
                         worktree_root: None,
                         git_connection_ref: git_connection_ref.clone(),
+                        semantic_tags: Vec::new(),
                     },
                 );
             }
@@ -277,6 +310,13 @@ impl RigState {
                 if let Some(entry) = self.rigs.get_mut(rig) {
                     entry.worktree_root = Some(new.clone());
                     self.worktree_root_changes
+                        .push((rig.clone(), old.clone(), new.clone()));
+                }
+            }
+            RigEvent::SemanticTagsChanged { rig, old, new, .. } => {
+                if let Some(entry) = self.rigs.get_mut(rig) {
+                    entry.semantic_tags = new.clone();
+                    self.semantic_tags_changes
                         .push((rig.clone(), old.clone(), new.clone()));
                 }
             }
@@ -362,6 +402,55 @@ pub fn validate_worktree_root(root: &Path) -> Result<(), String> {
         return Err(format!(
             "worktree_root {display:?} must not contain a `..` component"
         ));
+    }
+    Ok(())
+}
+
+/// Normalize a set of semantic capability tags into the canonical form stored on the rig:
+/// each tag trimmed and lowercased, empties dropped, duplicates removed (first occurrence
+/// wins, order otherwise preserved). Keeping normalization in one place means the discovery
+/// filter compares apples to apples (`a2a.discover` matches a lowercase `tag` arg against the
+/// stored tags) regardless of how the operator cased the input.
+pub fn normalize_semantic_tags(tags: &[String]) -> Vec<String> {
+    let mut out: Vec<String> = Vec::with_capacity(tags.len());
+    for tag in tags {
+        let norm = tag.trim().to_ascii_lowercase();
+        if norm.is_empty() {
+            continue;
+        }
+        if !out.iter().any(|t| t == &norm) {
+            out.push(norm);
+        }
+    }
+    out
+}
+
+/// Validate a normalized semantic-tag set (B3). Each tag is a short capability label — same
+/// grammar as a beads prefix (alphanumeric + hyphens) so a tag is a clean, URL/JSON-safe
+/// token — bounded by [`MAX_SEMANTIC_TAG_LEN`], and the whole set by [`MAX_SEMANTIC_TAGS`].
+/// Expects the input to already be [`normalize_semantic_tags`]-d (lowercase, no empties/dupes).
+pub fn validate_semantic_tags(tags: &[String]) -> Result<(), String> {
+    if tags.len() > MAX_SEMANTIC_TAGS {
+        return Err(format!(
+            "too many semantic tags ({}); max {MAX_SEMANTIC_TAGS}",
+            tags.len()
+        ));
+    }
+    for tag in tags {
+        if tag.is_empty() {
+            return Err("semantic tag is empty".into());
+        }
+        if tag.len() > MAX_SEMANTIC_TAG_LEN {
+            return Err(format!(
+                "semantic tag {tag:?} exceeds max length {MAX_SEMANTIC_TAG_LEN}"
+            ));
+        }
+        if !tag.chars().all(|c| c.is_ascii_alphanumeric() || c == '-') {
+            return Err(format!(
+                "semantic tag {tag:?} contains invalid characters; only alphanumerics and \
+                 hyphens allowed"
+            ));
+        }
     }
     Ok(())
 }
@@ -532,6 +621,69 @@ mod tests {
         assert_eq!(
             state.worktree_root_changes,
             vec![("plane".to_string(), None, root.clone())]
+        );
+
+        let rebuilt = RigCatalog::from_state(&state);
+        assert_eq!(rebuilt, catalog);
+    }
+
+    #[test]
+    fn semantic_tags_normalize_dedupe_and_validate() {
+        // Trim + lowercase + dedupe (first wins), empties dropped, order preserved.
+        let norm = normalize_semantic_tags(&[
+            "  Rust ".into(),
+            "backend".into(),
+            "RUST".into(),
+            "".into(),
+            "Backend".into(),
+        ]);
+        assert_eq!(norm, vec!["rust".to_string(), "backend".to_string()]);
+        assert!(validate_semantic_tags(&norm).is_ok());
+
+        // Invalid grammar (space inside a tag) is rejected.
+        assert!(validate_semantic_tags(&["not ok".to_string()]).is_err());
+        // Over-long tag is rejected.
+        let long = "a".repeat(MAX_SEMANTIC_TAG_LEN + 1);
+        assert!(validate_semantic_tags(&[long]).is_err());
+        // Too many tags is rejected.
+        let many: Vec<String> = (0..=MAX_SEMANTIC_TAGS).map(|i| format!("t{i}")).collect();
+        assert!(validate_semantic_tags(&many).is_err());
+    }
+
+    #[test]
+    fn semantic_tags_change_round_trips_through_state() {
+        let mut catalog = RigCatalog::default();
+        catalog.apply_add(RigEntry::new(
+            "plane",
+            "pl",
+            "git@github.com:o/plane.git",
+            "main",
+            1,
+        ));
+        let tags = vec!["rust".to_string(), "backend".to_string()];
+        assert!(catalog.apply_semantic_tags_change("plane", tags.clone()));
+        assert_eq!(catalog.get("plane").unwrap().semantic_tags, tags);
+
+        let mut state = RigState::default();
+        state.apply(&RigEvent::Added {
+            rig: "plane".into(),
+            prefix: "pl".into(),
+            git_url: "git@github.com:o/plane.git".into(),
+            push_url: None,
+            upstream_url: None,
+            default_branch: "main".into(),
+            git_connection_ref: None,
+            now_secs: 1,
+        });
+        state.apply(&RigEvent::SemanticTagsChanged {
+            rig: "plane".into(),
+            old: Vec::new(),
+            new: tags.clone(),
+            now_secs: 2,
+        });
+        assert_eq!(
+            state.semantic_tags_changes,
+            vec![("plane".to_string(), Vec::new(), tags.clone())]
         );
 
         let rebuilt = RigCatalog::from_state(&state);

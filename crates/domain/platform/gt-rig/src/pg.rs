@@ -64,6 +64,9 @@ fn row_to_entry(row: &PgRow) -> Result<RigEntry, AppError> {
         registered_at_secs: registered_at as u64,
         worktree_root: worktree_root.map(PathBuf::from),
         git_connection_ref: row.try_get("git_connection_ref").map_err(backend)?,
+        // TEXT[] → Vec<String>; the column is NOT NULL DEFAULT '{}' (rig/0004) so a missing
+        // tag set reads back as an empty vector, never NULL.
+        semantic_tags: row.try_get("semantic_tags").map_err(backend)?,
     })
 }
 
@@ -84,8 +87,8 @@ impl RigRepository for PgRigs {
             sqlx::query(
                 "INSERT INTO rigs \
                    (name, prefix, git_url, push_url, upstream_url, default_branch, registered_at, \
-                    worktree_root, git_connection_ref) \
-                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) \
+                    worktree_root, git_connection_ref, semantic_tags) \
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10) \
                  ON CONFLICT (name) DO UPDATE SET \
                    prefix = EXCLUDED.prefix, \
                    git_url = EXCLUDED.git_url, \
@@ -93,7 +96,8 @@ impl RigRepository for PgRigs {
                    upstream_url = EXCLUDED.upstream_url, \
                    default_branch = EXCLUDED.default_branch, \
                    worktree_root = EXCLUDED.worktree_root, \
-                   git_connection_ref = EXCLUDED.git_connection_ref",
+                   git_connection_ref = EXCLUDED.git_connection_ref, \
+                   semantic_tags = EXCLUDED.semantic_tags",
             )
             .bind(&entry.name)
             .bind(&entry.prefix)
@@ -104,6 +108,7 @@ impl RigRepository for PgRigs {
             .bind(entry.registered_at_secs as i64)
             .bind(&worktree_root)
             .bind(&entry.git_connection_ref)
+            .bind(&entry.semantic_tags)
             .execute(&pool)
             .await
             .map_err(backend)?;
@@ -130,7 +135,7 @@ impl RigRepository for PgRigs {
         async move {
             let row = sqlx::query(
                 "SELECT name, prefix, git_url, push_url, upstream_url, default_branch, \
-                        registered_at, worktree_root, git_connection_ref \
+                        registered_at, worktree_root, git_connection_ref, semantic_tags \
                  FROM rigs WHERE name = $1",
             )
             .bind(&name)
@@ -163,7 +168,7 @@ impl RigRepository for PgRigs {
         async move {
             let rows = sqlx::query(
                 "SELECT name, prefix, git_url, push_url, upstream_url, default_branch, \
-                        registered_at, worktree_root, git_connection_ref \
+                        registered_at, worktree_root, git_connection_ref, semantic_tags \
                  FROM rigs ORDER BY name",
             )
             .fetch_all(&pool)

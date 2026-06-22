@@ -15,7 +15,8 @@ use gt_events::{AppError, Command};
 
 use crate::events::RigEvent;
 use crate::state::{
-    validate_prefix, validate_rig_name, validate_worktree_root, RigCatalog, RigEntry,
+    normalize_semantic_tags, validate_prefix, validate_rig_name, validate_semantic_tags,
+    validate_worktree_root, RigCatalog, RigEntry,
 };
 
 /// Default tenant for a command built without an explicit workspace. The server stamps the
@@ -102,6 +103,7 @@ impl AddRig {
             registered_at_secs: self.now_secs,
             worktree_root: None,
             git_connection_ref: self.git_connection_ref.clone(),
+            semantic_tags: Vec::new(),
         }
     }
 }
@@ -394,6 +396,70 @@ impl Command for SetRigWorktreeRoot {
     }
 }
 
+/// Replace the semantic capability tags a rig advertises (B3, gtcore-dd3763). The tags feed
+/// `a2a.discover` and the Agent Card skills so a peer selects a rig by capability (`rust`,
+/// `backend`, …) in addition to its beads prefix. The command **replaces** the whole set
+/// (set semantics, not append) so the operator's input is the rig's full capability profile.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct SetRigSemanticTags {
+    pub name: String,
+    /// The new capability tags. Normalized (trimmed, lowercased, de-duplicated) before
+    /// validation and storage, so casing/whitespace in the payload does not matter.
+    pub tags: Vec<String>,
+    pub now_secs: u64,
+    /// Server-injected tenant — see [`AddRig::workspace_id`].
+    #[serde(skip_deserializing, default = "default_workspace")]
+    #[schemars(skip)]
+    pub workspace_id: String,
+}
+
+impl SetRigSemanticTags {
+    /// The normalized tag set the command stores (trim + lowercase + dedupe).
+    fn normalized(&self) -> Vec<String> {
+        normalize_semantic_tags(&self.tags)
+    }
+}
+
+impl Command for SetRigSemanticTags {
+    type Output = RigEvent;
+    type State = RigCatalog;
+
+    fn validate(&self, state: &Self::State) -> Result<(), AppError> {
+        if self.name.is_empty() {
+            return Err(AppError::Validation("rig name is empty".into()));
+        }
+        let normalized = self.normalized();
+        validate_semantic_tags(&normalized).map_err(AppError::Validation)?;
+        let Some(current) = state.get(&self.name) else {
+            return Err(AppError::NotFound(format!("rig {:?}", self.name)));
+        };
+        if current.semantic_tags == normalized {
+            return Err(AppError::Validation(format!(
+                "semantic tags already {normalized:?}"
+            )));
+        }
+        Ok(())
+    }
+
+    fn execute(&self, state: &mut Self::State) -> Result<Self::Output, AppError> {
+        self.validate(state)?;
+        let normalized = self.normalized();
+        // `validate` proved the rig exists; unwrap is safe.
+        let old = state
+            .get(&self.name)
+            .expect("rig present")
+            .semantic_tags
+            .clone();
+        state.apply_semantic_tags_change(&self.name, normalized.clone());
+        Ok(RigEvent::SemanticTagsChanged {
+            rig: self.name.clone(),
+            old,
+            new: normalized,
+            now_secs: self.now_secs,
+        })
+    }
+}
+
 /// Sum type so the actor routes any rig command through a single message variant.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(tag = "kind", rename_all = "snake_case")]
@@ -404,6 +470,7 @@ pub enum RigCommand {
     SetPrefix(SetRigPrefix),
     SetDefaultBranch(SetRigDefaultBranch),
     SetWorktreeRoot(SetRigWorktreeRoot),
+    SetSemanticTags(SetRigSemanticTags),
 }
 
 impl RigCommand {
@@ -416,6 +483,7 @@ impl RigCommand {
             Self::SetPrefix(_) => "rig.set-prefix",
             Self::SetDefaultBranch(_) => "rig.set-default-branch",
             Self::SetWorktreeRoot(_) => "rig.set-worktree-root",
+            Self::SetSemanticTags(_) => "rig.set-semantic-tags",
         }
     }
 
@@ -429,6 +497,7 @@ impl RigCommand {
             Self::SetPrefix(c) => &c.workspace_id,
             Self::SetDefaultBranch(c) => &c.workspace_id,
             Self::SetWorktreeRoot(c) => &c.workspace_id,
+            Self::SetSemanticTags(c) => &c.workspace_id,
         }
     }
 
@@ -445,6 +514,7 @@ impl RigCommand {
             Self::SetPrefix(c) => c.workspace_id = ws,
             Self::SetDefaultBranch(c) => c.workspace_id = ws,
             Self::SetWorktreeRoot(c) => c.workspace_id = ws,
+            Self::SetSemanticTags(c) => c.workspace_id = ws,
         }
         self
     }
@@ -462,6 +532,7 @@ impl Command for RigCommand {
             Self::SetPrefix(c) => c.validate(state),
             Self::SetDefaultBranch(c) => c.validate(state),
             Self::SetWorktreeRoot(c) => c.validate(state),
+            Self::SetSemanticTags(c) => c.validate(state),
         }
     }
 
@@ -473,6 +544,7 @@ impl Command for RigCommand {
             Self::SetPrefix(c) => c.execute(state),
             Self::SetDefaultBranch(c) => c.execute(state),
             Self::SetWorktreeRoot(c) => c.execute(state),
+            Self::SetSemanticTags(c) => c.execute(state),
         }
     }
 }
@@ -685,6 +757,56 @@ mod tests {
             ok.validate(&catalog),
             Err(AppError::Validation(_))
         ));
+    }
+
+    #[test]
+    fn set_semantic_tags_normalizes_round_trips_and_rejects_no_op() {
+        let mut catalog = RigCatalog::default();
+        add_cmd("plane", "pl", 1).execute(&mut catalog).unwrap();
+
+        // Unknown rig is a NotFound (and is checked after structural validation).
+        let missing = SetRigSemanticTags {
+            name: "ghost".into(),
+            tags: vec!["rust".into()],
+            now_secs: 2,
+            workspace_id: "default".into(),
+        };
+        assert!(matches!(
+            missing.validate(&catalog),
+            Err(AppError::NotFound(_))
+        ));
+
+        // Invalid grammar is rejected before the rig is consulted.
+        let bad = SetRigSemanticTags {
+            name: "plane".into(),
+            tags: vec!["not ok".into()],
+            now_secs: 2,
+            workspace_id: "default".into(),
+        };
+        assert!(matches!(bad.validate(&catalog), Err(AppError::Validation(_))));
+
+        // Mixed-case + dup input normalizes to a clean lowercase set.
+        let ok = SetRigSemanticTags {
+            name: "plane".into(),
+            tags: vec!["Rust".into(), "BACKEND".into(), "rust".into()],
+            now_secs: 3,
+            workspace_id: "default".into(),
+        };
+        let ev = ok.execute(&mut catalog).unwrap();
+        match ev {
+            RigEvent::SemanticTagsChanged { old, new, .. } => {
+                assert_eq!(old, Vec::<String>::new());
+                assert_eq!(new, vec!["rust".to_string(), "backend".to_string()]);
+            }
+            _ => panic!("expected SemanticTagsChanged"),
+        }
+        assert_eq!(
+            catalog.get("plane").unwrap().semantic_tags,
+            vec!["rust".to_string(), "backend".to_string()]
+        );
+
+        // Re-applying the same (normalized) set is a no-op rejection.
+        assert!(matches!(ok.validate(&catalog), Err(AppError::Validation(_))));
     }
 
     #[test]

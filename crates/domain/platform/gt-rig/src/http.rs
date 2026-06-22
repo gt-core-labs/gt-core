@@ -44,7 +44,10 @@ use serde_json::{json, Value};
 use gt_events::{AppError, Command};
 use gt_workspace::WorkspaceContext;
 
-use crate::commands::{AddRig, AdoptRig, RemoveRig, SetRigDefaultBranch, SetRigPrefix, SetRigWorktreeRoot};
+use crate::commands::{
+    AddRig, AdoptRig, RemoveRig, SetRigDefaultBranch, SetRigPrefix, SetRigSemanticTags,
+    SetRigWorktreeRoot,
+};
 use crate::repo::RigRepository;
 use crate::state::{RigCatalog, RigEntry};
 
@@ -138,6 +141,7 @@ impl RigApiState {
 /// | `POST /:name/set-prefix`       | `rig.set-prefix`         |
 /// | `POST /:name/set-default-branch` | `rig.set-default-branch` |
 /// | `POST /:name/set-worktree-root`  | `rig.set-worktree-root`  |
+/// | `POST /:name/set-semantic-tags`  | `rig.set-semantic-tags`  |
 pub fn rig_router(state: RigApiState) -> Router {
     Router::new()
         .route("/", get(list_rigs).post(add_rig))
@@ -147,6 +151,7 @@ pub fn rig_router(state: RigApiState) -> Router {
         .route("/:name/set-prefix", post(set_prefix))
         .route("/:name/set-default-branch", post(set_default_branch))
         .route("/:name/set-worktree-root", post(set_worktree_root))
+        .route("/:name/set-semantic-tags", post(set_semantic_tags))
         .with_state(state)
 }
 
@@ -350,6 +355,29 @@ async fn set_worktree_root(
     apply_and_upsert(&*repo, name, &cmd).await
 }
 
+/// `POST /:name/set-semantic-tags` — replace a rig's semantic capability tags
+/// (`rig.set-semantic-tags`). Body: `{"tags": ["rust", "backend"]}`. The set is normalized
+/// (trim/lowercase/dedupe) and validated before it is stored.
+#[cfg_attr(feature = "axum", utoipa::path(
+    post, path = "/{name}/set-semantic-tags",
+    params(("name" = String, Path, description = "Rig name")),
+    responses(
+        (status = 200, description = "Semantic tags replaced"),
+        (status = 422, description = "Validation failed (bad tag grammar, too many/long, or no-op)"),
+        (status = 404, description = "No rig with that name"),
+    ),
+))]
+async fn set_semantic_tags(
+    State(st): State<RigApiState>,
+    ctx: WorkspaceContext,
+    Path(name): Path<String>,
+    Json(body): Json<Value>,
+) -> Result<Json<Value>, ApiError> {
+    let repo = st.rigs.repo(ctx.workspace().as_str()).await?;
+    let cmd: SetRigSemanticTags = with_path_name(body, name.clone())?;
+    apply_and_upsert(&*repo, name, &cmd).await
+}
+
 /// The combined OpenAPI document for the rig REST surface (`hq-fe-api-platform.2`). The builder
 /// mounts it under the module prefix and rewrites its relative paths to `/api/v1/rig/...`, so
 /// the `#[utoipa::path]` annotations stay prefix-free.
@@ -364,6 +392,7 @@ async fn set_worktree_root(
     set_prefix,
     set_default_branch,
     set_worktree_root,
+    set_semantic_tags,
 ))]
 pub struct ApiDoc;
 
@@ -447,6 +476,7 @@ fn entry_json(entry: &RigEntry) -> Value {
         "registered_at_secs": entry.registered_at_secs,
         "worktree_root": entry.worktree_root,
         "git_connection_ref": entry.git_connection_ref,
+        "semantic_tags": entry.semantic_tags,
     })
 }
 

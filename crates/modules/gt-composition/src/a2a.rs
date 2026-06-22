@@ -727,6 +727,22 @@ pub fn a2a_env(env: impl Fn(&str) -> Option<String>) -> Option<A2aEnv> {
     })
 }
 
+/// The tags advertised on a rig's [`AgentSkill`] (B3, gtcore-dd3763): the beads `prefix`
+/// first — its routing identity — followed by the rig's semantic capability tags (`rust`,
+/// `backend`, …). De-duplicated so a tag equal to the prefix is not repeated. A peer's
+/// `a2a.discover` filter matches against this combined set, so a rig can be selected by
+/// capability in addition to prefix.
+fn skill_tags(rig: &RigEntry) -> Vec<String> {
+    let mut tags = Vec::with_capacity(1 + rig.semantic_tags.len());
+    tags.push(rig.prefix.clone());
+    for tag in &rig.semantic_tags {
+        if !tags.contains(tag) {
+            tags.push(tag.clone());
+        }
+    }
+    tags
+}
+
 /// Hydrate the discovery card from the rig catalog: one [`AgentSkill`] per
 /// dispatchable rig (work routes per rig — `metadata.rig` on `tasks/send` — so
 /// a rig IS the unit of capability the card advertises). `public_url` is the
@@ -764,7 +780,7 @@ pub fn agent_card(public_url: &str, rigs: &[RigEntry]) -> AgentCard {
                         r.name, r.git_url, r.default_branch
                     )
                 }),
-                tags: vec![r.prefix.clone()],
+                tags: skill_tags(r),
             })
             .collect(),
         signature: None,
@@ -806,7 +822,7 @@ pub fn rig_agent_card(public_url: &str, rig: &RigEntry) -> AgentCard {
                     rig.name, rig.git_url, rig.default_branch
                 )
             }),
-            tags: vec![rig.prefix.clone()],
+            tags: skill_tags(rig),
         }],
         signature: None,
     }

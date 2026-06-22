@@ -73,6 +73,16 @@ pub enum RigEvent {
         new: PathBuf,
         now_secs: u64,
     },
+    /// The semantic capability tags a rig advertises changed (B3, gtcore-dd3763). Carries both
+    /// sides (the full normalized sets) so the audit log + reducer reconstruct the transition.
+    /// These tags feed `a2a.discover` and the Agent Card skills so a peer can select a rig by
+    /// capability (`rust`, `backend`, …) rather than only by beads prefix.
+    SemanticTagsChanged {
+        rig: String,
+        old: Vec<String>,
+        new: Vec<String>,
+        now_secs: u64,
+    },
 }
 
 impl EventKind for RigEvent {
@@ -84,6 +94,7 @@ impl EventKind for RigEvent {
             RigEvent::PrefixChanged { .. } => "rig.prefix_changed.v1",
             RigEvent::DefaultBranchChanged { .. } => "rig.default_branch_changed.v1",
             RigEvent::WorktreeRootChanged { .. } => "rig.worktree_root_changed.v1",
+            RigEvent::SemanticTagsChanged { .. } => "rig.semantic_tags_changed.v1",
         }
     }
 }
