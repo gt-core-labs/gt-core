@@ -408,6 +408,20 @@ async fn main() -> anyhow::Result<()> {
     // it must tick where the outbox lives; the `last_sent_date` guard in the
     // persisted config keeps the send at-most-once per day.
     if let Some(svc) = &report_service {
+        // One-shot migration (gtcore-8ff13e): the schedule LIST now lives in the
+        // durable Postgres store, but pre-DB deployments persisted it to
+        // `system_config.json`. On the first boot against the DB store, seed it
+        // from whatever the legacy file still holds so those schedules are not
+        // lost; gated on an empty store, so this is a no-op on every later boot.
+        match svc.import_file_schedules(&system_initial_cfg.report_schedules).await {
+            Ok(0) => {}
+            Ok(n) => eprintln!(
+                "[gt-mcp-server] report scheduler: migrated {n} legacy schedule(s) from system_config.json into the DB store"
+            ),
+            Err(e) => eprintln!(
+                "[gt-mcp-server] report scheduler: legacy schedule migration skipped ({e})"
+            ),
+        }
         tokio::spawn(gt_composition::report_scheduler::ReportScheduler::new(svc.clone()).run());
         eprintln!("[gt-mcp-server] report scheduler on (digest via /api/v1/system/report/*)");
     }
