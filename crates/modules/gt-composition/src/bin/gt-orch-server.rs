@@ -555,7 +555,7 @@ async fn main() -> anyhow::Result<()> {
             // gtcore-2836bb: ALSO snapshot quota status so the re-sling rotates off a
             // Limited/Blocked active account — a re-sling onto a rate-limited account births the
             // polecat into the usage-limit dialog. The respec runs inside the supervisor's
-            // spawn_blocking tick, so block_on the snapshot is safe (same posture as bead_closed).
+            // spawn_blocking tick, so block_on the snapshot is safe (same posture as the slingability probe).
             let now_ms = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|d| d.as_millis() as u64)
@@ -592,14 +592,17 @@ async fn main() -> anyhow::Result<()> {
         eprintln!("[gt-orch-server] re-sling account re-resolution armed (keychain-backed)");
     }
 
-    // Closed-bead re-sling guard (gtcore-177770): a polecat can die after its bead was already
-    // closed (operator or merge auto-close) — re-slinging it then burns the restart budget on
-    // delivered work and keeps the slot occupied, starving new dispatches. Wire a probe the
-    // supervisor consults before each re-sling: it reads the bead's tracker status via a sync
-    // Dolt query (the supervisor's `tick` runs inside `spawn_blocking`, so blocking on the
-    // current runtime handle is safe here). Only a positively-closed bead is dropped; an
-    // unknown bead or a query error falls through to the normal re-sling path. Env-gated on
-    // GT_DOLT_URL — without it the guard is off and dead polecats re-sling as before.
+    // Slingability re-sling guard (gtcore-177770, unified by gtcore-db99e0): a polecat can die
+    // after its bead became un-slingable — closed (operator or merge auto-close, work delivered),
+    // flipped to an epic container, or set dispatch=manual. Re-slinging it then burns the restart
+    // budget on work no autonomous agent should touch and keeps the slot occupied, starving new
+    // dispatches. Wire a probe the supervisor consults before each re-sling: it re-reads the bead's
+    // CURRENT state and applies the unified `should_sling` predicate via `bead_should_sling` — the
+    // SAME decision the dispatch→sling path and the auto-dispatch frontier use. The supervisor's
+    // `tick` runs inside `spawn_blocking`, so blocking on the current runtime handle is safe here.
+    // Only a positive ¬slingable verdict drops; an unknown bead or a query error is treated as
+    // slingable and falls through to the normal re-sling path. Env-gated on GT_DOLT_URL — without it
+    // the guard is off and dead polecats re-sling as before.
     match std::env::var("GT_DOLT_URL")
         .ok()
         .filter(|v| !v.is_empty())
@@ -608,26 +611,17 @@ async fn main() -> anyhow::Result<()> {
         Some(store) => {
             let store = Arc::new(store);
             let handle = tokio::runtime::Handle::current();
-            supervisor.set_bead_closed(Box::new(move |bead: &str| {
+            supervisor.set_bead_slingable(Box::new(move |bead: &str| {
                 let store = store.clone();
                 let bead = bead.to_string();
-                handle.block_on(async move {
-                    match store.get_detail(&bead).await {
-                        Ok(Some(detail)) => detail.status == "closed",
-                        Ok(None) => false, // unknown bead → re-sling (conservative)
-                        Err(e) => {
-                            eprintln!(
-                                "[gt-orch-server] closed-bead probe failed bead={bead}: {e} — re-slinging"
-                            );
-                            false
-                        }
-                    }
-                })
+                handle.block_on(
+                    async move { gt_composition::polecat::bead_should_sling(&store, &bead).await },
+                )
             }));
-            eprintln!("[gt-orch-server] closed-bead re-sling guard armed (Dolt-backed)");
+            eprintln!("[gt-orch-server] slingability re-sling guard armed (Dolt-backed: closed/epic/manual dropped)");
         }
         None => {
-            eprintln!("[gt-orch-server] closed-bead re-sling guard OFF — GT_DOLT_URL unset (closed beads may re-sling)")
+            eprintln!("[gt-orch-server] slingability re-sling guard OFF — GT_DOLT_URL unset (closed/epic/manual beads may re-sling)")
         }
     }
 

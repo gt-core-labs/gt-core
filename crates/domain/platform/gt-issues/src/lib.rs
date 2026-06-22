@@ -112,7 +112,7 @@ pub use commands::{
 pub use delivery::{CommitInfo, CommitInspector, InspectorProvider};
 pub use dispatch::{
     filter_dispatch, locked_roots, occupied_surfaces, operator_locked, ready_for_auto,
-    resolve_dispatch, session_like_actor, surface_overlaps,
+    resolve_dispatch, session_like_actor, should_sling, surface_overlaps,
 };
 pub use events::{emit_issue_event, IssueEvent, IssueEventSink, IssueVerb};
 #[cfg(feature = "axum")]
