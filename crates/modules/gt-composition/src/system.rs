@@ -431,7 +431,9 @@ async fn create_report_schedule(
         Ok(svc) => svc,
         Err(resp) => return resp,
     };
-    match svc.create_schedule(patch).await {
+    // The System REST surface is the cross-tenant operator admin (authorized by
+    // scope claims, not workspace-bound), so it runs unscoped (`None`).
+    match svc.create_schedule(None, patch).await {
         Ok(s) => (StatusCode::OK, Json(s)).into_response(),
         Err(e) => (StatusCode::BAD_REQUEST, e).into_response(),
     }
@@ -450,7 +452,7 @@ async fn update_report_schedule(
         Ok(svc) => svc,
         Err(resp) => return resp,
     };
-    match svc.update_schedule(&id, patch).await {
+    match svc.update_schedule(None, &id, patch).await {
         Ok(s) => (StatusCode::OK, Json(s)).into_response(),
         Err(e) if e.starts_with("unknown schedule") => {
             (StatusCode::NOT_FOUND, e).into_response()
@@ -471,7 +473,7 @@ async fn delete_report_schedule(
         Ok(svc) => svc,
         Err(resp) => return resp,
     };
-    match svc.delete_schedule(&id).await {
+    match svc.delete_schedule(None, &id).await {
         Ok(()) => (StatusCode::OK, Json(serde_json::json!({ "ok": true }))).into_response(),
         Err(e) => (StatusCode::NOT_FOUND, e).into_response(),
     }
@@ -490,7 +492,7 @@ async fn run_report_schedule(
         Ok(svc) => svc,
         Err(resp) => return resp,
     };
-    let schedule = match svc.resolve_schedule(Some(&id)).await {
+    let schedule = match svc.resolve_schedule(None, Some(&id)).await {
         Ok(s) => s,
         Err(e) => return (StatusCode::NOT_FOUND, e).into_response(),
     };
