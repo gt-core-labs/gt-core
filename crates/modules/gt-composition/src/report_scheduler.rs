@@ -263,6 +263,35 @@ pub struct SchedulePatch {
     pub subscribers: Option<Vec<String>>,
 }
 
+/// Whether schedule `s` belongs to the actor's scope (gtcore-00325f).
+/// `None` is the unscoped admin view (every schedule); `Some(ws)` matches only
+/// that workspace's schedules.
+fn in_scope(scope: Option<&str>, s: &ReportSchedule) -> bool {
+    match scope {
+        Some(ws) => s.workspace == ws,
+        None => true,
+    }
+}
+
+/// Stamp the tenant scope onto a write patch (gtcore-00325f H3). On the
+/// tenant-bound MCP surface (`Some(ws)`) the patch's `workspace` is forced to
+/// the session's: a missing one defaults to it, and a different one is rejected
+/// as a cross-tenant write rather than silently honored. `None` (the admin REST
+/// surface) leaves the patch untouched so an operator can target any workspace.
+fn stamp_scope(scope: Option<&str>, mut patch: SchedulePatch) -> Result<SchedulePatch, String> {
+    if let Some(ws) = scope {
+        match patch.workspace.as_deref().map(str::trim) {
+            Some(req) if !req.is_empty() && req != ws => {
+                return Err(format!(
+                    "cross-tenant write rejected: schedule workspace `{req}` ≠ session `{ws}`"
+                ));
+            }
+            _ => patch.workspace = Some(ws.to_string()),
+        }
+    }
+    Ok(patch)
+}
+
 /// Apply `patch` onto `s`, then validate the result. The schedule is only
 /// mutated on success (validation runs on a candidate).
 pub fn apply_patch(s: &mut ReportSchedule, patch: SchedulePatch) -> Result<(), String> {
@@ -622,13 +651,28 @@ impl ReportService {
         }
     }
 
-    /// All schedules (the CRUD list).
-    pub async fn list_schedules(&self) -> Vec<ReportSchedule> {
-        self.config.read().await.report_schedules.clone()
+    /// All schedules visible to `scope` (gtcore-00325f H3 multi-tenant):
+    /// `Some(ws)` restricts to that workspace's schedules; `None` is the
+    /// unscoped admin view (every workspace), used by the System REST surface.
+    pub async fn list_schedules(&self, scope: Option<&str>) -> Vec<ReportSchedule> {
+        let all = self.config.read().await.report_schedules.clone();
+        match scope {
+            Some(ws) => all.into_iter().filter(|s| s.workspace == ws).collect(),
+            None => all,
+        }
     }
 
     /// Create a schedule from a patch over the defaults; persisted on success.
-    pub async fn create_schedule(&self, patch: SchedulePatch) -> Result<ReportSchedule, String> {
+    /// When `scope` is `Some(ws)` (the tenant-bound MCP surface) the schedule's
+    /// workspace is STAMPED to the session's — a cross-tenant `workspace` in the
+    /// patch is rejected rather than silently honored, so a schedule can only
+    /// ever land in the actor's own tenant.
+    pub async fn create_schedule(
+        &self,
+        scope: Option<&str>,
+        patch: SchedulePatch,
+    ) -> Result<ReportSchedule, String> {
+        let patch = stamp_scope(scope, patch)?;
         let mut s = ReportSchedule::default();
         apply_patch(&mut s, patch)?;
         self.config.write().await.report_schedules.push(s.clone());
@@ -637,17 +681,22 @@ impl ReportService {
     }
 
     /// Patch one schedule by id; `last_sent_date`/`id` untouched by design.
+    /// Tenant-scoped (`Some(ws)`): a schedule outside the actor's workspace is
+    /// invisible (reads as "unknown schedule"), and the patch cannot move it to
+    /// another workspace.
     pub async fn update_schedule(
         &self,
+        scope: Option<&str>,
         id: &str,
         patch: SchedulePatch,
     ) -> Result<ReportSchedule, String> {
+        let patch = stamp_scope(scope, patch)?;
         let updated = {
             let mut cfg = self.config.write().await;
             let s = cfg
                 .report_schedules
                 .iter_mut()
-                .find(|s| s.id == id)
+                .find(|s| s.id == id && in_scope(scope, s))
                 .ok_or_else(|| format!("unknown schedule `{id}`"))?;
             apply_patch(s, patch)?;
             s.clone()
@@ -656,12 +705,14 @@ impl ReportService {
         Ok(updated)
     }
 
-    /// Remove one schedule by id; persisted on success.
-    pub async fn delete_schedule(&self, id: &str) -> Result<(), String> {
+    /// Remove one schedule by id; persisted on success. Tenant-scoped: a
+    /// schedule outside the actor's workspace is not deletable (and reads as
+    /// unknown).
+    pub async fn delete_schedule(&self, scope: Option<&str>, id: &str) -> Result<(), String> {
         {
             let mut cfg = self.config.write().await;
             let before = cfg.report_schedules.len();
-            cfg.report_schedules.retain(|s| s.id != id);
+            cfg.report_schedules.retain(|s| !(s.id == id && in_scope(scope, s)));
             if cfg.report_schedules.len() == before {
                 return Err(format!("unknown schedule `{id}`"));
             }
@@ -671,9 +722,15 @@ impl ReportService {
     }
 
     /// Resolve the send target: an explicit id, or the single existing
-    /// schedule when unambiguous.
-    pub async fn resolve_schedule(&self, id: Option<&str>) -> Result<ReportSchedule, String> {
-        let schedules = self.config.read().await.report_schedules.clone();
+    /// schedule when unambiguous. Tenant-scoped: only the actor's workspace
+    /// schedules are visible, so the "exactly one" shortcut is per-tenant and an
+    /// id outside the tenant reads as unknown.
+    pub async fn resolve_schedule(
+        &self,
+        scope: Option<&str>,
+        id: Option<&str>,
+    ) -> Result<ReportSchedule, String> {
+        let schedules = self.list_schedules(scope).await;
         match id {
             Some(id) => schedules
                 .into_iter()
@@ -1166,5 +1223,114 @@ mod tests {
         // shared default DB → empty digest. It must now route to its own pool.
         let got = svc.tracker("cotrafa").expect("tracker");
         assert!(!Arc::ptr_eq(&got, &dolt));
+    }
+
+    // --- per-workspace CRUD scoping (gtcore-00325f H3) -----------------------
+    // The service runs on an in-memory `ArchiveConfig` with no `config_path`, so
+    // `persist()` is a no-op and the CRUD operates purely on the config list.
+
+    fn create_patch(ws: &str) -> SchedulePatch {
+        SchedulePatch { workspace: Some(ws.into()), ..Default::default() }
+    }
+
+    #[tokio::test]
+    async fn create_stamps_session_workspace_over_a_blank_patch() {
+        let (svc, _) = service(None);
+        // No workspace in the patch: the session's is stamped, not the default.
+        let s = svc
+            .create_schedule(Some("cotrafa"), SchedulePatch::default())
+            .await
+            .expect("create");
+        assert_eq!(s.workspace, "cotrafa");
+    }
+
+    #[tokio::test]
+    async fn create_rejects_a_cross_tenant_workspace() {
+        let (svc, _) = service(None);
+        let err = svc
+            .create_schedule(Some("cotrafa"), create_patch("default"))
+            .await
+            .expect_err("cross-tenant create must be rejected");
+        assert!(err.contains("cross-tenant"), "got: {err}");
+        // Nothing leaked into the config.
+        assert!(svc.list_schedules(None).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn list_is_isolated_by_workspace() {
+        let (svc, _) = service(None);
+        svc.create_schedule(Some("cotrafa"), SchedulePatch::default()).await.expect("c");
+        svc.create_schedule(Some("default"), SchedulePatch::default()).await.expect("d");
+
+        // The cotrafa schedule appears only in the cotrafa scope, never default
+        // (the incident this bead closes), and vice versa.
+        let cotrafa = svc.list_schedules(Some("cotrafa")).await;
+        assert_eq!(cotrafa.len(), 1);
+        assert_eq!(cotrafa[0].workspace, "cotrafa");
+        let default = svc.list_schedules(Some("default")).await;
+        assert_eq!(default.len(), 1);
+        assert_eq!(default[0].workspace, "default");
+        // The admin (unscoped) view sees both.
+        assert_eq!(svc.list_schedules(None).await.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn update_and_delete_cannot_cross_the_tenant_boundary() {
+        let (svc, _) = service(None);
+        let other = svc
+            .create_schedule(Some("cotrafa"), SchedulePatch::default())
+            .await
+            .expect("create cotrafa");
+
+        // A default-scoped actor cannot see, patch, or delete a cotrafa schedule.
+        let upd = svc
+            .update_schedule(Some("default"), &other.id, SchedulePatch {
+                hour: Some(9),
+                ..Default::default()
+            })
+            .await;
+        assert!(upd.unwrap_err().contains("unknown schedule"));
+        let del = svc.delete_schedule(Some("default"), &other.id).await;
+        assert!(del.unwrap_err().contains("unknown schedule"));
+        // The schedule survived untouched.
+        let live = svc.list_schedules(Some("cotrafa")).await;
+        assert_eq!(live.len(), 1);
+        assert_eq!(live[0].hour, other.hour);
+
+        // The owning tenant CAN patch it, but not relocate it to another tenant.
+        svc.update_schedule(Some("cotrafa"), &other.id, SchedulePatch {
+            hour: Some(9),
+            ..Default::default()
+        })
+        .await
+        .expect("owner update");
+        let relocate = svc
+            .update_schedule(Some("cotrafa"), &other.id, create_patch("default"))
+            .await;
+        assert!(relocate.unwrap_err().contains("cross-tenant"));
+        // In scope, the patched hour took; the workspace never moved.
+        let live = svc.list_schedules(Some("cotrafa")).await;
+        assert_eq!(live[0].hour, 9);
+        assert_eq!(live[0].workspace, "cotrafa");
+    }
+
+    #[tokio::test]
+    async fn resolve_is_per_tenant_unambiguous() {
+        let (svc, _) = service(None);
+        let c = svc.create_schedule(Some("cotrafa"), SchedulePatch::default()).await.expect("c");
+        svc.create_schedule(Some("default"), SchedulePatch::default()).await.expect("d");
+
+        // Two schedules exist globally, but each tenant has exactly one — so the
+        // "single schedule" send-now shortcut resolves per-tenant.
+        let r = svc.resolve_schedule(Some("cotrafa"), None).await.expect("resolve cotrafa");
+        assert_eq!(r.id, c.id);
+        // An explicit id from another tenant is invisible.
+        assert!(svc
+            .resolve_schedule(Some("default"), Some(&c.id))
+            .await
+            .unwrap_err()
+            .contains("unknown schedule"));
+        // Unscoped admin sees the ambiguity.
+        assert!(svc.resolve_schedule(None, None).await.unwrap_err().contains("pass schedule_id"));
     }
 }
