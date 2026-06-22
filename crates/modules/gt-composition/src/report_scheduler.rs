@@ -17,7 +17,6 @@
 //! configured sender, every registered recipient in CC (gtcore-ecf70d) — and
 //! the drain owns the transport. Manual sends never touch `last_sent_date`.
 
-use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -29,12 +28,12 @@ use gt_issues::report::{build_report, OperatorReport, ReportComment};
 use gt_issues::report_html::render_digest;
 use gt_store_dolt::{DoltIssues, IssueFilter, WorkspacePools};
 use gt_store_pg::{
-    EmailOutboxRepository, NewEmail, PgComments, PgEmailOutbox, PgReportSubscriptions,
+    EmailOutboxRepository, NewEmail, PgComments, PgEmailOutbox, PgReportSchedules,
+    PgReportSubscriptions, ReportScheduleError, ReportScheduleRow, ReportSchedulesRepository,
     ReportSubscriptionsRepository,
 };
 
 use crate::mcp::WsPools;
-use crate::system::SharedArchiveConfig;
 
 /// When a schedule fires.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -53,6 +52,32 @@ pub enum ScheduleMode {
     /// Exactly once on `date` at `hour:minute` (catch-up if the process was
     /// down that day); auto-disables after sending.
     Once,
+}
+
+impl ScheduleMode {
+    /// The persisted `mode` token (matches the snake_case serde wire form).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ScheduleMode::Daily => "daily",
+            ScheduleMode::EveryNDays => "every_n_days",
+            ScheduleMode::Weekly => "weekly",
+            ScheduleMode::Monthly => "monthly",
+            ScheduleMode::Once => "once",
+        }
+    }
+
+    /// Parse a persisted `mode` token; an unknown value falls back to `Daily`
+    /// (the same default the serde decoder applies), so a corrupt row never
+    /// panics the daemon.
+    pub fn from_token(s: &str) -> ScheduleMode {
+        match s {
+            "every_n_days" => ScheduleMode::EveryNDays,
+            "weekly" => ScheduleMode::Weekly,
+            "monthly" => ScheduleMode::Monthly,
+            "once" => ScheduleMode::Once,
+            _ => ScheduleMode::Daily,
+        }
+    }
 }
 
 /// One scheduled report send.
@@ -165,6 +190,61 @@ impl Default for ReportSchedule {
     }
 }
 
+impl ReportSchedule {
+    /// Project to the serialization-free DB row. `subscribers` JSON-encodes to
+    /// text here (the kernel store stays serde-free); `None` ⇒ NULL ⇒ the
+    /// global recipient fallback.
+    fn to_row(&self) -> ReportScheduleRow {
+        ReportScheduleRow {
+            id: self.id.clone(),
+            workspace: self.workspace.clone(),
+            kind: self.kind.clone(),
+            mode: self.mode.as_str().to_string(),
+            n_days: self.n_days as i32,
+            date: self.date.clone(),
+            weekday: i16::from(self.weekday),
+            day_of_month: i16::from(self.day_of_month),
+            start_date: self.start_date.clone(),
+            hour: i16::from(self.hour),
+            minute: i16::from(self.minute),
+            tz_offset_minutes: self.tz_offset_minutes as i32,
+            rig: self.rig.clone(),
+            enabled: self.enabled,
+            last_sent_date: self.last_sent_date.clone(),
+            subscribers: self
+                .subscribers
+                .as_ref()
+                .map(|list| serde_json::to_string(list).unwrap_or_else(|_| "[]".into())),
+        }
+    }
+
+    /// Rebuild from a DB row. Tolerant of out-of-range scalars (clamped to the
+    /// field width) and a corrupt `subscribers` blob (treated as the global
+    /// fallback) so one bad row never poisons the daemon's whole tick.
+    fn from_row(row: ReportScheduleRow) -> ReportSchedule {
+        ReportSchedule {
+            id: row.id,
+            kind: row.kind,
+            mode: ScheduleMode::from_token(&row.mode),
+            n_days: row.n_days.max(0) as u32,
+            date: row.date,
+            weekday: row.weekday.clamp(0, 255) as u8,
+            day_of_month: row.day_of_month.clamp(0, 255) as u8,
+            start_date: row.start_date,
+            hour: row.hour.clamp(0, 255) as u8,
+            minute: row.minute.clamp(0, 255) as u8,
+            tz_offset_minutes: i64::from(row.tz_offset_minutes),
+            rig: row.rig,
+            workspace: row.workspace,
+            enabled: row.enabled,
+            last_sent_date: row.last_sent_date,
+            subscribers: row
+                .subscribers
+                .and_then(|raw| serde_json::from_str::<Vec<String>>(&raw).ok()),
+        }
+    }
+}
+
 /// The PRE-multi-schedule scalar config (hq-84f93b). Still deserialized from
 /// the persisted file's `report` key so a deployed `system_config.json`
 /// migrates losslessly into one Daily schedule on load.
@@ -261,16 +341,6 @@ pub struct SchedulePatch {
     /// `Some(list)` sets the per-schedule recipients (trimmed, empties
     /// dropped; an empty result clears back to the global fallback).
     pub subscribers: Option<Vec<String>>,
-}
-
-/// Whether schedule `s` belongs to the actor's scope (gtcore-00325f).
-/// `None` is the unscoped admin view (every schedule); `Some(ws)` matches only
-/// that workspace's schedules.
-fn in_scope(scope: Option<&str>, s: &ReportSchedule) -> bool {
-    match scope {
-        Some(ws) => s.workspace == ws,
-        None => true,
-    }
 }
 
 /// Stamp the tenant scope onto a write patch (gtcore-00325f H3). On the
@@ -556,9 +626,10 @@ pub struct ReportService {
     /// comments the digest folds into the report. `None` ⇒ no PG (comments are
     /// skipped, the digest renders without them rather than failing).
     ws_pools: Option<Arc<WsPools>>,
-    /// The persisted system config (`report_schedules` is ours).
-    pub config: SharedArchiveConfig,
-    config_path: Option<PathBuf>,
+    /// The durable, DB-backed schedule store (gtcore-915232): the schedule LIST
+    /// now lives in `report_schedules` (Postgres), NOT `system_config.json` on
+    /// an ephemeral path — so a redeploy keeps schedules and `last_sent_date`.
+    schedules: Arc<dyn ReportSchedulesRepository>,
 }
 
 impl ReportService {
@@ -567,10 +638,23 @@ impl ReportService {
         dolt_workspaces: Option<Arc<WorkspacePools>>,
         pool: PgPool,
         ws_pools: Option<Arc<WsPools>>,
-        config: SharedArchiveConfig,
-        config_path: Option<PathBuf>,
     ) -> Self {
-        Self { dolt, dolt_workspaces, pool, ws_pools, config, config_path }
+        let schedules = Arc::new(PgReportSchedules::new(pool.clone()));
+        Self::with_schedules(dolt, dolt_workspaces, pool, ws_pools, schedules)
+    }
+
+    /// Build over an explicit schedule store. Production wires the Postgres
+    /// `PgReportSchedules` (via [`ReportService::new`]); the CRUD-scoping tests
+    /// inject an in-memory `ReportSchedulesRepository` so they exercise the edge
+    /// without a Postgres socket (gtcore-915232).
+    pub fn with_schedules(
+        dolt: Arc<DoltIssues>,
+        dolt_workspaces: Option<Arc<WorkspacePools>>,
+        pool: PgPool,
+        ws_pools: Option<Arc<WsPools>>,
+        schedules: Arc<dyn ReportSchedulesRepository>,
+    ) -> Self {
+        Self { dolt, dolt_workspaces, pool, ws_pools, schedules }
     }
 
     /// Load the bead/epic comments for the report rows from the schedule's
@@ -643,30 +727,28 @@ impl ReportService {
         PgReportSubscriptions::new(self.pool.clone())
     }
 
-    /// Persist the current config snapshot to disk.
-    pub async fn persist(&self) {
-        if let Some(path) = &self.config_path {
-            let snapshot = self.config.read().await.clone();
-            crate::system::persist_config(path, &snapshot);
-        }
-    }
-
     /// All schedules visible to `scope` (gtcore-00325f H3 multi-tenant):
     /// `Some(ws)` restricts to that workspace's schedules; `None` is the
     /// unscoped admin view (every workspace), used by the System REST surface.
+    /// Reads straight from the DB (gtcore-915232) on every call — no in-memory
+    /// snapshot — so a peer process's write is visible immediately. A store
+    /// error surfaces as an empty list with a log (the surfaces tolerate it the
+    /// same way the pre-DB read of an absent config did).
     pub async fn list_schedules(&self, scope: Option<&str>) -> Vec<ReportSchedule> {
-        let all = self.config.read().await.report_schedules.clone();
-        match scope {
-            Some(ws) => all.into_iter().filter(|s| s.workspace == ws).collect(),
-            None => all,
+        match self.schedules.list(scope).await {
+            Ok(rows) => rows.into_iter().map(ReportSchedule::from_row).collect(),
+            Err(e) => {
+                eprintln!("[report-scheduler] list schedules ({scope:?}): {e}");
+                Vec::new()
+            }
         }
     }
 
-    /// Create a schedule from a patch over the defaults; persisted on success.
-    /// When `scope` is `Some(ws)` (the tenant-bound MCP surface) the schedule's
-    /// workspace is STAMPED to the session's — a cross-tenant `workspace` in the
-    /// patch is rejected rather than silently honored, so a schedule can only
-    /// ever land in the actor's own tenant.
+    /// Create a schedule from a patch over the defaults; persisted to the DB on
+    /// success. When `scope` is `Some(ws)` (the tenant-bound MCP surface) the
+    /// schedule's workspace is STAMPED to the session's — a cross-tenant
+    /// `workspace` in the patch is rejected rather than silently honored, so a
+    /// schedule can only ever land in the actor's own tenant.
     pub async fn create_schedule(
         &self,
         scope: Option<&str>,
@@ -675,15 +757,17 @@ impl ReportService {
         let patch = stamp_scope(scope, patch)?;
         let mut s = ReportSchedule::default();
         apply_patch(&mut s, patch)?;
-        self.config.write().await.report_schedules.push(s.clone());
-        self.persist().await;
+        self.schedules
+            .insert(&s.to_row())
+            .await
+            .map_err(|e| format!("persist schedule: {e}"))?;
         Ok(s)
     }
 
     /// Patch one schedule by id; `last_sent_date`/`id` untouched by design.
     /// Tenant-scoped (`Some(ws)`): a schedule outside the actor's workspace is
     /// invisible (reads as "unknown schedule"), and the patch cannot move it to
-    /// another workspace.
+    /// another workspace. Read-modify-write against the DB.
     pub async fn update_schedule(
         &self,
         scope: Option<&str>,
@@ -691,34 +775,49 @@ impl ReportService {
         patch: SchedulePatch,
     ) -> Result<ReportSchedule, String> {
         let patch = stamp_scope(scope, patch)?;
-        let updated = {
-            let mut cfg = self.config.write().await;
-            let s = cfg
-                .report_schedules
-                .iter_mut()
-                .find(|s| s.id == id && in_scope(scope, s))
-                .ok_or_else(|| format!("unknown schedule `{id}`"))?;
-            apply_patch(s, patch)?;
-            s.clone()
-        };
-        self.persist().await;
-        Ok(updated)
+        // Load the current row within scope (an out-of-scope id is invisible).
+        let mut current = self
+            .list_schedules(scope)
+            .await
+            .into_iter()
+            .find(|s| s.id == id)
+            .ok_or_else(|| format!("unknown schedule `{id}`"))?;
+        apply_patch(&mut current, patch)?;
+        self.schedules
+            .update(scope, &current.to_row())
+            .await
+            .map_err(|e| match e {
+                ReportScheduleError::NotFound(id) => format!("unknown schedule `{id}`"),
+                other => format!("persist schedule: {other}"),
+            })?;
+        Ok(current)
     }
 
     /// Remove one schedule by id; persisted on success. Tenant-scoped: a
     /// schedule outside the actor's workspace is not deletable (and reads as
     /// unknown).
     pub async fn delete_schedule(&self, scope: Option<&str>, id: &str) -> Result<(), String> {
-        {
-            let mut cfg = self.config.write().await;
-            let before = cfg.report_schedules.len();
-            cfg.report_schedules.retain(|s| !(s.id == id && in_scope(scope, s)));
-            if cfg.report_schedules.len() == before {
-                return Err(format!("unknown schedule `{id}`"));
-            }
-        }
-        self.persist().await;
-        Ok(())
+        self.schedules.delete(scope, id).await.map_err(|e| match e {
+            ReportScheduleError::NotFound(id) => format!("unknown schedule `{id}`"),
+            other => format!("delete schedule: {other}"),
+        })
+    }
+
+    /// Daemon bookkeeping after a fire: stamp `last_sent_date` and, when
+    /// `disable` (a `once` schedule that just sent), flip `enabled` off — both in
+    /// one DB statement (gtcore-915232) so the at-most-once guard and the
+    /// auto-disable persist together and survive a redeploy. Unscoped: the
+    /// daemon spans every tenant.
+    pub async fn stamp_sent(
+        &self,
+        id: &str,
+        last_sent_date: &str,
+        disable: bool,
+    ) -> Result<(), String> {
+        self.schedules
+            .stamp_sent(id, last_sent_date, disable)
+            .await
+            .map_err(|e| format!("stamp last_sent_date: {e}"))
     }
 
     /// Resolve the send target: an explicit id, or the single existing
@@ -843,7 +942,11 @@ impl ReportScheduler {
 
     pub async fn run(self) {
         loop {
-            let schedules = self.service.config.read().await.report_schedules.clone();
+            // Read every tenant's schedules straight from the DB each tick
+            // (gtcore-915232) — unscoped (`None`), so the daemon spans all
+            // workspaces, and a CRUD edit by any process lands on the next tick
+            // without a restart.
+            let schedules = self.service.list_schedules(None).await;
             for schedule in &schedules {
                 let (local_date, minutes_now) = local_now(schedule.tz_offset_minutes);
                 if !is_due(schedule, &local_date, minutes_now) {
@@ -859,18 +962,18 @@ impl ReportScheduler {
                         );
                         // Stamp even when queued=0 (the schedule DID fire; a
                         // recipient added later gets the next cycle or
-                        // send-now). Once auto-disables: exactly-one send.
-                        let mut cfg = self.service.config.write().await;
-                        if let Some(live) =
-                            cfg.report_schedules.iter_mut().find(|s| s.id == schedule.id)
+                        // send-now). Once auto-disables: exactly-one send. Both
+                        // persist to the DB in one statement (gtcore-915232), so
+                        // the at-most-once guard survives a redeploy.
+                        let disable = schedule.mode == ScheduleMode::Once;
+                        if let Err(e) =
+                            self.service.stamp_sent(&schedule.id, &local_date, disable).await
                         {
-                            live.last_sent_date = Some(local_date);
-                            if live.mode == ScheduleMode::Once {
-                                live.enabled = false;
-                            }
+                            eprintln!(
+                                "[report-scheduler] `{}` stamp last_sent_date failed: {e}",
+                                schedule.id
+                            );
                         }
-                        drop(cfg);
-                        self.service.persist().await;
                     }
                     Err(e) => eprintln!(
                         "[report-scheduler] `{}` failed (retry next tick): {e}",
@@ -1188,17 +1291,88 @@ mod tests {
     // Both pure: mysql_async + sqlx pools are lazy, so no socket opens — the
     // same "lazy pool handle" seam multitenant_rbac.rs exercises.
 
+    /// In-memory `ReportSchedulesRepository` for the CRUD-scoping tests — the
+    /// same `scope` semantics as `PgReportSchedules` (gtcore-915232) with no
+    /// Postgres socket. Insertion order stands in for the `created_at` ordering.
+    #[derive(Default)]
+    struct InMemorySchedules {
+        rows: tokio::sync::Mutex<Vec<ReportScheduleRow>>,
+    }
+
+    #[async_trait::async_trait]
+    impl ReportSchedulesRepository for InMemorySchedules {
+        async fn list(
+            &self,
+            scope: Option<&str>,
+        ) -> Result<Vec<ReportScheduleRow>, ReportScheduleError> {
+            let rows = self.rows.lock().await;
+            Ok(rows
+                .iter()
+                .filter(|r| scope.map_or(true, |ws| r.workspace == ws))
+                .cloned()
+                .collect())
+        }
+
+        async fn insert(&self, row: &ReportScheduleRow) -> Result<(), ReportScheduleError> {
+            self.rows.lock().await.push(row.clone());
+            Ok(())
+        }
+
+        async fn update(
+            &self,
+            scope: Option<&str>,
+            row: &ReportScheduleRow,
+        ) -> Result<(), ReportScheduleError> {
+            let mut rows = self.rows.lock().await;
+            let slot = rows
+                .iter_mut()
+                .find(|r| r.id == row.id && scope.map_or(true, |ws| r.workspace == ws))
+                .ok_or_else(|| ReportScheduleError::NotFound(row.id.clone()))?;
+            // `last_sent_date` is daemon bookkeeping the CRUD path never writes
+            // (mirrors the SQL UPDATE column set, which omits it).
+            let keep = slot.last_sent_date.clone();
+            *slot = row.clone();
+            slot.last_sent_date = keep;
+            Ok(())
+        }
+
+        async fn delete(&self, scope: Option<&str>, id: &str) -> Result<(), ReportScheduleError> {
+            let mut rows = self.rows.lock().await;
+            let before = rows.len();
+            rows.retain(|r| !(r.id == id && scope.map_or(true, |ws| r.workspace == ws)));
+            if rows.len() == before {
+                return Err(ReportScheduleError::NotFound(id.to_string()));
+            }
+            Ok(())
+        }
+
+        async fn stamp_sent(
+            &self,
+            id: &str,
+            last_sent_date: &str,
+            disable: bool,
+        ) -> Result<(), ReportScheduleError> {
+            let mut rows = self.rows.lock().await;
+            if let Some(r) = rows.iter_mut().find(|r| r.id == id) {
+                r.last_sent_date = Some(last_sent_date.to_string());
+                if disable {
+                    r.enabled = false;
+                }
+            }
+            Ok(())
+        }
+    }
+
     fn service(dolt_workspaces: Option<Arc<WorkspacePools>>) -> (ReportService, Arc<DoltIssues>) {
         let dolt = Arc::new(
             DoltIssues::connect("mysql://root@127.0.0.1:3307/hq").expect("lazy dolt pool"),
         );
-        let svc = ReportService::new(
+        let svc = ReportService::with_schedules(
             dolt.clone(),
             dolt_workspaces,
             PgPool::connect_lazy("postgres://gt@127.0.0.1:1/none").expect("lazy pg pool"),
             None,
-            Arc::new(tokio::sync::RwLock::new(crate::system::ArchiveConfig::default())),
-            None,
+            Arc::new(InMemorySchedules::default()),
         );
         (svc, dolt)
     }

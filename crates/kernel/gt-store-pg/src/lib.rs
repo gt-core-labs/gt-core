@@ -55,6 +55,13 @@ pub use report_subscriptions::{
 };
 
 #[cfg(feature = "pg")]
+pub mod report_schedules;
+#[cfg(feature = "pg")]
+pub use report_schedules::{
+    PgReportSchedules, ReportScheduleError, ReportScheduleRow, ReportSchedulesRepository,
+};
+
+#[cfg(feature = "pg")]
 pub mod invites;
 #[cfg(feature = "pg")]
 pub use invites::{Invite, InviteError, InvitesRepository, NewInvite, PgInvites};
@@ -198,6 +205,9 @@ const EMAIL_0002_SQL: &str = include_str!("../migrations/email/0002_email_subscr
 const EMAIL_0003_SQL: &str = include_str!("../migrations/email/0003_report_subscriptions.sql");
 /// Migration #4: `email_outbox.cc` — carbon-copy recipients (gtcore-ecf70d).
 const EMAIL_0004_SQL: &str = include_str!("../migrations/email/0004_email_outbox_cc.sql");
+/// Migration #5: `report_schedules` — durable, DB-backed schedule list
+/// (gtcore-915232; was lost on every redeploy in `system_config.json`).
+const EMAIL_0005_SQL: &str = include_str!("../migrations/email/0005_report_schedules.sql");
 
 pub fn email_migrations() -> Vec<Migration> {
     vec![
@@ -205,6 +215,7 @@ pub fn email_migrations() -> Vec<Migration> {
         Migration::new(2, "0002_email_subscriptions", EMAIL_0002_SQL),
         Migration::new(3, "0003_report_subscriptions", EMAIL_0003_SQL),
         Migration::new(4, "0004_email_outbox_cc", EMAIL_0004_SQL),
+        Migration::new(5, "0005_report_schedules", EMAIL_0005_SQL),
     ]
 }
 
