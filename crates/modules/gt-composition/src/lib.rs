@@ -48,6 +48,7 @@ pub mod auth;
 pub mod delegation;
 pub mod delegation_http;
 pub mod denial_audit;
+pub mod domain_catalog;
 pub mod drift_reconcile;
 pub mod email_outbox_drain;
 pub mod escalation_notify;

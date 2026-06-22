@@ -153,6 +153,14 @@ async fn main() -> anyhow::Result<()> {
     store.ensure_schema().await?;
     eprintln!("[gt-mcp-server] issues: Dolt @ {dolt_url}");
 
+    // Per-workspace domain catalog (gtcore-55d5fb H1): ensure the `default`
+    // workspace's `domain_catalog` table exists and is seeded with the technical
+    // set (built from the `Domain` enum so it can't diverge). Idempotent — a
+    // re-boot re-upserts by key. Business workspaces get the editable generic
+    // template at provision time (see mcp::workspace::provision_tenant).
+    gt_composition::domain_catalog::seed_default_workspace(store.as_ref()).await?;
+    eprintln!("[gt-mcp-server] domain catalog: default workspace seeded (technical set)");
+
     // The per-workspace event log (the event-sourced domains' durable store AND the SSE feed's
     // source) is path-partitioned under GT_EVENTLOG_ROOT (default /var/lib/gt-core). Built here
     // — before the issues REST state + the MCP service — so both can emit issue-mutation events
