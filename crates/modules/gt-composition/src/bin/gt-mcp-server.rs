@@ -401,7 +401,7 @@ async fn main() -> anyhow::Result<()> {
     // GT_PG_URL is set; unset ⇒ an empty router, so the server serves issues +
     // meta exactly as before.
     let (domains, rig_prefixes, ws_status, documents, report_service) =
-        build_domain_router(event_log.clone(), system_config.clone(), system_config_path.clone())
+        build_domain_router(event_log.clone())
             .await?;
     // Report-digest scheduler (hq-84f93b): fixed-time daily send to the ENABLED
     // subscribers. Like the outbox drain/mailbox, NOT behind the singleton gate —
@@ -2070,8 +2070,6 @@ ORDER BY c.relname, a.attnum";
 /// SSE feed streams from.
 async fn build_domain_router(
     event_log: Arc<EventLog>,
-    system_config: gt_composition::system::SharedArchiveConfig,
-    system_config_path: Option<std::path::PathBuf>,
 ) -> anyhow::Result<(
     DomainRouter,
     Option<Arc<dyn WorkspaceRigPrefixes>>,
@@ -2511,9 +2509,10 @@ async fn build_domain_router(
         Some(report_dolt) => {
             let report_dolt = Arc::new(report_dolt);
             let (report_blob, report_bucket) = build_blob_store();
-            // The digest service (hq-84f93b): same Dolt row source + outbox
-            // pool as report.generate; shares the persisted system config so
-            // schedule edits land without a restart.
+            // The digest service (hq-84f93b): same Dolt row source + outbox pool
+            // as report.generate. The schedule LIST now lives in the DB-backed
+            // `report_schedules` store (gtcore-915232) — durable across redeploys
+            // — so a CRUD edit lands on the next daemon tick without a restart.
             let service = Arc::new(gt_composition::report_scheduler::ReportService::new(
                 report_dolt.clone(),
                 dolt_pools.clone(),
@@ -2521,8 +2520,6 @@ async fn build_domain_router(
                 // Per-workspace PG pools: the source of the bead/epic comments the
                 // digest folds into the report (gtcore-01bcf2).
                 Some(ws_pools.clone()),
-                system_config,
-                system_config_path,
             ));
             let router = router.register(Arc::new(ReportHandler::new(
                 ws_pools.clone(),
