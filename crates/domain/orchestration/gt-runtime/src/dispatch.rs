@@ -34,10 +34,11 @@
 //! explicit [`complete`](Dispatcher::complete).
 
 use std::collections::HashSet;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, Notify};
 use tokio::task::JoinHandle;
 
 /// Identifier of a tracked bead, e.g. `hq-auto.1`. A thin newtype so the
