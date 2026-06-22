@@ -472,7 +472,17 @@ pub(crate) async fn provision_tenant(
     if let Some(dolt) = dolt {
         let server = dolt.server_pool();
         gt_store_dolt::create_workspace_dolt(&server, slug).await?;
-        dolt.ensured_pool(slug).await?;
+        let pool = dolt.ensured_pool(slug).await?;
+        // Domain catalog (gtcore-55d5fb H1): a freshly-provisioned BUSINESS
+        // workspace receives the editable generic template as its reusable base.
+        // Idempotent and guarded by `is_seeded` so re-provisioning never stomps a
+        // catalog an operator has since edited (or the technical set the `default`
+        // workspace was seeded with at boot).
+        let catalog = gt_store_dolt::DoltDomainCatalog::new(pool);
+        catalog.ensure_schema().await?;
+        if !catalog.is_seeded().await? {
+            catalog.seed(&gt_store_dolt::generic_template()).await?;
+        }
     }
     Ok(())
 }
