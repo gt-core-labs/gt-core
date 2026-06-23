@@ -390,7 +390,7 @@ pub fn polecat_prompt(workspace: &str, bead: &str, branch: &str) -> String {
          `mcp__gt__memory_recall` with context relevant to your bead; treat every memory of kind \
          `feedback` as a hard rule you must obey. As you work and learn something durable \
          (a decision, gotcha, or convention worth keeping across sessions), persist it with \
-         the MCP tool `mcp__gt__memory_save` — never write memory to local files. \
+         the MCP tool `mcp__gt__memory_save` — never write memory to local files.{}\
          When your work is committed on branch `{branch}`, signal completion by calling \
          the MCP tool `mcp__gt__merge_submit` with arguments \
          {{\"bead\":\"{bead}\",\"branch\":\"{branch}\"}}. \
@@ -399,8 +399,33 @@ pub fn polecat_prompt(workspace: &str, bead: &str, branch: &str) -> String {
          2>/dev/null || date +%s%N); printf '{{\"bead\":\"%s\",\"branch\":\"%s\"}}' \"$GT_HOOK_BEAD\" \
          \"$GT_BRANCH\" > \"$d/.$i.tmp\" && mv \"$d/.$i.tmp\" \"$d/$i.event\"` \
          Then stop.{}",
+        rust_premerge_gate(),
         checkpoint_protocol(bead)
     )
+}
+
+/// Rust pre-merge verification gate appended to every sling prompt (`gtcore-2ef931`).
+///
+/// The orchd image now bakes a Rust toolchain (`Dockerfile.orchd`,
+/// [[polecat-worktree-no-rust-toolchain]]), so a polecat working a bead that touches Rust can —
+/// and must — compile the workspace in its worktree before signalling merge-ready. The build is
+/// run with `--locked` so a Cargo.lock that drifted out of sync with `Cargo.toml` fails HERE, on
+/// the worktree, instead of blind in the PR's CI after the refinery has already merged a sibling.
+/// `--all-targets` extends the gate to tests/benches/examples so a broken test target is caught
+/// too; `cargo test` follows where the change has testable behaviour.
+///
+/// Scoped to Rust-touching beads on purpose: a docs- or config-only bead should not pay a cold
+/// compile. Kept as its own `fn` so the contract — the exact gate command — is unit-testable.
+pub fn rust_premerge_gate() -> String {
+    " RUST PRE-MERGE GATE: if your work touches Rust (any `*.rs`, `Cargo.toml`, or `Cargo.lock` \
+     change), you MUST run `cargo build --workspace --all-targets --locked` in your worktree and \
+     get a clean build BEFORE you signal merge-ready — and `cargo test --workspace --locked` where \
+     the change has testable behaviour. The toolchain is baked into this image, so this catches a \
+     desynced Cargo.lock or a compile error locally instead of in the PR's CI. If the build fails, \
+     fix it (e.g. `cargo update -p <crate>` to resync the lock, or correct the code) and re-run \
+     until green; do NOT signal merge-ready on a red build. Skip this gate only for beads that \
+     touch no Rust at all. "
+        .to_string()
 }
 
 /// Checkpoint-on-context protocol appended to every sling prompt (`gtcore-2467b4`).
@@ -683,6 +708,32 @@ mod lifecycle_tests {
             p.contains("do NOT emit merge-ready")
                 && p.contains("do NOT call `mcp__gt__merge_submit`"),
             "prompt forbids signalling completion on an unfinished checkpoint"
+        );
+    }
+
+    #[test]
+    fn polecat_prompt_carries_rust_premerge_gate() {
+        // gtcore-2ef931: the orchd image now ships a Rust toolchain, so the sling prompt must
+        // direct a polecat on a Rust-touching bead to compile --locked in its worktree BEFORE
+        // merge-ready — catching a desynced Cargo.lock / compile error locally, not in PR CI.
+        let p = polecat_prompt("acme", "hq-9.2", "feat/x");
+
+        // The gate is named and scoped to Rust-touching changes.
+        assert!(
+            p.contains("RUST PRE-MERGE GATE") && p.contains("Cargo.lock"),
+            "prompt explains the Rust pre-merge build gate"
+        );
+        // The exact verification command, with --locked so a drifted lock fails here.
+        assert!(
+            p.contains("cargo build --workspace --all-targets --locked"),
+            "prompt pins the locked workspace build command"
+        );
+        // The gate runs BEFORE the merge-ready signal.
+        let gate = p.find("RUST PRE-MERGE GATE").expect("gate present");
+        let signal = p.find("signal completion").expect("merge-ready signal present");
+        assert!(
+            gate < signal,
+            "the Rust gate is stated before the merge-ready signal"
         );
     }
 
