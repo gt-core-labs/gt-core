@@ -96,6 +96,70 @@ pub const GENERIC_TEMPLATE: &[(&str, &str)] = &[
 /// a technical workspace both carry it.
 pub const RESERVED_GAP_KEY: &str = "meta.gap";
 
+/// How a freshly-created workspace's `domain_catalog` is initialised (gtcore-22f57b H3).
+///
+/// `workspace.create` carries an optional `catalog` argument that maps onto this:
+/// - [`Template`](Self::Template) (the default) — seed the editable [`generic_template`]
+///   base, the same reusable placeholder set H1 ships. A fresh business workspace's
+///   starting point.
+/// - [`CloneFrom`](Self::CloneFrom) — copy another workspace's catalog verbatim
+///   (every entry, reserved rows included), so a new tenant inherits an existing one's
+///   curated domains. The reserved `meta.gap` is re-appended defensively in case the
+///   source ever lacked it.
+/// - [`Empty`](Self::Empty) — seed nothing but the reserved `meta.gap` (every catalog
+///   must carry it), leaving the operator to define the domains later.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CatalogInit {
+    /// Seed the editable [`generic_template`] base (the default).
+    Template,
+    /// Copy the named workspace's catalog into the new one.
+    CloneFrom(String),
+    /// Seed only the reserved `meta.gap`; no editable domains.
+    Empty,
+}
+
+impl Default for CatalogInit {
+    fn default() -> Self {
+        Self::Template
+    }
+}
+
+impl CatalogInit {
+    /// Parse the `workspace.create` `catalog` argument (gtcore-22f57b H3). Accepts:
+    /// - `None` / `"template"` ⇒ [`Template`](Self::Template) (the default);
+    /// - `"empty"` ⇒ [`Empty`](Self::Empty);
+    /// - `"clone_from:<workspace>"` ⇒ [`CloneFrom`](Self::CloneFrom) (the source slug
+    ///   after the colon; surrounding whitespace trimmed, and a bare `"clone_from"`
+    ///   with no slug is rejected).
+    ///
+    /// An unrecognised value is a validation fault — the caller surfaces it as a
+    /// caller-side error, never a 500.
+    pub fn parse(raw: Option<&str>) -> Result<Self, String> {
+        match raw.map(str::trim) {
+            None | Some("") | Some("template") => Ok(Self::Template),
+            Some("empty") => Ok(Self::Empty),
+            Some(other) => {
+                if let Some(src) = other.strip_prefix("clone_from:") {
+                    let src = src.trim();
+                    if src.is_empty() {
+                        return Err(
+                            "catalog `clone_from:` requires a source workspace, e.g. \
+                             `clone_from:acme`"
+                                .to_string(),
+                        );
+                    }
+                    Ok(Self::CloneFrom(src.to_string()))
+                } else {
+                    Err(format!(
+                        "unknown catalog init `{other}` (expected `template`, `empty`, \
+                         or `clone_from:<workspace>`)"
+                    ))
+                }
+            }
+        }
+    }
+}
+
 /// Materialise [`GENERIC_TEMPLATE`] (+ the reserved `meta.gap`) as [`DomainEntry`]
 /// rows ready for [`DoltDomainCatalog::seed`]. Used to provision a business
 /// workspace with the reusable base.
@@ -205,6 +269,42 @@ impl DoltDomainCatalog {
         }
         commit(&mut conn, "domain_catalog seed (gtcore-55d5fb)").await?;
         Ok(written)
+    }
+
+    /// Initialise a freshly-created (or un-seeded) catalog from a [`CatalogInit`]
+    /// directive (gtcore-22f57b H3), idempotently. Ensures the table exists, then —
+    /// only when the catalog has NO rows yet ([`is_seeded`](Self::is_seeded) is false)
+    /// — seeds the chosen set:
+    /// - [`Template`](CatalogInit::Template) ⇒ the [`generic_template`] base;
+    /// - [`Empty`](CatalogInit::Empty) ⇒ only the reserved `meta.gap`;
+    /// - [`CloneFrom`](CatalogInit::CloneFrom) ⇒ the supplied `clone_rows` (the caller
+    ///   resolves the source workspace's pool and passes its [`list`](Self::list)),
+    ///   with the reserved `meta.gap` re-appended in case the source lacked it.
+    ///
+    /// Re-running is a no-op once seeded — it never stomps a catalog an operator has
+    /// since edited, nor the technical set the `default` workspace was seeded with at
+    /// boot. Returns the number of rows written (0 when already seeded). The
+    /// `clone_rows` are ignored for the non-clone variants (pass `&[]`).
+    pub async fn seed_initial(
+        &self,
+        init: &CatalogInit,
+        clone_rows: &[DomainEntry],
+    ) -> Result<u64, AppError> {
+        self.ensure_schema().await?;
+        if self.is_seeded().await? {
+            return Ok(0);
+        }
+        let entries = match init {
+            CatalogInit::Template => generic_template(),
+            CatalogInit::Empty => vec![reserved_gap_entry()],
+            CatalogInit::CloneFrom(_) => {
+                let mut rows: Vec<DomainEntry> =
+                    clone_rows.iter().filter(|e| e.key != RESERVED_GAP_KEY).cloned().collect();
+                rows.push(reserved_gap_entry());
+                rows
+            }
+        };
+        self.seed(&entries).await
     }
 
     /// List the workspace's catalog, ordered for a stable UI (`tier` then `key`).
@@ -396,5 +496,36 @@ mod tests {
         assert!(!e.reserved);
         assert_eq!(e.label, "Sales");
         assert_eq!(e.tier, None);
+    }
+
+    #[test]
+    fn catalog_init_parses_the_three_modes_and_defaults_to_template() {
+        // Absent / blank / explicit `template` all mean the editable base.
+        assert_eq!(CatalogInit::parse(None).unwrap(), CatalogInit::Template);
+        assert_eq!(CatalogInit::parse(Some("")).unwrap(), CatalogInit::Template);
+        assert_eq!(CatalogInit::parse(Some("  ")).unwrap(), CatalogInit::Template);
+        assert_eq!(CatalogInit::parse(Some("template")).unwrap(), CatalogInit::Template);
+        assert_eq!(CatalogInit::default(), CatalogInit::Template);
+        // `empty`.
+        assert_eq!(CatalogInit::parse(Some("empty")).unwrap(), CatalogInit::Empty);
+        // `clone_from:<ws>` carries the trimmed source slug.
+        assert_eq!(
+            CatalogInit::parse(Some("clone_from:acme")).unwrap(),
+            CatalogInit::CloneFrom("acme".to_string())
+        );
+        assert_eq!(
+            CatalogInit::parse(Some(" clone_from: acme ")).unwrap(),
+            CatalogInit::CloneFrom("acme".to_string())
+        );
+    }
+
+    #[test]
+    fn catalog_init_rejects_unknown_and_sourceless_clone() {
+        // A bare clone_from with no source is a validation fault.
+        assert!(CatalogInit::parse(Some("clone_from:")).is_err());
+        assert!(CatalogInit::parse(Some("clone_from:   ")).is_err());
+        // An entirely unrecognised mode is a validation fault.
+        let err = CatalogInit::parse(Some("nonsense")).unwrap_err();
+        assert!(err.contains("unknown catalog init"), "{err}");
     }
 }
