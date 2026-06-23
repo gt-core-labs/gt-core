@@ -118,6 +118,12 @@ fn parity_map(ns: &str) -> Vec<Route> {
             rt("POST", "/{id}/suspend", Some("workspace.suspend")),
             rt("POST", "/{id}/resume", Some("workspace.resume")),
             rt("POST", "/{id}/archive", Some("workspace.archive")),
+            // Domain-catalog backfill of an existing workspace (gtcore-22f57b H3).
+            rt(
+                "POST",
+                "/{id}/backfill-catalog",
+                Some("workspace.backfill-catalog"),
+            ),
         ],
         "rig" => vec![
             rt("GET", "/", Some("rig.list")),

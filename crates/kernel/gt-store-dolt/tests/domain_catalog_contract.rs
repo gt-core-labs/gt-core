@@ -14,7 +14,10 @@
 
 use mysql_async::prelude::Queryable;
 
-use gt_store_dolt::{generic_template, DoltDomainCatalog, DomainEntry};
+use gt_store_dolt::{
+    generic_template, CatalogInit, DoltDomainCatalog, DomainEntry, GENERIC_TEMPLATE,
+    RESERVED_GAP_KEY,
+};
 
 const TEST_DB: &str = "gt_rs_domain_catalog_test";
 
@@ -66,6 +69,87 @@ async fn ensure_schema_is_idempotent_and_seed_upserts_by_key() {
     let again = catalog.seed(&tpl).await.expect("re-seed");
     assert_eq!(again as usize, tpl.len());
     assert_eq!(catalog.list().await.expect("list2").len(), tpl.len());
+}
+
+#[tokio::test]
+async fn seed_initial_template_is_idempotent_and_never_restomps() {
+    let Ok(base) = std::env::var("GT_DOLT_URL") else {
+        eprintln!("GT_DOLT_URL unset — skipping seed_initial template contract");
+        return;
+    };
+    let pool = fresh_pool(&base).await.expect("fresh test db");
+    let catalog = DoltDomainCatalog::new(pool);
+
+    // First seed_initial(Template) on an un-seeded catalog writes the generic base (10 + gap).
+    let written = catalog
+        .seed_initial(&CatalogInit::Template, &[])
+        .await
+        .expect("seed_initial template");
+    assert_eq!(written as usize, GENERIC_TEMPLATE.len() + 1);
+    assert!(catalog.is_seeded().await.unwrap());
+
+    // An operator edits a domain; a second seed_initial is a NO-OP (already seeded) and must
+    // leave the edit intact — never re-stomp with the template.
+    catalog
+        .upsert(&DomainEntry::new("producto", "Producto Editado", None))
+        .await
+        .expect("edit");
+    let again = catalog
+        .seed_initial(&CatalogInit::Template, &[])
+        .await
+        .expect("seed_initial #2");
+    assert_eq!(again, 0, "already seeded ⇒ no rows written");
+    let prod = catalog.get("producto").await.unwrap().unwrap();
+    assert_eq!(prod.label, "Producto Editado", "edit survived the re-run");
+}
+
+#[tokio::test]
+async fn seed_initial_empty_seeds_only_the_reserved_gap() {
+    let Ok(base) = std::env::var("GT_DOLT_URL") else {
+        eprintln!("GT_DOLT_URL unset — skipping seed_initial empty contract");
+        return;
+    };
+    let pool = fresh_pool(&base).await.expect("fresh test db");
+    let catalog = DoltDomainCatalog::new(pool);
+
+    let written = catalog
+        .seed_initial(&CatalogInit::Empty, &[])
+        .await
+        .expect("seed_initial empty");
+    assert_eq!(written, 1, "only meta.gap");
+    let listed = catalog.list().await.unwrap();
+    assert_eq!(listed.len(), 1);
+    assert_eq!(listed[0].key, RESERVED_GAP_KEY);
+    assert!(listed[0].reserved);
+}
+
+#[tokio::test]
+async fn seed_initial_clone_copies_source_rows_plus_reserved_gap() {
+    let Ok(base) = std::env::var("GT_DOLT_URL") else {
+        eprintln!("GT_DOLT_URL unset — skipping seed_initial clone contract");
+        return;
+    };
+    let pool = fresh_pool(&base).await.expect("fresh test db");
+    let catalog = DoltDomainCatalog::new(pool);
+
+    // The clone rows the caller resolved from a source workspace (a curated set + its own gap).
+    let source_rows = vec![
+        DomainEntry::new("ventas", "Ventas", None),
+        DomainEntry::new("riesgo", "Riesgo", Some("compliance".into())),
+        gt_store_dolt::reserved_gap_entry(),
+    ];
+    let written = catalog
+        .seed_initial(&CatalogInit::CloneFrom("acme".into()), &source_rows)
+        .await
+        .expect("seed_initial clone");
+    // The two business rows + exactly one meta.gap (deduped — never two gaps).
+    assert_eq!(written, 3);
+    let listed = catalog.list().await.unwrap();
+    assert_eq!(listed.len(), 3);
+    assert_eq!(listed.iter().filter(|e| e.key == RESERVED_GAP_KEY).count(), 1);
+    assert!(listed.iter().any(|e| e.key == "ventas"));
+    let riesgo = listed.iter().find(|e| e.key == "riesgo").unwrap();
+    assert_eq!(riesgo.tier.as_deref(), Some("compliance"));
 }
 
 #[tokio::test]
