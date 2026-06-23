@@ -105,6 +105,10 @@ fn parity_map(ns: &str) -> Vec<Route> {
         "meta" => vec![
             rt("GET", "/help", Some("meta.help.execute")),
             rt("GET", "/scopes", None), // REST-only grantable-scope catalog (hq-scope-catalog)
+            // REST-only active-workspace domain catalog (gtcore-d81e77 H2): the FE domain
+            // selector reads it; no MCP tool sibling — domains validate inside the issues
+            // handler against the per-workspace catalog, not via a meta tool.
+            rt("GET", "/domains", None),
             rt("POST", "/report-gap", Some("meta.report-gap.execute")),
         ],
         "workspace" => vec![
