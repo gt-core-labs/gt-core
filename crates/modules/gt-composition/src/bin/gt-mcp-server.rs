@@ -729,11 +729,31 @@ async fn main() -> anyhow::Result<()> {
             .map(std::path::PathBuf::from)
             .unwrap_or_else(|_| std::path::PathBuf::from(DEFAULT_EVENTLOG_ROOT));
         let accounts_root = gt_composition::account_dirs::accounts_root(&relogin_eventlog_root);
-        gt_composition::relogin::relogin_router(gt_composition::relogin::ReloginState::new(
-            v.clone(),
-            audit.clone(),
-            accounts_root,
-        ))
+        // Enumerate every quota-tracked account in cred-health (gtcore-e09320): replay the
+        // workspace's quota log into the registry so an account in `quota.list` with NO on-disk dir
+        // (brayanrayo/fsrbwowr) still surfaces as needs_relogin instead of vanishing → shown Healthy.
+        let known_log = event_log.clone();
+        let known_ws = std::env::var("GT_WORKSPACE").unwrap_or_else(|_| "default".to_string());
+        let known_accounts: gt_composition::relogin::KnownAccountsFn = Arc::new(move || {
+            known_log
+                .replay_domain(
+                    Some(&known_ws),
+                    "quota.",
+                    gt_quota::QuotaState::default(),
+                    gt_quota::QuotaState::apply,
+                )
+                .map(|st| {
+                    gt_quota::AccountRegistry::from_state(&st)
+                        .accounts()
+                        .map(|a| a.id.clone())
+                        .collect::<Vec<String>>()
+                })
+                .unwrap_or_default()
+        });
+        gt_composition::relogin::relogin_router(
+            gt_composition::relogin::ReloginState::new(v.clone(), audit.clone(), accounts_root)
+                .with_known_accounts(known_accounts),
+        )
     });
 
     // Global Claude Code hook registry (hq-hooks): GET/POST/DELETE /api/v1/hooks list/register/

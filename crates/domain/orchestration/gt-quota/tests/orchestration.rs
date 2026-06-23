@@ -41,6 +41,7 @@ fn account_with_window() -> Account {
         last_probe_secs: None,
         sampled_since_probe: 0.0,
         probe_divergence: None,
+        credential_dead: false,
     }
 }
 
