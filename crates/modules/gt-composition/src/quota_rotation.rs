@@ -618,6 +618,7 @@ async fn apply_feed(quota: &QuotaHandle, p: QuotaFeedPayload) {
                     last_probe_secs: None,
                     sampled_since_probe: 0.0,
                     probe_divergence: None,
+                    credential_dead: false,
                 })
                 .await;
         }
@@ -661,6 +662,7 @@ async fn apply_feed(quota: &QuotaHandle, p: QuotaFeedPayload) {
                         last_probe_secs: None,
                         sampled_since_probe: 0.0,
                         probe_divergence: None,
+                        credential_dead: false,
                     })
                     .await;
             }
@@ -908,6 +910,7 @@ mod tests {
                 last_probe_secs: None,
                 sampled_since_probe: 0.0,
                 probe_divergence: None,
+                credential_dead: false,
             })
             .await;
         // A sample sets the burn-rate EWMA (0 tokens ⇒ consumed unchanged, rate = consumed/elapsed).
@@ -1005,6 +1008,7 @@ mod tests {
                 last_probe_secs: None,
                 sampled_since_probe: 0.0,
                 probe_divergence: None,
+                credential_dead: false,
             })
             .await;
         apply_feed(
@@ -1080,6 +1084,7 @@ mod tests {
                 last_probe_secs: None,
                 sampled_since_probe: 0.0,
                 probe_divergence: None,
+                credential_dead: false,
             })
             .await;
         // Simulate the actor receiving a 429 (sets status = Blocked).

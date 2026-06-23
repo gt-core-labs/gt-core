@@ -72,6 +72,13 @@ pub enum QuotaMsg {
         until_secs: Option<u64>,
         now_secs: u64,
     },
+    /// The usage-probe could not authenticate the account (gtcore-e09320): latch
+    /// `Account::credential_dead` and emit `quota.credential_dead.v1` so the deadness is observable
+    /// on `quota.list` instead of only logged.
+    CredentialDead {
+        account: String,
+        now_secs: u64,
+    },
     Rotated {
         from_account: String,
         to_account: String,
@@ -357,6 +364,19 @@ impl QuotaHandle {
             .send(QuotaMsg::Blocked {
                 account: account.into(),
                 until_secs,
+                now_secs,
+            })
+            .await;
+    }
+
+    /// Latch the account credential-dead (gtcore-e09320): the usage-probe could not authenticate
+    /// it (expired token + no refresh, or the token endpoint rejected the refresh). Emits
+    /// `quota.credential_dead.v1`; the next successful probe clears it.
+    pub async fn credential_dead(&self, account: impl Into<String>, now_secs: u64) {
+        let _ = self
+            .tx
+            .send(QuotaMsg::CredentialDead {
+                account: account.into(),
                 now_secs,
             })
             .await;
@@ -878,6 +898,17 @@ pub fn spawn_hydrated(
                             until_secs,
                             now_secs,
                         }))
+                        .await;
+                }
+                QuotaMsg::CredentialDead { account, now_secs } => {
+                    // Credential VALIDITY, not quota usage (gtcore-e09320): latch the flag so the
+                    // registry — and `quota.list` rebuilt from it — stops reading the account as
+                    // usable. Status is left untouched; the FE combines `credential_dead` with it.
+                    if let Some(a) = registry.get_mut(&account) {
+                        a.credential_dead = true;
+                    }
+                    let _ = events
+                        .send(Envelope::root(QuotaEvent::CredentialDead { account, now_secs }))
                         .await;
                 }
                 QuotaMsg::Rotated {

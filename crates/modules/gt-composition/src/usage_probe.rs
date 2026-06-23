@@ -25,9 +25,23 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use gt_quota::{
     parse_credentials_json, parse_refresh_response, parse_usage_response, probe_from_usage,
-    render_credentials_json, Keychain, OauthCredentials, QuotaHandle, DEFAULT_PLAN_LIMIT,
-    REFRESH_SKEW_MS,
+    render_credentials_json, Keychain, OauthCredentials, QuotaEvent, QuotaHandle,
+    DEFAULT_PLAN_LIMIT, REFRESH_SKEW_MS,
 };
+
+/// True when a probe failure denotes a genuinely DEAD credential — one that only a `quota.relogin`
+/// recovers (gtcore-e09320): the access token is expired with NO refresh token stored, or the OAuth
+/// token endpoint REJECTED the refresh with a 4xx (a revoked/invalid refresh token). Transient
+/// failures (5xx, network, timeouts) are deliberately excluded so a blip never flags a live account
+/// — and even a false positive self-heals, since the next successful probe clears the flag. The
+/// matched substrings are this module's own error format strings (see [`UsageProber::refresh`] /
+/// [`EventLogSyncProber::refresh`]), so the check stays stable.
+fn refresh_error_is_credential_dead(err: &str) -> bool {
+    err.contains("no refresh token stored")
+        || err.contains("HTTP 400")
+        || err.contains("HTTP 401")
+        || err.contains("HTTP 403")
+}
 
 /// Default usage endpoint — the same one Claude Code's `/usage` screen reads.
 const DEFAULT_USAGE_URL: &str = "https://api.anthropic.com/api/oauth/usage";
@@ -85,7 +99,16 @@ impl UsageProber {
         for account in accounts {
             match self.probe_account(&account).await {
                 Ok(()) => ok += 1,
-                Err(e) => eprintln!("[usage-probe] {account}: {e}"),
+                Err(e) => {
+                    eprintln!("[usage-probe] {account}: {e}");
+                    // gtcore-e09320: a probe that failed because the credential is DEAD (expired +
+                    // no refresh, a 4xx token-endpoint rejection, or a 401 even after refresh) is
+                    // latched onto the account so it stops reading Healthy. Transient failures are
+                    // not latched; the next successful probe clears the flag regardless.
+                    if refresh_error_is_credential_dead(&e) || e.contains("401 after refresh") {
+                        self.quota.credential_dead(account.clone(), now_secs()).await;
+                    }
+                }
             }
         }
         ok
@@ -224,6 +247,23 @@ impl UsageProber {
                 .or_else(|| creds.refresh_token.clone()),
             ..fresh
         })
+    }
+}
+
+/// Append a `CredentialDead` event to `workspace`'s quota log so the deadness the sync-probe just
+/// detected becomes observable on `quota.list` (gtcore-e09320). Best-effort: a failed append is
+/// logged, not fatal — the next sweep re-detects and re-appends.
+async fn mark_credential_dead(
+    quota: &dyn gt_quota::http::WorkspaceQuota,
+    workspace: &str,
+    account: &str,
+) {
+    let event = QuotaEvent::CredentialDead {
+        account: account.to_string(),
+        now_secs: now_secs(),
+    };
+    if let Err(e) = quota.append(workspace, event).await {
+        eprintln!("[sync-probe] {account}: append credential_dead: {e}");
     }
 }
 
@@ -386,6 +426,12 @@ impl gt_quota::http::SyncProber for EventLogSyncProber {
                     Ok(fresh) => creds = fresh,
                     Err(e) => {
                         eprintln!("[sync-probe] {account}: refresh: {e}");
+                        // gtcore-e09320: persist the deadness so `quota.list` stops showing this
+                        // account Healthy. Only for genuinely-dead signatures (expired + no refresh,
+                        // or a 4xx token-endpoint rejection) — transient failures are left to retry.
+                        if refresh_error_is_credential_dead(&e) {
+                            mark_credential_dead(quota, workspace, account).await;
+                        }
                         continue;
                     }
                 }
@@ -412,6 +458,9 @@ impl gt_quota::http::SyncProber for EventLogSyncProber {
                     }
                     Err(e) => {
                         eprintln!("[sync-probe] {account}: refresh on 401: {e}");
+                        if refresh_error_is_credential_dead(&e) {
+                            mark_credential_dead(quota, workspace, account).await;
+                        }
                         continue;
                     }
                 }
@@ -419,7 +468,10 @@ impl gt_quota::http::SyncProber for EventLogSyncProber {
             let body = match body {
                 Some(b) => b,
                 None => {
-                    eprintln!("[sync-probe] {account}: 401 after refresh");
+                    // The provider rejected even the freshly-refreshed token: the credential is
+                    // dead, not merely stale (gtcore-e09320). Persist it so quota.list reflects it.
+                    eprintln!("[sync-probe] {account}: 401 after refresh — marking credential dead");
+                    mark_credential_dead(quota, workspace, account).await;
                     continue;
                 }
             };
@@ -455,5 +507,31 @@ impl gt_quota::http::SyncProber for EventLogSyncProber {
             ok += 1;
         }
         ok
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::refresh_error_is_credential_dead;
+
+    #[test]
+    fn dead_credential_signatures_are_recognized() {
+        // The exact bead signature + the token-endpoint 4xx rejections only a relogin recovers.
+        assert!(refresh_error_is_credential_dead(
+            "access token expired and no refresh token stored"
+        ));
+        assert!(refresh_error_is_credential_dead("token refresh: HTTP 400 Bad Request"));
+        assert!(refresh_error_is_credential_dead("token endpoint: HTTP 401 Unauthorized"));
+        assert!(refresh_error_is_credential_dead("token endpoint: HTTP 403 Forbidden"));
+    }
+
+    #[test]
+    fn transient_failures_are_not_treated_as_dead() {
+        // 5xx / network / timeout must NOT latch a live account dead — they self-retry next sweep.
+        assert!(!refresh_error_is_credential_dead("token endpoint: HTTP 503 Service Unavailable"));
+        assert!(!refresh_error_is_credential_dead(
+            "token endpoint: error sending request for url"
+        ));
+        assert!(!refresh_error_is_credential_dead("usage endpoint: HTTP 500"));
     }
 }
