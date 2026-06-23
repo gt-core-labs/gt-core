@@ -15,7 +15,9 @@
 //! - `GT_MCP_HTTP_BIND` — listen address, default `127.0.0.1:8765`.
 //! - `GT_MCP_ALLOWED_HOSTS` — extra `Host` authorities the /mcp transport accepts, appended to
 //!   the loopback defaults (comma-separated). Set the served domain here for a public deploy
-//!   behind a reverse proxy; unset ⇒ loopback-only.
+//!   behind a reverse proxy; unset ⇒ loopback-only. The authorities of `GT_SELF_URL` and
+//!   `GT_PUBLIC_URL` are auto-appended too (gtcore-2cc534), so an in-cluster `gt mcp call`
+//!   against the URL the orchd writes into agents' `.mcp.json` is accepted without extra config.
 //! - `GT_MCP_ACTOR` — scope actor, default `mcp-local`.
 //! - `GT_MCP_SCOPE_CONFIG` — RBAC TOML/JSON path; unset ⇒ deny-by-default.
 //! - `GT_REPO_DIR` — gt-core checkout whose `main` tree backs surface validation
@@ -613,6 +615,29 @@ async fn main() -> anyhow::Result<()> {
     // is APPENDED to the loopback defaults, so local clients keep working and the deploy adds
     // its own domain (e.g. `gt.codecsrayo.com`). Unset ⇒ loopback-only, exactly as before.
     let mut http_config = StreamableHttpServerConfig::default();
+    // Auto-allow the authorities the deploy already advertises as "where to reach me": the
+    // in-cluster `GT_SELF_URL` (e.g. `http://gt-mcp-server:8765`) and the public `GT_PUBLIC_URL`
+    // (e.g. `https://gt-dev.codecsrayo.com`). gt-orch-server writes GT_SELF_URL verbatim into
+    // every agent's `.mcp.json` on each sling (hq-polecat-rig-config.1), so without this an
+    // in-cluster `gt mcp call` / native `mcp__gt__*` against that host is rejected 403 "Host
+    // header is not allowed" and the only workaround — hand-editing server_url to the public
+    // host — is reverted by the next sling (gtcore-2cc534). Deriving the allow-list from the
+    // SAME env the orchd hands out keeps a freshly-spawned agent working with no config edit,
+    // and survives an orchd restart (it is code + already-present env, not a mutable file).
+    for (var, label) in [
+        ("GT_SELF_URL", "in-cluster self URL"),
+        ("GT_PUBLIC_URL", "public origin"),
+    ] {
+        if let Some(url) = std::env::var(var).ok().filter(|v| !v.trim().is_empty()) {
+            let hosts = authority_allowed_hosts(&url);
+            if hosts.is_empty() {
+                eprintln!("[gt-mcp-server] {var}={url:?} has no parseable Host authority; not added to allow-list");
+            } else {
+                eprintln!("[gt-mcp-server] allowed_hosts += {hosts:?} (from {var}, {label})");
+                http_config.allowed_hosts.extend(hosts);
+            }
+        }
+    }
     if let Ok(raw) = std::env::var("GT_MCP_ALLOWED_HOSTS") {
         let extra: Vec<String> = raw
             .split(',')
@@ -3068,6 +3093,33 @@ fn is_safe_schema_ident(s: &str) -> bool {
             .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_')
 }
 
+/// The `Host` allow-list entries implied by a service URL (`GT_SELF_URL` / `GT_PUBLIC_URL`).
+///
+/// rmcp's streamable-HTTP transport rejects any request whose `Host` is not in
+/// `allowed_hosts` (a DNS-rebinding guard). gt-orch-server writes `GT_SELF_URL` verbatim into
+/// every agent's `.mcp.json`, so the server must accept that exact authority or an in-cluster
+/// `gt mcp call` is 403'd. Given `http://gt-mcp-server:8765` this returns
+/// `["gt-mcp-server", "gt-mcp-server:8765"]` — the bare host (matches any port, per rmcp's
+/// `host_is_allowed`) plus the explicit `host:port` for clarity. An empty/unparseable URL, or
+/// one with no host authority, yields an empty vec (the caller logs and skips it).
+fn authority_allowed_hosts(url: &str) -> Vec<String> {
+    let Ok(uri) = url.trim().parse::<axum::http::Uri>() else {
+        return Vec::new();
+    };
+    let Some(authority) = uri.authority() else {
+        return Vec::new();
+    };
+    let host = authority.host();
+    if host.is_empty() {
+        return Vec::new();
+    }
+    let mut out = vec![host.to_string()];
+    if let Some(port) = authority.port_u16() {
+        out.push(format!("{host}:{port}"));
+    }
+    out
+}
+
 /// Parse a `u64` env var, falling back to `default` when it is unset or unparseable.
 fn env_u64(key: &str, default: u64) -> u64 {
     std::env::var(key)
@@ -3290,6 +3342,41 @@ mod tests {
             &format!("ws_{}", "a".repeat(61)),
         ] {
             assert!(!is_safe_schema_ident(bad), "{bad:?} must be rejected");
+        }
+    }
+
+    /// gtcore-2cc534: the `Host` allow-list derived from `GT_SELF_URL`/`GT_PUBLIC_URL` must yield
+    /// the exact authority the orchd writes into every agent's `.mcp.json`, so an in-cluster
+    /// `gt mcp call` is no longer 403'd. The bare host (port-agnostic, matching rmcp's
+    /// `host_is_allowed`) plus the explicit `host:port` are emitted; junk yields nothing.
+    #[test]
+    fn authority_allowed_hosts_extracts_host_and_port() {
+        // The in-cluster GT_SELF_URL the deploy hands agents — the case this bead fixes.
+        assert_eq!(
+            authority_allowed_hosts("http://gt-mcp-server:8765"),
+            vec!["gt-mcp-server".to_string(), "gt-mcp-server:8765".to_string()]
+        );
+        // Public ingress, https default port (no explicit port in the URL).
+        assert_eq!(
+            authority_allowed_hosts("https://gt-dev.codecsrayo.com"),
+            vec!["gt-dev.codecsrayo.com".to_string()]
+        );
+        // A path/trailing slash does not change the authority.
+        assert_eq!(
+            authority_allowed_hosts("http://gt-mcp-server:8765/mcp"),
+            vec!["gt-mcp-server".to_string(), "gt-mcp-server:8765".to_string()]
+        );
+        // Surrounding whitespace is tolerated (env values can be sloppy).
+        assert_eq!(
+            authority_allowed_hosts("  http://gt-mcp-server:8765  "),
+            vec!["gt-mcp-server".to_string(), "gt-mcp-server:8765".to_string()]
+        );
+        // Empty / authority-less / unparseable inputs yield nothing (caller logs + skips).
+        for junk in ["", "   ", "not a url", "/just/a/path"] {
+            assert!(
+                authority_allowed_hosts(junk).is_empty(),
+                "{junk:?} must yield no allow-list entries"
+            );
         }
     }
 
