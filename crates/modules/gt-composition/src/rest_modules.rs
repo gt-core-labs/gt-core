@@ -167,13 +167,22 @@ pub async fn build_rest_modules(
         pg,
     } = parts;
 
+    // The per-workspace Dolt pools (multi-tenant only) the meta `GET /domains` endpoint
+    // resolves the active tenant's `domain_catalog` from (gtcore-d81e77 H2). Cloned out of
+    // the still-owned `pg` parts before they are destructured below; `None` in single-tenant
+    // builds, where the meta catalog reads the fallback `meta_store` pool.
+    let meta_workspaces = pg.as_ref().and_then(|p| p.issues_workspaces.clone());
+
     let mut rest = RootBuilder::new()
-        // meta REST: GET /help (full tools/list) + POST /report-gap.
-        .module(MetaModule::with_http(MetaApiState::new(
-            meta_store,
-            actor.clone(),
-            meta_tools,
-        )))
+        // meta REST: GET /help (full tools/list) + GET /domains (active-workspace
+        // domain catalog) + POST /report-gap.
+        .module(MetaModule::with_http({
+            let state = MetaApiState::new(meta_store, actor.clone(), meta_tools);
+            match meta_workspaces {
+                Some(pools) => state.with_workspaces(pools),
+                None => state,
+            }
+        }))
         // agent.*: the REST surface now delegates to the SAME EventLog the MCP handler uses
         // (gtcore-8c3823), so both transports always agree on session state regardless of
         // whether the backend is file or Postgres.

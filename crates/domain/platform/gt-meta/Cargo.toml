@@ -38,7 +38,7 @@ gt-workspace = { workspace = true, optional = true, features = ["axum"] }
 # gap-minting handler (`handlers.rs`), and the route/spec-bearing `MetaHttpModule`.
 # Off by default — the descriptor-only build pulls no HTTP stack and no store; the
 # composition bin enables it to expose the REST surface.
-axum = ["dep:axum", "dep:utoipa", "dep:gt-store-dolt", "dep:gt-rbac"]
+axum = ["dep:axum", "dep:utoipa", "dep:gt-store-dolt", "dep:gt-rbac", "dep:gt-workspace"]
 
 [dev-dependencies]
 # Exercise the REST router in-process (hq-fe-api-platform.4): `oneshot` a request
