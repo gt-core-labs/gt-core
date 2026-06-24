@@ -1311,6 +1311,89 @@ pub fn rig_routing_from_catalog(
     (configs, paths)
 }
 
+/// Ensure every catalog rig has its base checkout on disk, cloning a missing one from the rig's
+/// own catalog `git_url` (gtcore-d0ec4f).
+///
+/// THE BUG this closes: [`rig_routing_from_catalog`] SKIPS a rig whose resolved worktree root is
+/// absent on this host, so its beads fall back to the BOOT template — and a cross-rig bead (e.g.
+/// `gtweb-*`) then slings into the boot rig's checkout (gt-core, cloned at deploy time from
+/// `GT_RIG_GIT_URL`), the WRONG repo: the per-bead worktree is cut off the gt-core tree and carries
+/// the gt-core origin, making a gt-web frontend task impossible. Cloning each missing rig from its
+/// OWN catalog `git_url` here, BEFORE routing, makes routing find a real checkout so the per-bead
+/// worktree carries the correct origin (`git_url`), exactly as the multi-rig path intends.
+///
+/// Best-effort and idempotent: a rig whose checkout already exists, or whose `git_url` is empty, is
+/// left untouched; a clone failure (auth/network) is logged and the rig stays unrouted (the legacy
+/// skip). Returns the prefixes successfully provisioned (for logging / tests).
+pub fn provision_rig_checkouts(
+    rigs: &[gt_rig::RigEntry],
+    ws: &str,
+    home: &std::path::Path,
+) -> Vec<String> {
+    let mut provisioned = Vec::new();
+    for rig in rigs {
+        let workdir = rig.resolved_worktree_root(ws, home);
+        if workdir.is_dir() {
+            continue;
+        }
+        match clone_rig_checkout(&rig.git_url, &rig.default_branch, &workdir) {
+            Ok(()) => {
+                eprintln!(
+                    "[gt-orch-server] rig '{}' (prefix '{}') checkout provisioned at {} (cloned from {})",
+                    rig.name,
+                    rig.prefix,
+                    workdir.display(),
+                    rig.git_url
+                );
+                provisioned.push(rig.prefix.clone());
+            }
+            Err(e) => {
+                eprintln!(
+                    "[gt-orch-server] rig '{}' (prefix '{}') checkout {} missing and clone failed: {e} — its beads fall back to the boot template",
+                    rig.name,
+                    rig.prefix,
+                    workdir.display()
+                );
+            }
+        }
+    }
+    provisioned
+}
+
+/// `git clone [--branch <default_branch>] <git_url> <workdir>` for [`provision_rig_checkouts`].
+/// Creates `workdir`'s parent first so a convention root (`<home>/gastown-wt/<ws>/<name>`) under a
+/// not-yet-existing tree still lands. An empty `git_url` is rejected (nothing to clone from).
+fn clone_rig_checkout(
+    git_url: &str,
+    default_branch: &str,
+    workdir: &std::path::Path,
+) -> std::io::Result<()> {
+    let git_url = git_url.trim();
+    if git_url.is_empty() {
+        return Err(std::io::Error::other("rig has no git_url to clone from"));
+    }
+    if let Some(parent) = workdir.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let mut args: Vec<String> = vec!["clone".to_string()];
+    let branch = default_branch.trim();
+    if !branch.is_empty() {
+        args.push("--branch".to_string());
+        args.push(branch.to_string());
+    }
+    args.push(git_url.to_string());
+    args.push(workdir.display().to_string());
+    let status = std::process::Command::new("git").args(&args).status()?;
+    if status.success() && workdir.is_dir() {
+        Ok(())
+    } else {
+        Err(std::io::Error::other(format!(
+            "git clone {git_url} -> {} failed (status {status})",
+            workdir.display()
+        )))
+    }
+}
+
 /// Wall-clock epoch milliseconds, for the sling-time credential guard (gtcore-bf4acd). Mirrors the
 /// `now_ms` discipline in `usage_probe.rs`; `0` on a pre-epoch clock (the guard then treats every
 /// expiry as in the future, i.e. fails open — liveness over a spurious credential block).
@@ -2543,6 +2626,117 @@ mod tests {
         assert_eq!(cfg.worktree_root.as_deref(), Some(wt_root));
         assert_eq!(paths.get("gtweb"), Some(&gtweb_root));
         assert!(!paths.contains_key("gh"), "missing-root rig not routed");
+    }
+
+    /// Run `git <args>` in `dir`, asserting success (test helper for the clone path below).
+    #[cfg(test)]
+    fn git_in(dir: &std::path::Path, args: &[&str]) {
+        let ok = std::process::Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(args)
+            .status()
+            .expect("git runs")
+            .success();
+        assert!(ok, "git {args:?} in {} failed", dir.display());
+    }
+
+    /// `git -C dir remote get-url origin`, trimmed (test helper).
+    #[cfg(test)]
+    fn origin_of(dir: &std::path::Path) -> String {
+        let out = std::process::Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(["remote", "get-url", "origin"])
+            .output()
+            .expect("git runs");
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    }
+
+    #[test]
+    fn provision_rig_checkouts_clones_missing_rig_from_its_git_url() {
+        // gtcore-d0ec4f: a cross-rig bead (gtweb-*) must land in a worktree cut off the rig's OWN
+        // catalog git_url, not the boot rig's checkout. Before routing, provision_rig_checkouts
+        // clones a missing rig from its git_url; the per-bead worktree then carries that origin.
+        use gt_rig::RigEntry;
+        let dir = tempfile::tempdir().unwrap();
+
+        // A local "remote" standing in for gt-core-labs/gt-web: a real repo with a commit on main.
+        let remote = dir.path().join("gtweb-remote");
+        std::fs::create_dir_all(&remote).unwrap();
+        git_in(&remote, &["init", "-q", "-b", "main"]);
+        git_in(&remote, &["config", "user.email", "t@t"]);
+        git_in(&remote, &["config", "user.name", "t"]);
+        std::fs::write(remote.join("package.json"), "{}").unwrap();
+        git_in(&remote, &["add", "-A"]);
+        git_in(&remote, &["commit", "-q", "-m", "init"]);
+        let remote_url = remote.display().to_string();
+
+        // The rig's resolved checkout does NOT exist yet (the regression's precondition).
+        let gtweb_root = dir.path().join("checkout").join("gtweb");
+        assert!(!gtweb_root.is_dir());
+        let mut gtweb = RigEntry::new("gtweb", "gtweb", &remote_url, "main", 0);
+        gtweb.worktree_root = Some(gtweb_root.clone());
+
+        // Provision: the missing rig is cloned from its git_url, NOT skipped.
+        let provisioned = provision_rig_checkouts(&[gtweb.clone()], "default", dir.path());
+        assert_eq!(provisioned, vec!["gtweb".to_string()]);
+        assert!(
+            gtweb_root.join("package.json").is_file(),
+            "the cloned checkout carries the remote's content"
+        );
+        assert_eq!(
+            origin_of(&gtweb_root),
+            remote_url,
+            "the provisioned checkout's origin is the rig's catalog git_url"
+        );
+
+        // Routing now finds the real checkout (no longer skipped).
+        let base = SpawnTemplate {
+            rig: "gtcore".into(),
+            prefix: "gt".into(),
+            workdir: "/rig-wt/gtcore".into(),
+            command: "claude".into(),
+            args: vec!["--flag".into()],
+            base_env: vec![("GT_ROLE".to_string(), "polecat".to_string())],
+            heartbeat_dir: std::env::temp_dir(),
+        };
+        let wt_root = dir.path().join("wt");
+        let (configs, _paths) =
+            rig_routing_from_catalog(&[gtweb], &base, Some(wt_root.as_path()), "default", dir.path());
+        let cfg = configs.get("gtweb").expect("gtweb now routes");
+        assert_eq!(cfg.template.workdir, gtweb_root);
+
+        // The per-bead worktree, cut off the routed checkout, carries gt-web's origin — NOT gt-core.
+        let worktree = wt_root.join("gt-gtweb-855bac");
+        crate::worktree::provision(&cfg.template.workdir, &worktree, "gtweb-855bac")
+            .expect("worktree provisions off the gtweb checkout");
+        assert_eq!(
+            origin_of(&worktree),
+            remote_url,
+            "a cross-rig bead's worktree clones from the rig's git_url, not GT_RIG_GIT_URL"
+        );
+    }
+
+    #[test]
+    fn provision_rig_checkouts_skips_present_or_urlless_rigs() {
+        // Idempotent: an existing checkout is left untouched; a rig with no git_url can't be cloned.
+        use gt_rig::RigEntry;
+        let dir = tempfile::tempdir().unwrap();
+        let present_root = dir.path().join("present");
+        std::fs::create_dir_all(&present_root).unwrap();
+        let mut present = RigEntry::new("present", "pr", "https://x/present.git", "main", 0);
+        present.worktree_root = Some(present_root.clone());
+
+        let mut urlless = RigEntry::new("urlless", "ul", "", "main", 0);
+        urlless.worktree_root = Some(dir.path().join("never"));
+
+        let provisioned = provision_rig_checkouts(&[present, urlless], "default", dir.path());
+        assert!(
+            provisioned.is_empty(),
+            "present checkout skipped (no clone), urlless rig not cloneable"
+        );
+        assert!(!dir.path().join("never").exists(), "urlless rig left unprovisioned");
     }
 
     #[tokio::test]
