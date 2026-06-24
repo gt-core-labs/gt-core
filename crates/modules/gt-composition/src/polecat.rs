@@ -1360,9 +1360,32 @@ pub fn provision_rig_checkouts(
     provisioned
 }
 
+/// Embed `token` into an `https://host/...` git URL as userinfo (`https://<token>@host/...`) — the
+/// exact form the boot clone's `origin` already carries, so `git push` authenticates with no
+/// credential helper. A URL that is not `https://`, or already carries userinfo before the path
+/// (`...@...`, i.e. already credentialed), is returned UNCHANGED — never double-embed, never touch
+/// `git@`/`ssh://`/local-path remotes.
+fn embed_token_in_url(url: &str, token: &str) -> String {
+    const SCHEME: &str = "https://";
+    if let Some(rest) = url.strip_prefix(SCHEME) {
+        let authority_end = rest.find('/').unwrap_or(rest.len());
+        if !rest[..authority_end].contains('@') {
+            return format!("{SCHEME}{token}@{rest}");
+        }
+    }
+    url.to_string()
+}
+
 /// `git clone [--branch <default_branch>] <git_url> <workdir>` for [`provision_rig_checkouts`].
 /// Creates `workdir`'s parent first so a convention root (`<home>/gastown-wt/<ws>/<name>`) under a
 /// not-yet-existing tree still lands. An empty `git_url` is rejected (nothing to clone from).
+///
+/// The catalog `git_url` is the PLAIN `https://github.com/...` (no token), but the orchd pod has
+/// neither a git credential helper nor a TTY — so a tokenless `origin` makes every polecat push fail
+/// `could not read Username` (gtcore-abfe8a). We embed the rig token ([`crate::gh_auth::rig_token_from_env`])
+/// into the clone URL so the resulting `origin` can push, matching the boot clone's
+/// `https://<token>@github.com/...` remote. The TOKEN-BEARING URL is used only for the `git`
+/// invocation; every log line keeps the plain `git_url`, so the token never reaches stderr.
 fn clone_rig_checkout(
     git_url: &str,
     default_branch: &str,
@@ -1375,13 +1398,17 @@ fn clone_rig_checkout(
     if let Some(parent) = workdir.parent() {
         std::fs::create_dir_all(parent)?;
     }
+    let clone_url = match crate::gh_auth::rig_token_from_env() {
+        Some(tok) => embed_token_in_url(git_url, &tok),
+        None => git_url.to_string(),
+    };
     let mut args: Vec<String> = vec!["clone".to_string()];
     let branch = default_branch.trim();
     if !branch.is_empty() {
         args.push("--branch".to_string());
         args.push(branch.to_string());
     }
-    args.push(git_url.to_string());
+    args.push(clone_url);
     args.push(workdir.display().to_string());
     let status = std::process::Command::new("git").args(&args).status()?;
     if status.success() && workdir.is_dir() {
@@ -2737,6 +2764,29 @@ mod tests {
             "present checkout skipped (no clone), urlless rig not cloneable"
         );
         assert!(!dir.path().join("never").exists(), "urlless rig left unprovisioned");
+    }
+
+    #[test]
+    fn embed_token_in_url_credentialises_https_and_leaves_others_untouched() {
+        // gtcore-abfe8a: a plain https URL gets the token as userinfo (push-capable origin).
+        assert_eq!(
+            embed_token_in_url("https://github.com/gt-core-labs/gt-web.git", "gho_TOKEN"),
+            "https://gho_TOKEN@github.com/gt-core-labs/gt-web.git"
+        );
+        // Already credentialed — never double-embed.
+        assert_eq!(
+            embed_token_in_url("https://gho_OLD@github.com/o/r.git", "gho_NEW"),
+            "https://gho_OLD@github.com/o/r.git"
+        );
+        // Non-https remotes (ssh, local path) are left as-is.
+        assert_eq!(
+            embed_token_in_url("git@github.com:o/r.git", "gho_TOKEN"),
+            "git@github.com:o/r.git"
+        );
+        assert_eq!(
+            embed_token_in_url("/tmp/local-remote", "gho_TOKEN"),
+            "/tmp/local-remote"
+        );
     }
 
     #[tokio::test]
