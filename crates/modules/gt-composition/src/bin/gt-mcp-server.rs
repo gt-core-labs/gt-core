@@ -2915,10 +2915,20 @@ async fn seed_rigs(pg_url: &str) -> anyhow::Result<()> {
 
     // Idempotency gate: never touch a non-empty catalog. A curated prod (or any deploy where an
     // operator already registered a rig) is left untouched — the live `rig.*` surface owns it there.
-    let existing = repo
-        .list()
-        .await
-        .context("rig catalog seed: list existing rigs")?;
+    //
+    // A list failure here is NON-FATAL (gtcore-e07dd0): if `ws_default.rigs` is missing or the schema
+    // is not yet provisioned, this seed must not crashloop the ENTIRE mcp-server (which takes the whole
+    // platform down). The catalog just stays whatever it is; an operator can `rig.add`. Mirrors the
+    // connect-failure skip above.
+    let existing = match repo.list().await {
+        Ok(rigs) => rigs,
+        Err(e) => {
+            eprintln!(
+                "[gt-mcp-server] rig catalog seed skipped (list failed — schema not ready: {e})"
+            );
+            return Ok(());
+        }
+    };
     if !existing.is_empty() {
         eprintln!(
             "[gt-mcp-server] rig catalog seed skipped ({} rig(s) already registered)",
