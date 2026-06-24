@@ -1002,7 +1002,7 @@ async fn main() -> anyhow::Result<()> {
                     let (command, args, base_env, workdir) = mayor_launch;
                     let channel_root = std::env::var("GT_CHANNEL_ROOT")
                         .unwrap_or_else(|_| "/gt/.channels".to_string());
-                    let waker = gt_composition::mayor_dispatch::TmuxMayorWaker::new(
+                    let mut waker = gt_composition::mayor_dispatch::TmuxMayorWaker::new(
                         tmux.clone(),
                         ws_slug.clone(),
                         gt_composition::mayor_dispatch::DEFAULT_MAYOR_PREFIX,
@@ -1012,6 +1012,18 @@ async fn main() -> anyhow::Result<()> {
                         base_env,
                         std::path::PathBuf::from(channel_root),
                     );
+                    // Resolve + validate the mayor's claude account at spawn, exactly like the
+                    // polecat sling (gtcore-559c50): without this the mayor inherits the static
+                    // boot-template CLAUDE_CONFIG_DIR and is born in 401 once that account's creds
+                    // expire. Quota gates rotation off a Limited/Blocked account; the proxy feeds
+                    // its spend into per-call quota truth.
+                    if let Some(kc) = &keychain {
+                        waker = waker.with_keychain(kc.clone());
+                    }
+                    waker = waker.with_quota(quota.clone());
+                    if let Some(url) = &anthropic_proxy_url {
+                        waker = waker.with_anthropic_proxy(url.clone());
+                    }
                     let dispatcher =
                         Arc::new(gt_composition::mayor_dispatch::MayorDispatcher::new(source, waker));
                     mayor_dispatch_task =
