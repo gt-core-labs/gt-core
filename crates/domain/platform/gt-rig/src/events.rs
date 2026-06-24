@@ -83,6 +83,16 @@ pub enum RigEvent {
         new: Vec<String>,
         now_secs: u64,
     },
+    /// The rig's soft VCS-connection ref changed (gtcore-103958). `old`/`new` are the prior and
+    /// new `git_connection_ref` (`None` = unbound, the legacy operator-mounted token path). The
+    /// JIT installation-token mint is a runtime/deploy-edge concern; this event records only the
+    /// orchestrator's binding to a `public.vcs_connections.id`.
+    ConnectionChanged {
+        rig: String,
+        old: Option<String>,
+        new: Option<String>,
+        now_secs: u64,
+    },
 }
 
 impl EventKind for RigEvent {
@@ -95,6 +105,7 @@ impl EventKind for RigEvent {
             RigEvent::DefaultBranchChanged { .. } => "rig.default_branch_changed.v1",
             RigEvent::WorktreeRootChanged { .. } => "rig.worktree_root_changed.v1",
             RigEvent::TagsChanged { .. } => "rig.tags_changed.v1",
+            RigEvent::ConnectionChanged { .. } => "rig.connection_changed.v1",
         }
     }
 }

@@ -290,6 +290,19 @@ impl RigCatalog {
         }
     }
 
+    /// Set (or clear) the soft VCS-connection ref for a rig (gtcore-103958). `new_ref` is the
+    /// `public.vcs_connections.id` to bind, or `None` to clear. Mirrors the actor's mutation so
+    /// the command path and direct messages stay in lockstep.
+    pub fn apply_connection_change(&mut self, name: &str, new_ref: Option<String>) -> bool {
+        match self.rigs.get_mut(name) {
+            Some(entry) => {
+                entry.git_connection_ref = new_ref;
+                true
+            }
+            None => false,
+        }
+    }
+
     /// Snapshot of the catalog as a sorted vector. Cheap clone; used by the actor's
     /// `Snapshot` reply path.
     pub fn snapshot(&self) -> Vec<RigEntry> {
@@ -322,6 +335,8 @@ pub struct RigState {
     pub worktree_root_changes: Vec<(String, Option<PathBuf>, PathBuf)>,
     /// Sequence of `(rig, old_tags, new_tags)` semantic-tag transitions (B3).
     pub tags_changes: Vec<(String, Vec<String>, Vec<String>)>,
+    /// Sequence of `(rig, old_ref, new_ref)` VCS-connection binding transitions (gtcore-103958).
+    pub connection_changes: Vec<(String, Option<String>, Option<String>)>,
 }
 
 impl RigState {
@@ -393,6 +408,13 @@ impl RigState {
                 if let Some(entry) = self.rigs.get_mut(rig) {
                     entry.semantic_tags = new.clone();
                     self.tags_changes
+                        .push((rig.clone(), old.clone(), new.clone()));
+                }
+            }
+            RigEvent::ConnectionChanged { rig, old, new, .. } => {
+                if let Some(entry) = self.rigs.get_mut(rig) {
+                    entry.git_connection_ref = new.clone();
+                    self.connection_changes
                         .push((rig.clone(), old.clone(), new.clone()));
                 }
             }

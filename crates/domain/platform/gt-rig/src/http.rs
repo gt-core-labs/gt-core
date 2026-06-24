@@ -45,7 +45,8 @@ use gt_events::{AppError, Command};
 use gt_workspace::WorkspaceContext;
 
 use crate::commands::{
-    AddRig, AdoptRig, RemoveRig, SetRigDefaultBranch, SetRigPrefix, SetRigTags, SetRigWorktreeRoot,
+    AddRig, AdoptRig, RemoveRig, SetRigConnection, SetRigDefaultBranch, SetRigPrefix, SetRigTags,
+    SetRigWorktreeRoot,
 };
 use crate::repo::RigRepository;
 use crate::state::{RigCatalog, RigEntry, RigReadiness};
@@ -141,6 +142,7 @@ impl RigApiState {
 /// | `POST /:name/set-default-branch` | `rig.set-default-branch` |
 /// | `POST /:name/set-worktree-root`  | `rig.set-worktree-root`  |
 /// | `POST /:name/set-tags`           | `rig.set-tags`           |
+/// | `POST /:name/set-connection`     | `rig.set-connection`     |
 pub fn rig_router(state: RigApiState) -> Router {
     Router::new()
         .route("/", get(list_rigs).post(add_rig))
@@ -151,6 +153,7 @@ pub fn rig_router(state: RigApiState) -> Router {
         .route("/:name/set-default-branch", post(set_default_branch))
         .route("/:name/set-worktree-root", post(set_worktree_root))
         .route("/:name/set-tags", post(set_tags))
+        .route("/:name/set-connection", post(set_connection))
         .with_state(state)
 }
 
@@ -377,6 +380,31 @@ async fn set_tags(
     apply_and_upsert(&*repo, name, &cmd).await
 }
 
+/// `POST /:name/set-connection` — (re)bind or clear a rig's soft VCS-connection ref
+/// (`rig.set-connection`, gtcore-103958). The body carries `git_connection_ref` (a
+/// `public.vcs_connections.id`); omit it or pass `""` to clear. The name always comes from the
+/// path. This is the only API path that sets the binding on an existing rig — `add`/`adopt`
+/// reject a registered name.
+#[cfg_attr(feature = "axum", utoipa::path(
+    post, path = "/{name}/set-connection",
+    params(("name" = String, Path, description = "Rig name")),
+    responses(
+        (status = 200, description = "Connection binding set or cleared"),
+        (status = 422, description = "Validation failed (empty name or no-op)"),
+        (status = 404, description = "No rig with that name"),
+    ),
+))]
+async fn set_connection(
+    State(st): State<RigApiState>,
+    ctx: WorkspaceContext,
+    Path(name): Path<String>,
+    Json(body): Json<Value>,
+) -> Result<Json<Value>, ApiError> {
+    let repo = st.rigs.repo(ctx.workspace().as_str()).await?;
+    let cmd: SetRigConnection = with_path_name(body, name.clone())?;
+    apply_and_upsert(&*repo, name, &cmd).await
+}
+
 /// The combined OpenAPI document for the rig REST surface (`hq-fe-api-platform.2`). The builder
 /// mounts it under the module prefix and rewrites its relative paths to `/api/v1/rig/...`, so
 /// the `#[utoipa::path]` annotations stay prefix-free.
@@ -392,6 +420,7 @@ async fn set_tags(
     set_default_branch,
     set_worktree_root,
     set_tags,
+    set_connection,
 ))]
 pub struct ApiDoc;
 

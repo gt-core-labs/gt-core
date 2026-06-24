@@ -38,8 +38,8 @@ pub use pg::PgRigs;
 
 pub use actor::{spawn, spawn_hydrated, RigHandle, RigMsg};
 pub use commands::{
-    AddRig, AdoptRig, RemoveRig, RigCommand, SetRigDefaultBranch, SetRigPrefix, SetRigTags,
-    SetRigWorktreeRoot,
+    AddRig, AdoptRig, RemoveRig, RigCommand, SetRigConnection, SetRigDefaultBranch, SetRigPrefix,
+    SetRigTags, SetRigWorktreeRoot,
 };
 pub use events::RigEvent;
 #[cfg(feature = "axum")]
