@@ -2424,10 +2424,13 @@ async fn build_domain_router(
             let repo_dir = std::env::var("GT_REPO_DIR")
                 .ok()
                 .map(std::path::PathBuf::from);
-            router.register(Arc::new(DispatchHandler::new(
-                Arc::new(dispatch_dolt),
-                repo_dir,
-            )))
+            let mut handler = DispatchHandler::new(Arc::new(dispatch_dolt), repo_dir);
+            // rig-hold H2 (gtcore-1f5e67): give the probe the per-workspace rig pools so it
+            // excludes held rigs, matching the orchd frontier. Fail-soft without GT_PG_URL.
+            if let Some(pg_url) = std::env::var("GT_PG_URL").ok().filter(|v| !v.is_empty()) {
+                handler = handler.with_held_rigs(Arc::new(WsPools::new(pg_url)));
+            }
+            router.register(Arc::new(handler))
         }
         None => {
             eprintln!("[gt-mcp-server] dispatch.* off — GT_DOLT_URL unset");
