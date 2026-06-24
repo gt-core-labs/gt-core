@@ -23,9 +23,9 @@ use gt_events::Command;
 use gt_mcp_server::{DomainCtx, DomainHandler, WorkspaceRigPrefixes};
 use gt_module::McpTool;
 use gt_rig::{
-    AddRig, AdoptRig, PgRigs, RemoveRig, RigCatalog, RigEntry, RigReadiness, RigRepository,
-    SetRigConnection, SetRigDefaultBranch, SetRigPrefix, SetRigTags, SetRigWorktreeRoot,
-    RESERVED_RIG_NAMES,
+    AddRig, AdoptRig, DispatchMode, HoldRig, PgRigs, RemoveRig, ResumeRig, RigCatalog, RigEntry,
+    RigEvent, RigEventSink, RigReadiness, RigRepository, SetRigConnection, SetRigDefaultBranch,
+    SetRigPrefix, SetRigTags, SetRigWorktreeRoot, RESERVED_RIG_NAMES,
 };
 use gt_store_dolt::AppError;
 
@@ -35,12 +35,81 @@ use super::util::{descriptor, opt, req};
 /// PG-backed handler for the `rig.*` tool namespace.
 pub struct RigHandler {
     pools: Arc<WsPools>,
+    /// Optional observability sink for the dispatch-mode transitions (`rig.held.v1` /
+    /// `rig.resumed.v1`, rig-hold H1). `None` ⇒ emission is a silent no-op (the catalog mutation
+    /// still persists). The server wiring backs it with the per-workspace event log; tests leave it
+    /// `None`.
+    event_sink: Option<Arc<dyn RigEventSink>>,
 }
 
 impl RigHandler {
-    /// Wrap the per-workspace pool cache.
+    /// Wrap the per-workspace pool cache. No event sink — `rig.hold`/`rig.resume` still mutate and
+    /// persist, but emit no audit event (use [`with_event_sink`](Self::with_event_sink) to wire
+    /// one). Keeps the existing single-arg call sites (tests, parity harness) working.
     pub fn new(pools: Arc<WsPools>) -> Self {
-        Self { pools }
+        Self {
+            pools,
+            event_sink: None,
+        }
+    }
+
+    /// Attach the observability sink for dispatch-mode transitions (rig-hold H1). Builder-style so
+    /// the server wiring can opt in (`RigHandler::new(pools).with_event_sink(sink)`).
+    pub fn with_event_sink(mut self, sink: Arc<dyn RigEventSink>) -> Self {
+        self.event_sink = Some(sink);
+        self
+    }
+
+    /// Apply a `rig.hold` / `rig.resume` transition idempotently (rig-hold H1).
+    ///
+    /// `cmd.validate` enforces existence (an absent rig is `NotFound`). The **idempotency gate** is
+    /// here, not in the command: if the rig is already in `target`, this returns `ok` with
+    /// `changed:false` and emits **no** event — so the log never carries a duplicate
+    /// `rig.held.v1` / `rig.resumed.v1`. On a real transition, `cmd.execute` mutates the hydrated
+    /// catalog and produces the event; the touched row is upserted, then the event is emitted to
+    /// the observability sink (best-effort — a sink failure does not fail the committed mutation).
+    async fn apply_dispatch_mode<C>(
+        &self,
+        repo: &PgRigs,
+        workspace: Option<&str>,
+        name: &str,
+        target: DispatchMode,
+        cmd: &C,
+    ) -> Result<Value, AppError>
+    where
+        C: gt_events::Command<State = RigCatalog, Output = RigEvent>,
+    {
+        let mut catalog = hydrate(repo).await?;
+        // Existence check (NotFound for an unknown rig). Idempotency is NOT a validation fault.
+        cmd.validate(&catalog).map_err(ev_err)?;
+        let current = catalog
+            .get(name)
+            .map(|e| e.dispatch_mode)
+            .unwrap_or_default();
+        if current == target {
+            // Already in the target mode: a successful no-op, no row write, no event.
+            return Ok(json!({
+                "ok": true,
+                "rig": name,
+                "dispatch_mode": target.as_str(),
+                "changed": false,
+            }));
+        }
+        let event = cmd.execute(&mut catalog).map_err(ev_err)?;
+        let entry = catalog
+            .get(name)
+            .cloned()
+            .ok_or_else(|| AppError::Other(format!("rig {name} missing after execute")))?;
+        repo.upsert(&entry).await.map_err(ev_err)?;
+        if let Some(sink) = &self.event_sink {
+            sink.emit(workspace, &event);
+        }
+        Ok(json!({
+            "ok": true,
+            "rig": name,
+            "dispatch_mode": target.as_str(),
+            "changed": true,
+        }))
     }
 }
 
@@ -107,6 +176,20 @@ impl DomainHandler for RigHandler {
                 &[req("name", "string"), opt("git_connection_ref", "string")],
             ),
             descriptor(
+                "rig.hold",
+                "Put a rig on dispatch hold (dispatch_mode=hold) so an operator can intervene \
+                 without colliding with the orchestrator. Idempotent: holding an already-held rig \
+                 is a successful no-op. Records rig.held.v1 with the reason.",
+                &[req("name", "string"), opt("reason", "string")],
+            ),
+            descriptor(
+                "rig.resume",
+                "Take a rig off dispatch hold (dispatch_mode=auto), restoring orchestrator \
+                 dispatch + watchdog re-sling. Idempotent: resuming an already-auto rig is a \
+                 successful no-op. Records rig.resumed.v1.",
+                &[req("name", "string")],
+            ),
+            descriptor(
                 "rig.remove",
                 "Remove a rig from the catalog.",
                 &[req("name", "string")],
@@ -165,6 +248,18 @@ impl DomainHandler for RigHandler {
             "rig.set-connection" => {
                 let cmd: SetRigConnection = parse_cmd(ctx.args)?;
                 apply_and_upsert(&repo, cmd.name.clone(), &cmd).await
+            }
+            "rig.hold" => {
+                let cmd: HoldRig = parse_cmd(ctx.args)?;
+                let name = cmd.name.clone();
+                self.apply_dispatch_mode(&repo, ctx.workspace, &name, DispatchMode::Hold, &cmd)
+                    .await
+            }
+            "rig.resume" => {
+                let cmd: ResumeRig = parse_cmd(ctx.args)?;
+                let name = cmd.name.clone();
+                self.apply_dispatch_mode(&repo, ctx.workspace, &name, DispatchMode::Auto, &cmd)
+                    .await
             }
             "rig.remove" => {
                 let cmd: RemoveRig = parse_cmd(ctx.args)?;
@@ -344,6 +439,10 @@ fn entry_json(entry: &RigEntry) -> Value {
         "worktree_root": entry.worktree_root,
         "git_connection_ref": entry.git_connection_ref,
         "semantic_tags": entry.semantic_tags,
+        // rig-hold H1: surface the dispatch mode (auto|hold) inline so `rig.info` / `rig.list`
+        // answer "is this rig paused?" directly — the read the UI badge (H4) and the
+        // scheduler/watchdogs (H2/H3) consume.
+        "dispatch_mode": entry.dispatch_mode.as_str(),
         // hq-29ea8a B2/B3: surface autonomous-operation readiness inline so `rig.info` /
         // `rig.list` answer "is this rig wired for parallel polecats + auto-push?" directly.
         "readiness": readiness_json(&entry.readiness()),
@@ -522,6 +621,65 @@ mod tests {
             json!(["rust", "infra"]),
             "semantic_tags normalised + persisted to PG"
         );
+
+        // rig-hold H1: dispatch_mode defaults to auto, holds, is idempotent, and resumes.
+        let info_default = handler
+            .dispatch("rig.info", ctx(json!({ "name": "dispatchrig" })))
+            .await
+            .unwrap();
+        assert_eq!(
+            info_default["dispatch_mode"], "auto",
+            "a never-held rig defaults to auto"
+        );
+
+        let held = handler
+            .dispatch(
+                "rig.hold",
+                ctx(json!({ "name": "dispatchrig", "reason": "operator intervention" })),
+            )
+            .await
+            .unwrap();
+        assert_eq!(held["changed"], true);
+        assert_eq!(held["dispatch_mode"], "hold");
+        let info_held = handler
+            .dispatch("rig.info", ctx(json!({ "name": "dispatchrig" })))
+            .await
+            .unwrap();
+        assert_eq!(info_held["dispatch_mode"], "hold", "hold persisted to PG");
+
+        // Re-holding is an idempotent no-op: ok, no error, changed:false.
+        let rehold = handler
+            .dispatch("rig.hold", ctx(json!({ "name": "dispatchrig" })))
+            .await
+            .unwrap();
+        assert_eq!(rehold["changed"], false, "re-hold is an idempotent no-op");
+        assert_eq!(rehold["dispatch_mode"], "hold");
+
+        // Holding an unknown rig is NotFound.
+        let ghost = handler
+            .dispatch("rig.hold", ctx(json!({ "name": "ghostrig" })))
+            .await
+            .unwrap_err();
+        assert!(matches!(ghost, AppError::NotFound(_)));
+
+        let resumed = handler
+            .dispatch("rig.resume", ctx(json!({ "name": "dispatchrig" })))
+            .await
+            .unwrap();
+        assert_eq!(resumed["changed"], true);
+        assert_eq!(resumed["dispatch_mode"], "auto");
+        let info_resumed = handler
+            .dispatch("rig.info", ctx(json!({ "name": "dispatchrig" })))
+            .await
+            .unwrap();
+        assert_eq!(info_resumed["dispatch_mode"], "auto", "resume persisted to PG");
+
+        // Re-resuming is likewise an idempotent no-op.
+        let reresume = handler
+            .dispatch("rig.resume", ctx(json!({ "name": "dispatchrig" })))
+            .await
+            .unwrap();
+        assert_eq!(reresume["changed"], false, "re-resume is an idempotent no-op");
 
         // Resolve the rig back from its (changed) prefix.
         let by_prefix = handler

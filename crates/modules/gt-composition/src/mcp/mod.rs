@@ -60,7 +60,7 @@ pub use escalate::EscalateHandler;
 pub use invites::InvitesHandler;
 pub use report::ReportHandler;
 pub use documents::{DocumentsHandler, PgDocumentsResource};
-pub use eventlog::{EventLog, EventLogIssueSink};
+pub use eventlog::{EventLog, EventLogIssueSink, EventLogRigSink};
 pub use graph::{GraphHandler, RigProvisioner};
 pub use memory::MemoryHandler;
 pub use merge::MergeHandler;

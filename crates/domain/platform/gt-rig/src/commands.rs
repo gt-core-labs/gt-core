@@ -16,7 +16,7 @@ use gt_events::{AppError, Command};
 use crate::events::RigEvent;
 use crate::state::{
     normalize_semantic_tags, validate_prefix, validate_rig_name, validate_semantic_tags,
-    validate_worktree_root, RigCatalog, RigEntry,
+    validate_worktree_root, DispatchMode, RigCatalog, RigEntry,
 };
 
 /// Default tenant for a command built without an explicit workspace. The server stamps the
@@ -104,6 +104,9 @@ impl AddRig {
             worktree_root: None,
             git_connection_ref: self.git_connection_ref.clone(),
             semantic_tags: Vec::new(),
+            // A newly-registered rig is dispatchable (back-compat default); the operator holds it
+            // later via rig.hold (rig-hold H1).
+            dispatch_mode: DispatchMode::Auto,
         }
     }
 }
@@ -531,6 +534,89 @@ impl Command for SetRigConnection {
     }
 }
 
+/// Put a rig on dispatch hold (rig-hold H1, epic gtcore-4b7d56). The rig-level sibling of a bead's
+/// `dispatch=manual`: it pauses the dispatch + agent-lifecycle plane so an operator can intervene
+/// without colliding with the orchestrator (the scheduler/watchdogs honouring it is H2/H3).
+///
+/// **Idempotent by contract.** Unlike [`SetRigPrefix`] / [`SetRigTags`], holding an already-held
+/// rig is NOT a validation error — it is a successful no-op. [`Self::validate`] only requires the
+/// rig to exist; the "already in the target mode ⇒ emit nothing" gate lives in the dispatch
+/// handler (it reads the current mode before executing), so the log never carries a duplicate
+/// `rig.held.v1`. [`Self::execute`] assumes a real transition and always returns the event.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct HoldRig {
+    pub name: String,
+    /// Operator's note for the audit trail (carried by `rig.held.v1`). Optional; defaults to empty.
+    #[serde(default)]
+    pub reason: String,
+    pub now_secs: u64,
+    /// Server-injected tenant — see [`AddRig::workspace_id`].
+    #[serde(skip_deserializing, default = "default_workspace")]
+    #[schemars(skip)]
+    pub workspace_id: String,
+}
+
+impl Command for HoldRig {
+    type Output = RigEvent;
+    type State = RigCatalog;
+
+    fn validate(&self, state: &Self::State) -> Result<(), AppError> {
+        if self.name.is_empty() {
+            return Err(AppError::Validation("rig name is empty".into()));
+        }
+        if !state.contains(&self.name) {
+            return Err(AppError::NotFound(format!("rig {:?}", self.name)));
+        }
+        Ok(())
+    }
+
+    fn execute(&self, state: &mut Self::State) -> Result<Self::Output, AppError> {
+        self.validate(state)?;
+        state.apply_dispatch_mode_change(&self.name, DispatchMode::Hold);
+        Ok(RigEvent::Held {
+            rig: self.name.clone(),
+            reason: self.reason.clone(),
+            now_secs: self.now_secs,
+        })
+    }
+}
+
+/// Take a rig off dispatch hold (rig-hold H1). The inverse of [`HoldRig`]; same idempotency
+/// contract — resuming an already-`auto` rig is a successful no-op, not an error.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct ResumeRig {
+    pub name: String,
+    pub now_secs: u64,
+    /// Server-injected tenant — see [`AddRig::workspace_id`].
+    #[serde(skip_deserializing, default = "default_workspace")]
+    #[schemars(skip)]
+    pub workspace_id: String,
+}
+
+impl Command for ResumeRig {
+    type Output = RigEvent;
+    type State = RigCatalog;
+
+    fn validate(&self, state: &Self::State) -> Result<(), AppError> {
+        if self.name.is_empty() {
+            return Err(AppError::Validation("rig name is empty".into()));
+        }
+        if !state.contains(&self.name) {
+            return Err(AppError::NotFound(format!("rig {:?}", self.name)));
+        }
+        Ok(())
+    }
+
+    fn execute(&self, state: &mut Self::State) -> Result<Self::Output, AppError> {
+        self.validate(state)?;
+        state.apply_dispatch_mode_change(&self.name, DispatchMode::Auto);
+        Ok(RigEvent::Resumed {
+            rig: self.name.clone(),
+            now_secs: self.now_secs,
+        })
+    }
+}
+
 /// Sum type so the actor routes any rig command through a single message variant.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(tag = "kind", rename_all = "snake_case")]
@@ -543,6 +629,8 @@ pub enum RigCommand {
     SetWorktreeRoot(SetRigWorktreeRoot),
     SetTags(SetRigTags),
     SetConnection(SetRigConnection),
+    Hold(HoldRig),
+    Resume(ResumeRig),
 }
 
 impl RigCommand {
@@ -557,6 +645,8 @@ impl RigCommand {
             Self::SetWorktreeRoot(_) => "rig.set-worktree-root",
             Self::SetTags(_) => "rig.set-tags",
             Self::SetConnection(_) => "rig.set-connection",
+            Self::Hold(_) => "rig.hold",
+            Self::Resume(_) => "rig.resume",
         }
     }
 
@@ -572,6 +662,8 @@ impl RigCommand {
             Self::SetWorktreeRoot(c) => &c.workspace_id,
             Self::SetTags(c) => &c.workspace_id,
             Self::SetConnection(c) => &c.workspace_id,
+            Self::Hold(c) => &c.workspace_id,
+            Self::Resume(c) => &c.workspace_id,
         }
     }
 
@@ -590,6 +682,8 @@ impl RigCommand {
             Self::SetWorktreeRoot(c) => c.workspace_id = ws,
             Self::SetTags(c) => c.workspace_id = ws,
             Self::SetConnection(c) => c.workspace_id = ws,
+            Self::Hold(c) => c.workspace_id = ws,
+            Self::Resume(c) => c.workspace_id = ws,
         }
         self
     }
@@ -609,6 +703,8 @@ impl Command for RigCommand {
             Self::SetWorktreeRoot(c) => c.validate(state),
             Self::SetTags(c) => c.validate(state),
             Self::SetConnection(c) => c.validate(state),
+            Self::Hold(c) => c.validate(state),
+            Self::Resume(c) => c.validate(state),
         }
     }
 
@@ -622,6 +718,8 @@ impl Command for RigCommand {
             Self::SetWorktreeRoot(c) => c.execute(state),
             Self::SetTags(c) => c.execute(state),
             Self::SetConnection(c) => c.execute(state),
+            Self::Hold(c) => c.execute(state),
+            Self::Resume(c) => c.execute(state),
         }
     }
 }
@@ -954,6 +1052,77 @@ mod tests {
         };
         clear.execute(&mut catalog).unwrap();
         assert!(catalog.get("plane").unwrap().semantic_tags.is_empty());
+    }
+
+    #[test]
+    fn hold_and_resume_transition_and_reject_unknown_rig() {
+        let mut catalog = RigCatalog::default();
+        add_cmd("plane", "pl", 1).execute(&mut catalog).unwrap();
+        assert_eq!(catalog.get("plane").unwrap().dispatch_mode, DispatchMode::Auto);
+
+        // Unknown rig is a NotFound for both.
+        let ghost_hold = HoldRig {
+            name: "ghost".into(),
+            reason: "x".into(),
+            now_secs: 2,
+            workspace_id: "default".into(),
+        };
+        assert!(matches!(ghost_hold.validate(&catalog), Err(AppError::NotFound(_))));
+        let ghost_resume = ResumeRig {
+            name: "ghost".into(),
+            now_secs: 2,
+            workspace_id: "default".into(),
+        };
+        assert!(matches!(ghost_resume.validate(&catalog), Err(AppError::NotFound(_))));
+
+        // Hold flips to Hold and carries the reason in the event.
+        let hold = HoldRig {
+            name: "plane".into(),
+            reason: "operator intervention".into(),
+            now_secs: 3,
+            workspace_id: "default".into(),
+        };
+        match hold.execute(&mut catalog).unwrap() {
+            RigEvent::Held { rig, reason, .. } => {
+                assert_eq!(rig, "plane");
+                assert_eq!(reason, "operator intervention");
+            }
+            _ => panic!("expected Held"),
+        }
+        assert_eq!(catalog.get("plane").unwrap().dispatch_mode, DispatchMode::Hold);
+
+        // Holding again is NOT a validation error (idempotent contract — the no-event gate is in
+        // the handler, not here).
+        assert!(hold.validate(&catalog).is_ok(), "re-hold is not an error");
+
+        // Resume flips back to Auto.
+        let resume = ResumeRig {
+            name: "plane".into(),
+            now_secs: 4,
+            workspace_id: "default".into(),
+        };
+        assert!(matches!(resume.execute(&mut catalog).unwrap(), RigEvent::Resumed { .. }));
+        assert_eq!(catalog.get("plane").unwrap().dispatch_mode, DispatchMode::Auto);
+        assert!(resume.validate(&catalog).is_ok(), "re-resume is not an error");
+    }
+
+    #[test]
+    fn hold_tool_names_route_through_sum_type() {
+        let hold = RigCommand::Hold(HoldRig {
+            name: "plane".into(),
+            reason: String::new(),
+            now_secs: 1,
+            workspace_id: "default".into(),
+        });
+        assert_eq!(hold.tool_name(), "rig.hold");
+        let resume = RigCommand::Resume(ResumeRig {
+            name: "plane".into(),
+            now_secs: 1,
+            workspace_id: "default".into(),
+        });
+        assert_eq!(resume.tool_name(), "rig.resume");
+        // workspace_id stamping works through the sum type.
+        assert_eq!(hold.in_workspace("acme").workspace_id(), "acme");
     }
 
     #[test]

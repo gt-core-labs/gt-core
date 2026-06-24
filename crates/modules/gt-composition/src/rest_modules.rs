@@ -46,8 +46,8 @@ use gt_workspace::{PgWorkspaces, WorkspaceApiState, WorkspaceModule};
 
 use crate::mcp::{
     CompositionTenantProvisioner, EventLog, EventLogAgentEvents, EventLogConvoy, EventLogFeed,
-    EventLogGraph, EventLogMerges, EventLogQuota, EventLogSkills, FsAccountCatalog, GraphHandler,
-    GraphHandlerRefresher, RigProvisioner, WsPoolRigs, WsPools,
+    EventLogGraph, EventLogMerges, EventLogQuota, EventLogRigSink, EventLogSkills, FsAccountCatalog,
+    GraphHandler, GraphHandlerRefresher, RigProvisioner, WsPoolRigs, WsPools,
 };
 
 /// The Postgres-gated slice of the REST module set (workspace / rig / connection /
@@ -315,9 +315,14 @@ pub async fn build_rest_modules(
                     )),
                 ),
             ))
-            .module(RigsModule::with_http(RigApiState::new(Arc::new(
-                WsPoolRigs::new(Arc::new(WsPools::new(pg_url.clone()))),
-            ))))
+            // rig-hold H1: the REST hold/resume routes emit `rig.held.v1` / `rig.resumed.v1` to the
+            // same event log the MCP handler uses, so the transition is auditable across transports.
+            .module(RigsModule::with_http(
+                RigApiState::new(Arc::new(WsPoolRigs::new(Arc::new(WsPools::new(
+                    pg_url.clone(),
+                )))))
+                .with_event_sink(Arc::new(EventLogRigSink::new(event_log.clone()))),
+            ))
             // connection.*: per-workspace VCS connections over the GLOBAL
             // `public.vcs_connections` table, + the GitHub App install flow when
             // an App is configured.
