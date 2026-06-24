@@ -82,6 +82,34 @@ impl RigsModule {
     pub fn with_http(state: crate::http::RigApiState) -> RigsHttpModule {
         RigsHttpModule { http: state }
     }
+
+    /// The full, idempotent DDL that converges the `ws_default` rigs TEMPLATE to the current
+    /// schema from ANY prior state — a missing table, or a table holding only a subset of the
+    /// follow-on columns. It is the concatenation of every rig migration's SQL; each statement is
+    /// `CREATE …/ALTER … IF NOT EXISTS`, so replaying them all in order is a safe self-heal,
+    /// mirroring the `events`/`dispatch` `ensure_schema` belt-and-suspenders (gtcore-a80f74).
+    ///
+    /// Why this exists, given the migrations are already idempotent: the migration tracking table
+    /// (`_gt_schema_migrations`) lives in the shared `public` schema and SURVIVES a
+    /// `DROP SCHEMA ws_default CASCADE` (e.g. the tenant-reprovision / data-wipe path). After such a
+    /// drop the loader still sees `create_rigs` recorded as applied and SKIPS it, so the dropped
+    /// `ws_default.rigs` is never recreated — then the next *pending* follow-on migration
+    /// (`ALTER TABLE ws_default.rigs ADD COLUMN …`) aborts boot with `relation "ws_default.rigs"
+    /// does not exist`, crashlooping the whole gt-mcp-server. Replaying this idempotent DDL
+    /// UNCONDITIONALLY before `gt_module_migrate::apply` guarantees the template table is present
+    /// and complete, so both the pending ALTERs and the runtime `rig.list`/`rig.info` reads
+    /// always find it — independent of what the tracking table claims.
+    ///
+    /// The DDL is derived from [`migrations`](GtModule::migrations) so the self-heal can never
+    /// drift from the migration history: it is exactly the same statements, in the same order.
+    pub fn template_ensure_sql() -> String {
+        RigsModule
+            .migrations()
+            .iter()
+            .map(|m| m.sql.as_str())
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
 }
 
 /// The HTTP-enabled rig module (`hq-fe-api-platform.2`): the same `GtModule` contract as
@@ -413,6 +441,37 @@ mod tests {
                 .contains("CREATE SCHEMA IF NOT EXISTS ws_default"),
             "must bootstrap the template schema it populates",
         );
+    }
+
+    #[test]
+    fn template_ensure_sql_is_the_complete_idempotent_superset() {
+        // The boot-time self-heal (gtcore-a80f74) must converge a missing-or-partial
+        // `ws_default.rigs` to the current schema. It bootstraps the schema + table and (re)adds
+        // every follow-on column, all `IF NOT EXISTS`, so replaying it against any prior state is
+        // safe and lands the full schema.
+        let ddl = RigsModule::template_ensure_sql();
+        assert!(ddl.contains("CREATE SCHEMA IF NOT EXISTS ws_default"));
+        assert!(ddl.contains("CREATE TABLE IF NOT EXISTS ws_default.rigs"));
+        for col in [
+            "worktree_root",
+            "git_connection_ref",
+            "semantic_tags",
+            "dispatch_mode",
+        ] {
+            assert!(
+                ddl.contains(&format!("ADD COLUMN IF NOT EXISTS {col}")),
+                "ensure DDL must re-add the {col} column",
+            );
+        }
+        // Derived from `migrations()` so it can never drift from the migration history: it is
+        // exactly the migration SQLs, in order, joined.
+        let joined = RigsModule
+            .migrations()
+            .iter()
+            .map(|m| m.sql.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert_eq!(ddl, joined);
     }
 
     #[test]
