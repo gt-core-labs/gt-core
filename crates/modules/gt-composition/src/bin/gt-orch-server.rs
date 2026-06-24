@@ -634,6 +634,24 @@ async fn main() -> anyhow::Result<()> {
     // Only a positive ¬slingable verdict drops; an unknown bead or a query error is treated as
     // slingable and falls through to the normal re-sling path. Env-gated on GT_DOLT_URL — without it
     // the guard is off and dead polecats re-sling as before.
+    //
+    // rig-hold H3 (gtcore-9a84e6): the held-rigs source, SHARED by the dead-polecat re-sling guard
+    // (this closure) and the supervisor plugin's crash/CI-failure re-sling (`with_held_rigs` below) —
+    // a `rig.hold` pauses the watchdogs too, else they restart exactly the work H2's hold paused.
+    // Fail-soft: no GT_PG_URL ⇒ no rig is ever held (pre-feature behaviour).
+    let held_rigs_source: Option<Arc<dyn gt_composition::auto_dispatch::HeldRigs>> =
+        match std::env::var("GT_PG_URL").ok().filter(|v| !v.is_empty()) {
+            Some(pg_url) => match gt_store_pg::WorkspacePool::connect(&pg_url, &ws_slug).await {
+                Ok(pool) => Some(Arc::new(gt_composition::auto_dispatch::CatalogHeldRigs::new(
+                    gt_rig::PgRigs::new(pool.pool().clone()),
+                )) as Arc<dyn gt_composition::auto_dispatch::HeldRigs>),
+                Err(e) => {
+                    eprintln!("[gt-orch-server] rig-hold (watchdogs) OFF — held-rigs pool connect failed: {e}");
+                    None
+                }
+            },
+            None => None,
+        };
     match std::env::var("GT_DOLT_URL")
         .ok()
         .filter(|v| !v.is_empty())
@@ -642,12 +660,18 @@ async fn main() -> anyhow::Result<()> {
         Some(store) => {
             let store = Arc::new(store);
             let handle = tokio::runtime::Handle::current();
+            let held_for_guard = held_rigs_source.clone();
             supervisor.set_bead_slingable(Box::new(move |bead: &str| {
                 let store = store.clone();
                 let bead = bead.to_string();
-                handle.block_on(
-                    async move { gt_composition::polecat::bead_should_sling(&store, &bead).await },
-                )
+                let held_for_guard = held_for_guard.clone();
+                handle.block_on(async move {
+                    let held = match &held_for_guard {
+                        Some(s) => s.held().await,
+                        None => std::collections::HashSet::new(),
+                    };
+                    gt_composition::polecat::bead_should_sling(&store, &bead, &held).await
+                })
             }));
             eprintln!("[gt-orch-server] slingability re-sling guard armed (Dolt-backed: closed/epic/manual dropped)");
         }
@@ -751,6 +775,15 @@ async fn main() -> anyhow::Result<()> {
     // the same pattern terminal.rs uses for interactive sessions.
     let knowledge_log = Arc::new(EventLog::new(Some(event_root_for_polecat)));
     pol_plugin = pol_plugin.with_event_log(knowledge_log.clone());
+    // rig-hold H3 (gtcore-9a84e6): the supervisor plugin's crash re-sling (boot re-hydration /
+    // stale dispatch) and CI-failure re-sling (sheriff) skip a bead whose rig is on hold — reusing
+    // the same source the dead-polecat guard above uses.
+    if let Some(source) = held_rigs_source.clone() {
+        pol_plugin = pol_plugin.with_held_rigs(source);
+        eprintln!(
+            "[gt-orch-server] rig-hold watchdog guard on — supervisor skips re-sling of held rigs (crash + CI-failure)"
+        );
+    }
     eprintln!("[gt-orch-server] Knowledge role prompt on — polecat CLAUDE.md from skills.* log");
     // Dolt issues store for the polecat sling → working transition + bead auto-close. Resolved
     // once and shared across both plugins. Env-gated on GT_DOLT_URL — without it the bead stays
