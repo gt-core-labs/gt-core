@@ -27,6 +27,7 @@ use async_trait::async_trait;
 use tokio::sync::broadcast;
 
 use gt_agent::{AgentEvent, SessionRole};
+use crate::auto_dispatch::HeldRigs;
 use gt_auth::{JwtClaims, JwtMinter};
 use gt_eventlog::EventRecord;
 use gt_events::{AppError, Envelope};
@@ -59,7 +60,15 @@ use crate::polecat_event::PolecatEvent;
 /// unknown bead or any read error is treated as SLINGABLE (permissive) so a transient Dolt hiccup
 /// never silently abandons live work — the same conservative degradation as the closed-bead guard
 /// this generalizes.
-pub async fn bead_should_sling(issues: &DoltIssues, bead: &str) -> bool {
+///
+/// `held_rigs` (rig-hold H3, gtcore-9a84e6) are the rig names on dispatch hold: a bead whose rig is
+/// in this set is NOT slingable, so the supervisor's dead-polecat / boot re-hydration re-sling honours
+/// a `rig.hold` instead of restarting what the hold paused. Pass an empty set to disable the gate.
+pub async fn bead_should_sling(
+    issues: &DoltIssues,
+    bead: &str,
+    held_rigs: &HashSet<String>,
+) -> bool {
     let detail = match issues.get_detail(bead).await {
         Ok(Some(d)) => d,
         Ok(None) => return true, // unknown bead → permissive (sling)
@@ -70,6 +79,14 @@ pub async fn bead_should_sling(issues: &DoltIssues, bead: &str) -> bool {
             return true;
         }
     };
+    // rig-hold H3: a held rig pauses the watchdogs too — never re-sling its beads.
+    if held_rigs.contains(detail.rig.trim()) {
+        eprintln!(
+            "[polecat] re-sling skipped for {bead}: rig '{}' on dispatch hold",
+            detail.rig
+        );
+        return false;
+    }
     // Unscoped maps (empty rig + ws) — an ancestor epic may live outside any one rig/workspace,
     // exactly the inputs `resolve_dispatch` expects. A map read error degrades to an empty map,
     // which resolves to the bead's own dispatch value (or Manual) — never a panic.
@@ -244,6 +261,12 @@ pub struct PolecatSupervisorPlugin {
     /// `GT_CI_MAX_RETRIES`). After this many failed attempts the bead is abandoned with an alert
     /// rather than re-slung again — the "no infinite loop" half of the AC.
     ci_max_retries: u32,
+    /// Rigs on dispatch hold (rig-hold H3, gtcore-9a84e6). When set, the supervisor's re-sling
+    /// paths (the dead-polecat crash re-sling and the CI-failure re-sling) skip a bead whose rig is
+    /// held — a `rig.hold` pauses the watchdogs too, else they would restart exactly the work the
+    /// hold paused (H2 stops new dispatch; H3 stops the re-sling behind it). In-flight polecats are
+    /// untouched. `None` ⇒ no rig is ever treated as held (pre-feature behaviour).
+    held_rigs: Option<Arc<dyn HeldRigs>>,
 }
 
 /// Default CI-failure retry cap when `GT_CI_MAX_RETRIES` is unset (gtcore-3a1bd4): three automated
@@ -283,6 +306,42 @@ impl PolecatSupervisorPlugin {
             sched: None,
             ci_retries: Arc::new(Mutex::new(HashMap::new())),
             ci_max_retries: DEFAULT_CI_MAX_RETRIES,
+            held_rigs: None,
+        }
+    }
+
+    /// Wire the rig-hold source (rig-hold H3, gtcore-9a84e6) so the supervisor's re-sling paths skip
+    /// a bead whose rig is on `hold`. Absent ⇒ no rig is ever held (pre-feature behaviour).
+    pub fn with_held_rigs(mut self, source: Arc<dyn HeldRigs>) -> Self {
+        self.held_rigs = Some(source);
+        self
+    }
+
+    /// The rigs currently on dispatch hold (empty when no source is wired). Fetched per use so a
+    /// `rig.hold`/`rig.resume` takes effect on the next event with no daemon restart; fail-open via
+    /// the source itself.
+    async fn held_rigs_set(&self) -> HashSet<String> {
+        match &self.held_rigs {
+            Some(source) => source.held().await,
+            None => HashSet::new(),
+        }
+    }
+
+    /// Whether `bead`'s rig is on dispatch hold (rig-hold H3, gtcore-9a84e6) — the gate the
+    /// sheriff/CI-failure re-sling consults before re-slinging. Fail-open to `false` (no issues
+    /// handle, no holds wired, or a read fault never blocks recovery), the same conservative
+    /// degradation as [`bead_should_sling`].
+    async fn rig_on_hold(&self, bead: &str) -> bool {
+        let Some(issues) = &self.issues else {
+            return false;
+        };
+        let held = self.held_rigs_set().await;
+        if held.is_empty() {
+            return false;
+        }
+        match issues.get_detail(bead).await {
+            Ok(Some(d)) => held.contains(d.rig.trim()),
+            _ => false,
         }
     }
 
@@ -685,9 +744,10 @@ impl Plugin for PolecatSupervisorPlugin {
                 // claiming the pool. No issues handle ⇒ the gate is permissive (legacy: every
                 // dispatch slings), matching the rest of the sling path's degradation.
                 if let Some(issues) = &self.issues {
-                    if !bead_should_sling(issues, &bead).await {
+                    let held = self.held_rigs_set().await;
+                    if !bead_should_sling(issues, &bead, &held).await {
                         eprintln!(
-                            "[polecat] sling skipped for {bead}: not slingable (closed/epic/manual) — boot re-hydration / stale dispatch"
+                            "[polecat] sling skipped for {bead}: not slingable (closed/epic/manual/rig-on-hold) — boot re-hydration / stale dispatch"
                         );
                         if let Some(sched) = &self.sched {
                             sched.capacity_freed().await;
@@ -1141,6 +1201,17 @@ impl Plugin for PolecatSupervisorPlugin {
                 let MergeEvent::Failed { bead, reason } = record.decode::<MergeEvent>()? else {
                     return Ok(());
                 };
+                // rig-hold H3 (gtcore-9a84e6): a held rig pauses the watchdogs too — the sheriff /
+                // CI-failure recovery does NOT re-sling a held rig's bead (the `merge.failed.v1`
+                // alert + observation still stand; the bead simply isn't auto-re-dispatched until the
+                // rig resumes). Guard BEFORE counting the attempt so a hold never burns the retry
+                // budget.
+                if self.rig_on_hold(&bead).await {
+                    eprintln!(
+                        "[polecat] CI-failure re-sling skipped for {bead}: rig on dispatch hold (rig-hold H3)"
+                    );
+                    return Ok(());
+                }
                 // Count this failure as one attempt against the bead's budget.
                 let attempt = {
                     let mut tally = self.ci_retries.lock().expect("ci_retries mutex");

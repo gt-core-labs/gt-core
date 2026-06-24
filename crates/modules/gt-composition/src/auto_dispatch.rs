@@ -265,3 +265,29 @@ where
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use gt_rig::{InMemoryRigs, RigEntry};
+
+    #[tokio::test]
+    async fn catalog_held_rigs_reports_only_rigs_in_dispatch_hold() {
+        // rig-hold H2/H3: the held-rigs source the frontier (H2) and the supervisor watchdogs (H3)
+        // both consume. A rig with dispatch_mode=Hold is reported; an auto rig (the default) is not.
+        let catalog = InMemoryRigs::default();
+        let mut held = RigEntry::new("gtcore", "gtcore", "https://x/gtcore.git", "main", 0);
+        held.dispatch_mode = DispatchMode::Hold;
+        let auto = RigEntry::new("gtweb", "gtweb", "https://x/gtweb.git", "main", 0); // default Auto
+        catalog.upsert(&held).await.unwrap();
+        catalog.upsert(&auto).await.unwrap();
+
+        let source = CatalogHeldRigs::new(catalog);
+        let held_set = source.held().await;
+        assert_eq!(
+            held_set,
+            ["gtcore".to_string()].into_iter().collect::<HashSet<_>>(),
+            "only the rig on hold is reported; the auto rig is omitted"
+        );
+    }
+}
