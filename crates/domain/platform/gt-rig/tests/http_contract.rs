@@ -190,6 +190,51 @@ async fn set_branch_and_worktree_root_persist() {
 }
 
 #[tokio::test]
+async fn hold_and_resume_toggle_dispatch_mode_idempotently() {
+    // rig-hold H1: a freshly-added rig defaults to dispatch_mode=auto; hold flips it to hold and
+    // resume back, each idempotent (a no-op transition returns 200 changed:false, not an error).
+    let app = router();
+    send(&app, post_in("acme", "/", add_body("plane", "pl"))).await;
+
+    let (_, info) = send(&app, get_in("acme", "/plane")).await;
+    assert_eq!(info["dispatch_mode"], "auto", "default dispatch mode is auto");
+
+    // Hold with a reason → 200, changed, dispatch_mode=hold, persisted.
+    let (status, held) = send(
+        &app,
+        post_in("acme", "/plane/hold", json!({ "reason": "operator intervention" })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(held["changed"], true);
+    assert_eq!(held["dispatch_mode"], "hold");
+    let (_, info) = send(&app, get_in("acme", "/plane")).await;
+    assert_eq!(info["dispatch_mode"], "hold", "hold persisted");
+
+    // Re-hold is an idempotent no-op (changed:false), still 200.
+    let (status, rehold) = send(&app, post_in("acme", "/plane/hold", json!({}))).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(rehold["changed"], false, "re-hold is an idempotent no-op");
+
+    // Holding an unknown rig is a 404.
+    let (status, _) = send(&app, post_in("acme", "/ghost/hold", json!({}))).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+
+    // Resume → 200, changed, back to auto.
+    let (status, resumed) = send(&app, post_in("acme", "/plane/resume", json!({}))).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(resumed["changed"], true);
+    assert_eq!(resumed["dispatch_mode"], "auto");
+    let (_, info) = send(&app, get_in("acme", "/plane")).await;
+    assert_eq!(info["dispatch_mode"], "auto", "resume persisted");
+
+    // Re-resume is likewise an idempotent no-op.
+    let (status, reresume) = send(&app, post_in("acme", "/plane/resume", json!({}))).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(reresume["changed"], false, "re-resume is an idempotent no-op");
+}
+
+#[tokio::test]
 async fn delete_removes_then_404() {
     let app = router();
     send(&app, post_in("acme", "/", add_body("plane", "pl"))).await;

@@ -31,6 +31,53 @@ pub const MAX_SEMANTIC_TAGS: usize = 16;
 /// (`rust`, `frontend`, `infra`), not sentences.
 pub const MAX_SEMANTIC_TAG_LEN: usize = 32;
 
+/// Per-rig dispatch mode (rig-hold H1, epic gtcore-4b7d56). The rig-level sibling of a bead's
+/// `dispatch=auto|manual`: it governs only the **dispatch + agent-lifecycle** plane.
+///
+/// - [`Auto`](DispatchMode::Auto) (the default — every pre-feature rig resolves here, back-compat):
+///   the orchestrator may delegate the rig's ready beads and the watchdogs may re-sling its
+///   polecats, exactly as today.
+/// - [`Hold`](DispatchMode::Hold): the operator has paused the rig so they can intervene without
+///   colliding with the orchestrator. H2/H3 teach the scheduler and the witness/sheriff to respect
+///   it; **this task (H1) only carries the state, the API, and the observability** — it changes no
+///   scheduler or watchdog behaviour.
+///
+/// Out of scope by design (`rig-hold-mechanism-design`): the deploy reconciler (namespace plane,
+/// already has a cronjob suspend) and the refinery/merge queue (branch plane). Mixing those into
+/// the hold would muddy the semantics.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum DispatchMode {
+    /// Orchestrator dispatch + watchdog re-sling are active for the rig (default, back-compat).
+    #[default]
+    Auto,
+    /// The rig is paused: H2/H3 will stop the scheduler delegating its beads and the watchdogs
+    /// re-slinging its polecats. In-flight work drains; live agents are not killed.
+    Hold,
+}
+
+impl DispatchMode {
+    /// Stable wire/DB token (`"auto"` / `"hold"`). Matches the lowercase serde rename so the
+    /// JSON and the `dispatch_mode` TEXT column carry the same string.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            DispatchMode::Auto => "auto",
+            DispatchMode::Hold => "hold",
+        }
+    }
+
+    /// Resolve the stored token back to a mode. `"hold"` ⇒ [`Hold`](DispatchMode::Hold); ANY other
+    /// value — including a legacy `NULL`/empty column or an unrecognised string — resolves to
+    /// [`Auto`](DispatchMode::Auto), the back-compat default a never-touched rig carries.
+    pub fn from_db(s: &str) -> Self {
+        if s.eq_ignore_ascii_case("hold") {
+            DispatchMode::Hold
+        } else {
+            DispatchMode::Auto
+        }
+    }
+}
+
 /// A rig entry in the catalog. Identity is `name`; the rest is what the orchestrator needs
 /// to route work and reason about the rig's git topology. Mirrors the orchestrator-relevant
 /// subset of Go `RigConfig` (drops filesystem-only fields like `local_repo`, polecat pool
@@ -67,6 +114,12 @@ pub struct RigEntry {
     /// exactly as before.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub semantic_tags: Vec<String>,
+    /// Orchestrator dispatch mode for the rig (rig-hold H1, epic gtcore-4b7d56). `#[serde(default)]`
+    /// makes a pre-feature entry (and any event/seed logged before this field existed) read back as
+    /// [`DispatchMode::Auto`] — a never-held rig behaves exactly as before. `rig.hold`/`rig.resume`
+    /// flip it; the scheduler/watchdogs reading it to gate work is H2/H3, not this task.
+    #[serde(default)]
+    pub dispatch_mode: DispatchMode,
 }
 
 impl RigEntry {
@@ -88,6 +141,7 @@ impl RigEntry {
             worktree_root: None,
             git_connection_ref: None,
             semantic_tags: Vec::new(),
+            dispatch_mode: DispatchMode::Auto,
         }
     }
 
@@ -303,6 +357,20 @@ impl RigCatalog {
         }
     }
 
+    /// Set the dispatch mode for a rig (rig-hold H1). Mirrors the actor's mutation so the command
+    /// path and direct messages stay in lockstep. Idempotent at the catalog level: re-applying the
+    /// current mode is a harmless overwrite (the no-event idempotency gate lives one layer up, in
+    /// the command/handler, so a no-op never emits `rig.held`/`rig.resumed`).
+    pub fn apply_dispatch_mode_change(&mut self, name: &str, mode: DispatchMode) -> bool {
+        match self.rigs.get_mut(name) {
+            Some(entry) => {
+                entry.dispatch_mode = mode;
+                true
+            }
+            None => false,
+        }
+    }
+
     /// Snapshot of the catalog as a sorted vector. Cheap clone; used by the actor's
     /// `Snapshot` reply path.
     pub fn snapshot(&self) -> Vec<RigEntry> {
@@ -337,6 +405,10 @@ pub struct RigState {
     pub tags_changes: Vec<(String, Vec<String>, Vec<String>)>,
     /// Sequence of `(rig, old_ref, new_ref)` VCS-connection binding transitions (gtcore-103958).
     pub connection_changes: Vec<(String, Option<String>, Option<String>)>,
+    /// Sequence of `(rig, mode, reason)` dispatch-mode transitions (rig-hold H1). `reason` is the
+    /// operator's note carried by `rig.held.v1` (empty for a `rig.resumed.v1`). Observable history
+    /// only — the catalog rebuild reads `rigs`, not this vector.
+    pub dispatch_mode_changes: Vec<(String, DispatchMode, String)>,
 }
 
 impl RigState {
@@ -375,6 +447,7 @@ impl RigState {
                         worktree_root: None,
                         git_connection_ref: git_connection_ref.clone(),
                         semantic_tags: Vec::new(),
+                        dispatch_mode: DispatchMode::Auto,
                     },
                 );
             }
@@ -416,6 +489,20 @@ impl RigState {
                     entry.git_connection_ref = new.clone();
                     self.connection_changes
                         .push((rig.clone(), old.clone(), new.clone()));
+                }
+            }
+            RigEvent::Held { rig, reason, .. } => {
+                if let Some(entry) = self.rigs.get_mut(rig) {
+                    entry.dispatch_mode = DispatchMode::Hold;
+                    self.dispatch_mode_changes
+                        .push((rig.clone(), DispatchMode::Hold, reason.clone()));
+                }
+            }
+            RigEvent::Resumed { rig, .. } => {
+                if let Some(entry) = self.rigs.get_mut(rig) {
+                    entry.dispatch_mode = DispatchMode::Auto;
+                    self.dispatch_mode_changes
+                        .push((rig.clone(), DispatchMode::Auto, String::new()));
                 }
             }
         }
@@ -858,6 +945,86 @@ mod tests {
         assert!(!r.has_push_url);
         assert_eq!(r.gaps.len(), 2, "both blank git_url and push_url are gaps");
         assert!(!r.ready());
+    }
+
+    #[test]
+    fn dispatch_mode_defaults_to_auto_and_round_trips_through_state() {
+        // Back-compat: a freshly-added rig resolves to Auto (the never-held default).
+        let mut catalog = RigCatalog::default();
+        catalog.apply_add(RigEntry::new(
+            "plane",
+            "pl",
+            "git@github.com:o/plane.git",
+            "main",
+            1,
+        ));
+        assert_eq!(
+            catalog.get("plane").unwrap().dispatch_mode,
+            DispatchMode::Auto,
+            "default dispatch mode is auto"
+        );
+
+        // Hold then resume flips the stored mode; an absent rig is a no-op.
+        assert!(catalog.apply_dispatch_mode_change("plane", DispatchMode::Hold));
+        assert_eq!(catalog.get("plane").unwrap().dispatch_mode, DispatchMode::Hold);
+        assert!(!catalog.apply_dispatch_mode_change("ghost", DispatchMode::Hold));
+
+        // Replay gate: Added → Held → Resumed rebuilds a catalog whose mode matches a live
+        // Add → hold → resume sequence (back to Auto).
+        let mut live = RigCatalog::default();
+        live.apply_add(RigEntry::new("plane", "pl", "git@github.com:o/plane.git", "main", 1));
+        live.apply_dispatch_mode_change("plane", DispatchMode::Hold);
+        live.apply_dispatch_mode_change("plane", DispatchMode::Auto);
+
+        let mut state = RigState::default();
+        state.apply(&RigEvent::Added {
+            rig: "plane".into(),
+            prefix: "pl".into(),
+            git_url: "git@github.com:o/plane.git".into(),
+            push_url: None,
+            upstream_url: None,
+            default_branch: "main".into(),
+            git_connection_ref: None,
+            now_secs: 1,
+        });
+        state.apply(&RigEvent::Held {
+            rig: "plane".into(),
+            reason: "operator intervention".into(),
+            now_secs: 2,
+        });
+        state.apply(&RigEvent::Resumed {
+            rig: "plane".into(),
+            now_secs: 3,
+        });
+        assert_eq!(
+            state.dispatch_mode_changes,
+            vec![
+                ("plane".to_string(), DispatchMode::Hold, "operator intervention".to_string()),
+                ("plane".to_string(), DispatchMode::Auto, String::new()),
+            ]
+        );
+        let rebuilt = RigCatalog::from_state(&state);
+        assert_eq!(rebuilt, live);
+        assert_eq!(
+            rebuilt.get("plane").unwrap().dispatch_mode,
+            DispatchMode::Auto
+        );
+    }
+
+    #[test]
+    fn dispatch_mode_serializes_as_lowercase_token() {
+        assert_eq!(DispatchMode::Auto.as_str(), "auto");
+        assert_eq!(DispatchMode::Hold.as_str(), "hold");
+        assert_eq!(DispatchMode::from_db("hold"), DispatchMode::Hold);
+        assert_eq!(DispatchMode::from_db("HOLD"), DispatchMode::Hold);
+        // Any other value (legacy NULL/empty, unknown string) resolves to the Auto default.
+        assert_eq!(DispatchMode::from_db("auto"), DispatchMode::Auto);
+        assert_eq!(DispatchMode::from_db(""), DispatchMode::Auto);
+        assert_eq!(DispatchMode::from_db("banana"), DispatchMode::Auto);
+        assert_eq!(
+            serde_json::to_value(DispatchMode::Hold).unwrap(),
+            serde_json::json!("hold")
+        );
     }
 
     #[test]

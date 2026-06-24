@@ -155,6 +155,8 @@ fn parity_map(ns: &str) -> Vec<Route> {
                 "/{name}/set-connection",
                 Some("rig.set-connection"),
             ),
+            rt("POST", "/{name}/hold", Some("rig.hold")),
+            rt("POST", "/{name}/resume", Some("rig.resume")),
         ],
         "documents" => vec![
             rt("POST", "/", Some("documents.attach.execute")),

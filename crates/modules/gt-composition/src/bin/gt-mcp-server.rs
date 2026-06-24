@@ -61,7 +61,7 @@ use gt_composition::kanban_rest::{kanban_rest_router, KanbanRestState};
 use gt_composition::notifications::{notifications_router, NotificationsApiState};
 use gt_composition::mcp::{
     A2aDelegateHandler, AgentHandler, AnalyticsHandler, AuditHandler, CommentsHandler, ConvoyHandler, CrossWsGrants, DispatchHandler, DocumentsHandler, DomainCatalogHandler, EmailHandler, EscalateHandler, EventLog, EventLogHooks,
-    EventLogIssueSink, GraphHandler, IdentityDoltMeStats, InvitesHandler, MemoryHandler, MergeHandler, NotifyHandler, ReportHandler,
+    EventLogIssueSink, EventLogRigSink, GraphHandler, IdentityDoltMeStats, InvitesHandler, MemoryHandler, MergeHandler, NotifyHandler, ReportHandler,
     PgDocumentsResource, PgRigPrefixes, PgWorkspaceStatus, QuotaBlockGuard, QuotaHandler, RigHandler,
     WorkspaceHandler, WsPools,
 };
@@ -2288,7 +2288,12 @@ async fn build_domain_router(
     };
     let router = DomainRouter::new()
         .register(Arc::new(workspace_handler))
-        .register(Arc::new(RigHandler::new(ws_pools.clone())))
+        // rig-hold H1: the rig handler emits `rig.held.v1` / `rig.resumed.v1` to the shared event
+        // log so the operator's hold/resume is auditable + visible on the SSE feed.
+        .register(Arc::new(
+            RigHandler::new(ws_pools.clone())
+                .with_event_sink(Arc::new(EventLogRigSink::new(event_log.clone()))),
+        ))
         // A completed merge marks the owning rig's graph stale (hq-graphrig.7).
         .register(Arc::new(
             MergeHandler::new(event_log.clone()).with_rig_pools(ws_pools.clone()),
