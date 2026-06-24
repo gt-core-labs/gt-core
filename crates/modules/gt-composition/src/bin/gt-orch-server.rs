@@ -1240,6 +1240,8 @@ async fn main() -> anyhow::Result<()> {
     let sup_timer = supervisor.clone();
     let alloc_timer = allocator.clone();
     let heartbeat_log = Arc::new(EventLog::new(Some(event_root_for_heartbeat)));
+    // Shared with the refinery lifecycle emitter below (same log root, cheap Arc clone).
+    let refinery_log = Arc::clone(&heartbeat_log);
     let heartbeat_ws = ws_slug.clone();
     let pol_timer = tokio::spawn(async move {
         let mut tick = tokio::time::interval(Duration::from_secs(tick_secs));
@@ -1489,6 +1491,7 @@ async fn main() -> anyhow::Result<()> {
     // the merge actor, under a restart+backoff supervisor (gt-core agents may instead submit via
     // the MCP merge.submit path — both feed the same event-sourced board). Absent/unopenable
     // channel ⇒ the loop is disabled and the daemon still boots.
+    let refinery_ws = ws_slug.clone();
     let refinery_task = match Channel::open(&channel_root, &merge_ready_channel) {
         Ok(channel) => {
             eprintln!(
@@ -1496,6 +1499,28 @@ async fn main() -> anyhow::Result<()> {
                 channel.dir().display()
             );
             Some(tokio::spawn(async move {
+                let session = format!("refinery-{refinery_ws}");
+                let ws_opt = Some(refinery_ws.as_str());
+                // Announce the refinery as a live role session (gtcore-cd9a14): emits
+                // agent.spawned.v1 so it appears in agent_list/audit like any other role.
+                // maintains_heartbeat=false → the session reconciler won't kill it on
+                // missing heartbeat; it stays visible until session-end at shutdown.
+                if let Err(e) = refinery_log.append(
+                    ws_opt,
+                    gt_agent::AgentEvent::Spawned {
+                        session: session.clone(),
+                        rig: refinery_ws.clone(),
+                        role: gt_agent::SessionRole::Dog(gt_agent::DogKind::Refinery),
+                        crew: None,
+                        spawned_by: None,
+                        skills: vec![],
+                        hooks: vec![],
+                        maintains_heartbeat: false,
+                        tmux_socket: None,
+                    },
+                ) {
+                    eprintln!("[gt-orch-server] refinery: agent.spawned append failed: {e}");
+                }
                 let mut tracker = RestartTracker::new(RestartConfig::default());
                 let make = || {
                     let channel = channel.clone();
@@ -1508,6 +1533,13 @@ async fn main() -> anyhow::Result<()> {
                 };
                 gt_polecat::supervise_daemon("refinery", make, &mut tracker, u32::MAX, now_secs)
                     .await;
+                // Emit session-end when the loop exits (channel closed or daemon shutdown).
+                if let Err(e) = refinery_log.append(
+                    ws_opt,
+                    gt_agent::AgentEvent::SessionEnd { session },
+                ) {
+                    eprintln!("[gt-orch-server] refinery: agent.session-end append failed: {e}");
+                }
             }))
         }
         Err(e) => {
