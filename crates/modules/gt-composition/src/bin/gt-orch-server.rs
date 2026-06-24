@@ -384,6 +384,17 @@ async fn main() -> anyhow::Result<()> {
                             let home = PathBuf::from(
                                 std::env::var("HOME").unwrap_or_else(|_| "/root".into()),
                             );
+                            // Provision any missing rig checkout from its OWN catalog git_url
+                            // BEFORE routing (gtcore-d0ec4f). Without this, a rig whose checkout is
+                            // absent on the host is skipped below and its beads fall back to the
+                            // BOOT template — slinging a cross-rig bead (gtweb-*) into the gt-core
+                            // checkout (the wrong repo). Cloning from the rig's git_url makes the
+                            // route find a real checkout so the per-bead worktree carries the
+                            // correct origin. Best-effort: a clone failure leaves the rig on the
+                            // legacy skip.
+                            let _ = gt_composition::polecat::provision_rig_checkouts(
+                                &rigs, &ws_slug, &home,
+                            );
                             rig_routing_from_catalog(
                                 &rigs,
                                 &template,
