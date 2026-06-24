@@ -457,6 +457,80 @@ impl Command for SetRigTags {
     }
 }
 
+/// Set (or clear) the soft VCS-connection ref a rig clones/pushes with — the `git_connection_ref`
+/// pointing at a `public.vcs_connections.id` (gtcore-103958). This is the only way to (re)bind a
+/// connection on an EXISTING rig: `add`/`adopt` reject an already-registered name, so before this
+/// command the only path was a direct SQL `UPDATE`. The matching JIT installation-token mint is a
+/// runtime/deploy-edge concern (gt-vcs); this command records the binding only.
+///
+/// `git_connection_ref` is a SOFT ref (no FK to `vcs_connections`), exactly as `add`/`adopt` treat
+/// it — so a stale/typo'd id is the operator's to fix, not rejected here. `None` (or an
+/// empty/whitespace string) CLEARS the binding, back to the legacy operator-mounted token path.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct SetRigConnection {
+    pub name: String,
+    /// The connection id to bind (e.g. `gh-139659957`), or `None`/empty to clear. Normalised by
+    /// [`Self::normalized`] (trimmed; empty ⇒ `None`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub git_connection_ref: Option<String>,
+    pub now_secs: u64,
+    /// Server-injected tenant — see [`AddRig::workspace_id`].
+    #[serde(skip_deserializing, default = "default_workspace")]
+    #[schemars(skip)]
+    pub workspace_id: String,
+}
+
+impl SetRigConnection {
+    /// The normalised binding this command applies: trimmed, with an empty string mapped to
+    /// `None` (clear) so `""` and an omitted field mean the same thing.
+    fn normalized(&self) -> Option<String> {
+        self.git_connection_ref
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+    }
+}
+
+impl Command for SetRigConnection {
+    type Output = RigEvent;
+    type State = RigCatalog;
+
+    fn validate(&self, state: &Self::State) -> Result<(), AppError> {
+        if self.name.is_empty() {
+            return Err(AppError::Validation("rig name is empty".into()));
+        }
+        let Some(current) = state.get(&self.name) else {
+            return Err(AppError::NotFound(format!("rig {:?}", self.name)));
+        };
+        if current.git_connection_ref == self.normalized() {
+            return Err(AppError::Validation(match self.normalized() {
+                Some(r) => format!("git_connection_ref already {r:?}"),
+                None => "git_connection_ref already unset".into(),
+            }));
+        }
+        Ok(())
+    }
+
+    fn execute(&self, state: &mut Self::State) -> Result<Self::Output, AppError> {
+        self.validate(state)?;
+        // `validate` proved the rig exists; unwrap is safe.
+        let old = state
+            .get(&self.name)
+            .expect("rig present")
+            .git_connection_ref
+            .clone();
+        let new = self.normalized();
+        state.apply_connection_change(&self.name, new.clone());
+        Ok(RigEvent::ConnectionChanged {
+            rig: self.name.clone(),
+            old,
+            new,
+            now_secs: self.now_secs,
+        })
+    }
+}
+
 /// Sum type so the actor routes any rig command through a single message variant.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(tag = "kind", rename_all = "snake_case")]
@@ -468,6 +542,7 @@ pub enum RigCommand {
     SetDefaultBranch(SetRigDefaultBranch),
     SetWorktreeRoot(SetRigWorktreeRoot),
     SetTags(SetRigTags),
+    SetConnection(SetRigConnection),
 }
 
 impl RigCommand {
@@ -481,6 +556,7 @@ impl RigCommand {
             Self::SetDefaultBranch(_) => "rig.set-default-branch",
             Self::SetWorktreeRoot(_) => "rig.set-worktree-root",
             Self::SetTags(_) => "rig.set-tags",
+            Self::SetConnection(_) => "rig.set-connection",
         }
     }
 
@@ -495,6 +571,7 @@ impl RigCommand {
             Self::SetDefaultBranch(c) => &c.workspace_id,
             Self::SetWorktreeRoot(c) => &c.workspace_id,
             Self::SetTags(c) => &c.workspace_id,
+            Self::SetConnection(c) => &c.workspace_id,
         }
     }
 
@@ -512,6 +589,7 @@ impl RigCommand {
             Self::SetDefaultBranch(c) => c.workspace_id = ws,
             Self::SetWorktreeRoot(c) => c.workspace_id = ws,
             Self::SetTags(c) => c.workspace_id = ws,
+            Self::SetConnection(c) => c.workspace_id = ws,
         }
         self
     }
@@ -530,6 +608,7 @@ impl Command for RigCommand {
             Self::SetDefaultBranch(c) => c.validate(state),
             Self::SetWorktreeRoot(c) => c.validate(state),
             Self::SetTags(c) => c.validate(state),
+            Self::SetConnection(c) => c.validate(state),
         }
     }
 
@@ -542,6 +621,7 @@ impl Command for RigCommand {
             Self::SetDefaultBranch(c) => c.execute(state),
             Self::SetWorktreeRoot(c) => c.execute(state),
             Self::SetTags(c) => c.execute(state),
+            Self::SetConnection(c) => c.execute(state),
         }
     }
 }
@@ -754,6 +834,69 @@ mod tests {
             ok.validate(&catalog),
             Err(AppError::Validation(_))
         ));
+    }
+
+    #[test]
+    fn set_connection_binds_clears_round_trips_and_rejects_noop() {
+        let mut catalog = RigCatalog::default();
+        add_cmd("plane", "pl", 1).execute(&mut catalog).unwrap();
+        assert_eq!(catalog.get("plane").unwrap().git_connection_ref, None);
+
+        let conn = |name: &str, ref_: Option<&str>, now: u64| SetRigConnection {
+            name: name.into(),
+            git_connection_ref: ref_.map(str::to_string),
+            now_secs: now,
+            workspace_id: "default".into(),
+        };
+
+        // Unknown rig is a NotFound.
+        assert!(matches!(
+            conn("ghost", Some("gh-1"), 2).validate(&catalog),
+            Err(AppError::NotFound(_))
+        ));
+
+        // Clearing an already-unbound rig is a no-op rejection (None and "" are equivalent).
+        assert!(matches!(
+            conn("plane", None, 2).validate(&catalog),
+            Err(AppError::Validation(_))
+        ));
+        assert!(matches!(
+            conn("plane", Some("  "), 2).validate(&catalog),
+            Err(AppError::Validation(_))
+        ));
+
+        // Bind: emits ConnectionChanged and the entry carries the ref (trimmed).
+        let ev = conn("plane", Some(" gh-139659957 "), 3)
+            .execute(&mut catalog)
+            .unwrap();
+        match ev {
+            RigEvent::ConnectionChanged { old, ref new, .. } => {
+                assert_eq!(old, None);
+                assert_eq!(new.as_deref(), Some("gh-139659957"));
+            }
+            _ => panic!("expected ConnectionChanged"),
+        }
+        assert_eq!(
+            catalog.get("plane").unwrap().git_connection_ref.as_deref(),
+            Some("gh-139659957")
+        );
+
+        // Re-binding the same ref is a no-op rejection.
+        assert!(matches!(
+            conn("plane", Some("gh-139659957"), 4).validate(&catalog),
+            Err(AppError::Validation(_))
+        ));
+
+        // Clear: maps back to None and round-trips.
+        let ev = conn("plane", None, 5).execute(&mut catalog).unwrap();
+        match ev {
+            RigEvent::ConnectionChanged { old, new, .. } => {
+                assert_eq!(old.as_deref(), Some("gh-139659957"));
+                assert_eq!(new, None);
+            }
+            _ => panic!("expected ConnectionChanged"),
+        }
+        assert_eq!(catalog.get("plane").unwrap().git_connection_ref, None);
     }
 
     #[test]

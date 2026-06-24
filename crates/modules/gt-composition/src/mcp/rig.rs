@@ -24,7 +24,8 @@ use gt_mcp_server::{DomainCtx, DomainHandler, WorkspaceRigPrefixes};
 use gt_module::McpTool;
 use gt_rig::{
     AddRig, AdoptRig, PgRigs, RemoveRig, RigCatalog, RigEntry, RigReadiness, RigRepository,
-    SetRigDefaultBranch, SetRigPrefix, SetRigTags, SetRigWorktreeRoot, RESERVED_RIG_NAMES,
+    SetRigConnection, SetRigDefaultBranch, SetRigPrefix, SetRigTags, SetRigWorktreeRoot,
+    RESERVED_RIG_NAMES,
 };
 use gt_store_dolt::AppError;
 
@@ -97,6 +98,15 @@ impl DomainHandler for RigHandler {
                 &[req("name", "string"), opt("tags", "array")],
             ),
             descriptor(
+                "rig.set-connection",
+                "Bind (or clear) the VCS connection a rig clones/pushes with — its \
+                 git_connection_ref, a public.vcs_connections.id (e.g. a GitHub App installation). \
+                 The only way to (re)connect an existing rig: add/adopt reject a registered name. \
+                 Pass git_connection_ref to bind; omit it or pass \"\" to clear (back to the \
+                 operator-mounted token path).",
+                &[req("name", "string"), opt("git_connection_ref", "string")],
+            ),
+            descriptor(
                 "rig.remove",
                 "Remove a rig from the catalog.",
                 &[req("name", "string")],
@@ -150,6 +160,10 @@ impl DomainHandler for RigHandler {
             }
             "rig.set-tags" => {
                 let cmd: SetRigTags = parse_cmd(ctx.args)?;
+                apply_and_upsert(&repo, cmd.name.clone(), &cmd).await
+            }
+            "rig.set-connection" => {
+                let cmd: SetRigConnection = parse_cmd(ctx.args)?;
                 apply_and_upsert(&repo, cmd.name.clone(), &cmd).await
             }
             "rig.remove" => {
