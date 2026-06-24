@@ -1,4 +1,4 @@
-//! Domain dispatch coverage (`hq-mcp-test.2`): the 7 domain namespaces respond.
+//! Domain dispatch coverage (`hq-mcp-test.2`): every domain namespace responds.
 //!
 //! The server routes any non-`meta.*`/`issues.*` tool to the [`DomainRouter`];
 //! `Ok(None)` from the router is the "unknown tool" signal (no handler owns the
@@ -10,25 +10,28 @@
 //! - **Env-free** — the four event-log-backed namespaces (merge/convoy/agent/
 //!   quota) build over a tempdir log and a representative `*.list` read replays
 //!   the empty log end to end. Runs in host CI with no sidecar.
-//! - **`GT_PG_URL`-gated** — the full production router (all 7, mirroring the
+//! - **`GT_PG_URL`-gated** — the full production router (mirroring the
 //!   `gt-mcp-server` binary's `build_domain_router`) asserts the exact namespace
 //!   set and that each namespace responds.
 
 use std::sync::Arc;
 
 use gt_composition::mcp::{
-    AgentHandler, ConvoyHandler, EventLog, GraphHandler, MergeHandler, QuotaHandler, RigHandler,
-    WorkspaceHandler, WsPools,
+    AgentHandler, ConvoyHandler, DomainCatalogHandler, EventLog, GraphHandler, MergeHandler,
+    QuotaHandler, RigHandler, WorkspaceHandler, WsPools,
 };
+use gt_store_dolt::DoltIssues;
 use gt_graphindex::GraphifyIndexer;
 use gt_mcp_server::{DomainCtx, DomainRouter};
 use serde_json::json;
 use tempfile::TempDir;
 
-/// The 7 domain dispatch namespaces the production server registers.
+/// The domain dispatch namespaces the production server registers. `namespaces()`
+/// returns them sorted, so this list is alphabetical.
 const EXPECTED_NAMESPACES: &[&str] = &[
     "agent",
     "convoy",
+    "domain",
     "graph",
     "merge",
     "quota",
@@ -179,12 +182,17 @@ async fn all_seven_domain_namespaces_registered_and_respond() {
         .register(Arc::new(GraphHandler::new(
             log.clone(),
             Arc::new(GraphifyIndexer::new()),
-        )));
+        )))
+        // domain.catalog.* (gtcore-b37400 H4): a never-connected Dolt store is enough —
+        // `domain.list` resolves only the (lazy) pool handle, never dialing.
+        .register(Arc::new(DomainCatalogHandler::new(Arc::new(
+            DoltIssues::connect("mysql://x@127.0.0.1:1/none").expect("lazy dolt never dials"),
+        ))));
 
     assert_eq!(
         router.namespaces(),
         EXPECTED_NAMESPACES,
-        "the production router owns exactly the 7 domain namespaces"
+        "the production router owns exactly the domain namespaces"
     );
 
     // Every namespace responds to a representative read verb (owned, not Ok(None)).

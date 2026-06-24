@@ -20,6 +20,11 @@ pub mod commands;
 /// REST routes that reuse the same gap-minting logic as the MCP tools.
 #[cfg(feature = "axum")]
 pub mod http;
+/// The off-by-default `axum` REST adapter for the per-workspace domain catalog
+/// (gtcore-b37400 H4): admin-scoped list/add/rename/set-enabled/remove routes that
+/// reuse the same `DoltDomainCatalog` CRUD as the `domain.catalog.*` MCP tools.
+#[cfg(feature = "axum")]
+pub mod domain_http;
 /// Transport-free handlers shared by the MCP path and the REST adapter
 /// (`hq-fe-api-platform.4`). Gated with the adapter — the descriptor-only build
 /// needs neither the handler nor its store.
@@ -31,5 +36,7 @@ pub use commands::ReportGap;
 #[cfg(feature = "axum")]
 pub use http::{meta_router, ApiDoc, MetaApiState};
 #[cfg(feature = "axum")]
-pub use module::MetaHttpModule;
+pub use domain_http::{domain_router, DomainApiState};
+#[cfg(feature = "axum")]
+pub use module::{DomainCatalogHttpModule, MetaHttpModule};
 pub use module::MetaModule;

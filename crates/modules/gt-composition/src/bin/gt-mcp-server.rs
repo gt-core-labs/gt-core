@@ -60,7 +60,7 @@ use gt_composition::hooks::{hooks_router, HooksApiState};
 use gt_composition::kanban_rest::{kanban_rest_router, KanbanRestState};
 use gt_composition::notifications::{notifications_router, NotificationsApiState};
 use gt_composition::mcp::{
-    A2aDelegateHandler, AgentHandler, AnalyticsHandler, AuditHandler, CommentsHandler, ConvoyHandler, CrossWsGrants, DispatchHandler, DocumentsHandler, EmailHandler, EscalateHandler, EventLog, EventLogHooks,
+    A2aDelegateHandler, AgentHandler, AnalyticsHandler, AuditHandler, CommentsHandler, ConvoyHandler, CrossWsGrants, DispatchHandler, DocumentsHandler, DomainCatalogHandler, EmailHandler, EscalateHandler, EventLog, EventLogHooks,
     EventLogIssueSink, GraphHandler, IdentityDoltMeStats, InvitesHandler, MemoryHandler, MergeHandler, NotifyHandler, ReportHandler,
     PgDocumentsResource, PgRigPrefixes, PgWorkspaceStatus, QuotaBlockGuard, QuotaHandler, RigHandler,
     WorkspaceHandler, WsPools,
@@ -2383,6 +2383,30 @@ async fn build_domain_router(
     // pool cache and resolves `ws_<slug>.memories` per-request from the caller's tenant
     // (hq-memory-admin.4), exactly like documents.* — no longer bound to `ws_default`.
     let router = router.register(Arc::new(MemoryHandler::new(ws_pools.clone(), embedder)));
+
+    // domain.catalog.* — operator-editable per-workspace domain catalog (gtcore-b37400
+    // H4). Resolves the active workspace's catalog over the SAME Dolt store the issues
+    // surface writes to (the shared `hq` default, or the tenant's `hq_<ws>` under
+    // multi-tenant routing), so an edit here is read back by the bead-create domain
+    // validation (gtcore-d81e77 H2). Needs Dolt (GT_DOLT_URL) for the default store;
+    // skipped otherwise (no catalog to edit).
+    let router = match std::env::var("GT_DOLT_URL")
+        .ok()
+        .and_then(|url| DoltIssues::connect(&url).ok())
+    {
+        Some(catalog_store) => {
+            let handler = DomainCatalogHandler::new(Arc::new(catalog_store));
+            let handler = match &dolt_pools {
+                Some(dolt) => handler.with_dolt(dolt.clone()),
+                None => handler,
+            };
+            router.register(Arc::new(handler))
+        }
+        None => {
+            eprintln!("[gt-mcp-server] domain.catalog.* off — GT_DOLT_URL unset");
+            router
+        }
+    };
 
     // dispatch.* — agent-dispatch frontier probe (gtcore-7bec8c — C3): exposes
     // ready_for_auto as an MCP tool so operators/agents can query which beads are
