@@ -16,6 +16,7 @@
 //! `GT_DOLT_URL`.
 
 use std::path::PathBuf;
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -27,15 +28,57 @@ use gt_issues::{
     locked_roots, occupied_surfaces, ready_for_auto, session_like_actor, AllowAllTree, SurfaceTree,
 };
 use gt_plugin::Plugin;
+use gt_rig::{DispatchMode, RigRepository};
 use gt_runtime::{BeadId, DispatchError, Dispatcher, ReadySource, Worker};
 use gt_scheduling::actor::SchedHandle;
 use gt_store_dolt::DoltIssues;
+
+/// Source of the rigs currently on dispatch hold (rig-hold H2, gtcore-1f5e67) — the rig-level
+/// pause the frontier honours. `held()` is polled each dispatch tick; a rig it names has its
+/// ready+auto beads excluded from the frontier. **Fail-open**: any read error returns an empty
+/// set, so a rig-catalog blip never freezes dispatch (a missed hold is recoverable; a frozen
+/// frontier stalls all work).
+#[async_trait]
+pub trait HeldRigs: Send + Sync {
+    async fn held(&self) -> HashSet<String>;
+}
+
+/// A [`RigRepository`]-backed [`HeldRigs`]: the names of rigs whose catalog `dispatch_mode` is
+/// [`DispatchMode::Hold`]. Reads the live catalog each poll so a `rig.hold`/`rig.resume` takes
+/// effect on the next dispatch tick with no daemon restart.
+pub struct CatalogHeldRigs<R: RigRepository> {
+    rigs: R,
+}
+
+impl<R: RigRepository> CatalogHeldRigs<R> {
+    pub fn new(rigs: R) -> Self {
+        Self { rigs }
+    }
+}
+
+#[async_trait]
+impl<R: RigRepository + Send + Sync> HeldRigs for CatalogHeldRigs<R> {
+    async fn held(&self) -> HashSet<String> {
+        match self.rigs.list().await {
+            Ok(entries) => entries
+                .into_iter()
+                .filter(|e| e.dispatch_mode == DispatchMode::Hold)
+                .map(|e| e.name)
+                .collect(),
+            Err(e) => {
+                eprintln!("[auto-dispatch] held-rigs read failed (fail-open, no holds applied): {e}");
+                HashSet::new()
+            }
+        }
+    }
+}
 
 /// [`ReadySource`] adapter: polls the `ready_for_auto` frontier from Dolt.
 pub struct FrontierSource {
     store: Arc<DoltIssues>,
     repo_dir: Option<PathBuf>,
     rig: Option<String>,
+    held_rigs: Option<Arc<dyn HeldRigs>>,
 }
 
 impl FrontierSource {
@@ -44,12 +87,20 @@ impl FrontierSource {
             store,
             repo_dir,
             rig: None,
+            held_rigs: None,
         }
     }
 
     /// Scope the frontier to a specific rig (optional).
     pub fn with_rig(mut self, rig: impl Into<String>) -> Self {
         self.rig = Some(rig.into());
+        self
+    }
+
+    /// Wire the rig-hold source (rig-hold H2). Absent ⇒ no rig is ever treated as held (the
+    /// pre-feature behaviour), so an orchd without a rig catalog dispatches exactly as before.
+    pub fn with_held_rigs(mut self, source: Arc<dyn HeldRigs>) -> Self {
+        self.held_rigs = Some(source);
         self
     }
 
@@ -101,6 +152,13 @@ impl ReadySource for FrontierSource {
         );
         let occupied = occupied_surfaces(&working_surfs);
 
+        // Rigs on dispatch hold (rig-hold H2): their ready+auto beads are excluded from the
+        // frontier. Fail-open via the source itself; absent source ⇒ no holds.
+        let held = match &self.held_rigs {
+            Some(source) => source.held().await,
+            None => HashSet::new(),
+        };
+
         let dep_fact_fn = |id: &str| dep_facts.get(id).cloned();
         let frontier = ready_for_auto(
             rows,
@@ -112,6 +170,7 @@ impl ReadySource for FrontierSource {
             &dispatch_raw,
             &locked,
             &occupied,
+            &held,
         );
 
         frontier

@@ -12,6 +12,7 @@
 //! 3. **Operator lock** (C2): not inside a human-claimed epic subtree.
 //! 4. **Surface overlap** (C3): no crate path collision with a `working` bead.
 
+use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -23,19 +24,56 @@ use gt_issues::{
 };
 use gt_mcp_server::{DomainCtx, DomainHandler};
 use gt_module::McpTool;
+use gt_rig::PgRigs;
 use gt_store_dolt::{AppError, DoltIssues, IssueFilter};
 
+use super::pools::WsPools;
 use super::util::{descriptor, opt};
+use crate::auto_dispatch::{CatalogHeldRigs, HeldRigs};
 
 /// Dolt-backed handler for the `dispatch.*` tool namespace.
 pub struct DispatchHandler {
     store: Arc<DoltIssues>,
     repo_dir: Option<PathBuf>,
+    /// Per-workspace rig pools, used to resolve the rigs on dispatch hold (rig-hold H2) so the
+    /// probe reflects the SAME frontier the orchd would sling. Absent ⇒ no holds applied.
+    held_pools: Option<Arc<WsPools>>,
 }
 
 impl DispatchHandler {
     pub fn new(store: Arc<DoltIssues>, repo_dir: Option<PathBuf>) -> Self {
-        Self { store, repo_dir }
+        Self {
+            store,
+            repo_dir,
+            held_pools: None,
+        }
+    }
+
+    /// Wire the per-workspace rig pools so the probe excludes held rigs (rig-hold H2, gtcore-1f5e67),
+    /// matching the orchd's [`crate::auto_dispatch::FrontierSource`]. Without this the probe ignores
+    /// holds (back-compat).
+    pub fn with_held_rigs(mut self, pools: Arc<WsPools>) -> Self {
+        self.held_pools = Some(pools);
+        self
+    }
+
+    /// The rigs on dispatch hold in `workspace` — fail-open to an empty set so a rig-catalog read
+    /// fault never makes the probe over-report the frontier.
+    async fn held_rigs(&self, workspace: Option<&str>) -> HashSet<String> {
+        let Some(pools) = &self.held_pools else {
+            return HashSet::new();
+        };
+        match pools.get(workspace).await {
+            Ok(pool) => {
+                CatalogHeldRigs::new(PgRigs::new(pool.pool().clone()))
+                    .held()
+                    .await
+            }
+            Err(e) => {
+                eprintln!("[dispatch-probe] held-rigs pool resolve failed for ws {workspace:?} (fail-open): {e}");
+                HashSet::new()
+            }
+        }
     }
 
     fn surface_tree(&self) -> Box<dyn SurfaceTree + Send + Sync> {
@@ -78,6 +116,10 @@ impl DispatchHandler {
         let working_surfs = self.store.working_surfaces().await?;
         let occupied = occupied_surfaces(&working_surfs);
 
+        // Rigs on dispatch hold (rig-hold H2): excluded from the frontier so the probe matches
+        // what the orchd would actually sling.
+        let held = self.held_rigs(workspace).await;
+
         let dep_fact_fn = |id: &str| dep_facts.get(id).cloned();
         let frontier = ready_for_auto(
             rows,
@@ -89,6 +131,7 @@ impl DispatchHandler {
             &dispatch_raw,
             &locked,
             &occupied,
+            &held,
         );
 
         Ok(json!({

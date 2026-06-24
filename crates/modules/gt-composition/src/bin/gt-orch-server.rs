@@ -1060,8 +1060,30 @@ async fn main() -> anyhow::Result<()> {
                 let repo_dir = std::env::var("GT_REPO_DIR")
                     .ok()
                     .map(std::path::PathBuf::from);
-                let source =
+                let mut source =
                     gt_composition::auto_dispatch::FrontierSource::new(Arc::new(store), repo_dir);
+                // rig-hold H2 (gtcore-1f5e67): wire the rig catalog so a rig on `hold` has its
+                // ready+auto beads excluded from the frontier (both DIRECT and MAYOR modes consume
+                // this source). Fail-soft: no PG ⇒ holds simply never apply.
+                if let Some(pg_url) =
+                    std::env::var("GT_PG_URL").ok().filter(|v| !v.is_empty())
+                {
+                    match gt_store_pg::WorkspacePool::connect(&pg_url, &ws_slug).await {
+                        Ok(pool) => {
+                            source = source.with_held_rigs(Arc::new(
+                                gt_composition::auto_dispatch::CatalogHeldRigs::new(
+                                    gt_rig::PgRigs::new(pool.pool().clone()),
+                                ),
+                            ));
+                            eprintln!(
+                                "[gt-orch-server] rig-hold on — frontier excludes beads of rigs in dispatch_mode=hold"
+                            );
+                        }
+                        Err(e) => eprintln!(
+                            "[gt-orch-server] rig-hold OFF — held-rigs pool connect failed (holds not applied): {e}"
+                        ),
+                    }
+                }
                 if dispatch_via_mayor {
                     let (command, args, base_env, workdir) = mayor_launch;
                     let channel_root = std::env::var("GT_CHANNEL_ROOT")
