@@ -952,6 +952,59 @@ async fn main() -> anyhow::Result<()> {
             None
         }
     };
+    // Rig VCS-connection health sweep (gtcore-406b12, epic gtcore-0e095b): ring the operator bell
+    // when a rig becomes unbound or its connection goes inactive (the dev data-wipe left the rigs
+    // unbound silently). Same GT_PG_URL-gated bell as escalations; gated additionally on
+    // GT_RIG_CONNECTION_CHECK_SECS > 0 (off by default). Self-contained loop, spawned here.
+    {
+        let check_secs = env_usize("GT_RIG_CONNECTION_CHECK_SECS", 0) as u64;
+        match (&deleg_bell_pool, check_secs) {
+            (Some(pool), secs) if secs > 0 => {
+                match std::env::var("GT_PG_URL")
+                    .ok()
+                    .filter(|v| !v.is_empty())
+                {
+                    Some(pg_url) => {
+                        match gt_composition::rig_connection_notify::PgRigHealthSource::connect(
+                            &pg_url,
+                            ws_slug.clone(),
+                        )
+                        .await
+                        {
+                            Ok(source) => {
+                                let notifier =
+                                    gt_composition::escalation_notify::OperatorNotifier::new(
+                                        pool.clone(),
+                                        knowledge_log.clone(),
+                                        ws_slug.clone(),
+                                    )
+                                    .with_public_url(
+                                        std::env::var("GT_PUBLIC_URL").unwrap_or_default(),
+                                    );
+                                let public_url =
+                                    std::env::var("GT_PUBLIC_URL").unwrap_or_default();
+                                eprintln!(
+                                    "[gt-orch-server] rig connection-health sweep on — operator bell every {secs}s when a rig is unbound/inactive"
+                                );
+                                let ticker = gt_composition::rig_connection_notify::RigConnectionHealthTicker::new(
+                                    std::sync::Arc::new(source),
+                                    notifier,
+                                    secs,
+                                    public_url,
+                                );
+                                tokio::spawn(ticker.run());
+                            }
+                            Err(e) => eprintln!(
+                                "[gt-orch-server] rig connection-health sweep OFF — pool connect failed: {e}"
+                            ),
+                        }
+                    }
+                    None => {}
+                }
+            }
+            _ => {}
+        }
+    }
     // Patrol bridge (gtcore-a33952 — C2): agent.spawned → lease, session-end/killed → close,
     // patrol.lease-expired → release_claim (Dolt CAS). Env-gated on GT_DOLT_URL — without it,
     // the bridge is off and crashed agents stay working until manual reconciliation.
