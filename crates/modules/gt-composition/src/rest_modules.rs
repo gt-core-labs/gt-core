@@ -35,7 +35,7 @@ use gt_documents::{DocumentsApiState, DocumentsModule};
 use gt_feed::{FeedApiState, FeedModule};
 use gt_graphindex::GraphifyIndexer;
 use gt_merge::{MergeApiState, MergeModule};
-use gt_meta::{MetaApiState, MetaModule};
+use gt_meta::{DomainApiState, DomainCatalogHttpModule, MetaApiState, MetaModule};
 use gt_module::{McpTool, RootBuilder};
 use gt_orchestration::{ConvoyApiState, ConvoyModule};
 use gt_quota::{QuotaApiState, QuotaModule};
@@ -173,6 +173,17 @@ pub async fn build_rest_modules(
     // builds, where the meta catalog reads the fallback `meta_store` pool.
     let meta_workspaces = pg.as_ref().and_then(|p| p.issues_workspaces.clone());
 
+    // The domain-catalog REST module (gtcore-b37400 H4) shares the same store + per-workspace
+    // pools as the meta `GET /domains` read, so it resolves and writes ONE catalog. Cloned out
+    // before `meta_store`/`meta_workspaces` are consumed by the meta module below.
+    let domain_state = {
+        let state = DomainApiState::new(meta_store.clone());
+        match &meta_workspaces {
+            Some(pools) => state.with_workspaces(pools.clone()),
+            None => state,
+        }
+    };
+
     let mut rest = RootBuilder::new()
         // meta REST: GET /help (full tools/list) + GET /domains (active-workspace
         // domain catalog) + POST /report-gap.
@@ -183,6 +194,10 @@ pub async fn build_rest_modules(
                 None => state,
             }
         }))
+        // domain.catalog.* REST: admin-scoped (domain.read/domain.write) list/add/rename/
+        // set-enabled/remove for the active workspace's catalog — the REST twin of the
+        // `domain.catalog.*` MCP tools (gtcore-b37400 H4).
+        .module(DomainCatalogHttpModule::with_http(domain_state))
         // agent.*: the REST surface now delegates to the SAME EventLog the MCP handler uses
         // (gtcore-8c3823), so both transports always agree on session state regardless of
         // whether the backend is file or Postgres.

@@ -96,6 +96,48 @@ pub const GENERIC_TEMPLATE: &[(&str, &str)] = &[
 /// a technical workspace both carry it.
 pub const RESERVED_GAP_KEY: &str = "meta.gap";
 
+/// Validate a domain `key` against the catalog grammar (gtcore-b37400): lowercase
+/// alphanumerics grouped by single `.` or `-` separators (e.g. `producto`,
+/// `orch.merge`, `seguridad-cumplimiento`), 1..=255 chars, with no
+/// leading/trailing/doubled separator. The single source of the key grammar, shared
+/// by the MCP `domain.catalog.add` handler and the REST `POST /domain/catalog` route
+/// (both validate before any I/O) and re-checked inside [`DoltDomainCatalog::add`].
+/// Returns the trimmed key on success; a malformed key is an [`AppError::Validation`]
+/// so a hostile value never reaches the `key` primary key or a UI that renders it.
+pub fn validate_domain_key(raw: &str) -> Result<String, AppError> {
+    let key = raw.trim();
+    let invalid = |why: &str| AppError::Validation(format!("invalid domain key '{raw}': {why}"));
+    if key.is_empty() {
+        return Err(invalid("must not be empty"));
+    }
+    if key.len() > 255 {
+        return Err(invalid("must be at most 255 characters"));
+    }
+    let bytes = key.as_bytes();
+    let is_sep = |b: u8| b == b'.' || b == b'-';
+    if is_sep(bytes[0]) || is_sep(bytes[bytes.len() - 1]) {
+        return Err(invalid("must not start or end with `.` or `-`"));
+    }
+    let mut prev_sep = false;
+    for &b in bytes {
+        match b {
+            b'a'..=b'z' | b'0'..=b'9' => prev_sep = false,
+            b'.' | b'-' => {
+                if prev_sep {
+                    return Err(invalid("`.`/`-` separators may not repeat"));
+                }
+                prev_sep = true;
+            }
+            _ => {
+                return Err(invalid(
+                    "only lowercase letters, digits, `.` and `-` are allowed",
+                ))
+            }
+        }
+    }
+    Ok(key.to_string())
+}
+
 /// How a freshly-created workspace's `domain_catalog` is initialised (gtcore-22f57b H3).
 ///
 /// `workspace.create` carries an optional `catalog` argument that maps onto this:
@@ -411,6 +453,70 @@ impl DoltDomainCatalog {
         .map_err(map_err)
     }
 
+    /// Add a NEW entry (the operator-edit `add` path, gtcore-b37400). Ensures the
+    /// table exists (self-healing for a tenant whose catalog was never seeded), then
+    /// inserts only when `entry.key` is absent — a colliding key is a validation
+    /// fault (`add` is not an upsert; editing an existing row goes through
+    /// [`rename`](Self::rename) / [`set_enabled`](Self::set_enabled)). The reserved
+    /// `meta.gap` is never operator-addable: a caller must pass a non-reserved entry,
+    /// and a collision with the seeded `meta.gap` surfaces as "already exists".
+    pub async fn add(&self, entry: &DomainEntry) -> Result<(), AppError> {
+        // Re-validate the key grammar + the reserved guard (defense in depth — both
+        // transports also check pre-I/O, but `add` is the chokepoint every write path
+        // funnels through, so the invariant holds even if a caller forgets).
+        validate_domain_key(&entry.key)?;
+        if entry.key == RESERVED_GAP_KEY {
+            return Err(AppError::Validation(format!(
+                "domain '{RESERVED_GAP_KEY}' is reserved and seeded into every catalog; \
+                 it cannot be added"
+            )));
+        }
+        self.ensure_schema().await?;
+        if self.get(&entry.key).await?.is_some() {
+            return Err(AppError::Validation(format!(
+                "domain '{}' already exists in this workspace's catalog",
+                entry.key
+            )));
+        }
+        self.upsert(entry).await
+    }
+
+    /// Rename an entry's display `label` (the operator-edit `rename` path,
+    /// gtcore-b37400), leaving its `key`/`tier`/`enabled` untouched — the `key` is the
+    /// stable identifier beads carry, so it is never rewritten. A missing key is a
+    /// not-found; a RESERVED entry (`meta.gap`) is not editable.
+    pub async fn rename(&self, key: &str, label: &str) -> Result<(), AppError> {
+        let mut entry = self.require_editable(key).await?;
+        entry.label = label.to_string();
+        self.upsert(&entry).await
+    }
+
+    /// Toggle an entry's `enabled` flag (the operator-edit `set-enabled` path,
+    /// gtcore-b37400) — a disabled domain stays in the catalog but is rejected for new
+    /// beads (H2). A missing key is a not-found; a RESERVED entry (`meta.gap`) is not
+    /// editable, since the auto-minted gap beads must always be able to carry it.
+    pub async fn set_enabled(&self, key: &str, enabled: bool) -> Result<(), AppError> {
+        let mut entry = self.require_editable(key).await?;
+        entry.enabled = enabled;
+        self.upsert(&entry).await
+    }
+
+    /// Fetch an entry that the operator is allowed to edit: a present, NON-reserved
+    /// row. An absent key is [`AppError::NotFound`]; a reserved key is
+    /// [`AppError::Validation`] (the reserved `meta.gap` is read-only to operators —
+    /// not editable and not deletable, mirroring [`delete`](Self::delete)).
+    async fn require_editable(&self, key: &str) -> Result<DomainEntry, AppError> {
+        match self.get(key).await? {
+            None => Err(AppError::NotFound(format!(
+                "domain '{key}' not found in this workspace's catalog"
+            ))),
+            Some(entry) if entry.reserved => Err(AppError::Validation(format!(
+                "domain '{key}' is reserved and may not be edited"
+            ))),
+            Some(entry) => Ok(entry),
+        }
+    }
+
     /// Delete one entry by key, committing the change. Returns `true` when a row
     /// was removed. A RESERVED row (`meta.gap`) is protected: deleting it is a
     /// validation error, since every catalog must carry it.
@@ -487,6 +593,23 @@ mod tests {
         assert!(prod.enabled);
         // Exactly one reserved row in the template.
         assert_eq!(rows.iter().filter(|e| e.reserved).count(), 1);
+    }
+
+    #[test]
+    fn validate_domain_key_accepts_business_and_technical_shapes() {
+        for ok in ["producto", "orch.merge", "seguridad-cumplimiento", "store.dolt", "a1.b2-c3"] {
+            assert!(validate_domain_key(ok).is_ok(), "{ok} should be valid");
+        }
+        // The trimmed key is returned.
+        assert_eq!(validate_domain_key("  ventas  ").unwrap(), "ventas");
+    }
+
+    #[test]
+    fn validate_domain_key_rejects_malformed() {
+        for bad in ["", "  ", ".lead", "trail.", "a..b", "a--b", "Upper", "has space", "under_score"]
+        {
+            assert!(validate_domain_key(bad).is_err(), "{bad:?} should be rejected");
+        }
     }
 
     #[test]

@@ -49,7 +49,8 @@ use gt_module::{GtModule, McpRegistry};
 use utoipa::OpenApi;
 
 use gt_composition::mcp::{
-    AgentHandler, EventLog, MergeHandler, QuotaHandler, RigHandler, WorkspaceHandler, WsPools,
+    AgentHandler, DomainCatalogHandler, EventLog, MergeHandler, QuotaHandler, RigHandler,
+    WorkspaceHandler, WsPools,
 };
 use gt_documents::DocumentsModule;
 use gt_issues::IssuesModule;
@@ -65,7 +66,12 @@ const NAMESPACES: &[&str] = &[
     "agent",
     "quota",
     "merge",
+    "domain",
 ];
+
+/// A never-connected Dolt (mysql) URL for the Dolt-backed `domain.catalog.*` handler: its
+/// `descriptors()` reads no store, so a lazy client that never dials suffices to harvest offline.
+const DUMMY_DOLT: &str = "mysql://parity@127.0.0.1:1/none";
 
 /// A never-connected Postgres URL: the PG-backed handlers store the pool/url but `descriptors()`
 /// never touches it, so a lazy pool that never dials is enough to harvest the tool set offline.
@@ -201,6 +207,17 @@ fn parity_map(ns: &str) -> Vec<Route> {
             rt("POST", "/{bead}/complete", Some("merge.complete")),
             rt("POST", "/{bead}/fail", Some("merge.fail")),
         ],
+        // domain.catalog.* (gtcore-b37400 H4): the per-workspace domain catalog, editable over
+        // both transports. `rename` and `set-enabled` share the one `PATCH /catalog/{key}` route
+        // (a partial edit carrying `label?`/`enabled?`), so both tools point at it — the
+        // (method, path) set still collapses to one entry against the served OpenAPI.
+        "domain" => vec![
+            rt("GET", "/catalog", Some("domain.catalog.list")),
+            rt("POST", "/catalog", Some("domain.catalog.add")),
+            rt("PATCH", "/catalog/{key}", Some("domain.catalog.rename")),
+            rt("PATCH", "/catalog/{key}", Some("domain.catalog.set-enabled")),
+            rt("DELETE", "/catalog/{key}", Some("domain.catalog.remove")),
+        ],
         other => panic!("no parity map for namespace `{other}`"),
     }
 }
@@ -216,6 +233,7 @@ fn served_openapi(ns: &str) -> utoipa::openapi::OpenApi {
         "agent" => gt_agent::ApiDoc::openapi(),
         "quota" => gt_quota::ApiDoc::openapi(),
         "merge" => gt_merge::http::ApiDoc::openapi(),
+        "domain" => gt_meta::domain_http::ApiDoc::openapi(),
         other => panic!("no OpenAPI for namespace `{other}`"),
     }
 }
@@ -245,6 +263,12 @@ fn served_mcp_tools(ns: &str) -> Vec<String> {
         "agent" => from_handler(&AgentHandler::new(event_log())),
         "quota" => from_handler(&QuotaHandler::new(event_log())),
         "merge" => from_handler(&MergeHandler::new(event_log())),
+        "domain" => {
+            let store = Arc::new(
+                gt_store_dolt::DoltIssues::connect(DUMMY_DOLT).expect("lazy dolt never dials"),
+            );
+            from_handler(&DomainCatalogHandler::new(store))
+        }
         other => panic!("no MCP source for namespace `{other}`"),
     }
 }

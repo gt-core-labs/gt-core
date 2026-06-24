@@ -192,3 +192,50 @@ async fn upsert_get_and_reserved_delete_guard() {
     assert!(err.to_string().contains("reserved"), "got: {err}");
     assert!(catalog.get("meta.gap").await.unwrap().is_some(), "meta.gap survives");
 }
+
+#[tokio::test]
+async fn add_rename_set_enabled_and_reserved_edit_guards() {
+    let Ok(base) = std::env::var("GT_DOLT_URL") else {
+        eprintln!("GT_DOLT_URL unset — skipping DoltDomainCatalog edit contract");
+        return;
+    };
+    let pool = fresh_pool(&base).await.expect("fresh test db");
+    let catalog = DoltDomainCatalog::new(pool);
+    catalog.seed(&generic_template()).await.expect("seed");
+
+    // `add` inserts a new business domain (enabled, non-reserved).
+    catalog
+        .add(&DomainEntry::new("facturacion", "Facturación", None))
+        .await
+        .expect("add facturacion");
+    let got = catalog.get("facturacion").await.unwrap().expect("present");
+    assert!(got.enabled && !got.reserved);
+
+    // `add` of an existing key is a validation fault (not an upsert).
+    let dup = catalog
+        .add(&DomainEntry::new("facturacion", "Otra", None))
+        .await
+        .expect_err("duplicate add");
+    assert!(dup.to_string().contains("already exists"), "got: {dup}");
+
+    // `rename` changes the label, leaving the key intact.
+    catalog.rename("facturacion", "Billing").await.expect("rename");
+    assert_eq!(catalog.get("facturacion").await.unwrap().unwrap().label, "Billing");
+
+    // `set_enabled(false)` disables; `set_enabled(true)` re-enables.
+    catalog.set_enabled("facturacion", false).await.expect("disable");
+    assert!(!catalog.get("facturacion").await.unwrap().unwrap().enabled);
+    catalog.set_enabled("facturacion", true).await.expect("re-enable");
+    assert!(catalog.get("facturacion").await.unwrap().unwrap().enabled);
+
+    // Editing/renaming a MISSING key is a not-found.
+    let miss = catalog.rename("nope", "X").await.expect_err("missing rename");
+    assert!(matches!(miss, gt_store_dolt::AppError::NotFound(_)), "got: {miss}");
+
+    // The reserved meta.gap is not editable: rename and set-enabled both refuse it.
+    let r1 = catalog.rename("meta.gap", "X").await.expect_err("reserved rename");
+    assert!(r1.to_string().contains("reserved"), "got: {r1}");
+    let r2 = catalog.set_enabled("meta.gap", false).await.expect_err("reserved disable");
+    assert!(r2.to_string().contains("reserved"), "got: {r2}");
+    assert!(catalog.get("meta.gap").await.unwrap().unwrap().enabled, "meta.gap stays enabled");
+}
