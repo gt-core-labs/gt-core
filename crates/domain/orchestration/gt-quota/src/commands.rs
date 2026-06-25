@@ -349,6 +349,7 @@ mod tests {
             last_probe_secs: None,
             sampled_since_probe: 0.0,
             probe_divergence: None,
+            credential_dead: false,
         });
         // acc-2: a healthy standby used by rotate tests as a valid target.
         r.upsert_account(Account::new("acc-2"));
@@ -582,6 +583,7 @@ mod tests {
             last_probe_secs: None,
             sampled_since_probe: 0.0,
             probe_divergence: None,
+            credential_dead: false,
         });
         let cmd = RotateAccount {
             from_account: "acc-1".into(),
@@ -606,6 +608,7 @@ mod tests {
             last_probe_secs: None,
             sampled_since_probe: 0.0,
             probe_divergence: None,
+            credential_dead: false,
         });
         let cmd = RotateAccount {
             from_account: "acc-1".into(),

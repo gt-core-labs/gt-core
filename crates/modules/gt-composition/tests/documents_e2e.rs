@@ -87,6 +87,7 @@ async fn stack() -> Option<(
         eprintln!("GT_PG_URL / GT_BLOB_ENDPOINT unset; skipping documents e2e (stack not up)");
         return None;
     };
+    gt_store_pg::assert_ephemeral_pg_url(&pg);
     let bucket = std::env::var("GT_BLOB_BUCKET").unwrap_or_else(|_| "gt-documents".into());
     let region = std::env::var("GT_BLOB_REGION").unwrap_or_else(|_| "us-east-1".into());
     let access = std::env::var("GT_BLOB_ACCESS_KEY").unwrap_or_default();

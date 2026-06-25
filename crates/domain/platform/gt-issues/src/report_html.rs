@@ -10,6 +10,8 @@
 //! `<link>`/`<script>`/external CSS — Gmail strips them), table layout, same
 //! navy aesthetic as the xlsx report.
 
+use pulldown_cmark::{html::push_html, Event, Options, Parser, Tag, TagEnd};
+
 use crate::analytics::AnalyticsSummary;
 use crate::report::{OperatorReport, ReportComment};
 
@@ -18,16 +20,35 @@ fn esc(s: &str) -> String {
     s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;").replace('"', "&quot;")
 }
 
-/// Render a bead/epic's comments as an inline block (gtcore-01bcf2): one line
-/// per comment, `[autor] cuerpo`, all escaped. Empty input → empty string
-/// (no markup, so a comment-less cell stays unchanged). `compact=true` drops the
-/// top divider for the section-header variant.
-///
-/// The comment's `fecha` (its `created_at`) is intentionally NOT rendered
-/// (gtcore-abc0ae): the report already carries the date in its Fecha Inicio /
-/// Fecha Fin columns, so a per-comment timestamp inside Notas only duplicates
-/// information already on the row. The underlying `created_at` is untouched —
-/// this is a presentation-only omission.
+/// Render a markdown string to inline-safe HTML for email clients.
+/// GFM enabled (tables, strikethrough, task lists). Returns an empty string for
+/// empty input so callers can use it in format strings without conditional guards.
+fn md_to_html(s: &str) -> String {
+    if s.is_empty() {
+        return String::new();
+    }
+    let opts = Options::ENABLE_TABLES
+        | Options::ENABLE_STRIKETHROUGH
+        | Options::ENABLE_TASKLISTS;
+    // Strip raw HTML events so operator notes cannot inject arbitrary tags.
+    let safe = Parser::new_ext(s, opts).filter(|e| {
+        !matches!(
+            e,
+            Event::Html(_)
+                | Event::InlineHtml(_)
+                | Event::Start(Tag::HtmlBlock)
+                | Event::End(TagEnd::HtmlBlock)
+        )
+    });
+    let mut out = String::with_capacity(s.len() + 64);
+    push_html(&mut out, safe);
+    out
+}
+
+/// Render a bead/epic's comments as an inline block (gtcore-01bcf2): one entry
+/// per comment showing `[autor · YYYY-MM-DD]` header and the body rendered as
+/// markdown HTML. Empty input → empty string. `compact=true` drops the top
+/// divider for the section-header variant.
 fn render_comments(comments: &[ReportComment], compact: bool) -> String {
     if comments.is_empty() {
         return String::new();
@@ -36,10 +57,13 @@ fn render_comments(comments: &[ReportComment], compact: bool) -> String {
         .iter()
         .map(|c| {
             format!(
-                "<div style=\"font-size:11px;color:#555;margin-top:2px;\">\
-                 <span style=\"color:{NAVY};font-weight:bold;\">[{autor}]</span> {body}</div>",
+                "<div style=\"font-size:11px;color:#555;margin-top:4px;\">\
+                 <span style=\"color:{NAVY};font-weight:bold;\">[{autor}]</span>\
+                 <span style=\"color:#888;font-size:10px;margin-left:4px;\">{fecha}</span>\
+                 <div style=\"margin-top:2px;\">{body}</div></div>",
                 autor = esc(&c.author),
-                body = esc(&c.body),
+                fecha = esc(&c.fecha),
+                body = md_to_html(&c.body),
             )
         })
         .collect();
@@ -216,7 +240,7 @@ pub fn render_digest(report: &OperatorReport, summary: &AnalyticsSummary, fecha:
                 resp = esc(&row.responsable),
                 ini = esc(&row.fecha_inicio),
                 fin = esc(&row.fecha_fin),
-                notas = esc(&row.notas),
+                notas = md_to_html(&row.notas),
                 comentarios = render_comments(&row.comentarios, false),
             ));
         }
@@ -313,26 +337,21 @@ mod tests {
         assert!(html.contains("3 tareas"), "missing task count in header");
         assert!(html.contains("TOTAL HORAS"));
         assert!(html.contains(&format!("{:.1}", report.total_horas)));
-        // Escaping: the raw note must not inject markup.
-        assert!(html.contains("nota &lt;x&gt;") && !html.contains("nota <x>"));
-        // Comments render with [autor] (no timestamp) and stay escaped
-        // (gtcore-01bcf2 + gtcore-abc0ae: the per-comment fecha/hora is dropped
-        // since the date already lives in the Fecha columns).
+        // Safe-HTML: raw HTML tags in notes are stripped by the safe markdown
+        // renderer (not escaped, just dropped) — the text "nota" survives but
+        // the `<x>` injection does not appear in the output in any form.
+        assert!(html.contains("nota"), "nota text must appear");
+        assert!(!html.contains("<x>"), "raw <x> tag must not pass through");
+        // Comments render with [autor] date + markdown body (gtcore-01bcf2).
         assert!(html.contains("Comentarios"), "missing comments block");
         assert!(html.contains("[ana]"), "missing bead comment author");
-        assert!(html.contains("revisar &lt;edge&gt; case"), "bead comment not escaped/rendered");
+        assert!(html.contains("2026-06-10"), "bead comment must show fecha");
+        // body goes through md_to_html — raw markdown angle-brackets in the
+        // body text are rendered as HTML, not escaped as &lt;/&gt;.
+        assert!(html.contains("revisar"), "bead comment body missing");
         assert!(html.contains("[leo]"), "missing epic comment author");
+        assert!(html.contains("2026-06-11"), "epic comment must show fecha");
         assert!(html.contains("modulo bloqueado"), "missing epic comment body");
-        // The redundant timestamp prefix must NOT appear inside the folded
-        // Notas text (gtcore-abc0ae). The comment dates were 2026-06-10/11.
-        assert!(!html.contains("[2026-06-10 ana]"), "bead comment must not carry a timestamp prefix");
-        assert!(!html.contains("[2026-06-11 leo]"), "epic comment must not carry a timestamp prefix");
-        // Guard the general timestamp-in-fold pattern: no `[YYYY-MM-DD ...]`
-        // bracket where a comment is rendered.
-        assert!(
-            !has_dated_comment_bracket(&html),
-            "Notas fold must not contain a [date author] timestamp bracket"
-        );
     }
 
     /// True when `html` contains a `[YYYY-MM-DD …]` bracket — the timestamp

@@ -49,6 +49,11 @@ pub mod board_http;
 pub mod board_module;
 pub mod commands;
 pub mod delivery;
+/// Runtime domain validation against the per-workspace `domain_catalog`
+/// (gtcore-d81e77 H2): the catalog — not the closed [`taxonomy::Domain`] enum — is
+/// the write-path arbiter, with an enum fallback for un-seeded workspaces pending
+/// the H3 backfill.
+pub mod domain_validate;
 /// Dispatch-policy resolution with `child_of` inheritance (gtcore-1acbcf C1):
 /// [`dispatch::resolve_dispatch`] (the helper C3's `ready_for_auto` frontier
 /// consumes) and [`dispatch::filter_dispatch`] (the resolved `?dispatch=` list
@@ -110,6 +115,7 @@ pub use commands::{
     UpdateIssue,
 };
 pub use delivery::{CommitInfo, CommitInspector, InspectorProvider};
+pub use domain_validate::validate_domains;
 pub use dispatch::{
     filter_dispatch, locked_roots, occupied_surfaces, operator_locked, ready_for_auto,
     resolve_dispatch, session_like_actor, should_sling, surface_overlaps,

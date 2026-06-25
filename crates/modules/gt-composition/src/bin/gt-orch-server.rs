@@ -72,6 +72,9 @@ use gt_composition::polecat::{
     RigConfig, ScopeResolver, DEFAULT_CI_MAX_RETRIES,
 };
 use gt_composition::quota_rotation::{self, QuotaRotationPlugin};
+use gt_composition::role_agent::{
+    RoleAgentDispatcher, RoleAgentPlugin, RoleTrigger, SpecRoleLauncher,
+};
 use gt_composition::session_reconcile::{ReapScope, ReapSink, SessionReconciler};
 use gt_composition::witness_sweep::WitnessSweep;
 use gt_composition::workflow_notify::WorkflowNotifyPlugin;
@@ -316,6 +319,16 @@ async fn main() -> anyhow::Result<()> {
     // before `template` is moved into the polecat supervisor plugin below.
     let rig_path = template.workdir.clone();
 
+    // Trigger-driven role agents (gtcore-999795): sheriff/witness/deacon as AGENTS WITH CRITERION,
+    // slung single-shot only when their trigger fires. Gated on GT_ROLE_AGENTS. Capture the template
+    // clone the role launcher needs BEFORE `template` is moved into the polecat supervisor plugin —
+    // only when the feature is on, so an unused clone never lingers when it's off.
+    let role_agents_on = std::env::var("GT_ROLE_AGENTS")
+        .ok()
+        .filter(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .is_some();
+    let role_template = role_agents_on.then(|| template.clone());
+
     // Seed `gh` auth before the merge edge can fire (gtcore-4c9c85). `gh`'s login lives in
     // $HOME/.config/gh, but the orchd's HOME=/tmp is wiped on every pod restart — so without this,
     // the GitMergePlugin's `gh pr create`/`gh pr merge` fail with "please run: gh auth login" after
@@ -370,6 +383,17 @@ async fn main() -> anyhow::Result<()> {
                             );
                             let home = PathBuf::from(
                                 std::env::var("HOME").unwrap_or_else(|_| "/root".into()),
+                            );
+                            // Provision any missing rig checkout from its OWN catalog git_url
+                            // BEFORE routing (gtcore-d0ec4f). Without this, a rig whose checkout is
+                            // absent on the host is skipped below and its beads fall back to the
+                            // BOOT template — slinging a cross-rig bead (gtweb-*) into the gt-core
+                            // checkout (the wrong repo). Cloning from the rig's git_url makes the
+                            // route find a real checkout so the per-bead worktree carries the
+                            // correct origin. Best-effort: a clone failure leaves the rig on the
+                            // legacy skip.
+                            let _ = gt_composition::polecat::provision_rig_checkouts(
+                                &rigs, &ws_slug, &home,
                             );
                             rig_routing_from_catalog(
                                 &rigs,
@@ -431,6 +455,13 @@ async fn main() -> anyhow::Result<()> {
             None
         }
     };
+
+    // The role-agent launcher mints the same kind of least-privilege per-agent token as the polecat
+    // path; clone the configured minter before `agent_token` is moved into the polecat plugin below
+    // (only when role agents are on, so the clone is never built needlessly).
+    let role_agent_token = role_agents_on
+        .then(|| agent_token.clone())
+        .flatten();
 
     // Claude-account keychain for predictive rotation (hq-agent-provisioning.7). GT_CLAUDE_ACCOUNTS
     // is a comma list of `account=CLAUDE_CONFIG_DIR` pairs; the first is the boot-active account.
@@ -568,7 +599,7 @@ async fn main() -> anyhow::Result<()> {
             if let gt_composition::credential_guard::CredOutcome::Resolved { resolved, .. } =
                 gt_composition::credential_guard::resolve_for_sling(&kc, now_ms, |acc| {
                     quota_status.get(acc).copied()
-                })
+                }, |_| 100.0)
             {
                 set_env(&mut spec.env, "CLAUDE_CONFIG_DIR", resolved.config_dir);
                 set_env(
@@ -603,6 +634,24 @@ async fn main() -> anyhow::Result<()> {
     // Only a positive ¬slingable verdict drops; an unknown bead or a query error is treated as
     // slingable and falls through to the normal re-sling path. Env-gated on GT_DOLT_URL — without it
     // the guard is off and dead polecats re-sling as before.
+    //
+    // rig-hold H3 (gtcore-9a84e6): the held-rigs source, SHARED by the dead-polecat re-sling guard
+    // (this closure) and the supervisor plugin's crash/CI-failure re-sling (`with_held_rigs` below) —
+    // a `rig.hold` pauses the watchdogs too, else they restart exactly the work H2's hold paused.
+    // Fail-soft: no GT_PG_URL ⇒ no rig is ever held (pre-feature behaviour).
+    let held_rigs_source: Option<Arc<dyn gt_composition::auto_dispatch::HeldRigs>> =
+        match std::env::var("GT_PG_URL").ok().filter(|v| !v.is_empty()) {
+            Some(pg_url) => match gt_store_pg::WorkspacePool::connect(&pg_url, &ws_slug).await {
+                Ok(pool) => Some(Arc::new(gt_composition::auto_dispatch::CatalogHeldRigs::new(
+                    gt_rig::PgRigs::new(pool.pool().clone()),
+                )) as Arc<dyn gt_composition::auto_dispatch::HeldRigs>),
+                Err(e) => {
+                    eprintln!("[gt-orch-server] rig-hold (watchdogs) OFF — held-rigs pool connect failed: {e}");
+                    None
+                }
+            },
+            None => None,
+        };
     match std::env::var("GT_DOLT_URL")
         .ok()
         .filter(|v| !v.is_empty())
@@ -611,12 +660,18 @@ async fn main() -> anyhow::Result<()> {
         Some(store) => {
             let store = Arc::new(store);
             let handle = tokio::runtime::Handle::current();
+            let held_for_guard = held_rigs_source.clone();
             supervisor.set_bead_slingable(Box::new(move |bead: &str| {
                 let store = store.clone();
                 let bead = bead.to_string();
-                handle.block_on(
-                    async move { gt_composition::polecat::bead_should_sling(&store, &bead).await },
-                )
+                let held_for_guard = held_for_guard.clone();
+                handle.block_on(async move {
+                    let held = match &held_for_guard {
+                        Some(s) => s.held().await,
+                        None => std::collections::HashSet::new(),
+                    };
+                    gt_composition::polecat::bead_should_sling(&store, &bead, &held).await
+                })
             }));
             eprintln!("[gt-orch-server] slingability re-sling guard armed (Dolt-backed: closed/epic/manual dropped)");
         }
@@ -720,6 +775,15 @@ async fn main() -> anyhow::Result<()> {
     // the same pattern terminal.rs uses for interactive sessions.
     let knowledge_log = Arc::new(EventLog::new(Some(event_root_for_polecat)));
     pol_plugin = pol_plugin.with_event_log(knowledge_log.clone());
+    // rig-hold H3 (gtcore-9a84e6): the supervisor plugin's crash re-sling (boot re-hydration /
+    // stale dispatch) and CI-failure re-sling (sheriff) skip a bead whose rig is on hold — reusing
+    // the same source the dead-polecat guard above uses.
+    if let Some(source) = held_rigs_source.clone() {
+        pol_plugin = pol_plugin.with_held_rigs(source);
+        eprintln!(
+            "[gt-orch-server] rig-hold watchdog guard on — supervisor skips re-sling of held rigs (crash + CI-failure)"
+        );
+    }
     eprintln!("[gt-orch-server] Knowledge role prompt on — polecat CLAUDE.md from skills.* log");
     // Dolt issues store for the polecat sling → working transition + bead auto-close. Resolved
     // once and shared across both plugins. Env-gated on GT_DOLT_URL — without it the bead stays
@@ -921,6 +985,59 @@ async fn main() -> anyhow::Result<()> {
             None
         }
     };
+    // Rig VCS-connection health sweep (gtcore-406b12, epic gtcore-0e095b): ring the operator bell
+    // when a rig becomes unbound or its connection goes inactive (the dev data-wipe left the rigs
+    // unbound silently). Same GT_PG_URL-gated bell as escalations; gated additionally on
+    // GT_RIG_CONNECTION_CHECK_SECS > 0 (off by default). Self-contained loop, spawned here.
+    {
+        let check_secs = env_usize("GT_RIG_CONNECTION_CHECK_SECS", 0) as u64;
+        match (&deleg_bell_pool, check_secs) {
+            (Some(pool), secs) if secs > 0 => {
+                match std::env::var("GT_PG_URL")
+                    .ok()
+                    .filter(|v| !v.is_empty())
+                {
+                    Some(pg_url) => {
+                        match gt_composition::rig_connection_notify::PgRigHealthSource::connect(
+                            &pg_url,
+                            ws_slug.clone(),
+                        )
+                        .await
+                        {
+                            Ok(source) => {
+                                let notifier =
+                                    gt_composition::escalation_notify::OperatorNotifier::new(
+                                        pool.clone(),
+                                        knowledge_log.clone(),
+                                        ws_slug.clone(),
+                                    )
+                                    .with_public_url(
+                                        std::env::var("GT_PUBLIC_URL").unwrap_or_default(),
+                                    );
+                                let public_url =
+                                    std::env::var("GT_PUBLIC_URL").unwrap_or_default();
+                                eprintln!(
+                                    "[gt-orch-server] rig connection-health sweep on — operator bell every {secs}s when a rig is unbound/inactive"
+                                );
+                                let ticker = gt_composition::rig_connection_notify::RigConnectionHealthTicker::new(
+                                    std::sync::Arc::new(source),
+                                    notifier,
+                                    secs,
+                                    public_url,
+                                );
+                                tokio::spawn(ticker.run());
+                            }
+                            Err(e) => eprintln!(
+                                "[gt-orch-server] rig connection-health sweep OFF — pool connect failed: {e}"
+                            ),
+                        }
+                    }
+                    None => {}
+                }
+            }
+            _ => {}
+        }
+    }
     // Patrol bridge (gtcore-a33952 — C2): agent.spawned → lease, session-end/killed → close,
     // patrol.lease-expired → release_claim (Dolt CAS). Env-gated on GT_DOLT_URL — without it,
     // the bridge is off and crashed agents stay working until manual reconciliation.
@@ -976,13 +1093,35 @@ async fn main() -> anyhow::Result<()> {
                 let repo_dir = std::env::var("GT_REPO_DIR")
                     .ok()
                     .map(std::path::PathBuf::from);
-                let source =
+                let mut source =
                     gt_composition::auto_dispatch::FrontierSource::new(Arc::new(store), repo_dir);
+                // rig-hold H2 (gtcore-1f5e67): wire the rig catalog so a rig on `hold` has its
+                // ready+auto beads excluded from the frontier (both DIRECT and MAYOR modes consume
+                // this source). Fail-soft: no PG ⇒ holds simply never apply.
+                if let Some(pg_url) =
+                    std::env::var("GT_PG_URL").ok().filter(|v| !v.is_empty())
+                {
+                    match gt_store_pg::WorkspacePool::connect(&pg_url, &ws_slug).await {
+                        Ok(pool) => {
+                            source = source.with_held_rigs(Arc::new(
+                                gt_composition::auto_dispatch::CatalogHeldRigs::new(
+                                    gt_rig::PgRigs::new(pool.pool().clone()),
+                                ),
+                            ));
+                            eprintln!(
+                                "[gt-orch-server] rig-hold on — frontier excludes beads of rigs in dispatch_mode=hold"
+                            );
+                        }
+                        Err(e) => eprintln!(
+                            "[gt-orch-server] rig-hold OFF — held-rigs pool connect failed (holds not applied): {e}"
+                        ),
+                    }
+                }
                 if dispatch_via_mayor {
                     let (command, args, base_env, workdir) = mayor_launch;
                     let channel_root = std::env::var("GT_CHANNEL_ROOT")
                         .unwrap_or_else(|_| "/gt/.channels".to_string());
-                    let waker = gt_composition::mayor_dispatch::TmuxMayorWaker::new(
+                    let mut waker = gt_composition::mayor_dispatch::TmuxMayorWaker::new(
                         tmux.clone(),
                         ws_slug.clone(),
                         gt_composition::mayor_dispatch::DEFAULT_MAYOR_PREFIX,
@@ -992,6 +1131,18 @@ async fn main() -> anyhow::Result<()> {
                         base_env,
                         std::path::PathBuf::from(channel_root),
                     );
+                    // Resolve + validate the mayor's claude account at spawn, exactly like the
+                    // polecat sling (gtcore-559c50): without this the mayor inherits the static
+                    // boot-template CLAUDE_CONFIG_DIR and is born in 401 once that account's creds
+                    // expire. Quota gates rotation off a Limited/Blocked account; the proxy feeds
+                    // its spend into per-call quota truth.
+                    if let Some(kc) = &keychain {
+                        waker = waker.with_keychain(kc.clone());
+                    }
+                    waker = waker.with_quota(quota.clone());
+                    if let Some(url) = &anthropic_proxy_url {
+                        waker = waker.with_anthropic_proxy(url.clone());
+                    }
                     let dispatcher =
                         Arc::new(gt_composition::mayor_dispatch::MayorDispatcher::new(source, waker));
                     mayor_dispatch_task =
@@ -1029,6 +1180,51 @@ async fn main() -> anyhow::Result<()> {
         None
     };
 
+    // --- Trigger-driven role agents (gtcore-999795) ---
+    // sheriff/witness/deacon run as AGENTS WITH CRITERION — slung single-shot ONLY when their trigger
+    // fires (sheriff ← merge.failed.v1/merge.ready.v1; witness ← issues.closed.v1; deacon ← a health
+    // tick), with single-flight per role so a burst can't sling a racing herd. Between triggers there
+    // is no live session, so idle cost is ≈0 tokens. The launcher gives each agent its own per-session
+    // workdir (under the polecat worktree root) with a least-privilege `.mcp.json`, so concurrent role
+    // agents never race on a shared token. Registered on the SAME relay as the polecat sling so it
+    // observes the same hub. GT_ROLE_AGENTS off ⇒ the legacy in-process loops + witness safety-net
+    // stand unchanged. The returned dispatcher is shared with the deacon health-tick timer below.
+    let role_dispatcher: Option<Arc<RoleAgentDispatcher>> = match role_template {
+        Some(role_template) => {
+            let mut launcher = SpecRoleLauncher::new(role_template, tmux.clone())
+                .with_workspace(ws_slug.clone())
+                .with_session_events(handle.events_sender());
+            if let Some(tm) = role_agent_token {
+                launcher = launcher.with_agent_token(tm);
+            }
+            if let Some(kc) = &keychain {
+                launcher = launcher.with_keychain(kc.clone());
+            }
+            match std::env::var("GT_SELF_URL").ok().filter(|v| !v.is_empty()) {
+                Some(url) => launcher = launcher.with_server_url(url),
+                None => eprintln!(
+                    "[gt-orch-server] role agents: GT_SELF_URL unset — role sessions get no .mcp.json (gt MCP tools unavailable)"
+                ),
+            }
+            if let Some(root) = &polecat_worktree_root {
+                launcher = launcher.with_session_root(root.clone());
+            }
+            let dispatcher =
+                Arc::new(RoleAgentDispatcher::new(ws_slug.clone(), Arc::new(launcher)));
+            pol_registry = pol_registry.register(RoleAgentPlugin::new(dispatcher.clone()));
+            eprintln!(
+                "[gt-orch-server] role agents ON — sheriff←merge.failed/ready, witness←issues.closed, deacon←health tick (single-shot, single-flight, idle≈0 tokens)"
+            );
+            Some(dispatcher)
+        }
+        None => {
+            eprintln!(
+                "[gt-orch-server] role agents OFF — set GT_ROLE_AGENTS=1 (sheriff/witness/deacon stay in-process loops + witness safety-net)"
+            );
+            None
+        }
+    };
+
     let pol_registry = Arc::new(pol_registry);
     let pol_relay = spawn_plugin_relay(handle.subscribe_events(), pol_registry);
     // All observers are live — kick the scheduler so hydrated beads pump Dispatched events.
@@ -1038,12 +1234,38 @@ async fn main() -> anyhow::Result<()> {
         allocator.lock().expect("pool mutex").host_cap()
     );
 
+    // Restart recovery (gtcore-c15018): slots still in `Merging` after rehydration are orphans —
+    // the refinery died mid-merge and will never call `fail`, so `merge.failed.v1` would never
+    // reach the hub and the sheriff would never fire. Emit the failure now while pol_relay is
+    // already subscribed so the sheriff fires and drives the board back to health autonomously.
+    {
+        let orphaned: Vec<_> = merge
+            .snapshot()
+            .await
+            .into_iter()
+            .filter(|s| s.state == gt_merge::MergeSlotState::Merging)
+            .map(|s| s.bead.clone())
+            .collect();
+        if !orphaned.is_empty() {
+            eprintln!(
+                "[gt-orch-server] restart recovery — {} orphaned merging slot(s) → emitting merge.failed.v1: {}",
+                orphaned.len(),
+                orphaned.join(", ")
+            );
+            for bead in orphaned {
+                merge.fail(bead, "orchd restart — orphaned merging slot").await;
+            }
+        }
+    }
+
     // Supervision + capacity timer: re-sling dead polecats (PolecatSupervisor::tick) and refresh
     // the host admission cap from live CPU + RAM, every GT_POLECAT_TICK_SECS (default 15s).
     let tick_secs = env_usize("GT_POLECAT_TICK_SECS", 15) as u64;
     let sup_timer = supervisor.clone();
     let alloc_timer = allocator.clone();
     let heartbeat_log = Arc::new(EventLog::new(Some(event_root_for_heartbeat)));
+    // Shared with the refinery lifecycle emitter below (same log root, cheap Arc clone).
+    let refinery_log = Arc::clone(&heartbeat_log);
     let heartbeat_ws = ws_slug.clone();
     let pol_timer = tokio::spawn(async move {
         let mut tick = tokio::time::interval(Duration::from_secs(tick_secs));
@@ -1163,6 +1385,25 @@ async fn main() -> anyhow::Result<()> {
         })
     });
 
+    // Deacon health-tick timer (gtcore-999795): the deacon trigger is time-driven, not event-driven,
+    // so a timer drives it on the SAME shared dispatcher the relay plugin holds. Each fire slings a
+    // single-shot deacon (single-flight absorbs a fire while one is still live), which scans flow
+    // health read-only and escalates. Only spawned when role agents are on. Default 900s (15 min) —
+    // a health sweep, not a hot loop — and the first fire is skipped (nothing to scan at boot).
+    let deacon_timer = role_dispatcher.as_ref().map(|dispatcher| {
+        let dispatcher = dispatcher.clone();
+        let deacon_tick_secs = env_usize("GT_DEACON_TICK_SECS", 900) as u64;
+        eprintln!("[gt-orch-server] deacon health tick every {deacon_tick_secs}s");
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(Duration::from_secs(deacon_tick_secs));
+            tick.tick().await; // skip the immediate first fire (nothing to scan at boot)
+            loop {
+                tick.tick().await;
+                dispatcher.on_trigger(&RoleTrigger::HealthTick);
+            }
+        })
+    });
+
     eprintln!(
         "[gt-orch-server] reactor loops on — patrol tick {patrol_tick_secs}s (lease timeout {lease_timeout}s), quota tick {quota_tick_secs}s (threshold {quota_threshold}s)"
     );
@@ -1274,6 +1515,7 @@ async fn main() -> anyhow::Result<()> {
     // the merge actor, under a restart+backoff supervisor (gt-core agents may instead submit via
     // the MCP merge.submit path — both feed the same event-sourced board). Absent/unopenable
     // channel ⇒ the loop is disabled and the daemon still boots.
+    let refinery_ws = ws_slug.clone();
     let refinery_task = match Channel::open(&channel_root, &merge_ready_channel) {
         Ok(channel) => {
             eprintln!(
@@ -1281,6 +1523,28 @@ async fn main() -> anyhow::Result<()> {
                 channel.dir().display()
             );
             Some(tokio::spawn(async move {
+                let session = format!("refinery-{refinery_ws}");
+                let ws_opt = Some(refinery_ws.as_str());
+                // Announce the refinery as a live role session (gtcore-cd9a14): emits
+                // agent.spawned.v1 so it appears in agent_list/audit like any other role.
+                // maintains_heartbeat=false → the session reconciler won't kill it on
+                // missing heartbeat; it stays visible until session-end at shutdown.
+                if let Err(e) = refinery_log.append(
+                    ws_opt,
+                    gt_agent::AgentEvent::Spawned {
+                        session: session.clone(),
+                        rig: refinery_ws.clone(),
+                        role: gt_agent::SessionRole::Dog(gt_agent::DogKind::Refinery),
+                        crew: None,
+                        spawned_by: None,
+                        skills: vec![],
+                        hooks: vec![],
+                        maintains_heartbeat: false,
+                        tmux_socket: None,
+                    },
+                ) {
+                    eprintln!("[gt-orch-server] refinery: agent.spawned append failed: {e}");
+                }
                 let mut tracker = RestartTracker::new(RestartConfig::default());
                 let make = || {
                     let channel = channel.clone();
@@ -1293,6 +1557,13 @@ async fn main() -> anyhow::Result<()> {
                 };
                 gt_polecat::supervise_daemon("refinery", make, &mut tracker, u32::MAX, now_secs)
                     .await;
+                // Emit session-end when the loop exits (channel closed or daemon shutdown).
+                if let Err(e) = refinery_log.append(
+                    ws_opt,
+                    gt_agent::AgentEvent::SessionEnd { session },
+                ) {
+                    eprintln!("[gt-orch-server] refinery: agent.session-end append failed: {e}");
+                }
             }))
         }
         Err(e) => {
@@ -1474,6 +1745,9 @@ async fn main() -> anyhow::Result<()> {
 
     patrol_timer.abort();
     quota_timer.abort();
+    if let Some(task) = &deacon_timer {
+        task.abort();
+    }
     delegation_timer.abort();
     if let Some(task) = &escalation_timer {
         task.abort();
@@ -1504,6 +1778,9 @@ async fn main() -> anyhow::Result<()> {
     }
     let _ = patrol_timer.await;
     let _ = quota_timer.await;
+    if let Some(task) = deacon_timer {
+        let _ = task.await;
+    }
     let _ = delegation_timer.await;
     if let Some(task) = escalation_timer {
         let _ = task.await;

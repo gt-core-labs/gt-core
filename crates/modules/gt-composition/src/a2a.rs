@@ -622,7 +622,11 @@ impl BeadIntake for DoltIntake {
             parent_id: Some(req.parent_id),
             assignee: None,
             owner: None,
-            domain: self.domain.clone(),
+            // H2 (gtcore-d81e77): the wire `domain` is now free strings validated
+            // at runtime against the workspace catalog; map the typed config enum
+            // to its dotted key. `meta.gap` (the gateway default) is reserved in
+            // every catalog, so A2A-minted gap beads keep validating.
+            domain: self.domain.iter().map(|d| d.as_str().to_string()).collect(),
             surface: Vec::new(),
             depends_on: Vec::new(),
             role_scope: None,

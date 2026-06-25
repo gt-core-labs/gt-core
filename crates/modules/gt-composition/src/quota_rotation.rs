@@ -295,11 +295,14 @@ impl QuotaRotationPlugin {
         self.quota
             .soft_drained(at_risk.to_string(), target.clone(), now_secs())
             .await;
-        // No credential hot-swap here (cf. rotate_away_from): in-flight polecats keep running on
-        // `at_risk` and drain it naturally; only the pointer for new slings moved to `target`.
+        // Hot credential swap (gtcore-98e14f gap #3): copy the new account's token into every
+        // in-flight polecat backed by `at_risk` so they continue without hitting the 429 wall.
+        // Unlike the old "drain naturally" contract, rotating creds in-flight at soft_pct avoids
+        // the polecat stalling into a rate-limit dialog before the window resets.
+        self.hot_swap_in_flight(at_risk, &target);
         eprintln!(
             "[quota-rotation] soft-drain {at_risk} → {target}: new slings use {target}, \
-             in-flight work drains on {at_risk}"
+             in-flight polecats hot-swapped to {target}"
         );
         Ok(())
     }
@@ -618,6 +621,7 @@ async fn apply_feed(quota: &QuotaHandle, p: QuotaFeedPayload) {
                     last_probe_secs: None,
                     sampled_since_probe: 0.0,
                     probe_divergence: None,
+                    credential_dead: false,
                 })
                 .await;
         }
@@ -661,6 +665,7 @@ async fn apply_feed(quota: &QuotaHandle, p: QuotaFeedPayload) {
                         last_probe_secs: None,
                         sampled_since_probe: 0.0,
                         probe_divergence: None,
+                        credential_dead: false,
                     })
                     .await;
             }
@@ -908,6 +913,7 @@ mod tests {
                 last_probe_secs: None,
                 sampled_since_probe: 0.0,
                 probe_divergence: None,
+                credential_dead: false,
             })
             .await;
         // A sample sets the burn-rate EWMA (0 tokens ⇒ consumed unchanged, rate = consumed/elapsed).
@@ -1005,6 +1011,7 @@ mod tests {
                 last_probe_secs: None,
                 sampled_since_probe: 0.0,
                 probe_divergence: None,
+                credential_dead: false,
             })
             .await;
         apply_feed(
@@ -1080,6 +1087,7 @@ mod tests {
                 last_probe_secs: None,
                 sampled_since_probe: 0.0,
                 probe_divergence: None,
+                credential_dead: false,
             })
             .await;
         // Simulate the actor receiving a 429 (sets status = Blocked).
