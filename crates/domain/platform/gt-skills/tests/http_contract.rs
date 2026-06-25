@@ -250,3 +250,26 @@ async fn catalog_is_per_tenant() {
         "acme's skill is invisible to other"
     );
 }
+
+#[tokio::test]
+async fn drift_report_compares_embedded_seed_against_the_live_catalog() {
+    // gtcore-63bb20: GET /drift compares the binary's embedded greenfield seed against the caller's
+    // live catalog. A live catalog that lacks the seed's roles/skills (here: a single unrelated
+    // skill) drifts — the seed roles show up as `missing_in_live`.
+    let app = router(MemProvider::new().seed("acme", &[skill("merge_admin", &["merge.read"])]));
+    let (status, body) = send(&app, get_in("acme", "/drift")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["drift"], true, "embedded seed differs from the sparse live catalog");
+    // A known seeded role the live catalog lacks is reported as missing-in-live.
+    let mayor = body["report"]["roles"]
+        .as_array()
+        .expect("roles array")
+        .iter()
+        .find(|r| r["role"] == "mayor")
+        .expect("mayor drift reported");
+    assert_eq!(mayor["status"], "missing_in_live");
+    assert!(
+        body["summary"].as_str().unwrap().contains("drift"),
+        "summary names the drift"
+    );
+}

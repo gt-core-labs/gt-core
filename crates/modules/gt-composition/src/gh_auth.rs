@@ -119,6 +119,23 @@ fn remote_token(rig: &Path) -> Option<String> {
     find_github_token(url.trim())
 }
 
+/// Resolve a GitHub token for embedding into a clone URL — env-only, so it works before any
+/// checkout exists. Same priority chain as [`seed_gh_auth`] minus the remote-scan step (step 3,
+/// which needs a worktree): `GH_TOKEN` → `GH_ENTERPRISE_TOKEN` → `GT_RIG_GIT_TOKEN`. Returns the
+/// trimmed token, or `None` when none is set. Used by `provision_rig_checkouts` (gtcore-abfe8a) to
+/// give a freshly-cloned rig checkout a push-capable `origin` in the helperless orchd pod.
+pub fn rig_token_from_env() -> Option<String> {
+    for var in ["GH_TOKEN", "GH_ENTERPRISE_TOKEN", "GT_RIG_GIT_TOKEN"] {
+        if let Ok(v) = std::env::var(var) {
+            let v = v.trim();
+            if !v.is_empty() {
+                return Some(v.to_string());
+            }
+        }
+    }
+    None
+}
+
 /// Seed `GH_TOKEN` into the current process env so `gh` is authenticated for the lifetime of the
 /// orchd, surviving the wiped `$HOME/.config/gh`. Call once at boot, before the merge edge can fire.
 /// Returns where the token came from for logging. Best-effort: never panics, never aborts boot.

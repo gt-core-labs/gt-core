@@ -119,6 +119,9 @@ simple_asn1 = "0.6"
 # pgvector binding for the phase-2 semantic search column (hq-docs-search.2). `sqlx`
 # feature wires encode/decode of the `vector` type over the PG wire.
 pgvector = { version = "0.4", default-features = false, features = ["sqlx"] }
+# CommonMark/GFM markdown → HTML for the planning-digest email report (notas +
+# comment bodies). Pull-down parse + HTML renderer, no unsafe, no JS runtime.
+pulldown-cmark = { version = "0.12", default-features = false, features = ["html"] }
 
 # Date/time the document/share ports surface (`DateTime<Utc>`) + relative TTL arithmetic
 # (`Duration`) for share-link expiry (hq-web-extras.9). Same crate `sqlx` resolves via its

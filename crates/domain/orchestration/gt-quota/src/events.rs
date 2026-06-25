@@ -123,6 +123,17 @@ pub enum QuotaEvent {
         until_secs: Option<u64>,
         now_secs: u64,
     },
+    /// The usage-probe could not authenticate the account (gtcore-e09320): its access token is
+    /// expired with NO refresh token stored, or the OAuth token endpoint rejected the refresh.
+    /// The credential is DEAD — a polecat slung on it would be born into `401`. Distinct from
+    /// [`Self::Blocked`] (quota exhausted, time-healing): a dead credential only recovers via
+    /// `quota.relogin`. Latches `Account::credential_dead` until the next successful
+    /// [`Self::UsageProbed`] clears it, so the deadness is observable on `quota.list` instead of
+    /// only living in the prober's stderr.
+    CredentialDead {
+        account: String,
+        now_secs: u64,
+    },
     /// A claude account was onboarded for rotation (`hq-quota-accounts.1`): its id plus the
     /// `config_dir` (a `CLAUDE_CONFIG_DIR` holding that account's logged-in creds). The durable,
     /// event-sourced replacement for the boot-time `GT_CLAUDE_ACCOUNTS` env — the daemon rebuilds
@@ -205,6 +216,7 @@ impl EventKind for QuotaEvent {
             QuotaEvent::AllExhausted { .. } => "quota.all_exhausted.v1",
             QuotaEvent::AccountRecovered { .. } => "quota.account_recovered.v1",
             QuotaEvent::Blocked { .. } => "quota.blocked.v1",
+            QuotaEvent::CredentialDead { .. } => "quota.credential_dead.v1",
             QuotaEvent::AccountRegistered { .. } => "quota.account_registered.v1",
             QuotaEvent::AccountDeregistered { .. } => "quota.account_deregistered.v1",
             // Per-session budget lifecycle (B1, gtcore-ab170f). Born versioned + kebab — no

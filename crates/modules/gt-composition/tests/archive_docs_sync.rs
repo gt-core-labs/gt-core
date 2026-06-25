@@ -49,6 +49,7 @@ async fn archived_epic_docs_are_soft_deleted_by_the_sweep() {
         eprintln!("GT_DOLT_URL / GT_PG_URL unset; skipping archive-docs-sync e2e (stores not up)");
         return;
     };
+    gt_store_pg::assert_ephemeral_pg_url(&pg);
     let dolt_base = dolt_base.trim_end_matches('/').to_string();
 
     // --- Dolt: an epic, closed and backdated past the cutoff. ---

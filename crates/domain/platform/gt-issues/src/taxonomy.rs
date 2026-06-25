@@ -136,6 +136,133 @@ pub enum Domain {
     MetaGap,
 }
 
+impl Domain {
+    /// Every variant, in declaration order. The single source of truth for the
+    /// technical domain set — the per-workspace `domain_catalog` seed for the
+    /// `default`/gtcore workspace is built from this slice (gtcore-55d5fb H1) so
+    /// the catalog can never silently diverge from the enum. Adding a `Domain`
+    /// variant extends the seed automatically.
+    pub const ALL: &'static [Domain] = &[
+        Self::KernelEvents,
+        Self::KernelBus,
+        Self::KernelAudit,
+        Self::KernelTelemetry,
+        Self::KernelPlugin,
+        Self::KernelChannel,
+        Self::KernelRoot,
+        Self::KernelGraphindex,
+        Self::LifecycleAgent,
+        Self::LifecyclePolecat,
+        Self::OrchScheduling,
+        Self::OrchPatrol,
+        Self::OrchMerge,
+        Self::OrchQuota,
+        Self::OrchConvoy,
+        Self::OrchLogin,
+        Self::PlatformFeed,
+        Self::PlatformNotify,
+        Self::PlatformRig,
+        Self::PlatformWisp,
+        Self::PlatformSkills,
+        Self::PlatformTerminal,
+        Self::PlatformDocuments,
+        Self::RoleSheriff,
+        Self::RoleDeacon,
+        Self::RoleRefinery,
+        Self::RoleWitness,
+        Self::RoleMayor,
+        Self::RoleGraphwarden,
+        Self::BinGt,
+        Self::BinGtWeb,
+        Self::BinGtMcp,
+        Self::BinGtMcpCli,
+        Self::BinGtMcpServer,
+        Self::StoreDolt,
+        Self::StorePg,
+        Self::StoreBeads,
+        Self::StoreBlob,
+        Self::FeWeb,
+        Self::FeDocs,
+        Self::DeployCompose,
+        Self::DeployDolt,
+        Self::DeployK8s,
+        Self::DeployTalos,
+        Self::DocsSpec,
+        Self::MetaGap,
+    ];
+
+    /// The dotted wire/store form (the `#[serde(rename)]`), e.g.
+    /// `Domain::OrchMerge` → `"orch.merge"`. Matches the JSON form
+    /// [`Serialize`] produces, but without going through serde — the catalog
+    /// seed and any non-JSON consumer (SQL keys) read the canonical key here.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::KernelEvents => "kernel.events",
+            Self::KernelBus => "kernel.bus",
+            Self::KernelAudit => "kernel.audit",
+            Self::KernelTelemetry => "kernel.telemetry",
+            Self::KernelPlugin => "kernel.plugin",
+            Self::KernelChannel => "kernel.channel",
+            Self::KernelRoot => "kernel.root",
+            Self::KernelGraphindex => "kernel.graphindex",
+            Self::LifecycleAgent => "lifecycle.agent",
+            Self::LifecyclePolecat => "lifecycle.polecat",
+            Self::OrchScheduling => "orch.scheduling",
+            Self::OrchPatrol => "orch.patrol",
+            Self::OrchMerge => "orch.merge",
+            Self::OrchQuota => "orch.quota",
+            Self::OrchConvoy => "orch.convoy",
+            Self::OrchLogin => "orch.login",
+            Self::PlatformFeed => "platform.feed",
+            Self::PlatformNotify => "platform.notify",
+            Self::PlatformRig => "platform.rig",
+            Self::PlatformWisp => "platform.wisp",
+            Self::PlatformSkills => "platform.skills",
+            Self::PlatformTerminal => "platform.terminal",
+            Self::PlatformDocuments => "platform.documents",
+            Self::RoleSheriff => "role.sheriff",
+            Self::RoleDeacon => "role.deacon",
+            Self::RoleRefinery => "role.refinery",
+            Self::RoleWitness => "role.witness",
+            Self::RoleMayor => "role.mayor",
+            Self::RoleGraphwarden => "role.graphwarden",
+            Self::BinGt => "bin.gt",
+            Self::BinGtWeb => "bin.gt-web",
+            Self::BinGtMcp => "bin.gt-mcp",
+            Self::BinGtMcpCli => "bin.gt-mcp-cli",
+            Self::BinGtMcpServer => "bin.gt-mcp-server",
+            Self::StoreDolt => "store.dolt",
+            Self::StorePg => "store.pg",
+            Self::StoreBeads => "store.beads",
+            Self::StoreBlob => "store.blob",
+            Self::FeWeb => "fe.web",
+            Self::FeDocs => "fe.docs",
+            Self::DeployCompose => "deploy.compose",
+            Self::DeployDolt => "deploy.dolt",
+            Self::DeployK8s => "deploy.k8s",
+            Self::DeployTalos => "deploy.talos",
+            Self::DocsSpec => "docs.spec",
+            Self::MetaGap => "meta.gap",
+        }
+    }
+
+    /// The coarse tier prefix of the dotted key (`kernel`, `orch`, `platform`,
+    /// `role`, `bin`, `store`, `fe`, `deploy`, `docs`, `meta`) — the segment
+    /// before the first `.`. The catalog stores this as the optional `tier`
+    /// column so a UI can group domains without re-parsing the key.
+    pub fn tier(self) -> &'static str {
+        self.as_str().split('.').next().unwrap_or("")
+    }
+
+    /// Whether this domain is RESERVED — present in every catalog and not an
+    /// operator-editable business domain. `meta.gap` is the reserved domain the
+    /// auto-created gap beads carry (gtcore-55d5fb H1); a reserved row is seeded
+    /// into every workspace catalog (technical and template alike).
+    pub fn is_reserved(self) -> bool {
+        matches!(self, Self::MetaGap)
+    }
+}
+
 /// A bead's `issue_type` — a CLOSED set (hq-48ca5c), same rationale as
 /// [`Domain`]: a free-form string let any value (`"banana"`) pass shape
 /// validation, while `domain` and `phase` were already closed. Typing the wire
@@ -383,6 +510,40 @@ mod tests {
         assert!(serde_json::from_str::<RoleScope>("\"Sheriff\"").is_err());
         // The dotted Domain form is NOT the role_scope wire form.
         assert!(serde_json::from_str::<RoleScope>("\"role.sheriff\"").is_err());
+    }
+
+    #[test]
+    fn all_matches_serde_wire_form_and_has_no_dupes() {
+        use std::collections::HashSet;
+        // `as_str` must agree with serde's `#[serde(rename)]` for every variant
+        // in `ALL` — they are the two faces of the same wire name, and the
+        // catalog seed relies on `as_str` matching what the write path validates.
+        let mut seen = HashSet::new();
+        for &d in Domain::ALL {
+            let via_serde = serde_json::to_string(&d).unwrap();
+            let via_as_str = format!("\"{}\"", d.as_str());
+            assert_eq!(via_serde, via_as_str, "as_str diverges from serde for {d:?}");
+            assert!(seen.insert(d.as_str()), "duplicate key {} in Domain::ALL", d.as_str());
+            // Round-trip back from the wire form to catch a missing ALL entry's twin.
+            let back: Domain = serde_json::from_str(&via_as_str).unwrap();
+            assert_eq!(back, d);
+        }
+        // The technical set the bead documents (~45 values) — pin the count so a
+        // dropped variant trips the test rather than silently shrinking the seed.
+        assert_eq!(Domain::ALL.len(), 46);
+    }
+
+    #[test]
+    fn meta_gap_is_the_reserved_domain() {
+        assert!(Domain::MetaGap.is_reserved());
+        assert_eq!(Domain::MetaGap.as_str(), "meta.gap");
+        assert_eq!(Domain::MetaGap.tier(), "meta");
+        // Exactly one reserved domain in the technical set.
+        assert_eq!(Domain::ALL.iter().filter(|d| d.is_reserved()).count(), 1);
+        // A non-reserved sample, and tier extraction.
+        assert!(!Domain::OrchMerge.is_reserved());
+        assert_eq!(Domain::OrchMerge.tier(), "orch");
+        assert_eq!(Domain::KernelGraphindex.tier(), "kernel");
     }
 
     #[test]

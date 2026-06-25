@@ -79,18 +79,13 @@ impl ReportHandler {
             .ok_or_else(|| AppError::Validation("report scheduler off (GT_PG_URL unset)".into()))
     }
 
-    /// The workspace whose GLOBAL subscriber list the subscriber tools manage:
-    /// the first schedule's, else `default`.
-    async fn report_workspace(
-        svc: &Arc<crate::report_scheduler::ReportService>,
-    ) -> String {
-        svc.config
-            .read()
-            .await
-            .report_schedules
-            .first()
-            .map(|s| s.workspace.clone())
-            .unwrap_or_else(|| "default".to_string())
+    /// The workspace whose GLOBAL subscriber list the subscriber tools manage.
+    /// Tenant-bound to the MCP session (gtcore-00325f): the actor's own
+    /// workspace, falling back to `default` only when the session is unscoped.
+    /// (Pre-H3 this read the first schedule's workspace globally — which leaked
+    /// one tenant's subscriber list into another's session.)
+    fn report_workspace(ws: Option<&str>) -> String {
+        ws.unwrap_or("default").to_string()
     }
 
     async fn tracker(&self, ws: Option<&str>) -> Result<Arc<DoltIssues>, AppError> {
@@ -405,7 +400,7 @@ impl DomainHandler for ReportHandler {
             }
             "report.subscribers.list" => {
                 let svc = self.scheduler()?;
-                let workspace = Self::report_workspace(svc).await;
+                let workspace = Self::report_workspace(ctx.workspace);
                 let subs = svc
                     .subscribers()
                     .list(&workspace)
@@ -424,7 +419,7 @@ impl DomainHandler for ReportHandler {
                 if !email.contains('@') {
                     return Err(AppError::Validation(format!("`{email}` is not an address")));
                 }
-                let workspace = Self::report_workspace(svc).await;
+                let workspace = Self::report_workspace(ctx.workspace);
                 svc.subscribers()
                     .add(&workspace, &email)
                     .await
@@ -434,7 +429,7 @@ impl DomainHandler for ReportHandler {
             "report.subscribers.remove" => {
                 let svc = self.scheduler()?;
                 let email = str_arg(&ctx.args, "email")?.trim().to_string();
-                let workspace = Self::report_workspace(svc).await;
+                let workspace = Self::report_workspace(ctx.workspace);
                 svc.subscribers()
                     .remove(&workspace, &email)
                     .await
@@ -449,7 +444,7 @@ impl DomainHandler for ReportHandler {
                     .get("enabled")
                     .and_then(Value::as_bool)
                     .ok_or_else(|| AppError::Validation("`enabled` (boolean) required".into()))?;
-                let workspace = Self::report_workspace(svc).await;
+                let workspace = Self::report_workspace(ctx.workspace);
                 svc.subscribers()
                     .set_enabled(&workspace, &email, enabled)
                     .await
@@ -458,7 +453,9 @@ impl DomainHandler for ReportHandler {
             }
             "report.schedules.list" => {
                 let svc = self.scheduler()?;
-                let schedules = svc.list_schedules().await;
+                // Tenant-scoped (gtcore-00325f): only the session workspace's
+                // schedules are visible — a cotrafa schedule never shows in default.
+                let schedules = svc.list_schedules(ctx.workspace).await;
                 Ok(json!({ "schedules": schedules }))
             }
             "report.schedules.create" => {
@@ -466,7 +463,11 @@ impl DomainHandler for ReportHandler {
                 let patch: crate::report_scheduler::SchedulePatch =
                     serde_json::from_value(ctx.args.clone())
                         .map_err(|e| AppError::Validation(format!("bad schedule args: {e}")))?;
-                let s = svc.create_schedule(patch).await.map_err(AppError::Validation)?;
+                // Stamp the session workspace; cross-tenant `workspace` rejected.
+                let s = svc
+                    .create_schedule(ctx.workspace, patch)
+                    .await
+                    .map_err(AppError::Validation)?;
                 serde_json::to_value(&s)
                     .map_err(|e| AppError::Other(format!("encode schedule: {e}")))
             }
@@ -480,14 +481,19 @@ impl DomainHandler for ReportHandler {
                 let patch: crate::report_scheduler::SchedulePatch =
                     serde_json::from_value(args)
                         .map_err(|e| AppError::Validation(format!("bad schedule args: {e}")))?;
-                let s = svc.update_schedule(&id, patch).await.map_err(AppError::Validation)?;
+                let s = svc
+                    .update_schedule(ctx.workspace, &id, patch)
+                    .await
+                    .map_err(AppError::Validation)?;
                 serde_json::to_value(&s)
                     .map_err(|e| AppError::Other(format!("encode schedule: {e}")))
             }
             "report.schedules.delete" => {
                 let svc = self.scheduler()?;
                 let id = str_arg(&ctx.args, "id")?.trim().to_string();
-                svc.delete_schedule(&id).await.map_err(AppError::Validation)?;
+                svc.delete_schedule(ctx.workspace, &id)
+                    .await
+                    .map_err(AppError::Validation)?;
                 Ok(json!({ "ok": true }))
             }
             "report.kinds.list" => {
@@ -496,8 +502,10 @@ impl DomainHandler for ReportHandler {
             "report.send-now" => {
                 let svc = self.scheduler()?;
                 let id = ctx.args.get("schedule_id").and_then(Value::as_str);
-                let schedule =
-                    svc.resolve_schedule(id).await.map_err(AppError::Validation)?;
+                let schedule = svc
+                    .resolve_schedule(ctx.workspace, id)
+                    .await
+                    .map_err(AppError::Validation)?;
                 let queued = svc
                     .send_schedule(&schedule, ctx.actor)
                     .await

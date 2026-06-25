@@ -127,8 +127,9 @@ impl OperatorNotifier {
     }
 
     /// Best-effort bell: insert the row, then mirror it to the SSE log. Never errors — a
-    /// notification problem must not break a relay or a tick.
-    async fn ring(&self, title: &str, body: &str, kind: &str) {
+    /// notification problem must not break a relay or a tick. `pub(crate)` so sibling tickers
+    /// (e.g. [`crate::rig_connection_notify`]) ring the same operator bell.
+    pub(crate) async fn ring(&self, title: &str, body: &str, kind: &str) {
         let row: Result<(String,), _> = sqlx::query_as(
             "INSERT INTO notifications (workspace, from_role, title, body, kind) \
              VALUES ($1, $2, $3, $4, $5) RETURNING id::text",

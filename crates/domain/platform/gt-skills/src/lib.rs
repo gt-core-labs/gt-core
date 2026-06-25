@@ -20,6 +20,9 @@
 
 pub mod actor;
 pub mod commands;
+/// Seed-vs-live drift detection (`gtcore-63bb20`): compare the embedded greenfield seed against the
+/// live `skills.*` catalog so a stale embedded snapshot can never rot silently.
+pub mod drift;
 pub mod presets;
 pub mod repo;
 
@@ -37,6 +40,7 @@ pub use commands::{
     DisableSkillForRole, EnableSkillForRole, RegisterSkill, RetireSkill, SetRoleModel,
     SetRolePrompt, SkillCommand, UpdateSkill, EFFORT_LEVELS, PERMISSION_MODES,
 };
+pub use drift::{compute_drift, seed_catalog, DriftReport, DriftStatus, RoleDrift, SkillDrift};
 pub use events::SkillEvent;
 #[cfg(feature = "axum")]
 pub use http::{skills_router, SkillWriter, SkillsApiState, WorkspaceSkills};
