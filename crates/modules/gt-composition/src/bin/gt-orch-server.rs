@@ -599,7 +599,7 @@ async fn main() -> anyhow::Result<()> {
             if let gt_composition::credential_guard::CredOutcome::Resolved { resolved, .. } =
                 gt_composition::credential_guard::resolve_for_sling(&kc, now_ms, |acc| {
                     quota_status.get(acc).copied()
-                })
+                }, |_| 100.0)
             {
                 set_env(&mut spec.env, "CLAUDE_CONFIG_DIR", resolved.config_dir);
                 set_env(
