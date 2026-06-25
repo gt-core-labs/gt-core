@@ -14,7 +14,7 @@ use sqlx::types::chrono::Utc;
 use chrono::Duration;
 use tokio::sync::Mutex;
 
-use gt_store_pg::{
+use gt_store_pg::{assert_ephemeral_pg_url, 
     email_migrations, EmailOutboxRepository, NewEmail, OutboxError, PgEmailOutbox,
 };
 
@@ -31,6 +31,7 @@ async fn repo_or_skip(test: &str) -> Option<(PgEmailOutbox, sqlx::PgPool)> {
         eprintln!("GT_PG_URL unset; skipping {test}");
         return None;
     };
+    assert_ephemeral_pg_url(&url);
     let pool = sqlx::PgPool::connect(&url).await.expect("connect");
     let mut conn = pool.acquire().await.expect("acquire");
     sqlx::query("SELECT pg_advisory_lock(4915623003)")

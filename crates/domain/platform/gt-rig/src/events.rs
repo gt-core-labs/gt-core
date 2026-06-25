@@ -83,6 +83,30 @@ pub enum RigEvent {
         new: Vec<String>,
         now_secs: u64,
     },
+    /// The rig's soft VCS-connection ref changed (gtcore-103958). `old`/`new` are the prior and
+    /// new `git_connection_ref` (`None` = unbound, the legacy operator-mounted token path). The
+    /// JIT installation-token mint is a runtime/deploy-edge concern; this event records only the
+    /// orchestrator's binding to a `public.vcs_connections.id`.
+    ConnectionChanged {
+        rig: String,
+        old: Option<String>,
+        new: Option<String>,
+        now_secs: u64,
+    },
+    /// The rig was put on dispatch hold (rig-hold H1, epic gtcore-4b7d56). Carries the operator's
+    /// `reason` for the audit trail; the reducer flips the rig's `dispatch_mode` to
+    /// [`Hold`](crate::DispatchMode::Hold). Emitted only on a real transition (auto → hold) — a
+    /// `rig.hold` on an already-held rig is an idempotent no-op that emits nothing, so the log
+    /// never carries a duplicate `rig.held.v1`.
+    Held {
+        rig: String,
+        reason: String,
+        now_secs: u64,
+    },
+    /// The rig was taken off dispatch hold (rig-hold H1). The reducer flips its `dispatch_mode`
+    /// back to [`Auto`](crate::DispatchMode::Auto). Like [`Held`](RigEvent::Held), emitted only on a
+    /// real transition (hold → auto); a `rig.resume` on an already-auto rig emits nothing.
+    Resumed { rig: String, now_secs: u64 },
 }
 
 impl EventKind for RigEvent {
@@ -95,6 +119,9 @@ impl EventKind for RigEvent {
             RigEvent::DefaultBranchChanged { .. } => "rig.default_branch_changed.v1",
             RigEvent::WorktreeRootChanged { .. } => "rig.worktree_root_changed.v1",
             RigEvent::TagsChanged { .. } => "rig.tags_changed.v1",
+            RigEvent::ConnectionChanged { .. } => "rig.connection_changed.v1",
+            RigEvent::Held { .. } => "rig.held.v1",
+            RigEvent::Resumed { .. } => "rig.resumed.v1",
         }
     }
 }

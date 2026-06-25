@@ -9,7 +9,7 @@
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use gt_store_pg::{
+use gt_store_pg::{assert_ephemeral_pg_url, 
     docs_migrations, DocChunksRepository, DocumentsRepository, NewChunk, NewDocument,
     PgDocChunks, PgDocuments, WorkspacePool,
 };
@@ -29,6 +29,7 @@ async fn repo_or_skip(test: &str) -> Option<(PgDocChunks, PgDocuments)> {
         eprintln!("GT_PG_URL unset; skipping {test}");
         return None;
     };
+    assert_ephemeral_pg_url(&url);
     let admin = sqlx::PgPool::connect(&url).await.expect("connect");
     let mut conn = admin.acquire().await.expect("acquire");
     sqlx::query("SELECT pg_advisory_lock(4915623005)")

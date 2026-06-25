@@ -135,6 +135,11 @@ pub struct IssuesServer {
     /// only when the pool is confirmed out of capacity. `None` keeps context mandatory,
     /// so the issues-only build is unchanged.
     quota_signal: Option<Arc<dyn QuotaBlockSignal>>,
+    /// Auto-complete merge slot hook (gtcore-71c575). `Some` when the composition root wires
+    /// the merge handler: after a successful `issues.close.execute` with a delivered_sha the
+    /// hook advances the bead's merge slot to `Merged`, preventing stale `failed` slots for
+    /// work already in main. `None` skips the side-effect (issues-only build unchanged).
+    close_hook: Option<Arc<dyn crate::dispatch::IssueClosedHook>>,
     /// Live-session push registry (gtcore-d366ff). `Some` when the composition root wires
     /// server→agent SSE push: each authorized `call_tool` registers the connection's peer
     /// under its actor + `Mcp-Session-Id`, so the bin's event-log observer can deliver
@@ -194,6 +199,7 @@ impl IssuesServer {
             documents: None,
             issue_sink: None,
             quota_signal: None,
+            close_hook: None,
             session_registry: None,
         }
     }
@@ -226,6 +232,16 @@ impl IssuesServer {
     /// capacity. Additive — without it, context stays mandatory for every `working` claim.
     pub fn with_quota_signal(mut self, signal: Arc<dyn QuotaBlockSignal>) -> Self {
         self.quota_signal = Some(signal);
+        self
+    }
+
+    /// Wire the merge-slot auto-complete hook (gtcore-71c575): after a successful
+    /// `issues.close.execute` with a `delivered_sha`, the hook advances the bead's
+    /// merge slot to `Merged`. Prevents stale `failed`/`ready` slots for work that
+    /// already landed in main via a different path. Additive — without it no slot is
+    /// touched on close (backward-compatible).
+    pub fn with_close_hook(mut self, hook: Arc<dyn crate::dispatch::IssueClosedHook>) -> Self {
+        self.close_hook = Some(hook);
         self
     }
 
@@ -713,6 +729,7 @@ impl ServerHandler for IssuesServer {
                         self.rig_prefixes.as_deref(),
                         self.issue_sink.as_deref(),
                         self.quota_signal.as_deref(),
+                        self.close_hook.as_deref(),
                     )
                     .await
                 }

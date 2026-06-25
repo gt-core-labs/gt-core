@@ -13,7 +13,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use chrono::Duration;
 use sqlx::types::chrono::Utc;
 
-use gt_store_pg::{invites_migrations, InviteError, InvitesRepository, NewInvite, PgInvites};
+use gt_store_pg::{assert_ephemeral_pg_url, invites_migrations, InviteError, InvitesRepository, NewInvite, PgInvites};
 
 fn nonce() -> u128 {
     SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos()
@@ -24,6 +24,7 @@ async fn repo_or_skip(test: &str) -> Option<PgInvites> {
         eprintln!("GT_PG_URL unset; skipping {test}");
         return None;
     };
+    assert_ephemeral_pg_url(&url);
     let pool = sqlx::PgPool::connect(&url).await.expect("connect");
     let mut conn = pool.acquire().await.expect("acquire");
     sqlx::query("SELECT pg_advisory_lock(4915623004)")

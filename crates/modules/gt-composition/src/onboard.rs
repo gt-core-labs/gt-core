@@ -53,6 +53,7 @@ use gt_events::Command;
 use gt_quota::{AccountRegistry, QuotaState, RegisterAccount};
 
 use crate::account_dirs::account_config_dir;
+use crate::worktree::seed_account_onboarding_complete;
 use crate::auth::SharedAuthenticator;
 use crate::denial_audit::{record_denial, SharedAudit, ANONYMOUS};
 use crate::mcp::eventlog::EventLog;
@@ -415,6 +416,12 @@ impl OnboardState {
         }
 
         let account = claude_auth_status_email(&dir).await?;
+        // Seed the onboarding-complete markers (hasCompletedOnboarding + bypass + theme +
+        // oauthAccount.emailAddress) so the freshly onboarded dir is immediately consumable by the
+        // sling and cred-health does not flag it `needs_relogin` — the SAME seed relogin.rs applies
+        // on its `complete`. `claude auth login` writes the credential + a partial oauthAccount but
+        // not the onboarding flags, so without this the dir wedges the first-run TUI at sling time.
+        seed_account_onboarding_complete(&dir, &account);
         let config_dir = dir.display().to_string();
         self.register(ws, &account, &config_dir)?;
         Ok(CompleteResponse {

@@ -14,6 +14,7 @@
 mod branch;
 mod commit;
 mod conn;
+mod domain_catalog;
 mod error;
 mod issues_repo;
 mod lock;
@@ -23,6 +24,10 @@ mod workspace;
 pub use branch::delete_branch;
 pub use commit::{commit, diff_summary, rollback};
 pub use conn::connect;
+pub use domain_catalog::{
+    generic_template, reserved_gap_entry, validate_domain_key, CatalogInit, DoltDomainCatalog,
+    DomainEntry, GENERIC_TEMPLATE, RESERVED_GAP_KEY,
+};
 pub use error::AppError;
 pub use lock::WorkspaceLock;
 pub use pool::{WorkspacePools, DEFAULT_MAX_CONNS_PER_WS};
