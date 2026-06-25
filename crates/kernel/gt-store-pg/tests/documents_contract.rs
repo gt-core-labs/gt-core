@@ -24,7 +24,7 @@
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use gt_store_pg::{docs_migrations, DocError, DocumentPatch, DocumentsRepository, NewDocument, PgDocuments, VectorStore, WorkspacePool};
+use gt_store_pg::{assert_ephemeral_pg_url, docs_migrations, DocError, DocumentPatch, DocumentsRepository, NewDocument, PgDocuments, VectorStore, WorkspacePool};
 
 /// Unique suffix so repeated runs against the same ephemeral DB never collide.
 fn nonce() -> u128 {
@@ -43,6 +43,7 @@ async fn repo_or_skip(test: &str) -> Option<PgDocuments> {
         eprintln!("GT_PG_URL unset; skipping {test}");
         return None;
     };
+    assert_ephemeral_pg_url(&url);
     let admin = sqlx::PgPool::connect(&url).await.expect("connect admin pool");
     let mut conn = admin.acquire().await.expect("acquire admin conn");
     sqlx::query("SELECT pg_advisory_lock(4915623001)")

@@ -78,6 +78,71 @@ pub mod memory_import;
 #[cfg(feature = "pg")]
 pub use memory_import::{import_corpus, ImportError, ImportReport};
 
+/// Fail-closed guard for PG-backed tests (gtcore-d43955).
+///
+/// Call this BEFORE opening any connection to a test database to ensure the URL is ephemeral.
+/// A URL is accepted when the host is `localhost`, `127.0.0.1`, or `::1`, or when the URL
+/// carries `gt_test_only=1` (the explicit opt-in for CI service URLs with non-loopback hosts).
+/// Everything else panics with a descriptive error before any SQL runs — making it impossible
+/// for tests to accidentally reach production/dev Postgres.
+///
+/// # Panics
+/// Panics when `url` does not look ephemeral, with a message that names the DSN and explains
+/// how to mark a CI service URL safe.
+pub fn assert_ephemeral_pg_url(url: &str) {
+    let ephemeral = url.contains("@localhost")
+        || url.contains("@127.0.0.1")
+        || url.contains("@[::1]")
+        || url.contains("gt_test_only=1");
+    if !ephemeral {
+        panic!(
+            "GT_PG_URL does not look ephemeral — refusing to run tests against \
+             a non-throwaway Postgres (production/dev wipe risk, see gtcore-d43955).\n\
+             URL host is not localhost / 127.0.0.1. To allow a CI service URL with \
+             a non-loopback host, append `?gt_test_only=1` to the DSN.\n\
+             Offending DSN: {url}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod dsn_guard_tests {
+    use super::assert_ephemeral_pg_url;
+
+    #[test]
+    fn localhost_passes() {
+        assert_ephemeral_pg_url("postgres://user:pw@localhost:5432/db");
+        assert_ephemeral_pg_url("postgresql://user@localhost/test");
+    }
+
+    #[test]
+    fn loopback_ipv4_passes() {
+        assert_ephemeral_pg_url("postgres://user:pw@127.0.0.1:5433/db");
+    }
+
+    #[test]
+    fn loopback_ipv6_passes() {
+        assert_ephemeral_pg_url("postgres://user:pw@[::1]:5432/db");
+    }
+
+    #[test]
+    fn explicit_marker_passes() {
+        assert_ephemeral_pg_url("postgres://user:pw@pg-service:5432/db?gt_test_only=1");
+    }
+
+    #[test]
+    #[should_panic(expected = "does not look ephemeral")]
+    fn prod_host_panics() {
+        assert_ephemeral_pg_url("postgres://gtapp:secret@gt-postgres:5432/gtapp");
+    }
+
+    #[test]
+    #[should_panic(expected = "does not look ephemeral")]
+    fn kubernetes_service_without_marker_panics() {
+        assert_ephemeral_pg_url("postgres://user:pw@postgres.svc.cluster.local:5432/db");
+    }
+}
+
 /// Canonical id of the bootstrap default workspace.
 ///
 /// A single workspace is seeded by the initial migration so the platform is

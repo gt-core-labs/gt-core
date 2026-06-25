@@ -74,6 +74,7 @@ async fn harness(
         eprintln!("GT_PG_URL unset; skipping {test}");
         return None;
     };
+    gt_store_pg::assert_ephemeral_pg_url(&url);
     let admin = sqlx::PgPool::connect(&url)
         .await
         .expect("connect admin pool");
