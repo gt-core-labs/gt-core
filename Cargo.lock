@@ -2118,6 +2118,7 @@ name = "gt-module-migrate"
 version = "0.1.0"
 dependencies = [
  "gt-module",
+ "gt-store-pg",
  "sqlx",
  "tokio",
 ]
