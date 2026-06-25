@@ -38,6 +38,9 @@ pub struct DispatchHandler {
     /// Per-workspace rig pools, used to resolve the rigs on dispatch hold (rig-hold H2) so the
     /// probe reflects the SAME frontier the orchd would sling. Absent ⇒ no holds applied.
     held_pools: Option<Arc<WsPools>>,
+    /// When wired, auto-completes the bead's merge slot after a successful close with a
+    /// `delivered_sha` — prevents stale `failed` slots for work already in main (gtcore-71c575).
+    merge: Option<Arc<super::MergeHandler>>,
 }
 
 impl DispatchHandler {
@@ -46,7 +49,14 @@ impl DispatchHandler {
             store,
             repo_dir,
             held_pools: None,
+            merge: None,
         }
+    }
+
+    /// Wire the merge handler so closed beads auto-complete their merge slot (gtcore-71c575).
+    pub fn with_merge(mut self, merge: Arc<super::MergeHandler>) -> Self {
+        self.merge = Some(merge);
+        self
     }
 
     /// Wire the per-workspace rig pools so the probe excludes held rigs (rig-hold H2, gtcore-1f5e67),

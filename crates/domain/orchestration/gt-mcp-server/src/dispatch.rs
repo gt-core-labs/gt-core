@@ -31,6 +31,19 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use crate::git_tree::{commit_inspector, surface_tree};
 use crate::prefixes::{bead_prefix, WorkspaceRigPrefixes};
 
+/// Side-effect hook called after a successful `issues.close.execute` (gtcore-71c575).
+///
+/// When a bead closes with a `delivered_sha`, any lingering merge slot for that bead should
+/// be auto-completed so it does not stay in `failed`/`ready`/`merging` state indefinitely.
+/// The composition root implements this via `MergeHandler::try_complete_slot`; the seam
+/// keeps `gt-mcp-server` free of a `gt-merge` dependency.
+pub trait IssueClosedHook: Send + Sync {
+    /// Called synchronously after the bead is closed. `delivered_sha` is `Some` when the bead
+    /// carries a code surface and the closing sha was supplied (or verified). Best-effort:
+    /// implementations must not panic or return errors that poison the close response.
+    fn on_closed(&self, ws: Option<&str>, bead: &str, delivered_sha: Option<&str>);
+}
+
 /// Map a serde deserialization error onto the domain error so a malformed tool
 /// payload surfaces as a validation failure (not a 500).
 fn parse_args<T: serde::de::DeserializeOwned>(args: Value) -> Result<T, AppError> {
@@ -147,6 +160,8 @@ pub async fn dispatch(
     // hq-context-custodian.2: the freshly-confirmed-block signal the claim-context
     // custodian consults on a `working` transition. `None` ⇒ context stays mandatory.
     quota_signal: Option<&dyn QuotaBlockSignal>,
+    // gtcore-71c575: auto-complete merge slot when bead closes with a delivered_sha.
+    close_hook: Option<&dyn IssueClosedHook>,
 ) -> Result<Value, AppError> {
     match tool {
         "issues.create.validate" => {
@@ -226,8 +241,15 @@ pub async fn dispatch(
             let inspector_ref = inspector
                 .as_ref()
                 .map(|i| i as &(dyn CommitInspector + Send + Sync));
+            let bead_id = a.id.clone();
+            let caller_sha = a.sha().map(str::to_string);
             run_close_issue(store, &a, actor, inspector_ref, false).await?;
-            emit_issue_event(sink, store, ws, IssueVerb::Closed, &a.id, actor).await;
+            emit_issue_event(sink, store, ws, IssueVerb::Closed, &bead_id, actor).await;
+            // Auto-complete the merge slot when the bead closes with a delivered sha
+            // (gtcore-71c575): prevents stale `failed` slots for work already in main.
+            if let Some(hook) = close_hook {
+                hook.on_closed(ws, &bead_id, caller_sha.as_deref());
+            }
             Ok(json!({ "ok": true }))
         }
         "issues.claim.validate" => {
