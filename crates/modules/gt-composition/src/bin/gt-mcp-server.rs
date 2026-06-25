@@ -389,7 +389,11 @@ async fn main() -> anyhow::Result<()> {
         // transition with no context is deferred (debt note) instead of stop-the-line ONLY
         // when the workspace pool is freshly out of capacity — read from the same per-workspace
         // quota event log the quota.* handler replays. Always on (the log is always present).
-        .with_quota_signal(Arc::new(QuotaBlockGuard::new(event_log.clone())));
+        .with_quota_signal(Arc::new(QuotaBlockGuard::new(event_log.clone())))
+        // Auto-complete merge slot on bead close (gtcore-71c575): when a bead closes with a
+        // delivered_sha, the close hook advances its merge slot to Merged so stale `failed`
+        // slots for work already in main are cleaned up automatically.
+        .with_close_hook(Arc::new(MergeHandler::new(event_log.clone())));
 
     // System config (hq-system-config) is loaded BEFORE the domain router so the
     // report-digest service (hq-84f93b) inside it and the /api/v1/system surface
@@ -1977,6 +1981,30 @@ async fn apply_pg_catalog(pool: &sqlx::PgPool) -> anyhow::Result<()> {
         .chain(connection_migs.iter().map(|m| (&connection_id, m)))
         .collect();
 
+    // Self-heal the `ws_default.rigs` TEMPLATE before applying the plan (gtcore-a80f74). The
+    // migration tracking table lives in `public` and survives a `DROP SCHEMA ws_default CASCADE`,
+    // so after such a drop `gt_module_migrate::apply` would SKIP the already-recorded `create_rigs`
+    // migration (never recreating the dropped table) and then abort boot when a pending follow-on
+    // `ALTER TABLE ws_default.rigs ADD COLUMN …` hits `relation "ws_default.rigs" does not exist`,
+    // crashlooping the whole server. Replaying the rigs module's fully idempotent DDL here
+    // UNCONDITIONALLY guarantees the table is present and complete regardless of what the tracking
+    // table claims — the same belt-and-suspenders self-heal `events`/`dispatch` already do via
+    // `ensure_schema`. The DDL is `CREATE …/ALTER … IF NOT EXISTS` only, so it never destroys data
+    // or clobbers existing rows.
+    //
+    // Run under a transaction-scoped advisory lock: this fires on EVERY boot across N mcp-server
+    // replicas (plus parallel tests), and concurrent `CREATE TABLE/ALTER … IF NOT EXISTS` against
+    // the same table races in Postgres. The lock makes provisioning a single-writer critical
+    // section; the key is arbitrary-but-fixed so every process contends on the same lock.
+    const RIGS_DDL_LOCK: i64 = 0x6774_7269_0001; // "gtri" + 1
+    let rigs_ensure = gt_rig::RigsModule::template_ensure_sql();
+    sqlx::raw_sql(&format!(
+        "BEGIN; SELECT pg_advisory_xact_lock({RIGS_DDL_LOCK}); {rigs_ensure} COMMIT;"
+    ))
+    .execute(pool)
+    .await
+    .context("self-heal ws_default.rigs template before migrations")?;
+
     let report = gt_module_migrate::apply(pool, &plan)
         .await
         .context("apply public-schema PG catalog migrations")?;
@@ -2424,10 +2452,13 @@ async fn build_domain_router(
             let repo_dir = std::env::var("GT_REPO_DIR")
                 .ok()
                 .map(std::path::PathBuf::from);
-            router.register(Arc::new(DispatchHandler::new(
-                Arc::new(dispatch_dolt),
-                repo_dir,
-            )))
+            let mut handler = DispatchHandler::new(Arc::new(dispatch_dolt), repo_dir);
+            // rig-hold H2 (gtcore-1f5e67): give the probe the per-workspace rig pools so it
+            // excludes held rigs, matching the orchd frontier. Fail-soft without GT_PG_URL.
+            if let Some(pg_url) = std::env::var("GT_PG_URL").ok().filter(|v| !v.is_empty()) {
+                handler = handler.with_held_rigs(Arc::new(WsPools::new(pg_url)));
+            }
+            router.register(Arc::new(handler))
         }
         None => {
             eprintln!("[gt-mcp-server] dispatch.* off — GT_DOLT_URL unset");

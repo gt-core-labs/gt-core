@@ -156,6 +156,7 @@ async fn all_seven_domain_namespaces_registered_and_respond() {
         eprintln!("GT_PG_URL unset — skipping hq-mcp-test.2 full 7-namespace proof");
         return;
     };
+    gt_store_pg::assert_ephemeral_pg_url(&pg_url);
     let pool = sqlx::PgPool::connect(&pg_url)
         .await
         .expect("connect postgres");

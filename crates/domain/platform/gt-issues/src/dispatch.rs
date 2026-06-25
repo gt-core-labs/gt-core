@@ -240,6 +240,11 @@ pub fn should_sling(status: &str, issue_type: &str, dispatch: Dispatch) -> bool 
 /// - `parents` / `dispatch_raw` — the two `child_of` + dispatch maps
 /// - `locked` — operator lock roots (from [`locked_roots`])
 /// - `occupied` — surfaces of `working` beads (from [`occupied_surfaces`])
+/// - `held_rigs` — rig names on dispatch hold (rig-hold H2, gtcore-1f5e67); a bead whose `rig`
+///   is in this set is excluded from the frontier even when otherwise ready+auto, so an operator
+///   can pause a rig without the orchestrator dispatching its beads. Resuming the rig (dropping it
+///   from the set) makes its ready beads eligible again on the next poll. In-flight polecats are
+///   untouched — this gates only what the frontier hands out next.
 pub fn ready_for_auto(
     rows: Vec<IssueRow>,
     deps_of: &HashMap<String, Vec<String>>,
@@ -250,6 +255,7 @@ pub fn ready_for_auto(
     dispatch_raw: &HashMap<String, Option<String>>,
     locked: &HashSet<String>,
     occupied: &HashSet<String>,
+    held_rigs: &HashSet<String>,
 ) -> Vec<IssueRow> {
     rows.into_iter()
         .filter(|r| {
@@ -259,6 +265,7 @@ pub fn ready_for_auto(
                 && should_sling(&r.status, &r.issue_type, dispatch)
                 && !operator_locked(&r.id, parents, locked)
                 && !surface_overlaps(r, occupied)
+                && !held_rigs.contains(r.rig.trim())
         })
         .collect()
 }
@@ -598,11 +605,77 @@ mod tests {
             &dispatch_raw,
             &locked,
             &occupied,
+            &HashSet::new(),
         );
         assert_eq!(
             frontier.iter().map(|r| r.id.as_str()).collect::<Vec<_>>(),
             ["b-ok"],
             "only the bead that passes all clauses survives"
+        );
+    }
+
+    #[test]
+    fn ready_for_auto_excludes_beads_of_a_held_rig() {
+        // rig-hold H2 (gtcore-1f5e67): a ready+auto bead whose rig is on hold is dropped from the
+        // frontier; an otherwise-identical bead on an auto rig still passes. Resuming the rig
+        // (dropping it from the held set) makes its bead eligible again next poll.
+        let mk_rows = || {
+            let held_bead = {
+                let mut r = auto_row("held-bead", r#"["crates/a"]"#);
+                r.rig = "gtcore".into();
+                r
+            };
+            let auto_bead = {
+                let mut r = auto_row("auto-bead", r#"["crates/b"]"#);
+                r.rig = "gtweb".into();
+                r
+            };
+            vec![held_bead, auto_bead]
+        };
+
+        let deps_of: HashMap<String, Vec<String>> = HashMap::new();
+        let dep_fact = |_: &str| -> Option<DepFact> { None };
+        let (parents, dispatch_raw) = maps(&[], &[]);
+        let locked: HashSet<String> = HashSet::new();
+        let occupied: HashSet<String> = HashSet::new();
+
+        // gtcore on hold → only the gtweb bead survives.
+        let held: HashSet<String> = ["gtcore".to_string()].into_iter().collect();
+        let frontier = ready_for_auto(
+            mk_rows(),
+            &deps_of,
+            &dep_fact,
+            IssuePhase::P1,
+            &AllowAll,
+            &parents,
+            &dispatch_raw,
+            &locked,
+            &occupied,
+            &held,
+        );
+        assert_eq!(
+            frontier.iter().map(|r| r.id.as_str()).collect::<Vec<_>>(),
+            ["auto-bead"],
+            "a held rig's bead is excluded; the auto rig's bead passes"
+        );
+
+        // Resume gtcore (empty held set) → both ready beads are eligible again.
+        let frontier = ready_for_auto(
+            mk_rows(),
+            &deps_of,
+            &dep_fact,
+            IssuePhase::P1,
+            &AllowAll,
+            &parents,
+            &dispatch_raw,
+            &locked,
+            &occupied,
+            &HashSet::new(),
+        );
+        assert_eq!(
+            frontier.iter().map(|r| r.id.as_str()).collect::<Vec<_>>(),
+            ["held-bead", "auto-bead"],
+            "resuming the rig restores its bead to the frontier"
         );
     }
 
@@ -646,6 +719,7 @@ mod tests {
             &dispatch_raw,
             &locked,
             &occupied,
+            &HashSet::new(),
         );
         assert_eq!(
             frontier.iter().map(|r| r.id.as_str()).collect::<Vec<_>>(),
@@ -710,6 +784,7 @@ mod tests {
             &dispatch_raw,
             &locked,
             &occupied,
+            &HashSet::new(),
         );
         assert_eq!(
             frontier.iter().map(|r| r.id.as_str()).collect::<Vec<_>>(),

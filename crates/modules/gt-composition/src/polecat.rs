@@ -27,6 +27,7 @@ use async_trait::async_trait;
 use tokio::sync::broadcast;
 
 use gt_agent::{AgentEvent, SessionRole};
+use crate::auto_dispatch::HeldRigs;
 use gt_auth::{JwtClaims, JwtMinter};
 use gt_eventlog::EventRecord;
 use gt_events::{AppError, Envelope};
@@ -59,7 +60,15 @@ use crate::polecat_event::PolecatEvent;
 /// unknown bead or any read error is treated as SLINGABLE (permissive) so a transient Dolt hiccup
 /// never silently abandons live work — the same conservative degradation as the closed-bead guard
 /// this generalizes.
-pub async fn bead_should_sling(issues: &DoltIssues, bead: &str) -> bool {
+///
+/// `held_rigs` (rig-hold H3, gtcore-9a84e6) are the rig names on dispatch hold: a bead whose rig is
+/// in this set is NOT slingable, so the supervisor's dead-polecat / boot re-hydration re-sling honours
+/// a `rig.hold` instead of restarting what the hold paused. Pass an empty set to disable the gate.
+pub async fn bead_should_sling(
+    issues: &DoltIssues,
+    bead: &str,
+    held_rigs: &HashSet<String>,
+) -> bool {
     let detail = match issues.get_detail(bead).await {
         Ok(Some(d)) => d,
         Ok(None) => return true, // unknown bead → permissive (sling)
@@ -70,6 +79,14 @@ pub async fn bead_should_sling(issues: &DoltIssues, bead: &str) -> bool {
             return true;
         }
     };
+    // rig-hold H3: a held rig pauses the watchdogs too — never re-sling its beads.
+    if held_rigs.contains(detail.rig.trim()) {
+        eprintln!(
+            "[polecat] re-sling skipped for {bead}: rig '{}' on dispatch hold",
+            detail.rig
+        );
+        return false;
+    }
     // Unscoped maps (empty rig + ws) — an ancestor epic may live outside any one rig/workspace,
     // exactly the inputs `resolve_dispatch` expects. A map read error degrades to an empty map,
     // which resolves to the bead's own dispatch value (or Manual) — never a panic.
@@ -244,6 +261,12 @@ pub struct PolecatSupervisorPlugin {
     /// `GT_CI_MAX_RETRIES`). After this many failed attempts the bead is abandoned with an alert
     /// rather than re-slung again — the "no infinite loop" half of the AC.
     ci_max_retries: u32,
+    /// Rigs on dispatch hold (rig-hold H3, gtcore-9a84e6). When set, the supervisor's re-sling
+    /// paths (the dead-polecat crash re-sling and the CI-failure re-sling) skip a bead whose rig is
+    /// held — a `rig.hold` pauses the watchdogs too, else they would restart exactly the work the
+    /// hold paused (H2 stops new dispatch; H3 stops the re-sling behind it). In-flight polecats are
+    /// untouched. `None` ⇒ no rig is ever treated as held (pre-feature behaviour).
+    held_rigs: Option<Arc<dyn HeldRigs>>,
 }
 
 /// Default CI-failure retry cap when `GT_CI_MAX_RETRIES` is unset (gtcore-3a1bd4): three automated
@@ -283,6 +306,42 @@ impl PolecatSupervisorPlugin {
             sched: None,
             ci_retries: Arc::new(Mutex::new(HashMap::new())),
             ci_max_retries: DEFAULT_CI_MAX_RETRIES,
+            held_rigs: None,
+        }
+    }
+
+    /// Wire the rig-hold source (rig-hold H3, gtcore-9a84e6) so the supervisor's re-sling paths skip
+    /// a bead whose rig is on `hold`. Absent ⇒ no rig is ever held (pre-feature behaviour).
+    pub fn with_held_rigs(mut self, source: Arc<dyn HeldRigs>) -> Self {
+        self.held_rigs = Some(source);
+        self
+    }
+
+    /// The rigs currently on dispatch hold (empty when no source is wired). Fetched per use so a
+    /// `rig.hold`/`rig.resume` takes effect on the next event with no daemon restart; fail-open via
+    /// the source itself.
+    async fn held_rigs_set(&self) -> HashSet<String> {
+        match &self.held_rigs {
+            Some(source) => source.held().await,
+            None => HashSet::new(),
+        }
+    }
+
+    /// Whether `bead`'s rig is on dispatch hold (rig-hold H3, gtcore-9a84e6) — the gate the
+    /// sheriff/CI-failure re-sling consults before re-slinging. Fail-open to `false` (no issues
+    /// handle, no holds wired, or a read fault never blocks recovery), the same conservative
+    /// degradation as [`bead_should_sling`].
+    async fn rig_on_hold(&self, bead: &str) -> bool {
+        let Some(issues) = &self.issues else {
+            return false;
+        };
+        let held = self.held_rigs_set().await;
+        if held.is_empty() {
+            return false;
+        }
+        match issues.get_detail(bead).await {
+            Ok(Some(d)) => held.contains(d.rig.trim()),
+            _ => false,
         }
     }
 
@@ -685,9 +744,10 @@ impl Plugin for PolecatSupervisorPlugin {
                 // claiming the pool. No issues handle ⇒ the gate is permissive (legacy: every
                 // dispatch slings), matching the rest of the sling path's degradation.
                 if let Some(issues) = &self.issues {
-                    if !bead_should_sling(issues, &bead).await {
+                    let held = self.held_rigs_set().await;
+                    if !bead_should_sling(issues, &bead, &held).await {
                         eprintln!(
-                            "[polecat] sling skipped for {bead}: not slingable (closed/epic/manual) — boot re-hydration / stale dispatch"
+                            "[polecat] sling skipped for {bead}: not slingable (closed/epic/manual/rig-on-hold) — boot re-hydration / stale dispatch"
                         );
                         if let Some(sched) = &self.sched {
                             sched.capacity_freed().await;
@@ -751,24 +811,33 @@ impl Plugin for PolecatSupervisorPlugin {
                 // the polecat on the host default ~/.claude.
                 let mut active_config_dir: Option<String> = None;
                 if let Some(kc) = &self.keychain {
-                    // Snapshot quota status per account for the sling-time quota gate (gtcore-2836bb).
-                    // A pre-fetched map keeps the guard's `status_of` closure synchronous (the guard
-                    // is pure-ish and must not await). No quota handle ⇒ empty map ⇒ the guard treats
-                    // every account's status as unknown (permissive), i.e. the legacy credential-only
-                    // behaviour.
+                    // Snapshot quota status + headroom per account for the sling-time gate
+                    // (gtcore-2836bb) and concurrent distribution (gtcore-98e14f). Pre-fetched maps
+                    // keep the guard's closures synchronous (the guard is pure-ish and must not
+                    // await). No quota handle ⇒ empty maps ⇒ legacy credential-only behaviour.
+                    let quota_accounts: Vec<gt_quota::Account> = match &self.quota {
+                        Some(q) => q.accounts().await,
+                        None => Vec::new(),
+                    };
                     let quota_status: HashMap<String, gt_quota::AccountQuotaStatus> =
-                        match &self.quota {
-                            Some(q) => q
-                                .accounts()
-                                .await
-                                .into_iter()
-                                .map(|a| (a.id, a.status))
-                                .collect(),
-                            None => HashMap::new(),
-                        };
-                    match crate::credential_guard::resolve_for_sling(kc, now_ms(), |acc| {
-                        quota_status.get(acc).copied()
-                    }) {
+                        quota_accounts.iter().map(|a| (a.id.clone(), a.status)).collect();
+                    let quota_headroom: HashMap<String, f64> = quota_accounts
+                        .iter()
+                        .map(|a| {
+                            let pct = |w: &Option<gt_quota::AccountWindow>| match w {
+                                Some(w) if w.limit > 0 => (w.consumed / w.limit as f64) * 100.0,
+                                _ => 0.0,
+                            };
+                            let util = pct(&a.window).max(pct(&a.weekly_window));
+                            (a.id.clone(), 100.0_f64 - util)
+                        })
+                        .collect();
+                    match crate::credential_guard::resolve_for_sling(
+                        kc,
+                        now_ms(),
+                        |acc| quota_status.get(acc).copied(),
+                        |acc| quota_headroom.get(acc).copied().unwrap_or(100.0),
+                    ) {
                         crate::credential_guard::CredOutcome::Resolved {
                             resolved,
                             dead,
@@ -1141,6 +1210,17 @@ impl Plugin for PolecatSupervisorPlugin {
                 let MergeEvent::Failed { bead, reason } = record.decode::<MergeEvent>()? else {
                     return Ok(());
                 };
+                // rig-hold H3 (gtcore-9a84e6): a held rig pauses the watchdogs too — the sheriff /
+                // CI-failure recovery does NOT re-sling a held rig's bead (the `merge.failed.v1`
+                // alert + observation still stand; the bead simply isn't auto-re-dispatched until the
+                // rig resumes). Guard BEFORE counting the attempt so a hold never burns the retry
+                // budget.
+                if self.rig_on_hold(&bead).await {
+                    eprintln!(
+                        "[polecat] CI-failure re-sling skipped for {bead}: rig on dispatch hold (rig-hold H3)"
+                    );
+                    return Ok(());
+                }
                 // Count this failure as one attempt against the bead's budget.
                 let attempt = {
                     let mut tally = self.ci_retries.lock().expect("ci_retries mutex");

@@ -114,6 +114,7 @@ async fn attach_list_get_update_remove_roundtrip_through_the_store() {
         eprintln!("GT_PG_URL unset — skipping documents http roundtrip");
         return;
     };
+    gt_store_pg::assert_ephemeral_pg_url(&pg_url);
     ensure_schema(&pg_url).await;
     let app = router(&pg_url);
 

@@ -68,14 +68,18 @@ fn read_credentials(config_dir: &str) -> Option<String> {
 
 /// Resolve the account a sling should authenticate as, validating the active account's credentials
 /// AND its quota status. `status_of(account)` returns the account's quota status (`None` ⇒ unknown,
-/// treated as slingable so an un-probed account is not blocked). Reads files via [`read_credentials`];
-/// see [`resolve_for_sling_with`] for the pure-ish core that tests drive with injected closures.
+/// treated as slingable so an un-probed account is not blocked). `headroom_of(account)` returns
+/// available quota headroom in \[0, 100\]: the sling lands on the slingable account with the MOST
+/// headroom so concurrent slings distribute naturally (gtcore-98e14f gap #2). Pass `|_| 100.0`
+/// when utilization data is unavailable — all slingable accounts are treated as equally available.
+/// Reads files via [`read_credentials`]; see [`resolve_for_sling_with`] for the pure-ish core.
 pub fn resolve_for_sling(
     keychain: &Arc<dyn Keychain>,
     now_ms: u64,
     status_of: impl Fn(&str) -> Option<AccountQuotaStatus>,
+    headroom_of: impl Fn(&str) -> f64,
 ) -> CredOutcome {
-    resolve_for_sling_with(keychain, now_ms, read_credentials, status_of)
+    resolve_for_sling_with(keychain, now_ms, read_credentials, status_of, headroom_of)
 }
 
 /// Whether an account is usable for a NEW sling on BOTH axes: its quota status is slingable (Healthy,
@@ -87,14 +91,17 @@ fn quota_slingable(account: &str, status_of: &impl Fn(&str) -> Option<AccountQuo
     status_of(account).map(|s| s.is_slingable()).unwrap_or(true)
 }
 
-/// Core of [`resolve_for_sling`] with the file reader + quota-status lookup injected so tests
-/// exercise every path without touching disk or a live quota actor. `read(config_dir) -> Some(raw)`
-/// for a present file, `None` for missing/unreadable. `status_of(account)` reports the quota status.
+/// Core of [`resolve_for_sling`] with the file reader + quota-status + headroom lookups injected
+/// so tests exercise every path without touching disk or a live quota actor.
+/// `read(config_dir) -> Some(raw)` for a present file, `None` for missing/unreadable.
+/// `status_of(account)` reports the quota status. `headroom_of(account)` returns available quota
+/// headroom in \[0, 100\] (higher = more room); used to distribute concurrent slings.
 pub fn resolve_for_sling_with(
     keychain: &Arc<dyn Keychain>,
     now_ms: u64,
     read: impl Fn(&str) -> Option<String>,
     status_of: impl Fn(&str) -> Option<AccountQuotaStatus>,
+    headroom_of: impl Fn(&str) -> f64,
 ) -> CredOutcome {
     // No live pointer → nothing to validate; legacy host-default path.
     let active = match keychain.active() {
@@ -135,6 +142,31 @@ pub fn resolve_for_sling_with(
     };
 
     if active_cred_ok && active_quota_ok {
+        // Distribute concurrent slings by headroom (gtcore-98e14f gap #2): if another slingable
+        // account has STRICTLY more headroom, use it for this sling WITHOUT touching the active
+        // pointer (quota_rotation owns pointer moves; here we only decide per-sling assignment).
+        let active_headroom = headroom_of(&active);
+        let best_alt = keychain
+            .accounts()
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|acc| *acc != active && quota_slingable(acc, &status_of))
+            .filter_map(|acc| {
+                let h = headroom_of(&acc);
+                if h > active_headroom {
+                    keychain.get(&acc).ok().flatten().map(|cred| (acc, cred.secret, h))
+                } else {
+                    None
+                }
+            })
+            .max_by(|(_, _, ha), (_, _, hb)| ha.partial_cmp(hb).unwrap_or(std::cmp::Ordering::Equal));
+        if let Some((best_id, best_dir, _)) = best_alt {
+            return CredOutcome::Resolved {
+                resolved: ResolvedCredentials { account: best_id, config_dir: best_dir },
+                dead: Vec::new(),
+                rotated_from: None,
+            };
+        }
         return CredOutcome::Resolved {
             resolved: ResolvedCredentials {
                 account: active,
@@ -269,7 +301,7 @@ mod tests {
     #[test]
     fn no_active_pointer_is_host_default() {
         let kc = keychain(&[("a", "/dir/a")]);
-        let out = resolve_for_sling_with(&kc, NOW, |_| None, all_healthy);
+        let out = resolve_for_sling_with(&kc, NOW, |_| None, all_healthy, |_| 100.0);
         assert_eq!(out, CredOutcome::HostDefault);
     }
 
@@ -279,7 +311,7 @@ mod tests {
         // this is exactly the existing dispatch test's shape and must not regress.
         let kc = keychain(&[("a", "/dir/a")]);
         kc.set_active("a").unwrap();
-        let out = resolve_for_sling_with(&kc, NOW, |_| None, all_healthy);
+        let out = resolve_for_sling_with(&kc, NOW, |_| None, all_healthy, |_| 100.0);
         assert_eq!(
             out,
             CredOutcome::Resolved {
@@ -298,7 +330,7 @@ mod tests {
         let kc = keychain(&[("a", "/dir/a")]);
         kc.set_active("a").unwrap();
         let valid = creds(Some(NOW + 3_600_000), true);
-        let out = resolve_for_sling_with(&kc, NOW, |_| Some(valid.clone()), all_healthy);
+        let out = resolve_for_sling_with(&kc, NOW, |_| Some(valid.clone()), all_healthy, |_| 100.0);
         match out {
             CredOutcome::Resolved { resolved, rotated_from, .. } => {
                 assert_eq!(resolved.account, "a");
@@ -320,7 +352,7 @@ mod tests {
             "/dir/dead" => Some(dead_raw.clone()),
             "/dir/fresh" => Some(fresh_raw.clone()),
             _ => None,
-        }, all_healthy);
+        }, all_healthy, |_| 100.0);
         match out {
             CredOutcome::Resolved { resolved, dead, rotated_from } => {
                 assert_eq!(resolved.account, "fresh");
@@ -346,7 +378,7 @@ mod tests {
             "/dir/dead" => Some(dead_raw.clone()),
             "/dir/also" => Some(also_raw.clone()),
             _ => None,
-        }, all_healthy);
+        }, all_healthy, |_| 100.0);
         match out {
             CredOutcome::NoValidAccount { dead } => {
                 assert_eq!(dead.len(), 1);
@@ -377,6 +409,7 @@ mod tests {
                     _ => AccountQuotaStatus::Healthy,
                 })
             },
+            |_| 100.0,
         );
         match out {
             CredOutcome::Resolved { resolved, rotated_from, dead } => {
@@ -413,6 +446,7 @@ mod tests {
                     _ => AccountQuotaStatus::Healthy,
                 })
             },
+            |_| 100.0,
         );
         match out {
             CredOutcome::NoValidAccount { dead } => assert_eq!(dead[0].account, "dead"),
@@ -427,7 +461,7 @@ mod tests {
         let kc = keychain(&[("a", "/dir/a"), ("b", "/dir/b")]);
         kc.set_active("a").unwrap();
         let valid = creds(Some(NOW + 3_600_000), true);
-        let out = resolve_for_sling_with(&kc, NOW, move |_| Some(valid.clone()), all_healthy);
+        let out = resolve_for_sling_with(&kc, NOW, move |_| Some(valid.clone()), all_healthy, |_| 100.0);
         match out {
             CredOutcome::Resolved { resolved, rotated_from, .. } => {
                 assert_eq!(resolved.account, "a");
@@ -444,7 +478,7 @@ mod tests {
         let kc = keychain(&[("a", "/dir/a")]);
         kc.set_active("a").unwrap();
         let valid = creds(Some(NOW + 3_600_000), true);
-        let out = resolve_for_sling_with(&kc, NOW, move |_| Some(valid.clone()), |_| None);
+        let out = resolve_for_sling_with(&kc, NOW, move |_| Some(valid.clone()), |_| None, |_| 100.0);
         match out {
             CredOutcome::Resolved { resolved, rotated_from, .. } => {
                 assert_eq!(resolved.account, "a");
@@ -452,5 +486,74 @@ mod tests {
             }
             other => panic!("expected Resolved, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn concurrent_slings_pick_higher_headroom_account(  ) {
+        // gtcore-98e14f gap #2: active `a` is slingable but `b` has strictly more headroom
+        // → sling goes to `b` WITHOUT flipping the active pointer.
+        let kc = keychain(&[("a", "/dir/a"), ("b", "/dir/b")]);
+        kc.set_active("a").unwrap();
+        let valid = creds(Some(NOW + 3_600_000), true);
+        let v2 = valid.clone();
+        let out = resolve_for_sling_with(
+            &kc,
+            NOW,
+            move |_| Some(v2.clone()),
+            all_healthy,
+            |acc| match acc { "a" => 20.0, _ => 80.0 }, // b has more headroom
+        );
+        match out {
+            CredOutcome::Resolved { resolved, rotated_from, dead } => {
+                assert_eq!(resolved.account, "b", "sling should land on higher-headroom account");
+                assert!(rotated_from.is_none(), "distribution must NOT flip the active pointer");
+                assert!(dead.is_empty());
+            }
+            other => panic!("expected Resolved, got {other:?}"),
+        }
+        // Active pointer NOT moved — distribution, not rotation.
+        assert_eq!(kc.active().unwrap().as_deref(), Some("a"));
+        let _ = valid;
+    }
+
+    #[test]
+    fn equal_headroom_uses_active() {
+        // When all slingable accounts have equal headroom, use the active account (fast path).
+        let kc = keychain(&[("a", "/dir/a"), ("b", "/dir/b")]);
+        kc.set_active("a").unwrap();
+        let valid = creds(Some(NOW + 3_600_000), true);
+        let v2 = valid.clone();
+        let out = resolve_for_sling_with(&kc, NOW, move |_| Some(v2.clone()), all_healthy, |_| 50.0);
+        match out {
+            CredOutcome::Resolved { resolved, rotated_from, .. } => {
+                assert_eq!(resolved.account, "a", "equal headroom → use active");
+                assert!(rotated_from.is_none());
+            }
+            other => panic!("expected Resolved, got {other:?}"),
+        }
+        let _ = valid;
+    }
+
+    #[test]
+    fn blocked_account_never_receives_sling_even_with_more_headroom() {
+        // A Blocked account is never a distribution target, even if headroom_of says it has room.
+        let kc = keychain(&[("a", "/dir/a"), ("blocked", "/dir/blocked")]);
+        kc.set_active("a").unwrap();
+        let valid = creds(Some(NOW + 3_600_000), true);
+        let v2 = valid.clone();
+        let out = resolve_for_sling_with(
+            &kc,
+            NOW,
+            move |_| Some(v2.clone()),
+            |acc| Some(match acc { "blocked" => AccountQuotaStatus::Blocked, _ => AccountQuotaStatus::Healthy }),
+            |acc| match acc { "blocked" => 99.0, _ => 10.0 }, // blocked has "more headroom" but is Blocked
+        );
+        match out {
+            CredOutcome::Resolved { resolved, .. } => {
+                assert_eq!(resolved.account, "a", "Blocked account must never receive a sling");
+            }
+            other => panic!("expected Resolved on a, got {other:?}"),
+        }
+        let _ = valid;
     }
 }
