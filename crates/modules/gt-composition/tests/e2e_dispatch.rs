@@ -51,6 +51,7 @@ async fn create_workspace_rig_and_session_via_dispatch() {
         eprintln!("GT_PG_URL unset; skipping hq-mcp-dispatch.8 E2E");
         return;
     };
+    gt_store_pg::assert_ephemeral_pg_url(&url);
     let pool = PgPool::connect(&url).await.expect("connect postgres");
 
     // --- Schema preconditions (a deploy/migration concern; applied inline here) ---
