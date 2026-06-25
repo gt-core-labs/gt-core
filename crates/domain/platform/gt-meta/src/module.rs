@@ -131,6 +131,74 @@ impl GtModule for MetaHttpModule {
     }
 }
 
+/// The per-workspace domain-catalog REST module (gtcore-b37400 H4).
+///
+/// A standalone module (id `domain`, distinct from `meta`) so its routes are guarded
+/// by `domain.read`/`domain.write` — admin scopes the agent presets never carry —
+/// rather than the `meta.read`/`meta.write` the `report-gap` surface shares. It
+/// contributes NO MCP tools: the `domain.catalog.*` tools are served by the
+/// composition-tier `DomainRouter` handler, which also advertises their descriptors,
+/// so the `/scopes` catalog surfaces `domain.read`/`domain.write` from the tool names
+/// alone. This module only mounts the REST twin of those tools.
+#[cfg(feature = "axum")]
+#[derive(Clone)]
+pub struct DomainCatalogHttpModule {
+    /// The REST state baked into the router by [`register_routes`](GtModule::register_routes).
+    http: crate::domain_http::DomainApiState,
+}
+
+#[cfg(feature = "axum")]
+impl DomainCatalogHttpModule {
+    /// The module's stable id (`domain`) — matches the `domain.*` tool namespace and
+    /// the `domain.<verb>` scope namespace.
+    pub fn id() -> ModuleId {
+        ModuleId::new("domain").expect("`domain` is a valid module id")
+    }
+
+    /// Build the module over its REST state (the live store + per-workspace pools).
+    pub fn with_http(state: crate::domain_http::DomainApiState) -> Self {
+        Self { http: state }
+    }
+
+    /// The `domain.read` / `domain.write` scopes this module owns — the same
+    /// `<resource>.<verb>` convention the rest follow. The route guard derives
+    /// `domain.read` for `GET` and `domain.write` for the mutating methods.
+    fn domain_capability() -> Capability {
+        Capability::empty().claiming_all([
+            Scope::new("domain.read").expect("valid scope"),
+            Scope::new("domain.write").expect("valid scope"),
+        ])
+    }
+}
+
+#[cfg(feature = "axum")]
+impl GtModule for DomainCatalogHttpModule {
+    fn meta(&self) -> ModuleMeta {
+        ModuleMeta::new(
+            Self::id(),
+            "Domain catalog",
+            Version::new(1, 0, 0),
+            "Per-workspace domain catalog editing: list/add/rename/set-enabled/remove \
+             the domains a workspace's beads may carry (gtcore-b37400).",
+        )
+    }
+
+    fn capability(&self) -> Capability {
+        Self::domain_capability()
+    }
+
+    /// The `domain.catalog.*` REST routes, relative — the builder nests them under
+    /// `/api/v1/domain` and applies the `domain.read`/`domain.write` scope guard.
+    fn register_routes(&self) -> axum::Router {
+        crate::domain_http::domain_router(self.http.clone())
+    }
+
+    fn openapi(&self) -> Option<utoipa::openapi::OpenApi> {
+        use utoipa::OpenApi;
+        Some(crate::domain_http::ApiDoc::openapi())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

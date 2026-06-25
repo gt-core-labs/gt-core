@@ -5,7 +5,7 @@
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use gt_store_pg::{
+use gt_store_pg::{assert_ephemeral_pg_url, 
     email_migrations, PgReportSubscriptions, ReportSubscriptionError,
     ReportSubscriptionsRepository,
 };
@@ -20,6 +20,7 @@ async fn add_select_toggle_remove_lifecycle() {
         eprintln!("GT_PG_URL unset; skipping report subscriptions contract");
         return;
     };
+    assert_ephemeral_pg_url(&url);
     let pool = sqlx::PgPool::connect(&url).await.expect("connect");
     let mut conn = pool.acquire().await.expect("acquire");
     sqlx::query("SELECT pg_advisory_lock(4915623007)").execute(&mut *conn).await.expect("lock");

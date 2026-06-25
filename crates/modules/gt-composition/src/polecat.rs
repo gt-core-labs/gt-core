@@ -27,9 +27,11 @@ use async_trait::async_trait;
 use tokio::sync::broadcast;
 
 use gt_agent::{AgentEvent, SessionRole};
+use crate::auto_dispatch::HeldRigs;
 use gt_auth::{JwtClaims, JwtMinter};
 use gt_eventlog::EventRecord;
 use gt_events::{AppError, Envelope};
+use gt_issues::{resolve_dispatch, should_sling};
 use gt_mcp_server::bead_prefix;
 use gt_merge::MergeEvent;
 use gt_plugin::Plugin;
@@ -47,6 +49,53 @@ use crate::mcp::EventLog;
 use crate::operator_event::IssueOperatorEvent;
 use crate::polecat_event::PolecatEvent;
 
+/// Re-read `bead`'s CURRENT tracker state and decide whether a polecat should be (re-)slung for it
+/// (gtcore-db99e0) — the unified slingability gate shared by the dispatch→sling path (which, at
+/// boot, replays `replay_orphaned_inflight`'s crash-orphaned beads) and the supervisor's
+/// dead-polecat re-sling probe.
+///
+/// Reads the bead detail plus the unscoped `child_of` + dispatch maps so the dispatch policy is
+/// resolved through inheritance EXACTLY as [`gt_issues::ready_for_auto`] does, then applies the pure
+/// [`gt_issues::should_sling`] predicate (status ∈ {open,working} ∧ ¬epic ∧ dispatch=auto). An
+/// unknown bead or any read error is treated as SLINGABLE (permissive) so a transient Dolt hiccup
+/// never silently abandons live work — the same conservative degradation as the closed-bead guard
+/// this generalizes.
+///
+/// `held_rigs` (rig-hold H3, gtcore-9a84e6) are the rig names on dispatch hold: a bead whose rig is
+/// in this set is NOT slingable, so the supervisor's dead-polecat / boot re-hydration re-sling honours
+/// a `rig.hold` instead of restarting what the hold paused. Pass an empty set to disable the gate.
+pub async fn bead_should_sling(
+    issues: &DoltIssues,
+    bead: &str,
+    held_rigs: &HashSet<String>,
+) -> bool {
+    let detail = match issues.get_detail(bead).await {
+        Ok(Some(d)) => d,
+        Ok(None) => return true, // unknown bead → permissive (sling)
+        Err(e) => {
+            eprintln!(
+                "[polecat] slingability probe: get_detail({bead}) failed: {e} — treating as slingable"
+            );
+            return true;
+        }
+    };
+    // rig-hold H3: a held rig pauses the watchdogs too — never re-sling its beads.
+    if held_rigs.contains(detail.rig.trim()) {
+        eprintln!(
+            "[polecat] re-sling skipped for {bead}: rig '{}' on dispatch hold",
+            detail.rig
+        );
+        return false;
+    }
+    // Unscoped maps (empty rig + ws) — an ancestor epic may live outside any one rig/workspace,
+    // exactly the inputs `resolve_dispatch` expects. A map read error degrades to an empty map,
+    // which resolves to the bead's own dispatch value (or Manual) — never a panic.
+    let parents = issues.parent_map("", "").await.unwrap_or_default();
+    let raw = issues.dispatch_index().await.unwrap_or_default();
+    let dispatch = resolve_dispatch(bead, detail.dispatch.as_deref(), &parents, &raw);
+    should_sling(&detail.status, &detail.issue_type, dispatch)
+}
+
 /// Resolves the least-privilege scope set for an agent role (`hq-agent-provisioning.3`). The
 /// production resolver delegates to `gt_skills::SkillCatalog::scopes_for_roles`; tests pass a
 /// closure. Returns the role's scopes, never `*`.
@@ -59,6 +108,11 @@ pub type ScopeResolver = Arc<dyn Fn(&str) -> Vec<String> + Send + Sync>;
 /// inheriting the operator's admin (`*`) config. The token is RS256-signed by [`JwtMinter`] (the
 /// daemon holds the private key); the gateway verifies it with the matching public key. A short
 /// `ttl_secs` bounds exposure — a polecat that outlives it is re-slung with a fresh token.
+///
+/// `Clone` (all fields are: [`JwtMinter`] is `Clone`, [`ScopeResolver`] is an `Arc`) so the daemon
+/// can hand the same configured minter to both the polecat supervisor and the role-agent launcher
+/// (`gtcore-999795`) without rebuilding the role→scopes policy twice.
+#[derive(Clone)]
 pub struct AgentTokenMinter {
     minter: JwtMinter,
     scopes_for_role: ScopeResolver,
@@ -85,7 +139,10 @@ impl AgentTokenMinter {
 
     /// Mint a token for `session` running as `role`. `sub` is the session id, scopes come from the
     /// resolver (least-privilege; never `*`), and `exp` is `now + ttl_secs`.
-    fn token_for(&self, session: &str, role: &str) -> Result<String, gt_auth::AuthError> {
+    ///
+    /// `pub(crate)` so the role-agent launcher ([`crate::role_agent`]) can mint the same kind of
+    /// least-privilege token for a triggered sheriff/witness/deacon session.
+    pub(crate) fn token_for(&self, session: &str, role: &str) -> Result<String, gt_auth::AuthError> {
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_secs())
@@ -204,6 +261,12 @@ pub struct PolecatSupervisorPlugin {
     /// `GT_CI_MAX_RETRIES`). After this many failed attempts the bead is abandoned with an alert
     /// rather than re-slung again — the "no infinite loop" half of the AC.
     ci_max_retries: u32,
+    /// Rigs on dispatch hold (rig-hold H3, gtcore-9a84e6). When set, the supervisor's re-sling
+    /// paths (the dead-polecat crash re-sling and the CI-failure re-sling) skip a bead whose rig is
+    /// held — a `rig.hold` pauses the watchdogs too, else they would restart exactly the work the
+    /// hold paused (H2 stops new dispatch; H3 stops the re-sling behind it). In-flight polecats are
+    /// untouched. `None` ⇒ no rig is ever treated as held (pre-feature behaviour).
+    held_rigs: Option<Arc<dyn HeldRigs>>,
 }
 
 /// Default CI-failure retry cap when `GT_CI_MAX_RETRIES` is unset (gtcore-3a1bd4): three automated
@@ -243,6 +306,42 @@ impl PolecatSupervisorPlugin {
             sched: None,
             ci_retries: Arc::new(Mutex::new(HashMap::new())),
             ci_max_retries: DEFAULT_CI_MAX_RETRIES,
+            held_rigs: None,
+        }
+    }
+
+    /// Wire the rig-hold source (rig-hold H3, gtcore-9a84e6) so the supervisor's re-sling paths skip
+    /// a bead whose rig is on `hold`. Absent ⇒ no rig is ever held (pre-feature behaviour).
+    pub fn with_held_rigs(mut self, source: Arc<dyn HeldRigs>) -> Self {
+        self.held_rigs = Some(source);
+        self
+    }
+
+    /// The rigs currently on dispatch hold (empty when no source is wired). Fetched per use so a
+    /// `rig.hold`/`rig.resume` takes effect on the next event with no daemon restart; fail-open via
+    /// the source itself.
+    async fn held_rigs_set(&self) -> HashSet<String> {
+        match &self.held_rigs {
+            Some(source) => source.held().await,
+            None => HashSet::new(),
+        }
+    }
+
+    /// Whether `bead`'s rig is on dispatch hold (rig-hold H3, gtcore-9a84e6) — the gate the
+    /// sheriff/CI-failure re-sling consults before re-slinging. Fail-open to `false` (no issues
+    /// handle, no holds wired, or a read fault never blocks recovery), the same conservative
+    /// degradation as [`bead_should_sling`].
+    async fn rig_on_hold(&self, bead: &str) -> bool {
+        let Some(issues) = &self.issues else {
+            return false;
+        };
+        let held = self.held_rigs_set().await;
+        if held.is_empty() {
+            return false;
+        }
+        match issues.get_detail(bead).await {
+            Ok(Some(d)) => held.contains(d.rig.trim()),
+            _ => false,
         }
     }
 
@@ -578,6 +677,24 @@ impl PolecatSupervisorPlugin {
             spec.args[last] = prompt;
         }
 
+        // Unlike the context-exhaustion re-sling (driven BY a tmux death, so the session is already
+        // gone), a CI failure arrives from the CI-gate webhook independently of session liveness:
+        // the original polecat commonly lingers idle after signalling merge-ready instead of
+        // exiting, so its tmux session is still alive — heartbeat recent — when `merge.failed.v1`
+        // lands. `tmux new-session` then rejects the duplicate name and the supervisor retries
+        // forever, since the lingering session never dies on its own (gtcore-8701c4). Tear it down
+        // first, guarded by `has_session` so the common clean case (polecat already exited) skips a
+        // pointless `kill-session` that the real adapter would error-and-retry on. The re-sling then
+        // always lands a fresh session and converges.
+        if self.tmux.has_session(&session) {
+            if let Err(e) = self.tmux.kill_session(&session) {
+                eprintln!(
+                    "[polecat] CI-failure re-sling: kill-session({session}) failed for {bead}: {e} — supervisor tick will retry"
+                );
+                return;
+            }
+        }
+
         if let Err(e) = spawn_tmux(self.tmux.as_ref(), &spec) {
             eprintln!(
                 "[polecat] CI-failure re-sling spawn failed for {bead}: {e} — supervisor tick will retry"
@@ -616,6 +733,28 @@ impl Plugin for PolecatSupervisorPlugin {
                 let SchedEvent::Dispatched { bead, .. } = record.decode::<SchedEvent>()? else {
                     return Ok(());
                 };
+                // Slingability gate (gtcore-db99e0): re-validate the bead's CURRENT state before
+                // claiming a pool slot or spawning. A `dispatched` event can name a bead that is no
+                // longer slingable — most acutely at BOOT, where `replay_orphaned_inflight`
+                // re-enqueues every dispatched-but-unmerged bead WITHOUT re-checking it, so a
+                // since-closed bead, an epic container, or a dispatch=manual bead would otherwise
+                // be re-slung (gtcore-e7a851). When `should_sling` says no, free the scheduler
+                // governor slot the dispatch just `acquire`d (so it does not leak — the same
+                // capacity teardown the CI-retry-exhaustion abandon does) and return WITHOUT
+                // claiming the pool. No issues handle ⇒ the gate is permissive (legacy: every
+                // dispatch slings), matching the rest of the sling path's degradation.
+                if let Some(issues) = &self.issues {
+                    let held = self.held_rigs_set().await;
+                    if !bead_should_sling(issues, &bead, &held).await {
+                        eprintln!(
+                            "[polecat] sling skipped for {bead}: not slingable (closed/epic/manual/rig-on-hold) — boot re-hydration / stale dispatch"
+                        );
+                        if let Some(sched) = &self.sched {
+                            sched.capacity_freed().await;
+                        }
+                        return Ok(());
+                    }
+                }
                 // Admission first: a refused claim is backpressure, not an error — the bead stays
                 // queued/dispatched in the log; capacity will free up as live polecats finish.
                 if self
@@ -672,24 +811,33 @@ impl Plugin for PolecatSupervisorPlugin {
                 // the polecat on the host default ~/.claude.
                 let mut active_config_dir: Option<String> = None;
                 if let Some(kc) = &self.keychain {
-                    // Snapshot quota status per account for the sling-time quota gate (gtcore-2836bb).
-                    // A pre-fetched map keeps the guard's `status_of` closure synchronous (the guard
-                    // is pure-ish and must not await). No quota handle ⇒ empty map ⇒ the guard treats
-                    // every account's status as unknown (permissive), i.e. the legacy credential-only
-                    // behaviour.
+                    // Snapshot quota status + headroom per account for the sling-time gate
+                    // (gtcore-2836bb) and concurrent distribution (gtcore-98e14f). Pre-fetched maps
+                    // keep the guard's closures synchronous (the guard is pure-ish and must not
+                    // await). No quota handle ⇒ empty maps ⇒ legacy credential-only behaviour.
+                    let quota_accounts: Vec<gt_quota::Account> = match &self.quota {
+                        Some(q) => q.accounts().await,
+                        None => Vec::new(),
+                    };
                     let quota_status: HashMap<String, gt_quota::AccountQuotaStatus> =
-                        match &self.quota {
-                            Some(q) => q
-                                .accounts()
-                                .await
-                                .into_iter()
-                                .map(|a| (a.id, a.status))
-                                .collect(),
-                            None => HashMap::new(),
-                        };
-                    match crate::credential_guard::resolve_for_sling(kc, now_ms(), |acc| {
-                        quota_status.get(acc).copied()
-                    }) {
+                        quota_accounts.iter().map(|a| (a.id.clone(), a.status)).collect();
+                    let quota_headroom: HashMap<String, f64> = quota_accounts
+                        .iter()
+                        .map(|a| {
+                            let pct = |w: &Option<gt_quota::AccountWindow>| match w {
+                                Some(w) if w.limit > 0 => (w.consumed / w.limit as f64) * 100.0,
+                                _ => 0.0,
+                            };
+                            let util = pct(&a.window).max(pct(&a.weekly_window));
+                            (a.id.clone(), 100.0_f64 - util)
+                        })
+                        .collect();
+                    match crate::credential_guard::resolve_for_sling(
+                        kc,
+                        now_ms(),
+                        |acc| quota_status.get(acc).copied(),
+                        |acc| quota_headroom.get(acc).copied().unwrap_or(100.0),
+                    ) {
                         crate::credential_guard::CredOutcome::Resolved {
                             resolved,
                             dead,
@@ -1062,6 +1210,17 @@ impl Plugin for PolecatSupervisorPlugin {
                 let MergeEvent::Failed { bead, reason } = record.decode::<MergeEvent>()? else {
                     return Ok(());
                 };
+                // rig-hold H3 (gtcore-9a84e6): a held rig pauses the watchdogs too — the sheriff /
+                // CI-failure recovery does NOT re-sling a held rig's bead (the `merge.failed.v1`
+                // alert + observation still stand; the bead simply isn't auto-re-dispatched until the
+                // rig resumes). Guard BEFORE counting the attempt so a hold never burns the retry
+                // budget.
+                if self.rig_on_hold(&bead).await {
+                    eprintln!(
+                        "[polecat] CI-failure re-sling skipped for {bead}: rig on dispatch hold (rig-hold H3)"
+                    );
+                    return Ok(());
+                }
                 // Count this failure as one attempt against the bead's budget.
                 let attempt = {
                     let mut tally = self.ci_retries.lock().expect("ci_retries mutex");
@@ -1230,6 +1389,116 @@ pub fn rig_routing_from_catalog(
         paths.insert(rig.prefix.clone(), workdir);
     }
     (configs, paths)
+}
+
+/// Ensure every catalog rig has its base checkout on disk, cloning a missing one from the rig's
+/// own catalog `git_url` (gtcore-d0ec4f).
+///
+/// THE BUG this closes: [`rig_routing_from_catalog`] SKIPS a rig whose resolved worktree root is
+/// absent on this host, so its beads fall back to the BOOT template — and a cross-rig bead (e.g.
+/// `gtweb-*`) then slings into the boot rig's checkout (gt-core, cloned at deploy time from
+/// `GT_RIG_GIT_URL`), the WRONG repo: the per-bead worktree is cut off the gt-core tree and carries
+/// the gt-core origin, making a gt-web frontend task impossible. Cloning each missing rig from its
+/// OWN catalog `git_url` here, BEFORE routing, makes routing find a real checkout so the per-bead
+/// worktree carries the correct origin (`git_url`), exactly as the multi-rig path intends.
+///
+/// Best-effort and idempotent: a rig whose checkout already exists, or whose `git_url` is empty, is
+/// left untouched; a clone failure (auth/network) is logged and the rig stays unrouted (the legacy
+/// skip). Returns the prefixes successfully provisioned (for logging / tests).
+pub fn provision_rig_checkouts(
+    rigs: &[gt_rig::RigEntry],
+    ws: &str,
+    home: &std::path::Path,
+) -> Vec<String> {
+    let mut provisioned = Vec::new();
+    for rig in rigs {
+        let workdir = rig.resolved_worktree_root(ws, home);
+        if workdir.is_dir() {
+            continue;
+        }
+        match clone_rig_checkout(&rig.git_url, &rig.default_branch, &workdir) {
+            Ok(()) => {
+                eprintln!(
+                    "[gt-orch-server] rig '{}' (prefix '{}') checkout provisioned at {} (cloned from {})",
+                    rig.name,
+                    rig.prefix,
+                    workdir.display(),
+                    rig.git_url
+                );
+                provisioned.push(rig.prefix.clone());
+            }
+            Err(e) => {
+                eprintln!(
+                    "[gt-orch-server] rig '{}' (prefix '{}') checkout {} missing and clone failed: {e} — its beads fall back to the boot template",
+                    rig.name,
+                    rig.prefix,
+                    workdir.display()
+                );
+            }
+        }
+    }
+    provisioned
+}
+
+/// Embed `token` into an `https://host/...` git URL as userinfo (`https://<token>@host/...`) — the
+/// exact form the boot clone's `origin` already carries, so `git push` authenticates with no
+/// credential helper. A URL that is not `https://`, or already carries userinfo before the path
+/// (`...@...`, i.e. already credentialed), is returned UNCHANGED — never double-embed, never touch
+/// `git@`/`ssh://`/local-path remotes.
+fn embed_token_in_url(url: &str, token: &str) -> String {
+    const SCHEME: &str = "https://";
+    if let Some(rest) = url.strip_prefix(SCHEME) {
+        let authority_end = rest.find('/').unwrap_or(rest.len());
+        if !rest[..authority_end].contains('@') {
+            return format!("{SCHEME}{token}@{rest}");
+        }
+    }
+    url.to_string()
+}
+
+/// `git clone [--branch <default_branch>] <git_url> <workdir>` for [`provision_rig_checkouts`].
+/// Creates `workdir`'s parent first so a convention root (`<home>/gastown-wt/<ws>/<name>`) under a
+/// not-yet-existing tree still lands. An empty `git_url` is rejected (nothing to clone from).
+///
+/// The catalog `git_url` is the PLAIN `https://github.com/...` (no token), but the orchd pod has
+/// neither a git credential helper nor a TTY — so a tokenless `origin` makes every polecat push fail
+/// `could not read Username` (gtcore-abfe8a). We embed the rig token ([`crate::gh_auth::rig_token_from_env`])
+/// into the clone URL so the resulting `origin` can push, matching the boot clone's
+/// `https://<token>@github.com/...` remote. The TOKEN-BEARING URL is used only for the `git`
+/// invocation; every log line keeps the plain `git_url`, so the token never reaches stderr.
+fn clone_rig_checkout(
+    git_url: &str,
+    default_branch: &str,
+    workdir: &std::path::Path,
+) -> std::io::Result<()> {
+    let git_url = git_url.trim();
+    if git_url.is_empty() {
+        return Err(std::io::Error::other("rig has no git_url to clone from"));
+    }
+    if let Some(parent) = workdir.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let clone_url = match crate::gh_auth::rig_token_from_env() {
+        Some(tok) => embed_token_in_url(git_url, &tok),
+        None => git_url.to_string(),
+    };
+    let mut args: Vec<String> = vec!["clone".to_string()];
+    let branch = default_branch.trim();
+    if !branch.is_empty() {
+        args.push("--branch".to_string());
+        args.push(branch.to_string());
+    }
+    args.push(clone_url);
+    args.push(workdir.display().to_string());
+    let status = std::process::Command::new("git").args(&args).status()?;
+    if status.success() && workdir.is_dir() {
+        Ok(())
+    } else {
+        Err(std::io::Error::other(format!(
+            "git clone {git_url} -> {} failed (status {status})",
+            workdir.display()
+        )))
+    }
 }
 
 /// Wall-clock epoch milliseconds, for the sling-time credential guard (gtcore-bf4acd). Mirrors the
@@ -1693,6 +1962,83 @@ mod tests {
             sup.watched_count(),
             0,
             "the bead is unwatched once its CI-retry budget is exhausted"
+        );
+    }
+
+    #[tokio::test]
+    async fn ci_failure_reslings_over_a_still_live_session_by_killing_it_first() {
+        // gtcore-8701c4: a `merge.failed.v1` arrives from the CI-gate webhook independently of
+        // session liveness, and the original polecat commonly lingers idle (tmux session alive,
+        // heartbeat recent) after signalling merge-ready rather than exiting. A naive re-sling then
+        // hits `tmux new-session: duplicate session` and the supervisor retries forever, since the
+        // lingering session never dies on its own. The CI re-sling must tear the live session down
+        // first (idempotent) so the respawn lands a fresh session and the loop converges.
+        let fake = Arc::new(FakeTmux::new());
+        let tmux: Arc<dyn Tmux> = fake.clone();
+        let supervisor = Arc::new(PolecatSupervisor::new(
+            tmux.clone(),
+            RestartConfig::default(),
+            8,
+        ));
+        let template = SpawnTemplate {
+            rig: "hq".into(),
+            prefix: "hq".into(),
+            workdir: "/tmp".into(),
+            command: "true".into(),
+            args: vec![],
+            base_env: vec![],
+            heartbeat_dir: std::env::temp_dir(),
+        };
+        let alloc = Arc::new(Mutex::new(PoolAllocator::new(10, 5)));
+        let p = PolecatSupervisorPlugin::new("acme", tmux, template, supervisor.clone(), alloc)
+            .with_ci_max_retries(2);
+
+        // Sling the bead → its tmux session is created and (unlike a context-exhaustion death) stays
+        // alive: the polecat has not exited when CI fails.
+        p.on_event(&record(SchedEvent::Dispatched {
+            bead: "gg-1".into(),
+            worker: "w1".into(),
+        }))
+        .await
+        .unwrap();
+        assert!(
+            fake.has_session("hq-gg-1"),
+            "polecat session is live before CI fails"
+        );
+        assert!(fake.kills().is_empty(), "no teardown on the initial sling");
+
+        // CI fails while that session is still alive.
+        p.on_event(&record(MergeEvent::Failed {
+            bead: "gg-1".into(),
+            reason: "CI failed: failure".into(),
+        }))
+        .await
+        .unwrap();
+
+        // The live session was torn down exactly once before the respawn — so the real adapter's
+        // `new-session` never collides with a duplicate and the loop converges.
+        assert_eq!(
+            fake.kills(),
+            vec!["hq-gg-1".to_string()],
+            "the still-live session is killed once before the re-sling respawn"
+        );
+        // The re-sling still landed: a fresh session, supervised, carrying the CI-fix prompt.
+        assert!(fake.has_session("hq-gg-1"), "respawned after the teardown");
+        assert_eq!(
+            supervisor.watched_count(),
+            1,
+            "still supervised after the CI re-sling"
+        );
+        let prompt = supervisor
+            .spec_for_session("hq-gg-1")
+            .expect("re-watched after CI re-sling")
+            .args
+            .last()
+            .expect("ci-fix prompt arg")
+            .clone();
+        assert!(
+            prompt.contains("RESUMING work on bead `gg-1`"),
+            "ci-fix prompt injected: {prompt}"
         );
     }
 
@@ -2387,6 +2733,140 @@ mod tests {
         assert_eq!(cfg.worktree_root.as_deref(), Some(wt_root));
         assert_eq!(paths.get("gtweb"), Some(&gtweb_root));
         assert!(!paths.contains_key("gh"), "missing-root rig not routed");
+    }
+
+    /// Run `git <args>` in `dir`, asserting success (test helper for the clone path below).
+    #[cfg(test)]
+    fn git_in(dir: &std::path::Path, args: &[&str]) {
+        let ok = std::process::Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(args)
+            .status()
+            .expect("git runs")
+            .success();
+        assert!(ok, "git {args:?} in {} failed", dir.display());
+    }
+
+    /// `git -C dir remote get-url origin`, trimmed (test helper).
+    #[cfg(test)]
+    fn origin_of(dir: &std::path::Path) -> String {
+        let out = std::process::Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(["remote", "get-url", "origin"])
+            .output()
+            .expect("git runs");
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    }
+
+    #[test]
+    fn provision_rig_checkouts_clones_missing_rig_from_its_git_url() {
+        // gtcore-d0ec4f: a cross-rig bead (gtweb-*) must land in a worktree cut off the rig's OWN
+        // catalog git_url, not the boot rig's checkout. Before routing, provision_rig_checkouts
+        // clones a missing rig from its git_url; the per-bead worktree then carries that origin.
+        use gt_rig::RigEntry;
+        let dir = tempfile::tempdir().unwrap();
+
+        // A local "remote" standing in for gt-core-labs/gt-web: a real repo with a commit on main.
+        let remote = dir.path().join("gtweb-remote");
+        std::fs::create_dir_all(&remote).unwrap();
+        git_in(&remote, &["init", "-q", "-b", "main"]);
+        git_in(&remote, &["config", "user.email", "t@t"]);
+        git_in(&remote, &["config", "user.name", "t"]);
+        std::fs::write(remote.join("package.json"), "{}").unwrap();
+        git_in(&remote, &["add", "-A"]);
+        git_in(&remote, &["commit", "-q", "-m", "init"]);
+        let remote_url = remote.display().to_string();
+
+        // The rig's resolved checkout does NOT exist yet (the regression's precondition).
+        let gtweb_root = dir.path().join("checkout").join("gtweb");
+        assert!(!gtweb_root.is_dir());
+        let mut gtweb = RigEntry::new("gtweb", "gtweb", &remote_url, "main", 0);
+        gtweb.worktree_root = Some(gtweb_root.clone());
+
+        // Provision: the missing rig is cloned from its git_url, NOT skipped.
+        let provisioned = provision_rig_checkouts(&[gtweb.clone()], "default", dir.path());
+        assert_eq!(provisioned, vec!["gtweb".to_string()]);
+        assert!(
+            gtweb_root.join("package.json").is_file(),
+            "the cloned checkout carries the remote's content"
+        );
+        assert_eq!(
+            origin_of(&gtweb_root),
+            remote_url,
+            "the provisioned checkout's origin is the rig's catalog git_url"
+        );
+
+        // Routing now finds the real checkout (no longer skipped).
+        let base = SpawnTemplate {
+            rig: "gtcore".into(),
+            prefix: "gt".into(),
+            workdir: "/rig-wt/gtcore".into(),
+            command: "claude".into(),
+            args: vec!["--flag".into()],
+            base_env: vec![("GT_ROLE".to_string(), "polecat".to_string())],
+            heartbeat_dir: std::env::temp_dir(),
+        };
+        let wt_root = dir.path().join("wt");
+        let (configs, _paths) =
+            rig_routing_from_catalog(&[gtweb], &base, Some(wt_root.as_path()), "default", dir.path());
+        let cfg = configs.get("gtweb").expect("gtweb now routes");
+        assert_eq!(cfg.template.workdir, gtweb_root);
+
+        // The per-bead worktree, cut off the routed checkout, carries gt-web's origin — NOT gt-core.
+        let worktree = wt_root.join("gt-gtweb-855bac");
+        crate::worktree::provision(&cfg.template.workdir, &worktree, "gtweb-855bac")
+            .expect("worktree provisions off the gtweb checkout");
+        assert_eq!(
+            origin_of(&worktree),
+            remote_url,
+            "a cross-rig bead's worktree clones from the rig's git_url, not GT_RIG_GIT_URL"
+        );
+    }
+
+    #[test]
+    fn provision_rig_checkouts_skips_present_or_urlless_rigs() {
+        // Idempotent: an existing checkout is left untouched; a rig with no git_url can't be cloned.
+        use gt_rig::RigEntry;
+        let dir = tempfile::tempdir().unwrap();
+        let present_root = dir.path().join("present");
+        std::fs::create_dir_all(&present_root).unwrap();
+        let mut present = RigEntry::new("present", "pr", "https://x/present.git", "main", 0);
+        present.worktree_root = Some(present_root.clone());
+
+        let mut urlless = RigEntry::new("urlless", "ul", "", "main", 0);
+        urlless.worktree_root = Some(dir.path().join("never"));
+
+        let provisioned = provision_rig_checkouts(&[present, urlless], "default", dir.path());
+        assert!(
+            provisioned.is_empty(),
+            "present checkout skipped (no clone), urlless rig not cloneable"
+        );
+        assert!(!dir.path().join("never").exists(), "urlless rig left unprovisioned");
+    }
+
+    #[test]
+    fn embed_token_in_url_credentialises_https_and_leaves_others_untouched() {
+        // gtcore-abfe8a: a plain https URL gets the token as userinfo (push-capable origin).
+        assert_eq!(
+            embed_token_in_url("https://github.com/gt-core-labs/gt-web.git", "gho_TOKEN"),
+            "https://gho_TOKEN@github.com/gt-core-labs/gt-web.git"
+        );
+        // Already credentialed — never double-embed.
+        assert_eq!(
+            embed_token_in_url("https://gho_OLD@github.com/o/r.git", "gho_NEW"),
+            "https://gho_OLD@github.com/o/r.git"
+        );
+        // Non-https remotes (ssh, local path) are left as-is.
+        assert_eq!(
+            embed_token_in_url("git@github.com:o/r.git", "gho_TOKEN"),
+            "git@github.com:o/r.git"
+        );
+        assert_eq!(
+            embed_token_in_url("/tmp/local-remote", "gho_TOKEN"),
+            "/tmp/local-remote"
+        );
     }
 
     #[tokio::test]

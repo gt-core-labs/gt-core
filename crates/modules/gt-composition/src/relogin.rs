@@ -8,7 +8,7 @@
 //!
 //! This module is the backend of the relogin flow the operator drives from the FE — the
 //! credential-validity sibling of [`crate::onboard`] (which onboards a NEW account). It reuses the
-//! same proven process-driving machinery (`claude /login` over piped stdio, URL capture, OOB-code
+//! same proven process-driving machinery (`claude auth login` over piped stdio, URL capture, OOB-code
 //! writeback, RS256 auth) but differs on three points the incident demanded:
 //!
 //! 1. **Relogin, not onboard** — `start` takes an existing `account` (its email) and relogs into the
@@ -31,7 +31,7 @@
 //!
 //! Same trust boundary as [`crate::onboard`]: mounted only with an RS256 verifier, every call
 //! requires a `gt_web_token` cookie or bearer carrying `quota.write` (writes) / `quota.read`
-//! (cred-health read) or `*`; rejections audit a denial. `claude /login` runs with the server
+//! (cred-health read) or `*`; rejections audit a denial. `claude auth login` runs with the server
 //! process's privileges.
 
 use std::collections::HashMap;
@@ -92,7 +92,7 @@ fn now_ms() -> u64 {
         .unwrap_or(0)
 }
 
-/// A relogin in flight: the live `claude /login` process holding the OAuth handshake open, its
+/// A relogin in flight: the live `claude auth login` process holding the OAuth handshake open, its
 /// stdin (where the OOB code is written in `complete`), the account email it relogs, and the creds
 /// dir it logs into. Reader tasks keep stdout/stderr drained; `kill_on_drop` reaps an un-completed
 /// child.
@@ -104,14 +104,23 @@ struct LiveRelogin {
     _readers: [JoinHandle<()>; 2],
 }
 
+/// Resolves the account ids the quota registry tracks (`quota.list`), so cred-health can enumerate
+/// accounts with no on-disk dir (gtcore-e09320). A thunk rather than a stored snapshot because the
+/// registry changes as accounts are registered/probed; the binary wires it over the event log.
+pub type KnownAccountsFn = Arc<dyn Fn() -> Vec<String> + Send + Sync>;
+
 /// Everything the relogin handlers need: auth (RS256 verifier + denial audit), the live-session
-/// map, and the accounts root the per-account creds dirs live under.
+/// map, the accounts root the per-account creds dirs live under, and (optionally) the quota account
+/// roster so cred-health enumerates every tracked account, not just the ones with a dir.
 #[derive(Clone)]
 pub struct ReloginState {
     authenticator: SharedAuthenticator,
     audit: SharedAudit,
     sessions: Arc<Mutex<HashMap<String, LiveRelogin>>>,
     accounts_root: Arc<Path>,
+    /// The quota-tracked account ids (`quota.list`). `None` ⇒ cred-health reports only the on-disk
+    /// dirs (the prior behavior, kept for tests / degraded boots without an event log).
+    known_accounts: Option<KnownAccountsFn>,
 }
 
 impl ReloginState {
@@ -125,7 +134,16 @@ impl ReloginState {
             audit,
             sessions: Arc::new(Mutex::new(HashMap::new())),
             accounts_root: accounts_root.into(),
+            known_accounts: None,
         }
+    }
+
+    /// Wire the quota-account roster so `GET /api/v1/quota/cred-health` enumerates every account
+    /// `quota.list` tracks — a dead/absent credential then surfaces as `needs_relogin` instead of
+    /// vanishing from the report (gtcore-e09320).
+    pub fn with_known_accounts(mut self, known: KnownAccountsFn) -> Self {
+        self.known_accounts = Some(known);
+        self
     }
 }
 
@@ -188,7 +206,7 @@ impl IntoResponse for ReloginError {
             }
             ReloginError::NoUrl => (
                 StatusCode::BAD_GATEWAY,
-                "claude /login produced no login URL".to_string(),
+                "claude auth login produced no login URL".to_string(),
             ),
             ReloginError::Timeout(what) => {
                 (StatusCode::GATEWAY_TIMEOUT, format!("timed out: {what}"))
@@ -292,7 +310,7 @@ fn retire_dir(dir: &Path, disabled_root: &Path) -> Option<String> {
 }
 
 impl ReloginState {
-    /// Begin a relogin: resolve the account's existing creds dir, spawn `claude /login` into it,
+    /// Begin a relogin: resolve the account's existing creds dir, spawn `claude auth login` into it,
     /// capture the URL, keep the process alive in the session map.
     async fn start(&self, account: &str) -> Result<StartResponse, ReloginError> {
         let account = account.trim();
@@ -307,7 +325,10 @@ impl ReloginState {
             .ok_or_else(|| ReloginError::UnknownAccount(account.to_string()))?;
 
         let mut cmd = TokioCommand::new(claude_bin());
-        cmd.args(["/login"])
+        // `claude auth login` — the same subcommand onboard.rs drives. NOT `/login`
+        // (an interactive REPL slash command): as CLI args the installed CLI prints
+        // "/login isn't available in this environment." and exits with no URL → NoUrl.
+        cmd.args(["auth", "login"])
             .env("CLAUDE_CONFIG_DIR", &dir)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -397,7 +418,7 @@ impl ReloginState {
         };
         if !status.success() {
             return Err(ReloginError::LoginFailed(format!(
-                "claude /login exited {status}"
+                "claude auth login exited {status}"
             )));
         }
 
@@ -429,7 +450,12 @@ impl ReloginState {
     /// edge clock. Delegates to [`cred_health_in`] so the read logic is unit-tested without an auth
     /// double.
     fn cred_health(&self) -> Vec<CredHealthReport> {
-        cred_health_in(&self.accounts_root, now_ms())
+        let known = self
+            .known_accounts
+            .as_ref()
+            .map(|f| f())
+            .unwrap_or_default();
+        cred_health_in(&self.accounts_root, &known, now_ms())
     }
 }
 
@@ -437,34 +463,54 @@ impl ReloginState {
 /// wins, matching [`crate::mcp::rest_backings::FsAccountCatalog`]). Pure classification via
 /// [`assess_cred_health`]; this only reads the files (`now_ms` is the edge clock the caller stamps).
 ///
+/// `known_accounts` is the set of account ids the quota registry tracks (`quota.list`). It closes
+/// the visibility gap that hid dead credentials (gtcore-e09320): an account tracked in quota but
+/// with NO on-disk dir — e.g. `brayanrayo`/`fsrbwowr`, whose creds dir was never provisioned or was
+/// retired — would otherwise be ABSENT from this report, so the FE's `health[id]?.needs_relogin`
+/// resolved `undefined → false` and rendered it `Healthy`. Every known account missing from the
+/// on-disk scan is synthesized as `Unreadable` / `needs_relogin = true` (the same verdict
+/// [`assess_cred_health`] gives a missing `.credentials.json`), so the report ENUMERATES every
+/// quota-tracked account, never just the ones with a dir.
+///
 /// `pub(crate)` so the MCP `quota.cred_health` tool ([`crate::mcp::quota`]) serves the SAME report
 /// the REST `GET /api/v1/quota/cred-health` does — one read path, two transports.
-pub(crate) fn cred_health_in(root: &Path, now_ms: u64) -> Vec<CredHealthReport> {
-    let Ok(read) = std::fs::read_dir(root) else {
-        return Vec::new();
-    };
+pub(crate) fn cred_health_in(
+    root: &Path,
+    known_accounts: &[String],
+    now_ms: u64,
+) -> Vec<CredHealthReport> {
     let mut by_email: std::collections::BTreeMap<String, CredHealthReport> =
         std::collections::BTreeMap::new();
-    for entry in read.flatten() {
-        let path = entry.path();
-        if !path.is_dir() {
-            continue;
+    if let Ok(read) = std::fs::read_dir(root) {
+        for entry in read.flatten() {
+            let path = entry.path();
+            if !path.is_dir() {
+                continue;
+            }
+            let Some(email) = email_of(&path) else {
+                continue; // no oauth email ⇒ not yet a catalog entry
+            };
+            if by_email.contains_key(&email) {
+                continue; // first dir per email wins (matches FsAccountCatalog)
+            }
+            let creds_raw = std::fs::read_to_string(path.join(".credentials.json")).ok();
+            let report = assess_cred_health(
+                email.clone(),
+                creds_raw.as_deref(),
+                onboarding_complete(&path),
+                now_ms,
+                REFRESH_SKEW_MS,
+            );
+            by_email.insert(email, report);
         }
-        let Some(email) = email_of(&path) else {
-            continue; // no oauth email ⇒ not yet a catalog entry
-        };
-        if by_email.contains_key(&email) {
-            continue; // first dir per email wins (matches FsAccountCatalog)
-        }
-        let creds_raw = std::fs::read_to_string(path.join(".credentials.json")).ok();
-        let report = assess_cred_health(
-            email.clone(),
-            creds_raw.as_deref(),
-            onboarding_complete(&path),
-            now_ms,
-            REFRESH_SKEW_MS,
-        );
-        by_email.insert(email, report);
+    }
+    // Enumerate every quota-tracked account: one with no on-disk dir (no entry above) is dead from
+    // the FE's standpoint — a sling can't be born on it — so synthesize the `Unreadable` /
+    // `needs_relogin` verdict instead of leaving it silently absent (gtcore-e09320).
+    for account in known_accounts {
+        by_email.entry(account.clone()).or_insert_with(|| {
+            assess_cred_health(account.clone(), None, false, now_ms, REFRESH_SKEW_MS)
+        });
     }
     by_email.into_values().collect()
 }
@@ -736,7 +782,7 @@ mod tests {
         // No creds file at all ⇒ needs relogin.
         write_dir(&accounts, "01NOCRED", "nocred@x.com", true, None);
 
-        let reports = cred_health_in(&accounts, now);
+        let reports = cred_health_in(&accounts, &[], now);
         let by: HashMap<&str, &CredHealthReport> =
             reports.iter().map(|r| (r.account.as_str(), r)).collect();
 
@@ -745,5 +791,38 @@ mod tests {
         assert!(by["wedge@x.com"].needs_relogin);
         assert!(!by["wedge@x.com"].onboarding_complete);
         assert!(by["nocred@x.com"].needs_relogin);
+    }
+
+    #[test]
+    fn cred_health_enumerates_quota_accounts_without_a_dir() {
+        // gtcore-e09320: an account tracked in quota but with NO on-disk dir (brayanrayo/fsrbwowr)
+        // must still appear — as Unreadable / needs_relogin — so the FE never renders it Healthy.
+        let tmp = tempfile::tempdir().unwrap();
+        let accounts = tmp.path().join("accounts");
+        std::fs::create_dir_all(&accounts).unwrap();
+        let now = now_ms();
+        // One account HAS a healthy dir; two are quota-tracked but dirless.
+        write_dir(&accounts, "01HEALTHY", "ok@x.com", true, Some(&valid_creds(now)));
+        let known = vec![
+            "ok@x.com".to_string(),
+            "brayanrayo@bi-quare.com".to_string(),
+            "fsrbwowr@gmail.com".to_string(),
+        ];
+
+        let reports = cred_health_in(&accounts, &known, now);
+        let by: HashMap<&str, &CredHealthReport> =
+            reports.iter().map(|r| (r.account.as_str(), r)).collect();
+
+        // The on-disk healthy account keeps its real (slingable) verdict — not overwritten.
+        assert!(!by["ok@x.com"].needs_relogin);
+        assert!(by["ok@x.com"].onboarding_complete);
+        // The dirless quota accounts are enumerated as dead.
+        for dead in ["brayanrayo@bi-quare.com", "fsrbwowr@gmail.com"] {
+            assert!(by[dead].needs_relogin, "{dead} must need relogin");
+            assert!(!by[dead].onboarding_complete);
+            assert_eq!(by[dead].credential, gt_quota::CredentialHealth::Unreadable);
+            assert!(!by[dead].refresh);
+            assert_eq!(by[dead].expires_at_secs, None);
+        }
     }
 }

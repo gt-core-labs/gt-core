@@ -35,7 +35,7 @@ use gt_documents::{DocumentsApiState, DocumentsModule};
 use gt_feed::{FeedApiState, FeedModule};
 use gt_graphindex::GraphifyIndexer;
 use gt_merge::{MergeApiState, MergeModule};
-use gt_meta::{MetaApiState, MetaModule};
+use gt_meta::{DomainApiState, DomainCatalogHttpModule, MetaApiState, MetaModule};
 use gt_module::{McpTool, RootBuilder};
 use gt_orchestration::{ConvoyApiState, ConvoyModule};
 use gt_quota::{QuotaApiState, QuotaModule};
@@ -46,8 +46,8 @@ use gt_workspace::{PgWorkspaces, WorkspaceApiState, WorkspaceModule};
 
 use crate::mcp::{
     CompositionTenantProvisioner, EventLog, EventLogAgentEvents, EventLogConvoy, EventLogFeed,
-    EventLogGraph, EventLogMerges, EventLogQuota, EventLogSkills, FsAccountCatalog, GraphHandler,
-    GraphHandlerRefresher, RigProvisioner, WsPoolRigs, WsPools,
+    EventLogGraph, EventLogMerges, EventLogQuota, EventLogRigSink, EventLogSkills, FsAccountCatalog,
+    GraphHandler, GraphHandlerRefresher, RigProvisioner, WsPoolRigs, WsPools,
 };
 
 /// The Postgres-gated slice of the REST module set (workspace / rig / connection /
@@ -167,13 +167,37 @@ pub async fn build_rest_modules(
         pg,
     } = parts;
 
+    // The per-workspace Dolt pools (multi-tenant only) the meta `GET /domains` endpoint
+    // resolves the active tenant's `domain_catalog` from (gtcore-d81e77 H2). Cloned out of
+    // the still-owned `pg` parts before they are destructured below; `None` in single-tenant
+    // builds, where the meta catalog reads the fallback `meta_store` pool.
+    let meta_workspaces = pg.as_ref().and_then(|p| p.issues_workspaces.clone());
+
+    // The domain-catalog REST module (gtcore-b37400 H4) shares the same store + per-workspace
+    // pools as the meta `GET /domains` read, so it resolves and writes ONE catalog. Cloned out
+    // before `meta_store`/`meta_workspaces` are consumed by the meta module below.
+    let domain_state = {
+        let state = DomainApiState::new(meta_store.clone());
+        match &meta_workspaces {
+            Some(pools) => state.with_workspaces(pools.clone()),
+            None => state,
+        }
+    };
+
     let mut rest = RootBuilder::new()
-        // meta REST: GET /help (full tools/list) + POST /report-gap.
-        .module(MetaModule::with_http(MetaApiState::new(
-            meta_store,
-            actor.clone(),
-            meta_tools,
-        )))
+        // meta REST: GET /help (full tools/list) + GET /domains (active-workspace
+        // domain catalog) + POST /report-gap.
+        .module(MetaModule::with_http({
+            let state = MetaApiState::new(meta_store, actor.clone(), meta_tools);
+            match meta_workspaces {
+                Some(pools) => state.with_workspaces(pools),
+                None => state,
+            }
+        }))
+        // domain.catalog.* REST: admin-scoped (domain.read/domain.write) list/add/rename/
+        // set-enabled/remove for the active workspace's catalog — the REST twin of the
+        // `domain.catalog.*` MCP tools (gtcore-b37400 H4).
+        .module(DomainCatalogHttpModule::with_http(domain_state))
         // agent.*: the REST surface now delegates to the SAME EventLog the MCP handler uses
         // (gtcore-8c3823), so both transports always agree on session state regardless of
         // whether the backend is file or Postgres.
@@ -291,9 +315,14 @@ pub async fn build_rest_modules(
                     )),
                 ),
             ))
-            .module(RigsModule::with_http(RigApiState::new(Arc::new(
-                WsPoolRigs::new(Arc::new(WsPools::new(pg_url.clone()))),
-            ))))
+            // rig-hold H1: the REST hold/resume routes emit `rig.held.v1` / `rig.resumed.v1` to the
+            // same event log the MCP handler uses, so the transition is auditable across transports.
+            .module(RigsModule::with_http(
+                RigApiState::new(Arc::new(WsPoolRigs::new(Arc::new(WsPools::new(
+                    pg_url.clone(),
+                )))))
+                .with_event_sink(Arc::new(EventLogRigSink::new(event_log.clone()))),
+            ))
             // connection.*: per-workspace VCS connections over the GLOBAL
             // `public.vcs_connections` table, + the GitHub App install flow when
             // an App is configured.

@@ -99,6 +99,16 @@ pub struct Account {
     /// `quota.list`/`quota.info` so counter drift is diagnosable instead of silent.
     #[serde(default)]
     pub probe_divergence: Option<f64>,
+    /// Credential VALIDITY signal, distinct from `status` (which tracks quota USAGE): `true` when
+    /// the usage-probe could not authenticate the account — its access token is expired with NO
+    /// refresh token stored, or the OAuth token endpoint rejected the refresh (gtcore-e09320). A
+    /// dead credential makes every sling born on the account die at `401`, yet `status` can still
+    /// read `Healthy` (the budget is untouched). Surfaced on `quota.list`/`quota.info` so the
+    /// deadness the prober detects is observable instead of only logged. Unlike a `Blocked` quota
+    /// state (time-healing), a dead credential only recovers via `quota.relogin`; the next
+    /// successful `UsageProbed` (a probe only succeeds with a live credential) clears it.
+    #[serde(default)]
+    pub credential_dead: bool,
 }
 
 impl Account {
@@ -111,6 +121,7 @@ impl Account {
             last_probe_secs: None,
             sampled_since_probe: 0.0,
             probe_divergence: None,
+            credential_dead: false,
         }
     }
 
@@ -367,6 +378,10 @@ impl AccountRegistry {
             // sampled-since tail — from here the local counter is telemetry, not truth.
             acc.last_probe_secs = Some(now_secs);
             acc.sampled_since_probe = 0.0;
+            // A probe only reaches the provider with a LIVE credential (the prober refreshes or
+            // dies before this), so a successful probe clears any latched credential-dead flag
+            // (gtcore-e09320) — the account re-authenticated.
+            acc.credential_dead = false;
             // A probe with remaining > 0 means the account has real 5h capacity: lift any
             // non-Healthy status (Cooldown after rotation, Limited/Blocked after a 429) —
             // unless the weekly budget is exhausted, in which case the account stays parked
@@ -619,6 +634,9 @@ impl QuotaState {
                 }
                 entry.last_probe_secs = Some(*now_secs);
                 entry.sampled_since_probe = 0.0;
+                // A successful probe re-authenticated the credential, so clear any latched
+                // credential-dead flag (gtcore-e09320) — mirrors the live `apply_probe` clear.
+                entry.credential_dead = false;
                 // Same weekly gate as the live `apply_probe` (hq-34a2f5): 5h capacity alone
                 // must not lift an account whose weekly budget is exhausted.
                 let weekly_ok = match weekly_remaining {
@@ -699,6 +717,17 @@ impl QuotaState {
                     a.status = AccountQuotaStatus::Blocked;
                 }
             }
+            // Credential VALIDITY signal from the usage-probe (gtcore-e09320): latch the account
+            // dead so `quota.list` stops reading `Healthy` for it. Materialize the account if the
+            // probe found it dead before any other event created it (e.g. registered-but-never-
+            // probed). The flag is cleared by the next successful `UsageProbed`.
+            QuotaEvent::CredentialDead { account, .. } => {
+                let entry = self
+                    .accounts
+                    .entry(account.clone())
+                    .or_insert_with(|| Account::new(account.clone()));
+                entry.credential_dead = true;
+            }
             QuotaEvent::AccountRegistered { account, config_dir, .. } => {
                 self.registered.insert(account.clone(), config_dir.clone());
                 // Make it a rotation candidate too (Healthy with no window yet; the window arrives
@@ -766,6 +795,52 @@ mod tests {
         });
         assert!(s.registered.is_empty());
         assert!(!s.accounts.contains_key("acctB"));
+    }
+
+    #[test]
+    fn credential_dead_event_latches_flag_and_successful_probe_clears_it() {
+        // gtcore-e09320: a CredentialDead event makes `quota.list` (rebuilt from this reducer) read
+        // the account credential-dead even though its quota status stays Healthy; the next
+        // successful UsageProbed re-authenticates and clears the flag.
+        let mut s = QuotaState::default();
+        s.apply(&QuotaEvent::AccountRegistered {
+            account: "acct".into(),
+            config_dir: "/vol/accounts/acct".into(),
+            now_secs: 100,
+        });
+        assert!(!s.accounts["acct"].credential_dead);
+
+        s.apply(&QuotaEvent::CredentialDead {
+            account: "acct".into(),
+            now_secs: 200,
+        });
+        assert!(s.accounts["acct"].credential_dead, "probe-detected deadness latched");
+        // Status is a separate axis (quota usage), untouched by the credential signal.
+        assert_eq!(s.accounts["acct"].status, AccountQuotaStatus::Healthy);
+
+        // A successful probe (remaining > 0) proves the credential is live again → clear.
+        s.apply(&QuotaEvent::UsageProbed {
+            account: "acct".into(),
+            remaining: 40_000_000,
+            resets_at_secs: 36_000,
+            weekly_remaining: None,
+            weekly_resets_at_secs: None,
+            now_secs: 300,
+        });
+        assert!(!s.accounts["acct"].credential_dead, "live probe clears the dead flag");
+    }
+
+    #[test]
+    fn credential_dead_materializes_account_when_probe_finds_it_first() {
+        // The probe can detect a dead credential before any other event created the account in the
+        // projection; the reducer must still record it (gtcore-e09320).
+        let mut s = QuotaState::default();
+        s.apply(&QuotaEvent::CredentialDead {
+            account: "ghost".into(),
+            now_secs: 10,
+        });
+        assert!(s.accounts.contains_key("ghost"));
+        assert!(s.accounts["ghost"].credential_dead);
     }
 
     #[test]
@@ -933,6 +1008,7 @@ mod tests {
             last_probe_secs: None,
             sampled_since_probe: 0.0,
             probe_divergence: None,
+            credential_dead: false,
         });
         r.apply_probe("acc-1", 50_000_000, 36_000, None, 0);
         let acc = r.get("acc-1").unwrap();
@@ -960,6 +1036,7 @@ mod tests {
             last_probe_secs: None,
             sampled_since_probe: 0.0,
             probe_divergence: None,
+            credential_dead: false,
         });
         r.apply_probe("acc-1", 0, 18_000, None, 0);
         assert_eq!(
@@ -988,6 +1065,7 @@ mod tests {
             last_probe_secs: None,
             sampled_since_probe: 0.0,
             probe_divergence: None,
+            credential_dead: false,
         });
         // Probe reports recovered 5h capacity but an exhausted weekly budget.
         r.apply_probe("acc-1", 40_000_000, 36_000, Some(0), 100);
@@ -1026,6 +1104,7 @@ mod tests {
             last_probe_secs: None,
             sampled_since_probe: 0.0,
             probe_divergence: None,
+            credential_dead: false,
         });
         r.apply_probe("acc-1", 40_000_000, 36_000, None, 100);
         assert_eq!(
@@ -1068,6 +1147,7 @@ mod tests {
                 last_probe_secs: None,
                 sampled_since_probe: 0.0,
                 probe_divergence: None,
+                credential_dead: false,
             },
         );
         s.apply(&QuotaEvent::UsageProbed {
@@ -1112,6 +1192,7 @@ mod tests {
             last_probe_secs: None,
             sampled_since_probe: 0.0,
             probe_divergence: None,
+            credential_dead: false,
         });
         r.apply_probe("acc-1", 40_000_000, 36_000, None, 0);
         assert_eq!(
@@ -1132,6 +1213,7 @@ mod tests {
             last_probe_secs: None,
             sampled_since_probe: 0.0,
             probe_divergence: None,
+            credential_dead: false,
         };
         assert!(fresh.is_genuinely_blocked(9_000), "fresh block confirmed");
         // Stale block: the window already lapsed ⇒ NOT genuinely blocked (awaiting re-probe).
@@ -1146,6 +1228,7 @@ mod tests {
             last_probe_secs: None,
             sampled_since_probe: 0.0,
             probe_divergence: None,
+            credential_dead: false,
         };
         assert!(!no_window.is_genuinely_blocked(0));
         // Any non-Blocked status is never genuinely blocked, regardless of window.
@@ -1162,6 +1245,7 @@ mod tests {
                 last_probe_secs: None,
                 sampled_since_probe: 0.0,
                 probe_divergence: None,
+                credential_dead: false,
             };
             assert!(!acc.is_genuinely_blocked(9_000), "{status:?} is not a block");
         }
@@ -1177,6 +1261,7 @@ mod tests {
             last_probe_secs: None,
             sampled_since_probe: 0.0,
             probe_divergence: None,
+            credential_dead: false,
         };
         let now = 9_000; // before the 10_000 reset ⇒ fresh
 
@@ -1203,6 +1288,7 @@ mod tests {
             last_probe_secs: None,
             sampled_since_probe: 0.0,
             probe_divergence: None,
+            credential_dead: false,
         });
         assert!(
             !r.pool_genuinely_blocked(10_500),
@@ -1229,6 +1315,7 @@ mod tests {
             last_probe_secs: None,
             sampled_since_probe: 0.0,
             probe_divergence: None,
+            credential_dead: false,
         });
         // Local sampling accumulates the unverified tail (IDENTITY weights: 100+100=200).
         r.apply_sample("acc-1", "s1", "opus", 100, 100, 0, 0, 600);
@@ -1299,6 +1386,7 @@ mod tests {
             last_probe_secs: None,
             sampled_since_probe: 0.0,
             probe_divergence: None,
+            credential_dead: false,
         };
         let json = serde_json::to_string(&acc).unwrap();
         let back: Account = serde_json::from_str(&json).unwrap();

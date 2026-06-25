@@ -214,17 +214,25 @@ impl DomainHandler for QuotaHandler {
                 }
             }
             "quota.cred_health" => {
-                // Reads the on-disk account dirs (not the quota log) and classifies each on both
-                // slingability axes (credential validity + onboarding markers). The SAME report the
-                // REST `GET /api/v1/quota/cred-health` serves. Empty when no accounts root is wired.
+                // Reads the on-disk account dirs AND enumerates every account the quota registry
+                // tracks (gtcore-e09320): an account in `quota.list` with no dir is reported as
+                // Unreadable / needs_relogin instead of vanishing, so the FE never shows a
+                // dead/absent credential as Healthy. The SAME report the REST
+                // `GET /api/v1/quota/cred-health` serves. Empty when no accounts root is wired.
+                let known: Vec<String> = self
+                    .registry(ws)
+                    .map(|r| r.accounts().map(|a| a.id.clone()).collect())
+                    .unwrap_or_default();
                 let reports = match self.accounts_root.as_ref() {
                     Some(root) => {
                         let now_ms = SystemTime::now()
                             .duration_since(UNIX_EPOCH)
                             .map(|d| d.as_millis() as u64)
                             .unwrap_or(0);
-                        crate::relogin::cred_health_in(root, now_ms)
+                        crate::relogin::cred_health_in(root, &known, now_ms)
                     }
+                    // No accounts root wired (degraded boot / tests): keep the clean-degrade
+                    // contract and report nothing rather than flagging every tracked account dead.
                     None => Vec::new(),
                 };
                 Ok(json!({ "accounts": reports }))

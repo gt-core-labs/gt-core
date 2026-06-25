@@ -31,7 +31,7 @@ use time::{Date, Month};
 use crate::surface::{
     check_surface_existence, check_surface_shape, surface_to_json, SurfaceEntry, SurfaceTree,
 };
-use crate::taxonomy::{Dispatch, Domain, IssueType, RoleScope};
+use crate::taxonomy::{Dispatch, IssueType, RoleScope};
 
 /// Map a [`gt_module_mcp::taxonomy::TaxonomyError`] onto the store's
 /// [`AppError::Validation`] so the NN-16 rejection surfaces with the same
@@ -119,9 +119,12 @@ fn check_depends_on(id: &str, deps: &[String]) -> Result<(), AppError> {
     Ok(())
 }
 
-/// JSON-array string for the closed-set [`Domain`] values (e.g.
-/// `["orch.merge","store.dolt"]`). Same NOT-NULL `"[]"` fallback.
-fn domain_to_json(items: &[Domain]) -> String {
+/// JSON-array string for the bead's `domain` keys (e.g.
+/// `["orch.merge","store.dolt"]`). The values are now free strings validated at
+/// runtime against the workspace's `domain_catalog` (gtcore-d81e77 H2), not the
+/// closed `Domain` enum; the store column already persisted this JSON-array
+/// shape, so the wire form round-trips unchanged. Same NOT-NULL `"[]"` fallback.
+fn domain_to_json(items: &[String]) -> String {
     serde_json::to_string(items).unwrap_or_else(|_| "[]".to_string())
 }
 
@@ -189,10 +192,13 @@ pub struct CreateIssue {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub owner: Option<String>,
     /// Semantic domains the bead affects (doc 14 §3). At least one is required.
-    /// Closed set ([`Domain`]): an out-of-set value is rejected at deserialization
-    /// (hq-core-mcp.3).
+    /// Free strings validated at RUNTIME against the bead workspace's
+    /// `domain_catalog` (gtcore-d81e77 H2): each must exist and be enabled in that
+    /// workspace's catalog, otherwise the create is rejected naming the workspace's
+    /// set. The old closed `Domain` enum is now only the technical seed source
+    /// (gtcore-55d5fb H1), not the wire arbiter.
     #[serde(default)]
-    pub domain: Vec<Domain>,
+    pub domain: Vec<String>,
     /// Physical impact surface — crate names or repo paths the bead touches,
     /// each carrying a `planned` intent (docs/10 §S3). A bare string is read as
     /// `planned:false` for back-compat. Empty for pure spec/process work.
@@ -391,11 +397,13 @@ pub struct UpdateIssue {
     /// When set non-empty, NN-16 is re-checked against the (possibly also-updated) `issue_type`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parent_id: Option<String>,
-    /// New semantic domains (closed set [`Domain`]). `None` leaves the column
+    /// New semantic domains (free strings, runtime-validated against the bead
+    /// workspace's `domain_catalog` — gtcore-d81e77 H2). `None` leaves the column
     /// untouched; an empty overwrite is rejected (a bead must keep at least one
-    /// domain); an out-of-set value is rejected at deserialization.
+    /// domain); a value outside the workspace catalog is rejected at execute,
+    /// naming the workspace's set.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub domain: Option<Vec<Domain>>,
+    pub domain: Option<Vec<String>>,
     /// New impact surface (object form `[{path,planned}]`, bare string read as
     /// `planned:false`). `None` leaves the column untouched; `Some(_)` overwrites
     /// (empty allowed). This is the field that repoints stale `surface_json` paths
@@ -815,7 +823,7 @@ mod tests {
             parent_id: Some("hq-core-host".into()),
             assignee: None,
             owner: None,
-            domain: vec![Domain::StoreDolt],
+            domain: vec!["store.dolt".to_string()],
             surface: vec![],
             depends_on: vec![],
             role_scope: None,
