@@ -146,6 +146,51 @@ fn cmd(program: &str, args: &[&str], dir: &Path) -> std::io::Result<(bool, Strin
     Ok((out.status.success(), text))
 }
 
+/// Look up the worktree path that holds `branch`, returning `None` on any failure (the worktree
+/// lookup is best-effort — callers that need the worktree for a hard step use their own error path).
+fn find_worktree(rig: &Path, branch: &str) -> Option<PathBuf> {
+    let (ok, porcelain) = run(rig, &worktree_list_argv()).ok()?;
+    if !ok {
+        return None;
+    }
+    worktree_for_branch(&porcelain, branch)
+}
+
+/// Auto-sync `Cargo.lock` when it drifts from the workspace's `Cargo.toml` set (gtcore-bfb203).
+/// Runs `cargo generate-lockfile` in the worktree and, if the lock changed, commits it so the PR's
+/// CI never fails with "cannot update the lock file because --locked was passed". Best-effort:
+/// failures are logged and do not abort the merge — CI will catch any remaining desync.
+fn cargo_lock_sync(worktree: &Path, branch: &str) {
+    match cmd("cargo", &["generate-lockfile"], worktree) {
+        Ok((true, _)) => {}
+        Ok((false, err)) => {
+            eprintln!("[git-merge] {branch}: cargo generate-lockfile failed: {err} — Cargo.lock may be unsync'd");
+            return;
+        }
+        Err(e) => {
+            // `cargo` not in PATH (e.g. an image without a Rust toolchain) — skip silently.
+            if e.kind() != std::io::ErrorKind::NotFound {
+                eprintln!("[git-merge] {branch}: cargo generate-lockfile I/O error: {e}");
+            }
+            return;
+        }
+    }
+    // `git diff --quiet` exits 1 when there are unstaged changes, 0 when the tree is clean.
+    let lock_dirty = matches!(
+        run(worktree, &["diff".into(), "--quiet".into(), "--".into(), "Cargo.lock".into()]),
+        Ok((false, _))
+    );
+    if !lock_dirty {
+        return;
+    }
+    let _ = run(worktree, &["add".into(), "Cargo.lock".into()]);
+    match run(worktree, &["commit".into(), "-m".into(), "chore: sync Cargo.lock (auto, gtcore-bfb203)".into()]) {
+        Ok((true, _)) => eprintln!("[git-merge] {branch}: Cargo.lock synced and committed"),
+        Ok((false, err)) => eprintln!("[git-merge] {branch}: Cargo.lock commit failed: {err}"),
+        Err(e) => eprintln!("[git-merge] {branch}: Cargo.lock commit I/O error: {e}"),
+    }
+}
+
 /// The outcome of a real merge attempt: the sha now on `main`, or a human reason for the failure.
 type MergeOutcome = Result<String, String>;
 
@@ -254,6 +299,11 @@ fn merge_branch_to_main(rig: &Path, branch: &str) -> Result<MergeResult, String>
         Err(e) => return Err(format!("git fetch origin error: {e}")),
     }
 
+    // 1b) Sync Cargo.lock before pushing (gtcore-bfb203): regenerate and commit if drifted.
+    if let Some(wt) = find_worktree(rig, branch) {
+        cargo_lock_sync(&wt, branch);
+    }
+
     // 2) Fast-forward push. The common case: the branch is already on top of origin/main.
     match run(rig, &push_argv(branch)) {
         Ok((true, _)) => return resolve_sha(rig, branch).map(MergeResult::Merged),
@@ -281,6 +331,9 @@ fn merge_branch_to_main(rig: &Path, branch: &str) -> Result<MergeResult, String>
         }
         Err(e) => return Err(format!("git rebase error: {e}")),
     }
+
+    // 3b) Sync Cargo.lock again after rebase — a rebase may introduce new Cargo.toml changes.
+    cargo_lock_sync(&worktree, branch);
 
     // 4) Retry the now-fast-forwardable push.
     match run(rig, &push_argv(branch)) {
@@ -314,6 +367,11 @@ fn merge_branch_via_pr(rig: &Path, branch: &str, bead: &str) -> Result<MergeResu
 
     // 2) Rebase onto origin/main so the PR is clean.
     rebase_branch_onto_main(rig, branch)?;
+
+    // 2b) Sync Cargo.lock after rebase (gtcore-bfb203).
+    if let Some(wt) = find_worktree(rig, branch) {
+        cargo_lock_sync(&wt, branch);
+    }
 
     // 3) Push the branch to origin.
     match run(rig, &push_branch_argv(branch)) {
