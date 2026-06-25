@@ -146,6 +146,119 @@ fn cmd(program: &str, args: &[&str], dir: &Path) -> std::io::Result<(bool, Strin
     Ok((out.status.success(), text))
 }
 
+/// Look up the worktree path that holds `branch`, returning `None` on any failure (the worktree
+/// lookup is best-effort — callers that need the worktree for a hard step use their own error path).
+fn find_worktree(rig: &Path, branch: &str) -> Option<PathBuf> {
+    let (ok, porcelain) = run(rig, &worktree_list_argv()).ok()?;
+    if !ok {
+        return None;
+    }
+    worktree_for_branch(&porcelain, branch)
+}
+
+/// Read the exact version of a crate from `Cargo.lock`, e.g. `"0.8.6"` for `"sqlx"`.
+/// Used to re-pin a crate after a full lock regeneration so transitive consumers don't drift
+/// to a newer incompatible version (see `cargo_lock_sync`).
+fn lock_crate_version(worktree: &Path, krate: &str) -> Option<String> {
+    let lock_path = worktree.join("Cargo.lock");
+    let text = std::fs::read_to_string(&lock_path).ok()?;
+    let needle_name = format!("name = \"{krate}\"");
+    for block in text.split("\n[[package]]") {
+        if block.contains(&needle_name) {
+            for line in block.lines() {
+                if let Some(v) = line.strip_prefix("version = \"") {
+                    return Some(v.trim_end_matches('"').to_owned());
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Return `true` when `cargo metadata --locked` exits 0 — the lock file is in sync with all
+/// `Cargo.toml` files in the workspace. Fails fast on any I/O error.
+fn cargo_locked_ok(worktree: &Path) -> bool {
+    matches!(
+        cmd("cargo", &["metadata", "--locked", "--format-version", "1"], worktree),
+        Ok((true, _))
+    )
+}
+
+/// Auto-sync `Cargo.lock` when it drifts from the workspace's `Cargo.toml` set (gtcore-bfb203).
+/// Two-stage strategy so that adding a workspace-member dep (the common case) never upgrades
+/// external crate versions:
+///
+/// 1. `cargo update --workspace`: only touches workspace-member entries — safe, never upgrades
+///    external crates.  Handles the common case (e.g. adding a path dep between members).
+/// 2. If the lock is still inconsistent (a brand-new external dep was added), fall back to
+///    `cargo generate-lockfile`.  After that, re-pin any crate that the workspace already locked
+///    to a specific version — currently `sqlx`, which pgvector otherwise pulls to a newer minor
+///    that conflicts with the workspace's 0.8.x pin.
+///
+/// Best-effort: failures are logged and do not abort the merge — CI catches any remaining desync.
+fn cargo_lock_sync(worktree: &Path, branch: &str) {
+    // Fast path: already in sync.
+    if cargo_locked_ok(worktree) {
+        return;
+    }
+
+    // Stage 1: workspace-only update — never upgrades external deps.
+    match cmd("cargo", &["update", "--workspace"], worktree) {
+        Ok(_) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return, // cargo not in PATH
+        Err(e) => {
+            eprintln!("[git-merge] {branch}: cargo update --workspace I/O error: {e}");
+            return;
+        }
+    }
+    if cargo_locked_ok(worktree) {
+        // Stage 1 was enough (workspace-member dep change).
+        return commit_lock_if_dirty(worktree, branch);
+    }
+
+    // Stage 2: new external crate was added — need full regeneration.
+    // Capture the workspace's pinned sqlx version first so we can re-pin afterward.
+    let sqlx_pin = lock_crate_version(worktree, "sqlx");
+
+    match cmd("cargo", &["generate-lockfile"], worktree) {
+        Ok((true, _)) => {}
+        Ok((false, err)) => {
+            eprintln!("[git-merge] {branch}: cargo generate-lockfile failed: {err} — Cargo.lock may be unsync'd");
+            return;
+        }
+        Err(e) => {
+            eprintln!("[git-merge] {branch}: cargo generate-lockfile I/O error: {e}");
+            return;
+        }
+    }
+
+    // Re-pin sqlx after full regeneration: pgvector 0.4.x declares `sqlx >= 0.8, < 0.10`
+    // so a fresh resolve picks sqlx 0.9 as a second instance, breaking trait coherence with
+    // the workspace's sqlx 0.8 consumers.  Forcing both to the same version fixes it.
+    if let Some(ver) = sqlx_pin {
+        let _ = cmd("cargo", &["update", "-p", "sqlx", "--precise", &ver], worktree);
+    }
+
+    commit_lock_if_dirty(worktree, branch);
+}
+
+fn commit_lock_if_dirty(worktree: &Path, branch: &str) {
+    // `git diff --quiet` exits 1 when there are unstaged changes, 0 when the tree is clean.
+    let lock_dirty = matches!(
+        run(worktree, &["diff".into(), "--quiet".into(), "--".into(), "Cargo.lock".into()]),
+        Ok((false, _))
+    );
+    if !lock_dirty {
+        return;
+    }
+    let _ = run(worktree, &["add".into(), "Cargo.lock".into()]);
+    match run(worktree, &["commit".into(), "-m".into(), "chore: sync Cargo.lock (auto, gtcore-bfb203)".into()]) {
+        Ok((true, _)) => eprintln!("[git-merge] {branch}: Cargo.lock synced and committed"),
+        Ok((false, err)) => eprintln!("[git-merge] {branch}: Cargo.lock commit failed: {err}"),
+        Err(e) => eprintln!("[git-merge] {branch}: Cargo.lock commit I/O error: {e}"),
+    }
+}
+
 /// The outcome of a real merge attempt: the sha now on `main`, or a human reason for the failure.
 type MergeOutcome = Result<String, String>;
 
@@ -241,6 +354,18 @@ const GATE_SETTLE_DELAY: std::time::Duration = std::time::Duration::from_secs(2)
 /// merge queue cannot spin us force-pushing indefinitely.
 const MAX_REBASE_RETRIES: u32 = 3;
 
+/// `git -C <rig> merge-base --is-ancestor <branch> origin/main` argv — exits 0 when `branch`
+/// is already an ancestor of `origin/main` (merged via another path), exits 1 otherwise.
+/// Used to short-circuit the merge for `ahead=0` branches (gtcore-e34546).
+fn already_merged_argv(branch: &str) -> Vec<String> {
+    vec![
+        "merge-base".into(),
+        "--is-ancestor".into(),
+        branch.into(),
+        "origin/main".into(),
+    ]
+}
+
 /// Execute the real merge of `branch` into `main` from the `rig` checkout, per CLAUDE.md
 /// flat-history: fetch, fast-forward push, and on divergence rebase the branch onto `origin/main`
 /// and retry once. Returns the merged sha on success or a reason on conflict/error. Pure of the
@@ -252,6 +377,23 @@ fn merge_branch_to_main(rig: &Path, branch: &str) -> Result<MergeResult, String>
         Ok((true, _)) => {}
         Ok((false, err)) => return Err(format!("git fetch origin failed: {err}")),
         Err(e) => return Err(format!("git fetch origin error: {e}")),
+    }
+
+    // 1a) Short-circuit: branch already an ancestor of origin/main (gtcore-e34546).
+    // Work arrived via another path (cherry-pick, another PR) — report merged immediately
+    // rather than failing with a non-ff conflict and looping through the sheriff.
+    if let Ok((true, _)) = run(rig, &already_merged_argv(branch)) {
+        eprintln!("[git-merge] {branch}: already merged into origin/main — marking complete");
+        let sha = match run(rig, &rev_parse_origin_main_argv()) {
+            Ok((true, s)) => s,
+            _ => String::new(),
+        };
+        return Ok(MergeResult::Merged(sha));
+    }
+
+    // 1b) Sync Cargo.lock before pushing (gtcore-bfb203): regenerate and commit if drifted.
+    if let Some(wt) = find_worktree(rig, branch) {
+        cargo_lock_sync(&wt, branch);
     }
 
     // 2) Fast-forward push. The common case: the branch is already on top of origin/main.
@@ -281,6 +423,9 @@ fn merge_branch_to_main(rig: &Path, branch: &str) -> Result<MergeResult, String>
         }
         Err(e) => return Err(format!("git rebase error: {e}")),
     }
+
+    // 3b) Sync Cargo.lock again after rebase — a rebase may introduce new Cargo.toml changes.
+    cargo_lock_sync(&worktree, branch);
 
     // 4) Retry the now-fast-forwardable push.
     match run(rig, &push_argv(branch)) {
@@ -312,8 +457,23 @@ fn merge_branch_via_pr(rig: &Path, branch: &str, bead: &str) -> Result<MergeResu
         Err(e) => return Err(format!("git fetch origin error: {e}")),
     }
 
+    // 1a) Short-circuit: branch already an ancestor of origin/main (gtcore-e34546).
+    if let Ok((true, _)) = run(rig, &already_merged_argv(branch)) {
+        eprintln!("[git-merge] {bead}: branch {branch} already merged into origin/main — marking complete");
+        let sha = match run(rig, &rev_parse_origin_main_argv()) {
+            Ok((true, s)) => s,
+            _ => String::new(),
+        };
+        return Ok(MergeResult::Merged(sha));
+    }
+
     // 2) Rebase onto origin/main so the PR is clean.
     rebase_branch_onto_main(rig, branch)?;
+
+    // 2b) Sync Cargo.lock after rebase (gtcore-bfb203).
+    if let Some(wt) = find_worktree(rig, branch) {
+        cargo_lock_sync(&wt, branch);
+    }
 
     // 3) Push the branch to origin.
     match run(rig, &push_branch_argv(branch)) {
@@ -660,6 +820,11 @@ mod tests {
             vec!["worktree", "list", "--porcelain"]
         );
         assert_eq!(
+            already_merged_argv("gtcore-00325f"),
+            vec!["merge-base", "--is-ancestor", "gtcore-00325f", "origin/main"],
+            "exits 0 when branch is already an ancestor of main"
+        );
+        assert_eq!(
             push_force_branch_argv("hq-x.1"),
             vec!["push", "--force-with-lease", "origin", "hq-x.1"],
             "BEHIND recovery force-pushes the rebased branch (lease-guarded), not branch:main"
@@ -890,6 +1055,43 @@ branch refs/heads/hq-z.1
         );
         // The detached tree's HEAD is not a branch — nothing resolves to it.
         assert_eq!(worktree_for_branch(porcelain, ""), None);
+    }
+
+    #[test]
+    fn lock_crate_version_parses_from_cargo_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let lock = r#"# This file is automatically @generated by Cargo.
+# It is not intended for manual editing.
+version = 3
+
+[[package]]
+name = "anyhow"
+version = "1.0.95"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+
+[[package]]
+name = "sqlx"
+version = "0.8.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+dependencies = [
+ "sqlx-core",
+]
+"#;
+        std::fs::write(dir.path().join("Cargo.lock"), lock).unwrap();
+        assert_eq!(
+            lock_crate_version(dir.path(), "sqlx"),
+            Some("0.8.6".to_owned()),
+            "parses version from Cargo.lock package block"
+        );
+        assert_eq!(
+            lock_crate_version(dir.path(), "anyhow"),
+            Some("1.0.95".to_owned()),
+        );
+        assert_eq!(
+            lock_crate_version(dir.path(), "nonexistent"),
+            None,
+            "returns None for crate not in lock"
+        );
     }
 
     /// A5 (gtcore-f3a016) — **the merge queue is the only path to `main`**, from the edge's

@@ -8,7 +8,7 @@
 //!
 //! This module is the backend of the relogin flow the operator drives from the FE — the
 //! credential-validity sibling of [`crate::onboard`] (which onboards a NEW account). It reuses the
-//! same proven process-driving machinery (`claude /login` over piped stdio, URL capture, OOB-code
+//! same proven process-driving machinery (`claude auth login` over piped stdio, URL capture, OOB-code
 //! writeback, RS256 auth) but differs on three points the incident demanded:
 //!
 //! 1. **Relogin, not onboard** — `start` takes an existing `account` (its email) and relogs into the
@@ -31,7 +31,7 @@
 //!
 //! Same trust boundary as [`crate::onboard`]: mounted only with an RS256 verifier, every call
 //! requires a `gt_web_token` cookie or bearer carrying `quota.write` (writes) / `quota.read`
-//! (cred-health read) or `*`; rejections audit a denial. `claude /login` runs with the server
+//! (cred-health read) or `*`; rejections audit a denial. `claude auth login` runs with the server
 //! process's privileges.
 
 use std::collections::HashMap;
@@ -92,7 +92,7 @@ fn now_ms() -> u64 {
         .unwrap_or(0)
 }
 
-/// A relogin in flight: the live `claude /login` process holding the OAuth handshake open, its
+/// A relogin in flight: the live `claude auth login` process holding the OAuth handshake open, its
 /// stdin (where the OOB code is written in `complete`), the account email it relogs, and the creds
 /// dir it logs into. Reader tasks keep stdout/stderr drained; `kill_on_drop` reaps an un-completed
 /// child.
@@ -206,7 +206,7 @@ impl IntoResponse for ReloginError {
             }
             ReloginError::NoUrl => (
                 StatusCode::BAD_GATEWAY,
-                "claude /login produced no login URL".to_string(),
+                "claude auth login produced no login URL".to_string(),
             ),
             ReloginError::Timeout(what) => {
                 (StatusCode::GATEWAY_TIMEOUT, format!("timed out: {what}"))
@@ -310,7 +310,7 @@ fn retire_dir(dir: &Path, disabled_root: &Path) -> Option<String> {
 }
 
 impl ReloginState {
-    /// Begin a relogin: resolve the account's existing creds dir, spawn `claude /login` into it,
+    /// Begin a relogin: resolve the account's existing creds dir, spawn `claude auth login` into it,
     /// capture the URL, keep the process alive in the session map.
     async fn start(&self, account: &str) -> Result<StartResponse, ReloginError> {
         let account = account.trim();
@@ -325,7 +325,10 @@ impl ReloginState {
             .ok_or_else(|| ReloginError::UnknownAccount(account.to_string()))?;
 
         let mut cmd = TokioCommand::new(claude_bin());
-        cmd.args(["/login"])
+        // `claude auth login` — the same subcommand onboard.rs drives. NOT `/login`
+        // (an interactive REPL slash command): as CLI args the installed CLI prints
+        // "/login isn't available in this environment." and exits with no URL → NoUrl.
+        cmd.args(["auth", "login"])
             .env("CLAUDE_CONFIG_DIR", &dir)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -415,7 +418,7 @@ impl ReloginState {
         };
         if !status.success() {
             return Err(ReloginError::LoginFailed(format!(
-                "claude /login exited {status}"
+                "claude auth login exited {status}"
             )));
         }
 
