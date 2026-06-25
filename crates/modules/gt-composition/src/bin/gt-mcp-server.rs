@@ -389,7 +389,11 @@ async fn main() -> anyhow::Result<()> {
         // transition with no context is deferred (debt note) instead of stop-the-line ONLY
         // when the workspace pool is freshly out of capacity — read from the same per-workspace
         // quota event log the quota.* handler replays. Always on (the log is always present).
-        .with_quota_signal(Arc::new(QuotaBlockGuard::new(event_log.clone())));
+        .with_quota_signal(Arc::new(QuotaBlockGuard::new(event_log.clone())))
+        // Auto-complete merge slot on bead close (gtcore-71c575): when a bead closes with a
+        // delivered_sha, the close hook advances its merge slot to Merged so stale `failed`
+        // slots for work already in main are cleaned up automatically.
+        .with_close_hook(Arc::new(MergeHandler::new(event_log.clone())));
 
     // System config (hq-system-config) is loaded BEFORE the domain router so the
     // report-digest service (hq-84f93b) inside it and the /api/v1/system surface
