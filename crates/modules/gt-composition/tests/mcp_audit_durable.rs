@@ -61,6 +61,7 @@ async fn pg_audit_survives_restart_and_tails_per_tenant() {
         eprintln!("GT_PG_URL unset — skipping hq-mcp-test.6 durable audit gate");
         return;
     };
+    gt_store_pg::assert_ephemeral_pg_url(&url);
 
     // Isolate from any prior run sharing the cross-tenant table.
     {

@@ -9,7 +9,7 @@
 
 use tokio::sync::{mpsc, oneshot};
 
-use gt_beads::{Bead, BeadRepository};
+use gt_beads::{Bead, BeadRepository, BeadStatus};
 use gt_events::{AppError, Command, Envelope};
 
 use crate::commands::SchedCommand;
@@ -32,6 +32,8 @@ pub enum SchedMsg {
     },
     /// Un worker terminó: libera capacidad y re-bombea.
     CapacityFreed,
+    /// Trigger the pump once all observers are registered.
+    Kick,
     /// (queued, in_flight)
     Snapshot(oneshot::Sender<(usize, usize)>),
     /// "Ask without doing": run `validate` against the current core. No mutation, no pump.
@@ -64,6 +66,11 @@ impl SchedHandle {
 
     pub async fn capacity_freed(&self) {
         let _ = self.tx.send(SchedMsg::CapacityFreed).await;
+    }
+
+    /// Trigger the pump after all hub observers are registered.
+    pub async fn kick(&self) {
+        let _ = self.tx.send(SchedMsg::Kick).await;
     }
 
     /// Create (or replace) a bead in the repo via the owning actor. Returns the repo result so
@@ -138,10 +145,12 @@ where
 /// Boot hydration (`hq-orchd.5`): same as [`spawn`] but seeds the dispatcher's pending queue
 /// with `(bead, priority)` pairs reconstructed by replaying the workspace event log, so a daemon
 /// restart restores still-pending dispatch work before the actor processes any edge message.
-/// Seeding the queue directly (rather than re-sending `Enqueue` commands) means hydration emits
-/// **no** events — the restored beads are not re-logged. The capacity governor starts empty: a
-/// restart assumes the previous run's in-flight polecats are gone, so freed slots resume from
-/// zero (polecat re-supervision is `hq-orchd.3`).
+/// Seeding the queue directly (rather than re-sending `Enqueue` commands) means hydration skips
+/// the `Enqueue` event. The caller **must** send [`SchedHandle::kick`] after all hub observers
+/// are registered so the pump drains hydrated beads into `Dispatched` events that reach the
+/// polecat supervisor. The capacity governor starts empty: a restart assumes the previous run's
+/// in-flight polecats are gone, so freed slots resume from zero (polecat re-supervision is
+/// `hq-orchd.3`).
 pub fn spawn_hydrated<R>(
     repo: R,
     events: mpsc::Sender<Envelope<SchedEvent>>,
@@ -154,6 +163,9 @@ where
     let (tx, mut rx) = mpsc::channel::<SchedMsg>(64);
     tokio::spawn(async move {
         let mut core = SchedCore::new(max);
+        for (bead, priority) in &pending {
+            let _ = repo.upsert(&Bead::new(bead.clone(), bead.clone(), BeadStatus::Pending, *priority)).await;
+        }
         for (bead, priority) in pending {
             core.queue.enqueue(bead, priority);
         }
@@ -175,6 +187,7 @@ where
                     pump = false;
                 }
                 SchedMsg::CapacityFreed => core.gov.release(),
+                SchedMsg::Kick => {},
                 SchedMsg::Snapshot(reply) => {
                     let _ = reply.send((core.queue.len(), core.gov.in_flight()));
                     pump = false;

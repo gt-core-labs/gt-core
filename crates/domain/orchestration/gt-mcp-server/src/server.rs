@@ -135,6 +135,18 @@ pub struct IssuesServer {
     /// only when the pool is confirmed out of capacity. `None` keeps context mandatory,
     /// so the issues-only build is unchanged.
     quota_signal: Option<Arc<dyn QuotaBlockSignal>>,
+    /// Auto-complete merge slot hook (gtcore-71c575). `Some` when the composition root wires
+    /// the merge handler: after a successful `issues.close.execute` with a delivered_sha the
+    /// hook advances the bead's merge slot to `Merged`, preventing stale `failed` slots for
+    /// work already in main. `None` skips the side-effect (issues-only build unchanged).
+    close_hook: Option<Arc<dyn crate::dispatch::IssueClosedHook>>,
+    /// Live-session push registry (gtcore-d366ff). `Some` when the composition root wires
+    /// server→agent SSE push: each authorized `call_tool` registers the connection's peer
+    /// under its actor + `Mcp-Session-Id`, so the bin's event-log observer can deliver
+    /// `notifications/resources/updated` (inbox / delegation) on the agent's open GET
+    /// stream instead of the agent polling. `None` ⇒ no registration, so a build without
+    /// the push observer behaves exactly as before (agents poll).
+    session_registry: Option<Arc<crate::session_push::SessionRegistry>>,
 }
 
 /// The auth-free readiness probe tool (hq-mcp-ready-probe.1). No input schema,
@@ -187,7 +199,22 @@ impl IssuesServer {
             documents: None,
             issue_sink: None,
             quota_signal: None,
+            close_hook: None,
+            session_registry: None,
         }
+    }
+
+    /// Wire the live-session push registry (gtcore-d366ff). With it, every authorized
+    /// `call_tool` registers the connection's [`Peer`](rmcp::service::Peer) under its
+    /// actor + `Mcp-Session-Id`, so the composition bin's event-log observer can push
+    /// `notifications/resources/updated` to the agent's open GET stream. Additive —
+    /// without it the server registers nothing and agents keep polling.
+    pub fn with_session_registry(
+        mut self,
+        registry: Arc<crate::session_push::SessionRegistry>,
+    ) -> Self {
+        self.session_registry = Some(registry);
+        self
     }
 
     /// Wire the SSE-feed event sink (`hq-issues-sse`): every successful `issues.*.execute`
@@ -205,6 +232,16 @@ impl IssuesServer {
     /// capacity. Additive — without it, context stays mandatory for every `working` claim.
     pub fn with_quota_signal(mut self, signal: Arc<dyn QuotaBlockSignal>) -> Self {
         self.quota_signal = Some(signal);
+        self
+    }
+
+    /// Wire the merge-slot auto-complete hook (gtcore-71c575): after a successful
+    /// `issues.close.execute` with a `delivered_sha`, the hook advances the bead's
+    /// merge slot to `Merged`. Prevents stale `failed`/`ready` slots for work that
+    /// already landed in main via a different path. Additive — without it no slot is
+    /// touched on close (backward-compatible).
+    pub fn with_close_hook(mut self, hook: Arc<dyn crate::dispatch::IssueClosedHook>) -> Self {
+        self.close_hook = Some(hook);
         self
     }
 
@@ -369,9 +406,12 @@ impl IssuesServer {
         if let Err(e) = scope.check(tool) {
             // The tenant is already resolved here (the token was verified), so an
             // out-of-scope denial is attributed to its workspace — not "default".
+            // A5 (gtcore-f3a016): stamp the actor's scopes so the audit trail shows what
+            // the actor held when it was denied — essential for RBAC forensics.
             let _ = self.audit.record(
                 AuditRecord::unauthorized(&scope.actor, tool, args.clone())
-                    .in_workspace(workspace_or_default(&workspace)),
+                    .in_workspace(workspace_or_default(&workspace))
+                    .with_scopes(scope.allow.iter().cloned().collect()),
             );
             return Err(McpError::invalid_request(e.to_string(), None));
         }
@@ -412,7 +452,9 @@ impl IssuesServer {
         match status {
             Some(s) if !s.allows_mutation() => {
                 let _ = self.audit.record(
-                    AuditRecord::unauthorized(&scope.actor, tool, args.clone()).in_workspace(ws),
+                    AuditRecord::unauthorized(&scope.actor, tool, args.clone())
+                        .in_workspace(ws)
+                        .with_scopes(scope.allow.iter().cloned().collect()),
                 );
                 Err(McpError::invalid_request(
                     format!(
@@ -612,6 +654,27 @@ impl ServerHandler for IssuesServer {
         // X-Workspace header in legacy mode) flows out for store + domain dispatch.
         let (scope, workspace) = self.authorize(&tool, &args, &context.extensions).await?;
 
+        // Live-session push registration (gtcore-d366ff): now that the caller is
+        // authenticated, bind this connection's peer to its actor + transport session id
+        // so the bin's event-log observer can push inbox/delegation notifications onto the
+        // agent's open GET stream. Keyed by `Mcp-Session-Id` so repeated calls on one
+        // connection refresh a single entry; absent that header (a stateless/legacy
+        // caller) there is no stream to push to, so registration is skipped. Best-effort —
+        // never blocks or fails the call.
+        if let Some(registry) = &self.session_registry {
+            if let Some(session_id) = session_id_from_ext(&context.extensions) {
+                let notifier = Arc::new(crate::session_push::PeerNotifier::new(
+                    context.peer.clone(),
+                ));
+                registry.register(
+                    session_id,
+                    workspace_or_default(&workspace),
+                    scope.actor.as_str(),
+                    notifier,
+                );
+            }
+        }
+
         // Suspend/archive enforcement (hq-mt-bootstrap.8): a mutating call against a
         // suspended/archived tenant is rejected here, after the tenant is resolved
         // and before any store I/O. Reads + `workspace.resume` pass through.
@@ -666,6 +729,7 @@ impl ServerHandler for IssuesServer {
                         self.rig_prefixes.as_deref(),
                         self.issue_sink.as_deref(),
                         self.quota_signal.as_deref(),
+                        self.close_hook.as_deref(),
                     )
                     .await
                 }
@@ -689,9 +753,12 @@ impl ServerHandler for IssuesServer {
         // workspace, hq-mcp-dispatch.9) so the audit trail is per-tenant filterable
         // (hq-mt-auth.7 SOC2 dump). Absent a resolved workspace (legacy header mode
         // with no X-Workspace) it falls back to the default tenant.
+        // A5 (gtcore-f3a016): stamp scopes on both invoked and denied records so the audit
+        // trail captures the actor's full grant at dispatch time.
         let _ = self.audit.record(
             AuditRecord::invoked(&scope.actor, &tool, args)
-                .in_workspace(workspace_or_default(&workspace)),
+                .in_workspace(workspace_or_default(&workspace))
+                .with_scopes(scope.allow.iter().cloned().collect()),
         );
 
         match result {
@@ -972,6 +1039,20 @@ fn split_format(uri: &str) -> Result<(String, OutputFormat), AppError> {
 fn actor_from_ext(ext: &Extensions) -> Option<&str> {
     ext.get::<axum::http::request::Parts>()
         .and_then(|p| p.headers.get("x-actor"))
+        .and_then(|v| v.to_str().ok())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+}
+
+/// Extract the rmcp transport session id (`Mcp-Session-Id`) from a request's
+/// extensions. rmcp mints the id on the initialize handshake and the client echoes it
+/// on every subsequent POST; rmcp injects the HTTP `Parts` into each call's extensions,
+/// so the header names the live session a server-initiated push targets (gtcore-d366ff).
+/// `None` when there are no Parts or the header is absent (a stateless/legacy caller with
+/// no standing GET stream to push to).
+fn session_id_from_ext(ext: &Extensions) -> Option<&str> {
+    ext.get::<axum::http::request::Parts>()
+        .and_then(|p| p.headers.get("mcp-session-id"))
         .and_then(|v| v.to_str().ok())
         .map(str::trim)
         .filter(|s| !s.is_empty())

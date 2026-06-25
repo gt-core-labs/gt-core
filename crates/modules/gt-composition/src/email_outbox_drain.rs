@@ -135,6 +135,15 @@ pub async fn drain_once(
             .unwrap_or(false);
         let msg = EmailMessage {
             to: entry.recipient.clone(),
+            // `cc` is stored comma-separated (empty = none); split back to the
+            // address list the transport puts in the CC header (gtcore-ecf70d).
+            cc: entry
+                .cc
+                .split(',')
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+                .collect(),
             subject: entry.subject.clone(),
             body: entry.body.clone(),
         };

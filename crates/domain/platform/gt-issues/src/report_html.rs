@@ -10,12 +10,72 @@
 //! `<link>`/`<script>`/external CSS — Gmail strips them), table layout, same
 //! navy aesthetic as the xlsx report.
 
+use pulldown_cmark::{html::push_html, Event, Options, Parser, Tag, TagEnd};
+
 use crate::analytics::AnalyticsSummary;
-use crate::report::OperatorReport;
+use crate::report::{OperatorReport, ReportComment};
 
 /// Minimal HTML escaping for text nodes/attributes.
 fn esc(s: &str) -> String {
     s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;").replace('"', "&quot;")
+}
+
+/// Render a markdown string to inline-safe HTML for email clients.
+/// GFM enabled (tables, strikethrough, task lists). Returns an empty string for
+/// empty input so callers can use it in format strings without conditional guards.
+fn md_to_html(s: &str) -> String {
+    if s.is_empty() {
+        return String::new();
+    }
+    let opts = Options::ENABLE_TABLES
+        | Options::ENABLE_STRIKETHROUGH
+        | Options::ENABLE_TASKLISTS;
+    // Strip raw HTML events so operator notes cannot inject arbitrary tags.
+    let safe = Parser::new_ext(s, opts).filter(|e| {
+        !matches!(
+            e,
+            Event::Html(_)
+                | Event::InlineHtml(_)
+                | Event::Start(Tag::HtmlBlock)
+                | Event::End(TagEnd::HtmlBlock)
+        )
+    });
+    let mut out = String::with_capacity(s.len() + 64);
+    push_html(&mut out, safe);
+    out
+}
+
+/// Render a bead/epic's comments as an inline block (gtcore-01bcf2): one entry
+/// per comment showing `[autor · YYYY-MM-DD]` header and the body rendered as
+/// markdown HTML. Empty input → empty string. `compact=true` drops the top
+/// divider for the section-header variant.
+fn render_comments(comments: &[ReportComment], compact: bool) -> String {
+    if comments.is_empty() {
+        return String::new();
+    }
+    let items: String = comments
+        .iter()
+        .map(|c| {
+            format!(
+                "<div style=\"font-size:11px;color:#555;margin-top:4px;\">\
+                 <span style=\"color:{NAVY};font-weight:bold;\">[{autor}]</span>\
+                 <span style=\"color:#888;font-size:10px;margin-left:4px;\">{fecha}</span>\
+                 <div style=\"margin-top:2px;\">{body}</div></div>",
+                autor = esc(&c.author),
+                fecha = esc(&c.fecha),
+                body = md_to_html(&c.body),
+            )
+        })
+        .collect();
+    let wrap = if compact {
+        "margin-top:2px;"
+    } else {
+        "margin-top:4px;border-top:1px dashed #c9c9c9;padding-top:3px;"
+    };
+    format!(
+        "<div style=\"{wrap}\"><div style=\"font-size:10px;color:#888;\
+         text-transform:uppercase;letter-spacing:.5px;\">Comentarios</div>{items}</div>"
+    )
 }
 
 fn fmt_horas(h: Option<f64>) -> String {
@@ -34,7 +94,25 @@ fn estado_color(estado: &str) -> &'static str {
 const NAVY: &str = "#1f3864";
 const HEADER_BG: &str = "#2e5395";
 const ROW_ALT: &str = "#f2f6fc";
-const TD: &str = "padding:6px 8px;border:1px solid #d9e2f3;font-size:13px;";
+const TD: &str = "padding:6px 8px;border:1px solid #d9e2f3;font-size:13px;vertical-align:top;";
+/// Short-column cells stay on one line (the operator asked for nowrap) so the
+/// narrow columns get their own width and stop bunching up; only Tarea/Notas
+/// wrap, since they hold long text + comments.
+const NOWRAP: &str = "white-space:nowrap;";
+
+/// Per-module palette `(row_tint, band_tint, icon)`: each module group paints
+/// its task rows with a tenuous tint, its separator band with a slightly
+/// stronger shade, and carries its own icon — all cycling by module index so
+/// adjacent modules are visually distinct (operator request: "una fila por
+/// submódulo + colores tenues por módulo + iconos variados").
+const MODULE_TINTS: &[(&str, &str, &str)] = &[
+    ("#f2f6fc", "#dbe6f6", "🏢"), // blue
+    ("#f1f8f1", "#dcefdc", "🧩"), // green
+    ("#fdf6ee", "#f8e6d2", "⚙️"), // orange
+    ("#f7f2fb", "#e7dbf3", "📊"), // purple
+    ("#fbf2f3", "#f6dcdf", "🗄️"), // pink
+    ("#eef9f8", "#d4efec", "🗂️"), // teal
+];
 
 /// One KPI card cell.
 fn kpi(label: &str, value: String, detail: String) -> String {
@@ -105,37 +183,53 @@ pub fn render_digest(report: &OperatorReport, summary: &AnalyticsSummary, fecha:
     ));
     html.push_str("</tr></table>");
 
-    // Bitácora: one table per module section, mockup column order.
-    for section in &report.sections {
+    // Bitácora: ONE flat table — every task row carries the complete column set
+    // (Modulo first, CSV/Excel-style), no per-section bands. Rows stay grouped by
+    // module because the sections are emitted in order.
+    html.push_str("<table style=\"border-collapse:collapse;width:100%;margin-top:16px;\">");
+    html.push_str(&format!(
+        "<tr>{}</tr>",
+        ["Modulo", "Tarea", "Proceso", "Nivel", "Horas Est.", "Estado", "Responsable",
+         "Fecha Inicio", "Fecha Fin", "Notas"]
+            .map(|h| format!(
+                "<th style=\"{TD}{NOWRAP}background:{HEADER_BG};color:#ffffff;text-align:left;\">{h}</th>"
+            ))
+            .join("")
+    ));
+    for (mi, section) in report.sections.iter().enumerate() {
+        let (row_tint, band_tint, icon) = MODULE_TINTS[mi % MODULE_TINTS.len()];
+        // Group separator row per module (epic) — a full-width band with the
+        // module title, its own icon, and its hours subtotal.
         html.push_str(&format!(
-            "<table style=\"border-collapse:collapse;width:100%;\
-             margin-top:16px;\"><tr><td colspan=\"9\" style=\"background:{HEADER_BG};\
-             color:#ffffff;padding:8px 10px;font-weight:bold;font-size:14px;\">{title}\
-             <span style=\"float:right;font-weight:normal;\">{horas:.1} h</span></td></tr>",
+            "<tr><td colspan=\"10\" style=\"{TD}background:{band_tint};color:{NAVY};\
+             font-weight:bold;\">{icon} {title}\
+             <span style=\"float:right;font-weight:normal;color:#5b6b8c;\">{horas:.1} h</span>\
+             </td></tr>",
             title = esc(&section.module_title),
             horas = section.horas,
         ));
-        html.push_str(&format!(
-            "<tr>{}</tr>",
-            ["Tarea", "Proceso", "Nivel", "Horas Est.", "Estado", "Responsable",
-             "Fecha Inicio", "Fecha Fin", "Notas"]
-                .map(|h| format!(
-                    "<th style=\"{TD}background:{ROW_ALT};color:{NAVY};text-align:left;\">{h}</th>"
-                ))
-                .join("")
-        ));
-        for (i, row) in section.rows.iter().enumerate() {
-            let bg = if i % 2 == 1 { format!("background:{ROW_ALT};") } else { String::new() };
+        // Epic-level comments (rare): a full-width row under the band.
+        if !section.comentarios.is_empty() {
             html.push_str(&format!(
-                "<tr><td style=\"{TD}{bg}\">{tarea}<div style=\"font-size:11px;color:#6c757d;\">\
-                 {id}</div></td><td style=\"{TD}{bg}\">{proceso}</td>\
-                 <td style=\"{TD}{bg}\">{nivel}</td>\
-                 <td style=\"{TD}{bg}text-align:right;\">{horas}</td>\
-                 <td style=\"{TD}{bg}color:{estado_color};font-weight:bold;\">{estado}</td>\
-                 <td style=\"{TD}{bg}\">{resp}</td>\
-                 <td style=\"{TD}{bg}white-space:nowrap;\">{ini}</td>\
-                 <td style=\"{TD}{bg}white-space:nowrap;\">{fin}</td>\
-                 <td style=\"{TD}{bg}\">{notas}</td></tr>",
+                "<tr><td colspan=\"10\" style=\"{TD}background:{row_tint};\">{}</td></tr>",
+                render_comments(&section.comentarios, true),
+            ));
+        }
+        for row in &section.rows {
+            // Subtle per-module tint on every row of the group.
+            let bg = format!("background:{row_tint};");
+            html.push_str(&format!(
+                "<tr><td style=\"{TD}{bg}{NOWRAP}\">{modulo}</td>\
+                 <td style=\"{TD}{bg}\">{tarea}<div style=\"font-size:11px;color:#6c757d;\">\
+                 {id}</div></td><td style=\"{TD}{bg}{NOWRAP}\">{proceso}</td>\
+                 <td style=\"{TD}{bg}{NOWRAP}\">{nivel}</td>\
+                 <td style=\"{TD}{bg}{NOWRAP}text-align:right;\">{horas}</td>\
+                 <td style=\"{TD}{bg}{NOWRAP}color:{estado_color};font-weight:bold;\">{estado}</td>\
+                 <td style=\"{TD}{bg}{NOWRAP}\">{resp}</td>\
+                 <td style=\"{TD}{bg}{NOWRAP}\">{ini}</td>\
+                 <td style=\"{TD}{bg}{NOWRAP}\">{fin}</td>\
+                 <td style=\"{TD}{bg}\">{notas}{comentarios}</td></tr>",
+                modulo = esc(&section.module_title),
                 tarea = esc(&row.tarea),
                 id = esc(&row.id),
                 proceso = esc(&row.proceso),
@@ -146,11 +240,12 @@ pub fn render_digest(report: &OperatorReport, summary: &AnalyticsSummary, fecha:
                 resp = esc(&row.responsable),
                 ini = esc(&row.fecha_inicio),
                 fin = esc(&row.fecha_fin),
-                notas = esc(&row.notas),
+                notas = md_to_html(&row.notas),
+                comentarios = render_comments(&row.comentarios, false),
             ));
         }
-        html.push_str("</table>");
     }
+    html.push_str("</table>");
 
     // TOTAL HORAS footer (xlsx parity).
     html.push_str(&format!(
@@ -197,7 +292,26 @@ mod tests {
         let mut parent_map = std::collections::HashMap::new();
         parent_map.insert("hq-1".to_string(), "hq-e1".to_string());
         parent_map.insert("hq-2".to_string(), "hq-e1".to_string());
-        let report = build_report("hq", "default", &rows, &parent_map);
+        // A comment on a bead (renders in its Notas cell) and one on the epic
+        // (renders in the section header) — gtcore-01bcf2.
+        let mut comments = std::collections::HashMap::new();
+        comments.insert(
+            "hq-1".to_string(),
+            vec![crate::report::ReportComment {
+                author: "ana".into(),
+                fecha: "2026-06-10".into(),
+                body: "revisar <edge> case".into(),
+            }],
+        );
+        comments.insert(
+            "hq-e1".to_string(),
+            vec![crate::report::ReportComment {
+                author: "leo".into(),
+                fecha: "2026-06-11".into(),
+                body: "modulo bloqueado".into(),
+            }],
+        );
+        let report = build_report("hq", "default", &rows, &parent_map, &comments);
         let summary = summarize("hq", "default", &rows, 0, "2026-06-12", 7, 30, &parent_map);
         let html = render_digest(&report, &summary, "2026-06-12");
 
@@ -212,12 +326,60 @@ mod tests {
         for kpi in ["Avance", "Errores", "Pendientes", "Retrasos", "Horas"] {
             assert!(html.contains(kpi), "missing KPI {kpi}");
         }
+        // Flat table: the Modulo column is a real header (not a section band).
+        assert!(html.contains(">Modulo</th>"), "missing flat Modulo column header");
+        // Per-module separator band + tenuous module tint on the rows.
+        assert!(html.contains("🏢 Modulo Uno"), "missing module separator band");
+        assert!(html.contains("background:#dbe6f6"), "missing module band tint");
+        assert!(html.contains("background:#f2f6fc"), "missing module row tint");
         // Reconciles with the summary by construction.
         assert!(html.contains(&format!("{:.0}%", summary.avance.pct)));
         assert!(html.contains("3 tareas"), "missing task count in header");
         assert!(html.contains("TOTAL HORAS"));
         assert!(html.contains(&format!("{:.1}", report.total_horas)));
-        // Escaping: the raw note must not inject markup.
-        assert!(html.contains("nota &lt;x&gt;") && !html.contains("nota <x>"));
+        // Safe-HTML: raw HTML tags in notes are stripped by the safe markdown
+        // renderer (not escaped, just dropped) — the text "nota" survives but
+        // the `<x>` injection does not appear in the output in any form.
+        assert!(html.contains("nota"), "nota text must appear");
+        assert!(!html.contains("<x>"), "raw <x> tag must not pass through");
+        // Comments render with [autor] date + markdown body (gtcore-01bcf2).
+        assert!(html.contains("Comentarios"), "missing comments block");
+        assert!(html.contains("[ana]"), "missing bead comment author");
+        assert!(html.contains("2026-06-10"), "bead comment must show fecha");
+        // body goes through md_to_html — raw markdown angle-brackets in the
+        // body text are rendered as HTML, not escaped as &lt;/&gt;.
+        assert!(html.contains("revisar"), "bead comment body missing");
+        assert!(html.contains("[leo]"), "missing epic comment author");
+        assert!(html.contains("2026-06-11"), "epic comment must show fecha");
+        assert!(html.contains("modulo bloqueado"), "missing epic comment body");
+    }
+
+    /// True when `html` contains a `[YYYY-MM-DD …]` bracket — the timestamp
+    /// prefix the digest used to put in front of folded comments. The render
+    /// test (gtcore-abc0ae AC) asserts this is absent from the Notas fold.
+    pub(crate) fn has_dated_comment_bracket(html: &str) -> bool {
+        // Scan for "[dddd-dd-dd" (4-2-2 digits with dashes, right after a `[`).
+        let bytes = html.as_bytes();
+        let is_digit = |i: usize| bytes.get(i).is_some_and(u8::is_ascii_digit);
+        for (i, &b) in bytes.iter().enumerate() {
+            if b != b'[' {
+                continue;
+            }
+            let d = i + 1;
+            if is_digit(d)
+                && is_digit(d + 1)
+                && is_digit(d + 2)
+                && is_digit(d + 3)
+                && bytes.get(d + 4) == Some(&b'-')
+                && is_digit(d + 5)
+                && is_digit(d + 6)
+                && bytes.get(d + 7) == Some(&b'-')
+                && is_digit(d + 8)
+                && is_digit(d + 9)
+            {
+                return true;
+            }
+        }
+        false
     }
 }

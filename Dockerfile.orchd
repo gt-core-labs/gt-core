@@ -1,0 +1,108 @@
+# gt-orch-server — orchestration daemon (split from Dockerfile.embeddings).
+#
+# Builds ONLY gt-orch-server (no embeddings, no fastembed, no ONNX). The MCP
+# server stays in Dockerfile.embeddings. Splitting the images lets Tilt rebuild
+# orchd independently (~2 min vs ~6 min for the full embeddings image).
+#
+# cargo-chef: dep layer keyed on Cargo.lock, skipped on warm builds.
+FROM lukemathwalker/cargo-chef:latest-rust-1-slim-bookworm AS chef
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+       clang pkg-config libssl-dev cmake \
+    && rm -rf /var/lib/apt/lists/*
+WORKDIR /build
+
+# --- recipe: dep graph snapshot ---
+FROM chef AS planner
+COPY . .
+RUN cargo chef prepare --recipe-path recipe.json
+
+# --- cook: compile ALL deps for oauth (NO embeddings-fastembed) ---
+FROM chef AS builder
+COPY --from=planner /build/recipe.json recipe.json
+RUN cargo chef cook --release --locked \
+    --features oauth \
+    --recipe-path recipe.json
+COPY . .
+RUN cargo build --release --locked -p gt-composition \
+    --bin gt-orch-server \
+    --features oauth
+
+FROM debian:bookworm-slim
+# git: S3 readiness clause (docs/10 §S4). libssl3: TLS runtime.
+# node + claude-code: polecats run claude CLI in tmux sessions.
+# tmux: polecat sessions. jq: token usage parsing in hooks.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates git libssl3 curl gnupg tmux jq \
+    && curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \
+       -o /usr/share/keyrings/githubcli-archive-keyring.gpg \
+    && echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" \
+       > /etc/apt/sources.list.d/github-cli.list \
+    && apt-get update \
+    && apt-get install -y --no-install-recommends gh \
+    && curl -fsSL https://deb.nodesource.com/setup_20.x | bash - \
+    && apt-get install -y --no-install-recommends nodejs \
+    && npm install -g @anthropic-ai/claude-code \
+    && npm cache clean --force \
+    && apt-get purge -y gnupg \
+    && apt-get autoremove -y \
+    && rm -rf /var/lib/apt/lists/*
+# gt CLI + gtmcp client (same as embeddings image).
+RUN curl -fsSL https://github.com/gt-core-labs/gt/releases/download/latest/gt-x86_64-unknown-linux-musl.tar.gz \
+       | tar -xz -C /usr/local/bin gt \
+    && chmod 0755 /usr/local/bin/gt
+ENV GT_BIN=/usr/local/bin/gt
+RUN curl -fsSL https://github.com/gt-core-labs/gt-mcp/releases/download/latest/gtmcp-x86_64-unknown-linux-musl \
+       -o /usr/local/bin/gtmcp \
+    && chmod 0755 /usr/local/bin/gtmcp
+# graphify (graph index for per-rig knowledge graphs).
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends python3 python3-venv \
+    && python3 -m venv /opt/graphify-venv \
+    && /opt/graphify-venv/bin/pip install --no-cache-dir graphifyy \
+    && apt-get autoremove -y \
+    && rm -rf /var/lib/apt/lists/*
+ENV GT_GRAPHIFY_PYTHON=/opt/graphify-venv/bin/python
+# --- Rust toolchain (gtcore-2ef931) ----------------------------------------
+# The polecat works its bead INSIDE this image, so it must be able to compile +
+# verify Rust in its worktree (`cargo build --workspace --all-targets --locked`)
+# BEFORE it signals merge-ready — a desynced Cargo.lock or a compile error is then
+# caught locally instead of blind in PR CI. Without cargo/rustc baked here the
+# polecat could only guess (gtcore-ee9939, [[polecat-worktree-no-rust-toolchain]]).
+#
+# Pinned, not the rolling `stable`: a fixed toolchain keeps the verification build
+# reproducible and tracks the cargo-chef `rust-1` builder above. Bump RUST_VERSION
+# in lockstep when the project advances stable (the workspace builds on stable; CI
+# uses dtolnay/rust-toolchain@stable, so keep this at the same release).
+#
+# The build deps (build-essential…clang) mirror the cargo-chef builder stage so the
+# workspace's openssl-sys / cmake / bindgen deps link; build-essential supplies the
+# system `cc`/`ld` linker the default toolchain shells out to.
+#
+# lld: rustc >= 1.90 defaults to its bundled `rust-lld` on linux-gnu, which works in
+# this clean image — it is broken only on the WSL workstation, where the workaround is
+# RUSTFLAGS="-Clinker-features=-lld -Clink-self-contained=-linker" ([[rust-toolchain-workaround-wsl]]).
+# No workaround is baked here; if a future base regresses lld, export that RUSTFLAGS
+# (or CARGO_BUILD_RUSTFLAGS) into the pod env rather than patching this layer.
+#
+# Cost: a heavier image + slower cold pull. Accepted for the capability; if it bites,
+# move $CARGO_HOME / $RUSTUP_HOME onto a warmed PVC instead of baking them in.
+ARG RUST_VERSION=1.90.0
+ENV RUSTUP_HOME=/usr/local/rustup \
+    CARGO_HOME=/usr/local/cargo \
+    PATH=/usr/local/cargo/bin:$PATH
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+       build-essential pkg-config libssl-dev cmake clang \
+    && curl -fsSL https://sh.rustup.rs -o /tmp/rustup-init.sh \
+    && sh /tmp/rustup-init.sh -y --no-modify-path --profile minimal \
+       --default-toolchain "${RUST_VERSION}" --default-host x86_64-unknown-linux-gnu \
+    && rm -f /tmp/rustup-init.sh \
+    && chmod -R a+w "$RUSTUP_HOME" "$CARGO_HOME" \
+    && rustc --version && cargo --version \
+    && rm -rf /var/lib/apt/lists/*
+COPY docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
+RUN chmod 0755 /usr/local/bin/docker-entrypoint.sh
+COPY --from=builder /build/target/release/gt-orch-server /usr/local/bin/gt-orch-server
+ENTRYPOINT ["/usr/local/bin/docker-entrypoint.sh"]
+CMD ["gt-orch-server"]

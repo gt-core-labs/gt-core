@@ -106,6 +106,9 @@ impl GtModule for AgentModule {
                 EventKind::new("agent.heartbeat.v1").expect("valid event kind"),
                 EventKind::new("agent.session-end.v1").expect("valid event kind"),
                 EventKind::new("agent.killed.v1").expect("valid event kind"),
+                // Pause-in-place lifecycle (B2, gtcore-5731e9).
+                EventKind::new("agent.paused.v1").expect("valid event kind"),
+                EventKind::new("agent.resumed.v1").expect("valid event kind"),
             ])
     }
 
@@ -177,7 +180,7 @@ mod tests {
     }
 
     #[test]
-    fn capability_owns_agent_scopes_and_four_versioned_kinds() {
+    fn capability_owns_agent_scopes_and_six_versioned_kinds() {
         let cap = AgentModule::default().capability();
 
         let scopes: Vec<&str> = cap.scopes().iter().map(Scope::as_str).collect();
@@ -191,6 +194,8 @@ mod tests {
                 "agent.heartbeat.v1",
                 "agent.session-end.v1",
                 "agent.killed.v1",
+                "agent.paused.v1",
+                "agent.resumed.v1",
             ]
         );
         // Every declared kind is owned by this module (kind prefix == meta id).
@@ -238,7 +243,9 @@ mod tests {
         // Built with HTTP state, the module documents its REST routes and returns a non-empty
         // OpenAPI spec the builder mounts under `/api/v1/agent`. (The router itself is exercised
         // by the http module's own tests + the contract test; here we assert the wiring flips on.)
-        let m = AgentModule::with_http(crate::http::AgentApiState::new("/tmp/gt-agent-rest-test"));
+        let m = AgentModule::with_http(crate::http::AgentApiState::new(
+            std::sync::Arc::new(crate::http::FileAgentLog::new("/tmp/gt-agent-rest-test")),
+        ));
         assert!(m.openapi().is_some());
     }
 }

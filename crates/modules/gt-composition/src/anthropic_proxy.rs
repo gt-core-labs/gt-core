@@ -83,6 +83,23 @@ async fn forward(
     let (parts, body) = req.into_parts();
     let account = header_str(&parts.headers, ACCOUNT_HEADER);
     let session = header_str(&parts.headers, SESSION_HEADER).unwrap_or_else(|| "proxy".into());
+
+    // A5 (gtcore-f3a016) HARD GATE: a session that burned past its per-session spend cap is
+    // frozen here — every further model call is refused (429) instead of forwarded, so a runaway
+    // agent stops itself. This is the *enforcement* the soft alert (B1's BudgetExceeded) lacked:
+    // "se frena con hard gate, no soft-fail silencioso". A session under its cap (the default,
+    // when no `GT_SESSION_HARD_CAP_COST` is set) sails through unchanged.
+    if proxy.quota.is_session_gated(session.as_str()).await {
+        eprintln!(
+            "[anthropic-proxy] session {session}: spend cap exceeded — REFUSING request (hard gate)"
+        );
+        return (
+            StatusCode::TOO_MANY_REQUESTS,
+            format!("gt spend cap exceeded for session `{session}`: request refused (hard gate)"),
+        )
+            .into_response();
+    }
+
     let path_q = parts
         .uri
         .path_and_query()

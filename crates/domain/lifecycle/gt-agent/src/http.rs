@@ -47,6 +47,51 @@ use gt_events::{AppError, Envelope, EventKind};
 use crate::state::{Session, SessionRegistry, SessionRole, SessionState};
 use crate::AgentEvent;
 
+/// A per-workspace agent event log provider for the REST adapter.
+///
+/// The binary supplies an [`EventLog`]-backed implementation that dispatches to the SAME backend
+/// (file or Postgres) the MCP `agent.*` tools use; the contract test supplies a file-backed one
+/// over a tempdir. This trait is the REST mirror of the MCP `AgentHandler`'s `Arc<EventLog>` —
+/// the composition root owns the persistence policy, the adapter only asks for "the log for
+/// *this* workspace".
+pub trait WorkspaceAgentLog: Send + Sync {
+    /// Rebuild the session registry by replaying the workspace's `agent.*` events.
+    fn registry(&self, workspace: Option<&str>) -> Result<SessionRegistry, AppError>;
+    /// Append one decided lifecycle event record to the workspace log.
+    fn append_record(&self, workspace: Option<&str>, record: &EventRecord) -> Result<(), AppError>;
+}
+
+/// File-backed [`WorkspaceAgentLog`] over path-partitioned JSONL segments — the same layout the
+/// file backend of the composition `EventLog` uses, but constructed directly from a root path.
+/// Used by the contract test (tempdir) and as the fallback when no shared `EventLog` is available.
+pub struct FileAgentLog {
+    root: PathBuf,
+}
+
+impl FileAgentLog {
+    /// Build a file-backed agent log over `root` (`<root>/<workspace>/events*.jsonl`).
+    pub fn new(root: impl Into<PathBuf>) -> Self {
+        Self { root: root.into() }
+    }
+}
+
+impl WorkspaceAgentLog for FileAgentLog {
+    fn registry(&self, workspace: Option<&str>) -> Result<SessionRegistry, AppError> {
+        let store = JsonlWriter::for_workspace_in(&self.root, workspace.unwrap_or(DEFAULT_WORKSPACE))?;
+        let records: Vec<EventRecord> = store
+            .read_all()?
+            .into_iter()
+            .filter(|r| r.kind.starts_with(NS))
+            .collect();
+        replay(&records, SessionRegistry::default(), SessionRegistry::apply)
+    }
+
+    fn append_record(&self, workspace: Option<&str>, record: &EventRecord) -> Result<(), AppError> {
+        JsonlWriter::for_workspace_in(&self.root, workspace.unwrap_or(DEFAULT_WORKSPACE))?
+            .append(record)
+    }
+}
+
 /// The event-log kind prefix for every agent event (`agent.*`) — the filter that keeps the
 /// heterogeneous log's foreign kinds out of the typed [`AgentEvent`] reducer.
 const NS: &str = "agent.";
@@ -64,14 +109,15 @@ const DEFAULT_WORKSPACE: &str = "default";
 /// before it leaves [`agent_router`] so the merged application router carries no outstanding
 /// state type (the kernel's state-erased `Router<()>` contract).
 ///
-/// The only handle is the event-log root volume: the per-workspace partition is resolved per
-/// request (so a single state serves every tenant), exactly as the MCP `EventLog` does. There is
-/// no store — the registry is replayed from the log on every call.
-#[derive(Clone, Debug)]
+/// The log handle is a [`WorkspaceAgentLog`] trait object: the binary supplies an `EventLog`-backed
+/// implementation that dispatches to the SAME backend (file or Postgres) the MCP `agent.*` tools
+/// use — so both transports always agree on session state. The contract test supplies a
+/// [`FileAgentLog`] over a tempdir.
+#[derive(Clone)]
 pub struct AgentApiState {
-    /// The event-log root the workspace partitions live under (`<root>/<ws>/`). The binary
-    /// supplies the production volume; the contract test points it at a tempdir.
-    root: Arc<PathBuf>,
+    /// The per-workspace agent event log provider — the composition root owns the persistence
+    /// policy (file or Postgres), the adapter only asks for "the log for *this* workspace".
+    log: Arc<dyn WorkspaceAgentLog>,
     /// Optional orchd dispatch channel dir. When `Some`, a polecat spawn with a crew bead drops a
     /// `{bead,priority}` message here so the orchd scheduler actually slings the agent. `None` ⇒
     /// the event is still recorded but orchd is not notified (GT_CHANNEL_ROOT unset, tests, or
@@ -79,12 +125,17 @@ pub struct AgentApiState {
     dispatch_channel: Option<Arc<PathBuf>>,
 }
 
+impl std::fmt::Debug for AgentApiState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AgentApiState").finish_non_exhaustive()
+    }
+}
+
 impl AgentApiState {
-    /// Build the REST state over the event-log root volume (the same root the MCP `EventLog`
-    /// uses). The binary calls this and hands the module the result via
-    /// [`AgentModule::with_http`](crate::AgentModule::with_http).
-    pub fn new(root: impl Into<PathBuf>) -> Self {
-        Self { root: Arc::new(root.into()), dispatch_channel: None }
+    /// Build the REST state over a per-workspace agent log provider. The binary supplies an
+    /// `EventLog`-backed implementation; the contract test supplies a [`FileAgentLog`].
+    pub fn new(log: Arc<dyn WorkspaceAgentLog>) -> Self {
+        Self { log, dispatch_channel: None }
     }
 
     /// Wire the orchd dispatch channel dir so a polecat spawn auto-drops a dispatch request
@@ -94,21 +145,10 @@ impl AgentApiState {
         self
     }
 
-    /// The workspace's append-only log (segments under `<root>/<ws>/`).
-    fn store(&self, workspace: Option<&str>) -> Result<JsonlWriter, AppError> {
-        JsonlWriter::for_workspace_in(self.root.as_path(), workspace.unwrap_or(DEFAULT_WORKSPACE))
-    }
-
-    /// Rebuild the session registry by folding the workspace's `agent.*` events — the same
-    /// replay the MCP handler runs (`replay_domain` with the `agent.` prefix + the pure reducer).
+    /// Rebuild the session registry by folding the workspace's `agent.*` events — delegated to
+    /// the [`WorkspaceAgentLog`] provider so MCP and REST always read the same backend.
     fn registry(&self, workspace: Option<&str>) -> Result<SessionRegistry, AppError> {
-        let records: Vec<EventRecord> = self
-            .store(workspace)?
-            .read_all()?
-            .into_iter()
-            .filter(|r| r.kind.starts_with(NS))
-            .collect();
-        replay(&records, SessionRegistry::default(), SessionRegistry::apply)
+        self.log.registry(workspace)
     }
 
     /// Append one decided lifecycle event to the workspace log + echo the dispatch payload (the
@@ -116,7 +156,7 @@ impl AgentApiState {
     fn record(&self, workspace: Option<&str>, event: AgentEvent, session: &str) -> Result<Value, AppError> {
         let kind = event.kind().to_string();
         let record = EventRecord::from_envelope(&Envelope::root(event))?;
-        self.store(workspace)?.append(&record)?;
+        self.log.append_record(workspace, &record)?;
         Ok(json!({ "ok": true, "session": session, "event": kind }))
     }
 
@@ -144,6 +184,8 @@ impl AgentApiState {
 /// | `POST /:id/heartbeat`| `agent.heartbeat`  |
 /// | `POST /:id/end`      | `agent.end`        |
 /// | `POST /:id/kill`     | `agent.kill`       |
+/// | `POST /:id/pause`    | `agent.pause`      |
+/// | `POST /:id/resume`   | `agent.resume`     |
 pub fn agent_router(state: AgentApiState) -> Router {
     Router::new()
         .route("/", get(list_sessions).post(spawn_session))
@@ -151,6 +193,8 @@ pub fn agent_router(state: AgentApiState) -> Router {
         .route("/:id/heartbeat", post(heartbeat_session))
         .route("/:id/end", post(end_session))
         .route("/:id/kill", post(kill_session))
+        .route("/:id/pause", post(pause_session))
+        .route("/:id/resume", post(resume_session))
         .with_state(state)
 }
 
@@ -175,6 +219,14 @@ struct SpawnArgs {
 #[derive(Debug, Deserialize)]
 struct KillArgs {
     /// Why the session was killed (recorded on the `Killed` event).
+    reason: String,
+}
+
+/// `agent.pause` body: the reason the session is being suspended in place (B2). Recorded on the
+/// `Paused` event so the operator/audit trail shows why context was frozen rather than killed.
+#[derive(Debug, Deserialize)]
+struct PauseArgs {
+    /// Why the session was paused (recorded on the `Paused` event).
     reason: String,
 }
 
@@ -259,6 +311,7 @@ async fn spawn_session(
             hooks: Vec::new(),
             maintains_heartbeat: role.maintains_heartbeat(),
             tmux_socket: role.tmux_socket(ws.unwrap_or("default")),
+            spawned_by: Some("ui".into()),
         },
         &session,
     )?;
@@ -350,6 +403,63 @@ async fn kill_session(
     Ok(Json(body))
 }
 
+/// `POST /:id/pause` — suspend a session **in place** (`agent.pause`, B2 gtcore-5731e9). Records
+/// `agent.paused.v1`, folding the session to `paused`, then sends `SIGSTOP` to the tmux pane's
+/// process group so the coding agent stops with its context intact (no kill, no re-sling). `404`
+/// on an unknown id; a missing `reason` is a `422`. The opposite of `/:id/kill`: this is the
+/// kill-preserving door for interactive sessions (mayor, dog) the bead targets.
+#[cfg_attr(feature = "axum", utoipa::path(
+    post, path = "/{id}/pause",
+    params(("id" = String, Path, description = "Session id")),
+    responses(
+        (status = 200, description = "Session paused in place"),
+        (status = 404, description = "No session with that id"),
+        (status = 422, description = "Missing pause reason"),
+    ),
+))]
+async fn pause_session(
+    State(st): State<AgentApiState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Json(a): Json<PauseArgs>,
+) -> Result<Json<Value>, ApiError> {
+    let ws = workspace_of(&headers);
+    let ws = ws.as_deref();
+    st.require_session(ws, &id)?;
+    let body = st.record(ws, AgentEvent::Paused { session: id.clone(), reason: a.reason }, &id)?;
+    // SIGSTOP the agent in place. Interactive sessions (mayor, dog) live on the per-workspace
+    // tmux server (`gt-<workspace>`), the same server the kill endpoint targets.
+    let server = format!("gt-{}", ws.unwrap_or("default"));
+    signal_tmux_panes(&server, &id, libc::SIGSTOP);
+    Ok(Json(body))
+}
+
+/// `POST /:id/resume` — resume a suspended session (`agent.resume`, B2 gtcore-5731e9). Records
+/// `agent.resumed.v1`, folding the session back to `working`, then sends `SIGCONT` to the tmux
+/// pane's process group so the coding agent picks up exactly where it was stopped. `404` on an
+/// unknown id.
+#[cfg_attr(feature = "axum", utoipa::path(
+    post, path = "/{id}/resume",
+    params(("id" = String, Path, description = "Session id")),
+    responses(
+        (status = 200, description = "Session resumed"),
+        (status = 404, description = "No session with that id"),
+    ),
+))]
+async fn resume_session(
+    State(st): State<AgentApiState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> Result<Json<Value>, ApiError> {
+    let ws = workspace_of(&headers);
+    let ws = ws.as_deref();
+    st.require_session(ws, &id)?;
+    let body = st.record(ws, AgentEvent::Resumed { session: id.clone() }, &id)?;
+    let server = format!("gt-{}", ws.unwrap_or("default"));
+    signal_tmux_panes(&server, &id, libc::SIGCONT);
+    Ok(Json(body))
+}
+
 /// The combined OpenAPI document for the agent REST surface (`hq-fe-api-orch.1`). The builder
 /// mounts it under the module prefix and rewrites its relative paths to `/api/v1/agent/...`, so
 /// the `#[utoipa::path]` annotations stay prefix-free.
@@ -361,6 +471,8 @@ async fn kill_session(
     heartbeat_session,
     end_session,
     kill_session,
+    pause_session,
+    resume_session,
 ))]
 pub struct ApiDoc;
 
@@ -387,11 +499,41 @@ fn drop_dispatch_event(channel: &std::path::Path, bead: &str, priority: u8) {
     }
 }
 
+/// Send `signal` (e.g. `SIGSTOP`/`SIGCONT`) to the process group of every pane in tmux session
+/// `session` on server `server` — the pause-in-place primitive (B2, gtcore-5731e9).
+///
+/// tmux runs each pane's command as its own session/process-group leader, so `#{pane_pid}` is the
+/// group id; signalling the **negative** pid reaches the shell *and* the coding agent (and any
+/// `bd`/tool subprocesses) it spawned, so `SIGSTOP` freezes the whole turn and `SIGCONT` thaws it.
+/// Best-effort, mirroring [`kill_session`]'s tmux call: the lifecycle event is already durable, so
+/// a missing tmux/pane is swallowed rather than failing the request.
+fn signal_tmux_panes(server: &str, session: &str, signal: libc::c_int) {
+    let out = std::process::Command::new("tmux")
+        .args(["-L", server, "list-panes", "-t", session, "-F", "#{pane_pid}"])
+        .output();
+    let Ok(out) = out else { return };
+    if !out.status.success() {
+        return;
+    }
+    for line in String::from_utf8_lossy(&out.stdout).lines() {
+        if let Ok(pid) = line.trim().parse::<i32>() {
+            if pid > 0 {
+                // Negative pid → the pane's whole process group (SAFETY: `kill(2)` is a plain
+                // syscall with no memory effects; we ignore the return — a reaped pane is fine).
+                unsafe {
+                    libc::kill(-pid, signal);
+                }
+            }
+        }
+    }
+}
+
 /// Stable spelling of a session state (matches the MCP dispatch payload).
 fn state_str(state: SessionState) -> &'static str {
     match state {
         SessionState::Spawned => "spawned",
         SessionState::Working => "working",
+        SessionState::Paused => "paused",
         SessionState::Done => "done",
         SessionState::Killed => "killed",
     }
@@ -405,6 +547,10 @@ fn session_json(session: &Session) -> Value {
         "state": state_str(session.state),
         "role": session.role.as_str(),
         "crew": session.crew,
+        "skills": session.skills,
+        "hooks": session.hooks,
+        "maintains_heartbeat": session.maintains_heartbeat,
+        "last_heartbeat_at": session.last_heartbeat_at,
     })
 }
 
@@ -452,7 +598,15 @@ mod tests {
         // rewrite them. Every declared route must be present so the combined document is complete.
         let doc = ApiDoc::openapi();
         let paths: Vec<&str> = doc.paths.paths.keys().map(String::as_str).collect();
-        for expected in ["/", "/{id}", "/{id}/heartbeat", "/{id}/end", "/{id}/kill"] {
+        for expected in [
+            "/",
+            "/{id}",
+            "/{id}/heartbeat",
+            "/{id}/end",
+            "/{id}/kill",
+            "/{id}/pause",
+            "/{id}/resume",
+        ] {
             assert!(paths.contains(&expected), "missing {expected} in {paths:?}");
         }
         // Prefix-free: the module builder, not the annotation, owns `/api/v1/agent`.

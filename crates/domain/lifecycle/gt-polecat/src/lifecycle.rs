@@ -93,6 +93,7 @@ impl SpawnSpec {
             hooks: Vec::new(),
             maintains_heartbeat: true,
             tmux_socket: None,
+            spawned_by: None,
         }
     }
 
@@ -241,6 +242,11 @@ impl SpawnTemplate {
         // and its account's claude creds, so a root session could read OTHER accounts' creds, the
         // RS256 signing key, and the whole volume. `GT_POLECAT_RUN_AS=<user>` re-execs the polecat
         // as a dedicated non-root uid via `runuser`. Unset ⇒ runs as the daemon's uid (legacy).
+        // Scrub the daemon's PROD store DSNs (GT_PG_URL/GT_PG_AUDIT_URL/GT_DOLT_URL) from the polecat
+        // launch (gtcore-b6c159): the tmux session inherits the orchd env pointing at the LIVE stores,
+        // and a polecat's `cargo test` would run gt-core contract tests that TRUNCATE/seed the live
+        // workspace and wipe user data. Wrap closest to the agent so `env -u` also covers `wrap_run_as`.
+        let (command, args) = wrap_scrub_prod_dsns(command, args);
         let (command, args) = wrap_run_as(command, args, env("GT_POLECAT_RUN_AS").as_deref());
         let heartbeat_dir = env("GT_HEARTBEAT_DIR")
             .map(PathBuf::from)
@@ -381,10 +387,34 @@ pub fn wrap_run_as(
     }
 }
 
+/// Wrap a polecat launch so the agent — and every child it spawns, e.g. `cargo test` — runs WITHOUT
+/// the daemon's PROD store DSNs (gtcore-b6c159). The tmux session inherits the orchd environment,
+/// which carries `GT_PG_URL` / `GT_PG_AUDIT_URL` / `GT_DOLT_URL` pointing at the LIVE Postgres/Dolt;
+/// a polecat running gt-core's `cargo test` (the Rust pre-merge gate) would otherwise have the
+/// contract tests TRUNCATE/seed the live workspace and WIPE user data (2026-06-23 incident). The
+/// polecat reaches gt over MCP, not direct PG/Dolt, so dropping these is safe. Returns
+/// `env -u GT_PG_URL -u GT_PG_AUDIT_URL -u GT_DOLT_URL <command> <args…>`. Pure argv rewrite (no
+/// shell), so it composes with [`wrap_run_as`] and stays unit-testable.
+pub fn wrap_scrub_prod_dsns(command: String, args: Vec<String>) -> (String, Vec<String>) {
+    let mut wrapped = Vec::with_capacity(args.len() + 7);
+    for var in ["GT_PG_URL", "GT_PG_AUDIT_URL", "GT_DOLT_URL"] {
+        wrapped.push("-u".to_string());
+        wrapped.push(var.to_string());
+    }
+    wrapped.push(command);
+    wrapped.extend(args);
+    ("env".to_string(), wrapped)
+}
+
 pub fn polecat_prompt(workspace: &str, bead: &str, branch: &str) -> String {
     format!(
         "You are a gt polecat in workspace `{workspace}`. Your assigned bead is `{bead}`. \
          Begin your duties per CLAUDE.md. Work autonomously and do not ask for confirmation. \
+         Before you start, recall durable team memory by calling the MCP tool \
+         `mcp__gt__memory_recall` with context relevant to your bead; treat every memory of kind \
+         `feedback` as a hard rule you must obey. As you work and learn something durable \
+         (a decision, gotcha, or convention worth keeping across sessions), persist it with \
+         the MCP tool `mcp__gt__memory_save` — never write memory to local files.{}\
          When your work is committed on branch `{branch}`, signal completion by calling \
          the MCP tool `mcp__gt__merge_submit` with arguments \
          {{\"bead\":\"{bead}\",\"branch\":\"{branch}\"}}. \
@@ -392,7 +422,76 @@ pub fn polecat_prompt(workspace: &str, bead: &str, branch: &str) -> String {
          `d=\"$GT_CHANNEL_ROOT/merge-ready\"; mkdir -p \"$d\"; i=$(cat /proc/sys/kernel/random/uuid \
          2>/dev/null || date +%s%N); printf '{{\"bead\":\"%s\",\"branch\":\"%s\"}}' \"$GT_HOOK_BEAD\" \
          \"$GT_BRANCH\" > \"$d/.$i.tmp\" && mv \"$d/.$i.tmp\" \"$d/$i.event\"` \
-         Then stop."
+         Then stop.{}",
+        rust_premerge_gate(),
+        checkpoint_protocol(bead)
+    )
+}
+
+/// Rust pre-merge verification gate appended to every sling prompt (`gtcore-2ef931`).
+///
+/// The orchd image now bakes a Rust toolchain (`Dockerfile.orchd`,
+/// [[polecat-worktree-no-rust-toolchain]]), so a polecat working a bead that touches Rust can —
+/// and must — compile the workspace in its worktree before signalling merge-ready. The build is
+/// run with `--locked` so a Cargo.lock that drifted out of sync with `Cargo.toml` fails HERE, on
+/// the worktree, instead of blind in the PR's CI after the refinery has already merged a sibling.
+/// `--all-targets` extends the gate to tests/benches/examples so a broken test target is caught
+/// too; `cargo test` follows where the change has testable behaviour.
+///
+/// Scoped to Rust-touching beads on purpose: a docs- or config-only bead should not pay a cold
+/// compile. Kept as its own `fn` so the contract — the exact gate command — is unit-testable.
+pub fn rust_premerge_gate() -> String {
+    " RUST PRE-MERGE GATE: if your work touches Rust (any `*.rs`, `Cargo.toml`, or `Cargo.lock` \
+     change), you MUST run `cargo build --workspace --all-targets --locked` in your worktree and \
+     get a clean build BEFORE you signal merge-ready — and `cargo test --workspace --locked` where \
+     the change has testable behaviour. The toolchain is baked into this image, so this catches a \
+     desynced Cargo.lock or a compile error locally instead of in the PR's CI. If the build fails, \
+     fix it (e.g. `cargo update -p <crate>` to resync the lock, or correct the code) and re-run \
+     until green; do NOT signal merge-ready on a red build. Skip this gate only for beads that \
+     touch no Rust at all. "
+        .to_string()
+}
+
+/// Checkpoint-on-context protocol appended to every sling prompt (`gtcore-2467b4`).
+///
+/// A polecat is never killed mid-bead; instead it cooperates voluntarily when it senses its context
+/// window filling up (~80%). At that point it must (1) commit ALL partial work, (2) persist a
+/// continuation summary onto the bead's notes via `mcp__gt__issues_update`, and (3) deliberately NOT
+/// emit merge-ready — the bead is not done, so signalling completion would have the refinery merge a
+/// half-finished branch. The next polecat slung for the same bead reads these notes and resumes.
+///
+/// The notes use a fixed, machine-parseable shape so the continuation can split it deterministically:
+///
+/// ```text
+/// ## Checkpoint
+/// ### Completado
+/// - <what landed, with file paths / commit subjects>
+/// ### Pendiente
+/// - <what remains, concrete next steps>
+/// ```
+///
+/// Kept as its own `fn` (not inlined into [`polecat_prompt`]) so the contract — the literal section
+/// headers and the three rules — is unit-testable in isolation.
+pub fn checkpoint_protocol(bead: &str) -> String {
+    format!(
+        " CHECKPOINT PROTOCOL: you are never force-killed, so you must hand off cleanly before \
+         your context runs out. When your context usage approaches ~80%, STOP taking on new work \
+         and check point instead: \
+         (1) commit ALL partial work on branch with a conventional commit (`git add -A` then \
+         `git commit`); \
+         (2) record a continuation summary on the bead's notes by calling the MCP tool \
+         `mcp__gt__issues_update` with arguments {{\"id\":\"{bead}\",\"notes\":\"<summary>\"}}, where \
+         <summary> uses EXACTLY this Markdown format so the next polecat can parse it: \
+         `## Checkpoint\\n### Completado\\n- <each thing already done, one bullet per line, name the \
+         files/commits>\\n### Pendiente\\n- <each thing still to do, one bullet per line, concrete \
+         next steps>`; \
+         (3) do NOT emit merge-ready and do NOT call `mcp__gt__merge_submit` — the bead is not \
+         finished, and signalling completion would merge an incomplete branch. After updating the \
+         notes, stop. A fresh polecat will be slung for `{bead}`, read the `## Checkpoint` notes, and \
+         resume from the `### Pendiente` list. \
+         If you instead are resuming a bead whose notes already contain a `## Checkpoint` section, \
+         read its `### Completado` and `### Pendiente` lists first and continue from there rather than \
+         restarting the work."
     )
 }
 
@@ -486,6 +585,44 @@ mod lifecycle_tests {
     fn wrap_run_as_empty_user_is_treated_as_unset() {
         let (cmd, _) = wrap_run_as("claude".to_string(), vec![], Some("  "));
         assert_eq!(cmd, "claude", "blank GT_POLECAT_RUN_AS must not wrap");
+    }
+
+    #[test]
+    fn wrap_scrub_prod_dsns_unsets_the_live_store_vars_and_keeps_args() {
+        // gtcore-b6c159: the agent must launch via `env -u …` so a polecat's `cargo test` never
+        // sees the live GT_PG_URL/GT_DOLT_URL (which would wipe prod). Original cmd+args preserved.
+        let (cmd, args) = wrap_scrub_prod_dsns(
+            "claude".to_string(),
+            vec!["--dangerously-skip-permissions".to_string()],
+        );
+        assert_eq!(cmd, "env");
+        assert_eq!(
+            args,
+            vec![
+                "-u",
+                "GT_PG_URL",
+                "-u",
+                "GT_PG_AUDIT_URL",
+                "-u",
+                "GT_DOLT_URL",
+                "claude",
+                "--dangerously-skip-permissions",
+            ]
+        );
+    }
+
+    #[test]
+    fn wrap_scrub_composes_under_run_as_with_env_closest_to_the_agent() {
+        // Both wraps together: runuser drops privilege, env -u (innermost) scrubs the DSNs for claude
+        // and its children. Order: runuser -u <user> -- env -u … claude …
+        let (command, args) = wrap_scrub_prod_dsns("claude".to_string(), vec![]);
+        let (command, args) = wrap_run_as(command, args, Some("gtpolecat"));
+        assert_eq!(command, "runuser");
+        assert_eq!(
+            args,
+            vec!["-u", "gtpolecat", "--", "env", "-u", "GT_PG_URL", "-u", "GT_PG_AUDIT_URL", "-u",
+                 "GT_DOLT_URL", "claude"]
+        );
     }
 
     #[test]
@@ -583,6 +720,105 @@ mod lifecycle_tests {
     fn polecat_prompt_names_workspace_bead_and_branch() {
         let p = polecat_prompt("acme", "hq-9.2", "feat/x");
         assert!(p.contains("acme") && p.contains("hq-9.2") && p.contains("feat/x"));
+    }
+
+    #[test]
+    fn polecat_prompt_instructs_memory_recall_and_save() {
+        // gtcore-bad8d9: the prompt must steer the polecat to the durable gt MCP memory so
+        // knowledge carries across sessions instead of being re-derived from zero each time.
+        let p = polecat_prompt("acme", "hq-9.2", "feat/x");
+        // Recall at start, with `feedback` memories treated as hard rules.
+        assert!(p.contains("mcp__gt__memory_recall"));
+        assert!(p.contains("feedback"));
+        assert!(p.contains("hard rule"));
+        // Persist durable findings via MCP — never to local files.
+        assert!(p.contains("mcp__gt__memory_save"));
+        assert!(p.contains("never write memory to local files"));
+    }
+
+    #[test]
+    fn polecat_prompt_carries_checkpoint_protocol() {
+        // gtcore-2467b4: the sling prompt must teach the polecat the context-checkpoint protocol —
+        // commit partial work, persist a parseable continuation summary on the bead notes via
+        // issues_update, and explicitly NOT emit merge-ready while unfinished.
+        let p = polecat_prompt("acme", "hq-9.2", "feat/x");
+
+        // (0) The protocol is triggered by context pressure (~80%).
+        assert!(
+            p.contains("CHECKPOINT PROTOCOL") && p.contains("80%"),
+            "prompt explains the context-checkpoint trigger"
+        );
+        // (1) Commit all partial work.
+        assert!(
+            p.contains("commit ALL partial work"),
+            "prompt instructs committing partial work before handoff"
+        );
+        // (2) Update the bead notes via the issues_update MCP tool, naming the bead.
+        assert!(
+            p.contains("mcp__gt__issues_update") && p.contains("hq-9.2"),
+            "prompt instructs persisting continuation notes via issues_update for this bead"
+        );
+        // (2b) The continuation notes use the fixed, parseable format the next polecat reads.
+        assert!(
+            p.contains("## Checkpoint")
+                && p.contains("### Completado")
+                && p.contains("### Pendiente"),
+            "prompt pins the parseable Checkpoint/Completado/Pendiente notes format"
+        );
+        // (3) Do NOT emit merge-ready while the bead is unfinished.
+        assert!(
+            p.contains("do NOT emit merge-ready")
+                && p.contains("do NOT call `mcp__gt__merge_submit`"),
+            "prompt forbids signalling completion on an unfinished checkpoint"
+        );
+    }
+
+    #[test]
+    fn polecat_prompt_carries_rust_premerge_gate() {
+        // gtcore-2ef931: the orchd image now ships a Rust toolchain, so the sling prompt must
+        // direct a polecat on a Rust-touching bead to compile --locked in its worktree BEFORE
+        // merge-ready — catching a desynced Cargo.lock / compile error locally, not in PR CI.
+        let p = polecat_prompt("acme", "hq-9.2", "feat/x");
+
+        // The gate is named and scoped to Rust-touching changes.
+        assert!(
+            p.contains("RUST PRE-MERGE GATE") && p.contains("Cargo.lock"),
+            "prompt explains the Rust pre-merge build gate"
+        );
+        // The exact verification command, with --locked so a drifted lock fails here.
+        assert!(
+            p.contains("cargo build --workspace --all-targets --locked"),
+            "prompt pins the locked workspace build command"
+        );
+        // The gate runs BEFORE the merge-ready signal.
+        let gate = p.find("RUST PRE-MERGE GATE").expect("gate present");
+        let signal = p.find("signal completion").expect("merge-ready signal present");
+        assert!(
+            gate < signal,
+            "the Rust gate is stated before the merge-ready signal"
+        );
+    }
+
+    #[test]
+    fn checkpoint_protocol_format_is_parseable_by_a_continuation() {
+        // The continuation half of gtcore-2467b4: a resuming polecat splits the notes the prior
+        // polecat wrote on `## Checkpoint` / `### Completado` / `### Pendiente`. Prove the literal
+        // headers the prompt dictates partition into exactly those three sections.
+        let text = checkpoint_protocol("hq-9.2");
+        // The prompt must reference each header by its literal Markdown so the parse is deterministic.
+        for header in ["## Checkpoint", "### Completado", "### Pendiente"] {
+            assert!(
+                text.contains(header),
+                "checkpoint protocol names the `{header}` section header"
+            );
+        }
+        // Completado is documented before Pendiente — the order the continuation reads them in.
+        let done = text.find("### Completado").expect("Completado section");
+        let todo = text.find("### Pendiente").expect("Pendiente section");
+        assert!(
+            done < todo,
+            "Completado is described before Pendiente, matching the parse order"
+        );
     }
 
     #[test]

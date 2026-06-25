@@ -35,12 +35,17 @@ serde_json = { workspace = true, optional = true }
 # event-sourced domain — there is no projection table). `gt-eventlog` is the upstream event-replay
 # store ported up (hq-core-port.8); it is also a dev-dependency for the replay gate below.
 gt-eventlog = { workspace = true, optional = true }
+# Raw `kill(2)` for pause-in-place (B2, gtcore-5731e9): the REST `/:id/pause` + `/:id/resume`
+# endpoints send `SIGSTOP`/`SIGCONT` to the tmux pane's process group so the coding agent is
+# suspended in place (context preserved) rather than killed. Optional + axum-gated — only the
+# REST surface signals processes; the MCP-only build records the events without the syscall.
+libc = { workspace = true, optional = true }
 
 [features]
 # Compile the axum REST adapter + OpenAPI spec (`http.rs`) and the route/spec overrides on
 # `AgentModule`. Off by default — the MCP-only build pulls no HTTP stack; the composition bin
 # enables it to expose the REST surface. Pulls the event-log replay/append the dispatch runs.
-axum = ["dep:axum", "dep:utoipa", "dep:serde_json", "dep:gt-eventlog"]
+axum = ["dep:axum", "dep:utoipa", "dep:serde_json", "dep:gt-eventlog", "dep:libc"]
 
 [dev-dependencies]
 # Replay gate only (the domain does not depend on the log at runtime). `gt-eventlog`

@@ -5,7 +5,7 @@
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use gt_store_pg::{email_migrations, PgSubscriptions, SubscriptionError, SubscriptionsRepository};
+use gt_store_pg::{assert_ephemeral_pg_url, email_migrations, PgSubscriptions, SubscriptionError, SubscriptionsRepository};
 
 fn nonce() -> u128 {
     SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos()
@@ -17,6 +17,7 @@ async fn subscribe_is_idempotent_and_fanout_lists_watchers() {
         eprintln!("GT_PG_URL unset; skipping subscriptions contract");
         return;
     };
+    assert_ephemeral_pg_url(&url);
     let pool = sqlx::PgPool::connect(&url).await.expect("connect");
     let mut conn = pool.acquire().await.expect("acquire");
     sqlx::query("SELECT pg_advisory_lock(4915623006)").execute(&mut *conn).await.expect("lock");

@@ -12,11 +12,11 @@
 //!
 //! - **Identity** ([`GtModule::meta`]) — id `rig`, semver, description.
 //! - **Capability** ([`GtModule::capability`]) — the `rig.read` / `rig.write` scopes the
-//!   module owns and the six versioned event kinds it emits.
-//! - **MCP tools** ([`GtModule::register_mcp_tools`]) — the twelve `rig.*` validate/execute
+//!   module owns and the nine versioned event kinds it emits.
+//! - **MCP tools** ([`GtModule::register_mcp_tools`]) — the eighteen `rig.*` validate/execute
 //!   tools, named and described verbatim from the current `gt-mcp` service.
-//! - **Migrations** ([`GtModule::migrations`]) — the `rigs` table + its `worktree_root`
-//!   column, owned by the module.
+//! - **Migrations** ([`GtModule::migrations`]) — the `rigs` table + its `worktree_root`,
+//!   `git_connection_ref`, `semantic_tags`, and `dispatch_mode` columns, owned by the module.
 //!
 //! - **HTTP routes + OpenAPI** (on the sibling [`RigsHttpModule`]) — under the off-by-default
 //!   `axum` feature (`hq-fe-api-platform.2`), the platform sibling of the issues HTTP surface:
@@ -82,6 +82,34 @@ impl RigsModule {
     pub fn with_http(state: crate::http::RigApiState) -> RigsHttpModule {
         RigsHttpModule { http: state }
     }
+
+    /// The full, idempotent DDL that converges the `ws_default` rigs TEMPLATE to the current
+    /// schema from ANY prior state — a missing table, or a table holding only a subset of the
+    /// follow-on columns. It is the concatenation of every rig migration's SQL; each statement is
+    /// `CREATE …/ALTER … IF NOT EXISTS`, so replaying them all in order is a safe self-heal,
+    /// mirroring the `events`/`dispatch` `ensure_schema` belt-and-suspenders (gtcore-a80f74).
+    ///
+    /// Why this exists, given the migrations are already idempotent: the migration tracking table
+    /// (`_gt_schema_migrations`) lives in the shared `public` schema and SURVIVES a
+    /// `DROP SCHEMA ws_default CASCADE` (e.g. the tenant-reprovision / data-wipe path). After such a
+    /// drop the loader still sees `create_rigs` recorded as applied and SKIPS it, so the dropped
+    /// `ws_default.rigs` is never recreated — then the next *pending* follow-on migration
+    /// (`ALTER TABLE ws_default.rigs ADD COLUMN …`) aborts boot with `relation "ws_default.rigs"
+    /// does not exist`, crashlooping the whole gt-mcp-server. Replaying this idempotent DDL
+    /// UNCONDITIONALLY before `gt_module_migrate::apply` guarantees the template table is present
+    /// and complete, so both the pending ALTERs and the runtime `rig.list`/`rig.info` reads
+    /// always find it — independent of what the tracking table claims.
+    ///
+    /// The DDL is derived from [`migrations`](GtModule::migrations) so the self-heal can never
+    /// drift from the migration history: it is exactly the same statements, in the same order.
+    pub fn template_ensure_sql() -> String {
+        RigsModule
+            .migrations()
+            .iter()
+            .map(|m| m.sql.as_str())
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
 }
 
 /// The HTTP-enabled rig module (`hq-fe-api-platform.2`): the same `GtModule` contract as
@@ -144,7 +172,7 @@ impl GtModule for RigsModule {
 
     fn capability(&self) -> Capability {
         // The `rig.read` / `rig.write` scopes the module owns (the same `<resource>.<verb>`
-        // convention `gt-merge` and `gt-quota` already follow). The six emitted kinds mirror
+        // convention `gt-merge` and `gt-quota` already follow). The nine emitted kinds mirror
         // `RigEvent`'s variants, declared in the canonical versioned + kebab shape.
         Capability::empty()
             .claiming_all([
@@ -158,6 +186,9 @@ impl GtModule for RigsModule {
                 EventKind::new("rig.prefix-changed.v1").expect("valid event kind"),
                 EventKind::new("rig.default-branch-changed.v1").expect("valid event kind"),
                 EventKind::new("rig.worktree-root-changed.v1").expect("valid event kind"),
+                EventKind::new("rig.tags-changed.v1").expect("valid event kind"),
+                EventKind::new("rig.held.v1").expect("valid event kind"),
+                EventKind::new("rig.resumed.v1").expect("valid event kind"),
             ])
     }
 
@@ -224,6 +255,40 @@ impl GtModule for RigsModule {
                 "Pin the absolute worktree root the orchestrator carves a rig's polecat \
                  checkouts under (the filesystem move is a deploy-edge side-effect). Emits \
                  rig.worktree_root_changed.",
+            )
+            .tool(
+                "rig.set-tags.validate",
+                "Check whether replacing a rig's semantic capability tags would be accepted \
+                 (tag grammar, count/length bounds, not a no-op). No state change.",
+            )
+            .tool(
+                "rig.set-tags.execute",
+                "Replace a rig's semantic capability tags (lowercased + deduped) so peers can \
+                 select it by capability via a2a.discover. Emits rig.tags_changed.",
+            )
+            .tool(
+                "rig.hold.validate",
+                "Check whether putting a rig on dispatch hold would be accepted (the rig must \
+                 exist). Holding an already-held rig is a valid no-op, not an error. No state \
+                 change.",
+            )
+            .tool(
+                "rig.hold.execute",
+                "Put a rig on dispatch hold (dispatch_mode=hold) so the operator can intervene \
+                 without colliding with the orchestrator. Idempotent. Emits rig.held on a real \
+                 transition.",
+            )
+            .tool(
+                "rig.resume.validate",
+                "Check whether taking a rig off dispatch hold would be accepted (the rig must \
+                 exist). Resuming an already-auto rig is a valid no-op, not an error. No state \
+                 change.",
+            )
+            .tool(
+                "rig.resume.execute",
+                "Take a rig off dispatch hold (dispatch_mode=auto), restoring orchestrator \
+                 dispatch + watchdog re-sling. Idempotent. Emits rig.resumed on a real \
+                 transition.",
             );
     }
 
@@ -247,6 +312,16 @@ impl GtModule for RigsModule {
                 "add_git_connection_ref",
                 include_str!("../migrations/rig/0003__add_git_connection_ref.sql"),
             ),
+            Migration::new(
+                4,
+                "add_semantic_tags",
+                include_str!("../migrations/rig/0004__add_semantic_tags.sql"),
+            ),
+            Migration::new(
+                5,
+                "add_dispatch_mode",
+                include_str!("../migrations/rig/0005__add_dispatch_mode.sql"),
+            ),
         ]
     }
 }
@@ -263,7 +338,7 @@ mod tests {
     }
 
     #[test]
-    fn capability_owns_rig_scopes_and_six_versioned_kinds() {
+    fn capability_owns_rig_scopes_and_nine_versioned_kinds() {
         let cap = RigsModule.capability();
 
         let scopes: Vec<&str> = cap.scopes().iter().map(Scope::as_str).collect();
@@ -279,6 +354,9 @@ mod tests {
                 "rig.prefix-changed.v1",
                 "rig.default-branch-changed.v1",
                 "rig.worktree-root-changed.v1",
+                "rig.tags-changed.v1",
+                "rig.held.v1",
+                "rig.resumed.v1",
             ]
         );
         // Every declared kind is owned by this module (prefix == meta id).
@@ -288,7 +366,7 @@ mod tests {
     }
 
     #[test]
-    fn registers_the_twelve_existing_rig_tools() {
+    fn registers_the_eighteen_existing_rig_tools() {
         let mut reg = McpRegistry::new();
         RigsModule.register_mcp_tools(&mut reg);
         let names: Vec<&str> = reg.tools().iter().map(|t| t.name.as_str()).collect();
@@ -307,6 +385,12 @@ mod tests {
                 "rig.set-default-branch.execute",
                 "rig.set-worktree-root.validate",
                 "rig.set-worktree-root.execute",
+                "rig.set-tags.validate",
+                "rig.set-tags.execute",
+                "rig.hold.validate",
+                "rig.hold.execute",
+                "rig.resume.validate",
+                "rig.resume.execute",
             ]
         );
     }
@@ -314,7 +398,7 @@ mod tests {
     #[test]
     fn owns_the_rigs_table_migration() {
         let migs = RigsModule.migrations();
-        assert_eq!(migs.len(), 3);
+        assert_eq!(migs.len(), 5);
         assert_eq!(migs[0].version, 1);
         assert_eq!(migs[0].name, "create_rigs");
         // The worktree_root column override (hq-mt-rigs.5) is a follow-on migration, never
@@ -331,6 +415,20 @@ mod tests {
         assert!(migs[2]
             .sql
             .contains("ADD COLUMN IF NOT EXISTS git_connection_ref"));
+        // The semantic_tags column (B3, gtcore-1caa48) backs tag-based peer selection in
+        // a2a.discover — another follow-on migration on the same template.
+        assert_eq!(migs[3].version, 4);
+        assert_eq!(migs[3].name, "add_semantic_tags");
+        assert!(migs[3]
+            .sql
+            .contains("ADD COLUMN IF NOT EXISTS semantic_tags"));
+        // The dispatch_mode column (rig-hold H1, gtcore-fab8fb) backs the per-rig hold state —
+        // another follow-on migration on the same template.
+        assert_eq!(migs[4].version, 5);
+        assert_eq!(migs[4].name, "add_dispatch_mode");
+        assert!(migs[4]
+            .sql
+            .contains("ADD COLUMN IF NOT EXISTS dispatch_mode"));
         // Schema-per-ws (hq-mt-data.3, docs/04 §15): the table is created in the
         // `ws_default` template schema so `gt_create_workspace_schema` clones it per
         // tenant — not in `public` (which holds only cross-tenant catalogs).
@@ -343,6 +441,37 @@ mod tests {
                 .contains("CREATE SCHEMA IF NOT EXISTS ws_default"),
             "must bootstrap the template schema it populates",
         );
+    }
+
+    #[test]
+    fn template_ensure_sql_is_the_complete_idempotent_superset() {
+        // The boot-time self-heal (gtcore-a80f74) must converge a missing-or-partial
+        // `ws_default.rigs` to the current schema. It bootstraps the schema + table and (re)adds
+        // every follow-on column, all `IF NOT EXISTS`, so replaying it against any prior state is
+        // safe and lands the full schema.
+        let ddl = RigsModule::template_ensure_sql();
+        assert!(ddl.contains("CREATE SCHEMA IF NOT EXISTS ws_default"));
+        assert!(ddl.contains("CREATE TABLE IF NOT EXISTS ws_default.rigs"));
+        for col in [
+            "worktree_root",
+            "git_connection_ref",
+            "semantic_tags",
+            "dispatch_mode",
+        ] {
+            assert!(
+                ddl.contains(&format!("ADD COLUMN IF NOT EXISTS {col}")),
+                "ensure DDL must re-add the {col} column",
+            );
+        }
+        // Derived from `migrations()` so it can never drift from the migration history: it is
+        // exactly the migration SQLs, in order, joined.
+        let joined = RigsModule
+            .migrations()
+            .iter()
+            .map(|m| m.sql.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert_eq!(ddl, joined);
     }
 
     #[test]
@@ -390,6 +519,6 @@ mod tests {
         );
         let mut reg = McpRegistry::new();
         m.register_mcp_tools(&mut reg);
-        assert_eq!(reg.tools().len(), 12, "the twelve rig tools still register");
+        assert_eq!(reg.tools().len(), 18, "the eighteen rig tools still register");
     }
 }

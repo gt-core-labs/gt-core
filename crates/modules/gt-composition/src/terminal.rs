@@ -855,6 +855,19 @@ fn build_command(target: &TerminalTarget) -> CommandBuilder {
                         cmd.arg("-e");
                         cmd.arg(format!("GT_CHANNEL_ROOT={root}"));
                     }
+                    // Scrub the orchd's PROD store DSNs from the polecat's environment (gtcore-b6c159).
+                    // The tmux session inherits the server (orchd) env, which carries GT_PG_URL /
+                    // GT_PG_AUDIT_URL / GT_DOLT_URL pointing at the LIVE Postgres/Dolt. A polecat that
+                    // runs `cargo test` would otherwise have gt-core's contract tests TRUNCATE+seed the
+                    // live workspace and WIPE user data (memories, PATs, rig catalog — the 2026-06-23
+                    // incident). The polecat reaches gt over MCP, not direct PG/Dolt, so dropping these
+                    // is safe; `env -u` removes them for claude AND every child it spawns. Tests then
+                    // see the vars unset and skip (their `env::var(..).ok()` guard).
+                    cmd.arg("env");
+                    for var in ["GT_PG_URL", "GT_PG_AUDIT_URL", "GT_DOLT_URL"] {
+                        cmd.arg("-u");
+                        cmd.arg(var);
+                    }
                     cmd.arg("claude");
                     // Load the session's hooks via claude's `--settings <file>` flag (hq-quota-feed):
                     // claude does NOT apply a project `.claude/settings.json`'s hooks on its own in
@@ -1236,6 +1249,13 @@ mod tests {
                 "CLAUDE_CONFIG_DIR=/var/lib/gt-core/accounts/abc",
                 "-e",
                 "IS_SANDBOX=1",
+                "env",
+                "-u",
+                "GT_PG_URL",
+                "-u",
+                "GT_PG_AUDIT_URL",
+                "-u",
+                "GT_DOLT_URL",
                 "claude",
                 "--settings",
                 "/var/lib/gt-core/term/hq-gg-1/.claude/settings.json"
@@ -1277,6 +1297,13 @@ mod tests {
                 "CLAUDE_CONFIG_DIR=/var/lib/gt-core/accounts/abc",
                 "-e",
                 "IS_SANDBOX=1",
+                "env",
+                "-u",
+                "GT_PG_URL",
+                "-u",
+                "GT_PG_AUDIT_URL",
+                "-u",
+                "GT_DOLT_URL",
                 "claude",
                 "--model",
                 "opus",
@@ -1430,6 +1457,7 @@ mod tests {
                 hooks: vec![],
                 maintains_heartbeat: false,
                 tmux_socket: Some("gt-acme".into()),
+                spawned_by: None,
             },
         )
         .unwrap();
@@ -1528,6 +1556,7 @@ mod tests {
                 hooks: vec![],
                 maintains_heartbeat: false,
                 tmux_socket: Some("gt-acme".into()),
+                spawned_by: None,
             },
         )
         .unwrap();
@@ -1566,6 +1595,7 @@ mod tests {
                 hooks: vec![],
                 maintains_heartbeat: false,
                 tmux_socket: Some("gt-acme".into()),
+                spawned_by: None,
             },
         )
         .unwrap();

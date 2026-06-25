@@ -27,6 +27,9 @@ use gt_events::AppError;
 
 use gt_auth::MembershipDirectory;
 use gt_claude_hooks::{HookEvent, HooksRegistry, HooksState, HooksStore};
+use gt_agent::http::WorkspaceAgentLog;
+use gt_agent::SessionRegistry;
+use gt_eventlog::EventRecord;
 use gt_feed::{FeedItem, FeedPage, WorkspaceFeed};
 use gt_graphindex::{GraphError, GraphRefresher, RigCustody, WorkspaceGraph};
 use gt_graphwarden::WardenState;
@@ -74,6 +77,11 @@ const HOOKS_NS: &str = "hooks.";
 /// [`ConvoyHandler`](super::convoy::ConvoyHandler)'s replay filter so the REST surface and the
 /// MCP handler fold the identical per-workspace stream.
 const CONVOY_NS: &str = "convoy.";
+
+/// The event-log kind prefix every agent event carries (`agent.*.v1`); matches
+/// [`AgentHandler`](super::agent::AgentHandler)'s replay filter so the REST surface and the
+/// MCP handler fold the identical per-workspace stream (gtcore-8c3823).
+const AGENT_NS: &str = "agent.";
 
 /// Upper bound on how many records the feed REST surface scans per request. The feed paginates the
 /// *whole* tenant log (every namespace, not one prefix), so a generous cap bounds the read without
@@ -238,6 +246,39 @@ impl AccountCatalog for FsAccountCatalog {
             .into_iter()
             .find(|(email, _)| email == account)
             .map(|(_, dir)| dir.to_string_lossy().into_owned()))
+    }
+}
+
+/// REST backing for `agent.*` (`gt_agent::http::WorkspaceAgentLog`): the durable mirror of
+/// [`AgentHandler`](super::agent::AgentHandler) (gtcore-8c3823). Before this backing, the agent
+/// REST surface hardcoded a file-based `JsonlWriter` while the MCP handler used the shared
+/// `EventLog` (file or Postgres) — so when `GT_EVENTLOG_PG=1`, the two transports read different
+/// backends and session state diverged. This backing delegates to the SAME `EventLog` both edges
+/// share, closing the split.
+pub struct EventLogAgentEvents {
+    log: Arc<EventLog>,
+}
+
+impl EventLogAgentEvents {
+    /// Wrap the per-workspace event log (the binary's single shared instance).
+    pub fn new(log: Arc<EventLog>) -> Self {
+        Self { log }
+    }
+}
+
+impl WorkspaceAgentLog for EventLogAgentEvents {
+    fn registry(&self, workspace: Option<&str>) -> Result<SessionRegistry, AppError> {
+        self.log
+            .replay_domain(workspace, AGENT_NS, SessionRegistry::default(), SessionRegistry::apply)
+            .map_err(lift)
+    }
+
+    fn append_record(&self, workspace: Option<&str>, record: &EventRecord) -> Result<(), AppError> {
+        // Delegate to the raw record append on the shared event log. The `EventLog::append` method
+        // takes a typed event, but the REST adapter already has a serialized `EventRecord` (it
+        // builds one from the `AgentEvent` via `Envelope::root`). Use `append_raw` to avoid a
+        // redundant round-trip through serde.
+        self.log.append_raw(workspace, record).map_err(lift)
     }
 }
 

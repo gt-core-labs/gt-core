@@ -334,6 +334,107 @@ async fn update_patches_visible_fields_and_commits() {
     );
 }
 
+/// gtcore-13738c: `issues.create`/`issues.update` must persist the `depends_on`
+/// edges into `issue_relations`, not validate-then-drop them. Before the fix a
+/// bead created with `depends_on=[X]` had no edge, so the readiness frontier
+/// treated it as dependency-free and auto-dispatched it out of order. Asserts the
+/// whole round-trip: create persists, `get_detail` + `depends_on_edges` surface
+/// the set, update replaces it, and `Some(vec![])` clears it.
+#[tokio::test]
+async fn create_and_update_persist_depends_on_edges() {
+    let Ok(base) = std::env::var("GT_DOLT_URL") else {
+        eprintln!("GT_DOLT_URL unset — skipping DoltIssues depends_on contract");
+        return;
+    };
+    let base = base.trim_end_matches('/').to_string();
+    seed(&base).await.expect("seed");
+
+    let repo = DoltIssues::connect(&format!("{base}/{TEST_DB}")).expect("connect");
+
+    // Two dependency targets the dependent bead will wait on.
+    let dep1 = format!("hq-dep1-{}", ulid::Ulid::new());
+    let dep2 = format!("hq-dep2-{}", ulid::Ulid::new());
+    for d in [&dep1, &dep2] {
+        repo.insert(&NewIssue {
+            id: d.clone(),
+            title: "dep".into(),
+            issue_type: "task".into(),
+            created_by: "test".into(),
+            ..Default::default()
+        })
+        .await
+        .expect("insert dep");
+    }
+
+    // create with depends_on must persist the edges (the regression).
+    let id = format!("hq-deps-{}", ulid::Ulid::new());
+    repo.insert(&NewIssue {
+        id: id.clone(),
+        title: "dependent".into(),
+        issue_type: "task".into(),
+        created_by: "test".into(),
+        depends_on: vec![dep1.clone(), dep2.clone()],
+        ..Default::default()
+    })
+    .await
+    .expect("insert dependent");
+
+    let want = {
+        let mut v = vec![dep1.clone(), dep2.clone()];
+        v.sort();
+        v
+    };
+
+    // get_detail surfaces the dependency set so issues.read returns it.
+    let detail = repo.get_detail(&id).await.expect("ok").expect("row");
+    let mut got = detail.depends_on.clone();
+    got.sort();
+    assert_eq!(got, want, "create must persist depends_on edges");
+
+    // depends_on_edges (the frontier's readiness input) sees them too.
+    let edges = repo
+        .depends_on_edges(&IssueFilter::default())
+        .await
+        .expect("edges");
+    let mut e = edges.get(&id).cloned().unwrap_or_default();
+    e.sort();
+    assert_eq!(e, want, "depends_on_edges must include the created edges");
+
+    // update with Some(list) replaces the whole set (drop dep2, keep dep1).
+    repo.update(
+        &id,
+        &IssuePatch {
+            depends_on: Some(vec![dep1.clone()]),
+            ..Default::default()
+        },
+    )
+    .await
+    .expect("update deps");
+    let detail = repo.get_detail(&id).await.expect("ok").expect("row");
+    assert_eq!(
+        detail.depends_on,
+        vec![dep1.clone()],
+        "update must replace the edge set, not append",
+    );
+
+    // update with Some(vec![]) clears every edge.
+    repo.update(
+        &id,
+        &IssuePatch {
+            depends_on: Some(vec![]),
+            ..Default::default()
+        },
+    )
+    .await
+    .expect("clear deps");
+    let detail = repo.get_detail(&id).await.expect("ok").expect("row");
+    assert!(
+        detail.depends_on.is_empty(),
+        "Some(vec![]) must clear all depends_on edges, got {:?}",
+        detail.depends_on,
+    );
+}
+
 #[tokio::test]
 async fn delivered_sha_round_trips() {
     // hq-core-mcp.10 (docs/10 §S2): set_delivered_sha stamps the column and it
@@ -502,6 +603,212 @@ async fn close_stamps_attribution_and_rejects_double() {
     assert!(
         err.to_string().to_lowercase().contains("not found"),
         "got `{err}`",
+    );
+}
+
+/// The DB's own `DATE(NOW())` as `YYYY-MM-DD` — the same value the store stamps
+/// via `COALESCE(.., DATE(NOW()))`. Read it from Dolt (not the test host clock)
+/// so the comparison never races a midnight rollover or a host/server tz skew.
+async fn dolt_today(base: &str) -> String {
+    use mysql_async::prelude::*;
+    let pool = gt_store_dolt::connect(&format!("{base}/{TEST_DB}")).expect("pool");
+    let mut conn = pool.get_conn().await.expect("conn");
+    conn.exec_first::<String, _, _>("SELECT DATE_FORMAT(DATE(NOW()), '%Y-%m-%d')", ())
+        .await
+        .expect("query today")
+        .expect("one row")
+}
+
+#[tokio::test]
+async fn transition_to_working_autofills_start_date_unless_planned() {
+    // gtcore-fdc175: the move to `working` derives "Fecha Inicio" from the real
+    // lifecycle — an UNSET start_date is filled with the event date, an
+    // already-populated (planned) start_date is RESPECTED, never overwritten.
+    let Ok(base) = std::env::var("GT_DOLT_URL") else {
+        eprintln!("GT_DOLT_URL unset — skipping start_date auto-fill contract");
+        return;
+    };
+    let base = base.trim_end_matches('/').to_string();
+    seed(&base).await.expect("seed");
+
+    let repo = DoltIssues::connect(&format!("{base}/{TEST_DB}")).expect("connect");
+
+    // --- empty start_date auto-fills with the event date -------------------
+    let empty = format!("hq-sd-empty-{}", ulid::Ulid::new());
+    repo.insert(&NewIssue {
+        id: empty.clone(),
+        title: "start auto-fill".into(),
+        issue_type: "task".into(),
+        created_by: "test".into(),
+        ..Default::default()
+    })
+    .await
+    .expect("seed insert");
+    assert_eq!(
+        repo.get_detail(&empty).await.unwrap().unwrap().start_date,
+        None,
+        "fresh row has no start_date",
+    );
+
+    repo.transition(&empty, IssueStatus::Working).await.expect("open->working");
+    let today = dolt_today(&base).await;
+    assert_eq!(
+        repo.get_detail(&empty).await.unwrap().unwrap().start_date.as_deref(),
+        Some(today.as_str()),
+        "unset start_date filled with the event date on the working move",
+    );
+
+    // --- a populated start_date is respected -------------------------------
+    let planned = format!("hq-sd-plan-{}", ulid::Ulid::new());
+    repo.insert(&NewIssue {
+        id: planned.clone(),
+        title: "start respected".into(),
+        issue_type: "task".into(),
+        created_by: "test".into(),
+        ..Default::default()
+    })
+    .await
+    .expect("seed insert");
+    repo.update(
+        &planned,
+        &IssuePatch { start_date: Some("2020-01-02".into()), ..Default::default() },
+    )
+    .await
+    .expect("seed planned start_date");
+
+    repo.transition(&planned, IssueStatus::Working).await.expect("open->working");
+    assert_eq!(
+        repo.get_detail(&planned).await.unwrap().unwrap().start_date.as_deref(),
+        Some("2020-01-02"),
+        "a hand-planned start_date is never overwritten by the working move",
+    );
+}
+
+#[tokio::test]
+async fn claim_autofills_start_date_unless_planned() {
+    // gtcore-fdc175: `claim` is the other path onto `working`, so it stamps
+    // "Fecha Inicio" the same way — unset is filled, planned is respected.
+    let Ok(base) = std::env::var("GT_DOLT_URL") else {
+        eprintln!("GT_DOLT_URL unset — skipping claim start_date auto-fill contract");
+        return;
+    };
+    let base = base.trim_end_matches('/').to_string();
+    seed(&base).await.expect("seed");
+
+    let repo = DoltIssues::connect(&format!("{base}/{TEST_DB}")).expect("connect");
+
+    // --- empty start_date auto-fills on claim ------------------------------
+    let empty = format!("hq-cl-empty-{}", ulid::Ulid::new());
+    repo.insert(&NewIssue {
+        id: empty.clone(),
+        title: "claim auto-fill".into(),
+        issue_type: "task".into(),
+        created_by: "test".into(),
+        ..Default::default()
+    })
+    .await
+    .expect("seed insert");
+    assert!(matches!(
+        repo.claim(&empty, "alice").await.expect("claim ok"),
+        ClaimOutcome::Won,
+    ));
+    let today = dolt_today(&base).await;
+    assert_eq!(
+        repo.get_detail(&empty).await.unwrap().unwrap().start_date.as_deref(),
+        Some(today.as_str()),
+        "unset start_date filled with the event date on claim",
+    );
+
+    // --- a populated start_date is respected on claim ----------------------
+    let planned = format!("hq-cl-plan-{}", ulid::Ulid::new());
+    repo.insert(&NewIssue {
+        id: planned.clone(),
+        title: "claim respected".into(),
+        issue_type: "task".into(),
+        created_by: "test".into(),
+        ..Default::default()
+    })
+    .await
+    .expect("seed insert");
+    repo.update(
+        &planned,
+        &IssuePatch { start_date: Some("2019-03-04".into()), ..Default::default() },
+    )
+    .await
+    .expect("seed planned start_date");
+    assert!(matches!(
+        repo.claim(&planned, "bob").await.expect("claim ok"),
+        ClaimOutcome::Won,
+    ));
+    assert_eq!(
+        repo.get_detail(&planned).await.unwrap().unwrap().start_date.as_deref(),
+        Some("2019-03-04"),
+        "a hand-planned start_date is never overwritten by claim",
+    );
+}
+
+#[tokio::test]
+async fn close_autofills_due_date_unless_planned() {
+    // gtcore-fdc175: closing a bead derives "Fecha Fin" from the real close
+    // date — an UNSET due_date is filled with the close date, an
+    // already-populated (planned) due_date is RESPECTED, never overwritten.
+    let Ok(base) = std::env::var("GT_DOLT_URL") else {
+        eprintln!("GT_DOLT_URL unset — skipping due_date auto-fill contract");
+        return;
+    };
+    let base = base.trim_end_matches('/').to_string();
+    seed(&base).await.expect("seed");
+
+    let repo = DoltIssues::connect(&format!("{base}/{TEST_DB}")).expect("connect");
+
+    // --- empty due_date auto-fills with the close date ---------------------
+    let empty = format!("hq-dd-empty-{}", ulid::Ulid::new());
+    repo.insert(&NewIssue {
+        id: empty.clone(),
+        title: "due auto-fill".into(),
+        issue_type: "task".into(),
+        created_by: "test".into(),
+        ..Default::default()
+    })
+    .await
+    .expect("seed insert");
+    assert_eq!(
+        repo.get_detail(&empty).await.unwrap().unwrap().due_date,
+        None,
+        "fresh row has no due_date",
+    );
+
+    repo.close(&empty, "claude-host").await.expect("close ok");
+    let today = dolt_today(&base).await;
+    assert_eq!(
+        repo.get_detail(&empty).await.unwrap().unwrap().due_date.as_deref(),
+        Some(today.as_str()),
+        "unset due_date filled with the close date",
+    );
+
+    // --- a populated due_date is respected ---------------------------------
+    let planned = format!("hq-dd-plan-{}", ulid::Ulid::new());
+    repo.insert(&NewIssue {
+        id: planned.clone(),
+        title: "due respected".into(),
+        issue_type: "task".into(),
+        created_by: "test".into(),
+        ..Default::default()
+    })
+    .await
+    .expect("seed insert");
+    repo.update(
+        &planned,
+        &IssuePatch { due_date: Some("2030-12-31".into()), ..Default::default() },
+    )
+    .await
+    .expect("seed planned due_date");
+
+    repo.close(&planned, "claude-host").await.expect("close ok");
+    assert_eq!(
+        repo.get_detail(&planned).await.unwrap().unwrap().due_date.as_deref(),
+        Some("2030-12-31"),
+        "a hand-planned due_date is never overwritten on close",
     );
 }
 
@@ -942,6 +1249,85 @@ async fn dispatch_column_round_trips_and_migration_is_idempotent() {
         repo.get_detail(&auto).await.expect("d").expect("row").dispatch,
         None,
         "empty-string patch clears back to NULL (inherit)"
+    );
+}
+
+/// gtcore-b45a2d: the `role_scope` column round-trips through insert/update/
+/// get_detail. Omitted stores NULL; a patch overwrites; and a LEGACY row that
+/// carries an arbitrary string (the column was free-form before the closed
+/// `RoleScope` set) still reads back verbatim — the read path stays `String`,
+/// only create/update narrow.
+#[tokio::test]
+async fn role_scope_column_round_trips_and_legacy_value_reads() {
+    let Ok(base) = std::env::var("GT_DOLT_URL") else {
+        eprintln!("GT_DOLT_URL unset — skipping DoltIssues role_scope contract");
+        return;
+    };
+    let base = base.trim_end_matches('/').to_string();
+    seed(&base).await.expect("seed");
+    let repo = DoltIssues::connect(&format!("{base}/{TEST_DB}")).expect("connect");
+
+    // Omitted role_scope → NULL (not every bead pins a role).
+    let plain = format!("hq-role-{}", ulid::Ulid::new());
+    repo.insert(&NewIssue {
+        id: plain.clone(),
+        title: "no role".into(),
+        issue_type: "task".into(),
+        created_by: "test".into(),
+        ..Default::default()
+    })
+    .await
+    .expect("insert plain");
+    assert_eq!(
+        repo.get_detail(&plain).await.expect("d").expect("row").role_scope,
+        None,
+        "omitted role_scope stores NULL"
+    );
+
+    // Explicit role_scope on insert surfaces on read.
+    let scoped = format!("hq-role-{}", ulid::Ulid::new());
+    repo.insert(&NewIssue {
+        id: scoped.clone(),
+        title: "sheriff bead".into(),
+        issue_type: "task".into(),
+        created_by: "test".into(),
+        role_scope: Some("sheriff".into()),
+        ..Default::default()
+    })
+    .await
+    .expect("insert scoped");
+    assert_eq!(
+        repo.get_detail(&scoped).await.expect("d").expect("row").role_scope.as_deref(),
+        Some("sheriff")
+    );
+
+    // Patch overwrites the discriminator with another closed-set token.
+    repo.update(&scoped, &IssuePatch { role_scope: Some("refinery".into()), ..Default::default() })
+        .await
+        .expect("patch role_scope");
+    assert_eq!(
+        repo.get_detail(&scoped).await.expect("d").expect("row").role_scope.as_deref(),
+        Some("refinery")
+    );
+
+    // BACK-COMPAT: a legacy row carrying an out-of-set arbitrary value (written
+    // when the column was free-form) reads back verbatim — the closed set guards
+    // only the create/update boundary, never the read path.
+    let legacy = format!("hq-role-{}", ulid::Ulid::new());
+    repo.insert(&NewIssue {
+        id: legacy.clone(),
+        title: "legacy free-form".into(),
+        issue_type: "task".into(),
+        created_by: "test".into(),
+        role_scope: Some("archivist-emeritus".into()),
+        ..Default::default()
+    })
+    .await
+    .expect("insert legacy");
+    assert_eq!(
+        repo.get_detail(&legacy).await.expect("d").expect("row").role_scope.as_deref(),
+        Some("archivist-emeritus"),
+        "legacy free-form role_scope reads without breaking"
     );
 }
 

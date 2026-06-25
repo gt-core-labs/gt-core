@@ -15,7 +15,8 @@ use gt_events::{AppError, Command};
 
 use crate::events::RigEvent;
 use crate::state::{
-    validate_prefix, validate_rig_name, validate_worktree_root, RigCatalog, RigEntry,
+    normalize_semantic_tags, validate_prefix, validate_rig_name, validate_semantic_tags,
+    validate_worktree_root, DispatchMode, RigCatalog, RigEntry,
 };
 
 /// Default tenant for a command built without an explicit workspace. The server stamps the
@@ -102,6 +103,10 @@ impl AddRig {
             registered_at_secs: self.now_secs,
             worktree_root: None,
             git_connection_ref: self.git_connection_ref.clone(),
+            semantic_tags: Vec::new(),
+            // A newly-registered rig is dispatchable (back-compat default); the operator holds it
+            // later via rig.hold (rig-hold H1).
+            dispatch_mode: DispatchMode::Auto,
         }
     }
 }
@@ -394,6 +399,224 @@ impl Command for SetRigWorktreeRoot {
     }
 }
 
+/// Replace a rig's semantic capability tags (B3, gtcore-1caa48). The `tags` are normalised
+/// (lowercased, trimmed, deduped) and validated before they replace the rig's existing set, so
+/// `a2a.discover` can match peers by capability (`rust`, `frontend`, …) rather than only by bead
+/// prefix. Replace, not merge: pass the full desired set; an empty set clears all tags (back to
+/// prefix-only discovery).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct SetRigTags {
+    pub name: String,
+    /// The full new tag set. Normalised + validated by [`Self::validate`].
+    #[serde(default)]
+    pub tags: Vec<String>,
+    pub now_secs: u64,
+    /// Server-injected tenant — see [`AddRig::workspace_id`].
+    #[serde(skip_deserializing, default = "default_workspace")]
+    #[schemars(skip)]
+    pub workspace_id: String,
+}
+
+impl SetRigTags {
+    /// The normalised tag set this command will apply (lowercased, trimmed, deduped).
+    fn normalized(&self) -> Vec<String> {
+        normalize_semantic_tags(&self.tags)
+    }
+}
+
+impl Command for SetRigTags {
+    type Output = RigEvent;
+    type State = RigCatalog;
+
+    fn validate(&self, state: &Self::State) -> Result<(), AppError> {
+        if self.name.is_empty() {
+            return Err(AppError::Validation("rig name is empty".into()));
+        }
+        let tags = self.normalized();
+        validate_semantic_tags(&tags).map_err(AppError::Validation)?;
+        let Some(current) = state.get(&self.name) else {
+            return Err(AppError::NotFound(format!("rig {:?}", self.name)));
+        };
+        if current.semantic_tags == tags {
+            return Err(AppError::Validation(format!(
+                "semantic tags already {tags:?}"
+            )));
+        }
+        Ok(())
+    }
+
+    fn execute(&self, state: &mut Self::State) -> Result<Self::Output, AppError> {
+        self.validate(state)?;
+        // `validate` proved the rig exists; unwrap is safe.
+        let old = state.get(&self.name).expect("rig present").semantic_tags.clone();
+        let new = self.normalized();
+        state.apply_tags_change(&self.name, new.clone());
+        Ok(RigEvent::TagsChanged {
+            rig: self.name.clone(),
+            old,
+            new,
+            now_secs: self.now_secs,
+        })
+    }
+}
+
+/// Set (or clear) the soft VCS-connection ref a rig clones/pushes with — the `git_connection_ref`
+/// pointing at a `public.vcs_connections.id` (gtcore-103958). This is the only way to (re)bind a
+/// connection on an EXISTING rig: `add`/`adopt` reject an already-registered name, so before this
+/// command the only path was a direct SQL `UPDATE`. The matching JIT installation-token mint is a
+/// runtime/deploy-edge concern (gt-vcs); this command records the binding only.
+///
+/// `git_connection_ref` is a SOFT ref (no FK to `vcs_connections`), exactly as `add`/`adopt` treat
+/// it — so a stale/typo'd id is the operator's to fix, not rejected here. `None` (or an
+/// empty/whitespace string) CLEARS the binding, back to the legacy operator-mounted token path.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct SetRigConnection {
+    pub name: String,
+    /// The connection id to bind (e.g. `gh-139659957`), or `None`/empty to clear. Normalised by
+    /// [`Self::normalized`] (trimmed; empty ⇒ `None`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub git_connection_ref: Option<String>,
+    pub now_secs: u64,
+    /// Server-injected tenant — see [`AddRig::workspace_id`].
+    #[serde(skip_deserializing, default = "default_workspace")]
+    #[schemars(skip)]
+    pub workspace_id: String,
+}
+
+impl SetRigConnection {
+    /// The normalised binding this command applies: trimmed, with an empty string mapped to
+    /// `None` (clear) so `""` and an omitted field mean the same thing.
+    fn normalized(&self) -> Option<String> {
+        self.git_connection_ref
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+    }
+}
+
+impl Command for SetRigConnection {
+    type Output = RigEvent;
+    type State = RigCatalog;
+
+    fn validate(&self, state: &Self::State) -> Result<(), AppError> {
+        if self.name.is_empty() {
+            return Err(AppError::Validation("rig name is empty".into()));
+        }
+        let Some(current) = state.get(&self.name) else {
+            return Err(AppError::NotFound(format!("rig {:?}", self.name)));
+        };
+        if current.git_connection_ref == self.normalized() {
+            return Err(AppError::Validation(match self.normalized() {
+                Some(r) => format!("git_connection_ref already {r:?}"),
+                None => "git_connection_ref already unset".into(),
+            }));
+        }
+        Ok(())
+    }
+
+    fn execute(&self, state: &mut Self::State) -> Result<Self::Output, AppError> {
+        self.validate(state)?;
+        // `validate` proved the rig exists; unwrap is safe.
+        let old = state
+            .get(&self.name)
+            .expect("rig present")
+            .git_connection_ref
+            .clone();
+        let new = self.normalized();
+        state.apply_connection_change(&self.name, new.clone());
+        Ok(RigEvent::ConnectionChanged {
+            rig: self.name.clone(),
+            old,
+            new,
+            now_secs: self.now_secs,
+        })
+    }
+}
+
+/// Put a rig on dispatch hold (rig-hold H1, epic gtcore-4b7d56). The rig-level sibling of a bead's
+/// `dispatch=manual`: it pauses the dispatch + agent-lifecycle plane so an operator can intervene
+/// without colliding with the orchestrator (the scheduler/watchdogs honouring it is H2/H3).
+///
+/// **Idempotent by contract.** Unlike [`SetRigPrefix`] / [`SetRigTags`], holding an already-held
+/// rig is NOT a validation error — it is a successful no-op. [`Self::validate`] only requires the
+/// rig to exist; the "already in the target mode ⇒ emit nothing" gate lives in the dispatch
+/// handler (it reads the current mode before executing), so the log never carries a duplicate
+/// `rig.held.v1`. [`Self::execute`] assumes a real transition and always returns the event.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct HoldRig {
+    pub name: String,
+    /// Operator's note for the audit trail (carried by `rig.held.v1`). Optional; defaults to empty.
+    #[serde(default)]
+    pub reason: String,
+    pub now_secs: u64,
+    /// Server-injected tenant — see [`AddRig::workspace_id`].
+    #[serde(skip_deserializing, default = "default_workspace")]
+    #[schemars(skip)]
+    pub workspace_id: String,
+}
+
+impl Command for HoldRig {
+    type Output = RigEvent;
+    type State = RigCatalog;
+
+    fn validate(&self, state: &Self::State) -> Result<(), AppError> {
+        if self.name.is_empty() {
+            return Err(AppError::Validation("rig name is empty".into()));
+        }
+        if !state.contains(&self.name) {
+            return Err(AppError::NotFound(format!("rig {:?}", self.name)));
+        }
+        Ok(())
+    }
+
+    fn execute(&self, state: &mut Self::State) -> Result<Self::Output, AppError> {
+        self.validate(state)?;
+        state.apply_dispatch_mode_change(&self.name, DispatchMode::Hold);
+        Ok(RigEvent::Held {
+            rig: self.name.clone(),
+            reason: self.reason.clone(),
+            now_secs: self.now_secs,
+        })
+    }
+}
+
+/// Take a rig off dispatch hold (rig-hold H1). The inverse of [`HoldRig`]; same idempotency
+/// contract — resuming an already-`auto` rig is a successful no-op, not an error.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct ResumeRig {
+    pub name: String,
+    pub now_secs: u64,
+    /// Server-injected tenant — see [`AddRig::workspace_id`].
+    #[serde(skip_deserializing, default = "default_workspace")]
+    #[schemars(skip)]
+    pub workspace_id: String,
+}
+
+impl Command for ResumeRig {
+    type Output = RigEvent;
+    type State = RigCatalog;
+
+    fn validate(&self, state: &Self::State) -> Result<(), AppError> {
+        if self.name.is_empty() {
+            return Err(AppError::Validation("rig name is empty".into()));
+        }
+        if !state.contains(&self.name) {
+            return Err(AppError::NotFound(format!("rig {:?}", self.name)));
+        }
+        Ok(())
+    }
+
+    fn execute(&self, state: &mut Self::State) -> Result<Self::Output, AppError> {
+        self.validate(state)?;
+        state.apply_dispatch_mode_change(&self.name, DispatchMode::Auto);
+        Ok(RigEvent::Resumed {
+            rig: self.name.clone(),
+            now_secs: self.now_secs,
+        })
+    }
+}
+
 /// Sum type so the actor routes any rig command through a single message variant.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(tag = "kind", rename_all = "snake_case")]
@@ -404,6 +627,10 @@ pub enum RigCommand {
     SetPrefix(SetRigPrefix),
     SetDefaultBranch(SetRigDefaultBranch),
     SetWorktreeRoot(SetRigWorktreeRoot),
+    SetTags(SetRigTags),
+    SetConnection(SetRigConnection),
+    Hold(HoldRig),
+    Resume(ResumeRig),
 }
 
 impl RigCommand {
@@ -416,6 +643,10 @@ impl RigCommand {
             Self::SetPrefix(_) => "rig.set-prefix",
             Self::SetDefaultBranch(_) => "rig.set-default-branch",
             Self::SetWorktreeRoot(_) => "rig.set-worktree-root",
+            Self::SetTags(_) => "rig.set-tags",
+            Self::SetConnection(_) => "rig.set-connection",
+            Self::Hold(_) => "rig.hold",
+            Self::Resume(_) => "rig.resume",
         }
     }
 
@@ -429,6 +660,10 @@ impl RigCommand {
             Self::SetPrefix(c) => &c.workspace_id,
             Self::SetDefaultBranch(c) => &c.workspace_id,
             Self::SetWorktreeRoot(c) => &c.workspace_id,
+            Self::SetTags(c) => &c.workspace_id,
+            Self::SetConnection(c) => &c.workspace_id,
+            Self::Hold(c) => &c.workspace_id,
+            Self::Resume(c) => &c.workspace_id,
         }
     }
 
@@ -445,6 +680,10 @@ impl RigCommand {
             Self::SetPrefix(c) => c.workspace_id = ws,
             Self::SetDefaultBranch(c) => c.workspace_id = ws,
             Self::SetWorktreeRoot(c) => c.workspace_id = ws,
+            Self::SetTags(c) => c.workspace_id = ws,
+            Self::SetConnection(c) => c.workspace_id = ws,
+            Self::Hold(c) => c.workspace_id = ws,
+            Self::Resume(c) => c.workspace_id = ws,
         }
         self
     }
@@ -462,6 +701,10 @@ impl Command for RigCommand {
             Self::SetPrefix(c) => c.validate(state),
             Self::SetDefaultBranch(c) => c.validate(state),
             Self::SetWorktreeRoot(c) => c.validate(state),
+            Self::SetTags(c) => c.validate(state),
+            Self::SetConnection(c) => c.validate(state),
+            Self::Hold(c) => c.validate(state),
+            Self::Resume(c) => c.validate(state),
         }
     }
 
@@ -473,6 +716,10 @@ impl Command for RigCommand {
             Self::SetPrefix(c) => c.execute(state),
             Self::SetDefaultBranch(c) => c.execute(state),
             Self::SetWorktreeRoot(c) => c.execute(state),
+            Self::SetTags(c) => c.execute(state),
+            Self::SetConnection(c) => c.execute(state),
+            Self::Hold(c) => c.execute(state),
+            Self::Resume(c) => c.execute(state),
         }
     }
 }
@@ -685,6 +932,197 @@ mod tests {
             ok.validate(&catalog),
             Err(AppError::Validation(_))
         ));
+    }
+
+    #[test]
+    fn set_connection_binds_clears_round_trips_and_rejects_noop() {
+        let mut catalog = RigCatalog::default();
+        add_cmd("plane", "pl", 1).execute(&mut catalog).unwrap();
+        assert_eq!(catalog.get("plane").unwrap().git_connection_ref, None);
+
+        let conn = |name: &str, ref_: Option<&str>, now: u64| SetRigConnection {
+            name: name.into(),
+            git_connection_ref: ref_.map(str::to_string),
+            now_secs: now,
+            workspace_id: "default".into(),
+        };
+
+        // Unknown rig is a NotFound.
+        assert!(matches!(
+            conn("ghost", Some("gh-1"), 2).validate(&catalog),
+            Err(AppError::NotFound(_))
+        ));
+
+        // Clearing an already-unbound rig is a no-op rejection (None and "" are equivalent).
+        assert!(matches!(
+            conn("plane", None, 2).validate(&catalog),
+            Err(AppError::Validation(_))
+        ));
+        assert!(matches!(
+            conn("plane", Some("  "), 2).validate(&catalog),
+            Err(AppError::Validation(_))
+        ));
+
+        // Bind: emits ConnectionChanged and the entry carries the ref (trimmed).
+        let ev = conn("plane", Some(" gh-139659957 "), 3)
+            .execute(&mut catalog)
+            .unwrap();
+        match ev {
+            RigEvent::ConnectionChanged { old, ref new, .. } => {
+                assert_eq!(old, None);
+                assert_eq!(new.as_deref(), Some("gh-139659957"));
+            }
+            _ => panic!("expected ConnectionChanged"),
+        }
+        assert_eq!(
+            catalog.get("plane").unwrap().git_connection_ref.as_deref(),
+            Some("gh-139659957")
+        );
+
+        // Re-binding the same ref is a no-op rejection.
+        assert!(matches!(
+            conn("plane", Some("gh-139659957"), 4).validate(&catalog),
+            Err(AppError::Validation(_))
+        ));
+
+        // Clear: maps back to None and round-trips.
+        let ev = conn("plane", None, 5).execute(&mut catalog).unwrap();
+        match ev {
+            RigEvent::ConnectionChanged { old, new, .. } => {
+                assert_eq!(old.as_deref(), Some("gh-139659957"));
+                assert_eq!(new, None);
+            }
+            _ => panic!("expected ConnectionChanged"),
+        }
+        assert_eq!(catalog.get("plane").unwrap().git_connection_ref, None);
+    }
+
+    #[test]
+    fn set_tags_normalizes_round_trips_and_rejects_noop() {
+        let mut catalog = RigCatalog::default();
+        add_cmd("plane", "pl", 1).execute(&mut catalog).unwrap();
+
+        // Unknown rig is a NotFound.
+        let missing = SetRigTags {
+            name: "ghost".into(),
+            tags: vec!["rust".into()],
+            now_secs: 2,
+            workspace_id: "default".into(),
+        };
+        assert!(matches!(missing.validate(&catalog), Err(AppError::NotFound(_))));
+
+        // Invalid tag grammar is a Validation fault.
+        let bad = SetRigTags {
+            name: "plane".into(),
+            tags: vec!["has space".into()],
+            now_secs: 3,
+            workspace_id: "default".into(),
+        };
+        assert!(matches!(bad.validate(&catalog), Err(AppError::Validation(_))));
+
+        // Mixed-case + dupes + whitespace normalise before landing.
+        let ok = SetRigTags {
+            name: "plane".into(),
+            tags: vec![" Rust ".into(), "infra".into(), "RUST".into()],
+            now_secs: 4,
+            workspace_id: "default".into(),
+        };
+        let ev = ok.execute(&mut catalog).unwrap();
+        match ev {
+            RigEvent::TagsChanged { old, new, .. } => {
+                assert!(old.is_empty());
+                assert_eq!(new, vec!["rust".to_string(), "infra".to_string()]);
+            }
+            _ => panic!("expected TagsChanged"),
+        }
+        assert_eq!(
+            catalog.get("plane").unwrap().semantic_tags,
+            vec!["rust".to_string(), "infra".to_string()]
+        );
+
+        // Re-applying the same (normalised) set is a no-op rejection.
+        assert!(matches!(ok.validate(&catalog), Err(AppError::Validation(_))));
+
+        // Clearing back to empty is a valid transition.
+        let clear = SetRigTags {
+            name: "plane".into(),
+            tags: vec![],
+            now_secs: 5,
+            workspace_id: "default".into(),
+        };
+        clear.execute(&mut catalog).unwrap();
+        assert!(catalog.get("plane").unwrap().semantic_tags.is_empty());
+    }
+
+    #[test]
+    fn hold_and_resume_transition_and_reject_unknown_rig() {
+        let mut catalog = RigCatalog::default();
+        add_cmd("plane", "pl", 1).execute(&mut catalog).unwrap();
+        assert_eq!(catalog.get("plane").unwrap().dispatch_mode, DispatchMode::Auto);
+
+        // Unknown rig is a NotFound for both.
+        let ghost_hold = HoldRig {
+            name: "ghost".into(),
+            reason: "x".into(),
+            now_secs: 2,
+            workspace_id: "default".into(),
+        };
+        assert!(matches!(ghost_hold.validate(&catalog), Err(AppError::NotFound(_))));
+        let ghost_resume = ResumeRig {
+            name: "ghost".into(),
+            now_secs: 2,
+            workspace_id: "default".into(),
+        };
+        assert!(matches!(ghost_resume.validate(&catalog), Err(AppError::NotFound(_))));
+
+        // Hold flips to Hold and carries the reason in the event.
+        let hold = HoldRig {
+            name: "plane".into(),
+            reason: "operator intervention".into(),
+            now_secs: 3,
+            workspace_id: "default".into(),
+        };
+        match hold.execute(&mut catalog).unwrap() {
+            RigEvent::Held { rig, reason, .. } => {
+                assert_eq!(rig, "plane");
+                assert_eq!(reason, "operator intervention");
+            }
+            _ => panic!("expected Held"),
+        }
+        assert_eq!(catalog.get("plane").unwrap().dispatch_mode, DispatchMode::Hold);
+
+        // Holding again is NOT a validation error (idempotent contract — the no-event gate is in
+        // the handler, not here).
+        assert!(hold.validate(&catalog).is_ok(), "re-hold is not an error");
+
+        // Resume flips back to Auto.
+        let resume = ResumeRig {
+            name: "plane".into(),
+            now_secs: 4,
+            workspace_id: "default".into(),
+        };
+        assert!(matches!(resume.execute(&mut catalog).unwrap(), RigEvent::Resumed { .. }));
+        assert_eq!(catalog.get("plane").unwrap().dispatch_mode, DispatchMode::Auto);
+        assert!(resume.validate(&catalog).is_ok(), "re-resume is not an error");
+    }
+
+    #[test]
+    fn hold_tool_names_route_through_sum_type() {
+        let hold = RigCommand::Hold(HoldRig {
+            name: "plane".into(),
+            reason: String::new(),
+            now_secs: 1,
+            workspace_id: "default".into(),
+        });
+        assert_eq!(hold.tool_name(), "rig.hold");
+        let resume = RigCommand::Resume(ResumeRig {
+            name: "plane".into(),
+            now_secs: 1,
+            workspace_id: "default".into(),
+        });
+        assert_eq!(resume.tool_name(), "rig.resume");
+        // workspace_id stamping works through the sum type.
+        assert_eq!(hold.in_workspace("acme").workspace_id(), "acme");
     }
 
     #[test]

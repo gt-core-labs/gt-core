@@ -397,12 +397,11 @@ fn subscriber_json(s: &gt_store_pg::ReportSubscriber) -> serde_json::Value {
 }
 
 /// The workspace whose GLOBAL subscriber list the legacy endpoints manage:
-/// the first schedule's, else `default`.
-async fn report_workspace(st: &SystemApiState) -> String {
-    st.config
-        .read()
+/// the first schedule's, else `default`. Reads the DB-backed schedule store
+/// (gtcore-915232), not the legacy in-memory config.
+async fn report_workspace(svc: &crate::report_scheduler::ReportService) -> String {
+    svc.list_schedules(None)
         .await
-        .report_schedules
         .first()
         .map(|s| s.workspace.clone())
         .unwrap_or_else(|| "default".to_string())
@@ -415,7 +414,14 @@ async fn list_report_schedules(
     if let Err(resp) = authorize(&st, &headers, READ_SCOPE, &Method::GET) {
         return resp;
     }
-    let schedules = st.config.read().await.report_schedules.clone();
+    let svc = match report_service(&st) {
+        Ok(svc) => svc,
+        Err(resp) => return resp,
+    };
+    // The System REST surface is the cross-tenant operator admin: unscoped
+    // (`None`) lists every workspace's schedules straight from the DB-backed
+    // store (gtcore-915232), not the legacy in-memory config.
+    let schedules = svc.list_schedules(None).await;
     (StatusCode::OK, Json(serde_json::json!({ "schedules": schedules }))).into_response()
 }
 
@@ -431,7 +437,9 @@ async fn create_report_schedule(
         Ok(svc) => svc,
         Err(resp) => return resp,
     };
-    match svc.create_schedule(patch).await {
+    // The System REST surface is the cross-tenant operator admin (authorized by
+    // scope claims, not workspace-bound), so it runs unscoped (`None`).
+    match svc.create_schedule(None, patch).await {
         Ok(s) => (StatusCode::OK, Json(s)).into_response(),
         Err(e) => (StatusCode::BAD_REQUEST, e).into_response(),
     }
@@ -450,7 +458,7 @@ async fn update_report_schedule(
         Ok(svc) => svc,
         Err(resp) => return resp,
     };
-    match svc.update_schedule(&id, patch).await {
+    match svc.update_schedule(None, &id, patch).await {
         Ok(s) => (StatusCode::OK, Json(s)).into_response(),
         Err(e) if e.starts_with("unknown schedule") => {
             (StatusCode::NOT_FOUND, e).into_response()
@@ -471,7 +479,7 @@ async fn delete_report_schedule(
         Ok(svc) => svc,
         Err(resp) => return resp,
     };
-    match svc.delete_schedule(&id).await {
+    match svc.delete_schedule(None, &id).await {
         Ok(()) => (StatusCode::OK, Json(serde_json::json!({ "ok": true }))).into_response(),
         Err(e) => (StatusCode::NOT_FOUND, e).into_response(),
     }
@@ -490,7 +498,7 @@ async fn run_report_schedule(
         Ok(svc) => svc,
         Err(resp) => return resp,
     };
-    let schedule = match svc.resolve_schedule(Some(&id)).await {
+    let schedule = match svc.resolve_schedule(None, Some(&id)).await {
         Ok(s) => s,
         Err(e) => return (StatusCode::NOT_FOUND, e).into_response(),
     };
@@ -609,7 +617,7 @@ async fn list_report_subscribers(
         Ok(svc) => svc,
         Err(resp) => return resp,
     };
-    let workspace = report_workspace(&st).await;
+    let workspace = report_workspace(&svc).await;
     match svc.subscribers().list(&workspace).await {
         Ok(subs) => {
             let subs: Vec<_> = subs.iter().map(subscriber_json).collect();
@@ -640,7 +648,7 @@ async fn add_report_subscriber(
     if !email.contains('@') {
         return (StatusCode::BAD_REQUEST, "email must be an address").into_response();
     }
-    let workspace = report_workspace(&st).await;
+    let workspace = report_workspace(&svc).await;
     match svc.subscribers().add(&workspace, &email).await {
         Ok(()) => (StatusCode::OK, Json(serde_json::json!({ "ok": true }))).into_response(),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
@@ -659,7 +667,7 @@ async fn remove_report_subscriber(
         Ok(svc) => svc,
         Err(resp) => return resp,
     };
-    let workspace = report_workspace(&st).await;
+    let workspace = report_workspace(&svc).await;
     match svc.subscribers().remove(&workspace, &email).await {
         Ok(()) => (StatusCode::OK, Json(serde_json::json!({ "ok": true }))).into_response(),
         Err(gt_store_pg::ReportSubscriptionError::NotFound(e)) => {
@@ -688,7 +696,7 @@ async fn toggle_report_subscriber(
         Ok(svc) => svc,
         Err(resp) => return resp,
     };
-    let workspace = report_workspace(&st).await;
+    let workspace = report_workspace(&svc).await;
     match svc.subscribers().set_enabled(&workspace, &email, body.enabled).await {
         Ok(()) => (StatusCode::OK, Json(serde_json::json!({ "ok": true }))).into_response(),
         Err(gt_store_pg::ReportSubscriptionError::NotFound(e)) => {

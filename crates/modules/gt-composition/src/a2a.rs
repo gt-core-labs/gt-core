@@ -72,16 +72,18 @@
 //! verifies the platform's bearer tokens (shape decision documented on
 //! [`sign_card`]).
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
-use axum::extract::Request;
+use axum::extract::{Path, Request, State};
 use axum::http::StatusCode;
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
-use axum::Router;
+use axum::routing::get;
+use axum::{Json, Router};
 use time::format_description::well_known::Rfc3339;
 use time::OffsetDateTime;
 
@@ -125,6 +127,28 @@ pub trait BeadIntake: Send + Sync {
 /// Port: enqueue the bead for the scheduler.
 pub trait DispatchSink: Send + Sync {
     fn dispatch(&self, bead: &str, priority: u8) -> Result<(), String>;
+}
+
+/// Port: read and resolve the human escalations a session is blocked on (A6, gtcore-46c9dc).
+///
+/// Wiring this into the gateway turns the bare `tasks/*` projection into the bidirectional
+/// escalation flow the spec calls for:
+///
+/// - `tasks/get` projects [`TaskState::InputRequired`] while a session is `pending` an
+///   escalation — the "Session Waiting" the operator sees on the dashboard.
+/// - `tasks/send` carrying the **same task id** as a blocked task is the operator's multi-turn
+///   reply: the gateway resolves the escalation and re-activates the SAME bead, never minting a
+///   new one (the A2A multi-turn pattern, not a fresh task).
+///
+/// Optional on the gateway: an unwired gateway behaves exactly as before (no `input-required`,
+/// every `tasks/send` mints a bead), so existing deploys are unaffected.
+#[async_trait]
+pub trait EscalationView: Send + Sync {
+    /// The id of the pending escalation a session is waiting on, or `None`.
+    async fn pending_for_session(&self, session: &str) -> Result<Option<String>, String>;
+    /// Record the operator's reply, resolving the pending escalation. Re-dispatch (re-activation)
+    /// of an `approved` reply is the gateway's job — this only closes the lifecycle.
+    async fn resolve(&self, id: &str, response: &str, approved: bool) -> Result<(), String>;
 }
 
 /// What `tasks/get`/`tasks/cancel` need to know about a bead: its tracker
@@ -197,6 +221,9 @@ pub struct A2aGateway {
     sessions: Arc<dyn SessionControl>,
     feed: Arc<dyn EventFeed>,
     config: A2aGatewayConfig,
+    /// Optional human-escalation view (A6): `None` ⇒ no `input-required` projection and every
+    /// `tasks/send` mints a bead (pre-A6 behaviour). `Some` ⇒ the bidirectional flow.
+    escalations: Option<Arc<dyn EscalationView>>,
 }
 
 impl A2aGateway {
@@ -208,7 +235,23 @@ impl A2aGateway {
         feed: Arc<dyn EventFeed>,
         config: A2aGatewayConfig,
     ) -> Self {
-        Self { intake, sink, store, sessions, feed, config }
+        Self {
+            intake,
+            sink,
+            store,
+            sessions,
+            feed,
+            config,
+            escalations: None,
+        }
+    }
+
+    /// Wire the human-escalation view (A6, gtcore-46c9dc): `tasks/get` projects `input-required`
+    /// while a session is blocked, and a `tasks/send` on a blocked task id becomes the operator's
+    /// reply that re-activates the bead instead of minting a new one.
+    pub fn with_escalations(mut self, escalations: Arc<dyn EscalationView>) -> Self {
+        self.escalations = Some(escalations);
+        self
     }
 
     /// Bead + session facts for `id`, or `-32001` when the bead does not exist.
@@ -258,6 +301,52 @@ impl A2aHandler for A2aGateway {
                 "message must carry at least one non-empty text part",
             ))
         })?;
+
+        // A6 multi-turn re-activation: a `tasks/send` carrying the SAME id as a task that is
+        // blocked (`input-required`) on a human escalation is the operator's reply, not a new
+        // task. Resolve the escalation and — on approval — re-dispatch the SAME bead, so the
+        // session re-activates without minting a fresh bead. `metadata.approved=false` records a
+        // rejection (the agent stays stopped); the default is to unblock.
+        if let Some(esc) = &self.escalations {
+            if let Ok(Some(snap)) = self.store.fetch(&params.id).await {
+                let session = session_of(&snap.rig, &params.id);
+                if let Ok(Some(esc_id)) = esc.pending_for_session(&session).await {
+                    let approved = params
+                        .metadata
+                        .as_ref()
+                        .and_then(|m| m.get("approved"))
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(true);
+                    esc.resolve(&esc_id, text, approved).await.map_err(|e| {
+                        A2aError::from(JsonRpcError::internal(format!("escalation resolve: {e}")))
+                    })?;
+                    // Re-sling the bead so a fresh polecat picks up with the operator's answer.
+                    if approved {
+                        self.sink.dispatch(&params.id, 1).map_err(|e| {
+                            A2aError::from(JsonRpcError::internal(format!("re-dispatch: {e}")))
+                        })?;
+                    }
+                    return Ok(Task {
+                        id: params.id.clone(),
+                        session_id: params.session_id.clone(),
+                        status: TaskStatus {
+                            // Approved ⇒ working again; rejected ⇒ the agent stays blocked.
+                            state: if approved {
+                                TaskState::Working
+                            } else {
+                                TaskState::InputRequired
+                            },
+                            timestamp: rfc3339_now(),
+                            message: None,
+                        },
+                        artifacts: vec![],
+                        history: vec![],
+                        metadata: None,
+                    });
+                }
+            }
+        }
+
         let (title, description) = split_title(text);
         let meta = |key: &str| {
             params
@@ -306,11 +395,22 @@ impl A2aHandler for A2aGateway {
 
     async fn get(&self, params: TaskIdParams) -> Result<Task, A2aError> {
         let (bead, session) = self.snapshot(&params.id).await?;
+        let mut state = project_state(&bead.status, session.as_deref());
+        // A6: a non-terminal task whose session is `pending` a human escalation is
+        // `input-required` — the "Session Waiting on operator input" the dashboard surfaces.
+        if !state.is_terminal() {
+            if let Some(esc) = &self.escalations {
+                let name = session_of(&bead.rig, &params.id);
+                if matches!(esc.pending_for_session(&name).await, Ok(Some(_))) {
+                    state = TaskState::InputRequired;
+                }
+            }
+        }
         Ok(Task {
             id: params.id,
             session_id: None,
             status: TaskStatus {
-                state: project_state(&bead.status, session.as_deref()),
+                state,
                 timestamp: rfc3339_now(),
                 message: None,
             },
@@ -522,7 +622,11 @@ impl BeadIntake for DoltIntake {
             parent_id: Some(req.parent_id),
             assignee: None,
             owner: None,
-            domain: self.domain.clone(),
+            // H2 (gtcore-d81e77): the wire `domain` is now free strings validated
+            // at runtime against the workspace catalog; map the typed config enum
+            // to its dotted key. `meta.gap` (the gateway default) is reserved in
+            // every catalog, so A2A-minted gap beads keep validating.
+            domain: self.domain.iter().map(|d| d.as_str().to_string()).collect(),
             surface: Vec::new(),
             depends_on: Vec::new(),
             role_scope: None,
@@ -674,6 +778,60 @@ impl EventFeed for LogEventFeed {
     }
 }
 
+/// [`EscalationView`] over the per-workspace event log — replays the same `escalation.*` stream
+/// `mcp/escalate.rs` writes, so the A2A gateway and the `escalate.*` MCP tools share one
+/// event-sourced source of truth (A6, gtcore-46c9dc).
+pub struct EventLogEscalations {
+    log: Arc<crate::mcp::EventLog>,
+    workspace: Option<String>,
+}
+
+impl EventLogEscalations {
+    pub fn new(log: Arc<crate::mcp::EventLog>, workspace: Option<String>) -> Self {
+        Self { log, workspace }
+    }
+
+    fn registry(&self) -> Result<crate::mcp::escalate::EscalationRegistry, String> {
+        self.log
+            .replay_domain(
+                self.workspace.as_deref(),
+                crate::mcp::escalate::NS,
+                crate::mcp::escalate::EscalationRegistry::default(),
+                crate::mcp::escalate::EscalationRegistry::apply,
+            )
+            .map_err(|e| e.to_string())
+    }
+}
+
+#[async_trait]
+impl EscalationView for EventLogEscalations {
+    async fn pending_for_session(&self, session: &str) -> Result<Option<String>, String> {
+        Ok(self
+            .registry()?
+            .pending_for_session(session)
+            .map(|e| e.id.clone()))
+    }
+
+    async fn resolve(&self, id: &str, response: &str, approved: bool) -> Result<(), String> {
+        // Guard against re-resolving (an operator double-submit, or a race with escalate.respond).
+        match self.registry()?.get(id) {
+            Some(e) if e.state == crate::mcp::escalate::EscalationState::Pending => {}
+            Some(_) => return Err(format!("escalation {id} already resolved")),
+            None => return Err(format!("escalation {id} not found")),
+        }
+        self.log
+            .append(
+                self.workspace.as_deref(),
+                crate::mcp::escalate::EscalationEvent::Resolved {
+                    id: id.to_string(),
+                    response: response.to_string(),
+                    approved,
+                },
+            )
+            .map_err(|e| e.to_string())
+    }
+}
+
 impl DispatchSink for ChannelDispatch {
     fn dispatch(&self, bead: &str, priority: u8) -> Result<(), String> {
         use std::sync::atomic::{AtomicU64, Ordering};
@@ -762,9 +920,64 @@ pub fn agent_card(public_url: &str, rigs: &[RigEntry]) -> AgentCard {
                         r.name, r.git_url, r.default_branch
                     )
                 }),
-                tags: vec![r.prefix.clone()],
+                tags: skill_tags(r),
             })
             .collect(),
+        signature: None,
+    }
+}
+
+/// Discovery tags for a rig's Agent Card skill (B3, gtcore-1caa48): the bead prefix first
+/// (always discoverable by prefix, as before), then the rig's semantic capability tags. The
+/// prefix is dropped from the tail if a semantic tag already equals it, so the list carries no
+/// duplicate. A rig with no semantic tags yields `[prefix]` — byte-for-byte the pre-B3 shape.
+pub(crate) fn skill_tags(rig: &RigEntry) -> Vec<String> {
+    let mut tags = vec![rig.prefix.clone()];
+    for tag in &rig.semantic_tags {
+        if tag != &rig.prefix {
+            tags.push(tag.clone());
+        }
+    }
+    tags
+}
+
+/// Per-rig discovery card (A2, gtcore-4023de): one [`AgentCard`] scoped to
+/// a single rig, served at `GET /.well-known/agent/<rig>.json`.
+///
+/// The `name` is `gt-<rig>` to distinguish it from the platform-level card.
+/// The `url` still points to `<public_url>/a2a` — tasks/send to a per-rig
+/// card routes through the same intake; the rig discriminator is task metadata.
+pub fn rig_agent_card(public_url: &str, rig: &RigEntry) -> AgentCard {
+    AgentCard {
+        name: format!("gt-{}", rig.name),
+        description: Some(format!(
+            "gt autonomous agent for rig `{}` — tasks are dispatched directly onto this rig",
+            rig.name
+        )),
+        url: format!("{}/a2a", public_url.trim_end_matches('/')),
+        version: env!("CARGO_PKG_VERSION").into(),
+        provider: Some(AgentProvider { organization: "gt-core-labs".into(), url: None }),
+        capabilities: AgentCapabilities {
+            streaming: true,
+            push_notifications: false,
+            state_transition_history: false,
+        },
+        authentication: Some(AgentAuthentication { schemes: vec!["bearer".into()] }),
+        default_input_modes: vec!["text".into()],
+        default_output_modes: vec!["text".into()],
+        skills: vec![AgentSkill {
+            id: rig.name.clone(),
+            name: rig.name.clone(),
+            description: Some(if rig.git_url.is_empty() {
+                format!("dispatch work onto rig `{}`", rig.name)
+            } else {
+                format!(
+                    "dispatch work onto rig `{}` ({}; default branch {})",
+                    rig.name, rig.git_url, rig.default_branch
+                )
+            }),
+            tags: skill_tags(rig),
+        }],
         signature: None,
     }
 }
@@ -788,17 +1001,43 @@ pub fn sign_card(card: AgentCard, minter: &JwtMinter) -> Result<AgentCard, AuthE
     Ok(card)
 }
 
+/// Handler for `GET /.well-known/agent/:rig` — per-rig discovery (A2, gtcore-4023de).
+/// Accepts both `/agent/gtcore` and `/agent/gtcore.json` (strips `.json` suffix).
+async fn rig_card_handler(
+    Path(rig): Path<String>,
+    State(cards): State<Arc<HashMap<String, AgentCard>>>,
+) -> Response {
+    let name = rig.trim_end_matches(".json");
+    match cards.get(name) {
+        Some(card) => Json(card).into_response(),
+        None => StatusCode::NOT_FOUND.into_response(),
+    }
+}
+
 /// The served A2A surface: public discovery + guarded RPC.
 ///
 /// `GET /.well-known/agent.json` is mounted bare — per spec the discovery
-/// document is public. `POST /a2a` is wrapped in [`authenticate`] over the
-/// SAME [`AuthState`] (RS256 verifier + PAT port) the rest of the deploy
-/// authenticates with, plus [`require_claims`] so an anonymous request — which
-/// `authenticate` deliberately passes through for public routes — is a `401`
-/// here.
-pub fn a2a_app(card: AgentCard, handler: Arc<dyn A2aHandler>, auth: AuthState) -> Router {
+/// document is public. `GET /.well-known/agent/:rig` serves per-rig cards
+/// (A2, gtcore-4023de); also public. `POST /a2a` is wrapped in [`authenticate`]
+/// over the SAME [`AuthState`] (RS256 verifier + PAT port) the rest of the
+/// deploy authenticates with, plus [`require_claims`] so an anonymous request —
+/// which `authenticate` deliberately passes through for public routes — is a
+/// `401` here.
+///
+/// `rig_cards` is a pre-built, pre-signed map from rig name → per-rig card.
+/// An empty map simply serves no per-rig routes (the global card still works).
+pub fn a2a_app(
+    card: AgentCard,
+    handler: Arc<dyn A2aHandler>,
+    auth: AuthState,
+    rig_cards: HashMap<String, AgentCard>,
+) -> Router {
     let (discovery, rpc) = gt_a2a::a2a_split_router(card, handler);
-    discovery.merge(
+    // Per-rig discovery routes (A2, gtcore-4023de).
+    let rig_discovery = Router::new()
+        .route("/.well-known/agent/:rig", get(rig_card_handler))
+        .with_state(Arc::new(rig_cards));
+    discovery.merge(rig_discovery).merge(
         rpc
             // Innermost-first: `authenticate` (outermost) resolves the bearer —
             // PAT or JWT — into claims; `require_claims` then rejects requests
@@ -826,6 +1065,21 @@ mod tests {
     use super::*;
     use gt_a2a::{Message, Role};
     use std::sync::Mutex;
+
+    #[test]
+    fn skill_tags_prefixes_then_semantic_deduped() {
+        // No semantic tags → byte-for-byte the pre-B3 shape: just the prefix.
+        let plain = RigEntry::new("gtcore", "gt", "https://x/y", "main", 0);
+        assert_eq!(skill_tags(&plain), vec!["gt".to_string()]);
+
+        // Prefix first, then semantic tags; a semantic tag equal to the prefix is not repeated.
+        let mut tagged = RigEntry::new("gtcore", "gt", "https://x/y", "main", 0);
+        tagged.semantic_tags = vec!["rust".into(), "gt".into(), "infra".into()];
+        assert_eq!(
+            skill_tags(&tagged),
+            vec!["gt".to_string(), "rust".to_string(), "infra".to_string()]
+        );
+    }
 
     struct FakeIntake {
         seen: Mutex<Vec<IntakeRequest>>,
@@ -901,6 +1155,33 @@ mod tests {
         }
         async fn kill(&self, session: &str, reason: &str) -> Result<(), String> {
             self.killed.lock().unwrap().push((session.into(), reason.into()));
+            Ok(())
+        }
+    }
+
+    /// Escalation fake (A6): a session is `pending` an escalation iff `pending` matches; `resolve`
+    /// records the operator reply so a test can assert the lifecycle closed.
+    #[derive(Default)]
+    struct FakeEscalations {
+        /// `Some((session, esc_id))` ⇒ that session is blocked on that escalation.
+        pending: Option<(String, String)>,
+        resolved: Mutex<Vec<(String, String, bool)>>,
+    }
+
+    #[async_trait]
+    impl EscalationView for FakeEscalations {
+        async fn pending_for_session(&self, session: &str) -> Result<Option<String>, String> {
+            Ok(self
+                .pending
+                .as_ref()
+                .filter(|(s, _)| s == session)
+                .map(|(_, id)| id.clone()))
+        }
+        async fn resolve(&self, id: &str, response: &str, approved: bool) -> Result<(), String> {
+            self.resolved
+                .lock()
+                .unwrap()
+                .push((id.into(), response.into(), approved));
             Ok(())
         }
     }
@@ -1118,6 +1399,156 @@ mod tests {
         assert_eq!(gw.cancel(id_params("gtcore-nope")).await.unwrap_err().0.code, -32001);
     }
 
+    // ── A6: input-required projection + multi-turn re-activation ──────────────
+
+    /// A non-terminal task whose session is blocked on a human escalation projects
+    /// `input-required` — the "Session Waiting on operator input" the dashboard shows.
+    #[tokio::test]
+    async fn get_projects_input_required_while_escalation_pending() {
+        let store = Arc::new(FakeStore {
+            snapshot: Some(BeadSnapshot { status: "working".into(), rig: "gtcore".into() }),
+            terminated: Mutex::new(vec![]),
+        });
+        let esc = Arc::new(FakeEscalations {
+            // The bead's session is <rig>-<bead> = gtcore-gtcore-abc123.
+            pending: Some(("gtcore-gtcore-abc123".into(), "esc-1".into())),
+            resolved: Mutex::new(vec![]),
+        });
+        let gw = A2aGateway::new(
+            Arc::new(FakeIntake { seen: Mutex::new(vec![]), fail: false }),
+            Arc::new(FakeSink(Mutex::new(vec![]))),
+            store,
+            Arc::new(FakeSessions { state: Some("working".into()), killed: Mutex::new(vec![]) }),
+            Arc::new(FakeFeed::default()),
+            config(),
+        )
+        .with_escalations(esc);
+        let task = gw.get(id_params("gtcore-abc123")).await.unwrap();
+        assert_eq!(task.status.state, TaskState::InputRequired);
+    }
+
+    /// A terminal task is never re-labelled `input-required`, even with a stray pending escalation.
+    #[tokio::test]
+    async fn get_terminal_task_ignores_pending_escalation() {
+        let store = Arc::new(FakeStore {
+            snapshot: Some(BeadSnapshot { status: "closed".into(), rig: "gtcore".into() }),
+            terminated: Mutex::new(vec![]),
+        });
+        let esc = Arc::new(FakeEscalations {
+            pending: Some(("gtcore-gtcore-abc123".into(), "esc-1".into())),
+            resolved: Mutex::new(vec![]),
+        });
+        let gw = A2aGateway::new(
+            Arc::new(FakeIntake { seen: Mutex::new(vec![]), fail: false }),
+            Arc::new(FakeSink(Mutex::new(vec![]))),
+            store,
+            Arc::new(FakeSessions::default()),
+            Arc::new(FakeFeed::default()),
+            config(),
+        )
+        .with_escalations(esc);
+        let task = gw.get(id_params("gtcore-abc123")).await.unwrap();
+        assert_eq!(task.status.state, TaskState::Completed);
+    }
+
+    /// The operator's multi-turn reply: `tasks/send` on a blocked task id resolves the escalation
+    /// and re-dispatches the SAME bead — no new bead is minted.
+    #[tokio::test]
+    async fn send_on_blocked_task_resolves_and_reactivates_without_new_bead() {
+        let intake = Arc::new(FakeIntake { seen: Mutex::new(vec![]), fail: false });
+        let sink = Arc::new(FakeSink(Mutex::new(vec![])));
+        let store = Arc::new(FakeStore {
+            snapshot: Some(BeadSnapshot { status: "working".into(), rig: "gtcore".into() }),
+            terminated: Mutex::new(vec![]),
+        });
+        let esc = Arc::new(FakeEscalations {
+            pending: Some(("gtcore-gtcore-abc123".into(), "esc-1".into())),
+            resolved: Mutex::new(vec![]),
+        });
+        let gw = A2aGateway::new(
+            intake.clone(),
+            sink.clone(),
+            store,
+            Arc::new(FakeSessions::default()),
+            Arc::new(FakeFeed::default()),
+            config(),
+        )
+        .with_escalations(esc.clone());
+
+        let mut p = send_params("go ahead, run the migration");
+        p.id = "gtcore-abc123".into(); // same task id as the blocked task
+        let task = gw.send(p).await.unwrap();
+
+        // Same bead id back, re-activated to working.
+        assert_eq!(task.id, "gtcore-abc123");
+        assert_eq!(task.status.state, TaskState::Working);
+        // No new bead minted.
+        assert!(intake.seen.lock().unwrap().is_empty(), "no new bead on a reply");
+        // Escalation resolved (approved by default) and bead re-dispatched.
+        let resolved = esc.resolved.lock().unwrap();
+        assert_eq!(resolved[0], ("esc-1".into(), "go ahead, run the migration".into(), true));
+        assert_eq!(sink.0.lock().unwrap()[0], ("gtcore-abc123".into(), 1));
+    }
+
+    /// A rejecting reply (`approved=false`) resolves the escalation but does NOT re-dispatch —
+    /// the agent stays blocked.
+    #[tokio::test]
+    async fn send_rejecting_reply_resolves_but_does_not_reactivate() {
+        let sink = Arc::new(FakeSink(Mutex::new(vec![])));
+        let store = Arc::new(FakeStore {
+            snapshot: Some(BeadSnapshot { status: "working".into(), rig: "gtcore".into() }),
+            terminated: Mutex::new(vec![]),
+        });
+        let esc = Arc::new(FakeEscalations {
+            pending: Some(("gtcore-gtcore-abc123".into(), "esc-1".into())),
+            resolved: Mutex::new(vec![]),
+        });
+        let gw = A2aGateway::new(
+            Arc::new(FakeIntake { seen: Mutex::new(vec![]), fail: false }),
+            sink.clone(),
+            store,
+            Arc::new(FakeSessions::default()),
+            Arc::new(FakeFeed::default()),
+            config(),
+        )
+        .with_escalations(esc.clone());
+
+        let mut p = send_params("no, abort that");
+        p.id = "gtcore-abc123".into();
+        p.metadata = Some(serde_json::json!({ "approved": false }));
+        let task = gw.send(p).await.unwrap();
+
+        assert_eq!(task.status.state, TaskState::InputRequired);
+        assert_eq!(esc.resolved.lock().unwrap()[0].2, false);
+        assert!(sink.0.lock().unwrap().is_empty(), "rejected reply does not re-dispatch");
+    }
+
+    /// A `tasks/send` for a task with NO pending escalation still mints a fresh bead, even with the
+    /// escalation view wired — the multi-turn branch only fires for a blocked task.
+    #[tokio::test]
+    async fn send_without_pending_escalation_mints_a_bead() {
+        let intake = Arc::new(FakeIntake { seen: Mutex::new(vec![]), fail: false });
+        let store = Arc::new(FakeStore {
+            snapshot: Some(BeadSnapshot { status: "working".into(), rig: "gtcore".into() }),
+            terminated: Mutex::new(vec![]),
+        });
+        let esc = Arc::new(FakeEscalations::default()); // nothing pending
+        let gw = A2aGateway::new(
+            intake.clone(),
+            Arc::new(FakeSink(Mutex::new(vec![]))),
+            store,
+            Arc::new(FakeSessions::default()),
+            Arc::new(FakeFeed::default()),
+            config(),
+        )
+        .with_escalations(esc);
+
+        let task = gw.send(send_params("a brand new task")).await.unwrap();
+        assert_eq!(task.id, "gtcore-abc123");
+        assert_eq!(task.status.state, TaskState::Submitted);
+        assert_eq!(intake.seen.lock().unwrap().len(), 1, "a fresh task still mints a bead");
+    }
+
     // ── tasks/sendSubscribe (B3) ─────────────────────────────────────────────
 
     /// The minted bead is FakeIntake's fixed id; FakeStore answers None, so the
@@ -1138,6 +1569,7 @@ mod tests {
                 hooks: vec![],
                 maintains_heartbeat: true,
                 tmux_socket: None,
+                spawned_by: None,
             })
             .unwrap(),
         )
@@ -1290,7 +1722,7 @@ mod tests {
             Arc::new(InMemoryAudit::new()),
         )
         .with_pat(Arc::new(OnePat));
-        a2a_app(agent_card("https://gt-dev.codecsrayo.com", &catalog()), Arc::new(gw), auth)
+        a2a_app(agent_card("https://gt-dev.codecsrayo.com", &catalog()), Arc::new(gw), auth, HashMap::new())
     }
 
     async fn post_a2a(app: Router, bearer: Option<&str>) -> (axum::http::StatusCode, serde_json::Value) {
@@ -1427,5 +1859,72 @@ mod tests {
         assert_eq!(body["bead"], "gtcore-abc123");
         assert_eq!(body["priority"], 1);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Build an app with per-rig cards populated from `catalog()`.
+    fn mounted_app_with_rig_cards() -> Router {
+        let (gw, _, _) = gateway(false);
+        let auth = AuthState::new(
+            Arc::new(InMemoryAuthenticator::new().with_token("good-jwt", test_claims("alice"))),
+            Arc::new(InMemoryAudit::new()),
+        )
+        .with_pat(Arc::new(OnePat));
+        let rig_cards: HashMap<String, AgentCard> = catalog()
+            .iter()
+            .map(|r| (r.name.clone(), rig_agent_card("https://gt-dev.codecsrayo.com", r)))
+            .collect();
+        a2a_app(agent_card("https://gt-dev.codecsrayo.com", &catalog()), Arc::new(gw), auth, rig_cards)
+    }
+
+    #[tokio::test]
+    async fn rig_card_is_served_at_well_known_agent_rig() {
+        // A2 (gtcore-4023de): GET /.well-known/agent/gtcore returns per-rig card.
+        let app = mounted_app_with_rig_cards();
+        let resp = app
+            .oneshot(
+                axum::http::Request::get("/.well-known/agent/gtcore")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), axum::http::StatusCode::OK);
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(v["name"], "gt-gtcore");
+        assert_eq!(v["skills"][0]["id"], "gtcore");
+    }
+
+    #[tokio::test]
+    async fn rig_card_is_served_with_json_suffix() {
+        // A2 (gtcore-4023de): .json suffix is stripped so both paths work.
+        let app = mounted_app_with_rig_cards();
+        let resp = app
+            .oneshot(
+                axum::http::Request::get("/.well-known/agent/gtweb.json")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), axum::http::StatusCode::OK);
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(v["name"], "gt-gtweb");
+    }
+
+    #[tokio::test]
+    async fn rig_card_unknown_rig_is_404() {
+        // A2 (gtcore-4023de): unknown rig returns 404, not panic.
+        let app = mounted_app_with_rig_cards();
+        let resp = app
+            .oneshot(
+                axum::http::Request::get("/.well-known/agent/nonexistent")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), axum::http::StatusCode::NOT_FOUND);
     }
 }

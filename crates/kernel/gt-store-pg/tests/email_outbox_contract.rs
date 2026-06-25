@@ -12,10 +12,15 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use sqlx::types::chrono::Utc;
 use chrono::Duration;
+use tokio::sync::Mutex;
 
-use gt_store_pg::{
+use gt_store_pg::{assert_ephemeral_pg_url, 
     email_migrations, EmailOutboxRepository, NewEmail, OutboxError, PgEmailOutbox,
 };
+
+// claim_due is table-wide (no workspace filter), so concurrent tests steal
+// each other's rows via SKIP LOCKED. Serialize all outbox tests.
+static OUTBOX_LOCK: Mutex<()> = Mutex::const_new(());
 
 fn nonce() -> u128 {
     SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos()
@@ -26,6 +31,7 @@ async fn repo_or_skip(test: &str) -> Option<(PgEmailOutbox, sqlx::PgPool)> {
         eprintln!("GT_PG_URL unset; skipping {test}");
         return None;
     };
+    assert_ephemeral_pg_url(&url);
     let pool = sqlx::PgPool::connect(&url).await.expect("connect");
     let mut conn = pool.acquire().await.expect("acquire");
     sqlx::query("SELECT pg_advisory_lock(4915623003)")
@@ -47,6 +53,7 @@ fn new_email(id: &str, ws: &str, send_at: Option<sqlx::types::chrono::DateTime<U
         id: id.into(),
         workspace: ws.into(),
         recipient: "ops@example.com".into(),
+        cc: vec![],
         subject: "reporte".into(),
         body: "hola".into(),
         template_ref: None,
@@ -57,6 +64,7 @@ fn new_email(id: &str, ws: &str, send_at: Option<sqlx::types::chrono::DateTime<U
 
 #[tokio::test]
 async fn schedule_claim_and_settlements_round_trip() {
+    let _guard = OUTBOX_LOCK.lock().await;
     let Some((repo, _pool)) = repo_or_skip("outbox pipeline contract").await else { return };
     let n = nonce();
     let ws = format!("wstest{n}");
@@ -65,6 +73,9 @@ async fn schedule_claim_and_settlements_round_trip() {
 
     // One immediately-due row, one scheduled into the future.
     let due = repo.enqueue(new_email(&due_id, &ws, None)).await.expect("enqueue due");
+    // Force send_at into the past using PG's own clock to avoid Rust/PG clock skew.
+    sqlx::query("UPDATE email_outbox SET send_at = now() - interval '2 seconds' WHERE id = $1")
+        .bind(&due_id).execute(&_pool).await.expect("force past");
     assert_eq!(due.status, "pending");
     assert_eq!(due.attempts, 0);
     repo.enqueue(new_email(&future_id, &ws, Some(Utc::now() + Duration::hours(2))))
@@ -110,6 +121,7 @@ async fn schedule_claim_and_settlements_round_trip() {
 
 #[tokio::test]
 async fn cancel_recalls_pending_but_never_sent() {
+    let _guard = OUTBOX_LOCK.lock().await;
     let Some((repo, _pool)) = repo_or_skip("outbox cancel contract").await else { return };
     let n = nonce();
     let ws = format!("wstest{n}");
@@ -133,12 +145,15 @@ async fn cancel_recalls_pending_but_never_sent() {
 
 #[tokio::test]
 async fn failed_settlement_records_the_terminal_state() {
+    let _guard = OUTBOX_LOCK.lock().await;
     let Some((repo, _pool)) = repo_or_skip("outbox failed contract").await else { return };
     let n = nonce();
     let ws = format!("wstest{n}");
     let id = format!("e-{n}-fail");
 
     repo.enqueue(new_email(&id, &ws, None)).await.expect("enqueue");
+    sqlx::query("UPDATE email_outbox SET send_at = now() - interval '2 seconds' WHERE id = $1")
+        .bind(&id).execute(&_pool).await.expect("force past");
     let claimed = repo.claim_due(500).await.expect("claim");
     assert!(claimed.iter().any(|e| e.id == id));
     repo.mark_failed(&id, "attempts exhausted").await.expect("fail");

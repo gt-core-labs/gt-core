@@ -51,6 +51,7 @@ async fn create_workspace_rig_and_session_via_dispatch() {
         eprintln!("GT_PG_URL unset; skipping hq-mcp-dispatch.8 E2E");
         return;
     };
+    gt_store_pg::assert_ephemeral_pg_url(&url);
     let pool = PgPool::connect(&url).await.expect("connect postgres");
 
     // --- Schema preconditions (a deploy/migration concern; applied inline here) ---
@@ -61,12 +62,15 @@ async fn create_workspace_rig_and_session_via_dispatch() {
             .await
             .expect("apply workspace migration");
     }
-    // The rigs table in the ws_default template, so the clone carries it.
-    let rig_mig = gt_rig::RigsModule.migrations();
-    sqlx::raw_sql(&rig_mig[0].sql)
-        .execute(&pool)
-        .await
-        .expect("apply rigs migration");
+    // The rigs table (+ its follow-on columns) in the ws_default template, so the clone carries
+    // them. Apply every rig migration in order, not just the create, or a tenant cloned from the
+    // template would miss later columns (e.g. semantic_tags, B3).
+    for m in gt_rig::RigsModule.migrations() {
+        sqlx::raw_sql(&m.sql)
+            .execute(&pool)
+            .await
+            .unwrap_or_else(|e| panic!("apply rigs migration {}: {e}", m.name));
+    }
     // Clean any leak from a prior run, then provision the tenant schema (clones
     // ws_default's structure — including rigs — into ws_e2e_dispatch).
     let schema = gt_store_pg::schema_for(WS);

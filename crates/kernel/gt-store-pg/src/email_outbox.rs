@@ -38,8 +38,11 @@ pub struct OutboxEntry {
     pub id: String,
     /// The workspace that scheduled it.
     pub workspace: String,
-    /// Recipient address.
+    /// Primary recipient address (the To: header).
     pub recipient: String,
+    /// Carbon-copy recipients, comma-separated (empty = none). The report
+    /// digest puts every registered subscriber here (gtcore-ecf70d).
+    pub cc: String,
     /// Subject line.
     pub subject: String,
     /// Rendered body.
@@ -69,8 +72,11 @@ pub struct NewEmail {
     pub id: String,
     /// The scheduling workspace.
     pub workspace: String,
-    /// Recipient address.
+    /// Primary recipient address (the To: header).
     pub recipient: String,
+    /// Carbon-copy recipients (the To: gets the message, these get a copy).
+    /// Empty = a plain single-recipient send.
+    pub cc: Vec<String>,
     /// Subject line.
     pub subject: String,
     /// Rendered body.
@@ -83,7 +89,7 @@ pub struct NewEmail {
     pub created_by: String,
 }
 
-const COLS: &str = "id, workspace, recipient, subject, body, template_ref, send_at, \
+const COLS: &str = "id, workspace, recipient, cc, subject, body, template_ref, send_at, \
                     status, attempts, last_error, created_by, created_at, sent_at";
 
 /// The outbox port the email handler + drain daemon depend on.
@@ -136,13 +142,14 @@ impl EmailOutboxRepository for PgEmailOutbox {
     async fn enqueue(&self, new: NewEmail) -> Result<OutboxEntry, OutboxError> {
         let row = sqlx::query_as::<_, OutboxEntry>(&format!(
             "INSERT INTO email_outbox \
-                (id, workspace, recipient, subject, body, template_ref, send_at, created_by) \
-             VALUES ($1, $2, $3, $4, $5, $6, COALESCE($7, now()), $8) \
+                (id, workspace, recipient, cc, subject, body, template_ref, send_at, created_by) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, COALESCE($8, now()), $9) \
              RETURNING {COLS}"
         ))
         .bind(&new.id)
         .bind(&new.workspace)
         .bind(&new.recipient)
+        .bind(new.cc.join(","))
         .bind(&new.subject)
         .bind(&new.body)
         .bind(&new.template_ref)

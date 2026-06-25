@@ -31,6 +31,19 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use crate::git_tree::{commit_inspector, surface_tree};
 use crate::prefixes::{bead_prefix, WorkspaceRigPrefixes};
 
+/// Side-effect hook called after a successful `issues.close.execute` (gtcore-71c575).
+///
+/// When a bead closes with a `delivered_sha`, any lingering merge slot for that bead should
+/// be auto-completed so it does not stay in `failed`/`ready`/`merging` state indefinitely.
+/// The composition root implements this via `MergeHandler::try_complete_slot`; the seam
+/// keeps `gt-mcp-server` free of a `gt-merge` dependency.
+pub trait IssueClosedHook: Send + Sync {
+    /// Called synchronously after the bead is closed. `delivered_sha` is `Some` when the bead
+    /// carries a code surface and the closing sha was supplied (or verified). Best-effort:
+    /// implementations must not panic or return errors that poison the close response.
+    fn on_closed(&self, ws: Option<&str>, bead: &str, delivered_sha: Option<&str>);
+}
+
 /// Map a serde deserialization error onto the domain error so a malformed tool
 /// payload surfaces as a validation failure (not a 500).
 fn parse_args<T: serde::de::DeserializeOwned>(args: Value) -> Result<T, AppError> {
@@ -81,6 +94,33 @@ async fn enforce_rig_prefix(
     Ok(())
 }
 
+/// Inherit the session scope into an `issues.create` whose scope fields are blank
+/// (hq-gap-issues-create-workspace-inherit). The operator already declared the
+/// working context in the MCP session headers; a `create` that omits `workspace`/
+/// `rig` should honour it rather than silently landing the bead in `'default'` / no
+/// rig. Mirrors the `X-Rig` fallback `issues.list` / `board.list.execute` already
+/// apply — `create` was the one write path that skipped it.
+///
+/// - `workspace` blank ⇒ adopt `ws` (the resolved tenant: JWT claim or `X-Workspace`).
+/// - `rig` AND `id` both blank (`effective_rig()` empty) ⇒ adopt `request_rig`
+///   (`X-Rig`). Guarded on `effective_rig()` so an explicit `id` keeps deriving its
+///   own rig prefix instead of being overridden by the session header.
+///
+/// When no header resolved (legacy single-tenant: `ws`/`request_rig` are `None`)
+/// the fields stay blank and fall through to the existing schema defaults.
+fn inherit_session_scope(a: &mut CreateIssue, ws: Option<&str>, request_rig: Option<&str>) {
+    if a.workspace.is_empty() {
+        if let Some(ws) = ws {
+            a.workspace = ws.to_string();
+        }
+    }
+    if a.effective_rig().is_empty() {
+        if let Some(rig) = request_rig {
+            a.rig = rig.to_string();
+        }
+    }
+}
+
 /// Inject the S5 claim echo (`description`, `acceptance_criteria`, `phase`) into a
 /// claim response so the agent reads any prose blocker + the phase gate before
 /// working (hq-core-mcp.8 / docs/10 S5). Fields are only added when present (a
@@ -120,10 +160,15 @@ pub async fn dispatch(
     // hq-context-custodian.2: the freshly-confirmed-block signal the claim-context
     // custodian consults on a `working` transition. `None` ⇒ context stays mandatory.
     quota_signal: Option<&dyn QuotaBlockSignal>,
+    // gtcore-71c575: auto-complete merge slot when bead closes with a delivered_sha.
+    close_hook: Option<&dyn IssueClosedHook>,
 ) -> Result<Value, AppError> {
     match tool {
         "issues.create.validate" => {
-            let a: CreateIssue = parse_args(args)?;
+            let mut a: CreateIssue = parse_args(args)?;
+            // hq-gap-issues-create-workspace-inherit: blank workspace/rig inherit the
+            // session scope (X-Workspace / X-Rig) before any validation or echo.
+            inherit_session_scope(&mut a, ws, request_rig);
             // hq-bead-id-standard.2: validate against the canonical rig name/prefix
             // (explicit `rig` field, or prefix derived from the provided `id`).
             enforce_rig_prefix(prefixes, ws, a.effective_rig()).await?;
@@ -132,7 +177,9 @@ pub async fn dispatch(
             Ok(json!({ "ok": true, "rig": a.effective_rig() }))
         }
         "issues.create.execute" => {
-            let a: CreateIssue = parse_args(args)?;
+            let mut a: CreateIssue = parse_args(args)?;
+            // hq-gap-issues-create-workspace-inherit: see the validate branch.
+            inherit_session_scope(&mut a, ws, request_rig);
             enforce_rig_prefix(prefixes, ws, a.effective_rig()).await?;
             // run_create_issue returns the actual bead id (which may be server-generated).
             let bead_id = run_create_issue(store, &a, surface_tree(repo_dir).as_ref(), false).await?;
@@ -194,8 +241,15 @@ pub async fn dispatch(
             let inspector_ref = inspector
                 .as_ref()
                 .map(|i| i as &(dyn CommitInspector + Send + Sync));
+            let bead_id = a.id.clone();
+            let caller_sha = a.sha().map(str::to_string);
             run_close_issue(store, &a, actor, inspector_ref, false).await?;
-            emit_issue_event(sink, store, ws, IssueVerb::Closed, &a.id, actor).await;
+            emit_issue_event(sink, store, ws, IssueVerb::Closed, &bead_id, actor).await;
+            // Auto-complete the merge slot when the bead closes with a delivered sha
+            // (gtcore-71c575): prevents stale `failed` slots for work already in main.
+            if let Some(hook) = close_hook {
+                hook.on_closed(ws, &bead_id, caller_sha.as_deref());
+            }
             Ok(json!({ "ok": true }))
         }
         "issues.claim.validate" => {
@@ -251,8 +305,12 @@ pub async fn dispatch(
                 // the X-Rig header the polecat's .mcp.json injects on every call — so `list`
                 // is automatically scoped to the right rig without prompt engineering.
                 rig: a.rig.or_else(|| request_rig.map(str::to_string)),
-                // hq-62130a — optional board-workspace narrowing.
-                workspace: a.workspace,
+                // hq-62130a — optional board-workspace narrowing. hq-gap-issues-
+                // create-workspace-inherit: when the caller didn't narrow, fall back
+                // to the session's X-Workspace so the whole tracker honours the
+                // operator's declared scope (vital in single-tenant mode, where the
+                // workspace column — not the store — separates tenants).
+                workspace: a.workspace.or_else(|| ws.map(str::to_string)),
             };
             // gtcore-1acbcf (C1) — `dispatch=auto|manual` narrows on the RESOLVED
             // policy (own value, else `child_of` inheritance, else manual), never
@@ -341,6 +399,13 @@ pub async fn dispatch(
             if a.rig.is_empty() {
                 if let Some(rig) = request_rig {
                     a.rig = rig.to_string();
+                }
+            }
+            // X-Workspace fallback (hq-gap-issues-create-workspace-inherit): same
+            // session-scope inheritance the create/list paths apply.
+            if a.workspace.is_empty() {
+                if let Some(ws) = ws {
+                    a.workspace = ws.to_string();
                 }
             }
             let snapshot = run_board_list(store, &a, false).await?;
@@ -573,10 +638,66 @@ pub fn parse_issue_filter(qs: &str) -> Result<IssueFilter, AppError> {
 
 #[cfg(test)]
 mod tests {
-    use super::{enforce_rig_prefix, json_array, parse_issue_filter, slugify, GAP_CATALOG_EPIC};
+    use super::{
+        enforce_rig_prefix, inherit_session_scope, json_array, parse_issue_filter, slugify,
+        CreateIssue, GAP_CATALOG_EPIC,
+    };
     use crate::prefixes::WorkspaceRigPrefixes;
     use async_trait::async_trait;
     use gt_store_dolt::AppError;
+
+    /// Build a minimal `CreateIssue` from a JSON patch over the required+scope
+    /// fields — the same shape `parse_args` deserializes on the wire.
+    fn mk(extra: serde_json::Value) -> CreateIssue {
+        let mut base = serde_json::json!({
+            "created_by": "op",
+            "issue_type": "task",
+            "title": "t",
+        });
+        base.as_object_mut()
+            .unwrap()
+            .extend(extra.as_object().unwrap().clone());
+        serde_json::from_value(base).unwrap()
+    }
+
+    #[test]
+    fn inherit_fills_blank_workspace_and_rig_from_session() {
+        // hq-gap-issues-create-workspace-inherit: neither workspace nor rig/id given
+        // ⇒ adopt the session's X-Workspace + X-Rig.
+        let mut a = mk(serde_json::json!({}));
+        inherit_session_scope(&mut a, Some("cotrafa"), Some("LaftScoreCotrafa"));
+        assert_eq!(a.workspace, "cotrafa");
+        assert_eq!(a.effective_rig(), "LaftScoreCotrafa");
+    }
+
+    #[test]
+    fn inherit_does_not_override_explicit_fields() {
+        // Caller declared scope explicitly ⇒ session headers leave it untouched.
+        let mut a = mk(serde_json::json!({ "workspace": "alpha", "rig": "beta" }));
+        inherit_session_scope(&mut a, Some("cotrafa"), Some("LaftScoreCotrafa"));
+        assert_eq!(a.workspace, "alpha");
+        assert_eq!(a.effective_rig(), "beta");
+    }
+
+    #[test]
+    fn inherit_keeps_id_derived_rig_but_still_fills_workspace() {
+        // An explicit `id` derives its own rig prefix (effective_rig non-empty), so
+        // X-Rig must not override it — but a blank workspace still inherits.
+        let mut a = mk(serde_json::json!({ "id": "gtcore-abc123" }));
+        inherit_session_scope(&mut a, Some("cotrafa"), Some("LaftScoreCotrafa"));
+        assert_eq!(a.effective_rig(), "gtcore");
+        assert_eq!(a.workspace, "cotrafa");
+    }
+
+    #[test]
+    fn inherit_is_noop_without_session_headers() {
+        // Legacy single-tenant: no X-Workspace / X-Rig ⇒ fields stay blank and fall
+        // through to the schema defaults ('default' workspace / no rig).
+        let mut a = mk(serde_json::json!({}));
+        inherit_session_scope(&mut a, None, None);
+        assert!(a.workspace.is_empty());
+        assert!(a.effective_rig().is_empty());
+    }
 
     /// Stub policy: a fixed set of allowed prefixes for workspace `acme`, mimicking
     /// the rig catalog + reserved-set the real PG adapter unions. Anything else is

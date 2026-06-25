@@ -12,7 +12,8 @@ use tokio::sync::{mpsc, oneshot};
 
 use gt_events::{AppError, Command, Envelope};
 
-use crate::commands::QuotaCommand;
+use crate::budget::{BudgetLedger, SessionBudget};
+use crate::commands::{normalize_model, QuotaCommand};
 use crate::cost::ModelWeights;
 use crate::events::QuotaEvent;
 use crate::expectations::predict;
@@ -71,9 +72,46 @@ pub enum QuotaMsg {
         until_secs: Option<u64>,
         now_secs: u64,
     },
+    /// The usage-probe could not authenticate the account (gtcore-e09320): latch
+    /// `Account::credential_dead` and emit `quota.credential_dead.v1` so the deadness is observable
+    /// on `quota.list` instead of only logged.
+    CredentialDead {
+        account: String,
+        now_secs: u64,
+    },
     Rotated {
         from_account: String,
         to_account: String,
+        now_secs: u64,
+    },
+    /// Proactive soft-drain (gtcore-df3319): park the source in Cooldown and emit
+    /// `quota.soft_drain.v1`. Mirrors [`Self::Rotated`] but records the proactive soft trigger
+    /// distinctly.
+    SoftDrained {
+        from_account: String,
+        to_account: String,
+        now_secs: u64,
+    },
+    /// Soft-drain warranted but no healthy target (all ≥ hard) — emit `quota.soft_drain_stalled.v1`
+    /// as an alert, no state mutation (gtcore-df3319).
+    SoftDrainStalled {
+        account: String,
+        now_secs: u64,
+    },
+    /// Every account is exhausted (gtcore-6f449f): record that the edge suspended the in-flight
+    /// polecats backed by `account`. Notification only — emits `quota.all_exhausted.v1`, no registry
+    /// mutation (the source's `Blocked` status is set by the `Blocked` message that precedes it).
+    AllExhausted {
+        account: String,
+        paused_sessions: Vec<String>,
+        now_secs: u64,
+    },
+    /// A paused account recovered (gtcore-6f449f): record that the edge resumed the suspended
+    /// polecats. Notification only — emits `quota.account_recovered.v1`; the lift back to `Healthy`
+    /// is already applied by the `Probe` that triggered it.
+    AccountRecovered {
+        account: String,
+        resumed_sessions: Vec<String>,
         now_secs: u64,
     },
     /// Onboard a claude account with its credential dir (`hq-quota-accounts.1`): adds it as a
@@ -88,6 +126,33 @@ pub enum QuotaMsg {
     DeregisterAccount {
         account: String,
         now_secs: u64,
+    },
+    /// Open (or refresh) a per-session budget (B1, gtcore-ab170f): stamp the `bead` the session
+    /// works and an optional cost-unit limit. Emits `SessionBudgetOpened`.
+    OpenBudget {
+        session: String,
+        bead: Option<String>,
+        limit_cost: Option<f64>,
+        now_secs: u64,
+    },
+    /// Close a per-session budget (B1): the session ended; finalizes the execution-minute span.
+    /// Emits `SessionBudgetClosed`.
+    CloseBudget {
+        session: String,
+        now_secs: u64,
+    },
+    /// Read-only snapshot of every per-session budget (B1) — the cost-attribution surface.
+    BudgetSnapshot(oneshot::Sender<Vec<SessionBudget>>),
+    /// Configure the default per-session HARD spend ceiling (A5, gtcore-f3a016). Sent once at
+    /// startup from `GT_SESSION_HARD_CAP_COST`; `None` disables the hard gate.
+    ConfigureBudgetGate {
+        hard_cap: Option<f64>,
+    },
+    /// Read whether a session is frozen by the hard gate (A5). The anthropic proxy asks this
+    /// before forwarding a model call.
+    IsSessionGated {
+        session: String,
+        reply: oneshot::Sender<bool>,
     },
     /// Diagnostics: (live accounts, predictions emitted).
     Snapshot(oneshot::Sender<(usize, usize)>),
@@ -159,6 +224,75 @@ impl QuotaHandle {
                 now_secs,
             })
             .await;
+    }
+
+    /// Open (or refresh) a per-session budget (B1, gtcore-ab170f). The edge calls this at session
+    /// spawn with the bead (`GT_HOOK_BEAD`) and, when configured, a cost-unit ceiling.
+    pub async fn open_budget(
+        &self,
+        session: impl Into<String>,
+        bead: Option<String>,
+        limit_cost: Option<f64>,
+        now_secs: u64,
+    ) {
+        let _ = self
+            .tx
+            .send(QuotaMsg::OpenBudget {
+                session: session.into(),
+                bead,
+                limit_cost,
+                now_secs,
+            })
+            .await;
+    }
+
+    /// Close a per-session budget (B1) at session end, finalizing its execution-minute span.
+    pub async fn close_budget(&self, session: impl Into<String>, now_secs: u64) {
+        let _ = self
+            .tx
+            .send(QuotaMsg::CloseBudget {
+                session: session.into(),
+                now_secs,
+            })
+            .await;
+    }
+
+    /// Owned snapshot of every per-session budget (B1) — token spend, execution minutes, and
+    /// bead attribution. The cost-attribution read surface for operators / reports.
+    pub async fn budgets(&self) -> Vec<SessionBudget> {
+        let (reply, rx) = oneshot::channel();
+        if self.tx.send(QuotaMsg::BudgetSnapshot(reply)).await.is_err() {
+            return Vec::new();
+        }
+        rx.await.unwrap_or_default()
+    }
+
+    /// Configure the default per-session HARD spend ceiling (A5, gtcore-f3a016). The composition
+    /// root calls this once at startup from `GT_SESSION_HARD_CAP_COST`; `None` disables the gate.
+    pub async fn configure_budget_gate(&self, hard_cap: Option<f64>) {
+        let _ = self
+            .tx
+            .send(QuotaMsg::ConfigureBudgetGate { hard_cap })
+            .await;
+    }
+
+    /// Whether a session is frozen by the per-session hard gate (A5). The anthropic proxy asks
+    /// this before forwarding a model call; `false` (fail-open) if the actor is gone or the
+    /// session is unknown — the gate only ever *adds* a refusal, never a spurious one.
+    pub async fn is_session_gated(&self, session: impl Into<String>) -> bool {
+        let (reply, rx) = oneshot::channel();
+        if self
+            .tx
+            .send(QuotaMsg::IsSessionGated {
+                session: session.into(),
+                reply,
+            })
+            .await
+            .is_err()
+        {
+            return false;
+        }
+        rx.await.unwrap_or(false)
     }
 
     pub async fn probe(
@@ -235,6 +369,19 @@ impl QuotaHandle {
             .await;
     }
 
+    /// Latch the account credential-dead (gtcore-e09320): the usage-probe could not authenticate
+    /// it (expired token + no refresh, or the token endpoint rejected the refresh). Emits
+    /// `quota.credential_dead.v1`; the next successful probe clears it.
+    pub async fn credential_dead(&self, account: impl Into<String>, now_secs: u64) {
+        let _ = self
+            .tx
+            .send(QuotaMsg::CredentialDead {
+                account: account.into(),
+                now_secs,
+            })
+            .await;
+    }
+
     pub async fn rotated(
         &self,
         from_account: impl Into<String>,
@@ -246,6 +393,73 @@ impl QuotaHandle {
             .send(QuotaMsg::Rotated {
                 from_account: from_account.into(),
                 to_account: to_account.into(),
+                now_secs,
+            })
+            .await;
+    }
+
+    /// Record a proactive soft-drain rotation (gtcore-df3319): parks `from_account` in Cooldown and
+    /// emits `quota.soft_drain.v1`. The keychain pointer flip + the "no credential swap" contract
+    /// live at the edge ([`crate`] caller); this only carries the durable record.
+    pub async fn soft_drained(
+        &self,
+        from_account: impl Into<String>,
+        to_account: impl Into<String>,
+        now_secs: u64,
+    ) {
+        let _ = self
+            .tx
+            .send(QuotaMsg::SoftDrained {
+                from_account: from_account.into(),
+                to_account: to_account.into(),
+                now_secs,
+            })
+            .await;
+    }
+
+    /// Record that a soft-drain was warranted but no healthy alternative exists (gtcore-df3319):
+    /// emits `quota.soft_drain_stalled.v1` as an operator alert. No rotation took place.
+    pub async fn soft_drain_stalled(&self, account: impl Into<String>, now_secs: u64) {
+        let _ = self
+            .tx
+            .send(QuotaMsg::SoftDrainStalled {
+                account: account.into(),
+                now_secs,
+            })
+            .await;
+    }
+
+    /// Record that every account is exhausted and the edge suspended `account`'s in-flight polecats
+    /// in place (gtcore-6f449f): emits `quota.all_exhausted.v1` carrying the paused session list.
+    pub async fn all_exhausted(
+        &self,
+        account: impl Into<String>,
+        paused_sessions: Vec<String>,
+        now_secs: u64,
+    ) {
+        let _ = self
+            .tx
+            .send(QuotaMsg::AllExhausted {
+                account: account.into(),
+                paused_sessions,
+                now_secs,
+            })
+            .await;
+    }
+
+    /// Record that a paused account recovered and the edge resumed its suspended polecats
+    /// (gtcore-6f449f): emits `quota.account_recovered.v1` carrying the resumed session list.
+    pub async fn account_recovered(
+        &self,
+        account: impl Into<String>,
+        resumed_sessions: Vec<String>,
+        now_secs: u64,
+    ) {
+        let _ = self
+            .tx
+            .send(QuotaMsg::AccountRecovered {
+                account: account.into(),
+                resumed_sessions,
                 now_secs,
             })
             .await;
@@ -348,6 +562,10 @@ pub fn spawn_hydrated(
         let mut registry = initial;
         registry.set_weights(weights);
         let mut predictions_emitted: usize = predictions_seen;
+        // B1 (gtcore-ab170f): per-session budget ledger. Starts empty and re-converges from the
+        // `TokensSampled` stream after a restart (telemetry, like the EWMA rates above); the bead
+        // attribution + limit re-arrive from the edge's `open_budget` at the next spawn.
+        let mut budgets = BudgetLedger::default();
 
         while let Some(msg) = rx.recv().await {
             match msg {
@@ -368,6 +586,13 @@ pub fn spawn_hydrated(
                     cache_creation,
                     now_secs,
                 } => {
+                    // Collapse the model id to its canonical family at the single point the live
+                    // quota-feed folds samples (the hook feeds full ids like `claude-opus-4-8`,
+                    // synthetic/MCP samples feed short aliases). Every downstream consumer — cost
+                    // weights, the per-session budget ledger, and the emitted TokensSampled event
+                    // the chart groups by — then sees one bucket per model. Mirrors the same
+                    // normalization on the MCP `SampleTokens` command path.
+                    let model = normalize_model(&model);
                     registry.apply_sample(
                         &account,
                         &session,
@@ -378,6 +603,28 @@ pub fn spawn_hydrated(
                         cache_creation,
                         now_secs,
                     );
+                    // B1: fold the same sample into the per-session budget ledger (cost weighted
+                    // by the registry's per-model calibration). If this sample is the one that
+                    // first crosses the budget, capture the alert fields before the event below
+                    // moves `session`/`account` out.
+                    let sample_cost = registry
+                        .cost_units(&model, input, output, cache_read, cache_creation);
+                    let crossed = budgets.record(
+                        session.clone(),
+                        sample_cost,
+                        input,
+                        output,
+                        cache_read,
+                        cache_creation,
+                        now_secs,
+                    );
+                    let budget_alert = crossed.then(|| budgets.get(&session).cloned()).flatten();
+                    // A5 (gtcore-f3a016): latch the HARD gate. If this sample is the one that
+                    // trips the hard ceiling, capture the budget for the enforcement event —
+                    // again before `session` is moved out below.
+                    let hard_tripped = budgets.gate_check(&session);
+                    let gate_trip =
+                        hard_tripped.then(|| budgets.get(&session).cloned()).flatten();
                     let _ = events
                         .send(Envelope::root(QuotaEvent::TokensSampled {
                             account,
@@ -390,6 +637,32 @@ pub fn spawn_hydrated(
                             now_secs,
                         }))
                         .await;
+                    // Emit the budget-exceeded alert once, right after the sample that crossed.
+                    if let Some(b) = budget_alert {
+                        let _ = events
+                            .send(Envelope::root(QuotaEvent::BudgetExceeded {
+                                session: b.session,
+                                bead: b.bead,
+                                consumed_cost: b.cost,
+                                limit_cost: b.limit_cost.unwrap_or(0.0),
+                                now_secs,
+                            }))
+                            .await;
+                    }
+                    // A5: emit the HARD gate event once, when the hard ceiling is first crossed.
+                    // From here the proxy refuses this session's further model calls (the runaway
+                    // freezes itself — "no soft-fail silencioso").
+                    if let Some(b) = gate_trip {
+                        let _ = events
+                            .send(Envelope::root(QuotaEvent::BudgetGateTripped {
+                                session: b.session,
+                                bead: b.bead,
+                                consumed_cost: b.cost,
+                                hard_limit_cost: b.hard_limit_cost.unwrap_or(0.0),
+                                now_secs,
+                            }))
+                            .await;
+                    }
                 }
                 QuotaMsg::Probe {
                     account,
@@ -627,6 +900,17 @@ pub fn spawn_hydrated(
                         }))
                         .await;
                 }
+                QuotaMsg::CredentialDead { account, now_secs } => {
+                    // Credential VALIDITY, not quota usage (gtcore-e09320): latch the flag so the
+                    // registry — and `quota.list` rebuilt from it — stops reading the account as
+                    // usable. Status is left untouched; the FE combines `credential_dead` with it.
+                    if let Some(a) = registry.get_mut(&account) {
+                        a.credential_dead = true;
+                    }
+                    let _ = events
+                        .send(Envelope::root(QuotaEvent::CredentialDead { account, now_secs }))
+                        .await;
+                }
                 QuotaMsg::Rotated {
                     from_account,
                     to_account,
@@ -637,6 +921,58 @@ pub fn spawn_hydrated(
                         .send(Envelope::root(QuotaEvent::Rotated {
                             from_account,
                             to_account,
+                            now_secs,
+                        }))
+                        .await;
+                }
+                QuotaMsg::SoftDrained {
+                    from_account,
+                    to_account,
+                    now_secs,
+                } => {
+                    // Same registry effect as a rotation (park the source in Cooldown), distinct
+                    // event so the proactive soft trigger is observable (gtcore-df3319).
+                    registry.apply_rotation(&from_account);
+                    let _ = events
+                        .send(Envelope::root(QuotaEvent::SoftDrained {
+                            from_account,
+                            to_account,
+                            now_secs,
+                        }))
+                        .await;
+                }
+                QuotaMsg::SoftDrainStalled { account, now_secs } => {
+                    // Alert only: the pointer stayed put, so no registry mutation (gtcore-df3319).
+                    let _ = events
+                        .send(Envelope::root(QuotaEvent::SoftDrainStalled { account, now_secs }))
+                        .await;
+                }
+                QuotaMsg::AllExhausted {
+                    account,
+                    paused_sessions,
+                    now_secs,
+                } => {
+                    // Notification only (gtcore-6f449f): the edge already SIGSTOP'd the polecats and
+                    // the source's Blocked status was set by the preceding Blocked message.
+                    let _ = events
+                        .send(Envelope::root(QuotaEvent::AllExhausted {
+                            account,
+                            paused_sessions,
+                            now_secs,
+                        }))
+                        .await;
+                }
+                QuotaMsg::AccountRecovered {
+                    account,
+                    resumed_sessions,
+                    now_secs,
+                } => {
+                    // Notification only (gtcore-6f449f): the lift back to Healthy was applied by the
+                    // Probe that triggered this, and the edge already SIGCONT'd the polecats.
+                    let _ = events
+                        .send(Envelope::root(QuotaEvent::AccountRecovered {
+                            account,
+                            resumed_sessions,
                             now_secs,
                         }))
                         .await;
@@ -665,6 +1001,40 @@ pub fn spawn_hydrated(
                             now_secs,
                         }))
                         .await;
+                }
+                QuotaMsg::OpenBudget {
+                    session,
+                    bead,
+                    limit_cost,
+                    now_secs,
+                } => {
+                    budgets.open(session.clone(), bead.clone(), limit_cost, now_secs);
+                    let _ = events
+                        .send(Envelope::root(QuotaEvent::SessionBudgetOpened {
+                            session,
+                            bead,
+                            limit_cost,
+                            now_secs,
+                        }))
+                        .await;
+                }
+                QuotaMsg::CloseBudget { session, now_secs } => {
+                    budgets.close(&session, now_secs);
+                    let _ = events
+                        .send(Envelope::root(QuotaEvent::SessionBudgetClosed {
+                            session,
+                            now_secs,
+                        }))
+                        .await;
+                }
+                QuotaMsg::BudgetSnapshot(reply) => {
+                    let _ = reply.send(budgets.snapshot());
+                }
+                QuotaMsg::ConfigureBudgetGate { hard_cap } => {
+                    budgets.set_default_hard_limit(hard_cap);
+                }
+                QuotaMsg::IsSessionGated { session, reply } => {
+                    let _ = reply.send(budgets.is_session_gated(&session));
                 }
                 QuotaMsg::Snapshot(reply) => {
                     let _ = reply.send((registry.accounts().count(), predictions_emitted));
@@ -726,5 +1096,116 @@ mod tests {
         q.deregister_account("acctB", 200).await;
         let (accounts, _) = q.snapshot().await;
         assert_eq!(accounts, 0, "deregistered account dropped from the registry");
+    }
+
+    #[tokio::test]
+    async fn budget_tracks_per_session_and_emits_exceeded_once() {
+        // B1, gtcore-ab170f: opening a budget stamps the bead + limit; samples accumulate the
+        // per-session spend and execution span; the first sample past the limit emits a single
+        // BudgetExceeded. IDENTITY weights → cost == input+output.
+        let (tx, mut rx) = mpsc::channel::<Envelope<QuotaEvent>>(32);
+        let q = spawn(tx, std::collections::HashMap::new());
+
+        q.open_budget("sess-a", Some("gtcore-ab170f".into()), Some(150.0), 0).await;
+        // Drain the SessionBudgetOpened.
+        let env = rx.recv().await.expect("opened emitted");
+        assert_eq!(env.payload.kind(), "quota.session_budget_opened.v1");
+
+        // Under budget: cost 100 < 150, only a TokensSampled is emitted.
+        q.sample("acc-1", "sess-a", "opus", 60, 40, 0, 0, 60).await;
+        let env = rx.recv().await.expect("sample emitted");
+        assert_eq!(env.payload.kind(), "quota.tokens_sampled.v1");
+
+        // Over budget: cumulative 100 + 100 = 200 > 150 → TokensSampled THEN one BudgetExceeded.
+        q.sample("acc-1", "sess-a", "opus", 60, 40, 0, 0, 120).await;
+        let env = rx.recv().await.expect("second sample emitted");
+        assert_eq!(env.payload.kind(), "quota.tokens_sampled.v1");
+        let env = rx.recv().await.expect("budget exceeded emitted");
+        match env.payload {
+            QuotaEvent::BudgetExceeded { session, bead, consumed_cost, limit_cost, .. } => {
+                assert_eq!(session, "sess-a");
+                assert_eq!(bead.as_deref(), Some("gtcore-ab170f"));
+                assert!((consumed_cost - 200.0).abs() < 1e-9);
+                assert!((limit_cost - 150.0).abs() < 1e-9);
+            }
+            other => panic!("expected BudgetExceeded, got {other:?}"),
+        }
+
+        // A third over-budget sample must NOT re-emit the alert (latched): the only event is the
+        // sample itself.
+        q.sample("acc-1", "sess-a", "opus", 10, 0, 0, 0, 180).await;
+        let env = rx.recv().await.expect("third sample emitted");
+        assert_eq!(env.payload.kind(), "quota.tokens_sampled.v1");
+
+        q.close_budget("sess-a", 300).await;
+        let env = rx.recv().await.expect("closed emitted");
+        assert_eq!(env.payload.kind(), "quota.session_budget_closed.v1");
+
+        // The snapshot reflects accumulated tokens, the 5-minute span (open@0 → close@300), and
+        // the latched bead attribution.
+        let budgets = q.budgets().await;
+        assert_eq!(budgets.len(), 1);
+        let b = &budgets[0];
+        assert_eq!(b.session, "sess-a");
+        assert_eq!(b.bead.as_deref(), Some("gtcore-ab170f"));
+        assert_eq!(b.total_tokens(), 210);
+        assert!(b.exceeded);
+        assert!((b.elapsed_minutes() - 5.0).abs() < 1e-9);
+    }
+
+    #[tokio::test]
+    async fn sample_normalizes_model_in_emitted_event() {
+        // gtcore-1f5112: the live quota-feed folds the hook's full model ids through this actor.
+        // A turn that is 100% opus (`claude-opus-4-8`) must emit `model=opus` so the burn chart
+        // groups it into a single bucket instead of splitting it from synthetic `opus` samples.
+        let (tx, mut rx) = mpsc::channel::<Envelope<QuotaEvent>>(8);
+        let q = spawn(tx, std::collections::HashMap::new());
+
+        q.sample("acc-1", "sess-a", "claude-opus-4-8", 100, 50, 0, 0, 60).await;
+        let env = rx.recv().await.expect("sample emitted");
+        match env.payload {
+            QuotaEvent::TokensSampled { model, .. } => assert_eq!(model, "opus"),
+            other => panic!("expected TokensSampled, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn hard_gate_trips_once_and_freezes_the_session() {
+        // A5, gtcore-f3a016: with a default HARD cap configured, a session that burns past it
+        // emits exactly one BudgetGateTripped and `is_session_gated` flips true — the proxy then
+        // refuses its further model calls. The freeze is sticky; a session with no cap is free.
+        let (tx, mut rx) = mpsc::channel::<Envelope<QuotaEvent>>(32);
+        let q = spawn(tx, std::collections::HashMap::new());
+        q.configure_budget_gate(Some(100.0)).await;
+
+        // Under cap (cost 60 < 100): only a TokensSampled, no gate, not frozen.
+        q.sample("acc-1", "run", "opus", 60, 0, 0, 0, 60).await;
+        let env = rx.recv().await.expect("sample emitted");
+        assert_eq!(env.payload.kind(), "quota.tokens_sampled.v1");
+        assert!(!q.is_session_gated("run").await, "under cap — not frozen");
+
+        // Over cap (cumulative 60 + 90 = 150 > 100): TokensSampled THEN one BudgetGateTripped.
+        q.sample("acc-1", "run", "opus", 90, 0, 0, 0, 120).await;
+        let env = rx.recv().await.expect("second sample emitted");
+        assert_eq!(env.payload.kind(), "quota.tokens_sampled.v1");
+        let env = rx.recv().await.expect("hard gate tripped emitted");
+        match env.payload {
+            QuotaEvent::BudgetGateTripped { session, consumed_cost, hard_limit_cost, .. } => {
+                assert_eq!(session, "run");
+                assert!((consumed_cost - 150.0).abs() < 1e-9);
+                assert!((hard_limit_cost - 100.0).abs() < 1e-9);
+            }
+            other => panic!("expected BudgetGateTripped, got {other:?}"),
+        }
+        assert!(q.is_session_gated("run").await, "over hard cap — the session is frozen");
+
+        // A further over-cap sample does NOT re-trip (latched): the only event is the sample.
+        q.sample("acc-1", "run", "opus", 50, 0, 0, 0, 180).await;
+        let env = rx.recv().await.expect("third sample emitted");
+        assert_eq!(env.payload.kind(), "quota.tokens_sampled.v1");
+        assert!(q.is_session_gated("run").await, "still frozen");
+
+        // An unknown session is never reported gated.
+        assert!(!q.is_session_gated("never-seen").await);
     }
 }

@@ -107,6 +107,35 @@ impl PgComments {
         Self { pool }
     }
 
+    /// Bulk-load the live comments of many `card` targets at once
+    /// (gtcore-01bcf2) — the report digest needs every bead/epic's comments in
+    /// one round trip instead of N `list_for_target` calls. Returns a map keyed
+    /// by `target_id`, each value chronological (`created_at ASC, id ASC`).
+    /// Absent/comment-less ids simply do not appear in the map. An empty input
+    /// short-circuits without a query.
+    pub async fn list_for_cards(
+        &self,
+        ids: &[String],
+    ) -> Result<std::collections::HashMap<String, Vec<Comment>>, CommentError> {
+        if ids.is_empty() {
+            return Ok(std::collections::HashMap::new());
+        }
+        let rows = sqlx::query_as::<_, Comment>(&format!(
+            "SELECT {COLS} FROM comments
+             WHERE target_kind = 'card' AND target_id = ANY($1) AND deleted_at IS NULL
+             ORDER BY target_id ASC, created_at ASC, id ASC"
+        ))
+        .bind(ids)
+        .fetch_all(self.pool.pool())
+        .await?;
+        let mut map: std::collections::HashMap<String, Vec<Comment>> =
+            std::collections::HashMap::new();
+        for row in rows {
+            map.entry(row.target_id.clone()).or_default().push(row);
+        }
+        Ok(map)
+    }
+
     /// Resolve an `@mention` handle to a member of this workspace: matches the
     /// tenant's `users` mirror (`ws_<slug>.users`, hq-platform-hardening.2) by
     /// full email or by the email's local part. Returns the member's email when

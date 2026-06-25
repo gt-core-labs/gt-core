@@ -19,6 +19,11 @@ pub enum AgentEvent {
         role: SessionRole,
         #[serde(default)]
         crew: Option<String>,
+        /// A5 (gtcore-f3a016): who triggered this spawn — the parent session id, an operator
+        /// actor name, or `"manual"` for CLI. `None` for pre-A5 events (serde default).
+        /// Enables inter-agent audit: tracing delegation chains when an agent spawns another.
+        #[serde(default)]
+        spawned_by: Option<String>,
         /// Skills the agent has loaded (its worktree `.claude/skills`), stamped by the polecat
         /// supervisor at sling (`hq-orch-sessions.2`). Empty for sessions spawned without a
         /// worktree (a manual `agent.spawn`). `#[serde(default)]` keeps pre-`.2` log entries
@@ -53,6 +58,16 @@ pub enum AgentEvent {
     },
     SessionEnd { session: String },
     Killed { session: String, reason: String },
+    /// A session was suspended **in place** (B2, gtcore-5731e9): its coding-agent process is
+    /// stopped with `SIGSTOP` so its in-memory context survives, instead of being killed and
+    /// re-slung. Pause-in-place is the kill-preserving alternative for interactive sessions
+    /// (mayor, dog) where losing the live conversation is expensive. `reason` records why the
+    /// session was paused (the escalation/operator action). This is **not** terminal: a matching
+    /// [`AgentEvent::Resumed`] (`SIGCONT`) folds the session back to `Working`.
+    Paused { session: String, reason: String },
+    /// A suspended session was resumed with `SIGCONT` (B2, gtcore-5731e9) — folds the session
+    /// back to `Working`.
+    Resumed { session: String },
 }
 
 impl EventKind for AgentEvent {
@@ -67,6 +82,10 @@ impl EventKind for AgentEvent {
             AgentEvent::Heartbeat { .. } => "agent.heartbeat.v1", // kind unchanged; new field is additive
             AgentEvent::SessionEnd { .. } => "agent.session-end.v1",
             AgentEvent::Killed { .. } => "agent.killed.v1",
+            // Pause-in-place lifecycle (B2). New kinds, born versioned + kebab — no legacy
+            // bare-kind records exist, so no back-compat entry is needed in the reader.
+            AgentEvent::Paused { .. } => "agent.paused.v1",
+            AgentEvent::Resumed { .. } => "agent.resumed.v1",
         }
     }
 }

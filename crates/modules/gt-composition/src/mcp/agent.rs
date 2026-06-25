@@ -153,6 +153,19 @@ impl DomainHandler for AgentHandler {
                 &[req("session", "string"), req("reason", "string")],
             ),
             descriptor(
+                "agent.pause",
+                "Record a session suspended in place (pause-in-place, B2): the coding agent is \
+                 SIGSTOP'd so its context survives instead of being killed. Use agent.resume to \
+                 lift it. Records agent.paused.v1; the REST /:id/pause endpoint performs the signal.",
+                &[req("session", "string"), req("reason", "string")],
+            ),
+            descriptor(
+                "agent.resume",
+                "Record a suspended session resumed (SIGCONT). Records agent.resumed.v1, folding \
+                 the session back to working.",
+                &[req("session", "string")],
+            ),
+            descriptor(
                 "agent.list",
                 "List every agent session in the workspace.",
                 &[opt("crew", "string")],
@@ -190,6 +203,8 @@ impl DomainHandler for AgentHandler {
                         hooks: Vec::new(),
                         maintains_heartbeat: a.role.maintains_heartbeat(),
                         tmux_socket: a.role.tmux_socket(ws.unwrap_or("default")),
+                        // A5 (gtcore-f3a016): the calling actor triggered this spawn.
+                        spawned_by: Some(ctx.actor.to_string()),
                     },
                     &session,
                 )?;
@@ -233,6 +248,31 @@ impl DomainHandler for AgentHandler {
                     AgentEvent::Killed {
                         session: session.clone(),
                         reason,
+                    },
+                    &session,
+                )
+            }
+            "agent.pause" => {
+                // Pause-in-place (B2): record-only, mirroring agent.kill — the REST /:id/pause
+                // endpoint is the door that both records and performs the SIGSTOP (a2a.rs notes the
+                // REST surface is the one place that signals the tmux process).
+                let session = self.require_session(ws, &ctx.args)?;
+                let reason = str_arg(&ctx.args, "reason")?.to_string();
+                self.record(
+                    ws,
+                    AgentEvent::Paused {
+                        session: session.clone(),
+                        reason,
+                    },
+                    &session,
+                )
+            }
+            "agent.resume" => {
+                let session = self.require_session(ws, &ctx.args)?;
+                self.record(
+                    ws,
+                    AgentEvent::Resumed {
+                        session: session.clone(),
                     },
                     &session,
                 )
@@ -289,6 +329,7 @@ fn state_str(state: SessionState) -> &'static str {
     match state {
         SessionState::Spawned => "spawned",
         SessionState::Working => "working",
+        SessionState::Paused => "paused",
         SessionState::Done => "done",
         SessionState::Killed => "killed",
     }
@@ -420,5 +461,43 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(info["state"], "killed");
+    }
+
+    #[tokio::test]
+    async fn pause_then_resume_folds_state_in_place() {
+        // B2: pause-in-place folds the session to `paused` (not terminal); resume returns it to
+        // `working`. Record-only on the MCP surface — the REST endpoint owns the SIGSTOP/SIGCONT.
+        let dir = TempDir::new().unwrap();
+        let h = handler(&dir);
+        h.dispatch("agent.spawn", ctx(json!({ "session": "s1", "rig": "granite" })))
+            .await
+            .unwrap();
+
+        let res = h
+            .dispatch("agent.pause", ctx(json!({ "session": "s1", "reason": "escalation" })))
+            .await
+            .unwrap();
+        assert_eq!(res["event"], "agent.paused.v1");
+        let info = h.dispatch("agent.info", ctx(json!({ "session": "s1" }))).await.unwrap();
+        assert_eq!(info["state"], "paused");
+
+        let res = h
+            .dispatch("agent.resume", ctx(json!({ "session": "s1" })))
+            .await
+            .unwrap();
+        assert_eq!(res["event"], "agent.resumed.v1");
+        let info = h.dispatch("agent.info", ctx(json!({ "session": "s1" }))).await.unwrap();
+        assert_eq!(info["state"], "working");
+    }
+
+    #[tokio::test]
+    async fn pause_on_unknown_session_is_not_found() {
+        let dir = TempDir::new().unwrap();
+        let h = handler(&dir);
+        let gone = h
+            .dispatch("agent.pause", ctx(json!({ "session": "nope", "reason": "x" })))
+            .await
+            .unwrap_err();
+        assert!(matches!(gone, AppError::NotFound(_)));
     }
 }

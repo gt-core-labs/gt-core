@@ -81,6 +81,12 @@ pub struct AuditRecord {
     /// RFC3339 timestamp supplied by the caller. Empty when the caller has no clock.
     #[serde(default)]
     pub ts: String,
+    /// The actor's resolved scopes at dispatch time (A5, gtcore-f3a016). Present on both
+    /// `Invoked` and `Unauthorized` records so an operator can see what the actor held
+    /// when it tried — essential for RBAC forensics (e.g. "this agent had `issues.read`
+    /// but lacked `issues.write`"). `#[serde(default)]` keeps pre-A5 records replayable.
+    #[serde(default)]
+    pub scopes: Vec<String>,
 }
 
 impl AuditRecord {
@@ -101,6 +107,7 @@ impl AuditRecord {
             args,
             outcome,
             ts: ts.into(),
+            scopes: Vec::new(),
         }
     }
 
@@ -109,6 +116,14 @@ impl AuditRecord {
     /// workspace here, so adding the column never broke a call site.
     pub fn in_workspace(mut self, workspace_id: impl Into<String>) -> Self {
         self.workspace_id = workspace_id.into();
+        self
+    }
+
+    /// Stamp the actor's resolved scopes (A5, gtcore-f3a016). Builder style — the server
+    /// resolves the scope set from the JWT or RBAC config and stamps it here so the audit
+    /// trail captures what the actor held at dispatch time.
+    pub fn with_scopes(mut self, scopes: Vec<String>) -> Self {
+        self.scopes = scopes;
         self
     }
 

@@ -11,14 +11,13 @@
 //! own; the binary supplies the live adapter. `validate_only` short-circuits
 //! before any state change, exactly as the `*.validate` tools do.
 
-use std::time::{SystemTime, UNIX_EPOCH};
-
-use gt_store_dolt::{AppError, ClaimOutcome, DoltIssues};
+use gt_store_dolt::{AppError, ClaimOutcome, DoltDomainCatalog, DoltIssues};
 
 use crate::commands::{
     AdvancePhase, ClaimIssue, CloseIssue, CreateIssue, TransitionIssue, UpdateIssue,
 };
 use crate::delivery::{path_touches_surface, CommitInspector};
+use crate::domain_validate::validate_domains;
 use crate::policy::{guard_claim_context, PolicyVerdict, Violation};
 use crate::surface::{parse_surface_json, SurfaceTree};
 
@@ -60,6 +59,12 @@ pub async fn run_create_issue(
 ) -> Result<String, AppError> {
     args.validate()?;
     args.validate_surface(tree)?;
+    // H2 (gtcore-d81e77): the bead's domains are validated against the workspace's
+    // `domain_catalog` — reached through the issues store's own per-workspace pool,
+    // the same `hq_<ws>` DB the bead lands in — not the closed `Domain` enum. Runs
+    // on the `.validate` path too so the validate tool reports an out-of-catalog
+    // domain, mirroring the surface-existence check above.
+    validate_domains(&DoltDomainCatalog::new(issues.pool().clone()), &args.domain).await?;
     if validate_only {
         return Ok(String::new());
     }
@@ -93,6 +98,14 @@ pub async fn run_update_issue(
             args.check_taxonomy(&detail.issue_type)?;
         }
     }
+    // H2 (gtcore-d81e77): when the patch repoints `domain`, validate the new set
+    // against the bead workspace's `domain_catalog` (the issues store's own pool),
+    // not the closed `Domain` enum. A `None` domain patch leaves the column alone
+    // and skips this. Runs before the validate-only return so the validate tool
+    // reports an out-of-catalog domain.
+    if let Some(domains) = &args.domain {
+        validate_domains(&DoltDomainCatalog::new(issues.pool().clone()), domains).await?;
+    }
     if validate_only {
         return Ok(None);
     }
@@ -119,7 +132,8 @@ pub async fn run_update_issue(
 /// - **Pass** (context present) → record it as a note *before* the flip, the same
 ///   breadcrumb-before-write order `run_close_issue` uses for the sha.
 /// - **Deferred** (no context, quota confirmed blocked) → flip, then stamp a
-///   `context-deferred: <reason> @ <ts>` debt note.
+///   `context-deferred: <reason>` debt note (no timestamp — the row's
+///   `updated_at`/Dolt commit already date it).
 ///
 /// `open`/`closed` moves carry no context contract and pass straight through.
 pub async fn run_transition_issue(
@@ -149,12 +163,11 @@ pub async fn run_transition_issue(
             }
         }
         PolicyVerdict::Deferred(reason) => {
-            let ts = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .map(|d| d.as_secs())
-                .unwrap_or(0);
+            // No timestamp in the note: `append_notes` stamps `updated_at = NOW()`
+            // and each append is its own Dolt commit, so an inline `@ {ts}` only
+            // adds redundant noise to the planning-digest Notas column.
             issues
-                .append_notes(&args.id, &format!("context-deferred: {reason} @ {ts}"))
+                .append_notes(&args.id, &format!("context-deferred: {reason}"))
                 .await?;
         }
     }

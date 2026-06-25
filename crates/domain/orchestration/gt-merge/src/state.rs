@@ -73,11 +73,22 @@ pub struct MergeBoard {
 impl MergeBoard {
     /// Registra un nuevo slot en estado `Ready`. Re-submit del mismo bead = `Validation`
     /// (la refinery ya marcó este como pendiente; no se duplica).
+    ///
+    /// EXCEPCIÓN (gtcore-3a1bd4): un slot ya `Failed` SÍ puede re-entrar la cola — se sobrescribe
+    /// de vuelta a `Ready`. Cuando la CI del PR de un bead falla, el bead se re-despacha, el agente
+    /// arregla el fallo y vuelve a llamar `merge_submit` sobre la MISMA rama; sin esta excepción ese
+    /// re-submit chocaría con "already submitted" y el lazo no cerraría. La rama arreglada vuelve a
+    /// pasar por la cola (`Ready → Merging → Merged`), respetando la invariante A5 (la cola es el
+    /// único camino a `main`). En replay, `MergeEvent::Ready` ya hace `upsert` a `Ready`, así que
+    /// la secuencia `…Failed, Ready` reconstruye un slot `Ready` sin evento nuevo. Un slot en
+    /// `Ready`/`Merging` (en vuelo) o `Merged` (terminal) sigue rechazando el duplicado.
     pub fn submit(&mut self, bead: String, branch: String) -> Result<(), AppError> {
-        if self.slots.contains_key(&bead) {
-            return Err(AppError::Validation(format!(
-                "merge slot for {bead} already submitted"
-            )));
+        if let Some(existing) = self.slots.get(&bead) {
+            if existing.state != MergeSlotState::Failed {
+                return Err(AppError::Validation(format!(
+                    "merge slot for {bead} already submitted"
+                )));
+            }
         }
         self.slots.insert(bead.clone(), MergeSlot::new(bead, branch));
         Ok(())
@@ -251,6 +262,40 @@ mod tests {
     }
 
     #[test]
+    fn failed_slot_may_resubmit_into_the_queue() {
+        // gtcore-3a1bd4: a CI-failed slot re-enters the queue when the bead is re-dispatched and the
+        // agent re-submits the fixed branch. The re-submit overwrites the Failed slot back to Ready
+        // (born-again through the queue), then drives Ready → Merging → Merged cleanly — so the
+        // eventual `complete` is legal (it would be illegal on the terminal Failed slot).
+        let mut b = MergeBoard::default();
+        b.submit("b1".into(), "feat/x".into()).unwrap();
+        b.start("b1").unwrap();
+        b.fail("b1").unwrap();
+        assert_eq!(b.get("b1").unwrap().state, MergeSlotState::Failed);
+
+        // Re-submit of the FAILED slot is allowed and resets it to Ready.
+        b.submit("b1".into(), "feat/x".into()).unwrap();
+        assert_eq!(b.get("b1").unwrap().state, MergeSlotState::Ready);
+        // The fixed branch goes through the queue to Merged.
+        b.start("b1").unwrap();
+        b.complete("b1").unwrap();
+        assert_eq!(b.get("b1").unwrap().state, MergeSlotState::Merged);
+    }
+
+    #[test]
+    fn in_flight_and_merged_slots_still_reject_resubmit() {
+        // The Failed exception is narrow: a slot in flight (Ready/Merging) or terminal (Merged) is a
+        // genuine duplicate and stays rejected, so a stray re-submit never disturbs a live merge.
+        let mut b = MergeBoard::default();
+        b.submit("b1".into(), "feat/x".into()).unwrap();
+        assert!(b.submit("b1".into(), "feat/x".into()).is_err(), "Ready rejects re-submit");
+        b.start("b1").unwrap();
+        assert!(b.submit("b1".into(), "feat/x".into()).is_err(), "Merging rejects re-submit");
+        b.complete("b1").unwrap();
+        assert!(b.submit("b1".into(), "feat/x".into()).is_err(), "Merged rejects re-submit");
+    }
+
+    #[test]
     fn from_slots_rehydrates_states_for_command_validation() {
         // A repo projection carries each slot's *current* state, not just `Ready`. The board
         // must come back with those states so a follow-up command validates correctly.
@@ -290,6 +335,55 @@ mod tests {
                 ("b1".into(), MergeSlotState::Merged),
                 ("b2".into(), MergeSlotState::Failed),
             ]
+        );
+    }
+
+    /// A5 (gtcore-f3a016) — **the merge queue is the only path to `main`**, codified as a slot
+    /// state-machine invariant. `Merged` is the "landed on main" terminal; a branch can only
+    /// reach it by passing through the queue: `submit` (→ `Ready`) → `start` (→ `Merging`) →
+    /// `complete` (→ `Merged`). This test pins that there is NO transition that jumps the queue:
+    /// `Merged` is reachable *exclusively* from `Merging`, `Merging` *exclusively* from `Ready`,
+    /// and a slot is *born* `Ready` (so no `Merging`/`Merged` slot can be fabricated off-queue).
+    #[test]
+    fn merge_queue_is_the_only_path_to_main() {
+        use MergeSlotState::{Failed, Merged, Merging, Ready};
+
+        // The ONLY legal transition into `Merged` (≙ on main) is `Merging → Merged`.
+        for from in [Ready, Merging, Merged, Failed] {
+            let mut s = MergeSlot { bead: "b".into(), branch: "x".into(), state: from };
+            assert_eq!(
+                s.transition(Merged).is_ok(),
+                from == Merging,
+                "Merged reachable only from Merging, never from {from:?}"
+            );
+        }
+        // The ONLY legal transition into `Merging` (the queue admit) is `Ready → Merging`.
+        for from in [Ready, Merging, Merged, Failed] {
+            let mut s = MergeSlot { bead: "b".into(), branch: "x".into(), state: from };
+            assert_eq!(
+                s.transition(Merging).is_ok(),
+                from == Ready,
+                "Merging reachable only from a Ready (submitted/queued) slot, never from {from:?}"
+            );
+        }
+
+        // A slot is always born `Ready`: both the public constructor and the queue's `submit`
+        // start there, so a `Merging`/`Merged` slot can never be conjured outside the queue.
+        assert_eq!(MergeSlot::new("b", "x").state, Ready);
+        let mut board = MergeBoard::default();
+        board.submit("b".into(), "x".into()).unwrap();
+        assert_eq!(board.get("b").unwrap().state, Ready);
+
+        // You cannot start (or complete) a merge for a bead the queue never admitted — there is
+        // no back door that lands an unsubmitted branch on main.
+        let mut empty = MergeBoard::default();
+        assert!(
+            empty.start("ghost").is_err(),
+            "cannot start a merge for a bead the queue never admitted"
+        );
+        assert!(
+            empty.complete("ghost").is_err(),
+            "cannot complete a merge for a bead the queue never admitted"
         );
     }
 }

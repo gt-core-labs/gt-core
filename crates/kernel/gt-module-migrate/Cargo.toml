@@ -14,3 +14,5 @@ gt-module = { workspace = true }
 # Async runtime for the GT_PG_URL-gated apply/disable/reactivate/purge
 # integration test (hq-mod-migrate.5).
 tokio = { workspace = true }
+# Ephemeral-PG guard (gtcore-d43955): fail-closed before any test statement.
+gt-store-pg = { workspace = true }

@@ -16,11 +16,11 @@ use axum::http::{Request, StatusCode};
 use serde_json::{json, Value};
 use tower::ServiceExt; // oneshot
 
-use gt_agent::http::{agent_router, AgentApiState};
+use gt_agent::http::{agent_router, AgentApiState, FileAgentLog};
 
 /// Build the REST router over a throwaway event-log root.
 fn router(root: &std::path::Path) -> axum::Router {
-    agent_router(AgentApiState::new(root.to_path_buf()))
+    agent_router(AgentApiState::new(std::sync::Arc::new(FileAgentLog::new(root.to_path_buf()))))
 }
 
 /// Send a request and return `(status, parsed-json-or-null)`.
@@ -113,6 +113,39 @@ async fn lifecycle_events_fold_the_session_state() {
     assert_eq!(body["event"], "agent.killed.v1");
     let (_, info) = send(&app, get("/s2")).await;
     assert_eq!(info["state"], "killed");
+}
+
+#[tokio::test]
+async fn pause_then_resume_folds_state_in_place() {
+    // B2 (gtcore-5731e9): pause-in-place records `agent.paused.v1` and folds the session to
+    // `paused` without killing it; resume records `agent.resumed.v1` and folds it back to
+    // `working`. The SIGSTOP/SIGCONT side effect targets a tmux pane that does not exist under
+    // the test, so it is a silent no-op — the event recording + state fold is what we assert.
+    let dir = tempfile::TempDir::new().unwrap();
+    let app = router(dir.path());
+    send(&app, post_json("/", json!({ "session": "s1", "rig": "granite" }))).await;
+
+    let (status, body) = send(&app, post_json("/s1/pause", json!({ "reason": "escalation" }))).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["event"], "agent.paused.v1");
+    let (_, info) = send(&app, get("/s1")).await;
+    assert_eq!(info["state"], "paused", "Paused folds the session to paused, not killed");
+
+    let (status, body) = send(&app, post_empty("/s1/resume")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["event"], "agent.resumed.v1");
+    let (_, info) = send(&app, get("/s1")).await;
+    assert_eq!(info["state"], "working", "Resumed folds the session back to working");
+}
+
+#[tokio::test]
+async fn pause_on_unknown_session_is_404() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let app = router(dir.path());
+    let (status, _) = send(&app, post_json("/nope/pause", json!({ "reason": "x" }))).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    let (status, _) = send(&app, post_empty("/nope/resume")).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
 }
 
 #[tokio::test]

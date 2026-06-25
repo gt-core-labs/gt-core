@@ -19,14 +19,18 @@
 //!   log, executes, and appends the produced event(s) back (see [`EventLog`]).
 
 pub mod a2a_delegate;
+pub mod a2a_msg;
 pub mod agent;
 pub mod analytics;
 pub mod comments;
 pub mod audit;
 pub mod convoy;
+pub mod cross_ws;
 pub mod dispatch;
+pub mod domain_catalog;
 pub mod documents;
 pub mod email;
+pub mod escalate;
 pub mod invites;
 pub mod report;
 pub mod eventlog;
@@ -42,17 +46,21 @@ pub mod util;
 pub mod workspace;
 
 pub use a2a_delegate::A2aDelegateHandler;
+pub use a2a_msg::A2aMessageHandler;
 pub use agent::AgentHandler;
+pub use cross_ws::CrossWsGrants;
 pub use audit::AuditHandler;
 pub use convoy::ConvoyHandler;
 pub use dispatch::DispatchHandler;
+pub use domain_catalog::DomainCatalogHandler;
 pub use analytics::AnalyticsHandler;
 pub use comments::CommentsHandler;
 pub use email::EmailHandler;
+pub use escalate::EscalateHandler;
 pub use invites::InvitesHandler;
 pub use report::ReportHandler;
 pub use documents::{DocumentsHandler, PgDocumentsResource};
-pub use eventlog::{EventLog, EventLogIssueSink};
+pub use eventlog::{EventLog, EventLogIssueSink, EventLogRigSink};
 pub use graph::{GraphHandler, RigProvisioner};
 pub use memory::MemoryHandler;
 pub use merge::MergeHandler;
@@ -60,8 +68,9 @@ pub use notify::NotifyHandler;
 pub use pools::WsPools;
 pub use quota::{QuotaBlockGuard, QuotaHandler};
 pub use rest_backings::{
-    EventLogConvoy, EventLogFeed, EventLogGraph, EventLogHooks, EventLogMerges, EventLogQuota,
-    EventLogSkills, FsAccountCatalog, GraphHandlerRefresher, IdentityDoltMeStats, WsPoolRigs,
+    EventLogAgentEvents, EventLogConvoy, EventLogFeed, EventLogGraph, EventLogHooks,
+    EventLogMerges, EventLogQuota, EventLogSkills, FsAccountCatalog, GraphHandlerRefresher,
+    IdentityDoltMeStats, WsPoolRigs,
 };
 pub use rig::{PgRigPrefixes, RigHandler};
 pub use workspace::{CompositionTenantProvisioner, PgWorkspaceStatus, WorkspaceHandler};

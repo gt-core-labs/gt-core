@@ -19,6 +19,7 @@ pub mod pool;
 pub mod restart;
 pub mod supervisor;
 pub mod tmux;
+pub mod wedge;
 
 pub use hooks::{hook_bead_for_spawn, hook_env, resolve_env_hook_bead, GT_HOOK_ACCOUNT, GT_HOOK_BEAD};
 pub use install::{
@@ -32,11 +33,13 @@ pub use manifest::{hooks_from_settings, skills_from_worktree};
 pub use pool::{AllocError, ExhaustedScope, PoolAllocator};
 pub use module::SessionsModule;
 pub use lifecycle::{
-    polecat_prompt, spawn_process, spawn_tmux, PolecatLifecycle, SpawnSpec, SpawnTemplate,
-    SpawnedPolecat, GT_WORKSPACE,
+    checkpoint_protocol, polecat_prompt, rust_premerge_gate, spawn_process, spawn_tmux,
+    PolecatLifecycle, SpawnSpec,
+    SpawnTemplate, SpawnedPolecat, GT_WORKSPACE,
 };
 pub use restart::{RestartConfig, RestartTracker};
 pub use supervisor::{
     supervise_daemon, supervise_polecat, watch, PolecatSupervisor, RespawnPolicy, WatchOutcome,
 };
 pub use tmux::{tmux_server_name, FakeTmux, Tmux, TmuxCli};
+pub use wedge::{classify_wedge, WedgeDialog, WedgeRecovery};

@@ -22,7 +22,7 @@ use sqlx::{PgPool, Row};
 
 use gt_events::AppError;
 
-use crate::state::RigEntry;
+use crate::state::{DispatchMode, RigEntry};
 use crate::RigRepository;
 
 /// Postgres-backed [`RigRepository`](crate::RigRepository).
@@ -54,6 +54,13 @@ fn backend(e: sqlx::Error) -> AppError {
 fn row_to_entry(row: &PgRow) -> Result<RigEntry, AppError> {
     let registered_at: i64 = row.try_get("registered_at").map_err(backend)?;
     let worktree_root: Option<String> = row.try_get("worktree_root").map_err(backend)?;
+    // TEXT[] → Vec<String>. The column is `NOT NULL DEFAULT '{}'` (migration 0004) so a pre-B3
+    // row reads back as an empty list — discoverable by prefix only, the pre-tags behaviour.
+    let semantic_tags: Vec<String> = row.try_get("semantic_tags").map_err(backend)?;
+    // TEXT → DispatchMode. The column is `NOT NULL DEFAULT 'auto'` (migration 0005), so a pre-H1
+    // row reads back as `auto` — dispatchable, the back-compat default; `from_db` also maps any
+    // unrecognised value to `auto` defensively.
+    let dispatch_mode: String = row.try_get("dispatch_mode").map_err(backend)?;
     Ok(RigEntry {
         name: row.try_get("name").map_err(backend)?,
         prefix: row.try_get("prefix").map_err(backend)?,
@@ -64,6 +71,8 @@ fn row_to_entry(row: &PgRow) -> Result<RigEntry, AppError> {
         registered_at_secs: registered_at as u64,
         worktree_root: worktree_root.map(PathBuf::from),
         git_connection_ref: row.try_get("git_connection_ref").map_err(backend)?,
+        semantic_tags,
+        dispatch_mode: DispatchMode::from_db(&dispatch_mode),
     })
 }
 
@@ -84,8 +93,8 @@ impl RigRepository for PgRigs {
             sqlx::query(
                 "INSERT INTO rigs \
                    (name, prefix, git_url, push_url, upstream_url, default_branch, registered_at, \
-                    worktree_root, git_connection_ref) \
-                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) \
+                    worktree_root, git_connection_ref, semantic_tags, dispatch_mode) \
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11) \
                  ON CONFLICT (name) DO UPDATE SET \
                    prefix = EXCLUDED.prefix, \
                    git_url = EXCLUDED.git_url, \
@@ -93,7 +102,9 @@ impl RigRepository for PgRigs {
                    upstream_url = EXCLUDED.upstream_url, \
                    default_branch = EXCLUDED.default_branch, \
                    worktree_root = EXCLUDED.worktree_root, \
-                   git_connection_ref = EXCLUDED.git_connection_ref",
+                   git_connection_ref = EXCLUDED.git_connection_ref, \
+                   semantic_tags = EXCLUDED.semantic_tags, \
+                   dispatch_mode = EXCLUDED.dispatch_mode",
             )
             .bind(&entry.name)
             .bind(&entry.prefix)
@@ -104,6 +115,8 @@ impl RigRepository for PgRigs {
             .bind(entry.registered_at_secs as i64)
             .bind(&worktree_root)
             .bind(&entry.git_connection_ref)
+            .bind(&entry.semantic_tags)
+            .bind(entry.dispatch_mode.as_str())
             .execute(&pool)
             .await
             .map_err(backend)?;
@@ -130,7 +143,8 @@ impl RigRepository for PgRigs {
         async move {
             let row = sqlx::query(
                 "SELECT name, prefix, git_url, push_url, upstream_url, default_branch, \
-                        registered_at, worktree_root, git_connection_ref \
+                        registered_at, worktree_root, git_connection_ref, semantic_tags, \
+                        dispatch_mode \
                  FROM rigs WHERE name = $1",
             )
             .bind(&name)
@@ -163,7 +177,8 @@ impl RigRepository for PgRigs {
         async move {
             let rows = sqlx::query(
                 "SELECT name, prefix, git_url, push_url, upstream_url, default_branch, \
-                        registered_at, worktree_root, git_connection_ref \
+                        registered_at, worktree_root, git_connection_ref, semantic_tags, \
+                        dispatch_mode \
                  FROM rigs ORDER BY name",
             )
             .fetch_all(&pool)

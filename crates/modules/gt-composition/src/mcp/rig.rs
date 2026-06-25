@@ -2,8 +2,8 @@
 //!
 //! Routes the rig catalog tools — `rig.add`, `rig.adopt`, `rig.remove`,
 //! `rig.set-prefix`, `rig.set-default-branch`, `rig.set-worktree-root`, plus the
-//! `rig.list` / `rig.info` / `rig.lookup-by-prefix` reads — onto the [`RigCommand`]
-//! decide/apply layer over the PG-backed [`PgRigs`] adapter.
+//! `rig.list` / `rig.info` / `rig.lookup-by-prefix` / `rig.readiness` reads — onto the
+//! [`RigCommand`] decide/apply layer over the PG-backed [`PgRigs`] adapter.
 //!
 //! Each mutation hydrates the [`RigCatalog`] from the tenant's `rigs` table,
 //! runs the command's `execute` (validate + mutate the in-memory catalog,
@@ -23,8 +23,9 @@ use gt_events::Command;
 use gt_mcp_server::{DomainCtx, DomainHandler, WorkspaceRigPrefixes};
 use gt_module::McpTool;
 use gt_rig::{
-    AddRig, AdoptRig, PgRigs, RemoveRig, RigCatalog, RigEntry, RigRepository, SetRigDefaultBranch,
-    SetRigPrefix, SetRigWorktreeRoot, RESERVED_RIG_NAMES,
+    AddRig, AdoptRig, DispatchMode, HoldRig, PgRigs, RemoveRig, ResumeRig, RigCatalog, RigEntry,
+    RigEvent, RigEventSink, RigReadiness, RigRepository, SetRigConnection, SetRigDefaultBranch,
+    SetRigPrefix, SetRigTags, SetRigWorktreeRoot, RESERVED_RIG_NAMES,
 };
 use gt_store_dolt::AppError;
 
@@ -34,12 +35,81 @@ use super::util::{descriptor, opt, req};
 /// PG-backed handler for the `rig.*` tool namespace.
 pub struct RigHandler {
     pools: Arc<WsPools>,
+    /// Optional observability sink for the dispatch-mode transitions (`rig.held.v1` /
+    /// `rig.resumed.v1`, rig-hold H1). `None` ⇒ emission is a silent no-op (the catalog mutation
+    /// still persists). The server wiring backs it with the per-workspace event log; tests leave it
+    /// `None`.
+    event_sink: Option<Arc<dyn RigEventSink>>,
 }
 
 impl RigHandler {
-    /// Wrap the per-workspace pool cache.
+    /// Wrap the per-workspace pool cache. No event sink — `rig.hold`/`rig.resume` still mutate and
+    /// persist, but emit no audit event (use [`with_event_sink`](Self::with_event_sink) to wire
+    /// one). Keeps the existing single-arg call sites (tests, parity harness) working.
     pub fn new(pools: Arc<WsPools>) -> Self {
-        Self { pools }
+        Self {
+            pools,
+            event_sink: None,
+        }
+    }
+
+    /// Attach the observability sink for dispatch-mode transitions (rig-hold H1). Builder-style so
+    /// the server wiring can opt in (`RigHandler::new(pools).with_event_sink(sink)`).
+    pub fn with_event_sink(mut self, sink: Arc<dyn RigEventSink>) -> Self {
+        self.event_sink = Some(sink);
+        self
+    }
+
+    /// Apply a `rig.hold` / `rig.resume` transition idempotently (rig-hold H1).
+    ///
+    /// `cmd.validate` enforces existence (an absent rig is `NotFound`). The **idempotency gate** is
+    /// here, not in the command: if the rig is already in `target`, this returns `ok` with
+    /// `changed:false` and emits **no** event — so the log never carries a duplicate
+    /// `rig.held.v1` / `rig.resumed.v1`. On a real transition, `cmd.execute` mutates the hydrated
+    /// catalog and produces the event; the touched row is upserted, then the event is emitted to
+    /// the observability sink (best-effort — a sink failure does not fail the committed mutation).
+    async fn apply_dispatch_mode<C>(
+        &self,
+        repo: &PgRigs,
+        workspace: Option<&str>,
+        name: &str,
+        target: DispatchMode,
+        cmd: &C,
+    ) -> Result<Value, AppError>
+    where
+        C: gt_events::Command<State = RigCatalog, Output = RigEvent>,
+    {
+        let mut catalog = hydrate(repo).await?;
+        // Existence check (NotFound for an unknown rig). Idempotency is NOT a validation fault.
+        cmd.validate(&catalog).map_err(ev_err)?;
+        let current = catalog
+            .get(name)
+            .map(|e| e.dispatch_mode)
+            .unwrap_or_default();
+        if current == target {
+            // Already in the target mode: a successful no-op, no row write, no event.
+            return Ok(json!({
+                "ok": true,
+                "rig": name,
+                "dispatch_mode": target.as_str(),
+                "changed": false,
+            }));
+        }
+        let event = cmd.execute(&mut catalog).map_err(ev_err)?;
+        let entry = catalog
+            .get(name)
+            .cloned()
+            .ok_or_else(|| AppError::Other(format!("rig {name} missing after execute")))?;
+        repo.upsert(&entry).await.map_err(ev_err)?;
+        if let Some(sink) = &self.event_sink {
+            sink.emit(workspace, &event);
+        }
+        Ok(json!({
+            "ok": true,
+            "rig": name,
+            "dispatch_mode": target.as_str(),
+            "changed": true,
+        }))
     }
 }
 
@@ -90,6 +160,36 @@ impl DomainHandler for RigHandler {
                 &[req("name", "string"), req("new_root", "string")],
             ),
             descriptor(
+                "rig.set-tags",
+                "Replace a rig's semantic capability tags (e.g. rust, frontend, infra) so peers \
+                 can find it by capability via a2a.discover. Pass the full desired set; \
+                 normalised (lowercased, deduped). An empty list clears all tags.",
+                &[req("name", "string"), opt("tags", "array")],
+            ),
+            descriptor(
+                "rig.set-connection",
+                "Bind (or clear) the VCS connection a rig clones/pushes with — its \
+                 git_connection_ref, a public.vcs_connections.id (e.g. a GitHub App installation). \
+                 The only way to (re)connect an existing rig: add/adopt reject a registered name. \
+                 Pass git_connection_ref to bind; omit it or pass \"\" to clear (back to the \
+                 operator-mounted token path).",
+                &[req("name", "string"), opt("git_connection_ref", "string")],
+            ),
+            descriptor(
+                "rig.hold",
+                "Put a rig on dispatch hold (dispatch_mode=hold) so an operator can intervene \
+                 without colliding with the orchestrator. Idempotent: holding an already-held rig \
+                 is a successful no-op. Records rig.held.v1 with the reason.",
+                &[req("name", "string"), opt("reason", "string")],
+            ),
+            descriptor(
+                "rig.resume",
+                "Take a rig off dispatch hold (dispatch_mode=auto), restoring orchestrator \
+                 dispatch + watchdog re-sling. Idempotent: resuming an already-auto rig is a \
+                 successful no-op. Records rig.resumed.v1.",
+                &[req("name", "string")],
+            ),
+            descriptor(
                 "rig.remove",
                 "Remove a rig from the catalog.",
                 &[req("name", "string")],
@@ -104,6 +204,14 @@ impl DomainHandler for RigHandler {
                 "rig.lookup-by-prefix",
                 "Resolve the rig owning a given bead-id prefix.",
                 &[req("prefix", "string")],
+            ),
+            descriptor(
+                "rig.readiness",
+                "Check whether rigs are provisioned for autonomous, parallel polecat operation \
+                 (clonable, push_url set for auto-push, worktree_root pinned). Pass `name` for \
+                 one rig; omit it to sweep the whole catalog and get an `all_ready` verdict plus \
+                 the not-ready rigs and their gaps.",
+                &[opt("name", "string")],
             ),
         ]
     }
@@ -132,6 +240,26 @@ impl DomainHandler for RigHandler {
             "rig.set-worktree-root" => {
                 let cmd: SetRigWorktreeRoot = parse_cmd(ctx.args)?;
                 apply_and_upsert(&repo, cmd.name.clone(), &cmd).await
+            }
+            "rig.set-tags" => {
+                let cmd: SetRigTags = parse_cmd(ctx.args)?;
+                apply_and_upsert(&repo, cmd.name.clone(), &cmd).await
+            }
+            "rig.set-connection" => {
+                let cmd: SetRigConnection = parse_cmd(ctx.args)?;
+                apply_and_upsert(&repo, cmd.name.clone(), &cmd).await
+            }
+            "rig.hold" => {
+                let cmd: HoldRig = parse_cmd(ctx.args)?;
+                let name = cmd.name.clone();
+                self.apply_dispatch_mode(&repo, ctx.workspace, &name, DispatchMode::Hold, &cmd)
+                    .await
+            }
+            "rig.resume" => {
+                let cmd: ResumeRig = parse_cmd(ctx.args)?;
+                let name = cmd.name.clone();
+                self.apply_dispatch_mode(&repo, ctx.workspace, &name, DispatchMode::Auto, &cmd)
+                    .await
             }
             "rig.remove" => {
                 let cmd: RemoveRig = parse_cmd(ctx.args)?;
@@ -166,6 +294,45 @@ impl DomainHandler for RigHandler {
                         None => Err(AppError::NotFound(format!("rig {name}"))),
                     },
                     None => Err(AppError::NotFound(format!("rig for prefix {prefix:?}"))),
+                }
+            }
+            "rig.readiness" => {
+                // One rig when `name` is given; otherwise a catalog-wide sweep (hq-29ea8a B2/B3)
+                // so an operator can verify "all rigs ready" in a single call instead of reading
+                // each `rig.info` by hand.
+                match ctx.args.get("name").and_then(Value::as_str) {
+                    Some(name) => match repo.get(name).await.map_err(ev_err)? {
+                        Some(entry) => Ok(json!({
+                            "rig": entry.name,
+                            "readiness": readiness_json(&entry.readiness()),
+                        })),
+                        None => Err(AppError::NotFound(format!("rig {name}"))),
+                    },
+                    None => {
+                        let rigs = repo.list().await.map_err(ev_err)?;
+                        let mut all_ready = true;
+                        let mut not_ready = Vec::new();
+                        let assessed = rigs
+                            .iter()
+                            .map(|entry| {
+                                let r = entry.readiness();
+                                if !r.ready() {
+                                    all_ready = false;
+                                    not_ready.push(entry.name.clone());
+                                }
+                                json!({
+                                    "rig": entry.name,
+                                    "readiness": readiness_json(&r),
+                                })
+                            })
+                            .collect::<Vec<_>>();
+                        Ok(json!({
+                            "all_ready": all_ready,
+                            "total": assessed.len(),
+                            "not_ready": not_ready,
+                            "rigs": assessed,
+                        }))
+                    }
                 }
             }
             other => Err(AppError::Validation(format!("unknown tool `{other}`"))),
@@ -271,6 +438,27 @@ fn entry_json(entry: &RigEntry) -> Value {
         "registered_at_secs": entry.registered_at_secs,
         "worktree_root": entry.worktree_root,
         "git_connection_ref": entry.git_connection_ref,
+        "semantic_tags": entry.semantic_tags,
+        // rig-hold H1: surface the dispatch mode (auto|hold) inline so `rig.info` / `rig.list`
+        // answer "is this rig paused?" directly — the read the UI badge (H4) and the
+        // scheduler/watchdogs (H2/H3) consume.
+        "dispatch_mode": entry.dispatch_mode.as_str(),
+        // hq-29ea8a B2/B3: surface autonomous-operation readiness inline so `rig.info` /
+        // `rig.list` answer "is this rig wired for parallel polecats + auto-push?" directly.
+        "readiness": readiness_json(&entry.readiness()),
+    })
+}
+
+/// Shape a [`RigReadiness`] as a dispatch payload, flattening the `ready()` verdict alongside
+/// the individual checks so callers can branch on one boolean (`ready`) or inspect the gaps.
+fn readiness_json(r: &RigReadiness) -> Value {
+    json!({
+        "ready": r.ready(),
+        "has_clone_url": r.has_clone_url,
+        "has_push_url": r.has_push_url,
+        "worktree_root_pinned": r.worktree_root_pinned,
+        "gaps": r.gaps,
+        "advisories": r.advisories,
     })
 }
 
@@ -323,12 +511,15 @@ mod tests {
             return;
         };
         let pool = PgPool::connect(&url).await.expect("connect postgres");
-        // The module owns the `rigs` schema (ws_default template); apply it.
+        // The module owns the `rigs` schema (ws_default template); apply every migration in
+        // order so follow-on columns (worktree_root, git_connection_ref, semantic_tags) exist.
         let migs = gt_rig::RigsModule.migrations();
-        sqlx::raw_sql(&migs[0].sql)
-            .execute(&pool)
-            .await
-            .expect("apply rigs migration");
+        for mig in &migs {
+            sqlx::raw_sql(&mig.sql)
+                .execute(&pool)
+                .await
+                .unwrap_or_else(|e| panic!("apply rigs migration {}: {e}", mig.name));
+        }
         sqlx::raw_sql("DELETE FROM ws_default.rigs WHERE name = 'dispatchrig'")
             .execute(&pool)
             .await
@@ -365,6 +556,23 @@ mod tests {
             .unwrap();
         assert_eq!(info["prefix"], "dr");
         assert_eq!(info["default_branch"], "main");
+        // hq-29ea8a B2/B3: rig.info carries the readiness verdict inline. This rig was added
+        // without a push_url, so it is clonable but not ready (refinery cannot auto-push).
+        assert_eq!(info["readiness"]["has_clone_url"], true);
+        assert_eq!(info["readiness"]["has_push_url"], false);
+        assert_eq!(info["readiness"]["ready"], false);
+
+        // The dedicated readiness sweep (no `name`) flags the same rig as not-ready.
+        let sweep = handler
+            .dispatch("rig.readiness", ctx(json!({})))
+            .await
+            .unwrap();
+        assert_eq!(sweep["all_ready"], false);
+        assert!(sweep["not_ready"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|n| n == "dispatchrig"));
 
         handler
             .dispatch(
@@ -395,6 +603,83 @@ mod tests {
             info3["worktree_root"], "/srv/wt/dispatchrig",
             "worktree_root override persisted to PG"
         );
+
+        // Set semantic tags (B3); they normalise + round-trip through the new TEXT[] column.
+        handler
+            .dispatch(
+                "rig.set-tags",
+                ctx(json!({ "name": "dispatchrig", "tags": [" Rust ", "infra", "RUST"] })),
+            )
+            .await
+            .unwrap();
+        let info_tags = handler
+            .dispatch("rig.info", ctx(json!({ "name": "dispatchrig" })))
+            .await
+            .unwrap();
+        assert_eq!(
+            info_tags["semantic_tags"],
+            json!(["rust", "infra"]),
+            "semantic_tags normalised + persisted to PG"
+        );
+
+        // rig-hold H1: dispatch_mode defaults to auto, holds, is idempotent, and resumes.
+        let info_default = handler
+            .dispatch("rig.info", ctx(json!({ "name": "dispatchrig" })))
+            .await
+            .unwrap();
+        assert_eq!(
+            info_default["dispatch_mode"], "auto",
+            "a never-held rig defaults to auto"
+        );
+
+        let held = handler
+            .dispatch(
+                "rig.hold",
+                ctx(json!({ "name": "dispatchrig", "reason": "operator intervention" })),
+            )
+            .await
+            .unwrap();
+        assert_eq!(held["changed"], true);
+        assert_eq!(held["dispatch_mode"], "hold");
+        let info_held = handler
+            .dispatch("rig.info", ctx(json!({ "name": "dispatchrig" })))
+            .await
+            .unwrap();
+        assert_eq!(info_held["dispatch_mode"], "hold", "hold persisted to PG");
+
+        // Re-holding is an idempotent no-op: ok, no error, changed:false.
+        let rehold = handler
+            .dispatch("rig.hold", ctx(json!({ "name": "dispatchrig" })))
+            .await
+            .unwrap();
+        assert_eq!(rehold["changed"], false, "re-hold is an idempotent no-op");
+        assert_eq!(rehold["dispatch_mode"], "hold");
+
+        // Holding an unknown rig is NotFound.
+        let ghost = handler
+            .dispatch("rig.hold", ctx(json!({ "name": "ghostrig" })))
+            .await
+            .unwrap_err();
+        assert!(matches!(ghost, AppError::NotFound(_)));
+
+        let resumed = handler
+            .dispatch("rig.resume", ctx(json!({ "name": "dispatchrig" })))
+            .await
+            .unwrap();
+        assert_eq!(resumed["changed"], true);
+        assert_eq!(resumed["dispatch_mode"], "auto");
+        let info_resumed = handler
+            .dispatch("rig.info", ctx(json!({ "name": "dispatchrig" })))
+            .await
+            .unwrap();
+        assert_eq!(info_resumed["dispatch_mode"], "auto", "resume persisted to PG");
+
+        // Re-resuming is likewise an idempotent no-op.
+        let reresume = handler
+            .dispatch("rig.resume", ctx(json!({ "name": "dispatchrig" })))
+            .await
+            .unwrap();
+        assert_eq!(reresume["changed"], false, "re-resume is an idempotent no-op");
 
         // Resolve the rig back from its (changed) prefix.
         let by_prefix = handler

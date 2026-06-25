@@ -26,11 +26,12 @@ use gt_module_mcp::taxonomy::{validate as taxonomy_validate, BeadTaxonomy};
 use gt_store_dolt::{AppError, IssuePatch, IssuePhase, IssueStatus, NewIssue};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
+use time::{Date, Month};
 
 use crate::surface::{
     check_surface_existence, check_surface_shape, surface_to_json, SurfaceEntry, SurfaceTree,
 };
-use crate::taxonomy::{Dispatch, Domain, IssueType};
+use crate::taxonomy::{Dispatch, IssueType, RoleScope};
 
 /// Map a [`gt_module_mcp::taxonomy::TaxonomyError`] onto the store's
 /// [`AppError::Validation`] so the NN-16 rejection surfaces with the same
@@ -39,9 +40,14 @@ fn taxonomy_err(e: gt_module_mcp::taxonomy::TaxonomyError) -> AppError {
     AppError::Validation(e.to_string())
 }
 
-/// Reject a planning date that is neither empty (the clear sentinel) nor
-/// `YYYY-MM-DD`-shaped (hq-62130a). Shape-only — calendar validity (e.g. a
-/// month 13) is left to the DATE column, which rejects it at execute.
+/// Reject a planning date that is neither empty (the clear sentinel) nor a real
+/// `YYYY-MM-DD` calendar date (hq-62130a, gtcore-9c95d3). The shape guard runs
+/// first (exactly ten `YYYY-MM-DD` bytes) so the report never sees a loosely
+/// formatted date; then [`Date::from_calendar_date`] rejects an *impossible* one
+/// — `2026-02-31`, `2026-13-01`, `2026-00-10` — that the shape-only check let
+/// through. start_date/due_date feed the planning report ("Fecha Inicio"/"Fecha
+/// Fin") and the retrasos metric and are auto-filled on transitions
+/// (gtcore-fdc175), so a calendar-invalid value would corrupt the report.
 fn check_date(field: &str, value: &str) -> Result<(), AppError> {
     if value.is_empty() {
         return Ok(()); // clear-to-NULL sentinel, mirrors assignee/external_ref
@@ -56,6 +62,18 @@ fn check_date(field: &str, value: &str) -> Result<(), AppError> {
             "{field} must be YYYY-MM-DD (or empty to clear), got `{value}`"
         )));
     }
+    // Shape guarantees ASCII digits at these positions, so the slices parse and
+    // we only need `time` to reject the calendar-impossible combinations.
+    let calendar_invalid = || {
+        AppError::Validation(format!(
+            "{field} must be a real calendar date (YYYY-MM-DD), got `{value}`"
+        ))
+    };
+    let year: i32 = value[0..4].parse().expect("shape guarantees 4 ascii digits");
+    let month: u8 = value[5..7].parse().expect("shape guarantees 2 ascii digits");
+    let day: u8 = value[8..10].parse().expect("shape guarantees 2 ascii digits");
+    let month = Month::try_from(month).map_err(|_| calendar_invalid())?;
+    Date::from_calendar_date(year, month, day).map_err(|_| calendar_invalid())?;
     Ok(())
 }
 
@@ -101,15 +119,12 @@ fn check_depends_on(id: &str, deps: &[String]) -> Result<(), AppError> {
     Ok(())
 }
 
-/// JSON-array string for a list of plain strings; `"[]"` on the (infallible)
-/// serialize error path, matching the store's NOT-NULL default.
-fn to_json_array(items: &[String]) -> String {
-    serde_json::to_string(items).unwrap_or_else(|_| "[]".to_string())
-}
-
-/// JSON-array string for the closed-set [`Domain`] values (e.g.
-/// `["orch.merge","store.dolt"]`). Same NOT-NULL `"[]"` fallback.
-fn domain_to_json(items: &[Domain]) -> String {
+/// JSON-array string for the bead's `domain` keys (e.g.
+/// `["orch.merge","store.dolt"]`). The values are now free strings validated at
+/// runtime against the workspace's `domain_catalog` (gtcore-d81e77 H2), not the
+/// closed `Domain` enum; the store column already persisted this JSON-array
+/// shape, so the wire form round-trips unchanged. Same NOT-NULL `"[]"` fallback.
+fn domain_to_json(items: &[String]) -> String {
     serde_json::to_string(items).unwrap_or_else(|_| "[]".to_string())
 }
 
@@ -177,10 +192,13 @@ pub struct CreateIssue {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub owner: Option<String>,
     /// Semantic domains the bead affects (doc 14 §3). At least one is required.
-    /// Closed set ([`Domain`]): an out-of-set value is rejected at deserialization
-    /// (hq-core-mcp.3).
+    /// Free strings validated at RUNTIME against the bead workspace's
+    /// `domain_catalog` (gtcore-d81e77 H2): each must exist and be enabled in that
+    /// workspace's catalog, otherwise the create is rejected naming the workspace's
+    /// set. The old closed `Domain` enum is now only the technical seed source
+    /// (gtcore-55d5fb H1), not the wire arbiter.
     #[serde(default)]
-    pub domain: Vec<Domain>,
+    pub domain: Vec<String>,
     /// Physical impact surface — crate names or repo paths the bead touches,
     /// each carrying a `planned` intent (docs/10 §S3). A bare string is read as
     /// `planned:false` for back-compat. Empty for pure spec/process work.
@@ -190,9 +208,12 @@ pub struct CreateIssue {
     /// closes). Self-edges and duplicates are rejected at [`Self::validate`].
     #[serde(default)]
     pub depends_on: Vec<String>,
-    /// Responsible role discriminator. Free-form; persisted verbatim.
+    /// Responsible role discriminator. Closed set ([`RoleScope`]): an out-of-set
+    /// value is rejected at deserialization, mirroring `issue_type`/`dispatch`
+    /// (gtcore-b45a2d). Optional — `None` stores SQL `NULL` (not every bead pins
+    /// a role).
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub role_scope: Option<String>,
+    pub role_scope: Option<RoleScope>,
     /// Lifecycle phase (`P1..P4`, hq-core-mcp.7 / docs/10 S1). `None` lets the
     /// column default to `P1`; `Some(_)` is a scalar overwrite validated against
     /// the closed set. Stamp `P4` on a bead gated behind the kernel migration so
@@ -321,11 +342,12 @@ impl CreateIssue {
             issue_type: self.issue_type.as_str().to_string(),
             created_by: self.created_by.clone(),
             parent_id: self.parent_id.clone(),
+            depends_on: self.depends_on.clone(),
             assignee: self.assignee.clone(),
             owner: self.owner.clone(),
             domain_json: domain_to_json(&self.domain),
             surface_json: surface_to_json(&self.surface),
-            role_scope: self.role_scope.clone(),
+            role_scope: self.role_scope.map(|r| r.as_str().to_string()),
             phase: self.phase.clone(),
             rig,
             workspace: self.workspace.clone(),
@@ -375,11 +397,13 @@ pub struct UpdateIssue {
     /// When set non-empty, NN-16 is re-checked against the (possibly also-updated) `issue_type`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parent_id: Option<String>,
-    /// New semantic domains (closed set [`Domain`]). `None` leaves the column
+    /// New semantic domains (free strings, runtime-validated against the bead
+    /// workspace's `domain_catalog` — gtcore-d81e77 H2). `None` leaves the column
     /// untouched; an empty overwrite is rejected (a bead must keep at least one
-    /// domain); an out-of-set value is rejected at deserialization.
+    /// domain); a value outside the workspace catalog is rejected at execute,
+    /// naming the workspace's set.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub domain: Option<Vec<Domain>>,
+    pub domain: Option<Vec<String>>,
     /// New impact surface (object form `[{path,planned}]`, bare string read as
     /// `planned:false`). `None` leaves the column untouched; `Some(_)` overwrites
     /// (empty allowed). This is the field that repoints stale `surface_json` paths
@@ -391,6 +415,12 @@ pub struct UpdateIssue {
     /// detection runs at execute in the store.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub depends_on: Option<Vec<String>>,
+    /// New responsible-role discriminator (closed set [`RoleScope`]). `None`
+    /// leaves the column untouched; `Some(_)` overwrites with the role's bare
+    /// lowercase token; an out-of-set value is rejected at deserialization
+    /// (gtcore-b45a2d).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub role_scope: Option<RoleScope>,
     /// New lifecycle phase (`P1..P4`, hq-core-mcp.7). `None` leaves the column
     /// untouched; `Some(_)` is a scalar overwrite validated against the closed
     /// set (it also re-stamps `phase_ratified_at`). This is how a prose-blocked
@@ -543,8 +573,10 @@ impl UpdateIssue {
             assignee: self.assignee.clone(),
             owner: self.owner.clone(),
             parent_id: self.parent_id.clone(),
+            depends_on: self.depends_on.clone(),
             domain_json: self.domain.as_deref().map(domain_to_json),
             surface_json: self.surface.as_deref().map(surface_to_json),
+            role_scope: self.role_scope.map(|r| r.as_str().to_string()),
             phase: self.phase.clone(),
             expected_version: self.expected_version,
             estimated_hours: self.estimated_hours,
@@ -791,7 +823,7 @@ mod tests {
             parent_id: Some("hq-core-host".into()),
             assignee: None,
             owner: None,
-            domain: vec![Domain::StoreDolt],
+            domain: vec!["store.dolt".to_string()],
             surface: vec![],
             depends_on: vec![],
             role_scope: None,
@@ -818,6 +850,7 @@ mod tests {
             domain: None,
             surface: None,
             depends_on: None,
+            role_scope: None,
             phase: None,
             expected_version: None,
             estimated_hours: None,
@@ -943,6 +976,27 @@ mod tests {
     }
 
     #[test]
+    fn create_to_new_carries_depends_on() {
+        // gtcore-13738c: the wire `depends_on` must reach the store row, not be
+        // validated and dropped. (The repo then persists it into issue_relations.)
+        let mut c = base_create();
+        c.depends_on = vec!["hq-dep-a".into(), "hq-dep-b".into()];
+        let n = c.to_new();
+        assert_eq!(n.depends_on, vec!["hq-dep-a".to_string(), "hq-dep-b".to_string()]);
+    }
+
+    #[test]
+    fn update_to_patch_carries_depends_on() {
+        // gtcore-13738c: issues.update's whole-list `depends_on` overwrite must
+        // reach the patch (None = leave untouched, Some(list) = replace).
+        let mut u = base_update();
+        u.depends_on = Some(vec!["hq-dep-a".into()]);
+        assert_eq!(u.to_patch().depends_on, Some(vec!["hq-dep-a".to_string()]));
+        u.depends_on = None;
+        assert_eq!(u.to_patch().depends_on, None);
+    }
+
+    #[test]
     fn create_surface_serializes_object_form_and_accepts_bare_wire() {
         // A bare-string surface entry on the wire reads as planned:false …
         let mut c = base_create();
@@ -1000,6 +1054,7 @@ mod tests {
             domain: None,
             surface: None,
             depends_on: None,
+            role_scope: None,
             phase: None,
             expected_version: None,
             estimated_hours: None,
@@ -1028,6 +1083,7 @@ mod tests {
             domain: None,
             surface: None,
             depends_on: None,
+            role_scope: None,
             phase: None,
             expected_version: Some(7),
             estimated_hours: None,
@@ -1060,6 +1116,7 @@ mod tests {
             domain: None,
             surface: None,
             depends_on: None,
+            role_scope: None,
             phase: None,
             expected_version: None,
             estimated_hours: None,
@@ -1227,6 +1284,7 @@ mod tests {
             domain: None,
             surface: None,
             depends_on: None,
+            role_scope: None,
             phase: Some("P4".into()),
             expected_version: None,
             estimated_hours: None,
@@ -1277,6 +1335,87 @@ mod tests {
         let mut u = base_update();
         u.dispatch = Some("manual".into());
         assert!(!u.to_patch().is_empty());
+    }
+
+    #[test]
+    fn update_accepts_real_dates_and_clear_but_rejects_bad_shape_and_calendar() {
+        // A real calendar date passes, on either planning field.
+        let mut u = base_update();
+        u.start_date = Some("2026-06-17".into());
+        assert!(u.validate().is_ok());
+        let mut u = base_update();
+        u.due_date = Some("2026-06-17".into());
+        assert!(u.validate().is_ok());
+
+        // Empty string is the clear-to-NULL sentinel (carried into the patch).
+        let mut u = base_update();
+        u.start_date = Some(String::new());
+        assert!(u.validate().is_ok());
+        assert_eq!(u.to_patch().start_date.as_deref(), Some(""));
+
+        // Wrong shape (not YYYY-MM-DD) is rejected.
+        for bad in ["2026-6-17", "2026/06/17", "17-06-2026", "not-a-date", "2026-06-17 "] {
+            let mut u = base_update();
+            u.due_date = Some(bad.into());
+            assert!(
+                matches!(u.validate(), Err(AppError::Validation(_))),
+                "expected bad shape `{bad}` to be rejected"
+            );
+        }
+
+        // Right shape but calendar-impossible is now rejected too (the bead's
+        // core fix): month 13, day 00, and Feb 31 all fail.
+        for bad in ["2026-13-01", "2026-00-10", "2026-02-31", "2026-04-31", "2025-02-29"] {
+            let mut u = base_update();
+            u.start_date = Some(bad.into());
+            assert!(
+                matches!(u.validate(), Err(AppError::Validation(_))),
+                "expected calendar-invalid `{bad}` to be rejected"
+            );
+        }
+
+        // A leap day in a real leap year is a valid calendar date.
+        let mut u = base_update();
+        u.due_date = Some("2024-02-29".into());
+        assert!(u.validate().is_ok());
+    }
+
+    #[test]
+    fn create_carries_role_scope_through_to_new_and_rejects_out_of_set_wire() {
+        // Typed field: to_new serializes the bare lowercase role token.
+        let mut c = base_create();
+        c.role_scope = Some(RoleScope::Sheriff);
+        assert!(c.validate().is_ok());
+        assert_eq!(c.to_new().role_scope.as_deref(), Some("sheriff"));
+        // Omitted ⇒ NULL (not every bead pins a role).
+        assert_eq!(base_create().to_new().role_scope, None);
+        // The closed set bites at deserialization, same plumbing as issue_type.
+        let mut wire = serde_json::to_value(base_create()).unwrap();
+        wire["role_scope"] = serde_json::json!("banana");
+        assert!(serde_json::from_value::<CreateIssue>(wire.clone()).is_err());
+        // The dotted Domain form is not the role_scope wire form.
+        wire["role_scope"] = serde_json::json!("role.sheriff");
+        assert!(serde_json::from_value::<CreateIssue>(wire.clone()).is_err());
+        wire["role_scope"] = serde_json::json!("graphwarden");
+        let parsed: CreateIssue = serde_json::from_value(wire).unwrap();
+        assert_eq!(parsed.role_scope, Some(RoleScope::Graphwarden));
+    }
+
+    #[test]
+    fn update_accepts_role_scope_overwrite_and_rejects_bad() {
+        // Overwrite with a closed-set token.
+        let mut u = base_update();
+        u.role_scope = Some(RoleScope::Refinery);
+        assert!(u.validate().is_ok());
+        assert_eq!(u.to_patch().role_scope.as_deref(), Some("refinery"));
+        // A role_scope-only patch is a non-empty patch.
+        assert!(!u.to_patch().is_empty());
+        // Omitted ⇒ column untouched.
+        assert_eq!(base_update().to_patch().role_scope, None);
+        // Out-of-set rejected at deserialization (the boundary), like issue_type.
+        let mut wire = serde_json::to_value(base_update()).unwrap();
+        wire["role_scope"] = serde_json::json!("banana");
+        assert!(serde_json::from_value::<UpdateIssue>(wire).is_err());
     }
 
     #[test]

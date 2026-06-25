@@ -19,6 +19,25 @@ use gt_events::{AppError, Command};
 use crate::events::QuotaEvent;
 use crate::state::{Account, AccountQuotaStatus, AccountRegistry};
 
+/// Collapse a provider model id to its canonical family (`opus`/`sonnet`/`haiku`).
+///
+/// The hook feeds full ids (`claude-opus-4-8`) while synthetic/MCP samples feed
+/// short aliases (`opus`); grouping the raw string splits one model across several
+/// legend buckets. Both `quota.sample` emit paths (this MCP command and the actor's
+/// live feed handler) run their model through here before emitting `TokensSampled`,
+/// so every consumer (chart, cost weights, per-model breakdown) sees one bucket per
+/// model. Full ids and already-short aliases both collapse to the family; an
+/// unrecognized id is preserved verbatim so we never silently drop a new model.
+pub fn normalize_model(model: &str) -> String {
+    let lower = model.trim().to_ascii_lowercase();
+    for family in ["opus", "sonnet", "haiku"] {
+        if lower == family || lower.contains(family) {
+            return family.to_string();
+        }
+    }
+    model.trim().to_string()
+}
+
 /// A local usage sample (one model response), attributable to a session.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct SampleTokens {
@@ -55,10 +74,11 @@ impl Command for SampleTokens {
 
     fn execute(&self, state: &mut Self::State) -> Result<Self::Output, AppError> {
         self.validate(state)?;
+        let model = normalize_model(&self.model);
         state.apply_sample(
             &self.account,
             &self.session,
-            &self.model,
+            &model,
             self.input,
             self.output,
             self.cache_read,
@@ -68,7 +88,7 @@ impl Command for SampleTokens {
         Ok(QuotaEvent::TokensSampled {
             account: self.account.clone(),
             session: self.session.clone(),
-            model: self.model.clone(),
+            model,
             input: self.input,
             output: self.output,
             cache_read: self.cache_read,
@@ -329,6 +349,7 @@ mod tests {
             last_probe_secs: None,
             sampled_since_probe: 0.0,
             probe_divergence: None,
+            credential_dead: false,
         });
         // acc-2: a healthy standby used by rotate tests as a valid target.
         r.upsert_account(Account::new("acc-2"));
@@ -441,6 +462,40 @@ mod tests {
     }
 
     #[test]
+    fn normalize_model_collapses_to_family() {
+        // Full provider ids collapse to the family.
+        assert_eq!(normalize_model("claude-opus-4-8"), "opus");
+        assert_eq!(normalize_model("claude-sonnet-4-6"), "sonnet");
+        assert_eq!(normalize_model("claude-haiku-4-5-20251001"), "haiku");
+        // Already-short aliases pass through unchanged.
+        assert_eq!(normalize_model("opus"), "opus");
+        assert_eq!(normalize_model("sonnet"), "sonnet");
+        assert_eq!(normalize_model("haiku"), "haiku");
+        // Unknown models are preserved verbatim.
+        assert_eq!(normalize_model("gpt-4o"), "gpt-4o");
+    }
+
+    #[test]
+    fn sample_emits_normalized_model() {
+        let mut r = registry_with_account();
+        let cmd = SampleTokens {
+            account: "acc-1".into(),
+            session: "s1".into(),
+            model: "claude-opus-4-8".into(),
+            input: 100,
+            output: 100,
+            cache_read: 0,
+            cache_creation: 0,
+            now_secs: 600,
+        };
+        let ev = cmd.execute(&mut r).unwrap();
+        match ev {
+            QuotaEvent::TokensSampled { model, .. } => assert_eq!(model, "opus"),
+            other => panic!("expected TokensSampled, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn validate_does_not_mutate() {
         let r = registry_with_account();
         let cmd = SampleTokens {
@@ -528,6 +583,7 @@ mod tests {
             last_probe_secs: None,
             sampled_since_probe: 0.0,
             probe_divergence: None,
+            credential_dead: false,
         });
         let cmd = RotateAccount {
             from_account: "acc-1".into(),
@@ -552,6 +608,7 @@ mod tests {
             last_probe_secs: None,
             sampled_since_probe: 0.0,
             probe_divergence: None,
+            credential_dead: false,
         });
         let cmd = RotateAccount {
             from_account: "acc-1".into(),

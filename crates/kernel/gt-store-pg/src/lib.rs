@@ -55,6 +55,13 @@ pub use report_subscriptions::{
 };
 
 #[cfg(feature = "pg")]
+pub mod report_schedules;
+#[cfg(feature = "pg")]
+pub use report_schedules::{
+    PgReportSchedules, ReportScheduleError, ReportScheduleRow, ReportSchedulesRepository,
+};
+
+#[cfg(feature = "pg")]
 pub mod invites;
 #[cfg(feature = "pg")]
 pub use invites::{Invite, InviteError, InvitesRepository, NewInvite, PgInvites};
@@ -70,6 +77,71 @@ pub use memory_store::{
 pub mod memory_import;
 #[cfg(feature = "pg")]
 pub use memory_import::{import_corpus, ImportError, ImportReport};
+
+/// Fail-closed guard for PG-backed tests (gtcore-d43955).
+///
+/// Call this BEFORE opening any connection to a test database to ensure the URL is ephemeral.
+/// A URL is accepted when the host is `localhost`, `127.0.0.1`, or `::1`, or when the URL
+/// carries `gt_test_only=1` (the explicit opt-in for CI service URLs with non-loopback hosts).
+/// Everything else panics with a descriptive error before any SQL runs — making it impossible
+/// for tests to accidentally reach production/dev Postgres.
+///
+/// # Panics
+/// Panics when `url` does not look ephemeral, with a message that names the DSN and explains
+/// how to mark a CI service URL safe.
+pub fn assert_ephemeral_pg_url(url: &str) {
+    let ephemeral = url.contains("@localhost")
+        || url.contains("@127.0.0.1")
+        || url.contains("@[::1]")
+        || url.contains("gt_test_only=1");
+    if !ephemeral {
+        panic!(
+            "GT_PG_URL does not look ephemeral — refusing to run tests against \
+             a non-throwaway Postgres (production/dev wipe risk, see gtcore-d43955).\n\
+             URL host is not localhost / 127.0.0.1. To allow a CI service URL with \
+             a non-loopback host, append `?gt_test_only=1` to the DSN.\n\
+             Offending DSN: {url}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod dsn_guard_tests {
+    use super::assert_ephemeral_pg_url;
+
+    #[test]
+    fn localhost_passes() {
+        assert_ephemeral_pg_url("postgres://user:pw@localhost:5432/db");
+        assert_ephemeral_pg_url("postgresql://user@localhost/test");
+    }
+
+    #[test]
+    fn loopback_ipv4_passes() {
+        assert_ephemeral_pg_url("postgres://user:pw@127.0.0.1:5433/db");
+    }
+
+    #[test]
+    fn loopback_ipv6_passes() {
+        assert_ephemeral_pg_url("postgres://user:pw@[::1]:5432/db");
+    }
+
+    #[test]
+    fn explicit_marker_passes() {
+        assert_ephemeral_pg_url("postgres://user:pw@pg-service:5432/db?gt_test_only=1");
+    }
+
+    #[test]
+    #[should_panic(expected = "does not look ephemeral")]
+    fn prod_host_panics() {
+        assert_ephemeral_pg_url("postgres://gtapp:secret@gt-postgres:5432/gtapp");
+    }
+
+    #[test]
+    #[should_panic(expected = "does not look ephemeral")]
+    fn kubernetes_service_without_marker_panics() {
+        assert_ephemeral_pg_url("postgres://user:pw@postgres.svc.cluster.local:5432/db");
+    }
+}
 
 /// Canonical id of the bootstrap default workspace.
 ///
@@ -196,12 +268,19 @@ const EMAIL_0001_SQL: &str = include_str!("../migrations/email/0001_email_outbox
 const EMAIL_0002_SQL: &str = include_str!("../migrations/email/0002_email_subscriptions.sql");
 /// Migration #3: `report_subscriptions` — scheduled-report recipients (hq-562e0b).
 const EMAIL_0003_SQL: &str = include_str!("../migrations/email/0003_report_subscriptions.sql");
+/// Migration #4: `email_outbox.cc` — carbon-copy recipients (gtcore-ecf70d).
+const EMAIL_0004_SQL: &str = include_str!("../migrations/email/0004_email_outbox_cc.sql");
+/// Migration #5: `report_schedules` — durable, DB-backed schedule list
+/// (gtcore-915232; was lost on every redeploy in `system_config.json`).
+const EMAIL_0005_SQL: &str = include_str!("../migrations/email/0005_report_schedules.sql");
 
 pub fn email_migrations() -> Vec<Migration> {
     vec![
         Migration::new(1, "0001_email_outbox", EMAIL_0001_SQL),
         Migration::new(2, "0002_email_subscriptions", EMAIL_0002_SQL),
         Migration::new(3, "0003_report_subscriptions", EMAIL_0003_SQL),
+        Migration::new(4, "0004_email_outbox_cc", EMAIL_0004_SQL),
+        Migration::new(5, "0005_report_schedules", EMAIL_0005_SQL),
     ]
 }
 

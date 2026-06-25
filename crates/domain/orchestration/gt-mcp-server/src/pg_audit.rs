@@ -74,15 +74,17 @@ impl AuditSink for PgAuditSink {
 }
 
 /// One `mcp_audit` row in the column order [`select_all`] projects: workspace_id,
-/// actor, tool, args (JSON text), outcome (`invoked`/`unauthorized`), ts (RFC3339).
-type AuditRow = (String, String, String, String, String, String);
+/// actor, tool, args (JSON text), outcome (`invoked`/`unauthorized`), ts (RFC3339),
+/// scopes (A5, gtcore-f3a016).
+type AuditRow = (String, String, String, String, String, String, Vec<String>);
 
 /// Read every row in append order (`id`). `ts` is rendered UTC RFC3339 in SQL so
 /// the record's `ts` round-trips the same string shape the in-memory sink carries.
 async fn select_all(pool: &PgPool) -> Result<Vec<AuditRow>, sqlx::Error> {
     sqlx::query_as::<_, AuditRow>(
         "SELECT workspace_id, actor, tool, args, outcome, \
-         to_char(ts AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"') \
+         to_char(ts AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"'), \
+         COALESCE(scopes, '{}') \
          FROM mcp_audit ORDER BY id",
     )
     .fetch_all(pool)
@@ -92,13 +94,13 @@ async fn select_all(pool: &PgPool) -> Result<Vec<AuditRow>, sqlx::Error> {
 /// Rebuild an [`AuditRecord`] from a projected row. A malformed `args` text (should
 /// not happen — we wrote it) degrades to JSON null rather than failing the dump; an
 /// unknown outcome string maps to `Invoked` (the only non-`unauthorized` value).
-fn row_to_record((workspace_id, actor, tool, args, outcome, ts): AuditRow) -> AuditRecord {
+fn row_to_record((workspace_id, actor, tool, args, outcome, ts, scopes): AuditRow) -> AuditRecord {
     let args = serde_json::from_str(&args).unwrap_or(serde_json::Value::Null);
     let outcome = match outcome.as_str() {
         "unauthorized" => Outcome::Unauthorized,
         _ => Outcome::Invoked,
     };
-    AuditRecord { workspace_id, actor, tool, args, outcome, ts }
+    AuditRecord { workspace_id, actor, tool, args, outcome, ts, scopes }
 }
 
 /// Idempotent table create — append-only audit of every tool dispatch.
@@ -134,6 +136,14 @@ async fn ensure_schema(pool: &PgPool) -> Result<(), sqlx::Error> {
     sqlx::query("CREATE INDEX IF NOT EXISTS mcp_audit_workspace_idx ON mcp_audit (workspace_id)")
         .execute(pool)
         .await?;
+    // A5 (gtcore-f3a016): per-record scope snapshot so the audit trail captures what the
+    // actor held at dispatch time. Stored as text[] for efficient contains queries.
+    sqlx::query(
+        "ALTER TABLE mcp_audit
+            ADD COLUMN IF NOT EXISTS scopes text[] NOT NULL DEFAULT '{}'",
+    )
+    .execute(pool)
+    .await?;
     Ok(())
 }
 
@@ -145,14 +155,15 @@ async fn insert(pool: &PgPool, rec: &AuditRecord) -> Result<(), sqlx::Error> {
         Outcome::Unauthorized => "unauthorized",
     };
     sqlx::query(
-        "INSERT INTO mcp_audit (workspace_id, actor, tool, args, outcome) \
-         VALUES ($1, $2, $3, $4, $5)",
+        "INSERT INTO mcp_audit (workspace_id, actor, tool, args, outcome, scopes) \
+         VALUES ($1, $2, $3, $4, $5, $6)",
     )
     .bind(&rec.workspace_id)
     .bind(&rec.actor)
     .bind(&rec.tool)
     .bind(rec.args.to_string())
     .bind(outcome)
+    .bind(&rec.scopes)
     .execute(pool)
     .await?;
     Ok(())

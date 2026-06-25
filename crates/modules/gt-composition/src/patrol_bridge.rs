@@ -138,7 +138,20 @@ impl Plugin for PatrolBridgePlugin {
                 };
                 let bead = self.sessions.lock().expect("sessions mutex").remove(&session);
                 if let Some(bead) = bead {
-                    self.patrol.close(bead).await;
+                    self.patrol.close(bead.clone()).await;
+                    // Release the Dolt claim (working → open) so the bead can
+                    // be re-dispatched or closed by BeadClosePlugin on merge.
+                    // Without this, a killed/done session leaves the bead
+                    // `working` forever — the "zombie claim" bug. The CAS is
+                    // idempotent: if the bead is already closed (merged while
+                    // the session was alive) the release is a stale no-op.
+                    match self.release.release_claim(&bead).await {
+                        Ok(true) => {
+                            eprintln!("[patrol-bridge] session ended — released {bead} back to open")
+                        }
+                        Ok(false) => {} // already closed/re-claimed, fine
+                        Err(e) => eprintln!("[patrol-bridge] release of {bead} on session end FAILED: {e}"),
+                    }
                 }
                 Ok(())
             }
@@ -228,8 +241,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn spawned_registers_lease_and_session_end_closes() {
+    async fn spawned_registers_lease_and_session_end_releases_claim() {
         let release = FakeRelease::new(true);
+        let release_spy: Arc<FakeRelease> = Arc::clone(&release);
         let (plugin, _rx) = make_bridge(release);
 
         // Spawn a heartbeat-bearing polecat with crew = bead
@@ -250,13 +264,17 @@ mod tests {
             Some(&"gtcore-bead1".to_string()),
         );
 
-        // Session end removes the link and closes the lease
+        // Session end removes the link, closes the lease, AND releases the Dolt claim
         let ev = record(
             "agent.session-end.v1",
             serde_json::json!({"SessionEnd": { "session": "gt-hq-abc-1" }}),
         );
         plugin.on_event(&ev).await.unwrap();
         assert!(plugin.sessions.lock().unwrap().is_empty());
+        assert!(
+            release_spy.was_called(),
+            "session end must release the Dolt claim (working → open)"
+        );
     }
 
     #[tokio::test]
