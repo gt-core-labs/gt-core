@@ -811,24 +811,33 @@ impl Plugin for PolecatSupervisorPlugin {
                 // the polecat on the host default ~/.claude.
                 let mut active_config_dir: Option<String> = None;
                 if let Some(kc) = &self.keychain {
-                    // Snapshot quota status per account for the sling-time quota gate (gtcore-2836bb).
-                    // A pre-fetched map keeps the guard's `status_of` closure synchronous (the guard
-                    // is pure-ish and must not await). No quota handle ⇒ empty map ⇒ the guard treats
-                    // every account's status as unknown (permissive), i.e. the legacy credential-only
-                    // behaviour.
+                    // Snapshot quota status + headroom per account for the sling-time gate
+                    // (gtcore-2836bb) and concurrent distribution (gtcore-98e14f). Pre-fetched maps
+                    // keep the guard's closures synchronous (the guard is pure-ish and must not
+                    // await). No quota handle ⇒ empty maps ⇒ legacy credential-only behaviour.
+                    let quota_accounts: Vec<gt_quota::Account> = match &self.quota {
+                        Some(q) => q.accounts().await,
+                        None => Vec::new(),
+                    };
                     let quota_status: HashMap<String, gt_quota::AccountQuotaStatus> =
-                        match &self.quota {
-                            Some(q) => q
-                                .accounts()
-                                .await
-                                .into_iter()
-                                .map(|a| (a.id, a.status))
-                                .collect(),
-                            None => HashMap::new(),
-                        };
-                    match crate::credential_guard::resolve_for_sling(kc, now_ms(), |acc| {
-                        quota_status.get(acc).copied()
-                    }) {
+                        quota_accounts.iter().map(|a| (a.id.clone(), a.status)).collect();
+                    let quota_headroom: HashMap<String, f64> = quota_accounts
+                        .iter()
+                        .map(|a| {
+                            let pct = |w: &Option<gt_quota::AccountWindow>| match w {
+                                Some(w) if w.limit > 0 => (w.consumed / w.limit as f64) * 100.0,
+                                _ => 0.0,
+                            };
+                            let util = pct(&a.window).max(pct(&a.weekly_window));
+                            (a.id.clone(), 100.0_f64 - util)
+                        })
+                        .collect();
+                    match crate::credential_guard::resolve_for_sling(
+                        kc,
+                        now_ms(),
+                        |acc| quota_status.get(acc).copied(),
+                        |acc| quota_headroom.get(acc).copied().unwrap_or(100.0),
+                    ) {
                         crate::credential_guard::CredOutcome::Resolved {
                             resolved,
                             dead,

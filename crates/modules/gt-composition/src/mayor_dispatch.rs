@@ -374,7 +374,7 @@ impl TmuxMayorWaker {
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_millis() as u64)
             .unwrap_or(0);
-        match resolve_for_sling(kc, now_ms, |acc| quota_status.get(acc).copied()) {
+        match resolve_for_sling(kc, now_ms, |acc| quota_status.get(acc).copied(), |_| 100.0) {
             CredOutcome::Resolved {
                 resolved,
                 rotated_from,

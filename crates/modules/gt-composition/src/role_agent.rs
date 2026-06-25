@@ -474,7 +474,7 @@ impl RoleLauncher for SpecRoleLauncher {
         let mut effective_config_dir: Option<std::path::PathBuf> = None;
         if let Some(kc) = &self.keychain {
             if let crate::credential_guard::CredOutcome::Resolved { resolved, .. } =
-                crate::credential_guard::resolve_for_sling(kc, now_ms(), |_| None)
+                crate::credential_guard::resolve_for_sling(kc, now_ms(), |_| None, |_| 100.0)
             {
                 effective_config_dir = Some(std::path::PathBuf::from(&resolved.config_dir));
                 spec.env
