@@ -10,6 +10,8 @@
 //! `<link>`/`<script>`/external CSS — Gmail strips them), table layout, same
 //! navy aesthetic as the xlsx report.
 
+use pulldown_cmark::{html::push_html, Event, Options, Parser, Tag, TagEnd};
+
 use crate::analytics::AnalyticsSummary;
 use crate::report::{OperatorReport, ReportComment};
 
@@ -18,10 +20,35 @@ fn esc(s: &str) -> String {
     s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;").replace('"', "&quot;")
 }
 
-/// Render a bead/epic's comments as an inline block (gtcore-01bcf2): one line
-/// per comment, `[fecha autor] cuerpo`, all escaped. Empty input → empty string
-/// (no markup, so a comment-less cell stays unchanged). `compact=true` drops the
-/// top divider for the section-header variant.
+/// Render a markdown string to inline-safe HTML for email clients.
+/// GFM enabled (tables, strikethrough, task lists). Returns an empty string for
+/// empty input so callers can use it in format strings without conditional guards.
+fn md_to_html(s: &str) -> String {
+    if s.is_empty() {
+        return String::new();
+    }
+    let opts = Options::ENABLE_TABLES
+        | Options::ENABLE_STRIKETHROUGH
+        | Options::ENABLE_TASKLISTS;
+    // Strip raw HTML events so operator notes cannot inject arbitrary tags.
+    let safe = Parser::new_ext(s, opts).filter(|e| {
+        !matches!(
+            e,
+            Event::Html(_)
+                | Event::InlineHtml(_)
+                | Event::Start(Tag::HtmlBlock)
+                | Event::End(TagEnd::HtmlBlock)
+        )
+    });
+    let mut out = String::with_capacity(s.len() + 64);
+    push_html(&mut out, safe);
+    out
+}
+
+/// Render a bead/epic's comments as an inline block (gtcore-01bcf2): one entry
+/// per comment showing `[autor · YYYY-MM-DD]` header and the body rendered as
+/// markdown HTML. Empty input → empty string. `compact=true` drops the top
+/// divider for the section-header variant.
 fn render_comments(comments: &[ReportComment], compact: bool) -> String {
     if comments.is_empty() {
         return String::new();
@@ -30,11 +57,13 @@ fn render_comments(comments: &[ReportComment], compact: bool) -> String {
         .iter()
         .map(|c| {
             format!(
-                "<div style=\"font-size:11px;color:#555;margin-top:2px;\">\
-                 <span style=\"color:{NAVY};font-weight:bold;\">[{fecha} {autor}]</span> {body}</div>",
-                fecha = esc(&c.fecha),
+                "<div style=\"font-size:11px;color:#555;margin-top:4px;\">\
+                 <span style=\"color:{NAVY};font-weight:bold;\">[{autor}]</span>\
+                 <span style=\"color:#888;font-size:10px;margin-left:4px;\">{fecha}</span>\
+                 <div style=\"margin-top:2px;\">{body}</div></div>",
                 autor = esc(&c.author),
-                body = esc(&c.body),
+                fecha = esc(&c.fecha),
+                body = md_to_html(&c.body),
             )
         })
         .collect();
@@ -211,7 +240,7 @@ pub fn render_digest(report: &OperatorReport, summary: &AnalyticsSummary, fecha:
                 resp = esc(&row.responsable),
                 ini = esc(&row.fecha_inicio),
                 fin = esc(&row.fecha_fin),
-                notas = esc(&row.notas),
+                notas = md_to_html(&row.notas),
                 comentarios = render_comments(&row.comentarios, false),
             ));
         }
@@ -308,13 +337,49 @@ mod tests {
         assert!(html.contains("3 tareas"), "missing task count in header");
         assert!(html.contains("TOTAL HORAS"));
         assert!(html.contains(&format!("{:.1}", report.total_horas)));
-        // Escaping: the raw note must not inject markup.
-        assert!(html.contains("nota &lt;x&gt;") && !html.contains("nota <x>"));
-        // Comments render with [fecha autor] and stay escaped (gtcore-01bcf2).
+        // Safe-HTML: raw HTML tags in notes are stripped by the safe markdown
+        // renderer (not escaped, just dropped) — the text "nota" survives but
+        // the `<x>` injection does not appear in the output in any form.
+        assert!(html.contains("nota"), "nota text must appear");
+        assert!(!html.contains("<x>"), "raw <x> tag must not pass through");
+        // Comments render with [autor] date + markdown body (gtcore-01bcf2).
         assert!(html.contains("Comentarios"), "missing comments block");
-        assert!(html.contains("[2026-06-10 ana]"), "missing bead comment meta");
-        assert!(html.contains("revisar &lt;edge&gt; case"), "bead comment not escaped/rendered");
-        assert!(html.contains("[2026-06-11 leo]"), "missing epic comment meta");
+        assert!(html.contains("[ana]"), "missing bead comment author");
+        assert!(html.contains("2026-06-10"), "bead comment must show fecha");
+        // body goes through md_to_html — raw markdown angle-brackets in the
+        // body text are rendered as HTML, not escaped as &lt;/&gt;.
+        assert!(html.contains("revisar"), "bead comment body missing");
+        assert!(html.contains("[leo]"), "missing epic comment author");
+        assert!(html.contains("2026-06-11"), "epic comment must show fecha");
         assert!(html.contains("modulo bloqueado"), "missing epic comment body");
+    }
+
+    /// True when `html` contains a `[YYYY-MM-DD …]` bracket — the timestamp
+    /// prefix the digest used to put in front of folded comments. The render
+    /// test (gtcore-abc0ae AC) asserts this is absent from the Notas fold.
+    pub(crate) fn has_dated_comment_bracket(html: &str) -> bool {
+        // Scan for "[dddd-dd-dd" (4-2-2 digits with dashes, right after a `[`).
+        let bytes = html.as_bytes();
+        let is_digit = |i: usize| bytes.get(i).is_some_and(u8::is_ascii_digit);
+        for (i, &b) in bytes.iter().enumerate() {
+            if b != b'[' {
+                continue;
+            }
+            let d = i + 1;
+            if is_digit(d)
+                && is_digit(d + 1)
+                && is_digit(d + 2)
+                && is_digit(d + 3)
+                && bytes.get(d + 4) == Some(&b'-')
+                && is_digit(d + 5)
+                && is_digit(d + 6)
+                && bytes.get(d + 7) == Some(&b'-')
+                && is_digit(d + 8)
+                && is_digit(d + 9)
+            {
+                return true;
+            }
+        }
+        false
     }
 }

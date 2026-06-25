@@ -85,6 +85,8 @@ impl SeedRig {
             worktree_root: self.worktree_root.map(std::path::PathBuf::from),
             git_connection_ref: self.git_connection_ref,
             semantic_tags: Vec::new(),
+            // A seeded rig starts dispatchable (back-compat default); the operator holds it later.
+            dispatch_mode: crate::DispatchMode::Auto,
         }
     }
 }

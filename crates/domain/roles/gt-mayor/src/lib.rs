@@ -7,14 +7,17 @@
 //! reducer is shared between live emit-on-apply and boot replay, and the audit log
 //! is authoritative.
 //!
-//! The long-running orchestration **loop** (periodic convoy scan → automatic
-//! `Delegate`) is a follow-up that lives at the composition-root edge; the helpers
-//! in [`mayor`] are the substrate it will call into. Until then the actor is
-//! exercised directly by tests and (eventually) by CLI / MCP commands.
+//! The long-running orchestration **loop** (on each orchd wake: read the frontier →
+//! prioritize → delegate one bead per polecat up to the pool cap) lives at the
+//! composition-root edge. Its pure decision step is [`triage`]: frontier + free
+//! capacity in, a [`TriagePlan`] (delegate / queue / decompose buckets) out. The
+//! producer helpers in [`mayor`] turn that plan into the `Delegate` commands the
+//! actor records — `gtcore-5c50f0`.
 
 pub mod actor;
 pub mod commands;
 pub mod mayor;
+pub mod triage;
 mod events;
 mod repo;
 mod state;
@@ -24,3 +27,4 @@ pub use commands::{Acknowledge, Delegate, MayorCommand, Resolve, Withdraw};
 pub use events::MayorEvent;
 pub use repo::{InMemoryMayorRepo, MayorRepository};
 pub use state::{Delegation, DelegationStatus, MayorState};
+pub use triage::{triage, FrontierBead, FrontierKind, PlannedDelegation, TriagePlan};

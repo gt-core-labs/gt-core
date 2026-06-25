@@ -82,12 +82,27 @@ impl QuotaBlockSignal for QuotaBlockGuard {
 /// Event-sourced handler for the `quota.*` tool namespace.
 pub struct QuotaHandler {
     log: Arc<EventLog>,
+    /// The accounts root (`GT_CLAUDE_ACCOUNTS_ROOT`) backing the `quota.cred_health` read
+    /// (gtcore-1fe9b4). `None` ⇒ no root wired, so `quota.cred_health` reports an empty list
+    /// (the same degraded mode the catalog runs in without an accounts root).
+    accounts_root: Option<std::path::PathBuf>,
 }
 
 impl QuotaHandler {
-    /// Wrap the per-workspace event log.
+    /// Wrap the per-workspace event log. No accounts root ⇒ `quota.cred_health` is empty until one
+    /// is wired with [`with_accounts_root`](Self::with_accounts_root).
     pub fn new(log: Arc<EventLog>) -> Self {
-        Self { log }
+        Self {
+            log,
+            accounts_root: None,
+        }
+    }
+
+    /// Wire the deploy-global accounts root so `quota.cred_health` can read each account dir's
+    /// `.credentials.json` + `.claude.json` and classify slingability (gtcore-1fe9b4).
+    pub fn with_accounts_root(mut self, root: std::path::PathBuf) -> Self {
+        self.accounts_root = Some(root);
+        self
     }
 
     /// Rebuild the account registry from the workspace's quota events.
@@ -158,6 +173,11 @@ impl DomainHandler for QuotaHandler {
                 "Drop an account from the rotation pool. Emits quota.account_deregistered; idempotent.",
                 &[req("account", "string")],
             ),
+            descriptor(
+                "quota.cred_health",
+                "Per-account credential health: refresh-token present, token expiry, onboarding-complete, and needs_relogin. Reads the on-disk account dirs, not the quota log.",
+                &[],
+            ),
         ]
     }
 
@@ -192,6 +212,30 @@ impl DomainHandler for QuotaHandler {
                     Some(account) => Ok(account_json(account)),
                     None => Err(AppError::NotFound(format!("account {id}"))),
                 }
+            }
+            "quota.cred_health" => {
+                // Reads the on-disk account dirs AND enumerates every account the quota registry
+                // tracks (gtcore-e09320): an account in `quota.list` with no dir is reported as
+                // Unreadable / needs_relogin instead of vanishing, so the FE never shows a
+                // dead/absent credential as Healthy. The SAME report the REST
+                // `GET /api/v1/quota/cred-health` serves. Empty when no accounts root is wired.
+                let known: Vec<String> = self
+                    .registry(ws)
+                    .map(|r| r.accounts().map(|a| a.id.clone()).collect())
+                    .unwrap_or_default();
+                let reports = match self.accounts_root.as_ref() {
+                    Some(root) => {
+                        let now_ms = SystemTime::now()
+                            .duration_since(UNIX_EPOCH)
+                            .map(|d| d.as_millis() as u64)
+                            .unwrap_or(0);
+                        crate::relogin::cred_health_in(root, &known, now_ms)
+                    }
+                    // No accounts root wired (degraded boot / tests): keep the clean-degrade
+                    // contract and report nothing rather than flagging every tracked account dead.
+                    None => Vec::new(),
+                };
+                Ok(json!({ "accounts": reports }))
             }
             other => Err(AppError::Validation(format!("unknown tool `{other}`"))),
         }

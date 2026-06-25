@@ -456,4 +456,69 @@ mod tests {
         assert_eq!(&bytes[..2], b"PK");
         assert!(bytes.len() > 500);
     }
+
+    /// True when `s` carries a `YYYY-MM-DD` date or an `HH:MM` clock time —
+    /// the redundant timestamp the tracker must NOT fold into the Notas cell
+    /// (gtcore-abc0ae).
+    fn has_timestamp(s: &str) -> bool {
+        let b = s.as_bytes();
+        let digit = |i: usize| b.get(i).is_some_and(u8::is_ascii_digit);
+        for i in 0..b.len() {
+            // YYYY-MM-DD
+            if digit(i)
+                && digit(i + 1)
+                && digit(i + 2)
+                && digit(i + 3)
+                && b.get(i + 4) == Some(&b'-')
+                && digit(i + 5)
+                && digit(i + 6)
+                && b.get(i + 7) == Some(&b'-')
+                && digit(i + 8)
+                && digit(i + 9)
+            {
+                return true;
+            }
+            // HH:MM
+            if digit(i) && digit(i + 1) && b.get(i + 2) == Some(&b':') && digit(i + 3) && digit(i + 4)
+            {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// The tracker xlsx/csv Notas cell must not carry a redundant date/time
+    /// (gtcore-abc0ae AC). The dates already live in Fecha Inicio/Fin; the
+    /// `closed … (by …)` breadcrumb that lands in `notes` carries no timestamp,
+    /// and the projection adds none.
+    #[test]
+    fn csv_notas_cell_has_no_redundant_timestamp() {
+        let mut closed = row("hq-2", "task", "Sesiones", Some(4.5), "closed");
+        // The breadcrumb the close handler appends to `notes` (handlers.rs):
+        // attribution only, never a date/time.
+        closed.notes = Some("closed @ deadbeefcafe (by ana)".into());
+        let rows = vec![
+            row("hq-mod-a", "epic", "Módulo Auth", None, "open"),
+            closed,
+        ];
+        let mut parent_map = HashMap::new();
+        parent_map.insert("hq-2".to_string(), "hq-mod-a".to_string());
+        let report = build_report("hq", "default", &rows, &parent_map, &HashMap::new());
+        let csv = to_csv(&report);
+
+        // The breadcrumb body survives (presentation-only change)…
+        assert!(csv.contains("closed @ deadbeefcafe (by ana)"), "breadcrumb body dropped");
+        // …but no Notas cell carries a YYYY-MM-DD or HH:MM timestamp. The only
+        // dates in the file are the dedicated Fecha Inicio/Fin columns.
+        for line in csv.lines() {
+            if line.starts_with("Modulo,") || line.starts_with("TOTAL HORAS") {
+                continue;
+            }
+            let notas = line.rsplit(',').next().unwrap_or("");
+            assert!(
+                !has_timestamp(notas),
+                "Notas cell carries a redundant timestamp: {notas:?}"
+            );
+        }
+    }
 }

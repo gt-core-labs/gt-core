@@ -45,10 +45,13 @@ use gt_events::{AppError, Command};
 use gt_workspace::WorkspaceContext;
 
 use crate::commands::{
-    AddRig, AdoptRig, RemoveRig, SetRigDefaultBranch, SetRigPrefix, SetRigTags, SetRigWorktreeRoot,
+    AddRig, AdoptRig, HoldRig, RemoveRig, ResumeRig, SetRigConnection, SetRigDefaultBranch,
+    SetRigPrefix, SetRigTags, SetRigWorktreeRoot,
 };
+use crate::events::RigEvent;
 use crate::repo::RigRepository;
-use crate::state::{RigCatalog, RigEntry, RigReadiness};
+use crate::sink::{NoopRigEventSink, RigEventSink};
+use crate::state::{DispatchMode, RigCatalog, RigEntry, RigReadiness};
 
 /// A per-workspace rig repository provider for the REST adapter.
 ///
@@ -114,12 +117,28 @@ pub struct RigApiState {
     /// The per-workspace repository provider the binary supplies — the module owns no store of
     /// its own, exactly as the MCP `RigHandler` owns only its pool cache.
     rigs: Arc<dyn WorkspaceRigs>,
+    /// Observability sink for the dispatch-mode transitions (`rig.held.v1` / `rig.resumed.v1`,
+    /// rig-hold H1). Defaults to [`NoopRigEventSink`] so a state built without one still mutates +
+    /// persists; the binary wires the event-log-backed sink so the REST `hold`/`resume` are
+    /// auditable on the same terms as the MCP tools.
+    event_sink: Arc<dyn RigEventSink>,
 }
 
 impl RigApiState {
-    /// Build the REST state over a per-workspace repository provider.
+    /// Build the REST state over a per-workspace repository provider. No event sink — the
+    /// dispatch-mode routes still mutate + persist but emit no audit event (use
+    /// [`with_event_sink`](Self::with_event_sink) to wire one).
     pub fn new(rigs: Arc<dyn WorkspaceRigs>) -> Self {
-        Self { rigs }
+        Self {
+            rigs,
+            event_sink: Arc::new(NoopRigEventSink),
+        }
+    }
+
+    /// Attach the observability sink for dispatch-mode transitions (rig-hold H1). Builder-style.
+    pub fn with_event_sink(mut self, sink: Arc<dyn RigEventSink>) -> Self {
+        self.event_sink = sink;
+        self
     }
 }
 
@@ -141,6 +160,9 @@ impl RigApiState {
 /// | `POST /:name/set-default-branch` | `rig.set-default-branch` |
 /// | `POST /:name/set-worktree-root`  | `rig.set-worktree-root`  |
 /// | `POST /:name/set-tags`           | `rig.set-tags`           |
+/// | `POST /:name/set-connection`     | `rig.set-connection`     |
+/// | `POST /:name/hold`               | `rig.hold`               |
+/// | `POST /:name/resume`             | `rig.resume`             |
 pub fn rig_router(state: RigApiState) -> Router {
     Router::new()
         .route("/", get(list_rigs).post(add_rig))
@@ -151,6 +173,9 @@ pub fn rig_router(state: RigApiState) -> Router {
         .route("/:name/set-default-branch", post(set_default_branch))
         .route("/:name/set-worktree-root", post(set_worktree_root))
         .route("/:name/set-tags", post(set_tags))
+        .route("/:name/set-connection", post(set_connection))
+        .route("/:name/hold", post(hold_rig))
+        .route("/:name/resume", post(resume_rig))
         .with_state(state)
 }
 
@@ -377,6 +402,74 @@ async fn set_tags(
     apply_and_upsert(&*repo, name, &cmd).await
 }
 
+/// `POST /:name/set-connection` — (re)bind or clear a rig's soft VCS-connection ref
+/// (`rig.set-connection`, gtcore-103958). The body carries `git_connection_ref` (a
+/// `public.vcs_connections.id`); omit it or pass `""` to clear. The name always comes from the
+/// path. This is the only API path that sets the binding on an existing rig — `add`/`adopt`
+/// reject a registered name.
+#[cfg_attr(feature = "axum", utoipa::path(
+    post, path = "/{name}/set-connection",
+    params(("name" = String, Path, description = "Rig name")),
+    responses(
+        (status = 200, description = "Connection binding set or cleared"),
+        (status = 422, description = "Validation failed (empty name or no-op)"),
+        (status = 404, description = "No rig with that name"),
+    ),
+))]
+async fn set_connection(
+    State(st): State<RigApiState>,
+    ctx: WorkspaceContext,
+    Path(name): Path<String>,
+    Json(body): Json<Value>,
+) -> Result<Json<Value>, ApiError> {
+    let repo = st.rigs.repo(ctx.workspace().as_str()).await?;
+    let cmd: SetRigConnection = with_path_name(body, name.clone())?;
+    apply_and_upsert(&*repo, name, &cmd).await
+}
+
+/// `POST /:name/hold` — put a rig on dispatch hold (`rig.hold`, rig-hold H1). The body may carry
+/// an operator `reason` (recorded on `rig.held.v1`); the name comes from the path. Idempotent:
+/// holding an already-held rig is a `200` no-op (`changed:false`), not an error.
+#[cfg_attr(feature = "axum", utoipa::path(
+    post, path = "/{name}/hold",
+    params(("name" = String, Path, description = "Rig name")),
+    responses(
+        (status = 200, description = "Rig held (or already on hold — idempotent)"),
+        (status = 404, description = "No rig with that name"),
+    ),
+))]
+async fn hold_rig(
+    State(st): State<RigApiState>,
+    ctx: WorkspaceContext,
+    Path(name): Path<String>,
+    Json(body): Json<Value>,
+) -> Result<Json<Value>, ApiError> {
+    let repo = st.rigs.repo(ctx.workspace().as_str()).await?;
+    let cmd: HoldRig = with_path_name(body, name.clone())?;
+    apply_dispatch_mode(&*repo, st.event_sink.as_ref(), ctx.workspace().as_str(), &name, DispatchMode::Hold, &cmd).await
+}
+
+/// `POST /:name/resume` — take a rig off dispatch hold (`rig.resume`, rig-hold H1). Idempotent:
+/// resuming an already-`auto` rig is a `200` no-op (`changed:false`), not an error.
+#[cfg_attr(feature = "axum", utoipa::path(
+    post, path = "/{name}/resume",
+    params(("name" = String, Path, description = "Rig name")),
+    responses(
+        (status = 200, description = "Rig resumed (or already auto — idempotent)"),
+        (status = 404, description = "No rig with that name"),
+    ),
+))]
+async fn resume_rig(
+    State(st): State<RigApiState>,
+    ctx: WorkspaceContext,
+    Path(name): Path<String>,
+    Json(body): Json<Value>,
+) -> Result<Json<Value>, ApiError> {
+    let repo = st.rigs.repo(ctx.workspace().as_str()).await?;
+    let cmd: ResumeRig = with_path_name(body, name.clone())?;
+    apply_dispatch_mode(&*repo, st.event_sink.as_ref(), ctx.workspace().as_str(), &name, DispatchMode::Auto, &cmd).await
+}
+
 /// The combined OpenAPI document for the rig REST surface (`hq-fe-api-platform.2`). The builder
 /// mounts it under the module prefix and rewrites its relative paths to `/api/v1/rig/...`, so
 /// the `#[utoipa::path]` annotations stay prefix-free.
@@ -392,6 +485,9 @@ async fn set_tags(
     set_default_branch,
     set_worktree_root,
     set_tags,
+    set_connection,
+    hold_rig,
+    resume_rig,
 ))]
 pub struct ApiDoc;
 
@@ -426,6 +522,52 @@ where
         .ok_or_else(|| ApiError(AppError::Other(format!("rig {name} missing after execute"))))?;
     repo.upsert(&entry).await?;
     Ok(Json(json!({ "ok": true, "rig": name })))
+}
+
+/// Apply a `hold` / `resume` transition idempotently (rig-hold H1), the REST mirror of the MCP
+/// `RigHandler::apply_dispatch_mode`. `cmd.validate` enforces existence (`404` for an unknown rig);
+/// the idempotency gate skips the row write + event emission when the rig is already in `target`
+/// (returning `changed:false`), so the log never carries a duplicate `rig.held.v1`/`rig.resumed.v1`.
+/// On a real transition the touched row is upserted, then the event is emitted to the (best-effort)
+/// observability sink.
+async fn apply_dispatch_mode<C>(
+    repo: &dyn DynRigRepository,
+    sink: &dyn RigEventSink,
+    workspace: &str,
+    name: &str,
+    target: DispatchMode,
+    cmd: &C,
+) -> Result<Json<Value>, ApiError>
+where
+    C: Command<State = RigCatalog, Output = RigEvent>,
+{
+    let mut catalog = hydrate(repo).await?;
+    cmd.validate(&catalog)?;
+    let current = catalog
+        .get(name)
+        .map(|e| e.dispatch_mode)
+        .unwrap_or_default();
+    if current == target {
+        return Ok(Json(json!({
+            "ok": true,
+            "rig": name,
+            "dispatch_mode": target.as_str(),
+            "changed": false,
+        })));
+    }
+    let event = cmd.execute(&mut catalog)?;
+    let entry = catalog
+        .get(name)
+        .cloned()
+        .ok_or_else(|| ApiError(AppError::Other(format!("rig {name} missing after execute"))))?;
+    repo.upsert(&entry).await?;
+    sink.emit(Some(workspace), &event);
+    Ok(Json(json!({
+        "ok": true,
+        "rig": name,
+        "dispatch_mode": target.as_str(),
+        "changed": true,
+    })))
 }
 
 /// Deserialize a command struct from a request body, stamping `now_secs` with the server clock
@@ -476,6 +618,8 @@ fn entry_json(entry: &RigEntry) -> Value {
         "worktree_root": entry.worktree_root,
         "git_connection_ref": entry.git_connection_ref,
         "semantic_tags": entry.semantic_tags,
+        // rig-hold H1: same inline dispatch mode (auto|hold) the MCP `rig.info`/`rig.list` carry.
+        "dispatch_mode": entry.dispatch_mode.as_str(),
         // hq-29ea8a B2/B3: same inline readiness verdict the MCP `rig.info` carries.
         "readiness": readiness_json(&entry.readiness()),
     })
@@ -538,6 +682,8 @@ mod tests {
             "/{name}/set-default-branch",
             "/{name}/set-worktree-root",
             "/{name}/set-tags",
+            "/{name}/hold",
+            "/{name}/resume",
         ] {
             assert!(paths.contains(&expected), "missing {expected} in {paths:?}");
         }

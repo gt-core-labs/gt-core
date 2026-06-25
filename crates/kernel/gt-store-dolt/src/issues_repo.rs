@@ -381,6 +381,14 @@ pub struct IssueDetail {
     /// the own value only, `None` = inherits from the `child_of` parent chain.
     #[serde(default)]
     pub dispatch: Option<String>,
+    /// The bead's `depends_on` edges (`issue_relations` rows where `from_id = id`
+    /// and `rel_type = 'depends_on'`), i.e. the ids this bead waits on before it
+    /// is ready for auto-dispatch (gtcore-13738c). Populated by
+    /// [`DoltIssues::get_detail`] from a second query so `issues.read` surfaces
+    /// the dependency set, not just the heavy bodies. Empty when the bead has no
+    /// dependencies.
+    #[serde(default)]
+    pub depends_on: Vec<String>,
 }
 
 /// A row from the `issue_relations` table.
@@ -437,6 +445,11 @@ pub struct IssuePatch {
     pub owner: Option<String>,
     /// New parent epic id. `Some("")` clears the `child_of` relation; `Some(id)` upserts it; `None` leaves it unchanged.
     pub parent_id: Option<String>,
+    /// New `depends_on` edge set (gtcore-13738c). `None` leaves the edges
+    /// untouched; `Some(list)` replaces the bead's `depends_on` rows in
+    /// `issue_relations` with exactly `list` (`Some(vec![])` clears them all),
+    /// mirroring the wire's whole-list overwrite semantics. Validated upstream.
+    pub depends_on: Option<Vec<String>>,
     /// New `domain_json` — raw JSON array string (e.g. `["orch.merge"]`).
     /// `None` leaves the column alone; `Some(_)` overwrites verbatim. The
     /// frontier serializes typed `Vec<Domain>` so the stored form round-trips.
@@ -444,6 +457,10 @@ pub struct IssuePatch {
     /// New `surface_json` — raw JSON array string of crate names / repo paths.
     /// `None` leaves the column alone; `Some(_)` overwrites verbatim.
     pub surface_json: Option<String>,
+    /// New `role_scope` discriminator (gtcore-b45a2d). `None` leaves the column
+    /// untouched; `Some(_)` overwrites with the role's bare lowercase token,
+    /// validated against the closed `RoleScope` set upstream.
+    pub role_scope: Option<String>,
     /// New lifecycle phase token (`"P1".."P4"`, hq-core-mcp.7). `None` leaves
     /// the column untouched; `Some(_)` is a scalar overwrite the frontier
     /// validates against [`IssuePhase`] before the write.
@@ -487,8 +504,10 @@ impl IssuePatch {
             && self.assignee.is_none()
             && self.owner.is_none()
             && self.parent_id.is_none()
+            && self.depends_on.is_none()
             && self.domain_json.is_none()
             && self.surface_json.is_none()
+            && self.role_scope.is_none()
             && self.phase.is_none()
             && self.estimated_hours.is_none()
             && self.start_date.is_none()
@@ -525,6 +544,12 @@ pub struct NewIssue {
     pub created_by: String,
     /// Optional parent epic id. When `Some(id)`, inserts a `child_of` relation into `issue_relations` after insert.
     pub parent_id: Option<String>,
+    /// `depends_on` edges to persist after insert (gtcore-13738c). Each id becomes
+    /// an `issue_relations` row `(from_id = this bead, to_id = dep, 'depends_on')`,
+    /// the same shape `child_of` uses for `parent_id`. Empty = no dependencies.
+    /// Validated (acyclic, no self-edge, no duplicate) at the frontier before the
+    /// repo write; the insert is `INSERT IGNORE` so a re-run is idempotent.
+    pub depends_on: Vec<String>,
     /// Optional assignee. `None` stores `NULL`.
     pub assignee: Option<String>,
     /// Optional initial owner. `None` stores schema default `''`.
@@ -1189,6 +1214,34 @@ impl DoltIssues {
             }
         }
 
+        // Persist the `depends_on` edges (gtcore-13738c). Without this the field
+        // rode the wire and was validated but silently dropped, so a bead created
+        // with dependencies entered the `ready_for_auto` frontier as if it had
+        // none. Same shape as `child_of`: one `(from_id, to_id, 'depends_on')` row
+        // per dep, `INSERT IGNORE` for idempotency, all under one Dolt commit.
+        if !row.depends_on.is_empty() {
+            for dep in &row.depends_on {
+                if dep.is_empty() {
+                    continue;
+                }
+                conn.exec_drop(
+                    "INSERT IGNORE INTO issue_relations (from_id, to_id, rel_type) \
+                     VALUES (:from_id, :to_id, 'depends_on')",
+                    mysql_async::params! { "from_id" => &row.id, "to_id" => dep },
+                )
+                .await
+                .map_err(map_err)?;
+            }
+            conn.exec_drop(
+                "CALL DOLT_COMMIT('-A', '-m', :msg)",
+                mysql_async::params! {
+                    "msg" => format!("relate {} depends_on {}", row.id, row.depends_on.join(",")),
+                },
+            )
+            .await
+            .map_err(map_err)?;
+        }
+
         Ok(())
     }
 
@@ -1257,6 +1310,13 @@ impl DoltIssues {
         if let Some(v) = &patch.surface_json {
             set_parts.push("surface_json = :surface_json");
             params_vec.push(("surface_json".to_string(), mysql_async::Value::from(v.clone())));
+        }
+        // gtcore-b45a2d — role_scope discriminator, validated against the closed
+        // `RoleScope` set upstream. The typed enum never yields an empty token,
+        // so this is a plain overwrite (no clear-to-NULL sentinel).
+        if let Some(v) = &patch.role_scope {
+            set_parts.push("role_scope = :role_scope");
+            params_vec.push(("role_scope".to_string(), mysql_async::Value::from(v.clone())));
         }
         // hq-core-mcp.7 — a phase overwrite also stamps `phase_ratified_at` so the
         // last ratification is auditable, mirroring the frontier's `ratified_at`.
@@ -1374,6 +1434,49 @@ impl DoltIssues {
             if let Err(ref e) = rel_commit_res {
                 if !e.to_string().contains("nothing to commit") {
                     return Err(map_err(rel_commit_res.unwrap_err()));
+                }
+            }
+        }
+
+        // Handle the depends_on edge set after the issues UPDATE commits
+        // (gtcore-13738c). `Some(list)` replaces the whole set: delete the bead's
+        // existing depends_on rows, then re-insert `list` (`Some(vec![])` just
+        // clears). Same whole-list overwrite the wire promises and the same
+        // delete-then-insert shape the `parent_id`/`child_of` block above uses.
+        if let Some(ref deps) = patch.depends_on {
+            conn.exec_drop(
+                "DELETE FROM issue_relations WHERE from_id = :id AND rel_type = 'depends_on'",
+                mysql_async::params! { "id" => id },
+            )
+            .await
+            .map_err(map_err)?;
+            for dep in deps {
+                if dep.is_empty() {
+                    continue;
+                }
+                conn.exec_drop(
+                    "INSERT IGNORE INTO issue_relations (from_id, to_id, rel_type) \
+                     VALUES (:from_id, :to_id, 'depends_on')",
+                    mysql_async::params! { "from_id" => id, "to_id" => dep },
+                )
+                .await
+                .map_err(map_err)?;
+            }
+            let dep_commit_res = conn
+                .exec_drop(
+                    "CALL DOLT_COMMIT('-A', '-m', :msg)",
+                    mysql_async::params! {
+                        "msg" => if deps.is_empty() {
+                            format!("unrelate {id} depends_on (cleared)")
+                        } else {
+                            format!("relate {id} depends_on {}", deps.join(","))
+                        },
+                    },
+                )
+                .await;
+            if let Err(ref e) = dep_commit_res {
+                if !e.to_string().contains("nothing to commit") {
+                    return Err(map_err(dep_commit_res.unwrap_err()));
                 }
             }
         }
@@ -2425,7 +2528,24 @@ impl DoltIssues {
             .exec(sql, mysql_async::params! { "id" => id })
             .await
             .map_err(map_err)?;
-        rows.into_iter().next().map(row_to_detail).transpose()
+        let detail = rows.into_iter().next().map(row_to_detail).transpose()?;
+        // Hydrate the `depends_on` edges so `issues.read` surfaces the dependency
+        // set (gtcore-13738c). One extra round-trip, only on the single-row read
+        // path — the cheap list/frontier paths resolve deps via `depends_on_edges`
+        // / `dep_index` instead.
+        let Some(mut detail) = detail else {
+            return Ok(None);
+        };
+        let deps: Vec<String> = conn
+            .exec(
+                "SELECT to_id FROM issue_relations \
+                 WHERE from_id = :id AND rel_type = 'depends_on' ORDER BY to_id",
+                mysql_async::params! { "id" => id },
+            )
+            .await
+            .map_err(map_err)?;
+        detail.depends_on = deps;
+        Ok(Some(detail))
     }
 }
 
@@ -2479,6 +2599,9 @@ fn row_to_detail(row: mysql_async::Row) -> Result<IssueDetail, AppError> {
         due_date: take_opt(&mut row, 26),
         // Raw own dispatch — NULL = inherit (gtcore-1acbcf C1).
         dispatch: take_opt(&mut row, 27),
+        // Filled by `get_detail` from a second `issue_relations` query — the
+        // single-row SELECT above cannot carry the (1:N) dependency edges.
+        depends_on: Vec::new(),
     })
 }
 

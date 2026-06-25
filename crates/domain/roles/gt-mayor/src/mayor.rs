@@ -3,16 +3,49 @@
 //! [`MayorCommand`]s through the handle. The thin wrappers below let callers state intent
 //! without re-constructing the command enum every time, mirroring `gt-sheriff::observe`.
 //!
-//! The real orchestration **loop** — periodically scanning convoys / queues for work to
-//! delegate — is a follow-up: that producer wraps these helpers in a background task and
-//! lives in the composition root once the cross-domain inputs (convoy snapshots, bead
-//! priorities) are wired. Until then, the actor is exercised directly by tests and the
-//! eventual CLI surface.
+//! [`delegate_frontier`] is the orchestration **loop**'s per-wake step: given the frontier the
+//! orchd hands the mayor and the free polecat capacity, it runs the pure [`triage`] and records
+//! a `Delegate` for each chosen bead (one bead → one polecat), returning the [`TriagePlan`] so
+//! the caller acts on the `queue` / `decompose` buckets and reports what it dispatched. The
+//! background task that drives this on each wake — and maps the opaque `polecat` target to the
+//! real dispatch (`a2a.delegate` intake / `agent.write` spawn) — lives at the composition root.
 
 use gt_events::AppError;
 
 use crate::actor::MayorHandle;
 use crate::commands::{Acknowledge, Delegate, MayorCommand, Resolve, Withdraw};
+use crate::triage::{triage, FrontierBead, TriagePlan};
+
+/// The role every mayor delegation hands off to: one bead → one polecat. Opaque `target`
+/// string on the `Delegate` command; the composition root maps it to the actual dispatch
+/// (in-process `a2a.delegate` intake or `agent.write` spawn).
+pub const POLECAT_TARGET: &str = "polecat";
+
+/// Run one wake of the orchestration loop's decision step over `frontier` with `capacity`
+/// free polecat slots, and record a `Delegate` for each bead the [`triage`] chose to dispatch
+/// (target = [`POLECAT_TARGET`], "one bead → one polecat"). Returns the full [`TriagePlan`] so
+/// the caller can act on `queue` (leave for the next wake) and `decompose` (`issues.create`)
+/// and report what it dispatched.
+///
+/// Idempotent against an already-recorded delegation: a `Delegate` whose id is already on the
+/// board is rejected by the actor (`already exists`); that error is swallowed so a re-wake
+/// over the same frontier does not abort the batch. Any other error propagates.
+pub async fn delegate_frontier(
+    handle: &MayorHandle,
+    frontier: &[FrontierBead],
+    capacity: usize,
+) -> Result<TriagePlan, AppError> {
+    let plan = triage(frontier, capacity);
+    for planned in &plan.delegate {
+        match delegate(handle, &planned.id, POLECAT_TARGET, &planned.summary).await {
+            Ok(()) => {}
+            // Re-delegating an existing id is a no-op on a re-wake, not a failure.
+            Err(AppError::Validation(msg)) if msg.contains("already exists") => {}
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(plan)
+}
 
 /// Delegate work to `target` with a free-form `summary`.
 pub async fn delegate(
