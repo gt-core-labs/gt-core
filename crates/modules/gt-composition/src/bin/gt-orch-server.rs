@@ -1234,6 +1234,30 @@ async fn main() -> anyhow::Result<()> {
         allocator.lock().expect("pool mutex").host_cap()
     );
 
+    // Restart recovery (gtcore-c15018): slots still in `Merging` after rehydration are orphans —
+    // the refinery died mid-merge and will never call `fail`, so `merge.failed.v1` would never
+    // reach the hub and the sheriff would never fire. Emit the failure now while pol_relay is
+    // already subscribed so the sheriff fires and drives the board back to health autonomously.
+    {
+        let orphaned: Vec<_> = merge
+            .snapshot()
+            .await
+            .into_iter()
+            .filter(|s| s.state == gt_merge::MergeSlotState::Merging)
+            .map(|s| s.bead.clone())
+            .collect();
+        if !orphaned.is_empty() {
+            eprintln!(
+                "[gt-orch-server] restart recovery — {} orphaned merging slot(s) → emitting merge.failed.v1: {}",
+                orphaned.len(),
+                orphaned.join(", ")
+            );
+            for bead in orphaned {
+                merge.fail(bead, "orchd restart — orphaned merging slot").await;
+            }
+        }
+    }
+
     // Supervision + capacity timer: re-sling dead polecats (PolecatSupervisor::tick) and refresh
     // the host admission cap from live CPU + RAM, every GT_POLECAT_TICK_SECS (default 15s).
     let tick_secs = env_usize("GT_POLECAT_TICK_SECS", 15) as u64;
