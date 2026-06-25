@@ -156,11 +156,70 @@ fn find_worktree(rig: &Path, branch: &str) -> Option<PathBuf> {
     worktree_for_branch(&porcelain, branch)
 }
 
+/// Read the exact version of a crate from `Cargo.lock`, e.g. `"0.8.6"` for `"sqlx"`.
+/// Used to re-pin a crate after a full lock regeneration so transitive consumers don't drift
+/// to a newer incompatible version (see `cargo_lock_sync`).
+fn lock_crate_version(worktree: &Path, krate: &str) -> Option<String> {
+    let lock_path = worktree.join("Cargo.lock");
+    let text = std::fs::read_to_string(&lock_path).ok()?;
+    let needle_name = format!("name = \"{krate}\"");
+    for block in text.split("\n[[package]]") {
+        if block.contains(&needle_name) {
+            for line in block.lines() {
+                if let Some(v) = line.strip_prefix("version = \"") {
+                    return Some(v.trim_end_matches('"').to_owned());
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Return `true` when `cargo metadata --locked` exits 0 — the lock file is in sync with all
+/// `Cargo.toml` files in the workspace. Fails fast on any I/O error.
+fn cargo_locked_ok(worktree: &Path) -> bool {
+    matches!(
+        cmd("cargo", &["metadata", "--locked", "--format-version", "1"], worktree),
+        Ok((true, _))
+    )
+}
+
 /// Auto-sync `Cargo.lock` when it drifts from the workspace's `Cargo.toml` set (gtcore-bfb203).
-/// Runs `cargo generate-lockfile` in the worktree and, if the lock changed, commits it so the PR's
-/// CI never fails with "cannot update the lock file because --locked was passed". Best-effort:
-/// failures are logged and do not abort the merge — CI will catch any remaining desync.
+/// Two-stage strategy so that adding a workspace-member dep (the common case) never upgrades
+/// external crate versions:
+///
+/// 1. `cargo update --workspace`: only touches workspace-member entries — safe, never upgrades
+///    external crates.  Handles the common case (e.g. adding a path dep between members).
+/// 2. If the lock is still inconsistent (a brand-new external dep was added), fall back to
+///    `cargo generate-lockfile`.  After that, re-pin any crate that the workspace already locked
+///    to a specific version — currently `sqlx`, which pgvector otherwise pulls to a newer minor
+///    that conflicts with the workspace's 0.8.x pin.
+///
+/// Best-effort: failures are logged and do not abort the merge — CI catches any remaining desync.
 fn cargo_lock_sync(worktree: &Path, branch: &str) {
+    // Fast path: already in sync.
+    if cargo_locked_ok(worktree) {
+        return;
+    }
+
+    // Stage 1: workspace-only update — never upgrades external deps.
+    match cmd("cargo", &["update", "--workspace"], worktree) {
+        Ok(_) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return, // cargo not in PATH
+        Err(e) => {
+            eprintln!("[git-merge] {branch}: cargo update --workspace I/O error: {e}");
+            return;
+        }
+    }
+    if cargo_locked_ok(worktree) {
+        // Stage 1 was enough (workspace-member dep change).
+        return commit_lock_if_dirty(worktree, branch);
+    }
+
+    // Stage 2: new external crate was added — need full regeneration.
+    // Capture the workspace's pinned sqlx version first so we can re-pin afterward.
+    let sqlx_pin = lock_crate_version(worktree, "sqlx");
+
     match cmd("cargo", &["generate-lockfile"], worktree) {
         Ok((true, _)) => {}
         Ok((false, err)) => {
@@ -168,13 +227,22 @@ fn cargo_lock_sync(worktree: &Path, branch: &str) {
             return;
         }
         Err(e) => {
-            // `cargo` not in PATH (e.g. an image without a Rust toolchain) — skip silently.
-            if e.kind() != std::io::ErrorKind::NotFound {
-                eprintln!("[git-merge] {branch}: cargo generate-lockfile I/O error: {e}");
-            }
+            eprintln!("[git-merge] {branch}: cargo generate-lockfile I/O error: {e}");
             return;
         }
     }
+
+    // Re-pin sqlx after full regeneration: pgvector 0.4.x declares `sqlx >= 0.8, < 0.10`
+    // so a fresh resolve picks sqlx 0.9 as a second instance, breaking trait coherence with
+    // the workspace's sqlx 0.8 consumers.  Forcing both to the same version fixes it.
+    if let Some(ver) = sqlx_pin {
+        let _ = cmd("cargo", &["update", "-p", "sqlx", "--precise", &ver], worktree);
+    }
+
+    commit_lock_if_dirty(worktree, branch);
+}
+
+fn commit_lock_if_dirty(worktree: &Path, branch: &str) {
     // `git diff --quiet` exits 1 when there are unstaged changes, 0 when the tree is clean.
     let lock_dirty = matches!(
         run(worktree, &["diff".into(), "--quiet".into(), "--".into(), "Cargo.lock".into()]),
@@ -987,6 +1055,43 @@ branch refs/heads/hq-z.1
         );
         // The detached tree's HEAD is not a branch — nothing resolves to it.
         assert_eq!(worktree_for_branch(porcelain, ""), None);
+    }
+
+    #[test]
+    fn lock_crate_version_parses_from_cargo_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let lock = r#"# This file is automatically @generated by Cargo.
+# It is not intended for manual editing.
+version = 3
+
+[[package]]
+name = "anyhow"
+version = "1.0.95"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+
+[[package]]
+name = "sqlx"
+version = "0.8.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+dependencies = [
+ "sqlx-core",
+]
+"#;
+        std::fs::write(dir.path().join("Cargo.lock"), lock).unwrap();
+        assert_eq!(
+            lock_crate_version(dir.path(), "sqlx"),
+            Some("0.8.6".to_owned()),
+            "parses version from Cargo.lock package block"
+        );
+        assert_eq!(
+            lock_crate_version(dir.path(), "anyhow"),
+            Some("1.0.95".to_owned()),
+        );
+        assert_eq!(
+            lock_crate_version(dir.path(), "nonexistent"),
+            None,
+            "returns None for crate not in lock"
+        );
     }
 
     /// A5 (gtcore-f3a016) — **the merge queue is the only path to `main`**, from the edge's
