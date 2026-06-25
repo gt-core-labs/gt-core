@@ -417,6 +417,9 @@ pub struct FakeTmux {
     /// Sessions currently SIGSTOP'd via [`Tmux::pause`] (gtcore-6f449f). In-memory stand-in for
     /// the real `SIGSTOP`/`SIGCONT` so gates can assert the supervisor froze/thawed the right set.
     paused: Mutex<std::collections::HashSet<String>>,
+    /// Names passed to [`Tmux::kill_session`], in call order. Lets gates assert a teardown happened
+    /// (e.g. the CI-failure re-sling killing a still-live session before respawning, gtcore-8701c4).
+    kills: Mutex<Vec<String>>,
 }
 
 impl FakeTmux {
@@ -437,6 +440,12 @@ impl FakeTmux {
     /// pause/resume primitive.
     pub fn is_paused(&self, session: &str) -> bool {
         self.paused.lock().unwrap().contains(session)
+    }
+
+    /// Session names handed to [`Tmux::kill_session`], in call order — test observability for
+    /// teardown paths (gtcore-8701c4).
+    pub fn kills(&self) -> Vec<String> {
+        self.kills.lock().unwrap().clone()
     }
 }
 
@@ -475,6 +484,7 @@ impl Tmux for FakeTmux {
     }
 
     fn kill_session(&self, session: &str) -> io::Result<()> {
+        self.kills.lock().unwrap().push(session.to_string());
         self.sessions.lock().unwrap().remove(session);
         Ok(())
     }

@@ -122,6 +122,32 @@ cargo test -p gt-skills --lib presets                          # replay-asserts 
 `design-taste-frontend`, `imagegen-*`, …, ~287 KB) are a curated UI-design catalog bound to no
 role, so they don't affect "functional roles." Seed them separately if a deploy wants that library.
 
+#### Freshness — one refresh path + a drift guard (gtcore-63bb20)
+
+The embedded seed and prod's live `skills.*` log **diverge** over time (operators edit the live
+Knowledge via REST; the embedded snapshot stays frozen at the last `extract-knowledge-seed.py`
+run). The single, decided refresh path:
+
+- **The live `skills.*` log is the runtime source of truth.** A running role reads its prompt /
+  model / scopes / skills from the live catalog, so updating a prompt is a REST edit — **no
+  re-release**. The embedded seed is ONLY the greenfield bootstrap (seeded solely when the workspace
+  catalog `is_empty()`). We do NOT load the seed dynamically (it is a frozen bootstrap) and do NOT
+  regenerate it every build; we keep it embedded and **guard** it.
+- **Drift report (`gt_skills::drift`):** `compute_drift(seed_catalog(), live)` returns, per role and
+  per skill, what differs (`prompt`/`model`/`scopes`/`skills`, or a skill's `body`/`scopes`/…) plus
+  the live high-water-mark timestamp ("since when"). Surfaced read-only at **`GET /api/v1/skills/drift`**
+  (`skills.read`) — the operator tool that answers "is the shipped seed stale, and where".
+- **Boot alert:** on a populated catalog, `gt-mcp-server` scans drift at boot. On *significant*
+  drift (a role's functional Knowledge changed, or a role/bound-skill diverged — never the benign
+  unbound-skill omission above) it warns to the log AND rings the operator bell
+  (`notifications` row, `kind=seed_drift`) so a regen lands on someone's radar.
+- **CI guard:** `cargo test -p gt-skills --lib drift` fails if the embedded seed stops being
+  internally consistent (self-drift) or its role/skill roster rots (a dropped role, a blanked
+  prompt, a role with no skills) — silent drift can't ship.
+
+When `/api/v1/skills/drift` reports significant drift, the fix is the regeneration just above
+(re-run `extract-knowledge-seed.py`, commit `seeds/knowledge.json`, redeploy).
+
 ### 4.2 IdP/OAuth providers + GitHub App (hq-greenfield-seeds.3) — DELIVERED
 
 The login providers (Google, …) were configured by hand in `/admin/providers` and lived ONLY in

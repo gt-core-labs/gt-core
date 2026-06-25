@@ -334,6 +334,107 @@ async fn update_patches_visible_fields_and_commits() {
     );
 }
 
+/// gtcore-13738c: `issues.create`/`issues.update` must persist the `depends_on`
+/// edges into `issue_relations`, not validate-then-drop them. Before the fix a
+/// bead created with `depends_on=[X]` had no edge, so the readiness frontier
+/// treated it as dependency-free and auto-dispatched it out of order. Asserts the
+/// whole round-trip: create persists, `get_detail` + `depends_on_edges` surface
+/// the set, update replaces it, and `Some(vec![])` clears it.
+#[tokio::test]
+async fn create_and_update_persist_depends_on_edges() {
+    let Ok(base) = std::env::var("GT_DOLT_URL") else {
+        eprintln!("GT_DOLT_URL unset — skipping DoltIssues depends_on contract");
+        return;
+    };
+    let base = base.trim_end_matches('/').to_string();
+    seed(&base).await.expect("seed");
+
+    let repo = DoltIssues::connect(&format!("{base}/{TEST_DB}")).expect("connect");
+
+    // Two dependency targets the dependent bead will wait on.
+    let dep1 = format!("hq-dep1-{}", ulid::Ulid::new());
+    let dep2 = format!("hq-dep2-{}", ulid::Ulid::new());
+    for d in [&dep1, &dep2] {
+        repo.insert(&NewIssue {
+            id: d.clone(),
+            title: "dep".into(),
+            issue_type: "task".into(),
+            created_by: "test".into(),
+            ..Default::default()
+        })
+        .await
+        .expect("insert dep");
+    }
+
+    // create with depends_on must persist the edges (the regression).
+    let id = format!("hq-deps-{}", ulid::Ulid::new());
+    repo.insert(&NewIssue {
+        id: id.clone(),
+        title: "dependent".into(),
+        issue_type: "task".into(),
+        created_by: "test".into(),
+        depends_on: vec![dep1.clone(), dep2.clone()],
+        ..Default::default()
+    })
+    .await
+    .expect("insert dependent");
+
+    let want = {
+        let mut v = vec![dep1.clone(), dep2.clone()];
+        v.sort();
+        v
+    };
+
+    // get_detail surfaces the dependency set so issues.read returns it.
+    let detail = repo.get_detail(&id).await.expect("ok").expect("row");
+    let mut got = detail.depends_on.clone();
+    got.sort();
+    assert_eq!(got, want, "create must persist depends_on edges");
+
+    // depends_on_edges (the frontier's readiness input) sees them too.
+    let edges = repo
+        .depends_on_edges(&IssueFilter::default())
+        .await
+        .expect("edges");
+    let mut e = edges.get(&id).cloned().unwrap_or_default();
+    e.sort();
+    assert_eq!(e, want, "depends_on_edges must include the created edges");
+
+    // update with Some(list) replaces the whole set (drop dep2, keep dep1).
+    repo.update(
+        &id,
+        &IssuePatch {
+            depends_on: Some(vec![dep1.clone()]),
+            ..Default::default()
+        },
+    )
+    .await
+    .expect("update deps");
+    let detail = repo.get_detail(&id).await.expect("ok").expect("row");
+    assert_eq!(
+        detail.depends_on,
+        vec![dep1.clone()],
+        "update must replace the edge set, not append",
+    );
+
+    // update with Some(vec![]) clears every edge.
+    repo.update(
+        &id,
+        &IssuePatch {
+            depends_on: Some(vec![]),
+            ..Default::default()
+        },
+    )
+    .await
+    .expect("clear deps");
+    let detail = repo.get_detail(&id).await.expect("ok").expect("row");
+    assert!(
+        detail.depends_on.is_empty(),
+        "Some(vec![]) must clear all depends_on edges, got {:?}",
+        detail.depends_on,
+    );
+}
+
 #[tokio::test]
 async fn delivered_sha_round_trips() {
     // hq-core-mcp.10 (docs/10 §S2): set_delivered_sha stamps the column and it

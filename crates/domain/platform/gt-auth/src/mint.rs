@@ -46,6 +46,11 @@ pub const ENV_SIGNING_KID: &str = "GT_JWT_RS256_SIGNING_KID";
 ///
 /// The asymmetric counterpart of [`JwtAuthenticator`](crate::JwtAuthenticator): this holds the
 /// **private** key and produces tokens; the verifier holds the **public** key and consumes them.
+///
+/// `Clone` (jsonwebtoken's `EncodingKey` is `Clone`) so a single configured minter can be shared by
+/// more than one sling edge — e.g. the polecat supervisor and the trigger-driven role-agent launcher
+/// (`gtcore-999795`) both mint per-agent tokens from the same daemon-held key.
+#[derive(Clone)]
 pub struct JwtMinter {
     /// The RS256 private key the token is signed with.
     key: EncodingKey,

@@ -40,7 +40,8 @@ use axum::{Json, Router};
 use serde_json::{json, Value};
 
 use gt_module::McpTool;
-use gt_store_dolt::{AppError, DoltIssues};
+use gt_store_dolt::{AppError, DoltDomainCatalog, DoltIssues, WorkspacePools};
+use gt_workspace::WorkspaceContext;
 
 use crate::commands::ReportGap;
 use crate::handlers::run_report_gap;
@@ -62,17 +63,51 @@ pub struct MetaApiState {
     /// every module. `meta.help` serializes it verbatim; it is shared (`Arc`) so the
     /// state stays cheap to clone per request.
     tools: Arc<[McpTool]>,
+    /// Per-workspace Dolt pool cache, present only when the binary runs multi-tenant
+    /// (gtcore-d81e77 H2). When `Some`, `GET /domains` resolves the request's tenant
+    /// `hq_<ws>` pool from the verified [`WorkspaceContext`] so the FE domain selector
+    /// is populated from the ACTIVE workspace's `domain_catalog`, not a global list.
+    /// When `None`, the catalog is read from the single fallback `store` pool — the
+    /// pre-routing single-tenant behaviour.
+    workspaces: Option<Arc<WorkspacePools>>,
 }
 
 impl MetaApiState {
     /// Build the REST state over a live store, the server attribution actor, and the
-    /// harvested tool-descriptor set (for `meta.help`).
+    /// harvested tool-descriptor set (for `meta.help`). Single-tenant by default; call
+    /// [`with_workspaces`](Self::with_workspaces) to enable per-request tenant routing
+    /// for the `GET /domains` catalog.
     pub fn new(
         store: Arc<DoltIssues>,
         actor: impl Into<Arc<str>>,
         tools: impl Into<Arc<[McpTool]>>,
     ) -> Self {
-        Self { store, actor: actor.into(), tools: tools.into() }
+        Self { store, actor: actor.into(), tools: tools.into(), workspaces: None }
+    }
+
+    /// Enable multi-tenant routing for `GET /domains` (gtcore-d81e77 H2): the request's
+    /// verified workspace resolves its own `hq_<ws>` pool from the shared cache, so the
+    /// domain catalog reflects the active tenant. Without this the catalog endpoint reads
+    /// the single fallback `store` for every caller (single-tenant).
+    pub fn with_workspaces(mut self, pools: Arc<WorkspacePools>) -> Self {
+        self.workspaces = Some(pools);
+        self
+    }
+
+    /// Resolve the `domain_catalog` repo for one request's workspace. In multi-tenant
+    /// mode the tenant's `hq_<ws>` pool is selected (the slug is already validated by the
+    /// [`WorkspaceContext`] extractor) and its schema ensured on first access; single-tenant
+    /// falls back to the shared `store` pool, ignoring the workspace exactly as before.
+    async fn resolve_catalog(
+        &self,
+        ctx: &WorkspaceContext,
+    ) -> Result<DoltDomainCatalog, AppError> {
+        match &self.workspaces {
+            Some(pools) => {
+                Ok(DoltDomainCatalog::new(pools.ensured_pool(ctx.workspace().as_str()).await?))
+            }
+            None => Ok(DoltDomainCatalog::new(self.store.pool().clone())),
+        }
     }
 }
 
@@ -85,6 +120,7 @@ pub fn meta_router(state: MetaApiState) -> Router {
     Router::new()
         .route("/help", get(help))
         .route("/scopes", get(scopes))
+        .route("/domains", get(domains))
         .route("/report-gap", post(report_gap))
         .with_state(state)
 }
@@ -122,6 +158,34 @@ async fn scopes(State(st): State<MetaApiState>) -> Json<Value> {
     Json(json!({ "scopes": catalog }))
 }
 
+/// `GET /domains` — the ACTIVE workspace's domain catalog (gtcore-d81e77 H2): every
+/// `domain_catalog` entry for the request's tenant `{ key, label, tier, enabled,
+/// reserved }`, so the FE domain selector (gtweb-186fbf) is populated per workspace
+/// instead of from the global `Domain` enum. The workspace is resolved through the
+/// verified [`WorkspaceContext`] — the same tenant boundary the issues surface uses —
+/// never a query/body field. A pure read, no state change.
+///
+/// An un-seeded workspace (no `domain_catalog` table — a tenant provisioned before H1,
+/// pending the H3 backfill) returns an empty list rather than a `500`, so the FE
+/// degrades to its free-text fallback exactly as when the catalog is absent.
+#[cfg_attr(feature = "axum", utoipa::path(
+    get, path = "/domains",
+    responses(
+        (status = 200, description = "The active workspace's domain catalog: [{ key, label, tier, enabled, reserved }]"),
+        (status = 400, description = "No workspace selector resolved (missing/invalid X-GT-Workspace + token claim)"),
+    ),
+))]
+async fn domains(
+    State(st): State<MetaApiState>,
+    ctx: WorkspaceContext,
+) -> Result<Json<Value>, ApiError> {
+    let catalog = st.resolve_catalog(&ctx).await?;
+    // `list_opt` is table-absent tolerant: `None` (un-seeded workspace) reads as an
+    // empty catalog so the read never 500s on a pre-H3 tenant.
+    let entries = catalog.list_opt().await?.unwrap_or_default();
+    Ok(Json(json!({ "domains": entries })))
+}
+
 /// `POST /report-gap` — surface a missing operation (`meta.report-gap.execute`):
 /// the server mints a `hq-gap-<slug>-<ts>` bead so the gap enters the routine
 /// catalog. The attribution actor is the server identity in [`MetaApiState`], never
@@ -145,7 +209,7 @@ async fn report_gap(
 /// The builder mounts it under the module prefix and rewrites its relative paths to
 /// `/api/v1/meta/...`, so the `#[utoipa::path]` annotations stay prefix-free.
 #[derive(utoipa::OpenApi)]
-#[openapi(paths(help, scopes, report_gap))]
+#[openapi(paths(help, scopes, domains, report_gap))]
 pub struct ApiDoc;
 
 /// HTTP wrapper over the domain [`AppError`] so a handler can `?`-propagate it and
@@ -183,7 +247,7 @@ mod tests {
         // nesting can rewrite them. Every declared route must be present.
         let doc = ApiDoc::openapi();
         let paths: Vec<&str> = doc.paths.paths.keys().map(String::as_str).collect();
-        for expected in ["/help", "/scopes", "/report-gap"] {
+        for expected in ["/help", "/scopes", "/domains", "/report-gap"] {
             assert!(paths.contains(&expected), "missing {expected} in {paths:?}");
         }
         // Prefix-free: the module builder, not the annotation, owns `/api/v1/meta`.

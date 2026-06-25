@@ -10,6 +10,8 @@
 
 use std::sync::Arc;
 
+use gt_mcp_server::dispatch::IssueClosedHook;
+
 use async_trait::async_trait;
 use serde::de::DeserializeOwned;
 use serde_json::{json, Value};
@@ -114,6 +116,62 @@ impl MergeHandler {
         let kind = gt_events::EventKind::kind(&event);
         self.log.append(ws, event)?;
         Ok(json!({ "ok": true, "event": kind }))
+    }
+
+    /// Auto-complete a merge slot when the bead closes with a `delivered_sha`
+    /// (gtcore-71c575). Advances the slot through the state machine to `Merged`
+    /// regardless of its current state:
+    /// - `Failed` → submit (reset to Ready) → start → complete
+    /// - `Ready` → start → complete
+    /// - `Merging` → complete
+    /// - `Merged` / not found → no-op
+    ///
+    /// Best-effort: any intermediate failure is logged but never propagates —
+    /// the close already landed and the slot state is always correctable later.
+    pub fn try_complete_slot(&self, ws: Option<&str>, bead: &str, sha: &str) {
+        let board = match self.board(ws) {
+            Ok(b) => b,
+            Err(e) => {
+                eprintln!("[bead-close] {bead}: merge slot auto-complete skipped — board read failed: {e}");
+                return;
+            }
+        };
+        let state = match board.get(bead) {
+            Some(slot) => slot.state,
+            None => return, // no slot — nothing to do
+        };
+        use gt_merge::MergeSlotState;
+        // Walk the state machine forward to Merged.
+        if state == MergeSlotState::Merged {
+            return;
+        }
+        if state == MergeSlotState::Failed {
+            let submit = json!({ "bead": bead, "branch": bead, "channel_msg_id": format!("auto-close-{bead}") });
+            if let Err(e) = self.run::<SubmitMerge>(ws, submit) {
+                eprintln!("[bead-close] {bead}: merge slot reset failed → {e}");
+                return;
+            }
+        }
+        if state != MergeSlotState::Merging {
+            let start = json!({ "bead": bead });
+            if let Err(e) = self.run::<StartMerge>(ws, start) {
+                eprintln!("[bead-close] {bead}: merge slot start failed → {e}");
+                return;
+            }
+        }
+        let complete = json!({ "bead": bead, "sha": sha });
+        match self.run::<CompleteMerge>(ws, complete) {
+            Ok(_) => eprintln!("[bead-close] {bead}: merge slot auto-completed (sha {sha})"),
+            Err(e) => eprintln!("[bead-close] {bead}: merge slot complete failed → {e}"),
+        }
+    }
+}
+
+impl IssueClosedHook for MergeHandler {
+    fn on_closed(&self, ws: Option<&str>, bead: &str, delivered_sha: Option<&str>) {
+        if let Some(sha) = delivered_sha {
+            self.try_complete_slot(ws, bead, sha);
+        }
     }
 }
 

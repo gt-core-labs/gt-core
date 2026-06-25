@@ -23,6 +23,7 @@ use gt_events::Envelope;
 use crate::lifecycle::{heartbeat_is_stale, spawn_process, spawn_tmux, SpawnSpec, SpawnedPolecat};
 use crate::restart::{RestartConfig, RestartTracker};
 use crate::tmux::Tmux;
+use crate::wedge::{classify_wedge, WedgeDialog};
 
 /// Context-usage percentage at or above which a polecat's self-exit is read as a death by
 /// context exhaustion rather than a clean completion (gtcore-91fdde). Claude Code surfaces an
@@ -475,22 +476,45 @@ pub struct PolecatSupervisor {
     /// keychain's CURRENT active pointer, so the re-sling lands on a healthy account while
     /// the bead's branch/worktree survive untouched. `None` ⇒ verbatim re-sling (legacy).
     respec: Mutex<Option<RespecFn>>,
-    /// Optional "is this bead closed?" probe consulted at RE-sling time (gtcore-177770). A
-    /// polecat can die (tmux session gone) after its bead was already closed — by the operator
-    /// or by merge auto-close — while the work is delivered. Re-slinging it then burns the
-    /// restart budget on finished work and keeps the slot occupied, starving new dispatches.
-    /// The composition root wires a closure that reads the bead's tracker status; when it
-    /// returns `true` for a dead polecat's `hook_bead`, `tick` unwatches the session instead of
-    /// re-slinging it. `None` ⇒ never closed-checks (legacy: re-sling every dead polecat).
-    bead_closed: Mutex<Option<BeadClosedFn>>,
+    /// Optional "should a polecat still be slung for this bead?" probe consulted at RE-sling time
+    /// (gtcore-177770, generalized by gtcore-db99e0). A polecat can die (tmux session gone) after
+    /// its bead became un-slingable — closed by the operator or merge auto-close (work delivered),
+    /// flipped to an epic container, or set dispatch=manual. Re-slinging it then burns the restart
+    /// budget on work no autonomous agent should touch and keeps the slot occupied, starving new
+    /// dispatches. The composition root wires a closure that re-reads the bead's CURRENT state and
+    /// applies the unified `should_sling` predicate (status ∈ {open,working} ∧ ¬epic ∧
+    /// dispatch=auto); when it returns `false` for a dead polecat's `hook_bead`, `tick` unwatches
+    /// the session instead of re-slinging it. `None` ⇒ never re-validates (legacy: re-sling every
+    /// dead polecat).
+    slingable: Mutex<Option<BeadSlingableFn>>,
+    /// Optional wedge-recovery hook consulted when `tick` finds an ALIVE session frozen on a known
+    /// interactive dialog (gtcore-2836bb). A wedged polecat keeps its tmux session, so the bare
+    /// `has_session` liveness check reads it as healthy while it produces nothing and holds a pool
+    /// slot. When wired, `tick` captures the pane (via [`Tmux::capture_pane`]), classifies it with
+    /// [`classify_wedge`], and — on a hit — invokes this hook with the wedged session's spec and the
+    /// dialog. The composition root's hook applies the recovery (re-seed onboarding for a trust
+    /// prompt / let the rotated pointer take for a usage-limit) and alerts the operator; the
+    /// supervisor then kills the wedged session so the SAME tick's re-sling path treats it as dead
+    /// and re-slings it onto the recovered state. The pool slot is NOT freed — the re-sling reuses
+    /// the slot the original sling claimed, exactly like a crash re-sling. `None` ⇒ wedges are not
+    /// detected (legacy: an alive session is always counted healthy).
+    on_wedge: Mutex<Option<WedgeFn>>,
 }
 
 /// Spec rewriter applied before a re-sling (see [`PolecatSupervisor::set_respec`]).
 pub type RespecFn = Box<dyn Fn(SpawnSpec) -> SpawnSpec + Send + Sync>;
 
-/// Bead-status probe consulted before a re-sling (see [`PolecatSupervisor::set_bead_closed`]).
-/// Given a `hook_bead` id, returns `true` when that bead is closed in the tracker.
-pub type BeadClosedFn = Box<dyn Fn(&str) -> bool + Send + Sync>;
+/// Slingability probe consulted before a re-sling (see [`PolecatSupervisor::set_bead_slingable`]).
+/// Given a `hook_bead` id, returns `true` when a polecat should still be (re-)slung for that bead —
+/// it is open/working, not an epic, and dispatch=auto (the unified `should_sling` predicate,
+/// gtcore-db99e0). `false` ⇒ `tick` drops the dead polecat instead of re-slinging it.
+pub type BeadSlingableFn = Box<dyn Fn(&str) -> bool + Send + Sync>;
+
+/// Wedge-recovery hook (see [`PolecatSupervisor::set_on_wedge`]). Given the wedged session's spec
+/// and the dialog it is frozen on, the composition root applies the recovery (re-seed onboarding /
+/// rotate account) and alerts the operator. Called by `tick` BEFORE it kills the wedged session, so
+/// the recovery (e.g. re-seeding the config dir) is in place for the re-sling that follows.
+pub type WedgeFn = Box<dyn Fn(&SpawnSpec, WedgeDialog) + Send + Sync>;
 
 struct SupervisorState {
     /// session id -> spec to re-sling it from.
@@ -518,7 +542,8 @@ impl PolecatSupervisor {
                 paused: HashSet::new(),
             }),
             respec: Mutex::new(None),
-            bead_closed: Mutex::new(None),
+            slingable: Mutex::new(None),
+            on_wedge: Mutex::new(None),
         }
     }
 
@@ -528,12 +553,21 @@ impl PolecatSupervisor {
         *self.respec.lock().unwrap() = Some(f);
     }
 
-    /// Install the bead-closed probe (gtcore-177770) — settable post-`Arc` because the
-    /// composition root builds the supervisor before the Dolt store handle exists. A dead
-    /// polecat whose `hook_bead` this probe reports closed is unwatched instead of re-slung.
-    /// See [`BeadClosedFn`].
-    pub fn set_bead_closed(&self, f: BeadClosedFn) {
-        *self.bead_closed.lock().unwrap() = Some(f);
+    /// Install the slingability probe (gtcore-177770, generalized by gtcore-db99e0) — settable
+    /// post-`Arc` because the composition root builds the supervisor before the Dolt store handle
+    /// exists. A dead polecat whose `hook_bead` this probe reports NOT slingable (closed, an epic,
+    /// or dispatch=manual) is unwatched instead of re-slung — and without spending its restart
+    /// budget. See [`BeadSlingableFn`].
+    pub fn set_bead_slingable(&self, f: BeadSlingableFn) {
+        *self.slingable.lock().unwrap() = Some(f);
+    }
+
+    /// Install the wedge-recovery hook (gtcore-2836bb) — settable post-`Arc` because the
+    /// composition root builds the supervisor before the keychain/allocator exist. When set, an
+    /// alive session frozen on a known interactive dialog is recovered (re-seed/rotate + slot
+    /// release + alert) and re-slung instead of being counted healthy. See [`WedgeFn`].
+    pub fn set_on_wedge(&self, f: WedgeFn) {
+        *self.on_wedge.lock().unwrap() = Some(f);
     }
 
     /// Register a freshly-slung polecat so its death is detected and recovered. Keyed by
@@ -715,32 +749,69 @@ impl PolecatSupervisor {
         let mut to_drop: Vec<String> = Vec::new();
         for session in sessions {
             if self.tmux.has_session(&session) {
-                st.tracker.record_success(&session, now);
-                continue;
+                // Alive by `has_session` — but a polecat can be alive yet WEDGED on an interactive
+                // dialog claude never gets past (trust-folder / usage-limit). Such a session
+                // produces nothing while holding its pool slot and would otherwise be counted
+                // healthy here (gtcore-2836bb). When a wedge hook is wired, inspect the pane: a
+                // known dialog ⇒ run the recovery (re-seed/rotate + alert via the hook), then KILL
+                // the session so the dead-path below re-slings it THIS tick onto the recovered
+                // state. A paused (SIGSTOP'd) polecat is deliberately skipped — its frozen pane is
+                // not a wedge, and resuming it is the quota subsystem's job.
+                let wedge_armed = self.on_wedge.lock().unwrap().is_some();
+                let wedged = if wedge_armed && !st.paused.contains(&session) {
+                    self.tmux
+                        .capture_pane(&session)
+                        .and_then(|pane| classify_wedge(&pane))
+                } else {
+                    None
+                };
+                let Some(dialog) = wedged else {
+                    st.tracker.record_success(&session, now);
+                    continue;
+                };
+                // Recovery hook (re-seed / rotate + alert) before the kill, so the re-sling that
+                // follows lands on the recovered state. Clone the spec out so the hook does not
+                // hold a borrow of `st.watched` across the call.
+                if let Some(spec) = st.watched.get(&session).cloned() {
+                    if let Some(hook) = self.on_wedge.lock().unwrap().as_ref() {
+                        hook(&spec, dialog);
+                    }
+                }
+                eprintln!(
+                    "[polecat-supervisor] session={session} wedged on {} — recovering + re-slinging",
+                    dialog.reason()
+                );
+                // Kill the wedged session and fall through to the dead-handling path below: the
+                // session is now gone, so it re-slings THIS tick exactly as a crashed polecat
+                // would (subject to the same restart budget + backoff). The slot is reused, not
+                // re-claimed.
+                let _ = self.tmux.kill_session(&session);
             }
             // Dead. A paused polecat that died (killed while suspended) is gone — drop it from the
             // pause set so a later resume does not thaw a stale id and any re-sling below starts a
             // fresh, un-paused session (gtcore-6f449f).
             st.paused.remove(&session);
-            // If the bead this polecat was slung for has already closed (operator or
-            // merge auto-close), the work is delivered — unwatch instead of burning restart
-            // budget re-slinging finished work and blocking the slot (gtcore-177770). Only the
-            // positively-closed case drops; an unknown bead or a probe error falls through to
-            // the normal re-sling path, so open beads (and a missing probe) never regress.
+            // If the bead this polecat was slung for is no longer slingable — closed (operator or
+            // merge auto-close, work delivered), an epic container, or dispatch=manual — unwatch
+            // instead of burning restart budget re-slinging work no autonomous agent should touch
+            // and blocking the slot (gtcore-177770, unified by gtcore-db99e0). Only a positive
+            // ¬slingable verdict drops; an unknown bead, a probe error, or a missing probe is
+            // treated as slingable and falls through to the normal re-sling path, so live work
+            // (and a deployment without the probe wired) never regresses.
             let hook_bead = st.watched.get(&session).and_then(|s| s.hook_bead.clone());
             if let Some(bead) = hook_bead {
-                let closed = self
-                    .bead_closed
+                let slingable = self
+                    .slingable
                     .lock()
                     .unwrap()
                     .as_ref()
                     .map(|f| f(&bead))
-                    .unwrap_or(false);
-                if closed {
+                    .unwrap_or(true);
+                if !slingable {
                     st.watched.remove(&session);
                     st.restarts.remove(&session);
                     eprintln!(
-                        "[polecat-supervisor] unwatching session={session} — bead {bead} is closed"
+                        "[polecat-supervisor] unwatching session={session} — bead {bead} is not slingable (closed/epic/manual)"
                     );
                     continue;
                 }
@@ -890,9 +961,11 @@ mod polecat_supervisor_tests {
     }
 
     #[test]
-    fn closed_bead_is_unwatched_not_reslung() {
-        // gtcore-177770: a polecat whose bead closed (operator / merge auto-close) while its
-        // tmux session was dead must be dropped on the first tick, never re-slung.
+    fn unslingable_bead_is_unwatched_not_reslung() {
+        // gtcore-177770 + gtcore-db99e0: a polecat whose bead became un-slingable (closed by
+        // operator / merge auto-close, or flipped to an epic / dispatch=manual) while its tmux
+        // session was dead must be dropped on the first tick, never re-slung — and without
+        // spending its restart budget.
         let tmux: Arc<FakeTmux> = Arc::new(FakeTmux::new());
         let sup = PolecatSupervisor::new(
             tmux.clone(),
@@ -906,21 +979,22 @@ mod polecat_supervisor_tests {
         let s = spec("gt-max", "hq-closed");
         spawn_tmux(tmux.as_ref(), &s).unwrap();
         sup.watch(s);
-        // Probe reports this exact bead closed.
-        sup.set_bead_closed(Box::new(|bead: &str| bead == "hq-closed"));
+        // Probe reports this exact bead NOT slingable (the wired closure embodies should_sling).
+        sup.set_bead_slingable(Box::new(|bead: &str| bead != "hq-closed"));
         assert_eq!(sup.watched_count(), 1);
 
-        // Session dies, but the bead is closed → first tick unwatches, no re-sling.
+        // Session dies, but the bead is not slingable → first tick unwatches, no re-sling.
         tmux.kill_session("gt-max").unwrap();
-        assert_eq!(sup.tick(1000), 0, "closed bead is not re-slung");
+        assert_eq!(sup.tick(1000), 0, "un-slingable bead is not re-slung");
         assert_eq!(sup.watched_count(), 0, "session dropped from the watched map");
-        assert!(!tmux.has_session("gt-max"), "closed polecat stays dead");
+        assert!(!tmux.has_session("gt-max"), "un-slingable polecat stays dead");
     }
 
     #[test]
-    fn open_bead_is_still_reslung_with_probe_installed() {
-        // gtcore-177770 (no-regression): with the closed-probe installed, a dead polecat whose
-        // bead is still open must re-sling exactly as before.
+    fn slingable_bead_is_still_reslung_with_probe_installed() {
+        // gtcore-177770 (no-regression): with the slingability probe installed, a dead polecat
+        // whose bead is still slingable (open/working, ¬epic, dispatch=auto) must re-sling as
+        // before.
         let tmux: Arc<FakeTmux> = Arc::new(FakeTmux::new());
         let sup = PolecatSupervisor::new(
             tmux.clone(),
@@ -934,11 +1008,11 @@ mod polecat_supervisor_tests {
         let s = spec("gt-rictus", "hq-open");
         spawn_tmux(tmux.as_ref(), &s).unwrap();
         sup.watch(s);
-        // Probe never reports closed (e.g. open bead, or unknown id).
-        sup.set_bead_closed(Box::new(|_bead: &str| false));
+        // Probe reports every bead slingable (e.g. open auto bead, or unknown id → permissive).
+        sup.set_bead_slingable(Box::new(|_bead: &str| true));
 
         tmux.kill_session("gt-rictus").unwrap();
-        assert_eq!(sup.tick(1000), 1, "open bead is re-slung");
+        assert_eq!(sup.tick(1000), 1, "slingable bead is re-slung");
         assert!(tmux.has_session("gt-rictus"), "re-slung session exists again");
         assert_eq!(sup.watched_count(), 1, "still supervised");
     }
@@ -1040,6 +1114,90 @@ mod polecat_supervisor_tests {
         // Resume: sess-2 is still paused; sess-1 was re-slung fresh (not in the pause set).
         let resumed = sup.resume_account("acct-a");
         assert_eq!(resumed, vec!["sess-2"], "only the still-paused session is thawed");
+    }
+
+    #[test]
+    fn wedged_alive_session_is_recovered_and_reslung() {
+        // gtcore-2836bb: a session that is alive (has_session) but frozen on the trust-folder
+        // dialog must be detected as wedged — the recovery hook fires, the session is killed and
+        // re-slung THIS tick, and the operator-facing dialog is reported to the hook.
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let tmux: Arc<FakeTmux> = Arc::new(FakeTmux::new());
+        let sup = PolecatSupervisor::new(
+            tmux.clone(),
+            RestartConfig {
+                initial_backoff_secs: 1,
+                crash_loop_count: 100,
+                ..RestartConfig::default()
+            },
+            u32::MAX,
+        );
+        let s = spec("gt-wedged", "hq-w");
+        spawn_tmux(tmux.as_ref(), &s).unwrap();
+        sup.watch(s);
+
+        let hook_calls = Arc::new(AtomicUsize::new(0));
+        let seen = Arc::new(Mutex::new(None));
+        let hc = hook_calls.clone();
+        let sn = seen.clone();
+        let tmux_for_hook = tmux.clone();
+        sup.set_on_wedge(Box::new(move |spec, dialog| {
+            hc.fetch_add(1, Ordering::SeqCst);
+            *sn.lock().unwrap() = Some(dialog);
+            // The recovery clears the wedge for the re-slung session (in production this is the
+            // re-seed; here we just drop the stale pane text so the next tick sees a clean session).
+            tmux_for_hook.set_pane(&spec.session, "");
+        }));
+
+        // The pane shows the trust prompt → wedged.
+        tmux.set_pane("gt-wedged", "Do you trust this folder? 1. Yes 2. No");
+        assert!(tmux.has_session("gt-wedged"), "session is alive before the tick");
+
+        let reslung = sup.tick(1000);
+        assert_eq!(reslung, 1, "the wedged session is killed and re-slung this tick");
+        assert_eq!(hook_calls.load(Ordering::SeqCst), 1, "recovery hook fired once");
+        assert_eq!(
+            *seen.lock().unwrap(),
+            Some(WedgeDialog::TrustPrompt),
+            "the hook saw the trust-folder dialog"
+        );
+        assert!(tmux.has_session("gt-wedged"), "the re-slung session exists again");
+        assert_eq!(sup.watched_count(), 1, "still supervised");
+
+        // The recovery cleared the pane → the next tick sees a healthy session (no re-sling).
+        assert_eq!(sup.tick(2000), 0, "a recovered session is no longer wedged");
+    }
+
+    #[test]
+    fn unwedged_alive_session_is_left_alone() {
+        // gtcore-2836bb no-regression: with the wedge hook installed, an alive session whose pane
+        // shows normal working output is NOT killed — it is counted healthy exactly as before.
+        let tmux: Arc<FakeTmux> = Arc::new(FakeTmux::new());
+        let sup = PolecatSupervisor::new(tmux.clone(), RestartConfig::default(), u32::MAX);
+        let s = spec("gt-busy", "hq-b");
+        spawn_tmux(tmux.as_ref(), &s).unwrap();
+        sup.watch(s);
+        sup.set_on_wedge(Box::new(|_spec, _dialog| {
+            panic!("a healthy session must not trigger the wedge hook");
+        }));
+        tmux.set_pane("gt-busy", "Running tests… 12 passed");
+        assert_eq!(sup.tick(1000), 0, "healthy session not re-slung");
+        assert!(tmux.has_session("gt-busy"), "healthy session left running");
+    }
+
+    #[test]
+    fn wedge_detection_is_off_without_the_hook() {
+        // Without set_on_wedge, the pane is never even captured — an alive session is always
+        // healthy (legacy behaviour preserved).
+        let tmux: Arc<FakeTmux> = Arc::new(FakeTmux::new());
+        let sup = PolecatSupervisor::new(tmux.clone(), RestartConfig::default(), u32::MAX);
+        let s = spec("gt-legacy", "hq-l");
+        spawn_tmux(tmux.as_ref(), &s).unwrap();
+        sup.watch(s);
+        // Even a pane that WOULD classify as wedged is ignored when no hook is wired.
+        tmux.set_pane("gt-legacy", "Usage limit reached\n1. Stop and wait for limit to reset");
+        assert_eq!(sup.tick(1000), 0, "no hook ⇒ no wedge detection");
+        assert!(tmux.has_session("gt-legacy"), "session left running");
     }
 
     #[test]

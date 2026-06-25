@@ -272,6 +272,34 @@ impl IssueEventSink for EventLogIssueSink {
     }
 }
 
+/// The composition-root [`gt_rig::RigEventSink`] for the rig catalog (rig-hold H1, gtcore-fab8fb).
+///
+/// The rig catalog is a Postgres projection, not event-sourced, so its mutations never reached the
+/// per-workspace event log. The rig-hold feature asked for the operator's `rig.hold`/`rig.resume`
+/// to be **auditable** (`rig.held.v1` / `rig.resumed.v1`); this sink closes that gap for those two
+/// transitions, appending the decided [`gt_rig::RigEvent`] to the same log the `GET /stream` SSE
+/// feed fans out, keyed to the rig's workspace. The other rig mutations stay projection-only.
+///
+/// Best-effort by the [`gt_rig::RigEventSink`] contract: the catalog row has already been upserted
+/// by the time this emits, so an append failure is swallowed and never surfaces to the caller.
+pub struct EventLogRigSink {
+    log: Arc<EventLog>,
+}
+
+impl EventLogRigSink {
+    /// Back the sink with the shared per-workspace event log — the same handle the SSE feed reads.
+    pub fn new(log: Arc<EventLog>) -> Self {
+        Self { log }
+    }
+}
+
+impl gt_rig::RigEventSink for EventLogRigSink {
+    fn emit(&self, workspace: Option<&str>, event: &gt_rig::RigEvent) {
+        // Best-effort, same rationale as the issue sink: the mutation already committed.
+        let _ = self.log.append(workspace, event.clone());
+    }
+}
+
 #[cfg(test)]
 mod issue_sink_tests {
     use super::*;

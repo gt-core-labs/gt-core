@@ -35,7 +35,7 @@ use gt_documents::{DocumentsApiState, DocumentsModule};
 use gt_feed::{FeedApiState, FeedModule};
 use gt_graphindex::GraphifyIndexer;
 use gt_merge::{MergeApiState, MergeModule};
-use gt_meta::{MetaApiState, MetaModule};
+use gt_meta::{DomainApiState, DomainCatalogHttpModule, MetaApiState, MetaModule};
 use gt_module::{McpTool, RootBuilder};
 use gt_orchestration::{ConvoyApiState, ConvoyModule};
 use gt_quota::{QuotaApiState, QuotaModule};
@@ -46,8 +46,8 @@ use gt_workspace::{PgWorkspaces, WorkspaceApiState, WorkspaceModule};
 
 use crate::mcp::{
     CompositionTenantProvisioner, EventLog, EventLogAgentEvents, EventLogConvoy, EventLogFeed,
-    EventLogGraph, EventLogMerges, EventLogQuota, EventLogSkills, FsAccountCatalog, GraphHandler,
-    GraphHandlerRefresher, RigProvisioner, WsPoolRigs, WsPools,
+    EventLogGraph, EventLogMerges, EventLogQuota, EventLogRigSink, EventLogSkills, FsAccountCatalog,
+    GraphHandler, GraphHandlerRefresher, RigProvisioner, WsPoolRigs, WsPools,
 };
 
 /// The Postgres-gated slice of the REST module set (workspace / rig / connection /
@@ -107,6 +107,37 @@ pub struct RestModuleParts {
     pub pg: Option<RestPgParts>,
 }
 
+/// Best-effort operator bell for embedded-seed drift (`gtcore-63bb20`). Inserts one row into the
+/// `notifications` table — the same browser-bell channel escalations / quota blocks use — so an
+/// operator sees that the shipped binary's greenfield seed has drifted from the live curated
+/// catalog and a `seeds/knowledge.json` regeneration is due. Never errors: a notification fault at
+/// boot must not break module assembly.
+async fn ring_seed_drift_bell(
+    pool: &sqlx::PgPool,
+    workspace: &str,
+    report: &gt_skills::DriftReport,
+) {
+    let title = "Skills seed drift detected";
+    let body = format!(
+        "The binary's embedded greenfield seed has drifted from the live `{workspace}` skills catalog: {}. Regenerate seeds/knowledge.json (scripts/extract-knowledge-seed.py) so a clean deploy bootstraps the current Knowledge.",
+        report.summary()
+    );
+    if let Err(e) = sqlx::query(
+        "INSERT INTO notifications (workspace, from_role, title, body, kind) \
+         VALUES ($1, $2, $3, $4, $5)",
+    )
+    .bind(workspace)
+    .bind("system")
+    .bind(title)
+    .bind(&body)
+    .bind("seed_drift")
+    .execute(pool)
+    .await
+    {
+        eprintln!("[gt-mcp-server] skills: seed-drift bell insert failed: {e}");
+    }
+}
+
 /// Assemble the REST domain `RootBuilder` — the `rest_root` set `gt-mcp-server`
 /// boots — without reading the environment or dialing a socket.
 ///
@@ -136,13 +167,37 @@ pub async fn build_rest_modules(
         pg,
     } = parts;
 
+    // The per-workspace Dolt pools (multi-tenant only) the meta `GET /domains` endpoint
+    // resolves the active tenant's `domain_catalog` from (gtcore-d81e77 H2). Cloned out of
+    // the still-owned `pg` parts before they are destructured below; `None` in single-tenant
+    // builds, where the meta catalog reads the fallback `meta_store` pool.
+    let meta_workspaces = pg.as_ref().and_then(|p| p.issues_workspaces.clone());
+
+    // The domain-catalog REST module (gtcore-b37400 H4) shares the same store + per-workspace
+    // pools as the meta `GET /domains` read, so it resolves and writes ONE catalog. Cloned out
+    // before `meta_store`/`meta_workspaces` are consumed by the meta module below.
+    let domain_state = {
+        let state = DomainApiState::new(meta_store.clone());
+        match &meta_workspaces {
+            Some(pools) => state.with_workspaces(pools.clone()),
+            None => state,
+        }
+    };
+
     let mut rest = RootBuilder::new()
-        // meta REST: GET /help (full tools/list) + POST /report-gap.
-        .module(MetaModule::with_http(MetaApiState::new(
-            meta_store,
-            actor.clone(),
-            meta_tools,
-        )))
+        // meta REST: GET /help (full tools/list) + GET /domains (active-workspace
+        // domain catalog) + POST /report-gap.
+        .module(MetaModule::with_http({
+            let state = MetaApiState::new(meta_store, actor.clone(), meta_tools);
+            match meta_workspaces {
+                Some(pools) => state.with_workspaces(pools),
+                None => state,
+            }
+        }))
+        // domain.catalog.* REST: admin-scoped (domain.read/domain.write) list/add/rename/
+        // set-enabled/remove for the active workspace's catalog — the REST twin of the
+        // `domain.catalog.*` MCP tools (gtcore-b37400 H4).
+        .module(DomainCatalogHttpModule::with_http(domain_state))
         // agent.*: the REST surface now delegates to the SAME EventLog the MCP handler uses
         // (gtcore-8c3823), so both transports always agree on session state regardless of
         // whether the backend is file or Postgres.
@@ -171,6 +226,10 @@ pub async fn build_rest_modules(
     // workspace's `skills.*` log when empty (idempotent), so a clean deploy gives
     // each role a working least-privilege MCP grant out of the box.
     let skills = Arc::new(EventLogSkills::new(event_log.clone()));
+    // gtcore-63bb20: the operator bell for embedded-seed drift rides the `notifications` table, so it
+    // needs the public PG pool. Borrow it before `pg` is consumed by the module-slice block below;
+    // `None` (GT_PG_URL unset) ⇒ the drift scan still warns to the log, just with no bell.
+    let drift_bell_pool = pg.as_ref().map(|p| p.pool.clone());
     {
         use gt_skills::{SkillWriter, WorkspaceSkills};
         if let Ok(cat) = skills.catalog(&skills_seed_workspace).await {
@@ -186,6 +245,28 @@ pub async fn build_rest_modules(
                     }
                 }
                 eprintln!("[gt-mcp-server] skills: seeded {seeded} role-catalog event(s) into empty `{skills_seed_workspace}` catalog");
+            } else {
+                // gtcore-63bb20: a populated (curated) catalog — the live `skills.*` log is now the
+                // source of truth and the embedded seed is only a frozen greenfield bootstrap. Detect
+                // when it has DRIFTED from the live catalog so it cannot rot silently: report it, and
+                // on SIGNIFICANT drift (a role's functional Knowledge changed, or a role/bound-skill
+                // diverged — never the intentional unbound-skill omission) warn loudly and ring the
+                // operator bell, so regenerating `seeds/knowledge.json` lands on someone's radar.
+                let report = gt_skills::compute_drift(&gt_skills::seed_catalog(), &cat);
+                if report.is_significant() {
+                    eprintln!(
+                        "[gt-mcp-server] skills: SEED DRIFT in `{skills_seed_workspace}` — {} (regenerate seeds/knowledge.json via scripts/extract-knowledge-seed.py)",
+                        report.summary()
+                    );
+                    if let Some(pool) = &drift_bell_pool {
+                        ring_seed_drift_bell(pool, &skills_seed_workspace, &report).await;
+                    }
+                } else if !report.is_empty() {
+                    eprintln!(
+                        "[gt-mcp-server] skills: embedded seed differs from live `{skills_seed_workspace}` catalog but only benignly ({}); no alert",
+                        report.summary()
+                    );
+                }
             }
         }
     }
@@ -234,9 +315,14 @@ pub async fn build_rest_modules(
                     )),
                 ),
             ))
-            .module(RigsModule::with_http(RigApiState::new(Arc::new(
-                WsPoolRigs::new(Arc::new(WsPools::new(pg_url.clone()))),
-            ))))
+            // rig-hold H1: the REST hold/resume routes emit `rig.held.v1` / `rig.resumed.v1` to the
+            // same event log the MCP handler uses, so the transition is auditable across transports.
+            .module(RigsModule::with_http(
+                RigApiState::new(Arc::new(WsPoolRigs::new(Arc::new(WsPools::new(
+                    pg_url.clone(),
+                )))))
+                .with_event_sink(Arc::new(EventLogRigSink::new(event_log.clone()))),
+            ))
             // connection.*: per-workspace VCS connections over the GLOBAL
             // `public.vcs_connections` table, + the GitHub App install flow when
             // an App is configured.

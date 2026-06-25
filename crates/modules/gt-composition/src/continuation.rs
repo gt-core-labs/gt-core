@@ -22,6 +22,12 @@ use std::process::Command;
 /// generous enough to orient the continuator while staying well under any argv limit.
 pub const MAX_DIFF_BYTES: usize = 24 * 1024;
 
+/// Hard cap on the embedded CI-failure log (bytes). The orchd snapshots a best-effort summary of
+/// the failing PR checks ([`read_ci_checks`]) into the re-sling prompt; like the diff it is
+/// truncated so the kickoff argv stays bounded. Smaller than the diff budget — the summary is a
+/// pointer (which checks failed + how to pull the full log), not the whole CI output.
+pub const MAX_CI_LOG_BYTES: usize = 8 * 1024;
+
 /// The structured checkpoint a previous agent left in the bead notes (gtcore-2467b4). The
 /// checkpoint protocol writes a `## Checkpoint` block with `### Completado` / `### Pendiente`
 /// sub-sections; this is the parsed form the continuation prompt renders back.
@@ -132,6 +138,37 @@ pub fn read_branch_diff(workdir: &Path, base: &str) -> String {
     }
     out.push_str(patch.trim_end());
     truncate_on_char_boundary(out.trim(), MAX_DIFF_BYTES)
+}
+
+/// Read a best-effort summary of the failing PR checks for `branch`, to embed in the CI-fix
+/// re-sling prompt (gtcore-3a1bd4). Shells `gh pr checks <branch>` in `workdir` (the bead's
+/// worktree, where the rig's authenticated `gh` works) and returns its output, truncated to
+/// [`MAX_CI_LOG_BYTES`]. Best-effort: `gh` missing / unauthenticated / no PR yields an empty
+/// string, so the prompt degrades to the failure reason + the self-fetch instructions rather than
+/// aborting the re-sling. This is a POINTER, not the whole CI log — the prompt tells the agent to
+/// pull the full failing job output itself (`gh run view --log-failed`), which is fresher and
+/// unbounded by the kickoff argv.
+pub fn read_ci_checks(workdir: &Path, branch: &str) -> String {
+    let out = Command::new("gh")
+        .arg("pr")
+        .arg("checks")
+        .arg(branch)
+        .current_dir(workdir)
+        .output();
+    let text = match out {
+        // `gh pr checks` exits non-zero when any check failed — exactly our case — so the output is
+        // useful on BOTH success and failure exit; take stdout, falling back to stderr if empty.
+        Ok(o) => {
+            let stdout = String::from_utf8_lossy(&o.stdout).into_owned();
+            if stdout.trim().is_empty() {
+                String::from_utf8_lossy(&o.stderr).into_owned()
+            } else {
+                stdout
+            }
+        }
+        Err(_) => String::new(),
+    };
+    truncate_on_char_boundary(text.trim(), MAX_CI_LOG_BYTES)
 }
 
 /// Run `git -C <workdir> <args…>` and return stdout (lossy UTF-8), or an empty string on any
@@ -251,6 +288,102 @@ pub fn build_continuation_prompt(
     p
 }
 
+/// Assemble the re-sling prompt handed to a polecat after its PR failed CI (gtcore-3a1bd4).
+///
+/// This is the CI-failure sibling of [`build_continuation_prompt`]: the bead's work is already on
+/// the branch (and a PR is open with auto-merge armed), but the PR's CI is red — typically Rust the
+/// previous agent wrote without compiling locally (a missing `derive`, a type error, a stale entry
+/// in a parity test). Rather than leaving the merge slot terminally `failed` for a human, the bead
+/// is re-dispatched to a polecat with this prompt: the CI failure `reason`, a best-effort snapshot
+/// of the failing checks (`ci_checks`, from [`read_ci_checks`]), the branch `diff`, and the
+/// acceptance criteria. `attempt`/`max` tell the agent which retry this is so it knows the budget is
+/// finite. It closes by telling the agent to fix, compile/test locally, push to the SAME branch, and
+/// re-submit — which re-enters the merge queue (a `Failed` slot accepts re-submit, gtcore-3a1bd4).
+pub fn build_ci_fix_prompt(
+    bead: &str,
+    reason: &str,
+    ci_checks: &str,
+    diff: &str,
+    acceptance_criteria: &str,
+    attempt: u32,
+    max: u32,
+) -> String {
+    let mut p = String::new();
+    p.push_str(&format!(
+        "You are a gt polecat RESUMING work on bead `{bead}` (branch `{bead}`). Your branch's work \
+         is already committed and a pull request is open, but the PR's CI is FAILING — the merge \
+         cannot land until CI is green. This is automated retry {attempt} of {max}; after the last \
+         retry the bead is escalated to a human, so fix the failure decisively now. Do NOT restart \
+         from scratch — the implementation is on the branch; you are fixing what CI flagged.\n\n"
+    ));
+
+    p.push_str("## Why CI failed\n");
+    let reason = reason.trim();
+    p.push_str(if reason.is_empty() {
+        "(no reason captured — inspect the checks below and the full logs)"
+    } else {
+        reason
+    });
+    p.push('\n');
+
+    p.push_str("\n## Failing checks (snapshot)\n");
+    let ci_checks = ci_checks.trim();
+    if ci_checks.is_empty() {
+        p.push_str(
+            "(no check snapshot captured — pull them yourself with the commands below)\n",
+        );
+    } else {
+        p.push_str("```\n");
+        p.push_str(ci_checks);
+        p.push_str("\n```\n");
+    }
+
+    p.push_str(
+        "\n## Get the full CI log\n\
+         The snapshot above is only a pointer. Read the actual failure (cargo build/test errors) \
+         from your branch's PR before changing anything:\n\
+         - `gh pr checks` — list the checks and their state\n\
+         - `gh run list --branch ");
+    p.push_str(bead);
+    p.push_str(
+        " --limit 1` then `gh run view <run-id> --log-failed` — the failing job's full output\n\
+         Reproduce locally where you can: `cargo build --locked` and `cargo test --locked` catch \
+         the common cases (missing `derive`, type errors, a parity-test entry you forgot).\n",
+    );
+
+    p.push_str("\n## Acceptance criteria (the bead is done when all are met)\n");
+    let ac = acceptance_criteria.trim();
+    p.push_str(if ac.is_empty() {
+        "(none recorded on the bead — read it via the `gt` MCP tools)"
+    } else {
+        ac
+    });
+    p.push('\n');
+
+    p.push_str("\n## Work already on the branch (`git diff main...HEAD`)\n");
+    let diff = diff.trim();
+    if diff.is_empty() {
+        p.push_str(
+            "(no diff captured — inspect the working tree and the branch directly)\n",
+        );
+    } else {
+        p.push_str("```diff\n");
+        p.push_str(diff);
+        p.push_str("\n```\n");
+    }
+
+    p.push_str(&format!(
+        "\nFix the CI failure on branch `{bead}`, committing your fix with a conventional message. \
+         Push to the SAME branch so the existing PR re-runs CI. When the fix is committed and \
+         pushed, signal completion by calling the MCP tool `mcp__gt__merge_submit` with arguments \
+         {{\"bead\":\"{bead}\",\"branch\":\"{bead}\"}} (re-submitting a CI-failed bead is allowed — \
+         it re-enters the merge queue). If the MCP tool is unavailable, fall back to the merge-ready \
+         channel as described in CLAUDE.md. Then stop."
+    ));
+
+    p
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -345,6 +478,49 @@ mod tests {
         let prompt = build_continuation_prompt("gg-2", "", "", "");
         assert!(prompt.contains("no checkpoint notes"));
         assert!(prompt.contains("none recorded on the bead"));
+    }
+
+    #[test]
+    fn build_ci_fix_prompt_carries_reason_checks_diff_ac_and_retry_budget() {
+        let prompt = build_ci_fix_prompt(
+            "gtcore-3a1bd4",
+            "CI failed: failure",
+            "build-test  fail  https://github.com/o/r/actions/runs/1",
+            "diff --git a/x b/x\n+missing derive",
+            "- cargo test green.\n- CI --locked green.",
+            2,
+            3,
+        );
+        // Frames it as a CI-failure resume, not a restart, and names the bead/branch.
+        assert!(prompt.contains("RESUMING work on bead `gtcore-3a1bd4`"));
+        assert!(prompt.contains("Do NOT restart"));
+        // Surfaces the retry budget so the agent knows it is finite.
+        assert!(prompt.contains("retry 2 of 3"));
+        // Carries the CI reason + the failing-checks snapshot.
+        assert!(prompt.contains("CI failed: failure"));
+        assert!(prompt.contains("build-test"));
+        // Tells the agent how to pull the full failing log itself.
+        assert!(prompt.contains("--log-failed"));
+        // Carries the acceptance criteria and the branch diff.
+        assert!(prompt.contains("cargo test green"));
+        assert!(prompt.contains("```diff"));
+        assert!(prompt.contains("+missing derive"));
+        // Closes with the completion signal, noting a CI-failed bead may re-submit.
+        assert!(prompt.contains("mcp__gt__merge_submit"));
+        assert!(prompt.contains("\"bead\":\"gtcore-3a1bd4\""));
+        assert!(prompt.contains("re-enters the merge queue"));
+    }
+
+    #[test]
+    fn build_ci_fix_prompt_tolerates_empty_reason_checks_diff_and_ac() {
+        let prompt = build_ci_fix_prompt("gg-9", "", "", "", "", 1, 3);
+        assert!(prompt.contains("no reason captured"));
+        assert!(prompt.contains("no check snapshot captured"));
+        assert!(prompt.contains("no diff captured"));
+        assert!(prompt.contains("none recorded on the bead"));
+        // Still self-contained: the self-fetch instructions and completion signal are present.
+        assert!(prompt.contains("--log-failed"));
+        assert!(prompt.contains("mcp__gt__merge_submit"));
     }
 
     #[test]

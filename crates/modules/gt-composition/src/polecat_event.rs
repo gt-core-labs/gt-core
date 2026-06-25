@@ -41,6 +41,15 @@ pub enum PolecatEvent {
     /// the sling is blocked, the pool slot is released, and the operator is alerted to fix
     /// credentials. `workspace` is the pool the slot was released to.
     SlingAuthBlocked { bead: String, workspace: String },
+    /// A bead's PR kept failing CI past the retry cap (gtcore-3a1bd4): the auto re-sling loop
+    /// (fix-and-re-push) was tried `attempts` times and CI is still red, so the loop was abandoned
+    /// rather than burning quota forever. The merge slot is left `failed` and the pool slot freed.
+    /// An ALERT — a human must read the CI log and unblock the PR. `reason` is the last CI failure.
+    CiRetriesExhausted {
+        bead: String,
+        reason: String,
+        attempts: u32,
+    },
 }
 
 impl EventKind for PolecatEvent {
@@ -52,6 +61,7 @@ impl EventKind for PolecatEvent {
             PolecatEvent::SlingFailed { .. } => "polecat.sling-failed.v1",
             PolecatEvent::CredentialDead { .. } => "polecat.credential-dead.v1",
             PolecatEvent::SlingAuthBlocked { .. } => "polecat.sling-auth-blocked.v1",
+            PolecatEvent::CiRetriesExhausted { .. } => "polecat.ci-retries-exhausted.v1",
         }
     }
 }
@@ -88,6 +98,15 @@ mod tests {
             workspace: "default".into(),
         };
         assert_eq!(blocked.kind(), "polecat.sling-auth-blocked.v1");
+
+        let exhausted = PolecatEvent::CiRetriesExhausted {
+            bead: "hq-1".into(),
+            reason: "CI failed: failure".into(),
+            attempts: 3,
+        };
+        assert_eq!(exhausted.kind(), "polecat.ci-retries-exhausted.v1");
+        assert!(exhausted.kind().starts_with("polecat."));
+        assert!(exhausted.kind().ends_with(".v1"));
     }
 
     #[test]
@@ -108,6 +127,11 @@ mod tests {
             PolecatEvent::SlingAuthBlocked {
                 bead: "gtweb-1".into(),
                 workspace: "default".into(),
+            },
+            PolecatEvent::CiRetriesExhausted {
+                bead: "gtweb-1".into(),
+                reason: "CI failed: failure".into(),
+                attempts: 3,
             },
         ] {
             let json = serde_json::to_string(&ev).unwrap();

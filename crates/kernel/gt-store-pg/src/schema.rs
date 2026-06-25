@@ -198,6 +198,7 @@ mod tests {
             eprintln!("GT_PG_URL unset; skipping WorkspacePool search_path test");
             return;
         };
+        crate::assert_ephemeral_pg_url(&url);
         let wp = WorkspacePool::connect(&url, "acme-pg-test")
             .await
             .expect("connect workspace pool");
@@ -243,6 +244,7 @@ mod tests {
             eprintln!("GT_PG_URL unset; skipping schema-clone completeness test");
             return;
         };
+        crate::assert_ephemeral_pg_url(&url);
 
         // Unique-ish names keep the test from colliding with real tenant data or
         // a parallel session on a shared Postgres.
