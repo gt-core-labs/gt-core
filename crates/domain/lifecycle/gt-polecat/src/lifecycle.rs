@@ -242,6 +242,11 @@ impl SpawnTemplate {
         // and its account's claude creds, so a root session could read OTHER accounts' creds, the
         // RS256 signing key, and the whole volume. `GT_POLECAT_RUN_AS=<user>` re-execs the polecat
         // as a dedicated non-root uid via `runuser`. Unset ⇒ runs as the daemon's uid (legacy).
+        // Scrub the daemon's PROD store DSNs (GT_PG_URL/GT_PG_AUDIT_URL/GT_DOLT_URL) from the polecat
+        // launch (gtcore-b6c159): the tmux session inherits the orchd env pointing at the LIVE stores,
+        // and a polecat's `cargo test` would run gt-core contract tests that TRUNCATE/seed the live
+        // workspace and wipe user data. Wrap closest to the agent so `env -u` also covers `wrap_run_as`.
+        let (command, args) = wrap_scrub_prod_dsns(command, args);
         let (command, args) = wrap_run_as(command, args, env("GT_POLECAT_RUN_AS").as_deref());
         let heartbeat_dir = env("GT_HEARTBEAT_DIR")
             .map(PathBuf::from)
@@ -380,6 +385,25 @@ pub fn wrap_run_as(
         }
         None => (command, args),
     }
+}
+
+/// Wrap a polecat launch so the agent — and every child it spawns, e.g. `cargo test` — runs WITHOUT
+/// the daemon's PROD store DSNs (gtcore-b6c159). The tmux session inherits the orchd environment,
+/// which carries `GT_PG_URL` / `GT_PG_AUDIT_URL` / `GT_DOLT_URL` pointing at the LIVE Postgres/Dolt;
+/// a polecat running gt-core's `cargo test` (the Rust pre-merge gate) would otherwise have the
+/// contract tests TRUNCATE/seed the live workspace and WIPE user data (2026-06-23 incident). The
+/// polecat reaches gt over MCP, not direct PG/Dolt, so dropping these is safe. Returns
+/// `env -u GT_PG_URL -u GT_PG_AUDIT_URL -u GT_DOLT_URL <command> <args…>`. Pure argv rewrite (no
+/// shell), so it composes with [`wrap_run_as`] and stays unit-testable.
+pub fn wrap_scrub_prod_dsns(command: String, args: Vec<String>) -> (String, Vec<String>) {
+    let mut wrapped = Vec::with_capacity(args.len() + 7);
+    for var in ["GT_PG_URL", "GT_PG_AUDIT_URL", "GT_DOLT_URL"] {
+        wrapped.push("-u".to_string());
+        wrapped.push(var.to_string());
+    }
+    wrapped.push(command);
+    wrapped.extend(args);
+    ("env".to_string(), wrapped)
 }
 
 pub fn polecat_prompt(workspace: &str, bead: &str, branch: &str) -> String {
@@ -561,6 +585,44 @@ mod lifecycle_tests {
     fn wrap_run_as_empty_user_is_treated_as_unset() {
         let (cmd, _) = wrap_run_as("claude".to_string(), vec![], Some("  "));
         assert_eq!(cmd, "claude", "blank GT_POLECAT_RUN_AS must not wrap");
+    }
+
+    #[test]
+    fn wrap_scrub_prod_dsns_unsets_the_live_store_vars_and_keeps_args() {
+        // gtcore-b6c159: the agent must launch via `env -u …` so a polecat's `cargo test` never
+        // sees the live GT_PG_URL/GT_DOLT_URL (which would wipe prod). Original cmd+args preserved.
+        let (cmd, args) = wrap_scrub_prod_dsns(
+            "claude".to_string(),
+            vec!["--dangerously-skip-permissions".to_string()],
+        );
+        assert_eq!(cmd, "env");
+        assert_eq!(
+            args,
+            vec![
+                "-u",
+                "GT_PG_URL",
+                "-u",
+                "GT_PG_AUDIT_URL",
+                "-u",
+                "GT_DOLT_URL",
+                "claude",
+                "--dangerously-skip-permissions",
+            ]
+        );
+    }
+
+    #[test]
+    fn wrap_scrub_composes_under_run_as_with_env_closest_to_the_agent() {
+        // Both wraps together: runuser drops privilege, env -u (innermost) scrubs the DSNs for claude
+        // and its children. Order: runuser -u <user> -- env -u … claude …
+        let (command, args) = wrap_scrub_prod_dsns("claude".to_string(), vec![]);
+        let (command, args) = wrap_run_as(command, args, Some("gtpolecat"));
+        assert_eq!(command, "runuser");
+        assert_eq!(
+            args,
+            vec!["-u", "gtpolecat", "--", "env", "-u", "GT_PG_URL", "-u", "GT_PG_AUDIT_URL", "-u",
+                 "GT_DOLT_URL", "claude"]
+        );
     }
 
     #[test]

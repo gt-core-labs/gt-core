@@ -40,11 +40,16 @@ impl Command for SubmitMerge {
         if self.branch.is_empty() {
             return Err(AppError::Validation("merge branch is empty".into()));
         }
-        if state.get(&self.bead).is_some() {
-            return Err(AppError::Validation(format!(
-                "merge slot for {} already submitted",
-                self.bead
-            )));
+        // Failed slots may be re-submitted: the sheriff repairs the branch and re-queues it.
+        // Any other state (Ready / Merging / Merged) rejects the duplicate — those are in-flight
+        // or terminal and must not be displaced. Mirrors MergeBoard::submit's state check.
+        if let Some(slot) = state.get(&self.bead) {
+            if slot.state != MergeSlotState::Failed {
+                return Err(AppError::Validation(format!(
+                    "merge slot for {} already submitted",
+                    self.bead
+                )));
+            }
         }
         Ok(())
     }

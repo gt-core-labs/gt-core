@@ -18,14 +18,14 @@ use tokio::sync::RwLock;
 
 use gt_mcp_server::{DomainCtx, DomainHandler, GateStatus, WorkspaceStatusGate};
 use gt_module::McpTool;
-use gt_store_dolt::{AppError, WorkspacePools};
+use gt_store_dolt::{AppError, CatalogInit, DoltDomainCatalog, WorkspacePools};
 use gt_store_pg::schema_for;
 use gt_workspace::{
     ActorError, PgWorkspaces, WorkspaceActor, WorkspaceCommand, WorkspaceEntry, WorkspaceError,
     WorkspaceId, WorkspaceRepository, WorkspaceStatus,
 };
 
-use super::util::{descriptor, req};
+use super::util::{descriptor, opt, req};
 
 /// PG-backed handler for the `workspace.*` tool namespace.
 ///
@@ -89,8 +89,27 @@ impl DomainHandler for WorkspaceHandler {
         let mut tools = vec![
             descriptor(
                 "workspace.create",
-                "Provision a new workspace (tenant) in the catalog.",
-                &[req("id", "string"), req("name", "string")],
+                "Provision a new workspace (tenant) in the catalog. Optional `catalog` initialises \
+                 the domain catalog: `template` (default — the editable generic base), `empty` \
+                 (only the reserved domain), or `clone_from:<workspace>` (copy another \
+                 workspace's catalog).",
+                &[
+                    req("id", "string"),
+                    req("name", "string"),
+                    opt("catalog", "string"),
+                ],
+            ),
+            // Backfill the domain catalog of an EXISTING workspace that lacks one (gtcore-22f57b
+            // H3): apply the editable generic template (or another mode) to a tenant provisioned
+            // before the catalog landed. Idempotent — a no-op once a catalog exists — and it
+            // refuses to touch a workspace whose catalog is already the technical set (`default`).
+            descriptor(
+                "workspace.backfill-catalog",
+                "Apply the generic domain template to an existing workspace that has no catalog \
+                 yet (gtcore-22f57b H3). Idempotent: a no-op when the workspace already has a \
+                 seeded catalog. Optional `catalog` selects the mode (`template` default, `empty`, \
+                 `clone_from:<workspace>`).",
+                &[req("id", "string"), opt("catalog", "string")],
             ),
             descriptor(
                 "workspace.suspend",
@@ -171,6 +190,11 @@ impl DomainHandler for WorkspaceHandler {
             "workspace.create" => {
                 let id = workspace_id(str_arg(&ctx.args, "id")?)?;
                 let name = str_arg(&ctx.args, "name")?.to_string();
+                // The optional catalog-init directive (gtcore-22f57b H3): parsed BEFORE the actor
+                // runs so a malformed `catalog` is a validation fault that never half-creates the
+                // workspace.
+                let init = CatalogInit::parse(opt_arg(&ctx.args, "catalog"))
+                    .map_err(AppError::Validation)?;
                 // Hydrate from Postgres, then run the command through the actor so
                 // the change is an applied event (replay-authoritative), persisted
                 // back to the `workspaces` table.
@@ -188,12 +212,29 @@ impl DomainHandler for WorkspaceHandler {
                 // issues schema, so the workspace is usable the moment it is created. Shared with
                 // the REST `POST /api/v1/workspace` path via `provision_tenant`
                 // (hq-gap-workspace-rest-create-provision).
-                provision_tenant(&self.pool, self.dolt.as_ref(), id.as_str(), ctx.actor).await?;
+                provision_tenant(&self.pool, self.dolt.as_ref(), id.as_str(), ctx.actor, &init)
+                    .await?;
                 Ok(json!({
                     "ok": true,
                     "id": id.as_str(),
                     "name": name,
                     "status": status_str(WorkspaceStatus::Active),
+                }))
+            }
+            "workspace.backfill-catalog" => {
+                // Apply the generic template (or another mode) to an EXISTING workspace that has
+                // no catalog yet (gtcore-22f57b H3) — a tenant provisioned before the domain
+                // catalog landed. Idempotent: `seed_initial` no-ops once a catalog is seeded, so
+                // re-running never stomps an operator's edits or the `default` technical set.
+                let id = workspace_id(str_arg(&ctx.args, "id")?)?;
+                let init = CatalogInit::parse(opt_arg(&ctx.args, "catalog"))
+                    .map_err(AppError::Validation)?;
+                let written = backfill_catalog(self.dolt.as_ref(), id.as_str(), &init).await?;
+                Ok(json!({
+                    "ok": true,
+                    "id": id.as_str(),
+                    "seeded": written > 0,
+                    "rows": written,
                 }))
             }
             "workspace.suspend" => {
@@ -456,6 +497,7 @@ pub(crate) async fn provision_tenant(
     dolt: Option<&Arc<WorkspacePools>>,
     slug: &str,
     actor: &str,
+    catalog_init: &CatalogInit,
 ) -> Result<(), AppError> {
     // Clone the `ws_default` template (CREATE TABLE LIKE) into `ws_<slug>` — idempotent, and
     // re-running repairs a tenant created before this fix.
@@ -473,18 +515,87 @@ pub(crate) async fn provision_tenant(
         let server = dolt.server_pool();
         gt_store_dolt::create_workspace_dolt(&server, slug).await?;
         let pool = dolt.ensured_pool(slug).await?;
-        // Domain catalog (gtcore-55d5fb H1): a freshly-provisioned BUSINESS
-        // workspace receives the editable generic template as its reusable base.
-        // Idempotent and guarded by `is_seeded` so re-provisioning never stomps a
-        // catalog an operator has since edited (or the technical set the `default`
-        // workspace was seeded with at boot).
-        let catalog = gt_store_dolt::DoltDomainCatalog::new(pool);
-        catalog.ensure_schema().await?;
-        if !catalog.is_seeded().await? {
-            catalog.seed(&gt_store_dolt::generic_template()).await?;
-        }
+        // Domain catalog (gtcore-55d5fb H1, gtcore-22f57b H3): a freshly-provisioned workspace
+        // receives the chosen init set as its catalog. `seed_initial` is idempotent and guarded
+        // by `is_seeded`, so re-provisioning never stomps a catalog an operator has since edited
+        // (or the technical set the `default` workspace was seeded with at boot). `clone_from`
+        // resolves the source workspace's catalog up front.
+        let clone_rows = clone_catalog_rows(Some(dolt), catalog_init).await?;
+        let catalog = DoltDomainCatalog::new(pool);
+        catalog.seed_initial(catalog_init, &clone_rows).await?;
     }
     Ok(())
+}
+
+/// Backfill an EXISTING workspace's `domain_catalog` (gtcore-22f57b H3): apply the chosen init
+/// set to a tenant that has none yet. Returns the number of rows written (0 when the workspace
+/// already has a seeded catalog — the idempotent no-op the acceptance criteria require, so a
+/// `default`/`gtcore` already carrying its technical set is left untouched).
+///
+/// Requires multi-tenant Dolt routing (a per-workspace `hq_<slug>` pool); without it there is no
+/// per-tenant catalog to backfill, which is a configuration error rather than a caller fault.
+pub(crate) async fn backfill_catalog(
+    dolt: Option<&Arc<WorkspacePools>>,
+    slug: &str,
+    init: &CatalogInit,
+) -> Result<u64, AppError> {
+    // The technical workspaces own the enum-derived set, seeded at boot; the generic template
+    // must never land there (gtcore-22f57b: "default/gtcore NO recibe el genérico"). `is_seeded`
+    // already no-ops on a seeded catalog, but this is an explicit refusal so a `default` whose
+    // catalog were somehow emptied is never backfilled with the wrong set.
+    if is_technical_workspace(slug) {
+        return Err(AppError::Validation(format!(
+            "workspace `{slug}` carries the technical domain set (seeded at boot) and is not \
+             eligible for the generic-template backfill"
+        )));
+    }
+    let Some(dolt) = dolt else {
+        return Err(AppError::Other(
+            "domain-catalog backfill needs multi-tenant Dolt routing (GT_DOLT_BASE_URL); \
+             single-tenant deployments share the one `hq` catalog"
+                .to_string(),
+        ));
+    };
+    // Resolve the clone source (if any) before touching the target, so a bad `clone_from`
+    // surfaces before we ensure the target's schema.
+    let clone_rows = clone_catalog_rows(Some(dolt), init).await?;
+    let pool = dolt.ensured_pool(slug).await?;
+    let catalog = DoltDomainCatalog::new(pool);
+    catalog.seed_initial(init, &clone_rows).await
+}
+
+/// Whether `slug` is a TECHNICAL workspace that owns the enum-derived domain set seeded at boot
+/// (`default` and its `gtcore` alias), and so is never a generic-template backfill target
+/// (gtcore-22f57b H3).
+fn is_technical_workspace(slug: &str) -> bool {
+    matches!(slug, "default" | "gtcore")
+}
+
+/// Resolve the rows a [`CatalogInit::CloneFrom`] copies — the source workspace's full catalog —
+/// or an empty slice for the non-clone modes. A `clone_from` naming a source with no catalog yet
+/// is a validation fault (there is nothing to copy): the operator should backfill the source
+/// first, or pick `template`/`empty`.
+async fn clone_catalog_rows(
+    dolt: Option<&Arc<WorkspacePools>>,
+    init: &CatalogInit,
+) -> Result<Vec<gt_store_dolt::DomainEntry>, AppError> {
+    let CatalogInit::CloneFrom(source) = init else {
+        return Ok(Vec::new());
+    };
+    let Some(dolt) = dolt else {
+        return Err(AppError::Other(
+            "catalog `clone_from` needs multi-tenant Dolt routing (GT_DOLT_BASE_URL)".to_string(),
+        ));
+    };
+    let src_pool = dolt.ensured_pool(source).await?;
+    let rows = DoltDomainCatalog::new(src_pool).list_opt().await?;
+    match rows {
+        Some(rows) if !rows.is_empty() => Ok(rows),
+        _ => Err(AppError::Validation(format!(
+            "catalog `clone_from:{source}` has no catalog to copy — backfill `{source}` first, \
+             or use `template`/`empty`"
+        ))),
+    }
 }
 
 /// The composition-tier [`gt_workspace::TenantProvisioner`] backing `POST /api/v1/workspace`:
@@ -508,8 +619,25 @@ impl gt_workspace::TenantProvisioner for CompositionTenantProvisioner {
         &self,
         slug: &str,
         actor: &str,
+        catalog: Option<&str>,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        provision_tenant(&self.pool, self.dolt.as_ref(), slug, actor)
+        // Parse the catalog directive here so a malformed value surfaces as the same validation
+        // text the MCP path produces (the REST handler maps it onto a 422).
+        let init = CatalogInit::parse(catalog)
+            .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { e.into() })?;
+        provision_tenant(&self.pool, self.dolt.as_ref(), slug, actor, &init)
+            .await
+            .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { e.to_string().into() })
+    }
+
+    async fn backfill_catalog(
+        &self,
+        slug: &str,
+        catalog: Option<&str>,
+    ) -> Result<u64, Box<dyn std::error::Error + Send + Sync>> {
+        let init = CatalogInit::parse(catalog)
+            .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { e.into() })?;
+        backfill_catalog(self.dolt.as_ref(), slug, &init)
             .await
             .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { e.to_string().into() })
     }
@@ -620,6 +748,13 @@ fn str_arg<'a>(args: &'a Value, key: &str) -> Result<&'a str, AppError> {
     args.get(key)
         .and_then(Value::as_str)
         .ok_or_else(|| AppError::Validation(format!("missing string argument `{key}`")))
+}
+
+/// Pull an OPTIONAL string argument: `Some(&str)` when present and a string, `None`
+/// when absent (or present-but-not-a-string, treated as absent so a `catalog: null`
+/// falls back to the default rather than erroring).
+fn opt_arg<'a>(args: &'a Value, key: &str) -> Option<&'a str> {
+    args.get(key).and_then(Value::as_str)
 }
 
 /// Parse a workspace slug, surfacing a malformed id as a validation fault.
@@ -773,6 +908,68 @@ mod tests {
         };
         let err = handler.dispatch("workspace.create", ctx).await.unwrap_err();
         assert!(matches!(err, AppError::Validation(_)));
+    }
+
+    /// `workspace.create` rejects a malformed `catalog` directive BEFORE any I/O — the parse
+    /// runs before the actor hydrates, so a bad value never half-creates the workspace.
+    #[tokio::test]
+    async fn create_rejects_bad_catalog_before_io() {
+        let pool = PgPool::connect_lazy("postgres://gt@127.0.0.1:1/none").unwrap();
+        let handler = WorkspaceHandler::new(pool);
+        let ctx = DomainCtx {
+            workspace: None,
+            actor: "tester",
+            args: json!({ "id": "acme", "name": "Acme", "catalog": "nonsense" }),
+        };
+        let err = handler.dispatch("workspace.create", ctx).await.unwrap_err();
+        assert!(matches!(err, AppError::Validation(_)), "got {err:?}");
+    }
+
+    /// `workspace.backfill-catalog` requires an `id`, and rejects a malformed `catalog`, both
+    /// before any I/O.
+    #[tokio::test]
+    async fn backfill_requires_id_and_valid_catalog() {
+        let pool = PgPool::connect_lazy("postgres://gt@127.0.0.1:1/none").unwrap();
+        let handler = WorkspaceHandler::new(pool);
+        let ctx = |args| DomainCtx { workspace: None, actor: "tester", args };
+        // Missing id.
+        let err = handler
+            .dispatch("workspace.backfill-catalog", ctx(json!({})))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, AppError::Validation(_)));
+        // Bad catalog directive.
+        let err = handler
+            .dispatch(
+                "workspace.backfill-catalog",
+                ctx(json!({ "id": "acme", "catalog": "clone_from:" })),
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, AppError::Validation(_)));
+    }
+
+    /// `workspace.backfill-catalog` refuses the technical workspaces (`default`/`gtcore`) — they
+    /// own the enum-derived set and must never receive the generic template (gtcore-22f57b H3).
+    /// The refusal is a validation fault raised before any Dolt I/O, so no pool is needed.
+    #[tokio::test]
+    async fn backfill_refuses_technical_workspaces() {
+        // A handler WITH a dummy Dolt routing so the technical-workspace guard (not the
+        // missing-routing guard) is what fires. The lazy pool never dials for these slugs.
+        let pool = PgPool::connect_lazy("postgres://gt@127.0.0.1:1/none").unwrap();
+        let dolt = Arc::new(WorkspacePools::from_url("mysql://gt@127.0.0.1:1").unwrap());
+        let handler = WorkspaceHandler::new(pool).with_dolt(dolt);
+        let ctx = |args| DomainCtx { workspace: None, actor: "tester", args };
+        for ws in ["default", "gtcore"] {
+            let err = handler
+                .dispatch("workspace.backfill-catalog", ctx(json!({ "id": ws })))
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(err, AppError::Validation(_)),
+                "{ws} must be refused as validation, got {err:?}"
+            );
+        }
     }
 
     /// `workspace.suspend` rejects a payload without an `id` before any I/O.

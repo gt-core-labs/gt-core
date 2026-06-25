@@ -60,8 +60,8 @@ use gt_composition::hooks::{hooks_router, HooksApiState};
 use gt_composition::kanban_rest::{kanban_rest_router, KanbanRestState};
 use gt_composition::notifications::{notifications_router, NotificationsApiState};
 use gt_composition::mcp::{
-    A2aDelegateHandler, AgentHandler, AnalyticsHandler, AuditHandler, CommentsHandler, ConvoyHandler, CrossWsGrants, DispatchHandler, DocumentsHandler, EmailHandler, EscalateHandler, EventLog, EventLogHooks,
-    EventLogIssueSink, GraphHandler, IdentityDoltMeStats, InvitesHandler, MemoryHandler, MergeHandler, NotifyHandler, ReportHandler,
+    A2aDelegateHandler, AgentHandler, AnalyticsHandler, AuditHandler, CommentsHandler, ConvoyHandler, CrossWsGrants, DispatchHandler, DocumentsHandler, DomainCatalogHandler, EmailHandler, EscalateHandler, EventLog, EventLogHooks,
+    EventLogIssueSink, EventLogRigSink, GraphHandler, IdentityDoltMeStats, InvitesHandler, MemoryHandler, MergeHandler, NotifyHandler, ReportHandler,
     PgDocumentsResource, PgRigPrefixes, PgWorkspaceStatus, QuotaBlockGuard, QuotaHandler, RigHandler,
     WorkspaceHandler, WsPools,
 };
@@ -389,7 +389,11 @@ async fn main() -> anyhow::Result<()> {
         // transition with no context is deferred (debt note) instead of stop-the-line ONLY
         // when the workspace pool is freshly out of capacity — read from the same per-workspace
         // quota event log the quota.* handler replays. Always on (the log is always present).
-        .with_quota_signal(Arc::new(QuotaBlockGuard::new(event_log.clone())));
+        .with_quota_signal(Arc::new(QuotaBlockGuard::new(event_log.clone())))
+        // Auto-complete merge slot on bead close (gtcore-71c575): when a bead closes with a
+        // delivered_sha, the close hook advances its merge slot to Merged so stale `failed`
+        // slots for work already in main are cleaned up automatically.
+        .with_close_hook(Arc::new(MergeHandler::new(event_log.clone())));
 
     // System config (hq-system-config) is loaded BEFORE the domain router so the
     // report-digest service (hq-84f93b) inside it and the /api/v1/system surface
@@ -1977,6 +1981,30 @@ async fn apply_pg_catalog(pool: &sqlx::PgPool) -> anyhow::Result<()> {
         .chain(connection_migs.iter().map(|m| (&connection_id, m)))
         .collect();
 
+    // Self-heal the `ws_default.rigs` TEMPLATE before applying the plan (gtcore-a80f74). The
+    // migration tracking table lives in `public` and survives a `DROP SCHEMA ws_default CASCADE`,
+    // so after such a drop `gt_module_migrate::apply` would SKIP the already-recorded `create_rigs`
+    // migration (never recreating the dropped table) and then abort boot when a pending follow-on
+    // `ALTER TABLE ws_default.rigs ADD COLUMN …` hits `relation "ws_default.rigs" does not exist`,
+    // crashlooping the whole server. Replaying the rigs module's fully idempotent DDL here
+    // UNCONDITIONALLY guarantees the table is present and complete regardless of what the tracking
+    // table claims — the same belt-and-suspenders self-heal `events`/`dispatch` already do via
+    // `ensure_schema`. The DDL is `CREATE …/ALTER … IF NOT EXISTS` only, so it never destroys data
+    // or clobbers existing rows.
+    //
+    // Run under a transaction-scoped advisory lock: this fires on EVERY boot across N mcp-server
+    // replicas (plus parallel tests), and concurrent `CREATE TABLE/ALTER … IF NOT EXISTS` against
+    // the same table races in Postgres. The lock makes provisioning a single-writer critical
+    // section; the key is arbitrary-but-fixed so every process contends on the same lock.
+    const RIGS_DDL_LOCK: i64 = 0x6774_7269_0001; // "gtri" + 1
+    let rigs_ensure = gt_rig::RigsModule::template_ensure_sql();
+    sqlx::raw_sql(&format!(
+        "BEGIN; SELECT pg_advisory_xact_lock({RIGS_DDL_LOCK}); {rigs_ensure} COMMIT;"
+    ))
+    .execute(pool)
+    .await
+    .context("self-heal ws_default.rigs template before migrations")?;
+
     let report = gt_module_migrate::apply(pool, &plan)
         .await
         .context("apply public-schema PG catalog migrations")?;
@@ -2288,7 +2316,12 @@ async fn build_domain_router(
     };
     let router = DomainRouter::new()
         .register(Arc::new(workspace_handler))
-        .register(Arc::new(RigHandler::new(ws_pools.clone())))
+        // rig-hold H1: the rig handler emits `rig.held.v1` / `rig.resumed.v1` to the shared event
+        // log so the operator's hold/resume is auditable + visible on the SSE feed.
+        .register(Arc::new(
+            RigHandler::new(ws_pools.clone())
+                .with_event_sink(Arc::new(EventLogRigSink::new(event_log.clone()))),
+        ))
         // A completed merge marks the owning rig's graph stale (hq-graphrig.7).
         .register(Arc::new(
             MergeHandler::new(event_log.clone()).with_rig_pools(ws_pools.clone()),
@@ -2384,6 +2417,30 @@ async fn build_domain_router(
     // (hq-memory-admin.4), exactly like documents.* — no longer bound to `ws_default`.
     let router = router.register(Arc::new(MemoryHandler::new(ws_pools.clone(), embedder)));
 
+    // domain.catalog.* — operator-editable per-workspace domain catalog (gtcore-b37400
+    // H4). Resolves the active workspace's catalog over the SAME Dolt store the issues
+    // surface writes to (the shared `hq` default, or the tenant's `hq_<ws>` under
+    // multi-tenant routing), so an edit here is read back by the bead-create domain
+    // validation (gtcore-d81e77 H2). Needs Dolt (GT_DOLT_URL) for the default store;
+    // skipped otherwise (no catalog to edit).
+    let router = match std::env::var("GT_DOLT_URL")
+        .ok()
+        .and_then(|url| DoltIssues::connect(&url).ok())
+    {
+        Some(catalog_store) => {
+            let handler = DomainCatalogHandler::new(Arc::new(catalog_store));
+            let handler = match &dolt_pools {
+                Some(dolt) => handler.with_dolt(dolt.clone()),
+                None => handler,
+            };
+            router.register(Arc::new(handler))
+        }
+        None => {
+            eprintln!("[gt-mcp-server] domain.catalog.* off — GT_DOLT_URL unset");
+            router
+        }
+    };
+
     // dispatch.* — agent-dispatch frontier probe (gtcore-7bec8c — C3): exposes
     // ready_for_auto as an MCP tool so operators/agents can query which beads are
     // safe for autonomous dispatch right now. Needs Dolt for the ready predicate.
@@ -2395,10 +2452,13 @@ async fn build_domain_router(
             let repo_dir = std::env::var("GT_REPO_DIR")
                 .ok()
                 .map(std::path::PathBuf::from);
-            router.register(Arc::new(DispatchHandler::new(
-                Arc::new(dispatch_dolt),
-                repo_dir,
-            )))
+            let mut handler = DispatchHandler::new(Arc::new(dispatch_dolt), repo_dir);
+            // rig-hold H2 (gtcore-1f5e67): give the probe the per-workspace rig pools so it
+            // excludes held rigs, matching the orchd frontier. Fail-soft without GT_PG_URL.
+            if let Some(pg_url) = std::env::var("GT_PG_URL").ok().filter(|v| !v.is_empty()) {
+                handler = handler.with_held_rigs(Arc::new(WsPools::new(pg_url)));
+            }
+            router.register(Arc::new(handler))
         }
         None => {
             eprintln!("[gt-mcp-server] dispatch.* off — GT_DOLT_URL unset");
@@ -2915,10 +2975,20 @@ async fn seed_rigs(pg_url: &str) -> anyhow::Result<()> {
 
     // Idempotency gate: never touch a non-empty catalog. A curated prod (or any deploy where an
     // operator already registered a rig) is left untouched — the live `rig.*` surface owns it there.
-    let existing = repo
-        .list()
-        .await
-        .context("rig catalog seed: list existing rigs")?;
+    //
+    // A list failure here is NON-FATAL (gtcore-e07dd0): if `ws_default.rigs` is missing or the schema
+    // is not yet provisioned, this seed must not crashloop the ENTIRE mcp-server (which takes the whole
+    // platform down). The catalog just stays whatever it is; an operator can `rig.add`. Mirrors the
+    // connect-failure skip above.
+    let existing = match repo.list().await {
+        Ok(rigs) => rigs,
+        Err(e) => {
+            eprintln!(
+                "[gt-mcp-server] rig catalog seed skipped (list failed — schema not ready: {e})"
+            );
+            return Ok(());
+        }
+    };
     if !existing.is_empty() {
         eprintln!(
             "[gt-mcp-server] rig catalog seed skipped ({} rig(s) already registered)",

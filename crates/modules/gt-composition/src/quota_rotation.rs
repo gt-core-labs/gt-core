@@ -295,11 +295,14 @@ impl QuotaRotationPlugin {
         self.quota
             .soft_drained(at_risk.to_string(), target.clone(), now_secs())
             .await;
-        // No credential hot-swap here (cf. rotate_away_from): in-flight polecats keep running on
-        // `at_risk` and drain it naturally; only the pointer for new slings moved to `target`.
+        // Hot credential swap (gtcore-98e14f gap #3): copy the new account's token into every
+        // in-flight polecat backed by `at_risk` so they continue without hitting the 429 wall.
+        // Unlike the old "drain naturally" contract, rotating creds in-flight at soft_pct avoids
+        // the polecat stalling into a rate-limit dialog before the window resets.
+        self.hot_swap_in_flight(at_risk, &target);
         eprintln!(
             "[quota-rotation] soft-drain {at_risk} → {target}: new slings use {target}, \
-             in-flight work drains on {at_risk}"
+             in-flight polecats hot-swapped to {target}"
         );
         Ok(())
     }
