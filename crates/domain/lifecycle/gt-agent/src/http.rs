@@ -547,6 +547,10 @@ fn session_json(session: &Session) -> Value {
         "state": state_str(session.state),
         "role": session.role.as_str(),
         "crew": session.crew,
+        "skills": session.skills,
+        "hooks": session.hooks,
+        "maintains_heartbeat": session.maintains_heartbeat,
+        "last_heartbeat_at": session.last_heartbeat_at,
     })
 }
 

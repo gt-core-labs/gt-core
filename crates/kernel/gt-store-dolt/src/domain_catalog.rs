@@ -96,6 +96,112 @@ pub const GENERIC_TEMPLATE: &[(&str, &str)] = &[
 /// a technical workspace both carry it.
 pub const RESERVED_GAP_KEY: &str = "meta.gap";
 
+/// Validate a domain `key` against the catalog grammar (gtcore-b37400): lowercase
+/// alphanumerics grouped by single `.` or `-` separators (e.g. `producto`,
+/// `orch.merge`, `seguridad-cumplimiento`), 1..=255 chars, with no
+/// leading/trailing/doubled separator. The single source of the key grammar, shared
+/// by the MCP `domain.catalog.add` handler and the REST `POST /domain/catalog` route
+/// (both validate before any I/O) and re-checked inside [`DoltDomainCatalog::add`].
+/// Returns the trimmed key on success; a malformed key is an [`AppError::Validation`]
+/// so a hostile value never reaches the `key` primary key or a UI that renders it.
+pub fn validate_domain_key(raw: &str) -> Result<String, AppError> {
+    let key = raw.trim();
+    let invalid = |why: &str| AppError::Validation(format!("invalid domain key '{raw}': {why}"));
+    if key.is_empty() {
+        return Err(invalid("must not be empty"));
+    }
+    if key.len() > 255 {
+        return Err(invalid("must be at most 255 characters"));
+    }
+    let bytes = key.as_bytes();
+    let is_sep = |b: u8| b == b'.' || b == b'-';
+    if is_sep(bytes[0]) || is_sep(bytes[bytes.len() - 1]) {
+        return Err(invalid("must not start or end with `.` or `-`"));
+    }
+    let mut prev_sep = false;
+    for &b in bytes {
+        match b {
+            b'a'..=b'z' | b'0'..=b'9' => prev_sep = false,
+            b'.' | b'-' => {
+                if prev_sep {
+                    return Err(invalid("`.`/`-` separators may not repeat"));
+                }
+                prev_sep = true;
+            }
+            _ => {
+                return Err(invalid(
+                    "only lowercase letters, digits, `.` and `-` are allowed",
+                ))
+            }
+        }
+    }
+    Ok(key.to_string())
+}
+
+/// How a freshly-created workspace's `domain_catalog` is initialised (gtcore-22f57b H3).
+///
+/// `workspace.create` carries an optional `catalog` argument that maps onto this:
+/// - [`Template`](Self::Template) (the default) — seed the editable [`generic_template`]
+///   base, the same reusable placeholder set H1 ships. A fresh business workspace's
+///   starting point.
+/// - [`CloneFrom`](Self::CloneFrom) — copy another workspace's catalog verbatim
+///   (every entry, reserved rows included), so a new tenant inherits an existing one's
+///   curated domains. The reserved `meta.gap` is re-appended defensively in case the
+///   source ever lacked it.
+/// - [`Empty`](Self::Empty) — seed nothing but the reserved `meta.gap` (every catalog
+///   must carry it), leaving the operator to define the domains later.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CatalogInit {
+    /// Seed the editable [`generic_template`] base (the default).
+    Template,
+    /// Copy the named workspace's catalog into the new one.
+    CloneFrom(String),
+    /// Seed only the reserved `meta.gap`; no editable domains.
+    Empty,
+}
+
+impl Default for CatalogInit {
+    fn default() -> Self {
+        Self::Template
+    }
+}
+
+impl CatalogInit {
+    /// Parse the `workspace.create` `catalog` argument (gtcore-22f57b H3). Accepts:
+    /// - `None` / `"template"` ⇒ [`Template`](Self::Template) (the default);
+    /// - `"empty"` ⇒ [`Empty`](Self::Empty);
+    /// - `"clone_from:<workspace>"` ⇒ [`CloneFrom`](Self::CloneFrom) (the source slug
+    ///   after the colon; surrounding whitespace trimmed, and a bare `"clone_from"`
+    ///   with no slug is rejected).
+    ///
+    /// An unrecognised value is a validation fault — the caller surfaces it as a
+    /// caller-side error, never a 500.
+    pub fn parse(raw: Option<&str>) -> Result<Self, String> {
+        match raw.map(str::trim) {
+            None | Some("") | Some("template") => Ok(Self::Template),
+            Some("empty") => Ok(Self::Empty),
+            Some(other) => {
+                if let Some(src) = other.strip_prefix("clone_from:") {
+                    let src = src.trim();
+                    if src.is_empty() {
+                        return Err(
+                            "catalog `clone_from:` requires a source workspace, e.g. \
+                             `clone_from:acme`"
+                                .to_string(),
+                        );
+                    }
+                    Ok(Self::CloneFrom(src.to_string()))
+                } else {
+                    Err(format!(
+                        "unknown catalog init `{other}` (expected `template`, `empty`, \
+                         or `clone_from:<workspace>`)"
+                    ))
+                }
+            }
+        }
+    }
+}
+
 /// Materialise [`GENERIC_TEMPLATE`] (+ the reserved `meta.gap`) as [`DomainEntry`]
 /// rows ready for [`DoltDomainCatalog::seed`]. Used to provision a business
 /// workspace with the reusable base.
@@ -207,6 +313,42 @@ impl DoltDomainCatalog {
         Ok(written)
     }
 
+    /// Initialise a freshly-created (or un-seeded) catalog from a [`CatalogInit`]
+    /// directive (gtcore-22f57b H3), idempotently. Ensures the table exists, then —
+    /// only when the catalog has NO rows yet ([`is_seeded`](Self::is_seeded) is false)
+    /// — seeds the chosen set:
+    /// - [`Template`](CatalogInit::Template) ⇒ the [`generic_template`] base;
+    /// - [`Empty`](CatalogInit::Empty) ⇒ only the reserved `meta.gap`;
+    /// - [`CloneFrom`](CatalogInit::CloneFrom) ⇒ the supplied `clone_rows` (the caller
+    ///   resolves the source workspace's pool and passes its [`list`](Self::list)),
+    ///   with the reserved `meta.gap` re-appended in case the source lacked it.
+    ///
+    /// Re-running is a no-op once seeded — it never stomps a catalog an operator has
+    /// since edited, nor the technical set the `default` workspace was seeded with at
+    /// boot. Returns the number of rows written (0 when already seeded). The
+    /// `clone_rows` are ignored for the non-clone variants (pass `&[]`).
+    pub async fn seed_initial(
+        &self,
+        init: &CatalogInit,
+        clone_rows: &[DomainEntry],
+    ) -> Result<u64, AppError> {
+        self.ensure_schema().await?;
+        if self.is_seeded().await? {
+            return Ok(0);
+        }
+        let entries = match init {
+            CatalogInit::Template => generic_template(),
+            CatalogInit::Empty => vec![reserved_gap_entry()],
+            CatalogInit::CloneFrom(_) => {
+                let mut rows: Vec<DomainEntry> =
+                    clone_rows.iter().filter(|e| e.key != RESERVED_GAP_KEY).cloned().collect();
+                rows.push(reserved_gap_entry());
+                rows
+            }
+        };
+        self.seed(&entries).await
+    }
+
     /// List the workspace's catalog, ordered for a stable UI (`tier` then `key`).
     pub async fn list(&self) -> Result<Vec<DomainEntry>, AppError> {
         let mut conn = self.pool.get_conn().await.map_err(map_err)?;
@@ -311,6 +453,70 @@ impl DoltDomainCatalog {
         .map_err(map_err)
     }
 
+    /// Add a NEW entry (the operator-edit `add` path, gtcore-b37400). Ensures the
+    /// table exists (self-healing for a tenant whose catalog was never seeded), then
+    /// inserts only when `entry.key` is absent — a colliding key is a validation
+    /// fault (`add` is not an upsert; editing an existing row goes through
+    /// [`rename`](Self::rename) / [`set_enabled`](Self::set_enabled)). The reserved
+    /// `meta.gap` is never operator-addable: a caller must pass a non-reserved entry,
+    /// and a collision with the seeded `meta.gap` surfaces as "already exists".
+    pub async fn add(&self, entry: &DomainEntry) -> Result<(), AppError> {
+        // Re-validate the key grammar + the reserved guard (defense in depth — both
+        // transports also check pre-I/O, but `add` is the chokepoint every write path
+        // funnels through, so the invariant holds even if a caller forgets).
+        validate_domain_key(&entry.key)?;
+        if entry.key == RESERVED_GAP_KEY {
+            return Err(AppError::Validation(format!(
+                "domain '{RESERVED_GAP_KEY}' is reserved and seeded into every catalog; \
+                 it cannot be added"
+            )));
+        }
+        self.ensure_schema().await?;
+        if self.get(&entry.key).await?.is_some() {
+            return Err(AppError::Validation(format!(
+                "domain '{}' already exists in this workspace's catalog",
+                entry.key
+            )));
+        }
+        self.upsert(entry).await
+    }
+
+    /// Rename an entry's display `label` (the operator-edit `rename` path,
+    /// gtcore-b37400), leaving its `key`/`tier`/`enabled` untouched — the `key` is the
+    /// stable identifier beads carry, so it is never rewritten. A missing key is a
+    /// not-found; a RESERVED entry (`meta.gap`) is not editable.
+    pub async fn rename(&self, key: &str, label: &str) -> Result<(), AppError> {
+        let mut entry = self.require_editable(key).await?;
+        entry.label = label.to_string();
+        self.upsert(&entry).await
+    }
+
+    /// Toggle an entry's `enabled` flag (the operator-edit `set-enabled` path,
+    /// gtcore-b37400) — a disabled domain stays in the catalog but is rejected for new
+    /// beads (H2). A missing key is a not-found; a RESERVED entry (`meta.gap`) is not
+    /// editable, since the auto-minted gap beads must always be able to carry it.
+    pub async fn set_enabled(&self, key: &str, enabled: bool) -> Result<(), AppError> {
+        let mut entry = self.require_editable(key).await?;
+        entry.enabled = enabled;
+        self.upsert(&entry).await
+    }
+
+    /// Fetch an entry that the operator is allowed to edit: a present, NON-reserved
+    /// row. An absent key is [`AppError::NotFound`]; a reserved key is
+    /// [`AppError::Validation`] (the reserved `meta.gap` is read-only to operators —
+    /// not editable and not deletable, mirroring [`delete`](Self::delete)).
+    async fn require_editable(&self, key: &str) -> Result<DomainEntry, AppError> {
+        match self.get(key).await? {
+            None => Err(AppError::NotFound(format!(
+                "domain '{key}' not found in this workspace's catalog"
+            ))),
+            Some(entry) if entry.reserved => Err(AppError::Validation(format!(
+                "domain '{key}' is reserved and may not be edited"
+            ))),
+            Some(entry) => Ok(entry),
+        }
+    }
+
     /// Delete one entry by key, committing the change. Returns `true` when a row
     /// was removed. A RESERVED row (`meta.gap`) is protected: deleting it is a
     /// validation error, since every catalog must carry it.
@@ -390,11 +596,59 @@ mod tests {
     }
 
     #[test]
+    fn validate_domain_key_accepts_business_and_technical_shapes() {
+        for ok in ["producto", "orch.merge", "seguridad-cumplimiento", "store.dolt", "a1.b2-c3"] {
+            assert!(validate_domain_key(ok).is_ok(), "{ok} should be valid");
+        }
+        // The trimmed key is returned.
+        assert_eq!(validate_domain_key("  ventas  ").unwrap(), "ventas");
+    }
+
+    #[test]
+    fn validate_domain_key_rejects_malformed() {
+        for bad in ["", "  ", ".lead", "trail.", "a..b", "a--b", "Upper", "has space", "under_score"]
+        {
+            assert!(validate_domain_key(bad).is_err(), "{bad:?} should be rejected");
+        }
+    }
+
+    #[test]
     fn entry_new_is_enabled_unreserved() {
         let e = DomainEntry::new("sales", "Sales", None);
         assert!(e.enabled);
         assert!(!e.reserved);
         assert_eq!(e.label, "Sales");
         assert_eq!(e.tier, None);
+    }
+
+    #[test]
+    fn catalog_init_parses_the_three_modes_and_defaults_to_template() {
+        // Absent / blank / explicit `template` all mean the editable base.
+        assert_eq!(CatalogInit::parse(None).unwrap(), CatalogInit::Template);
+        assert_eq!(CatalogInit::parse(Some("")).unwrap(), CatalogInit::Template);
+        assert_eq!(CatalogInit::parse(Some("  ")).unwrap(), CatalogInit::Template);
+        assert_eq!(CatalogInit::parse(Some("template")).unwrap(), CatalogInit::Template);
+        assert_eq!(CatalogInit::default(), CatalogInit::Template);
+        // `empty`.
+        assert_eq!(CatalogInit::parse(Some("empty")).unwrap(), CatalogInit::Empty);
+        // `clone_from:<ws>` carries the trimmed source slug.
+        assert_eq!(
+            CatalogInit::parse(Some("clone_from:acme")).unwrap(),
+            CatalogInit::CloneFrom("acme".to_string())
+        );
+        assert_eq!(
+            CatalogInit::parse(Some(" clone_from: acme ")).unwrap(),
+            CatalogInit::CloneFrom("acme".to_string())
+        );
+    }
+
+    #[test]
+    fn catalog_init_rejects_unknown_and_sourceless_clone() {
+        // A bare clone_from with no source is a validation fault.
+        assert!(CatalogInit::parse(Some("clone_from:")).is_err());
+        assert!(CatalogInit::parse(Some("clone_from:   ")).is_err());
+        // An entirely unrecognised mode is a validation fault.
+        let err = CatalogInit::parse(Some("nonsense")).unwrap_err();
+        assert!(err.contains("unknown catalog init"), "{err}");
     }
 }

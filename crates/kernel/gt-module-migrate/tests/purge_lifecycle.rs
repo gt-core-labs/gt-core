@@ -68,6 +68,7 @@ async fn apply_disable_reactivate_purge_lifecycle() {
         eprintln!("GT_PG_URL unset; skipping migration purge-lifecycle test");
         return;
     };
+    gt_store_pg::assert_ephemeral_pg_url(&url);
     let pool = PgPool::connect(&url).await.expect("connect postgres");
 
     reset(&pool).await;

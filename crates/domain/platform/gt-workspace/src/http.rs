@@ -72,11 +72,28 @@ use crate::workspace_id::{WorkspaceId, WorkspaceIdError};
 pub trait TenantProvisioner: Send + Sync {
     /// Provision the tenant `slug` on behalf of `actor` (the creator's verified `sub`, or `""`
     /// for a system-created workspace — the adapter then seeds the schema/role but no membership).
+    ///
+    /// `catalog` is the raw `domain_catalog` init directive (gtcore-22f57b H3): `None` /
+    /// `"template"` seeds the editable generic base, `"empty"` seeds only the reserved domain,
+    /// and `"clone_from:<workspace>"` copies another workspace's catalog. An unrecognised value
+    /// is a caller-side error the adapter surfaces as a validation fault.
     async fn provision(
         &self,
         slug: &str,
         actor: &str,
+        catalog: Option<&str>,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>>;
+
+    /// Backfill an EXISTING workspace's domain catalog (gtcore-22f57b H3): apply the generic
+    /// template (or the `catalog`-named mode) to a tenant `slug` provisioned before the catalog
+    /// landed. Idempotent — a no-op once the workspace has a seeded catalog — and it refuses the
+    /// technical workspaces (`default`/`gtcore`). Returns the number of rows seeded (0 ⇒ already
+    /// seeded). A bad `catalog` directive or an ineligible target is a caller-side error.
+    async fn backfill_catalog(
+        &self,
+        slug: &str,
+        catalog: Option<&str>,
+    ) -> Result<u64, Box<dyn std::error::Error + Send + Sync>>;
 }
 
 /// Everything the workspace REST handlers need, baked into the router with
@@ -138,6 +155,7 @@ impl WorkspaceApiState {
 /// | `POST /:id/suspend`     | `workspace.suspend`   |
 /// | `POST /:id/resume`      | `workspace.resume`    |
 /// | `POST /:id/archive`     | `workspace.archive`   |
+/// | `POST /:id/backfill-catalog` | `workspace.backfill-catalog` |
 pub fn workspace_router(state: WorkspaceApiState) -> Router {
     Router::new()
         .route("/", get(list_workspaces).post(create_workspace))
@@ -145,6 +163,7 @@ pub fn workspace_router(state: WorkspaceApiState) -> Router {
         .route("/:id/suspend", post(suspend_workspace))
         .route("/:id/resume", post(resume_workspace))
         .route("/:id/archive", post(archive_workspace))
+        .route("/:id/backfill-catalog", post(backfill_catalog))
         .with_state(state)
 }
 
@@ -156,6 +175,11 @@ struct CreateBody {
     id: String,
     /// Its display name.
     name: String,
+    /// Optional `domain_catalog` initialisation (gtcore-22f57b H3): `"template"`
+    /// (default), `"empty"`, or `"clone_from:<workspace>"`. Absent ⇒ the editable
+    /// generic template, exactly the pre-H3 behaviour.
+    #[serde(default)]
+    catalog: Option<String>,
 }
 
 /// `GET /` — every workspace in the catalog (`workspace.list`). A pure read straight
@@ -222,9 +246,9 @@ async fn create_workspace(
     if let Some(provisioner) = &st.provisioner {
         let creator = claims.as_ref().map(|Extension(c)| c.sub.as_str()).unwrap_or("");
         provisioner
-            .provision(id.as_str(), creator)
+            .provision(id.as_str(), creator, body.catalog.as_deref())
             .await
-            .map_err(|e| ApiError::Internal(format!("provision tenant {id}: {e}")))?;
+            .map_err(|e| provision_error(&id, e))?;
     }
     Ok((
         StatusCode::CREATED,
@@ -292,6 +316,54 @@ async fn archive_workspace(
     transition(st, &id, WorkspaceStatus::Archived, |id| WorkspaceCommand::Archive { id }).await
 }
 
+/// Request body for `POST /:id/backfill-catalog` — the optional catalog init mode
+/// (gtcore-22f57b H3). Absent ⇒ the generic template, exactly like `workspace.create`.
+#[derive(Debug, Deserialize, Default)]
+struct BackfillBody {
+    /// `"template"` (default), `"empty"`, or `"clone_from:<workspace>"`.
+    #[serde(default)]
+    catalog: Option<String>,
+}
+
+/// `POST /:id/backfill-catalog` — apply the generic domain template to an existing
+/// workspace that has no catalog yet (`workspace.backfill-catalog`, gtcore-22f57b H3).
+/// Idempotent: a workspace that already has a seeded catalog returns `seeded: false`
+/// with `200`. The technical workspaces (`default`/`gtcore`) are refused (`422`).
+/// Requires the per-tenant provisioner to be wired; without it (single-tenant Dolt)
+/// there is no per-workspace catalog to backfill (`500`).
+#[cfg_attr(feature = "axum", utoipa::path(
+    post, path = "/{id}/backfill-catalog",
+    params(("id" = String, Path, description = "Workspace slug")),
+    responses(
+        (status = 200, description = "Catalog backfilled (or already seeded — echoes { seeded, rows })"),
+        (status = 422, description = "Invalid id, bad catalog directive, or an ineligible technical workspace"),
+        (status = 500, description = "No per-tenant provisioner wired, or a backend fault"),
+    ),
+))]
+async fn backfill_catalog(
+    State(st): State<WorkspaceApiState>,
+    Path(id): Path<String>,
+    body: Option<Json<BackfillBody>>,
+) -> Result<Json<Value>, ApiError> {
+    let id = parse_id(&id)?;
+    let Json(body) = body.unwrap_or_default();
+    let Some(provisioner) = &st.provisioner else {
+        return Err(ApiError::Internal(
+            "domain-catalog backfill needs the per-tenant provisioner (multi-tenant Dolt)".into(),
+        ));
+    };
+    let rows = provisioner
+        .backfill_catalog(id.as_str(), body.catalog.as_deref())
+        .await
+        .map_err(|e| provision_error(&id, e))?;
+    Ok(Json(json!({
+        "ok": true,
+        "id": id.as_str(),
+        "seeded": rows > 0,
+        "rows": rows,
+    })))
+}
+
 /// Run one lifecycle transition: parse the path id, hydrate an actor, decide+apply
 /// the command, and echo the resulting status. Shared by suspend/resume/archive,
 /// which differ only in the command they build and the status they land on.
@@ -323,12 +395,32 @@ async fn transition(
     suspend_workspace,
     resume_workspace,
     archive_workspace,
+    backfill_catalog,
 ))]
 pub struct ApiDoc;
 
 /// Parse a path/body slug into a [`WorkspaceId`], surfacing a malformed id as a `422`.
 fn parse_id(raw: &str) -> Result<WorkspaceId, ApiError> {
     WorkspaceId::new(raw).map_err(ApiError::from)
+}
+
+/// Map a provisioner failure onto the HTTP error space (gtcore-22f57b H3). A bad
+/// `catalog` init directive is a caller-side validation fault (`422`); any other
+/// provisioning failure (PG/Dolt backend) is internal (`500`). The provisioner boxes
+/// the underlying [`AppError`]'s text, so the validation case is recognised by the
+/// `CatalogInit::parse` message shapes it forwards.
+fn provision_error(id: &WorkspaceId, e: Box<dyn std::error::Error + Send + Sync>) -> ApiError {
+    let msg = e.to_string();
+    // Caller-side faults: a malformed `catalog` directive, a `clone_from` whose source has no
+    // catalog, or an ineligible technical workspace. Everything else is a backend fault.
+    let caller_fault = msg.contains("unknown catalog init")
+        || msg.contains("clone_from")
+        || msg.contains("not eligible for the generic-template backfill");
+    if caller_fault {
+        ApiError::Unprocessable(msg)
+    } else {
+        ApiError::Internal(format!("provision tenant {id}: {msg}"))
+    }
 }
 
 /// The snake_case spelling of a status, matching the serde representation the MCP
@@ -427,7 +519,14 @@ mod tests {
         // nesting can rewrite them. Every declared route must be present.
         let doc = ApiDoc::openapi();
         let paths: Vec<&str> = doc.paths.paths.keys().map(String::as_str).collect();
-        for expected in ["/", "/{id}", "/{id}/suspend", "/{id}/resume", "/{id}/archive"] {
+        for expected in [
+            "/",
+            "/{id}",
+            "/{id}/suspend",
+            "/{id}/resume",
+            "/{id}/archive",
+            "/{id}/backfill-catalog",
+        ] {
             assert!(paths.contains(&expected), "missing {expected} in {paths:?}");
         }
         // Prefix-free: the module builder, not the annotation, owns `/api/v1/workspace`.
@@ -437,7 +536,7 @@ mod tests {
     /// A recording [`TenantProvisioner`] so the create test asserts the wiring without a DB.
     #[derive(Default)]
     struct RecordingProvisioner {
-        calls: std::sync::Mutex<Vec<(String, String)>>,
+        calls: std::sync::Mutex<Vec<(String, String, Option<String>)>>,
     }
 
     #[async_trait::async_trait]
@@ -446,9 +545,22 @@ mod tests {
             &self,
             slug: &str,
             actor: &str,
+            catalog: Option<&str>,
         ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-            self.calls.lock().unwrap().push((slug.to_string(), actor.to_string()));
+            self.calls.lock().unwrap().push((
+                slug.to_string(),
+                actor.to_string(),
+                catalog.map(str::to_string),
+            ));
             Ok(())
+        }
+
+        async fn backfill_catalog(
+            &self,
+            _slug: &str,
+            _catalog: Option<&str>,
+        ) -> Result<u64, Box<dyn std::error::Error + Send + Sync>> {
+            Ok(0)
         }
     }
 
@@ -484,7 +596,37 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::CREATED);
         assert_eq!(
             prov.calls.lock().unwrap().as_slice(),
-            &[("acme".to_string(), "alice".to_string())],
+            // No `catalog` in the body ⇒ the provisioner is called with `None` (the
+            // default template applies), attributed to the caller's sub.
+            &[("acme".to_string(), "alice".to_string(), None)],
+        );
+    }
+
+    #[tokio::test]
+    async fn rest_create_forwards_the_catalog_init_directive() {
+        use axum::body::Body;
+        use axum::http::Request;
+        use tower::ServiceExt;
+
+        // A body that names `catalog: "empty"` reaches the provisioner verbatim (gtcore-22f57b H3),
+        // so the REST path can pick the init mode exactly as the MCP `workspace.create` tool does.
+        let prov = Arc::new(RecordingProvisioner::default());
+        let state = WorkspaceApiState::new(Arc::new(crate::InMemoryWorkspaces::new()))
+            .with_provisioner(prov.clone());
+        let app = workspace_router(state);
+        let req = Request::builder()
+            .method("POST")
+            .uri("/")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                json!({ "id": "acme", "name": "Acme", "catalog": "empty" }).to_string(),
+            ))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::CREATED);
+        assert_eq!(
+            prov.calls.lock().unwrap().as_slice(),
+            &[("acme".to_string(), "".to_string(), Some("empty".to_string()))],
         );
     }
 

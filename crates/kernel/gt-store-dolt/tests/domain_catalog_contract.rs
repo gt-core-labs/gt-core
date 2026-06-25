@@ -14,7 +14,10 @@
 
 use mysql_async::prelude::Queryable;
 
-use gt_store_dolt::{generic_template, DoltDomainCatalog, DomainEntry};
+use gt_store_dolt::{
+    generic_template, CatalogInit, DoltDomainCatalog, DomainEntry, GENERIC_TEMPLATE,
+    RESERVED_GAP_KEY,
+};
 
 const TEST_DB: &str = "gt_rs_domain_catalog_test";
 
@@ -69,6 +72,87 @@ async fn ensure_schema_is_idempotent_and_seed_upserts_by_key() {
 }
 
 #[tokio::test]
+async fn seed_initial_template_is_idempotent_and_never_restomps() {
+    let Ok(base) = std::env::var("GT_DOLT_URL") else {
+        eprintln!("GT_DOLT_URL unset — skipping seed_initial template contract");
+        return;
+    };
+    let pool = fresh_pool(&base).await.expect("fresh test db");
+    let catalog = DoltDomainCatalog::new(pool);
+
+    // First seed_initial(Template) on an un-seeded catalog writes the generic base (10 + gap).
+    let written = catalog
+        .seed_initial(&CatalogInit::Template, &[])
+        .await
+        .expect("seed_initial template");
+    assert_eq!(written as usize, GENERIC_TEMPLATE.len() + 1);
+    assert!(catalog.is_seeded().await.unwrap());
+
+    // An operator edits a domain; a second seed_initial is a NO-OP (already seeded) and must
+    // leave the edit intact — never re-stomp with the template.
+    catalog
+        .upsert(&DomainEntry::new("producto", "Producto Editado", None))
+        .await
+        .expect("edit");
+    let again = catalog
+        .seed_initial(&CatalogInit::Template, &[])
+        .await
+        .expect("seed_initial #2");
+    assert_eq!(again, 0, "already seeded ⇒ no rows written");
+    let prod = catalog.get("producto").await.unwrap().unwrap();
+    assert_eq!(prod.label, "Producto Editado", "edit survived the re-run");
+}
+
+#[tokio::test]
+async fn seed_initial_empty_seeds_only_the_reserved_gap() {
+    let Ok(base) = std::env::var("GT_DOLT_URL") else {
+        eprintln!("GT_DOLT_URL unset — skipping seed_initial empty contract");
+        return;
+    };
+    let pool = fresh_pool(&base).await.expect("fresh test db");
+    let catalog = DoltDomainCatalog::new(pool);
+
+    let written = catalog
+        .seed_initial(&CatalogInit::Empty, &[])
+        .await
+        .expect("seed_initial empty");
+    assert_eq!(written, 1, "only meta.gap");
+    let listed = catalog.list().await.unwrap();
+    assert_eq!(listed.len(), 1);
+    assert_eq!(listed[0].key, RESERVED_GAP_KEY);
+    assert!(listed[0].reserved);
+}
+
+#[tokio::test]
+async fn seed_initial_clone_copies_source_rows_plus_reserved_gap() {
+    let Ok(base) = std::env::var("GT_DOLT_URL") else {
+        eprintln!("GT_DOLT_URL unset — skipping seed_initial clone contract");
+        return;
+    };
+    let pool = fresh_pool(&base).await.expect("fresh test db");
+    let catalog = DoltDomainCatalog::new(pool);
+
+    // The clone rows the caller resolved from a source workspace (a curated set + its own gap).
+    let source_rows = vec![
+        DomainEntry::new("ventas", "Ventas", None),
+        DomainEntry::new("riesgo", "Riesgo", Some("compliance".into())),
+        gt_store_dolt::reserved_gap_entry(),
+    ];
+    let written = catalog
+        .seed_initial(&CatalogInit::CloneFrom("acme".into()), &source_rows)
+        .await
+        .expect("seed_initial clone");
+    // The two business rows + exactly one meta.gap (deduped — never two gaps).
+    assert_eq!(written, 3);
+    let listed = catalog.list().await.unwrap();
+    assert_eq!(listed.len(), 3);
+    assert_eq!(listed.iter().filter(|e| e.key == RESERVED_GAP_KEY).count(), 1);
+    assert!(listed.iter().any(|e| e.key == "ventas"));
+    let riesgo = listed.iter().find(|e| e.key == "riesgo").unwrap();
+    assert_eq!(riesgo.tier.as_deref(), Some("compliance"));
+}
+
+#[tokio::test]
 async fn upsert_get_and_reserved_delete_guard() {
     let Ok(base) = std::env::var("GT_DOLT_URL") else {
         eprintln!("GT_DOLT_URL unset — skipping DoltDomainCatalog CRUD contract");
@@ -107,4 +191,51 @@ async fn upsert_get_and_reserved_delete_guard() {
     let err = catalog.delete("meta.gap").await.expect_err("reserved guard");
     assert!(err.to_string().contains("reserved"), "got: {err}");
     assert!(catalog.get("meta.gap").await.unwrap().is_some(), "meta.gap survives");
+}
+
+#[tokio::test]
+async fn add_rename_set_enabled_and_reserved_edit_guards() {
+    let Ok(base) = std::env::var("GT_DOLT_URL") else {
+        eprintln!("GT_DOLT_URL unset — skipping DoltDomainCatalog edit contract");
+        return;
+    };
+    let pool = fresh_pool(&base).await.expect("fresh test db");
+    let catalog = DoltDomainCatalog::new(pool);
+    catalog.seed(&generic_template()).await.expect("seed");
+
+    // `add` inserts a new business domain (enabled, non-reserved).
+    catalog
+        .add(&DomainEntry::new("facturacion", "Facturación", None))
+        .await
+        .expect("add facturacion");
+    let got = catalog.get("facturacion").await.unwrap().expect("present");
+    assert!(got.enabled && !got.reserved);
+
+    // `add` of an existing key is a validation fault (not an upsert).
+    let dup = catalog
+        .add(&DomainEntry::new("facturacion", "Otra", None))
+        .await
+        .expect_err("duplicate add");
+    assert!(dup.to_string().contains("already exists"), "got: {dup}");
+
+    // `rename` changes the label, leaving the key intact.
+    catalog.rename("facturacion", "Billing").await.expect("rename");
+    assert_eq!(catalog.get("facturacion").await.unwrap().unwrap().label, "Billing");
+
+    // `set_enabled(false)` disables; `set_enabled(true)` re-enables.
+    catalog.set_enabled("facturacion", false).await.expect("disable");
+    assert!(!catalog.get("facturacion").await.unwrap().unwrap().enabled);
+    catalog.set_enabled("facturacion", true).await.expect("re-enable");
+    assert!(catalog.get("facturacion").await.unwrap().unwrap().enabled);
+
+    // Editing/renaming a MISSING key is a not-found.
+    let miss = catalog.rename("nope", "X").await.expect_err("missing rename");
+    assert!(matches!(miss, gt_store_dolt::AppError::NotFound(_)), "got: {miss}");
+
+    // The reserved meta.gap is not editable: rename and set-enabled both refuse it.
+    let r1 = catalog.rename("meta.gap", "X").await.expect_err("reserved rename");
+    assert!(r1.to_string().contains("reserved"), "got: {r1}");
+    let r2 = catalog.set_enabled("meta.gap", false).await.expect_err("reserved disable");
+    assert!(r2.to_string().contains("reserved"), "got: {r2}");
+    assert!(catalog.get("meta.gap").await.unwrap().unwrap().enabled, "meta.gap stays enabled");
 }
