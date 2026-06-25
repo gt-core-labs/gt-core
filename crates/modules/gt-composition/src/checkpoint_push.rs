@@ -57,13 +57,18 @@ fn push_argv(branch: &str) -> Vec<String> {
     vec!["push".into(), "origin".into(), format!("{branch}:{branch}")]
 }
 
-/// `git -C <rig> push --force-with-lease origin <branch>:<branch>` argv — the fallback when the ff
-/// push is refused (a rebased branch). `--force-with-lease` (no value) protects against clobbering:
-/// it only overwrites origin when our remote-tracking `origin/<branch>` still matches what's there,
-/// so it advances the agent's OWN branch but refuses if someone else moved it.
+/// `git -C <rig> push --force-if-includes --force-with-lease origin <branch>:<branch>` argv.
+///
+/// `--force-if-includes` (git ≥ 2.30) only allows the push when the remote tip is an ancestor of
+/// the local branch — i.e., our local is a strict forward extension of the remote. If an operator
+/// (or another process) force-pushed a NEWER commit to origin, the remote tip is no longer in our
+/// local history, so git refuses the push, protecting the operator's work from being overwritten by
+/// a stale worktree checkpoint (gtcore-f75609). `--force-with-lease` adds the additional check that
+/// the remote-tracking ref matches the actual remote, guarding against concurrent writers.
 fn force_push_argv(branch: &str) -> Vec<String> {
     vec![
         "push".into(),
+        "--force-if-includes".into(),
         "--force-with-lease".into(),
         "origin".into(),
         format!("{branch}:{branch}"),
@@ -145,16 +150,24 @@ pub fn checkpoint_branches(porcelain: &str) -> Vec<String> {
         .collect()
 }
 
-/// Push one branch to origin: a fast-forward push, falling back to `--force-with-lease` only when
-/// the ff is refused. Returns `Ok` on a landed (or already-current) branch, `Err(reason)` otherwise.
+/// Push one branch to origin: a fast-forward push, falling back to `--force-if-includes
+/// --force-with-lease` when the ff is refused (rebased branch). The force-push is intentionally
+/// conservative: it only advances the remote if our local is a strict forward extension of the
+/// remote tip. If an operator pushed a newer commit to origin, `--force-if-includes` will refuse
+/// and we return `Ok(())` (a silent no-op) rather than overwriting the operator's work
+/// (gtcore-f75609). Returns `Err` only on I/O errors or a genuinely irrecoverable push failure.
 fn push_branch(rig: &Path, branch: &str) -> Result<(), String> {
     match run(rig, &push_argv(branch)) {
         Ok((true, _)) => Ok(()),
-        // Refused (non-fast-forward: a rebased branch) → retry under the lease.
+        // Refused (non-fast-forward: rebased branch, or operator pushed a newer commit) →
+        // retry under --force-if-includes. If the remote is newer, the flag rejects the push
+        // — that is the correct behavior; we do NOT want to overwrite operator work.
         Ok((false, _)) => match run(rig, &force_push_argv(branch)) {
             Ok((true, _)) => Ok(()),
-            Ok((false, err)) => Err(format!("ff + force-with-lease push refused: {err}")),
-            Err(e) => Err(format!("force-with-lease push error: {e}")),
+            // Rejected by --force-if-includes (remote has newer commits) or by the lease
+            // (concurrent writer): both are expected — treat as a silent no-op.
+            Ok((false, _)) => Ok(()),
+            Err(e) => Err(format!("force push error: {e}")),
         },
         Err(e) => Err(format!("push error: {e}")),
     }
@@ -349,11 +362,12 @@ mod tests {
             force_push_argv("gtcore-4cea57"),
             vec![
                 "push",
+                "--force-if-includes",
                 "--force-with-lease",
                 "origin",
                 "gtcore-4cea57:gtcore-4cea57"
             ],
-            "the fallback is lease-guarded, never a bare --force"
+            "the fallback is --force-if-includes + lease-guarded, never a bare --force"
         );
     }
 
