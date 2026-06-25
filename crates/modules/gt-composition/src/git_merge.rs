@@ -286,6 +286,18 @@ const GATE_SETTLE_DELAY: std::time::Duration = std::time::Duration::from_secs(2)
 /// merge queue cannot spin us force-pushing indefinitely.
 const MAX_REBASE_RETRIES: u32 = 3;
 
+/// `git -C <rig> merge-base --is-ancestor <branch> origin/main` argv — exits 0 when `branch`
+/// is already an ancestor of `origin/main` (merged via another path), exits 1 otherwise.
+/// Used to short-circuit the merge for `ahead=0` branches (gtcore-e34546).
+fn already_merged_argv(branch: &str) -> Vec<String> {
+    vec![
+        "merge-base".into(),
+        "--is-ancestor".into(),
+        branch.into(),
+        "origin/main".into(),
+    ]
+}
+
 /// Execute the real merge of `branch` into `main` from the `rig` checkout, per CLAUDE.md
 /// flat-history: fetch, fast-forward push, and on divergence rebase the branch onto `origin/main`
 /// and retry once. Returns the merged sha on success or a reason on conflict/error. Pure of the
@@ -297,6 +309,18 @@ fn merge_branch_to_main(rig: &Path, branch: &str) -> Result<MergeResult, String>
         Ok((true, _)) => {}
         Ok((false, err)) => return Err(format!("git fetch origin failed: {err}")),
         Err(e) => return Err(format!("git fetch origin error: {e}")),
+    }
+
+    // 1a) Short-circuit: branch already an ancestor of origin/main (gtcore-e34546).
+    // Work arrived via another path (cherry-pick, another PR) — report merged immediately
+    // rather than failing with a non-ff conflict and looping through the sheriff.
+    if let Ok((true, _)) = run(rig, &already_merged_argv(branch)) {
+        eprintln!("[git-merge] {branch}: already merged into origin/main — marking complete");
+        let sha = match run(rig, &rev_parse_origin_main_argv()) {
+            Ok((true, s)) => s,
+            _ => String::new(),
+        };
+        return Ok(MergeResult::Merged(sha));
     }
 
     // 1b) Sync Cargo.lock before pushing (gtcore-bfb203): regenerate and commit if drifted.
@@ -363,6 +387,16 @@ fn merge_branch_via_pr(rig: &Path, branch: &str, bead: &str) -> Result<MergeResu
         Ok((true, _)) => {}
         Ok((false, err)) => return Err(format!("git fetch origin failed: {err}")),
         Err(e) => return Err(format!("git fetch origin error: {e}")),
+    }
+
+    // 1a) Short-circuit: branch already an ancestor of origin/main (gtcore-e34546).
+    if let Ok((true, _)) = run(rig, &already_merged_argv(branch)) {
+        eprintln!("[git-merge] {bead}: branch {branch} already merged into origin/main — marking complete");
+        let sha = match run(rig, &rev_parse_origin_main_argv()) {
+            Ok((true, s)) => s,
+            _ => String::new(),
+        };
+        return Ok(MergeResult::Merged(sha));
     }
 
     // 2) Rebase onto origin/main so the PR is clean.
@@ -716,6 +750,11 @@ mod tests {
         assert_eq!(
             worktree_list_argv(),
             vec!["worktree", "list", "--porcelain"]
+        );
+        assert_eq!(
+            already_merged_argv("gtcore-00325f"),
+            vec!["merge-base", "--is-ancestor", "gtcore-00325f", "origin/main"],
+            "exits 0 when branch is already an ancestor of main"
         );
         assert_eq!(
             push_force_branch_argv("hq-x.1"),
