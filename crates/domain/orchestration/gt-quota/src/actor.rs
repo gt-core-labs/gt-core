@@ -72,6 +72,13 @@ pub enum QuotaMsg {
         until_secs: Option<u64>,
         now_secs: u64,
     },
+    /// The usage-probe could not authenticate the account (gtcore-e09320): latch
+    /// `Account::credential_dead` and emit `quota.credential_dead.v1` so the deadness is observable
+    /// on `quota.list` instead of only logged.
+    CredentialDead {
+        account: String,
+        now_secs: u64,
+    },
     Rotated {
         from_account: String,
         to_account: String,
@@ -89,6 +96,22 @@ pub enum QuotaMsg {
     /// as an alert, no state mutation (gtcore-df3319).
     SoftDrainStalled {
         account: String,
+        now_secs: u64,
+    },
+    /// Every account is exhausted (gtcore-6f449f): record that the edge suspended the in-flight
+    /// polecats backed by `account`. Notification only — emits `quota.all_exhausted.v1`, no registry
+    /// mutation (the source's `Blocked` status is set by the `Blocked` message that precedes it).
+    AllExhausted {
+        account: String,
+        paused_sessions: Vec<String>,
+        now_secs: u64,
+    },
+    /// A paused account recovered (gtcore-6f449f): record that the edge resumed the suspended
+    /// polecats. Notification only — emits `quota.account_recovered.v1`; the lift back to `Healthy`
+    /// is already applied by the `Probe` that triggered it.
+    AccountRecovered {
+        account: String,
+        resumed_sessions: Vec<String>,
         now_secs: u64,
     },
     /// Onboard a claude account with its credential dir (`hq-quota-accounts.1`): adds it as a
@@ -346,6 +369,19 @@ impl QuotaHandle {
             .await;
     }
 
+    /// Latch the account credential-dead (gtcore-e09320): the usage-probe could not authenticate
+    /// it (expired token + no refresh, or the token endpoint rejected the refresh). Emits
+    /// `quota.credential_dead.v1`; the next successful probe clears it.
+    pub async fn credential_dead(&self, account: impl Into<String>, now_secs: u64) {
+        let _ = self
+            .tx
+            .send(QuotaMsg::CredentialDead {
+                account: account.into(),
+                now_secs,
+            })
+            .await;
+    }
+
     pub async fn rotated(
         &self,
         from_account: impl Into<String>,
@@ -388,6 +424,42 @@ impl QuotaHandle {
             .tx
             .send(QuotaMsg::SoftDrainStalled {
                 account: account.into(),
+                now_secs,
+            })
+            .await;
+    }
+
+    /// Record that every account is exhausted and the edge suspended `account`'s in-flight polecats
+    /// in place (gtcore-6f449f): emits `quota.all_exhausted.v1` carrying the paused session list.
+    pub async fn all_exhausted(
+        &self,
+        account: impl Into<String>,
+        paused_sessions: Vec<String>,
+        now_secs: u64,
+    ) {
+        let _ = self
+            .tx
+            .send(QuotaMsg::AllExhausted {
+                account: account.into(),
+                paused_sessions,
+                now_secs,
+            })
+            .await;
+    }
+
+    /// Record that a paused account recovered and the edge resumed its suspended polecats
+    /// (gtcore-6f449f): emits `quota.account_recovered.v1` carrying the resumed session list.
+    pub async fn account_recovered(
+        &self,
+        account: impl Into<String>,
+        resumed_sessions: Vec<String>,
+        now_secs: u64,
+    ) {
+        let _ = self
+            .tx
+            .send(QuotaMsg::AccountRecovered {
+                account: account.into(),
+                resumed_sessions,
                 now_secs,
             })
             .await;
@@ -828,6 +900,17 @@ pub fn spawn_hydrated(
                         }))
                         .await;
                 }
+                QuotaMsg::CredentialDead { account, now_secs } => {
+                    // Credential VALIDITY, not quota usage (gtcore-e09320): latch the flag so the
+                    // registry — and `quota.list` rebuilt from it — stops reading the account as
+                    // usable. Status is left untouched; the FE combines `credential_dead` with it.
+                    if let Some(a) = registry.get_mut(&account) {
+                        a.credential_dead = true;
+                    }
+                    let _ = events
+                        .send(Envelope::root(QuotaEvent::CredentialDead { account, now_secs }))
+                        .await;
+                }
                 QuotaMsg::Rotated {
                     from_account,
                     to_account,
@@ -862,6 +945,36 @@ pub fn spawn_hydrated(
                     // Alert only: the pointer stayed put, so no registry mutation (gtcore-df3319).
                     let _ = events
                         .send(Envelope::root(QuotaEvent::SoftDrainStalled { account, now_secs }))
+                        .await;
+                }
+                QuotaMsg::AllExhausted {
+                    account,
+                    paused_sessions,
+                    now_secs,
+                } => {
+                    // Notification only (gtcore-6f449f): the edge already SIGSTOP'd the polecats and
+                    // the source's Blocked status was set by the preceding Blocked message.
+                    let _ = events
+                        .send(Envelope::root(QuotaEvent::AllExhausted {
+                            account,
+                            paused_sessions,
+                            now_secs,
+                        }))
+                        .await;
+                }
+                QuotaMsg::AccountRecovered {
+                    account,
+                    resumed_sessions,
+                    now_secs,
+                } => {
+                    // Notification only (gtcore-6f449f): the lift back to Healthy was applied by the
+                    // Probe that triggered this, and the edge already SIGCONT'd the polecats.
+                    let _ = events
+                        .send(Envelope::root(QuotaEvent::AccountRecovered {
+                            account,
+                            resumed_sessions,
+                            now_secs,
+                        }))
                         .await;
                 }
                 QuotaMsg::RegisterAccount {

@@ -88,12 +88,35 @@ fn enable(s: &mut SkillState, role: &str, skill: &str) {
 /// Build the canonical least-privilege catalog binding each automatic agent role to the minimal
 /// scope set its work needs. No role is granted `*`; an unbound role (e.g. `overseer`) gets nothing.
 ///
-/// - `polecat` → `issues.read`, `issues.write`, `merge.write` (work + claim + transition + submit merge).
+/// - `polecat` → `issues.read`, `issues.write`, `merge.write`, `memory.read`, `memory.write`,
+///   `a2a.read`, `a2a.write` (work + claim + transition + submit merge + durable memory + P2P).
 /// - `mayor` → `issues.read`, `issues.write`, `agent.read`, `agent.write`, `merge.read`, `merge.write` (coordinate + dispatch).
-/// - `sheriff` → `merge.read`, `merge.write` (drive merges / github).
+/// - `sheriff` → `merge.read`, `merge.write`, `notify.write`, `memory.read`, `memory.write`
+///   (drive the merge board, escalate to the operator, recall/persist durable memory).
 /// - `refinery` → `merge.write` (submit MERGE_READY).
-/// - `witness` → `issues.read` (observe only).
-/// - `deacon` → `issues.read` (read-only supervisory).
+/// - `witness` → `issues.read`, `comments.write`, `notify.write`, `memory.read`, `memory.write`
+///   (read a closed bead's AC, flag a bad closure with a comment + operator alert, durable memory).
+/// - `deacon` → `issues.read`, `board.read`, `merge.read`, `notify.write`, `memory.read`,
+///   `memory.write` (read-only flow scan across tracker/board/merge, escalate, durable memory).
+///
+/// The trigger-driven role agents (`gtcore-999795`) run sheriff/witness/deacon as *agents with
+/// criterion*, and their kickoff prompts (`crate`-external, `gt_composition::role_agent`) tell each
+/// to recall/persist memory, escalate via `notify.send`, and — for the witness — flag a bad closure
+/// via `comments.create`. Those grants are enumerated GRANULARLY here (the security layer), never as
+/// a wildcard: a missing scope would otherwise make the feature ship inert (the same class of bug
+/// `gtcore-abf278` fixed for the polecat). NOTE the operator-notification grant is `notify.write`
+/// (→ the `notify.*` MCP namespace `notify.send` lives in), NOT `notifications.write` (that folds to
+/// the `notifications.*` read/dismiss namespace and would NOT authorize `notify.send`).
+///
+/// `memory.*` and `a2a.*` close two grants that shipped inert (`gtcore-abf278`): a slung polecat's
+/// prompt tells it to recall/persist durable memory (`memory.recall`/`memory.save`, `gtcore-bad8d9`)
+/// and to coordinate peer-to-peer over A2A (`a2a.inbox`/`a2a.delegate`/…, `gtcore-3a3557`), but the
+/// daemon-minted token granted only `issues.*`+`merge.*`, so every such call returned `unauthorized`.
+/// The MCP grant is per-namespace (any granular `<resource>.<verb>` folds to `<resource>.*` in
+/// [`Scope::from_workspace_claim`](gt_rbac::Scope::from_workspace_claim)), and the a2a tool verbs
+/// (`inbox`/`send`/`delegate`/…) are NOT in the closed `SCOPE_VERBS` vocabulary — so the grant rides
+/// the known `read`/`write` verbs (`a2a.read`+`a2a.write` → the whole `a2a.*` namespace), exactly as
+/// `issues.read`+`issues.write` authorizes `issues.*`. Still least-privilege: no role gets `*`.
 pub fn agent_least_privilege_catalog() -> SkillCatalog {
     let mut s = SkillState::default();
     register(&mut s, "bead-work", &["issues.read", "issues.write"]);
@@ -101,14 +124,39 @@ pub fn agent_least_privilege_catalog() -> SkillCatalog {
     register(&mut s, "merge-ops", &["merge.read", "merge.write"]);
     register(&mut s, "merge-submit", &["merge.write"]);
     register(&mut s, "observe", &["issues.read"]);
+    // gtcore-abf278: durable memory (gtcore-bad8d9) and peer-to-peer A2A (gtcore-3a3557) were
+    // mergeable features left inert because the polecat token never carried their scopes.
+    register(&mut s, "memory-access", &["memory.read", "memory.write"]);
+    register(&mut s, "a2a-coordinate", &["a2a.read", "a2a.write"]);
+    // gtcore-999795: scopes the trigger-driven role agents' kickoffs actually exercise. `notify.write`
+    // (NOT `notifications.write`) is what authorizes the `notify.send` MCP tool — `notify.send` lives
+    // in the `notify.*` namespace, while `notifications.*` is the members' read/dismiss namespace.
+    register(&mut s, "operator-notify", &["notify.write"]);
+    register(&mut s, "comments-write", &["comments.write"]);
+    // The deacon's read-only flow scan reads the board (`board.list`) and merge board (`merge.list`)
+    // on top of the tracker (`issues.read`, via `observe`).
+    register(&mut s, "flow-read", &["board.read", "merge.read"]);
 
     enable(&mut s, "polecat", "bead-work");
     enable(&mut s, "polecat", "merge-submit");
+    enable(&mut s, "polecat", "memory-access");
+    enable(&mut s, "polecat", "a2a-coordinate");
     enable(&mut s, "mayor", "bead-coordinate");
+    // sheriff (gtcore-999795): drive the merge board + escalate + durable memory.
     enable(&mut s, "sheriff", "merge-ops");
+    enable(&mut s, "sheriff", "operator-notify");
+    enable(&mut s, "sheriff", "memory-access");
     enable(&mut s, "refinery", "merge-submit");
+    // witness (gtcore-999795): read AC + flag a bad closure (comment + operator alert) + memory.
     enable(&mut s, "witness", "observe");
+    enable(&mut s, "witness", "comments-write");
+    enable(&mut s, "witness", "operator-notify");
+    enable(&mut s, "witness", "memory-access");
+    // deacon (gtcore-999795): read-only flow scan + escalate + memory.
     enable(&mut s, "deacon", "observe");
+    enable(&mut s, "deacon", "flow-read");
+    enable(&mut s, "deacon", "operator-notify");
+    enable(&mut s, "deacon", "memory-access");
 
     // hq-role-scopes: a role's scopes are now read from `RoleBinding::scopes`, not derived from its
     // skills. Seed each role's scopes from its enabled-skill `default_scopes` via the one-shot
@@ -207,12 +255,35 @@ mod tests {
     #[test]
     fn each_role_gets_its_minimal_scopes_and_never_the_wildcard() {
         let c = agent_least_privilege_catalog();
-        assert_eq!(scopes(&c, "polecat"), vec!["issues.read", "issues.write", "merge.write"]);
+        // gtcore-abf278: the polecat grant carries memory.* and a2a.* so the durable-memory
+        // (gtcore-bad8d9) and P2P-delegation (gtcore-3a3557) features its prompt relies on are
+        // actually authorized — not just issues.*+merge.*. Order is the legacy union's: enabled
+        // skills walked alphabetically by id (a2a-coordinate, bead-work, memory-access, merge-submit),
+        // each contributing its `default_scopes` in registered order.
+        assert_eq!(
+            scopes(&c, "polecat"),
+            vec!["a2a.read", "a2a.write", "issues.read", "issues.write", "memory.read", "memory.write", "merge.write"]
+        );
         assert_eq!(scopes(&c, "mayor"), vec!["issues.read", "issues.write", "agent.read", "agent.write", "merge.read", "merge.write"]);
-        assert_eq!(scopes(&c, "sheriff"), vec!["merge.read", "merge.write"]);
         assert_eq!(scopes(&c, "refinery"), vec!["merge.write"]);
-        assert_eq!(scopes(&c, "witness"), vec!["issues.read"]);
-        assert_eq!(scopes(&c, "deacon"), vec!["issues.read"]);
+        // gtcore-999795: sheriff/witness/deacon carry the scopes their role-agent kickoffs exercise,
+        // enumerated granularly. Order is the legacy union's: enabled skills walked alphabetically by
+        // id, each contributing its `default_scopes` in registered order, dedup'd first-seen.
+        // sheriff: memory-access, merge-ops, operator-notify.
+        assert_eq!(
+            scopes(&c, "sheriff"),
+            vec!["memory.read", "memory.write", "merge.read", "merge.write", "notify.write"]
+        );
+        // witness: comments-write, memory-access, observe, operator-notify.
+        assert_eq!(
+            scopes(&c, "witness"),
+            vec!["comments.write", "memory.read", "memory.write", "issues.read", "notify.write"]
+        );
+        // deacon: flow-read, memory-access, observe, operator-notify.
+        assert_eq!(
+            scopes(&c, "deacon"),
+            vec!["board.read", "merge.read", "memory.read", "memory.write", "issues.read", "notify.write"]
+        );
         // No automatic role is ever the operator wildcard.
         for role in [
             "polecat", "mayor", "sheriff", "refinery", "witness", "deacon", "overseer",
@@ -221,6 +292,78 @@ mod tests {
                 !scopes(&c, role).iter().any(|s| s == "*"),
                 "{role} must not carry '*'"
             );
+        }
+    }
+
+    /// gtcore-abf278 (AC): the polecat's daemon-minted grant, expanded the way the MCP boundary
+    /// expands a JWT claim ([`gt_rbac::Scope::from_workspace_claim`]), must AUTHORIZE the memory and
+    /// a2a tools its prompt drives — `memory.recall`/`memory.save` (gtcore-bad8d9) and
+    /// `a2a.inbox`/`a2a.delegate`/… (gtcore-3a3557) — while still DENYING a namespace it was never
+    /// granted, so the fix is a grant widening, not an enforcement weakening.
+    #[test]
+    fn polecat_grant_reaches_memory_and_a2a_but_not_ungranted_namespaces() {
+        let c = agent_least_privilege_catalog();
+        let scope = gt_rbac::Scope::from_workspace_claim("polecat", &scopes(&c, "polecat"));
+
+        // The two formerly-inert capabilities are now authorized end-to-end.
+        scope.check("memory.recall").expect("memory.recall authorized");
+        scope.check("memory.save.execute").expect("memory.save authorized");
+        scope.check("a2a.inbox").expect("a2a.inbox authorized");
+        scope.check("a2a.discover").expect("a2a.discover authorized");
+        scope.check("a2a.delegate.execute").expect("a2a.delegate authorized");
+        scope.check("a2a.send.execute").expect("a2a.send authorized");
+
+        // The original grant still works.
+        scope.check("issues.read.execute").expect("issues still authorized");
+        scope.check("merge.submit.execute").expect("merge still authorized");
+
+        // Enforcement is NOT weakened: a namespace the polecat was never granted stays denied.
+        assert!(scope.check("workspace.create").is_err(), "no workspace admin");
+        assert!(scope.check("agent.add.execute").is_err(), "no agent dispatch");
+        assert!(scope.check("quota.set.execute").is_err(), "no quota control");
+
+        // Still least-privilege: never the wildcard.
+        assert!(!scope.allow.iter().any(|s| s == "*"), "polecat must not carry '*'");
+    }
+
+    /// gtcore-999795 (AC): the trigger-driven role agents' daemon-minted grants, expanded the way the
+    /// MCP boundary expands a JWT claim ([`gt_rbac::Scope::from_workspace_claim`]), must AUTHORIZE the
+    /// tools each role's kickoff drives — otherwise the feature ships inert. The crucial subtlety is
+    /// the operator-notification grant: `notify.write` authorizes `notify.send`, whereas the wrong-
+    /// namespace `notifications.write` would NOT (it folds to `notifications.*`).
+    #[test]
+    fn role_agent_grants_authorize_their_kickoff_tools() {
+        let c = agent_least_privilege_catalog();
+        let scope = |role: &str| gt_rbac::Scope::from_workspace_claim(role, &scopes(&c, role));
+
+        // sheriff: drive the merge board, escalate, recall/persist memory.
+        let sheriff = scope("sheriff");
+        sheriff.check("merge.list.execute").expect("sheriff reads the board");
+        sheriff.check("merge.submit.execute").expect("sheriff recovers a slot");
+        sheriff.check("notify.send.execute").expect("sheriff escalates");
+        sheriff.check("memory.recall").expect("sheriff recalls memory");
+        sheriff.check("memory.save.execute").expect("sheriff persists memory");
+        assert!(sheriff.check("issues.transition.execute").is_err(), "sheriff has no tracker write");
+
+        // witness: read the closed bead, flag a bad closure with a comment + operator alert, memory.
+        let witness = scope("witness");
+        witness.check("issues.read.execute").expect("witness reads the bead");
+        witness.check("comments.create.execute").expect("witness flags a bad closure");
+        witness.check("notify.send.execute").expect("witness alerts the operator");
+        witness.check("memory.recall").expect("witness recalls memory");
+        assert!(witness.check("merge.submit.execute").is_err(), "witness cannot merge");
+
+        // deacon: read-only flow scan across tracker/board/merge, escalate, memory.
+        let deacon = scope("deacon");
+        deacon.check("issues.list.execute").expect("deacon scans the tracker");
+        deacon.check("board.list.execute").expect("deacon reads the board");
+        deacon.check("merge.list.execute").expect("deacon reads the merge board");
+        deacon.check("notify.send.execute").expect("deacon escalates");
+        deacon.check("memory.recall").expect("deacon recalls memory");
+
+        // Still least-privilege: never the wildcard.
+        for role in ["sheriff", "witness", "deacon"] {
+            assert!(!scope(role).allow.iter().any(|s| s == "*"), "{role} must not carry '*'");
         }
     }
 

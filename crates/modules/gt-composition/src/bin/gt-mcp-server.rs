@@ -15,7 +15,9 @@
 //! - `GT_MCP_HTTP_BIND` — listen address, default `127.0.0.1:8765`.
 //! - `GT_MCP_ALLOWED_HOSTS` — extra `Host` authorities the /mcp transport accepts, appended to
 //!   the loopback defaults (comma-separated). Set the served domain here for a public deploy
-//!   behind a reverse proxy; unset ⇒ loopback-only.
+//!   behind a reverse proxy; unset ⇒ loopback-only. The authorities of `GT_SELF_URL` and
+//!   `GT_PUBLIC_URL` are auto-appended too (gtcore-2cc534), so an in-cluster `gt mcp call`
+//!   against the URL the orchd writes into agents' `.mcp.json` is accepted without extra config.
 //! - `GT_MCP_ACTOR` — scope actor, default `mcp-local`.
 //! - `GT_MCP_SCOPE_CONFIG` — RBAC TOML/JSON path; unset ⇒ deny-by-default.
 //! - `GT_REPO_DIR` — gt-core checkout whose `main` tree backs surface validation
@@ -58,8 +60,8 @@ use gt_composition::hooks::{hooks_router, HooksApiState};
 use gt_composition::kanban_rest::{kanban_rest_router, KanbanRestState};
 use gt_composition::notifications::{notifications_router, NotificationsApiState};
 use gt_composition::mcp::{
-    A2aDelegateHandler, AgentHandler, AnalyticsHandler, AuditHandler, CommentsHandler, ConvoyHandler, CrossWsGrants, DispatchHandler, DocumentsHandler, EmailHandler, EscalateHandler, EventLog, EventLogHooks,
-    EventLogIssueSink, GraphHandler, IdentityDoltMeStats, InvitesHandler, MemoryHandler, MergeHandler, NotifyHandler, ReportHandler,
+    A2aDelegateHandler, AgentHandler, AnalyticsHandler, AuditHandler, CommentsHandler, ConvoyHandler, CrossWsGrants, DispatchHandler, DocumentsHandler, DomainCatalogHandler, EmailHandler, EscalateHandler, EventLog, EventLogHooks,
+    EventLogIssueSink, EventLogRigSink, GraphHandler, IdentityDoltMeStats, InvitesHandler, MemoryHandler, MergeHandler, NotifyHandler, ReportHandler,
     PgDocumentsResource, PgRigPrefixes, PgWorkspaceStatus, QuotaBlockGuard, QuotaHandler, RigHandler,
     WorkspaceHandler, WsPools,
 };
@@ -152,6 +154,14 @@ async fn main() -> anyhow::Result<()> {
     let store = Arc::new(DoltIssues::connect(&dolt_url)?);
     store.ensure_schema().await?;
     eprintln!("[gt-mcp-server] issues: Dolt @ {dolt_url}");
+
+    // Per-workspace domain catalog (gtcore-55d5fb H1): ensure the `default`
+    // workspace's `domain_catalog` table exists and is seeded with the technical
+    // set (built from the `Domain` enum so it can't diverge). Idempotent — a
+    // re-boot re-upserts by key. Business workspaces get the editable generic
+    // template at provision time (see mcp::workspace::provision_tenant).
+    gt_composition::domain_catalog::seed_default_workspace(store.as_ref()).await?;
+    eprintln!("[gt-mcp-server] domain catalog: default workspace seeded (technical set)");
 
     // The per-workspace event log (the event-sourced domains' durable store AND the SSE feed's
     // source) is path-partitioned under GT_EVENTLOG_ROOT (default /var/lib/gt-core). Built here
@@ -379,7 +389,11 @@ async fn main() -> anyhow::Result<()> {
         // transition with no context is deferred (debt note) instead of stop-the-line ONLY
         // when the workspace pool is freshly out of capacity — read from the same per-workspace
         // quota event log the quota.* handler replays. Always on (the log is always present).
-        .with_quota_signal(Arc::new(QuotaBlockGuard::new(event_log.clone())));
+        .with_quota_signal(Arc::new(QuotaBlockGuard::new(event_log.clone())))
+        // Auto-complete merge slot on bead close (gtcore-71c575): when a bead closes with a
+        // delivered_sha, the close hook advances its merge slot to Merged so stale `failed`
+        // slots for work already in main are cleaned up automatically.
+        .with_close_hook(Arc::new(MergeHandler::new(event_log.clone())));
 
     // System config (hq-system-config) is loaded BEFORE the domain router so the
     // report-digest service (hq-84f93b) inside it and the /api/v1/system surface
@@ -401,13 +415,27 @@ async fn main() -> anyhow::Result<()> {
     // GT_PG_URL is set; unset ⇒ an empty router, so the server serves issues +
     // meta exactly as before.
     let (domains, rig_prefixes, ws_status, documents, report_service) =
-        build_domain_router(event_log.clone(), system_config.clone(), system_config_path.clone())
+        build_domain_router(event_log.clone())
             .await?;
     // Report-digest scheduler (hq-84f93b): fixed-time daily send to the ENABLED
     // subscribers. Like the outbox drain/mailbox, NOT behind the singleton gate —
     // it must tick where the outbox lives; the `last_sent_date` guard in the
     // persisted config keeps the send at-most-once per day.
     if let Some(svc) = &report_service {
+        // One-shot migration (gtcore-8ff13e): the schedule LIST now lives in the
+        // durable Postgres store, but pre-DB deployments persisted it to
+        // `system_config.json`. On the first boot against the DB store, seed it
+        // from whatever the legacy file still holds so those schedules are not
+        // lost; gated on an empty store, so this is a no-op on every later boot.
+        match svc.import_file_schedules(&system_initial_cfg.report_schedules).await {
+            Ok(0) => {}
+            Ok(n) => eprintln!(
+                "[gt-mcp-server] report scheduler: migrated {n} legacy schedule(s) from system_config.json into the DB store"
+            ),
+            Err(e) => eprintln!(
+                "[gt-mcp-server] report scheduler: legacy schedule migration skipped ({e})"
+            ),
+        }
         tokio::spawn(gt_composition::report_scheduler::ReportScheduler::new(svc.clone()).run());
         eprintln!("[gt-mcp-server] report scheduler on (digest via /api/v1/system/report/*)");
     }
@@ -591,6 +619,29 @@ async fn main() -> anyhow::Result<()> {
     // is APPENDED to the loopback defaults, so local clients keep working and the deploy adds
     // its own domain (e.g. `gt.codecsrayo.com`). Unset ⇒ loopback-only, exactly as before.
     let mut http_config = StreamableHttpServerConfig::default();
+    // Auto-allow the authorities the deploy already advertises as "where to reach me": the
+    // in-cluster `GT_SELF_URL` (e.g. `http://gt-mcp-server:8765`) and the public `GT_PUBLIC_URL`
+    // (e.g. `https://gt-dev.codecsrayo.com`). gt-orch-server writes GT_SELF_URL verbatim into
+    // every agent's `.mcp.json` on each sling (hq-polecat-rig-config.1), so without this an
+    // in-cluster `gt mcp call` / native `mcp__gt__*` against that host is rejected 403 "Host
+    // header is not allowed" and the only workaround — hand-editing server_url to the public
+    // host — is reverted by the next sling (gtcore-2cc534). Deriving the allow-list from the
+    // SAME env the orchd hands out keeps a freshly-spawned agent working with no config edit,
+    // and survives an orchd restart (it is code + already-present env, not a mutable file).
+    for (var, label) in [
+        ("GT_SELF_URL", "in-cluster self URL"),
+        ("GT_PUBLIC_URL", "public origin"),
+    ] {
+        if let Some(url) = std::env::var(var).ok().filter(|v| !v.trim().is_empty()) {
+            let hosts = authority_allowed_hosts(&url);
+            if hosts.is_empty() {
+                eprintln!("[gt-mcp-server] {var}={url:?} has no parseable Host authority; not added to allow-list");
+            } else {
+                eprintln!("[gt-mcp-server] allowed_hosts += {hosts:?} (from {var}, {label})");
+                http_config.allowed_hosts.extend(hosts);
+            }
+        }
+    }
     if let Ok(raw) = std::env::var("GT_MCP_ALLOWED_HOSTS") {
         let extra: Vec<String> = raw
             .split(',')
@@ -691,6 +742,47 @@ async fn main() -> anyhow::Result<()> {
             event_log.clone(),
             accounts_root,
         ))
+    });
+
+    // Per-account relogin + cred-health (gtcore-1fe9b4): POST /api/v1/quota/relogin/{start,complete}
+    // relogs an EXISTING keychain account's creds dir via `claude /login`, seeds the dir
+    // onboarding-complete so the sling consumes it without a first-run TUI/OAuth wedge, and dedups
+    // duplicate dirs for the same email. GET /api/v1/quota/cred-health reports per-account
+    // {refresh, expiry, onboarding, needs_relogin}. Mounted only with an RS256 verifier; relogin
+    // needs `quota.write`, cred-health `quota.read` (audited on denial). See `gt_composition::relogin`.
+    let relogin = verifier.as_ref().map(|v| {
+        eprintln!(
+            "[gt-mcp-server] relogin on POST /api/v1/quota/relogin/{{start,complete}} + GET /api/v1/quota/cred-health (cookie/bearer auth, scope quota.write/read)"
+        );
+        let relogin_eventlog_root = std::env::var("GT_EVENTLOG_ROOT")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|_| std::path::PathBuf::from(DEFAULT_EVENTLOG_ROOT));
+        let accounts_root = gt_composition::account_dirs::accounts_root(&relogin_eventlog_root);
+        // Enumerate every quota-tracked account in cred-health (gtcore-e09320): replay the
+        // workspace's quota log into the registry so an account in `quota.list` with NO on-disk dir
+        // (brayanrayo/fsrbwowr) still surfaces as needs_relogin instead of vanishing → shown Healthy.
+        let known_log = event_log.clone();
+        let known_ws = std::env::var("GT_WORKSPACE").unwrap_or_else(|_| "default".to_string());
+        let known_accounts: gt_composition::relogin::KnownAccountsFn = Arc::new(move || {
+            known_log
+                .replay_domain(
+                    Some(&known_ws),
+                    "quota.",
+                    gt_quota::QuotaState::default(),
+                    gt_quota::QuotaState::apply,
+                )
+                .map(|st| {
+                    gt_quota::AccountRegistry::from_state(&st)
+                        .accounts()
+                        .map(|a| a.id.clone())
+                        .collect::<Vec<String>>()
+                })
+                .unwrap_or_default()
+        });
+        gt_composition::relogin::relogin_router(
+            gt_composition::relogin::ReloginState::new(v.clone(), audit.clone(), accounts_root)
+                .with_known_accounts(known_accounts),
+        )
     });
 
     // Global Claude Code hook registry (hq-hooks): GET/POST/DELETE /api/v1/hooks list/register/
@@ -1134,6 +1226,9 @@ async fn main() -> anyhow::Result<()> {
     }
     if let Some(onboard) = onboard {
         app = app.merge(onboard);
+    }
+    if let Some(relogin) = relogin {
+        app = app.merge(relogin);
     }
     if let Some(hooks) = hooks {
         app = app.merge(hooks);
@@ -1886,6 +1981,30 @@ async fn apply_pg_catalog(pool: &sqlx::PgPool) -> anyhow::Result<()> {
         .chain(connection_migs.iter().map(|m| (&connection_id, m)))
         .collect();
 
+    // Self-heal the `ws_default.rigs` TEMPLATE before applying the plan (gtcore-a80f74). The
+    // migration tracking table lives in `public` and survives a `DROP SCHEMA ws_default CASCADE`,
+    // so after such a drop `gt_module_migrate::apply` would SKIP the already-recorded `create_rigs`
+    // migration (never recreating the dropped table) and then abort boot when a pending follow-on
+    // `ALTER TABLE ws_default.rigs ADD COLUMN …` hits `relation "ws_default.rigs" does not exist`,
+    // crashlooping the whole server. Replaying the rigs module's fully idempotent DDL here
+    // UNCONDITIONALLY guarantees the table is present and complete regardless of what the tracking
+    // table claims — the same belt-and-suspenders self-heal `events`/`dispatch` already do via
+    // `ensure_schema`. The DDL is `CREATE …/ALTER … IF NOT EXISTS` only, so it never destroys data
+    // or clobbers existing rows.
+    //
+    // Run under a transaction-scoped advisory lock: this fires on EVERY boot across N mcp-server
+    // replicas (plus parallel tests), and concurrent `CREATE TABLE/ALTER … IF NOT EXISTS` against
+    // the same table races in Postgres. The lock makes provisioning a single-writer critical
+    // section; the key is arbitrary-but-fixed so every process contends on the same lock.
+    const RIGS_DDL_LOCK: i64 = 0x6774_7269_0001; // "gtri" + 1
+    let rigs_ensure = gt_rig::RigsModule::template_ensure_sql();
+    sqlx::raw_sql(&format!(
+        "BEGIN; SELECT pg_advisory_xact_lock({RIGS_DDL_LOCK}); {rigs_ensure} COMMIT;"
+    ))
+    .execute(pool)
+    .await
+    .context("self-heal ws_default.rigs template before migrations")?;
+
     let report = gt_module_migrate::apply(pool, &plan)
         .await
         .context("apply public-schema PG catalog migrations")?;
@@ -2046,8 +2165,6 @@ ORDER BY c.relname, a.attnum";
 /// SSE feed streams from.
 async fn build_domain_router(
     event_log: Arc<EventLog>,
-    system_config: gt_composition::system::SharedArchiveConfig,
-    system_config_path: Option<std::path::PathBuf>,
 ) -> anyhow::Result<(
     DomainRouter,
     Option<Arc<dyn WorkspaceRigPrefixes>>,
@@ -2199,7 +2316,12 @@ async fn build_domain_router(
     };
     let router = DomainRouter::new()
         .register(Arc::new(workspace_handler))
-        .register(Arc::new(RigHandler::new(ws_pools.clone())))
+        // rig-hold H1: the rig handler emits `rig.held.v1` / `rig.resumed.v1` to the shared event
+        // log so the operator's hold/resume is auditable + visible on the SSE feed.
+        .register(Arc::new(
+            RigHandler::new(ws_pools.clone())
+                .with_event_sink(Arc::new(EventLogRigSink::new(event_log.clone()))),
+        ))
         // A completed merge marks the owning rig's graph stale (hq-graphrig.7).
         .register(Arc::new(
             MergeHandler::new(event_log.clone()).with_rig_pools(ws_pools.clone()),
@@ -2212,7 +2334,13 @@ async fn build_domain_router(
                 None => handler,
             }
         }))
-        .register(Arc::new(QuotaHandler::new(event_log.clone())))
+        .register(Arc::new(QuotaHandler::new(event_log.clone()).with_accounts_root(
+            gt_composition::account_dirs::accounts_root(
+                &std::env::var("GT_EVENTLOG_ROOT")
+                    .map(std::path::PathBuf::from)
+                    .unwrap_or_else(|_| std::path::PathBuf::from(DEFAULT_EVENTLOG_ROOT)),
+            ),
+        )))
         // notify.* — operator notification channel (hq-notifications): agents write
         // via notify.send; the browser bell polls/streams the same PG table.
         .register(Arc::new(NotifyHandler::new(pool.clone(), event_log.clone())))
@@ -2289,6 +2417,30 @@ async fn build_domain_router(
     // (hq-memory-admin.4), exactly like documents.* — no longer bound to `ws_default`.
     let router = router.register(Arc::new(MemoryHandler::new(ws_pools.clone(), embedder)));
 
+    // domain.catalog.* — operator-editable per-workspace domain catalog (gtcore-b37400
+    // H4). Resolves the active workspace's catalog over the SAME Dolt store the issues
+    // surface writes to (the shared `hq` default, or the tenant's `hq_<ws>` under
+    // multi-tenant routing), so an edit here is read back by the bead-create domain
+    // validation (gtcore-d81e77 H2). Needs Dolt (GT_DOLT_URL) for the default store;
+    // skipped otherwise (no catalog to edit).
+    let router = match std::env::var("GT_DOLT_URL")
+        .ok()
+        .and_then(|url| DoltIssues::connect(&url).ok())
+    {
+        Some(catalog_store) => {
+            let handler = DomainCatalogHandler::new(Arc::new(catalog_store));
+            let handler = match &dolt_pools {
+                Some(dolt) => handler.with_dolt(dolt.clone()),
+                None => handler,
+            };
+            router.register(Arc::new(handler))
+        }
+        None => {
+            eprintln!("[gt-mcp-server] domain.catalog.* off — GT_DOLT_URL unset");
+            router
+        }
+    };
+
     // dispatch.* — agent-dispatch frontier probe (gtcore-7bec8c — C3): exposes
     // ready_for_auto as an MCP tool so operators/agents can query which beads are
     // safe for autonomous dispatch right now. Needs Dolt for the ready predicate.
@@ -2300,10 +2452,13 @@ async fn build_domain_router(
             let repo_dir = std::env::var("GT_REPO_DIR")
                 .ok()
                 .map(std::path::PathBuf::from);
-            router.register(Arc::new(DispatchHandler::new(
-                Arc::new(dispatch_dolt),
-                repo_dir,
-            )))
+            let mut handler = DispatchHandler::new(Arc::new(dispatch_dolt), repo_dir);
+            // rig-hold H2 (gtcore-1f5e67): give the probe the per-workspace rig pools so it
+            // excludes held rigs, matching the orchd frontier. Fail-soft without GT_PG_URL.
+            if let Some(pg_url) = std::env::var("GT_PG_URL").ok().filter(|v| !v.is_empty()) {
+                handler = handler.with_held_rigs(Arc::new(WsPools::new(pg_url)));
+            }
+            router.register(Arc::new(handler))
         }
         None => {
             eprintln!("[gt-mcp-server] dispatch.* off — GT_DOLT_URL unset");
@@ -2481,9 +2636,10 @@ async fn build_domain_router(
         Some(report_dolt) => {
             let report_dolt = Arc::new(report_dolt);
             let (report_blob, report_bucket) = build_blob_store();
-            // The digest service (hq-84f93b): same Dolt row source + outbox
-            // pool as report.generate; shares the persisted system config so
-            // schedule edits land without a restart.
+            // The digest service (hq-84f93b): same Dolt row source + outbox pool
+            // as report.generate. The schedule LIST now lives in the DB-backed
+            // `report_schedules` store (gtcore-915232) — durable across redeploys
+            // — so a CRUD edit lands on the next daemon tick without a restart.
             let service = Arc::new(gt_composition::report_scheduler::ReportService::new(
                 report_dolt.clone(),
                 dolt_pools.clone(),
@@ -2491,8 +2647,6 @@ async fn build_domain_router(
                 // Per-workspace PG pools: the source of the bead/epic comments the
                 // digest folds into the report (gtcore-01bcf2).
                 Some(ws_pools.clone()),
-                system_config,
-                system_config_path,
             ));
             let router = router.register(Arc::new(ReportHandler::new(
                 ws_pools.clone(),
@@ -2821,10 +2975,20 @@ async fn seed_rigs(pg_url: &str) -> anyhow::Result<()> {
 
     // Idempotency gate: never touch a non-empty catalog. A curated prod (or any deploy where an
     // operator already registered a rig) is left untouched — the live `rig.*` surface owns it there.
-    let existing = repo
-        .list()
-        .await
-        .context("rig catalog seed: list existing rigs")?;
+    //
+    // A list failure here is NON-FATAL (gtcore-e07dd0): if `ws_default.rigs` is missing or the schema
+    // is not yet provisioned, this seed must not crashloop the ENTIRE mcp-server (which takes the whole
+    // platform down). The catalog just stays whatever it is; an operator can `rig.add`. Mirrors the
+    // connect-failure skip above.
+    let existing = match repo.list().await {
+        Ok(rigs) => rigs,
+        Err(e) => {
+            eprintln!(
+                "[gt-mcp-server] rig catalog seed skipped (list failed — schema not ready: {e})"
+            );
+            return Ok(());
+        }
+    };
     if !existing.is_empty() {
         eprintln!(
             "[gt-mcp-server] rig catalog seed skipped ({} rig(s) already registered)",
@@ -2997,6 +3161,33 @@ fn is_safe_schema_ident(s: &str) -> bool {
         && s.starts_with("ws_")
         && s.chars()
             .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_')
+}
+
+/// The `Host` allow-list entries implied by a service URL (`GT_SELF_URL` / `GT_PUBLIC_URL`).
+///
+/// rmcp's streamable-HTTP transport rejects any request whose `Host` is not in
+/// `allowed_hosts` (a DNS-rebinding guard). gt-orch-server writes `GT_SELF_URL` verbatim into
+/// every agent's `.mcp.json`, so the server must accept that exact authority or an in-cluster
+/// `gt mcp call` is 403'd. Given `http://gt-mcp-server:8765` this returns
+/// `["gt-mcp-server", "gt-mcp-server:8765"]` — the bare host (matches any port, per rmcp's
+/// `host_is_allowed`) plus the explicit `host:port` for clarity. An empty/unparseable URL, or
+/// one with no host authority, yields an empty vec (the caller logs and skips it).
+fn authority_allowed_hosts(url: &str) -> Vec<String> {
+    let Ok(uri) = url.trim().parse::<axum::http::Uri>() else {
+        return Vec::new();
+    };
+    let Some(authority) = uri.authority() else {
+        return Vec::new();
+    };
+    let host = authority.host();
+    if host.is_empty() {
+        return Vec::new();
+    }
+    let mut out = vec![host.to_string()];
+    if let Some(port) = authority.port_u16() {
+        out.push(format!("{host}:{port}"));
+    }
+    out
 }
 
 /// Parse a `u64` env var, falling back to `default` when it is unset or unparseable.
@@ -3221,6 +3412,41 @@ mod tests {
             &format!("ws_{}", "a".repeat(61)),
         ] {
             assert!(!is_safe_schema_ident(bad), "{bad:?} must be rejected");
+        }
+    }
+
+    /// gtcore-2cc534: the `Host` allow-list derived from `GT_SELF_URL`/`GT_PUBLIC_URL` must yield
+    /// the exact authority the orchd writes into every agent's `.mcp.json`, so an in-cluster
+    /// `gt mcp call` is no longer 403'd. The bare host (port-agnostic, matching rmcp's
+    /// `host_is_allowed`) plus the explicit `host:port` are emitted; junk yields nothing.
+    #[test]
+    fn authority_allowed_hosts_extracts_host_and_port() {
+        // The in-cluster GT_SELF_URL the deploy hands agents — the case this bead fixes.
+        assert_eq!(
+            authority_allowed_hosts("http://gt-mcp-server:8765"),
+            vec!["gt-mcp-server".to_string(), "gt-mcp-server:8765".to_string()]
+        );
+        // Public ingress, https default port (no explicit port in the URL).
+        assert_eq!(
+            authority_allowed_hosts("https://gt-dev.codecsrayo.com"),
+            vec!["gt-dev.codecsrayo.com".to_string()]
+        );
+        // A path/trailing slash does not change the authority.
+        assert_eq!(
+            authority_allowed_hosts("http://gt-mcp-server:8765/mcp"),
+            vec!["gt-mcp-server".to_string(), "gt-mcp-server:8765".to_string()]
+        );
+        // Surrounding whitespace is tolerated (env values can be sloppy).
+        assert_eq!(
+            authority_allowed_hosts("  http://gt-mcp-server:8765  "),
+            vec!["gt-mcp-server".to_string(), "gt-mcp-server:8765".to_string()]
+        );
+        // Empty / authority-less / unparseable inputs yield nothing (caller logs + skips).
+        for junk in ["", "   ", "not a url", "/just/a/path"] {
+            assert!(
+                authority_allowed_hosts(junk).is_empty(),
+                "{junk:?} must yield no allow-list entries"
+            );
         }
     }
 

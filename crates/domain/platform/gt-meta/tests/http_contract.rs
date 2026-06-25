@@ -49,6 +49,12 @@ fn get(uri: &str) -> Request<Body> {
     Request::builder().uri(uri).body(Body::empty()).unwrap()
 }
 
+/// A `GET` carrying the `X-GT-Workspace` selector the [`WorkspaceContext`] extractor
+/// resolves the tenant from (gtcore-d81e77 H2 `GET /domains`).
+fn get_ws(uri: &str, ws: &str) -> Request<Body> {
+    Request::builder().uri(uri).header("X-GT-Workspace", ws).body(Body::empty()).unwrap()
+}
+
 /// A never-connected store is fine for the help route: the handler reads no store.
 fn unconnected_store() -> Arc<DoltIssues> {
     Arc::new(DoltIssues::connect("mysql://x@127.0.0.1:1/none").expect("lazy connect"))
@@ -161,6 +167,61 @@ async fn report_gap_mints_a_gap_bead_in_the_store() {
     assert_eq!(detail.title, "gap: issues.archive.execute");
     // The catalog epic was auto-created so the parent ref is never dangling.
     assert!(repo.get_detail("hq-gaps").await.expect("read").is_some(), "catalog epic exists");
+}
+
+#[tokio::test]
+async fn domains_lists_the_active_workspaces_catalog() {
+    // gtcore-d81e77 H2: GET /domains returns the active workspace's domain_catalog so
+    // the FE selector is populated per workspace. Seed a catalog on a fresh DB, then
+    // read it back through the real router. Single-tenant here (no WorkspacePools), so
+    // the catalog resolves off the store pool; the `X-GT-Workspace` header only satisfies
+    // the WorkspaceContext extractor.
+    let Ok(base) = std::env::var("GT_DOLT_URL") else {
+        eprintln!("GT_DOLT_URL unset — skipping domains roundtrip");
+        return;
+    };
+    let base = base.trim_end_matches('/').to_string();
+    let db = "gt_meta_domains";
+    let pool = gt_store_dolt::connect(&base).expect("connect");
+    let mut conn = pool.get_conn().await.expect("conn");
+    conn.query_drop(format!("DROP DATABASE IF EXISTS {db}")).await.expect("drop");
+    conn.query_drop(format!("CREATE DATABASE {db}")).await.expect("create");
+    drop(conn);
+
+    let url = format!("{base}/{db}");
+    let catalog = gt_store_dolt::DoltDomainCatalog::new(gt_store_dolt::connect(&url).expect("pool"));
+    catalog.ensure_schema().await.expect("catalog schema");
+    catalog
+        .seed(&[
+            gt_store_dolt::DomainEntry::new("sales", "Sales", None),
+            gt_store_dolt::reserved_gap_entry(),
+        ])
+        .await
+        .expect("seed");
+
+    let store = DoltIssues::connect(&url).expect("connect db");
+    let app = meta_router(MetaApiState::new(Arc::new(store), "test-actor", Vec::<McpTool>::new()));
+
+    let (status, body) = send(&app, get_ws("/domains", "default")).await;
+    assert_eq!(status, StatusCode::OK, "domains returns 200: {body}");
+    let listed = body["domains"].as_array().expect("domains array");
+    let keys: Vec<&str> = listed.iter().map(|e| e["key"].as_str().expect("key")).collect();
+    // The seeded business domain and the reserved gap domain are both present.
+    assert!(keys.contains(&"sales"), "{keys:?}");
+    assert!(keys.contains(&"meta.gap"), "{keys:?}");
+    // Each entry carries the catalog flags the FE groups/filters on.
+    let sales = listed.iter().find(|e| e["key"] == "sales").expect("sales entry");
+    assert_eq!(sales["label"], "Sales");
+    assert_eq!(sales["enabled"], true);
+}
+
+#[tokio::test]
+async fn domains_requires_a_workspace_selector() {
+    // Without an X-GT-Workspace header (and no token claim) the WorkspaceContext
+    // extractor rejects with 400 before any store access — so this needs no DB.
+    let app = meta_router(MetaApiState::new(unconnected_store(), "test-actor", Vec::<McpTool>::new()));
+    let (status, _) = send(&app, get("/domains")).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "missing workspace selector is a 400");
 }
 
 #[tokio::test]

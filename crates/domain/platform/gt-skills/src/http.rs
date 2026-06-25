@@ -121,6 +121,10 @@ impl SkillsApiState {
 pub fn skills_router(state: SkillsApiState) -> Router {
     Router::new()
         .route("/", get(list_skills).post(register_skill))
+        // Seed-vs-live drift report (gtcore-63bb20): compares the binary's embedded greenfield seed
+        // against this workspace's live `skills.*` catalog. Read-only ⇒ skills.read. Declared before
+        // `/:id` for clarity (axum prefers the static segment regardless).
+        .route("/drift", get(get_drift))
         .route(
             "/:id",
             get(get_skill).put(update_skill).delete(retire_skill),
@@ -491,6 +495,30 @@ async fn set_role_scopes(
     Ok((StatusCode::OK, Json(json!({ "role": cmd.role }))).into_response())
 }
 
+/// `GET /drift` — the seed-vs-live drift report for the caller's workspace (`gtcore-63bb20`,
+/// `skills.read`). Compares the binary's **embedded** greenfield seed ([`crate::drift::seed_catalog`])
+/// against the workspace's **live** `skills.*` catalog and reports, per role and per skill, what
+/// differs and how recently the live catalog moved. This is the operator-facing tool for AC1 ("a
+/// command/tool reports drift per role: what differs and age"); when `drift` is `true` the fix is the
+/// documented `scripts/extract-knowledge-seed.py` regeneration (`docs/ops/greenfield-seeds.md` §4.1).
+#[cfg_attr(feature = "axum", utoipa::path(
+    get, path = "/drift",
+    responses((status = 200, description = "The embedded-seed-vs-live drift report for the caller's workspace")),
+))]
+async fn get_drift(
+    State(st): State<SkillsApiState>,
+    ctx: WorkspaceContext,
+) -> Result<Json<Value>, ApiError> {
+    let live = st.skills.catalog(ctx.workspace().as_str()).await?;
+    let seed = crate::drift::seed_catalog();
+    let report = crate::drift::compute_drift(&seed, &live);
+    Ok(Json(json!({
+        "drift": !report.is_empty(),
+        "summary": report.summary(),
+        "report": report,
+    })))
+}
+
 /// `GET /` — every registered skill in the caller's workspace, in sorted order, with the per-role
 /// bindings the dashboard hydrates from.
 #[cfg_attr(feature = "axum", utoipa::path(
@@ -545,6 +573,7 @@ async fn get_skill(
 #[derive(utoipa::OpenApi)]
 #[openapi(paths(
     list_skills,
+    get_drift,
     register_skill,
     get_skill,
     update_skill,

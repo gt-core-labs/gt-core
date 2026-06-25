@@ -12,7 +12,7 @@
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use gt_store_pg::{
+use gt_store_pg::{assert_ephemeral_pg_url, 
     memory_migrations, MemoryRepository, NewMemory, PgMemory, WorkspacePool,
 };
 
@@ -31,6 +31,7 @@ async fn repo_or_skip(test: &str) -> Option<PgMemory> {
         eprintln!("GT_PG_URL unset; skipping {test}");
         return None;
     };
+    assert_ephemeral_pg_url(&url);
     let admin = sqlx::PgPool::connect(&url).await.expect("connect admin pool");
     let mut conn = admin.acquire().await.expect("acquire admin conn");
     sqlx::query("SELECT pg_advisory_lock(4915623002)")

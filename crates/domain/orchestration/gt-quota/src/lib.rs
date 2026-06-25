@@ -30,6 +30,8 @@ pub mod probe;
 pub mod repo;
 
 pub mod budget;
+pub mod cred_health;
+pub mod credential_select;
 
 mod cost;
 mod events;
@@ -41,6 +43,10 @@ pub use commands::{
     ProbeWindow, QuotaCommand, RegisterAccount, RetireAccount, RotateAccount, SampleTokens,
 };
 pub use cost::{cost_units, Cost, ModelWeights};
+pub use cred_health::{assess_cred_health, CredHealthReport};
+pub use credential_select::{
+    classify_credentials, select_slingable, Candidate, CredentialHealth, DeadAccount, Selection,
+};
 pub use events::QuotaEvent;
 pub use expectations::{predict, Prediction};
 #[cfg(feature = "axum")]

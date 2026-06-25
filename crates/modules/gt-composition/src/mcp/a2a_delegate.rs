@@ -615,7 +615,10 @@ impl DomainHandler for A2aDelegateHandler {
                     owner: None,
                     // Beads minted via delegation carry no own dispatch policy —
                     // they inherit the intake epic's (same as the HTTP A2A path).
-                    domain: vec![Domain::MetaGap],
+                    // H2 (gtcore-d81e77): the wire `domain` is now free strings
+                    // validated against the workspace catalog. `meta.gap` is
+                    // reserved in every catalog, so delegation gap beads validate.
+                    domain: vec![Domain::MetaGap.as_str().to_string()],
                     surface: Vec::new(),
                     depends_on: Vec::new(),
                     role_scope: None,

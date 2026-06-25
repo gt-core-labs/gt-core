@@ -107,17 +107,26 @@ pub fn session_like_actor(actor: &str) -> bool {
     actor.split('-').filter(|seg| !seg.is_empty()).count() >= 3
 }
 
-/// The lock roots: epics in `working` whose owner is a HUMAN (per `is_agent`).
-/// Feed it the unscoped working-epic snapshot
+/// The lock roots: epics in `working` whose owner is an EXPLICIT HUMAN claim
+/// (a non-empty owner that `is_agent` rejects). Feed it the unscoped
+/// working-epic snapshot
 /// ([`working_epics`](gt_store_dolt::DoltIssues::working_epics)) — an operator
 /// may hold an epic outside the rig/workspace being listed.
+///
+/// An EMPTY owner does NOT lock (gtcore-bf0fc9): `working_epics` maps a
+/// `NULL`/unset owner to `""`, and a container epic flipped to `working` with
+/// no owner is NOT "a human claiming the subtree" — treating it as one
+/// silently freezes the whole auto-dispatch frontier beneath it (a bead like
+/// `gtcore-0179f8`, `open` + `dispatch=auto`, never gets slung). C2 is an
+/// OPT-IN operator lock, so it requires an explicit human owner; an orphaned
+/// `working` epic is left to the frontier rather than locking it.
 pub fn locked_roots<'a>(
     working_epics: impl IntoIterator<Item = (&'a str, &'a str)>,
     is_agent: &dyn Fn(&str) -> bool,
 ) -> HashSet<String> {
     working_epics
         .into_iter()
-        .filter(|(_, owner)| !is_agent(owner))
+        .filter(|(_, owner)| !owner.is_empty() && !is_agent(owner))
         .map(|(id, _)| id.to_string())
         .collect()
 }
@@ -176,16 +185,50 @@ pub fn surface_overlaps(row: &IssueRow, occupied: &HashSet<String>) -> bool {
         .any(|e| occupied.contains(e.path.trim().trim_end_matches('/')))
 }
 
-/// The agent-dispatch frontier: beads that pass ALL five clauses and are safe
-/// to hand to an autonomous agent right now.
+/// The UNIFIED slingability predicate (gtcore-db99e0): should a live polecat exist
+/// for this bead right now? ONE decision — previously drifted across the three sites
+/// that each independently re-slung beads they never should have: the auto-dispatch
+/// frontier ([`ready_for_auto`]), boot re-hydration of crash-orphaned work, and the
+/// supervisor's dead-polecat re-sling.
+///
+/// ```text
+/// should_sling(b) :=
+///       status ∈ {open, working}   -- a closed/delivered bead has nothing to sling
+///     ∧ issue_type ≠ epic          -- epics are CONTAINERS; their task/bug/feature
+///                                     children get slung, never the epic itself
+///     ∧ dispatch = Auto            -- manual beads are operator-driven, never auto-(re)slung
+/// ```
+///
+/// `dispatch` is the bead's ALREADY-RESOLVED policy (own value → `child_of`
+/// inheritance → `Manual`, from [`resolve_dispatch`]). The frontier resolves it from
+/// the maps it already holds; a caller that only knows a bead id reads the bead +
+/// the same two maps and resolves it the identical way before calling this. The
+/// status/type comparisons are whitespace- and case-tolerant so a raw tracker column
+/// never trips the predicate on formatting alone.
+pub fn should_sling(status: &str, issue_type: &str, dispatch: Dispatch) -> bool {
+    let status = status.trim();
+    (status.eq_ignore_ascii_case("open") || status.eq_ignore_ascii_case("working"))
+        && !issue_type.trim().eq_ignore_ascii_case("epic")
+        && dispatch == Dispatch::Auto
+}
+
+/// The agent-dispatch frontier: beads that pass ALL clauses and are safe to hand to
+/// an autonomous agent right now.
 ///
 /// ```text
 /// ready_for_auto(b) :=
 ///     is_ready(b)                                    -- §S4: deps + phase + surface + open
-///   ∧ resolve_dispatch(b) = Auto                     -- C1: explicit opt-in
+///   ∧ should_sling(b)                                -- C1 + gtcore-db99e0: dispatch=Auto ∧ ¬epic
 ///   ∧ ¬operator_locked(b)                            -- C2: no human epic claim above
 ///   ∧ ¬surface_overlaps(b, working_surfaces)         -- C3: no in-flight crate collision
 /// ```
+///
+/// The [`should_sling`] clause folds in C1's `dispatch = Auto` opt-in AND the
+/// `¬epic` exclusion the frontier was missing (gtcore-dc3c13): an `open`, `auto`
+/// epic used to satisfy [`is_ready`] and land a polecat ON the container instead of
+/// its children. `is_ready` already restricts to `open`, so the predicate's broader
+/// `{open, working}` status clause is a no-op here — the net new effect is dropping
+/// epics.
 ///
 /// The caller supplies the pre-fetched maps (all unscoped — an ancestor or a
 /// working bead may live outside the display scope):
@@ -197,6 +240,11 @@ pub fn surface_overlaps(row: &IssueRow, occupied: &HashSet<String>) -> bool {
 /// - `parents` / `dispatch_raw` — the two `child_of` + dispatch maps
 /// - `locked` — operator lock roots (from [`locked_roots`])
 /// - `occupied` — surfaces of `working` beads (from [`occupied_surfaces`])
+/// - `held_rigs` — rig names on dispatch hold (rig-hold H2, gtcore-1f5e67); a bead whose `rig`
+///   is in this set is excluded from the frontier even when otherwise ready+auto, so an operator
+///   can pause a rig without the orchestrator dispatching its beads. Resuming the rig (dropping it
+///   from the set) makes its ready beads eligible again on the next poll. In-flight polecats are
+///   untouched — this gates only what the frontier hands out next.
 pub fn ready_for_auto(
     rows: Vec<IssueRow>,
     deps_of: &HashMap<String, Vec<String>>,
@@ -207,15 +255,17 @@ pub fn ready_for_auto(
     dispatch_raw: &HashMap<String, Option<String>>,
     locked: &HashSet<String>,
     occupied: &HashSet<String>,
+    held_rigs: &HashSet<String>,
 ) -> Vec<IssueRow> {
     rows.into_iter()
         .filter(|r| {
             let deps = deps_of.get(&r.id).map(|v| v.as_slice()).unwrap_or(&[]);
+            let dispatch = resolve_dispatch(&r.id, r.dispatch.as_deref(), parents, dispatch_raw);
             is_ready(r, deps, open_phase, dep_fact, tree)
-                && resolve_dispatch(&r.id, r.dispatch.as_deref(), parents, dispatch_raw)
-                    == Dispatch::Auto
+                && should_sling(&r.status, &r.issue_type, dispatch)
                 && !operator_locked(&r.id, parents, locked)
                 && !surface_overlaps(r, occupied)
+                && !held_rigs.contains(r.rig.trim())
         })
         .collect()
 }
@@ -402,6 +452,29 @@ mod tests {
     }
 
     #[test]
+    fn empty_owner_working_epic_does_not_lock() {
+        // gtcore-bf0fc9: a container epic flipped to `working` with NO owner
+        // (working_epics maps NULL → "") must NOT lock its subtree — only an
+        // EXPLICIT human claim does. Otherwise the whole auto-dispatch frontier
+        // beneath an orphaned working epic freezes.
+        let epics = [
+            ("epic-orphan", ""),                  // empty owner → NOT a lock
+            ("epic-human", "ops@gt.local"),       // explicit human email → lock
+            ("epic-agent", "gtcore-gtcore-d72302"), // agent session → NOT a lock
+        ];
+        let locked = locked_roots(epics, &|a: &str| session_like_actor(a));
+        assert!(
+            !locked.contains("epic-orphan"),
+            "empty-owner working epic must not lock its subtree"
+        );
+        assert!(locked.contains("epic-human"), "explicit human claim locks");
+        assert!(
+            !locked.contains("epic-agent"),
+            "agent-session claim does not lock"
+        );
+    }
+
+    #[test]
     fn lock_covers_whole_subtree_and_releases() {
         let (parents, _) = maps(
             &[("hq-epic-1", "hq-epic"), ("hq-epic-1-a", "hq-epic-1"), ("free-1", "free")],
@@ -532,11 +605,191 @@ mod tests {
             &dispatch_raw,
             &locked,
             &occupied,
+            &HashSet::new(),
         );
         assert_eq!(
             frontier.iter().map(|r| r.id.as_str()).collect::<Vec<_>>(),
             ["b-ok"],
             "only the bead that passes all clauses survives"
+        );
+    }
+
+    #[test]
+    fn ready_for_auto_excludes_beads_of_a_held_rig() {
+        // rig-hold H2 (gtcore-1f5e67): a ready+auto bead whose rig is on hold is dropped from the
+        // frontier; an otherwise-identical bead on an auto rig still passes. Resuming the rig
+        // (dropping it from the held set) makes its bead eligible again next poll.
+        let mk_rows = || {
+            let held_bead = {
+                let mut r = auto_row("held-bead", r#"["crates/a"]"#);
+                r.rig = "gtcore".into();
+                r
+            };
+            let auto_bead = {
+                let mut r = auto_row("auto-bead", r#"["crates/b"]"#);
+                r.rig = "gtweb".into();
+                r
+            };
+            vec![held_bead, auto_bead]
+        };
+
+        let deps_of: HashMap<String, Vec<String>> = HashMap::new();
+        let dep_fact = |_: &str| -> Option<DepFact> { None };
+        let (parents, dispatch_raw) = maps(&[], &[]);
+        let locked: HashSet<String> = HashSet::new();
+        let occupied: HashSet<String> = HashSet::new();
+
+        // gtcore on hold → only the gtweb bead survives.
+        let held: HashSet<String> = ["gtcore".to_string()].into_iter().collect();
+        let frontier = ready_for_auto(
+            mk_rows(),
+            &deps_of,
+            &dep_fact,
+            IssuePhase::P1,
+            &AllowAll,
+            &parents,
+            &dispatch_raw,
+            &locked,
+            &occupied,
+            &held,
+        );
+        assert_eq!(
+            frontier.iter().map(|r| r.id.as_str()).collect::<Vec<_>>(),
+            ["auto-bead"],
+            "a held rig's bead is excluded; the auto rig's bead passes"
+        );
+
+        // Resume gtcore (empty held set) → both ready beads are eligible again.
+        let frontier = ready_for_auto(
+            mk_rows(),
+            &deps_of,
+            &dep_fact,
+            IssuePhase::P1,
+            &AllowAll,
+            &parents,
+            &dispatch_raw,
+            &locked,
+            &occupied,
+            &HashSet::new(),
+        );
+        assert_eq!(
+            frontier.iter().map(|r| r.id.as_str()).collect::<Vec<_>>(),
+            ["held-bead", "auto-bead"],
+            "resuming the rig restores its bead to the frontier"
+        );
+    }
+
+    #[test]
+    fn frontier_reaches_bead_under_orphaned_working_epic() {
+        // gtcore-bf0fc9 regression: an open + dispatch=auto bead nested under a
+        // container epic that is `working` with NO owner must reach the DIRECT
+        // auto-dispatch frontier. The pre-fix `locked_roots` treated the empty
+        // owner as a human claim and froze the whole subtree, so the bead was
+        // never slung despite spare pool/host/quota capacity.
+        let bead = auto_row("gtcore-0179f8", r#"["crates/free"]"#);
+        let rows = vec![bead];
+
+        let deps_of: HashMap<String, Vec<String>> = HashMap::new();
+        let dep_fact = |_: &str| -> Option<DepFact> { None };
+        // child_of chain: bead → child epic (auto) → orphaned working epic.
+        let (parents, dispatch_raw) = maps(
+            &[
+                ("gtcore-0179f8", "epic-child"),
+                ("epic-child", "epic-orphan"),
+            ],
+            &[("epic-child", Some("auto"))],
+        );
+        // The lock set is computed exactly as FrontierSource::ready does: the
+        // container epic is `working` with an empty owner.
+        let working_epics = [("epic-orphan", "")];
+        let locked = locked_roots(working_epics, &|a: &str| session_like_actor(a));
+        assert!(
+            locked.is_empty(),
+            "orphaned working epic must not produce a lock root"
+        );
+        let occupied: HashSet<String> = HashSet::new();
+
+        let frontier = ready_for_auto(
+            rows,
+            &deps_of,
+            &dep_fact,
+            IssuePhase::P1,
+            &AllowAll,
+            &parents,
+            &dispatch_raw,
+            &locked,
+            &occupied,
+            &HashSet::new(),
+        );
+        assert_eq!(
+            frontier.iter().map(|r| r.id.as_str()).collect::<Vec<_>>(),
+            ["gtcore-0179f8"],
+            "bead under an orphaned working epic reaches the frontier"
+        );
+    }
+
+    // --- gtcore-db99e0: the unified should_sling predicate ---
+
+    #[test]
+    fn should_sling_open_or_working_auto_task_is_slingable() {
+        // The only YES cases: an open OR working, non-epic, dispatch=Auto bead.
+        assert!(should_sling("open", "task", Dispatch::Auto));
+        assert!(should_sling("working", "bug", Dispatch::Auto));
+        assert!(should_sling("working", "feature", Dispatch::Auto));
+        // Tolerant of casing / surrounding whitespace on the raw tracker columns.
+        assert!(should_sling("  Working ", "Task", Dispatch::Auto));
+    }
+
+    #[test]
+    fn should_sling_excludes_closed_epic_and_manual() {
+        // Closed → delivered, nothing to sling (gtcore-e7a851: re-hydration re-slung a merged bead).
+        assert!(!should_sling("closed", "task", Dispatch::Auto));
+        // Epic → container; its children get slung, never the epic (gtcore-dc3c13).
+        assert!(!should_sling("open", "epic", Dispatch::Auto));
+        assert!(!should_sling("working", "epic", Dispatch::Auto));
+        // Manual → operator-driven, never auto-(re)slung (gtcore-e7a851: 915232).
+        assert!(!should_sling("open", "task", Dispatch::Manual));
+        assert!(!should_sling("working", "task", Dispatch::Manual));
+        // An unknown/empty status (neither open nor working) is not slingable.
+        assert!(!should_sling("", "task", Dispatch::Auto));
+    }
+
+    #[test]
+    fn ready_for_auto_never_includes_an_epic_but_keeps_its_children() {
+        // gtcore-dc3c13: an open + dispatch=auto EPIC used to satisfy is_ready and land a polecat
+        // on the container. Its task/bug children must still reach the frontier.
+        let epic = {
+            let mut r = auto_row("epic-1", r#"[]"#);
+            r.issue_type = "epic".to_string();
+            r
+        };
+        let child = auto_row("epic-1-task", r#"["crates/child"]"#);
+        let rows = vec![epic, child];
+
+        let deps_of: HashMap<String, Vec<String>> = HashMap::new();
+        let dep_fact = |_: &str| -> Option<DepFact> { None };
+        // The epic carries dispatch=auto itself; the child inherits it via child_of.
+        let (parents, dispatch_raw) =
+            maps(&[("epic-1-task", "epic-1")], &[("epic-1", Some("auto"))]);
+        let locked: HashSet<String> = HashSet::new();
+        let occupied: HashSet<String> = HashSet::new();
+
+        let frontier = ready_for_auto(
+            rows,
+            &deps_of,
+            &dep_fact,
+            IssuePhase::P1,
+            &AllowAll,
+            &parents,
+            &dispatch_raw,
+            &locked,
+            &occupied,
+            &HashSet::new(),
+        );
+        assert_eq!(
+            frontier.iter().map(|r| r.id.as_str()).collect::<Vec<_>>(),
+            ["epic-1-task"],
+            "the epic is excluded; its child is on the frontier"
         );
     }
 }

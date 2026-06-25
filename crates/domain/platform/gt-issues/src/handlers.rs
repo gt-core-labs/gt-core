@@ -11,12 +11,13 @@
 //! own; the binary supplies the live adapter. `validate_only` short-circuits
 //! before any state change, exactly as the `*.validate` tools do.
 
-use gt_store_dolt::{AppError, ClaimOutcome, DoltIssues};
+use gt_store_dolt::{AppError, ClaimOutcome, DoltDomainCatalog, DoltIssues};
 
 use crate::commands::{
     AdvancePhase, ClaimIssue, CloseIssue, CreateIssue, TransitionIssue, UpdateIssue,
 };
 use crate::delivery::{path_touches_surface, CommitInspector};
+use crate::domain_validate::validate_domains;
 use crate::policy::{guard_claim_context, PolicyVerdict, Violation};
 use crate::surface::{parse_surface_json, SurfaceTree};
 
@@ -58,6 +59,12 @@ pub async fn run_create_issue(
 ) -> Result<String, AppError> {
     args.validate()?;
     args.validate_surface(tree)?;
+    // H2 (gtcore-d81e77): the bead's domains are validated against the workspace's
+    // `domain_catalog` — reached through the issues store's own per-workspace pool,
+    // the same `hq_<ws>` DB the bead lands in — not the closed `Domain` enum. Runs
+    // on the `.validate` path too so the validate tool reports an out-of-catalog
+    // domain, mirroring the surface-existence check above.
+    validate_domains(&DoltDomainCatalog::new(issues.pool().clone()), &args.domain).await?;
     if validate_only {
         return Ok(String::new());
     }
@@ -90,6 +97,14 @@ pub async fn run_update_issue(
         if let Some(detail) = issues.get_detail(&args.id).await? {
             args.check_taxonomy(&detail.issue_type)?;
         }
+    }
+    // H2 (gtcore-d81e77): when the patch repoints `domain`, validate the new set
+    // against the bead workspace's `domain_catalog` (the issues store's own pool),
+    // not the closed `Domain` enum. A `None` domain patch leaves the column alone
+    // and skips this. Runs before the validate-only return so the validate tool
+    // reports an out-of-catalog domain.
+    if let Some(domains) = &args.domain {
+        validate_domains(&DoltDomainCatalog::new(issues.pool().clone()), domains).await?;
     }
     if validate_only {
         return Ok(None);

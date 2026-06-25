@@ -19,7 +19,7 @@
 //! Eviction on a shrunk cap is *not* done — admission is side-effect-free, running polecats finish
 //! naturally (NN#2, mirrored from [`gt_polecat::pool`]).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -27,9 +27,11 @@ use async_trait::async_trait;
 use tokio::sync::broadcast;
 
 use gt_agent::{AgentEvent, SessionRole};
+use crate::auto_dispatch::HeldRigs;
 use gt_auth::{JwtClaims, JwtMinter};
 use gt_eventlog::EventRecord;
 use gt_events::{AppError, Envelope};
+use gt_issues::{resolve_dispatch, should_sling};
 use gt_mcp_server::bead_prefix;
 use gt_merge::MergeEvent;
 use gt_plugin::Plugin;
@@ -37,7 +39,8 @@ use gt_polecat::{
     hooks_from_settings, skills_from_worktree, spawn_tmux, PolecatSupervisor, PoolAllocator,
     SpawnTemplate, Tmux,
 };
-use gt_quota::Keychain;
+use gt_quota::{Keychain, QuotaHandle};
+use gt_scheduling::actor::SchedHandle;
 use gt_scheduling::SchedEvent;
 use gt_skills::{ModelConfig, SkillState};
 use gt_store_dolt::{DoltIssues, IssueStatus};
@@ -45,6 +48,53 @@ use gt_store_dolt::{DoltIssues, IssueStatus};
 use crate::mcp::EventLog;
 use crate::operator_event::IssueOperatorEvent;
 use crate::polecat_event::PolecatEvent;
+
+/// Re-read `bead`'s CURRENT tracker state and decide whether a polecat should be (re-)slung for it
+/// (gtcore-db99e0) — the unified slingability gate shared by the dispatch→sling path (which, at
+/// boot, replays `replay_orphaned_inflight`'s crash-orphaned beads) and the supervisor's
+/// dead-polecat re-sling probe.
+///
+/// Reads the bead detail plus the unscoped `child_of` + dispatch maps so the dispatch policy is
+/// resolved through inheritance EXACTLY as [`gt_issues::ready_for_auto`] does, then applies the pure
+/// [`gt_issues::should_sling`] predicate (status ∈ {open,working} ∧ ¬epic ∧ dispatch=auto). An
+/// unknown bead or any read error is treated as SLINGABLE (permissive) so a transient Dolt hiccup
+/// never silently abandons live work — the same conservative degradation as the closed-bead guard
+/// this generalizes.
+///
+/// `held_rigs` (rig-hold H3, gtcore-9a84e6) are the rig names on dispatch hold: a bead whose rig is
+/// in this set is NOT slingable, so the supervisor's dead-polecat / boot re-hydration re-sling honours
+/// a `rig.hold` instead of restarting what the hold paused. Pass an empty set to disable the gate.
+pub async fn bead_should_sling(
+    issues: &DoltIssues,
+    bead: &str,
+    held_rigs: &HashSet<String>,
+) -> bool {
+    let detail = match issues.get_detail(bead).await {
+        Ok(Some(d)) => d,
+        Ok(None) => return true, // unknown bead → permissive (sling)
+        Err(e) => {
+            eprintln!(
+                "[polecat] slingability probe: get_detail({bead}) failed: {e} — treating as slingable"
+            );
+            return true;
+        }
+    };
+    // rig-hold H3: a held rig pauses the watchdogs too — never re-sling its beads.
+    if held_rigs.contains(detail.rig.trim()) {
+        eprintln!(
+            "[polecat] re-sling skipped for {bead}: rig '{}' on dispatch hold",
+            detail.rig
+        );
+        return false;
+    }
+    // Unscoped maps (empty rig + ws) — an ancestor epic may live outside any one rig/workspace,
+    // exactly the inputs `resolve_dispatch` expects. A map read error degrades to an empty map,
+    // which resolves to the bead's own dispatch value (or Manual) — never a panic.
+    let parents = issues.parent_map("", "").await.unwrap_or_default();
+    let raw = issues.dispatch_index().await.unwrap_or_default();
+    let dispatch = resolve_dispatch(bead, detail.dispatch.as_deref(), &parents, &raw);
+    should_sling(&detail.status, &detail.issue_type, dispatch)
+}
 
 /// Resolves the least-privilege scope set for an agent role (`hq-agent-provisioning.3`). The
 /// production resolver delegates to `gt_skills::SkillCatalog::scopes_for_roles`; tests pass a
@@ -58,6 +108,11 @@ pub type ScopeResolver = Arc<dyn Fn(&str) -> Vec<String> + Send + Sync>;
 /// inheriting the operator's admin (`*`) config. The token is RS256-signed by [`JwtMinter`] (the
 /// daemon holds the private key); the gateway verifies it with the matching public key. A short
 /// `ttl_secs` bounds exposure — a polecat that outlives it is re-slung with a fresh token.
+///
+/// `Clone` (all fields are: [`JwtMinter`] is `Clone`, [`ScopeResolver`] is an `Arc`) so the daemon
+/// can hand the same configured minter to both the polecat supervisor and the role-agent launcher
+/// (`gtcore-999795`) without rebuilding the role→scopes policy twice.
+#[derive(Clone)]
 pub struct AgentTokenMinter {
     minter: JwtMinter,
     scopes_for_role: ScopeResolver,
@@ -84,7 +139,10 @@ impl AgentTokenMinter {
 
     /// Mint a token for `session` running as `role`. `sub` is the session id, scopes come from the
     /// resolver (least-privilege; never `*`), and `exp` is `now + ttl_secs`.
-    fn token_for(&self, session: &str, role: &str) -> Result<String, gt_auth::AuthError> {
+    ///
+    /// `pub(crate)` so the role-agent launcher ([`crate::role_agent`]) can mint the same kind of
+    /// least-privilege token for a triggered sheriff/witness/deacon session.
+    pub(crate) fn token_for(&self, session: &str, role: &str) -> Result<String, gt_auth::AuthError> {
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_secs())
@@ -172,7 +230,48 @@ pub struct PolecatSupervisorPlugin {
     /// frontend and frontier see the state change without waiting for the polecat to self-transition.
     /// `None` ⇒ the bead stays `open` until the polecat calls `issues.transition` itself (legacy).
     issues: Option<Arc<DoltIssues>>,
+    /// Quota actor handle for the sling-time quota-status gate (gtcore-2836bb). When set, the
+    /// credential guard also rejects an active account that is quota-`Limited`/`Blocked` — even with
+    /// valid credentials — and rotates to a `Healthy` one, so a polecat is never born into the
+    /// rate-limit dialog. `None` ⇒ the guard checks credential validity only (legacy).
+    quota: Option<QuotaHandle>,
+    /// Session ids whose pool slot this plugin currently holds (gtcore-b05dbc). A slot is added
+    /// here when a sling succeeds (the claim landed AND the spawn landed) and removed when it is
+    /// released — at merge, OR when the session dies by any path (operator kill, heartbeat-stale,
+    /// reconciler reap, clean self-exit) WITHOUT a merge. Membership is what makes
+    /// [`release_slot_for`](Self::release_slot_for) idempotent and correctly scoped: a slot is
+    /// released exactly once (a duplicate or post-merge death event is a no-op), and only for a
+    /// session THIS workspace's plugin actually claimed — so a death event for some other
+    /// workspace's session never decrements the wrong pool. Without this set, the slot leaked
+    /// until the patrol lease expired (~300s), wedging all new slings on a phantom `pool cap`.
+    claimed: Mutex<HashSet<String>>,
+    /// Scheduler handle for releasing dispatch capacity when a bead's CI-retry budget is exhausted
+    /// (gtcore-3a1bd4). The CI-failure re-sling keeps the slot held across retries (the bead is
+    /// still in flight); only on cap-exhaustion is the bead abandoned, so the scheduler governor
+    /// must be told the slot freed (mirroring `merge.merged.v1`). `None` ⇒ only the pool allocator
+    /// is freed (tests without a scheduler).
+    sched: Option<SchedHandle>,
+    /// Per-bead count of CI-failure re-slings (gtcore-3a1bd4). A bead whose PR fails CI is
+    /// re-dispatched with a fix-and-re-push prompt; this counts the attempts so the loop stops at
+    /// [`Self::ci_max_retries`] instead of burning quota forever. In-memory (a daemon restart resets
+    /// it — acceptable: a restart is itself a fresh start, and the merge slot's `failed` state
+    /// survives in the log for the operator). Cleared for a bead when it merges or is escalated.
+    ci_retries: Arc<Mutex<HashMap<String, u32>>>,
+    /// Hard cap on CI-failure re-slings before escalating to the operator (gtcore-3a1bd4,
+    /// `GT_CI_MAX_RETRIES`). After this many failed attempts the bead is abandoned with an alert
+    /// rather than re-slung again — the "no infinite loop" half of the AC.
+    ci_max_retries: u32,
+    /// Rigs on dispatch hold (rig-hold H3, gtcore-9a84e6). When set, the supervisor's re-sling
+    /// paths (the dead-polecat crash re-sling and the CI-failure re-sling) skip a bead whose rig is
+    /// held — a `rig.hold` pauses the watchdogs too, else they would restart exactly the work the
+    /// hold paused (H2 stops new dispatch; H3 stops the re-sling behind it). In-flight polecats are
+    /// untouched. `None` ⇒ no rig is ever treated as held (pre-feature behaviour).
+    held_rigs: Option<Arc<dyn HeldRigs>>,
 }
+
+/// Default CI-failure retry cap when `GT_CI_MAX_RETRIES` is unset (gtcore-3a1bd4): three automated
+/// fix-and-re-push attempts before escalating to a human.
+pub const DEFAULT_CI_MAX_RETRIES: u32 = 3;
 
 impl PolecatSupervisorPlugin {
     /// Wire the dispatch→sling observer for `workspace`. `tmux` is the edge adapter (real
@@ -202,7 +301,73 @@ impl PolecatSupervisorPlugin {
             event_log: None,
             rig_configs: HashMap::new(),
             issues: None,
+            quota: None,
+            claimed: Mutex::new(HashSet::new()),
+            sched: None,
+            ci_retries: Arc::new(Mutex::new(HashMap::new())),
+            ci_max_retries: DEFAULT_CI_MAX_RETRIES,
+            held_rigs: None,
         }
+    }
+
+    /// Wire the rig-hold source (rig-hold H3, gtcore-9a84e6) so the supervisor's re-sling paths skip
+    /// a bead whose rig is on `hold`. Absent ⇒ no rig is ever held (pre-feature behaviour).
+    pub fn with_held_rigs(mut self, source: Arc<dyn HeldRigs>) -> Self {
+        self.held_rigs = Some(source);
+        self
+    }
+
+    /// The rigs currently on dispatch hold (empty when no source is wired). Fetched per use so a
+    /// `rig.hold`/`rig.resume` takes effect on the next event with no daemon restart; fail-open via
+    /// the source itself.
+    async fn held_rigs_set(&self) -> HashSet<String> {
+        match &self.held_rigs {
+            Some(source) => source.held().await,
+            None => HashSet::new(),
+        }
+    }
+
+    /// Whether `bead`'s rig is on dispatch hold (rig-hold H3, gtcore-9a84e6) — the gate the
+    /// sheriff/CI-failure re-sling consults before re-slinging. Fail-open to `false` (no issues
+    /// handle, no holds wired, or a read fault never blocks recovery), the same conservative
+    /// degradation as [`bead_should_sling`].
+    async fn rig_on_hold(&self, bead: &str) -> bool {
+        let Some(issues) = &self.issues else {
+            return false;
+        };
+        let held = self.held_rigs_set().await;
+        if held.is_empty() {
+            return false;
+        }
+        match issues.get_detail(bead).await {
+            Ok(Some(d)) => held.contains(d.rig.trim()),
+            _ => false,
+        }
+    }
+
+    /// Wire the scheduler handle so a CI-retry-exhausted bead frees its dispatch capacity
+    /// (gtcore-3a1bd4). Without it, an abandoned bead's slot is only returned to the pool allocator,
+    /// not the scheduler governor — fine for tests, but the daemon wires both.
+    pub fn with_scheduler(mut self, sched: SchedHandle) -> Self {
+        self.sched = Some(sched);
+        self
+    }
+
+    /// Set the CI-failure retry cap (gtcore-3a1bd4, `GT_CI_MAX_RETRIES`). A bead whose PR keeps
+    /// failing CI is re-slung up to this many times before being escalated to the operator. `0`
+    /// disables auto-retry (the first CI failure escalates immediately).
+    pub fn with_ci_max_retries(mut self, max: u32) -> Self {
+        self.ci_max_retries = max;
+        self
+    }
+
+    /// Wire the quota actor so sling-time selection also rejects quota-`Limited`/`Blocked` accounts
+    /// (gtcore-2836bb): the credential guard rotates off a non-`Healthy` active account onto a
+    /// `Healthy` one. Without it, an account that is credential-valid but rate-limited still receives
+    /// slings and the polecat is born into the usage-limit dialog.
+    pub fn with_quota(mut self, quota: QuotaHandle) -> Self {
+        self.quota = Some(quota);
+        self
     }
 
     /// Route dispatched beads to their rig by bead prefix (`hq-0ecfec`, epic hq-554308): a
@@ -342,6 +507,217 @@ impl PolecatSupervisorPlugin {
             }
         }
     }
+
+    /// Record that `session`'s pool slot is held by this plugin (gtcore-b05dbc). Called right after
+    /// a sling succeeds (claim + spawn both landed), so a later death/merge of that session can
+    /// release exactly the one slot it holds.
+    fn mark_claimed(&self, session: &str) {
+        self.claimed
+            .lock()
+            .expect("claimed mutex")
+            .insert(session.to_string());
+    }
+
+    /// Release the pool slot held for `session`, idempotently (gtcore-b05dbc).
+    ///
+    /// Returns `true` if a slot was actually released. The release is gated on the session being
+    /// in [`claimed`](Self::claimed): only a session this workspace's plugin claimed is released,
+    /// and a second call for the same session (a duplicate death event, or a death that arrives
+    /// after the merge already released it) is a harmless no-op. This is what ends the pool leak —
+    /// any path that ends a session (kill / heartbeat-stale / reconciler reap / clean exit) frees
+    /// the slot at once instead of waiting out the ~300s patrol lease — while keeping the count
+    /// exact (no double-release, no releasing another workspace's slot).
+    fn release_slot_for(&self, session: &str) -> bool {
+        if !self.claimed.lock().expect("claimed mutex").remove(session) {
+            return false;
+        }
+        self.allocator
+            .lock()
+            .expect("pool mutex")
+            .release(&self.workspace);
+        true
+    }
+
+    /// Re-sling a polecat that died of context exhaustion, handing the next agent a continuation
+    /// prompt instead of the original kickoff (gtcore-3b2a68).
+    ///
+    /// The dead polecat checkpointed its progress into the bead notes (gtcore-2467b4) and left
+    /// its work committed on the branch. The bead is NOT failed or bounced to `open` — it stays
+    /// `working` (this method performs NO transition) and is re-slung directly: the same session
+    /// id, the same per-bead worktree, but a prompt assembled from the checkpoint notes, the
+    /// branch diff, and the acceptance criteria ([`crate::continuation`]). The continuator thus
+    /// boots with a clean context window but full knowledge of the prior work.
+    ///
+    /// Every step is best-effort: a missing spec (the polecat is no longer supervised), an
+    /// unreadable bead, or an empty diff degrades the prompt rather than aborting — liveness over
+    /// completeness, matching the rest of the sling path. The pool slot is left as-is: it was
+    /// claimed at the original sling and is only released when the bead merges, so re-slinging
+    /// into the same slot needs no new claim.
+    async fn resling_on_context_exhaustion(&self, session: &str, reason: &str) {
+        let Some(mut spec) = self.supervisor.spec_for_session(session) else {
+            eprintln!(
+                "[polecat] context-exhaustion re-sling skipped for {session}: not supervised here"
+            );
+            return;
+        };
+        let bead = spec
+            .hook_bead
+            .clone()
+            .unwrap_or_else(|| session.to_string());
+
+        // Read the previous agent's checkpoint notes + the acceptance criteria from Dolt. Without
+        // an issues handle (or on a read error) the continuation prompt falls back to the diff +
+        // whatever the agent can read via its own `gt` MCP tools.
+        let (notes, acceptance_criteria) = match &self.issues {
+            Some(issues) => match issues.get_detail(&bead).await {
+                Ok(Some(detail)) => (detail.notes, detail.acceptance_criteria),
+                Ok(None) => (String::new(), String::new()),
+                Err(e) => {
+                    eprintln!(
+                        "[polecat] context-exhaustion re-sling: get_detail({bead}) failed: {e} — continuing with diff only"
+                    );
+                    (String::new(), String::new())
+                }
+            },
+            None => (String::new(), String::new()),
+        };
+
+        // Read what the dead polecat already committed on its branch (vs main) from its worktree.
+        let diff = crate::continuation::read_branch_diff(&spec.workdir, "main");
+        let prompt = crate::continuation::build_continuation_prompt(
+            &bead,
+            &notes,
+            &diff,
+            &acceptance_criteria,
+        );
+
+        // The bead prompt is always the final positional arg (spec_for pushes it last; the
+        // dispatch path inserts `--settings` BEFORE it), so swapping the last element retargets
+        // claude's kickoff at the continuation prompt without disturbing any flags.
+        if spec.args.is_empty() {
+            spec.args.push(prompt);
+        } else {
+            let last = spec.args.len() - 1;
+            spec.args[last] = prompt;
+        }
+
+        // Re-sling directly: spawn a fresh polecat for the SAME session/bead. No bead transition —
+        // it stays `working`. The deterministic session id + per-bead worktree are reused.
+        if let Err(e) = spawn_tmux(self.tmux.as_ref(), &spec) {
+            eprintln!(
+                "[polecat] context-exhaustion re-sling spawn failed for {bead}: {e} — supervisor tick will retry"
+            );
+            return;
+        }
+        self.supervisor.watch(spec);
+        eprintln!("[polecat] re-slung {bead} with a continuation prompt ({reason})");
+    }
+
+    /// Re-sling a bead whose PR failed CI, handing the next polecat a fix-and-re-push prompt
+    /// (gtcore-3a1bd4). This closes the CI loop: instead of leaving the merge slot terminally
+    /// `failed` for a human, the bead — its work already committed on the branch and its PR open
+    /// with auto-merge armed — is re-dispatched to fix what CI flagged and push to the SAME branch,
+    /// re-running CI. `attempt` is this re-sling's 1-based index in the retry budget; the caller has
+    /// already gated it under [`Self::ci_max_retries`].
+    ///
+    /// Like [`resling_on_context_exhaustion`](Self::resling_on_context_exhaustion) it reuses the
+    /// bead's deterministic session + per-bead worktree (so the pool slot, claimed at the original
+    /// sling and held until merge, is reused — no new claim), swapping only the kickoff prompt. The
+    /// bead is NOT transitioned (it stays `working`). Best-effort throughout: a session that is no
+    /// longer supervised, an unreadable bead, or an empty diff/CI snapshot degrades the prompt
+    /// rather than aborting — the retry counter still advances toward escalation.
+    async fn resling_on_ci_failure(&self, bead: &str, reason: &str, attempt: u32) {
+        // The session id is deterministic per bead (route by prefix → `spec_for`), the same
+        // derivation the `merge.merged.v1` teardown uses — so we find the supervised spec without
+        // the failed event carrying it.
+        let (template, _root) = self.route(bead);
+        let session = template.spec_for(&self.workspace, bead).session;
+        let Some(mut spec) = self.supervisor.spec_for_session(&session) else {
+            eprintln!(
+                "[polecat] CI-failure re-sling skipped for {bead}: session {session} not supervised here"
+            );
+            return;
+        };
+
+        // Acceptance criteria from Dolt orient the fix; absent issues handle / read error degrades
+        // to the diff + the agent's own `gt` MCP tools.
+        let acceptance_criteria = match &self.issues {
+            Some(issues) => match issues.get_detail(bead).await {
+                Ok(Some(detail)) => detail.acceptance_criteria,
+                Ok(None) => String::new(),
+                Err(e) => {
+                    eprintln!(
+                        "[polecat] CI-failure re-sling: get_detail({bead}) failed: {e} — continuing without AC"
+                    );
+                    String::new()
+                }
+            },
+            None => String::new(),
+        };
+
+        // The work already on the branch + a best-effort snapshot of the failing checks.
+        let diff = crate::continuation::read_branch_diff(&spec.workdir, "main");
+        let ci_checks = crate::continuation::read_ci_checks(&spec.workdir, bead);
+        let prompt = crate::continuation::build_ci_fix_prompt(
+            bead,
+            reason,
+            &ci_checks,
+            &diff,
+            &acceptance_criteria,
+            attempt,
+            self.ci_max_retries,
+        );
+
+        // The bead prompt is always the last positional arg — swap it for the CI-fix prompt without
+        // disturbing any preceding flags (same mechanism as the context-exhaustion re-sling).
+        if spec.args.is_empty() {
+            spec.args.push(prompt);
+        } else {
+            let last = spec.args.len() - 1;
+            spec.args[last] = prompt;
+        }
+
+        // Unlike the context-exhaustion re-sling (driven BY a tmux death, so the session is already
+        // gone), a CI failure arrives from the CI-gate webhook independently of session liveness:
+        // the original polecat commonly lingers idle after signalling merge-ready instead of
+        // exiting, so its tmux session is still alive — heartbeat recent — when `merge.failed.v1`
+        // lands. `tmux new-session` then rejects the duplicate name and the supervisor retries
+        // forever, since the lingering session never dies on its own (gtcore-8701c4). Tear it down
+        // first, guarded by `has_session` so the common clean case (polecat already exited) skips a
+        // pointless `kill-session` that the real adapter would error-and-retry on. The re-sling then
+        // always lands a fresh session and converges.
+        if self.tmux.has_session(&session) {
+            if let Err(e) = self.tmux.kill_session(&session) {
+                eprintln!(
+                    "[polecat] CI-failure re-sling: kill-session({session}) failed for {bead}: {e} — supervisor tick will retry"
+                );
+                return;
+            }
+        }
+
+        if let Err(e) = spawn_tmux(self.tmux.as_ref(), &spec) {
+            eprintln!(
+                "[polecat] CI-failure re-sling spawn failed for {bead}: {e} — supervisor tick will retry"
+            );
+            return;
+        }
+        self.supervisor.watch(spec);
+        eprintln!(
+            "[polecat] re-slung {bead} to fix CI (attempt {attempt}/{}): {reason}",
+            self.ci_max_retries
+        );
+    }
+}
+
+/// Does this `AgentEvent::Killed` reason mark a death by context exhaustion (gtcore-91fdde)?
+/// The polecat supervisor records such a death as a `Killed` whose reason begins
+/// `context exhausted: …` (no dedicated event kind), distinguishing it from a heartbeat-stale
+/// kill or an operator kill — only the exhaustion case warrants a continuation re-sling.
+fn is_context_exhaustion(reason: &str) -> bool {
+    reason
+        .trim_start()
+        .to_ascii_lowercase()
+        .starts_with("context exhaust")
 }
 
 #[async_trait]
@@ -357,6 +733,28 @@ impl Plugin for PolecatSupervisorPlugin {
                 let SchedEvent::Dispatched { bead, .. } = record.decode::<SchedEvent>()? else {
                     return Ok(());
                 };
+                // Slingability gate (gtcore-db99e0): re-validate the bead's CURRENT state before
+                // claiming a pool slot or spawning. A `dispatched` event can name a bead that is no
+                // longer slingable — most acutely at BOOT, where `replay_orphaned_inflight`
+                // re-enqueues every dispatched-but-unmerged bead WITHOUT re-checking it, so a
+                // since-closed bead, an epic container, or a dispatch=manual bead would otherwise
+                // be re-slung (gtcore-e7a851). When `should_sling` says no, free the scheduler
+                // governor slot the dispatch just `acquire`d (so it does not leak — the same
+                // capacity teardown the CI-retry-exhaustion abandon does) and return WITHOUT
+                // claiming the pool. No issues handle ⇒ the gate is permissive (legacy: every
+                // dispatch slings), matching the rest of the sling path's degradation.
+                if let Some(issues) = &self.issues {
+                    let held = self.held_rigs_set().await;
+                    if !bead_should_sling(issues, &bead, &held).await {
+                        eprintln!(
+                            "[polecat] sling skipped for {bead}: not slingable (closed/epic/manual/rig-on-hold) — boot re-hydration / stale dispatch"
+                        );
+                        if let Some(sched) = &self.sched {
+                            sched.capacity_freed().await;
+                        }
+                        return Ok(());
+                    }
+                }
                 // Admission first: a refused claim is backpressure, not an error — the bead stays
                 // queued/dispatched in the log; capacity will free up as live polecats finish.
                 if self
@@ -402,36 +800,102 @@ impl Plugin for PolecatSupervisorPlugin {
                 // Point the polecat's claude at the ACTIVE account's credentials dir
                 // (hq-agent-provisioning.7): the keychain's live pointer is what predictive
                 // rotation flips, so reading it here is what hands the next sling the rotated
-                // account. The stored secret IS the account's CLAUDE_CONFIG_DIR. Best-effort: any
-                // miss leaves the polecat on the host default ~/.claude (logged).
+                // account. The stored secret IS the account's CLAUDE_CONFIG_DIR.
+                //
+                // gtcore-bf4acd: the active account's `.credentials.json` is VALIDATED here (expiry,
+                // not just quota status) before stamping it. A credential-dead active account (token
+                // expired ~12h with no refresh — quota-`Healthy` but unauthable) is rotated to a
+                // credential-valid account; if NO account can authenticate, the sling is BLOCKED and
+                // the operator alerted rather than birthing the polecat into `401`. A missing
+                // credential file stays permissive (fresh/seeded dirs), and any keychain miss leaves
+                // the polecat on the host default ~/.claude.
                 let mut active_config_dir: Option<String> = None;
                 if let Some(kc) = &self.keychain {
-                    match kc.active() {
-                        Ok(Some(account)) => match kc.get(&account) {
-                            Ok(Some(cred)) => {
-                                active_config_dir = Some(cred.secret.clone());
-                                spec.env
-                                    .push(("CLAUDE_CONFIG_DIR".to_string(), cred.secret));
-                                // Stamp the account id so the polecat's Stop costs-report hook can
-                                // label its quota-feed sample (hq-agent-provisioning.8): the feed
-                                // message needs `{account}`, and only the daemon knows which
-                                // keychain account this sling resolved to.
-                                spec.env.push((
-                                    gt_polecat::GT_HOOK_ACCOUNT.to_string(),
-                                    account.clone(),
-                                ));
+                    // Snapshot quota status + headroom per account for the sling-time gate
+                    // (gtcore-2836bb) and concurrent distribution (gtcore-98e14f). Pre-fetched maps
+                    // keep the guard's closures synchronous (the guard is pure-ish and must not
+                    // await). No quota handle ⇒ empty maps ⇒ legacy credential-only behaviour.
+                    let quota_accounts: Vec<gt_quota::Account> = match &self.quota {
+                        Some(q) => q.accounts().await,
+                        None => Vec::new(),
+                    };
+                    let quota_status: HashMap<String, gt_quota::AccountQuotaStatus> =
+                        quota_accounts.iter().map(|a| (a.id.clone(), a.status)).collect();
+                    let quota_headroom: HashMap<String, f64> = quota_accounts
+                        .iter()
+                        .map(|a| {
+                            let pct = |w: &Option<gt_quota::AccountWindow>| match w {
+                                Some(w) if w.limit > 0 => (w.consumed / w.limit as f64) * 100.0,
+                                _ => 0.0,
+                            };
+                            let util = pct(&a.window).max(pct(&a.weekly_window));
+                            (a.id.clone(), 100.0_f64 - util)
+                        })
+                        .collect();
+                    match crate::credential_guard::resolve_for_sling(
+                        kc,
+                        now_ms(),
+                        |acc| quota_status.get(acc).copied(),
+                        |acc| quota_headroom.get(acc).copied().unwrap_or(100.0),
+                    ) {
+                        crate::credential_guard::CredOutcome::Resolved {
+                            resolved,
+                            dead,
+                            rotated_from,
+                        } => {
+                            active_config_dir = Some(resolved.config_dir.clone());
+                            spec.env
+                                .push(("CLAUDE_CONFIG_DIR".to_string(), resolved.config_dir));
+                            // Stamp the account id so the polecat's Stop costs-report hook can label
+                            // its quota-feed sample (hq-agent-provisioning.8): the feed message needs
+                            // `{account}`, and only the daemon knows which keychain account this sling
+                            // resolved to.
+                            spec.env.push((
+                                gt_polecat::GT_HOOK_ACCOUNT.to_string(),
+                                resolved.account.clone(),
+                            ));
+                            // Rotated off a credential-dead account → alert the operator (bell +
+                            // email) so they re-onboard/rotate it. The sling itself proceeds on the
+                            // healthy account picked above.
+                            if let Some(from) = &rotated_from {
+                                eprintln!(
+                                    "[polecat] sling for {bead}: active account {from} credential-dead — using {} instead",
+                                    resolved.account
+                                );
+                                for d in &dead {
+                                    self.emit_polecat(PolecatEvent::CredentialDead {
+                                        account: d.account.clone(),
+                                        reason: d.reason().to_string(),
+                                    });
+                                }
                             }
-                            Ok(None) => eprintln!(
-                                "[polecat] active claude account {account} has no stored credential — host default ~/.claude"
-                            ),
-                            Err(e) => eprintln!(
-                                "[polecat] keychain get({account}) failed: {e} — host default ~/.claude"
-                            ),
-                        },
-                        Ok(None) => {} // no active pointer yet → host default, no log noise
-                        Err(e) => eprintln!(
-                            "[polecat] keychain active() failed: {e} — host default ~/.claude"
-                        ),
+                        }
+                        crate::credential_guard::CredOutcome::NoValidAccount { dead } => {
+                            // No account can authenticate: blocking the sling (and freeing the slot)
+                            // is strictly better than a polecat born in 401 that latches a false
+                            // heartbeat and produces nothing (gtcore-bf4acd).
+                            self.allocator
+                                .lock()
+                                .expect("pool mutex")
+                                .release(&self.workspace);
+                            for d in &dead {
+                                self.emit_polecat(PolecatEvent::CredentialDead {
+                                    account: d.account.clone(),
+                                    reason: d.reason().to_string(),
+                                });
+                            }
+                            self.emit_polecat(PolecatEvent::SlingAuthBlocked {
+                                bead: bead.clone(),
+                                workspace: self.workspace.clone(),
+                            });
+                            eprintln!(
+                                "[polecat] sling BLOCKED for {bead}: no keychain account has valid credentials — alerting operator, not slinging into 401"
+                            );
+                            return Ok(());
+                        }
+                        // No keychain rotation configured (no active pointer / no cred record) →
+                        // host default ~/.claude, unchanged from before the guard.
+                        crate::credential_guard::CredOutcome::HostDefault => {}
                     }
                 }
                 // Route claude through the Anthropic passthrough proxy (hq-284842) so EVERY call
@@ -639,6 +1103,11 @@ impl Plugin for PolecatSupervisorPlugin {
                     });
                     return Ok(());
                 }
+                // The sling landed (claim + spawn both succeeded): record the slot against the
+                // session so any later death of this session releases it immediately, not only a
+                // merge (gtcore-b05dbc). A re-sling of the SAME session (continuation) keeps the
+                // same id, so this is idempotent — it never double-claims.
+                self.mark_claimed(&spec.session);
                 // Transition the bead open→working in Dolt (gtcore-orchd-working): the polecat is
                 // slung, so the bead IS being worked. Without this the bead stays `open` in the
                 // tracker until the polecat self-transitions — which may never happen, leaving the
@@ -699,16 +1168,15 @@ impl Plugin for PolecatSupervisorPlugin {
                     return Ok(());
                 };
                 self.supervisor.unwatch_member(&bead);
-                self.allocator
-                    .lock()
-                    .expect("pool mutex")
-                    .release(&self.workspace);
-                // Close the agent session for that bead (hq-orchd.6): the session id is the
-                // deterministic `spec_for` session, so it matches the `Spawned` emitted at sling.
-                // Routed by bead prefix (hq-0ecfec) so a gtweb bead's session/worktree derive from
-                // the SAME template the sling used — else teardown would miss the tree.
+                // The session id is the deterministic `spec_for` session, so it matches the
+                // `Spawned` emitted at sling and the slot recorded in `claimed`. Routed by bead
+                // prefix (hq-0ecfec) so a gtweb bead's session/worktree derive from the SAME
+                // template the sling used — else teardown would miss the tree.
                 let (template, worktree_root) = self.route(&bead);
                 let session = template.spec_for(&self.workspace, &bead).session;
+                // Free the slot keyed by session (gtcore-b05dbc): idempotent, so a merge that
+                // follows an already-counted death (or vice versa) never double-releases.
+                self.release_slot_for(&session);
                 // Tear down the per-bead worktree now its work has landed (hq-orchd-deploy.9):
                 // best-effort, mirrors the deterministic `<root>/<session>` path used at sling. The
                 // branch itself is reaped by the branch-GC reactor on this same event.
@@ -724,7 +1192,108 @@ impl Plugin for PolecatSupervisorPlugin {
                 self.emit(AgentEvent::SessionEnd { session });
                 // Clear the bead's operator marker (hq-agent-observability.2): its work landed, so
                 // the FE drops the agent chip. One agent per bead → the id alone identifies it.
-                self.emit_operator(IssueOperatorEvent::Cleared { bead });
+                self.emit_operator(IssueOperatorEvent::Cleared { bead: bead.clone() });
+                // Forget any CI-retry tally for this bead (gtcore-3a1bd4): it merged, clean slate.
+                self.ci_retries
+                    .lock()
+                    .expect("ci_retries mutex")
+                    .remove(&bead);
+                Ok(())
+            }
+            // The bead's PR failed CI → close the loop instead of leaving the slot terminally
+            // `failed` for a human (gtcore-3a1bd4). Under the retry cap, re-sling the SAME bead with
+            // a fix-and-re-push prompt carrying the CI failure context; at the cap, escalate to the
+            // operator and abandon the slot (free capacity, stop supervising) so the loop is finite.
+            // A `merge.failed.v1` arrives from the CI-gate webhook (CI red / PR closed unmerged) or
+            // the git-merge edge (local rebase conflict); both warrant the same fix-and-re-push.
+            "merge.failed.v1" => {
+                let MergeEvent::Failed { bead, reason } = record.decode::<MergeEvent>()? else {
+                    return Ok(());
+                };
+                // rig-hold H3 (gtcore-9a84e6): a held rig pauses the watchdogs too — the sheriff /
+                // CI-failure recovery does NOT re-sling a held rig's bead (the `merge.failed.v1`
+                // alert + observation still stand; the bead simply isn't auto-re-dispatched until the
+                // rig resumes). Guard BEFORE counting the attempt so a hold never burns the retry
+                // budget.
+                if self.rig_on_hold(&bead).await {
+                    eprintln!(
+                        "[polecat] CI-failure re-sling skipped for {bead}: rig on dispatch hold (rig-hold H3)"
+                    );
+                    return Ok(());
+                }
+                // Count this failure as one attempt against the bead's budget.
+                let attempt = {
+                    let mut tally = self.ci_retries.lock().expect("ci_retries mutex");
+                    let c = tally.entry(bead.clone()).or_insert(0);
+                    *c += 1;
+                    *c
+                };
+                if attempt <= self.ci_max_retries {
+                    self.resling_on_ci_failure(&bead, &reason, attempt).await;
+                } else {
+                    // Budget exhausted: escalate and abandon rather than loop forever burning quota.
+                    self.ci_retries
+                        .lock()
+                        .expect("ci_retries mutex")
+                        .remove(&bead);
+                    self.emit_polecat(PolecatEvent::CiRetriesExhausted {
+                        bead: bead.clone(),
+                        reason,
+                        attempts: self.ci_max_retries,
+                    });
+                    // Free the slot in both capacity systems (mirroring the merged teardown) and stop
+                    // supervising so the dead session is not re-slung by the supervisor tick.
+                    self.allocator
+                        .lock()
+                        .expect("pool mutex")
+                        .release(&self.workspace);
+                    let (template, _root) = self.route(&bead);
+                    let session = template.spec_for(&self.workspace, &bead).session;
+                    self.supervisor.unwatch(&session);
+                    if let Some(sched) = &self.sched {
+                        sched.capacity_freed().await;
+                    }
+                    eprintln!(
+                        "[polecat] {bead}: CI retries exhausted ({}) — escalated, slot abandoned",
+                        self.ci_max_retries
+                    );
+                }
+                Ok(())
+            }
+            // A polecat died (operator kill, heartbeat-stale, reconciler reap, or context
+            // exhaustion). The supervisor/reaper records every death as an `AgentEvent::Killed`;
+            // the `reason` tells the two apart (gtcore-91fdde).
+            //
+            // - Context exhaustion (reason begins `context exhausted`) → re-sling the SAME session
+            //   with a continuation prompt (gtcore-3b2a68). The slot is REUSED, not freed: the
+            //   session id is unchanged and stays in `claimed`, so a later merge/death releases it
+            //   exactly once.
+            // - Any other death → the work stopped without a merge. Free the slot IMMEDIATELY
+            //   (gtcore-b05dbc) instead of waiting out the ~300s patrol lease — that wait is what
+            //   wedged all new slings behind a phantom `pool cap reached` with zero live sessions.
+            //   `release_slot_for` is idempotent, so a duplicate kill (or a kill that races the
+            //   merge) is a harmless no-op.
+            "agent.killed.v1" => {
+                let AgentEvent::Killed { session, reason } = record.decode::<AgentEvent>()? else {
+                    return Ok(());
+                };
+                if is_context_exhaustion(&reason) {
+                    self.resling_on_context_exhaustion(&session, &reason).await;
+                } else {
+                    self.release_slot_for(&session);
+                }
+                Ok(())
+            }
+            // A polecat exited cleanly on its own without a merge (gtcore-b05dbc). The supervisor's
+            // direct-child path and the session reconciler both emit `agent.session-end.v1` for a
+            // self-exit; the merge path emits its own `SessionEnd` AFTER it has already released the
+            // slot, so this handler's idempotent release is a no-op there (the session is no longer
+            // in `claimed`). A self-exit that was NOT preceded by a merge frees the slot here.
+            "agent.session-end.v1" => {
+                let AgentEvent::SessionEnd { session } = record.decode::<AgentEvent>()? else {
+                    return Ok(());
+                };
+                self.release_slot_for(&session);
                 Ok(())
             }
             _ => Ok(()),
@@ -820,6 +1389,126 @@ pub fn rig_routing_from_catalog(
         paths.insert(rig.prefix.clone(), workdir);
     }
     (configs, paths)
+}
+
+/// Ensure every catalog rig has its base checkout on disk, cloning a missing one from the rig's
+/// own catalog `git_url` (gtcore-d0ec4f).
+///
+/// THE BUG this closes: [`rig_routing_from_catalog`] SKIPS a rig whose resolved worktree root is
+/// absent on this host, so its beads fall back to the BOOT template — and a cross-rig bead (e.g.
+/// `gtweb-*`) then slings into the boot rig's checkout (gt-core, cloned at deploy time from
+/// `GT_RIG_GIT_URL`), the WRONG repo: the per-bead worktree is cut off the gt-core tree and carries
+/// the gt-core origin, making a gt-web frontend task impossible. Cloning each missing rig from its
+/// OWN catalog `git_url` here, BEFORE routing, makes routing find a real checkout so the per-bead
+/// worktree carries the correct origin (`git_url`), exactly as the multi-rig path intends.
+///
+/// Best-effort and idempotent: a rig whose checkout already exists, or whose `git_url` is empty, is
+/// left untouched; a clone failure (auth/network) is logged and the rig stays unrouted (the legacy
+/// skip). Returns the prefixes successfully provisioned (for logging / tests).
+pub fn provision_rig_checkouts(
+    rigs: &[gt_rig::RigEntry],
+    ws: &str,
+    home: &std::path::Path,
+) -> Vec<String> {
+    let mut provisioned = Vec::new();
+    for rig in rigs {
+        let workdir = rig.resolved_worktree_root(ws, home);
+        if workdir.is_dir() {
+            continue;
+        }
+        match clone_rig_checkout(&rig.git_url, &rig.default_branch, &workdir) {
+            Ok(()) => {
+                eprintln!(
+                    "[gt-orch-server] rig '{}' (prefix '{}') checkout provisioned at {} (cloned from {})",
+                    rig.name,
+                    rig.prefix,
+                    workdir.display(),
+                    rig.git_url
+                );
+                provisioned.push(rig.prefix.clone());
+            }
+            Err(e) => {
+                eprintln!(
+                    "[gt-orch-server] rig '{}' (prefix '{}') checkout {} missing and clone failed: {e} — its beads fall back to the boot template",
+                    rig.name,
+                    rig.prefix,
+                    workdir.display()
+                );
+            }
+        }
+    }
+    provisioned
+}
+
+/// Embed `token` into an `https://host/...` git URL as userinfo (`https://<token>@host/...`) — the
+/// exact form the boot clone's `origin` already carries, so `git push` authenticates with no
+/// credential helper. A URL that is not `https://`, or already carries userinfo before the path
+/// (`...@...`, i.e. already credentialed), is returned UNCHANGED — never double-embed, never touch
+/// `git@`/`ssh://`/local-path remotes.
+fn embed_token_in_url(url: &str, token: &str) -> String {
+    const SCHEME: &str = "https://";
+    if let Some(rest) = url.strip_prefix(SCHEME) {
+        let authority_end = rest.find('/').unwrap_or(rest.len());
+        if !rest[..authority_end].contains('@') {
+            return format!("{SCHEME}{token}@{rest}");
+        }
+    }
+    url.to_string()
+}
+
+/// `git clone [--branch <default_branch>] <git_url> <workdir>` for [`provision_rig_checkouts`].
+/// Creates `workdir`'s parent first so a convention root (`<home>/gastown-wt/<ws>/<name>`) under a
+/// not-yet-existing tree still lands. An empty `git_url` is rejected (nothing to clone from).
+///
+/// The catalog `git_url` is the PLAIN `https://github.com/...` (no token), but the orchd pod has
+/// neither a git credential helper nor a TTY — so a tokenless `origin` makes every polecat push fail
+/// `could not read Username` (gtcore-abfe8a). We embed the rig token ([`crate::gh_auth::rig_token_from_env`])
+/// into the clone URL so the resulting `origin` can push, matching the boot clone's
+/// `https://<token>@github.com/...` remote. The TOKEN-BEARING URL is used only for the `git`
+/// invocation; every log line keeps the plain `git_url`, so the token never reaches stderr.
+fn clone_rig_checkout(
+    git_url: &str,
+    default_branch: &str,
+    workdir: &std::path::Path,
+) -> std::io::Result<()> {
+    let git_url = git_url.trim();
+    if git_url.is_empty() {
+        return Err(std::io::Error::other("rig has no git_url to clone from"));
+    }
+    if let Some(parent) = workdir.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let clone_url = match crate::gh_auth::rig_token_from_env() {
+        Some(tok) => embed_token_in_url(git_url, &tok),
+        None => git_url.to_string(),
+    };
+    let mut args: Vec<String> = vec!["clone".to_string()];
+    let branch = default_branch.trim();
+    if !branch.is_empty() {
+        args.push("--branch".to_string());
+        args.push(branch.to_string());
+    }
+    args.push(clone_url);
+    args.push(workdir.display().to_string());
+    let status = std::process::Command::new("git").args(&args).status()?;
+    if status.success() && workdir.is_dir() {
+        Ok(())
+    } else {
+        Err(std::io::Error::other(format!(
+            "git clone {git_url} -> {} failed (status {status})",
+            workdir.display()
+        )))
+    }
+}
+
+/// Wall-clock epoch milliseconds, for the sling-time credential guard (gtcore-bf4acd). Mirrors the
+/// `now_ms` discipline in `usage_probe.rs`; `0` on a pre-epoch clock (the guard then treats every
+/// expiry as in the future, i.e. fails open — liveness over a spurious credential block).
+fn now_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
 }
 
 /// Compute the host-wide polecat admission cap from live metrics (`hq-orchd.3`): the lesser of the
@@ -923,6 +1612,434 @@ mod tests {
         .unwrap();
         assert_eq!(sup.watched_count(), 0, "merged bead is unwatched");
         assert_eq!(alloc.lock().unwrap().in_flight("acme"), 0, "slot released");
+    }
+
+    #[tokio::test]
+    async fn killing_a_working_polecat_frees_its_slot_immediately() {
+        // gtcore-b05dbc: a non-exhaustion death (operator kill / heartbeat-stale / reconciler reap,
+        // all recorded as AgentEvent::Killed) must release the pool slot AT ONCE — not wait for a
+        // merge that will never come, nor the ~300s patrol lease. With the slot freed, a brand-new
+        // dispatch slings without hitting the phantom `pool cap reached`.
+        let alloc = Arc::new(Mutex::new(PoolAllocator::new(1, 1)));
+        let (p, sup) = plugin(alloc.clone());
+
+        p.on_event(&record(SchedEvent::Dispatched {
+            bead: "gg-1".into(),
+            worker: "w1".into(),
+        }))
+        .await
+        .unwrap();
+        assert_eq!(alloc.lock().unwrap().in_flight("acme"), 1, "slot claimed at sling");
+        // The host cap is 1 and it is full — a second dispatch would be refused right now.
+        assert!(!alloc.lock().unwrap().can_claim("acme"), "pool is full while the polecat lives");
+
+        // Operator kills the working session (no merge). The slot is freed immediately.
+        p.on_event(&record(AgentEvent::Killed {
+            session: "hq-gg-1".into(),
+            reason: "operator killed".into(),
+        }))
+        .await
+        .unwrap();
+        assert_eq!(
+            alloc.lock().unwrap().in_flight("acme"),
+            0,
+            "killed session releases its slot without waiting for merge/lease"
+        );
+
+        // A fresh dispatch now proceeds — no `pool cap reached`.
+        p.on_event(&record(SchedEvent::Dispatched {
+            bead: "gg-2".into(),
+            worker: "w2".into(),
+        }))
+        .await
+        .unwrap();
+        assert_eq!(alloc.lock().unwrap().in_flight("acme"), 1, "new sling admitted into the freed slot");
+        assert!(sup.spec_for_session("hq-gg-2").is_some(), "the new polecat is supervised");
+    }
+
+    #[tokio::test]
+    async fn clean_self_exit_without_merge_frees_its_slot() {
+        // gtcore-b05dbc: a polecat that exits on its own without a merge emits
+        // agent.session-end.v1 (the reconciler / direct-child path). That, too, must free the slot.
+        let alloc = Arc::new(Mutex::new(PoolAllocator::new(1, 1)));
+        let (p, _sup) = plugin(alloc.clone());
+
+        p.on_event(&record(SchedEvent::Dispatched {
+            bead: "gg-1".into(),
+            worker: "w1".into(),
+        }))
+        .await
+        .unwrap();
+        assert_eq!(alloc.lock().unwrap().in_flight("acme"), 1, "slot claimed at sling");
+
+        p.on_event(&record(AgentEvent::SessionEnd {
+            session: "hq-gg-1".into(),
+        }))
+        .await
+        .unwrap();
+        assert_eq!(
+            alloc.lock().unwrap().in_flight("acme"),
+            0,
+            "a self-exit without merge frees the slot"
+        );
+    }
+
+    #[tokio::test]
+    async fn slot_release_is_idempotent_no_double_count() {
+        // gtcore-b05dbc: the slot must be released EXACTLY once per session, however many
+        // death/merge events arrive. A kill followed by a (late) merge — or two kills, or a
+        // merge then a self-exit — must never drive the count negative or steal another
+        // workspace's slot. PoolAllocator saturates at 0 per workspace, so a stray double-release
+        // would silently under-count a co-tenant; the `claimed` gate prevents that entirely.
+        let alloc = Arc::new(Mutex::new(PoolAllocator::new(2, 2)));
+        let (p, _sup) = plugin(alloc.clone());
+
+        // Two live polecats in the same workspace.
+        for bead in ["gg-1", "gg-2"] {
+            p.on_event(&record(SchedEvent::Dispatched {
+                bead: bead.into(),
+                worker: "w".into(),
+            }))
+            .await
+            .unwrap();
+        }
+        assert_eq!(alloc.lock().unwrap().in_flight("acme"), 2, "both slots claimed");
+
+        // Kill gg-1, then a late merge for gg-1 arrives, then a duplicate kill: only the FIRST
+        // event releases; the rest are no-ops.
+        p.on_event(&record(AgentEvent::Killed {
+            session: "hq-gg-1".into(),
+            reason: "heartbeat stale".into(),
+        }))
+        .await
+        .unwrap();
+        p.on_event(&record(MergeEvent::Merged {
+            bead: "gg-1".into(),
+            sha: "abc".into(),
+        }))
+        .await
+        .unwrap();
+        p.on_event(&record(AgentEvent::Killed {
+            session: "hq-gg-1".into(),
+            reason: "operator killed".into(),
+        }))
+        .await
+        .unwrap();
+
+        assert_eq!(
+            alloc.lock().unwrap().in_flight("acme"),
+            1,
+            "gg-1 released exactly once; gg-2's slot is untouched (no double-count)"
+        );
+    }
+
+    #[tokio::test]
+    async fn context_exhaustion_resling_keeps_the_slot_claimed() {
+        // gtcore-b05dbc + gtcore-3b2a68: a context-exhaustion death re-slings the SAME session and
+        // must REUSE the slot — never release it (the work continues) and never re-claim it (no
+        // double-count). The slot is freed only by the eventual merge or a real death.
+        let alloc = Arc::new(Mutex::new(PoolAllocator::new(1, 1)));
+        let (p, sup) = plugin(alloc.clone());
+
+        p.on_event(&record(SchedEvent::Dispatched {
+            bead: "gg-1".into(),
+            worker: "w1".into(),
+        }))
+        .await
+        .unwrap();
+        assert_eq!(alloc.lock().unwrap().in_flight("acme"), 1, "slot claimed at sling");
+
+        // Context-exhaustion kill → continuation re-sling on the same session.
+        p.on_event(&record(AgentEvent::Killed {
+            session: "hq-gg-1".into(),
+            reason: "context exhausted: 92% context used".into(),
+        }))
+        .await
+        .unwrap();
+        assert_eq!(sup.watched_count(), 1, "still supervised after re-sling");
+        assert_eq!(
+            alloc.lock().unwrap().in_flight("acme"),
+            1,
+            "the slot is reused by the continuation — neither freed nor doubled"
+        );
+
+        // The continuation later merges → now the slot frees, exactly once.
+        p.on_event(&record(MergeEvent::Merged {
+            bead: "gg-1".into(),
+            sha: "abc".into(),
+        }))
+        .await
+        .unwrap();
+        assert_eq!(
+            alloc.lock().unwrap().in_flight("acme"),
+            0,
+            "merge of the continuation frees the (single) slot"
+        );
+    }
+
+    #[tokio::test]
+    async fn death_event_for_an_unclaimed_session_is_a_noop() {
+        // gtcore-b05dbc: a death event for a session this plugin never slung (e.g. another
+        // workspace's polecat on a shared hub, or a stale id) must NOT touch this workspace's
+        // count. The `claimed` gate scopes the release to sessions we actually hold.
+        let alloc = Arc::new(Mutex::new(PoolAllocator::new(2, 2)));
+        let (p, _sup) = plugin(alloc.clone());
+
+        p.on_event(&record(SchedEvent::Dispatched {
+            bead: "gg-1".into(),
+            worker: "w1".into(),
+        }))
+        .await
+        .unwrap();
+        assert_eq!(alloc.lock().unwrap().in_flight("acme"), 1);
+
+        // A kill for a session we never claimed.
+        p.on_event(&record(AgentEvent::Killed {
+            session: "hq-someone-elses-session".into(),
+            reason: "operator killed".into(),
+        }))
+        .await
+        .unwrap();
+        assert_eq!(
+            alloc.lock().unwrap().in_flight("acme"),
+            1,
+            "a foreign session's death does not steal our slot"
+        );
+    }
+
+    #[tokio::test]
+    async fn context_exhaustion_reslings_with_a_continuation_prompt_without_transition() {
+        // gtcore-3b2a68: a polecat death by context exhaustion (an AgentEvent::Killed whose
+        // reason begins `context exhausted`, gtcore-91fdde) re-slings the SAME bead — still
+        // `working`, no transition — with a continuation prompt in place of the original kickoff.
+        let alloc = Arc::new(Mutex::new(PoolAllocator::new(10, 5)));
+        let (p, sup) = plugin(alloc.clone());
+
+        // Sling the bead so the supervisor holds its spec (carrying the original kickoff prompt).
+        p.on_event(&record(SchedEvent::Dispatched {
+            bead: "gg-1".into(),
+            worker: "w1".into(),
+        }))
+        .await
+        .unwrap();
+        let original = sup.spec_for_session("hq-gg-1").expect("watched after sling");
+        assert!(
+            original
+                .args
+                .last()
+                .unwrap()
+                .contains("You are a gt polecat in workspace"),
+            "the original kickoff prompt is stored"
+        );
+
+        // A heartbeat-stale kill is NOT context exhaustion → the prompt is left untouched.
+        p.on_event(&record(AgentEvent::Killed {
+            session: "hq-gg-1".into(),
+            reason: "heartbeat stale".into(),
+        }))
+        .await
+        .unwrap();
+        assert!(
+            sup.spec_for_session("hq-gg-1")
+                .unwrap()
+                .args
+                .last()
+                .unwrap()
+                .contains("You are a gt polecat in workspace"),
+            "a non-exhaustion kill does not rewrite the prompt"
+        );
+
+        // A context-exhaustion kill re-slings with the continuation prompt. The bead is never
+        // transitioned to `open` on this path — it stays `working` (no transition call exists in
+        // resling_on_context_exhaustion), and the polecat stays supervised under the same session.
+        p.on_event(&record(AgentEvent::Killed {
+            session: "hq-gg-1".into(),
+            reason: "context exhausted: 92% context used".into(),
+        }))
+        .await
+        .unwrap();
+        assert_eq!(sup.watched_count(), 1, "still supervised after re-sling");
+        let cont = sup.spec_for_session("hq-gg-1").expect("re-watched after re-sling");
+        let prompt = cont.args.last().expect("continuation prompt arg");
+        assert!(
+            prompt.contains("CONTINUING work on bead `gg-1`"),
+            "continuation prompt injected: {prompt}"
+        );
+        // The continuator still learns how to signal completion.
+        assert!(prompt.contains("mcp__gt__merge_submit"));
+    }
+
+    #[test]
+    fn is_context_exhaustion_only_matches_the_exhaustion_reason() {
+        assert!(is_context_exhaustion("context exhausted: 90% context used"));
+        assert!(is_context_exhaustion("  Context Exhausted: 88% context used"));
+        assert!(!is_context_exhaustion("heartbeat stale"));
+        assert!(!is_context_exhaustion("operator killed"));
+        assert!(!is_context_exhaustion(""));
+    }
+
+    #[tokio::test]
+    async fn ci_failure_under_cap_reslings_with_a_fix_prompt_without_transition() {
+        // gtcore-3a1bd4: a `merge.failed.v1` (PR CI red) re-slings the SAME bead — still `working`,
+        // no transition, same held slot — with a fix-and-re-push prompt in place of the kickoff.
+        let alloc = Arc::new(Mutex::new(PoolAllocator::new(10, 5)));
+        let (p, sup) = plugin(alloc.clone());
+        let p = p.with_ci_max_retries(2);
+
+        // Sling the bead so the supervisor holds its spec (the original kickoff prompt).
+        p.on_event(&record(SchedEvent::Dispatched {
+            bead: "gg-1".into(),
+            worker: "w1".into(),
+        }))
+        .await
+        .unwrap();
+        assert!(sup
+            .spec_for_session("hq-gg-1")
+            .unwrap()
+            .args
+            .last()
+            .unwrap()
+            .contains("You are a gt polecat in workspace"));
+
+        // First CI failure → re-sling with the CI-fix prompt.
+        p.on_event(&record(MergeEvent::Failed {
+            bead: "gg-1".into(),
+            reason: "CI failed: failure".into(),
+        }))
+        .await
+        .unwrap();
+        assert_eq!(sup.watched_count(), 1, "still supervised after CI re-sling");
+        let prompt = sup
+            .spec_for_session("hq-gg-1")
+            .expect("re-watched after CI re-sling")
+            .args
+            .last()
+            .expect("ci-fix prompt arg")
+            .clone();
+        assert!(
+            prompt.contains("RESUMING work on bead `gg-1`"),
+            "ci-fix prompt injected: {prompt}"
+        );
+        assert!(prompt.contains("CI failed: failure"), "carries the CI reason");
+        assert!(prompt.contains("retry 1 of 2"), "carries the retry budget");
+        assert!(prompt.contains("mcp__gt__merge_submit"));
+    }
+
+    #[tokio::test]
+    async fn ci_failures_past_the_cap_escalate_and_abandon_the_slot() {
+        // gtcore-3a1bd4: after the retry cap is exhausted the bead is NOT re-slung again — it is
+        // escalated (the loop is finite) and its slot freed + unwatched so the supervisor tick does
+        // not resurrect it. With cap=1: failure #1 re-slings, failure #2 escalates.
+        let alloc = Arc::new(Mutex::new(PoolAllocator::new(10, 5)));
+        let (p, sup) = plugin(alloc.clone());
+        let p = p.with_ci_max_retries(1);
+
+        p.on_event(&record(SchedEvent::Dispatched {
+            bead: "gg-2".into(),
+            worker: "w1".into(),
+        }))
+        .await
+        .unwrap();
+        assert_eq!(sup.watched_count(), 1);
+
+        // Failure #1 (attempt 1 ≤ cap 1) → re-sling.
+        p.on_event(&record(MergeEvent::Failed {
+            bead: "gg-2".into(),
+            reason: "CI failed: failure".into(),
+        }))
+        .await
+        .unwrap();
+        assert_eq!(sup.watched_count(), 1, "re-slung within budget");
+
+        // Failure #2 (attempt 2 > cap 1) → escalate + abandon: no longer supervised.
+        p.on_event(&record(MergeEvent::Failed {
+            bead: "gg-2".into(),
+            reason: "CI failed: failure".into(),
+        }))
+        .await
+        .unwrap();
+        assert_eq!(
+            sup.watched_count(),
+            0,
+            "the bead is unwatched once its CI-retry budget is exhausted"
+        );
+    }
+
+    #[tokio::test]
+    async fn ci_failure_reslings_over_a_still_live_session_by_killing_it_first() {
+        // gtcore-8701c4: a `merge.failed.v1` arrives from the CI-gate webhook independently of
+        // session liveness, and the original polecat commonly lingers idle (tmux session alive,
+        // heartbeat recent) after signalling merge-ready rather than exiting. A naive re-sling then
+        // hits `tmux new-session: duplicate session` and the supervisor retries forever, since the
+        // lingering session never dies on its own. The CI re-sling must tear the live session down
+        // first (idempotent) so the respawn lands a fresh session and the loop converges.
+        let fake = Arc::new(FakeTmux::new());
+        let tmux: Arc<dyn Tmux> = fake.clone();
+        let supervisor = Arc::new(PolecatSupervisor::new(
+            tmux.clone(),
+            RestartConfig::default(),
+            8,
+        ));
+        let template = SpawnTemplate {
+            rig: "hq".into(),
+            prefix: "hq".into(),
+            workdir: "/tmp".into(),
+            command: "true".into(),
+            args: vec![],
+            base_env: vec![],
+            heartbeat_dir: std::env::temp_dir(),
+        };
+        let alloc = Arc::new(Mutex::new(PoolAllocator::new(10, 5)));
+        let p = PolecatSupervisorPlugin::new("acme", tmux, template, supervisor.clone(), alloc)
+            .with_ci_max_retries(2);
+
+        // Sling the bead → its tmux session is created and (unlike a context-exhaustion death) stays
+        // alive: the polecat has not exited when CI fails.
+        p.on_event(&record(SchedEvent::Dispatched {
+            bead: "gg-1".into(),
+            worker: "w1".into(),
+        }))
+        .await
+        .unwrap();
+        assert!(
+            fake.has_session("hq-gg-1"),
+            "polecat session is live before CI fails"
+        );
+        assert!(fake.kills().is_empty(), "no teardown on the initial sling");
+
+        // CI fails while that session is still alive.
+        p.on_event(&record(MergeEvent::Failed {
+            bead: "gg-1".into(),
+            reason: "CI failed: failure".into(),
+        }))
+        .await
+        .unwrap();
+
+        // The live session was torn down exactly once before the respawn — so the real adapter's
+        // `new-session` never collides with a duplicate and the loop converges.
+        assert_eq!(
+            fake.kills(),
+            vec!["hq-gg-1".to_string()],
+            "the still-live session is killed once before the re-sling respawn"
+        );
+        // The re-sling still landed: a fresh session, supervised, carrying the CI-fix prompt.
+        assert!(fake.has_session("hq-gg-1"), "respawned after the teardown");
+        assert_eq!(
+            supervisor.watched_count(),
+            1,
+            "still supervised after the CI re-sling"
+        );
+        let prompt = supervisor
+            .spec_for_session("hq-gg-1")
+            .expect("re-watched after CI re-sling")
+            .args
+            .last()
+            .expect("ci-fix prompt arg")
+            .clone();
+        assert!(
+            prompt.contains("RESUMING work on bead `gg-1`"),
+            "ci-fix prompt injected: {prompt}"
+        );
     }
 
     #[tokio::test]
@@ -1046,6 +2163,133 @@ mod tests {
             .unwrap()
             .expect("GT_HOOK_ACCOUNT injected from the active account");
         assert_eq!(acct, "acct-b");
+    }
+
+    /// gtcore-bf4acd: write a `.credentials.json` into `config_dir`, with a controllable expiry.
+    fn write_creds(config_dir: &std::path::Path, expires_at_ms: Option<u64>, refresh: bool) {
+        std::fs::create_dir_all(config_dir).unwrap();
+        let rt = if refresh { r#","refreshToken":"rt-1""# } else { "" };
+        let exp = expires_at_ms
+            .map(|e| format!(r#","expiresAt":{e}"#))
+            .unwrap_or_default();
+        let body = format!(r#"{{"claudeAiOauth":{{"accessToken":"at-1"{rt}{exp}}}}}"#);
+        std::fs::write(config_dir.join(".credentials.json"), body).unwrap();
+    }
+
+    #[tokio::test]
+    async fn dispatch_skips_a_credential_dead_active_account_no_polecat_born_in_401() {
+        // gtcore-bf4acd / AC1+T1: the active account's token expired (no refresh) — quota status is
+        // irrelevant. The sling must NOT stamp the dead account; it rotates to the credential-valid
+        // account, stamps THAT, and flips the live pointer so future slings follow.
+        use gt_quota::InMemoryKeychain;
+        let uniq = format!(
+            "{}-{}",
+            std::process::id(),
+            SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos()
+        );
+        let dead_dir = std::env::temp_dir().join(format!("gt-cred-dead-{uniq}"));
+        let fresh_dir = std::env::temp_dir().join(format!("gt-cred-fresh-{uniq}"));
+        let now = now_ms();
+        write_creds(&dead_dir, Some(now.saturating_sub(1)), false); // expired, no refresh
+        write_creds(&fresh_dir, Some(now + 3_600_000), true); // valid
+
+        let fake = Arc::new(FakeTmux::new());
+        let tmux: Arc<dyn Tmux> = fake.clone();
+        let supervisor = Arc::new(PolecatSupervisor::new(tmux.clone(), RestartConfig::default(), 8));
+        let template = SpawnTemplate {
+            rig: "hq".into(),
+            prefix: "hq".into(),
+            workdir: "/tmp".into(),
+            command: "true".into(),
+            args: vec![],
+            base_env: vec![],
+            heartbeat_dir: std::env::temp_dir(),
+        };
+        let keychain = Arc::new(InMemoryKeychain::seeded([
+            ("dead", dead_dir.to_string_lossy().to_string()),
+            ("fresh", fresh_dir.to_string_lossy().to_string()),
+        ]));
+        keychain.set_active("dead").unwrap();
+        let alloc = Arc::new(Mutex::new(PoolAllocator::new(10, 5)));
+        let p = PolecatSupervisorPlugin::new("acme", tmux, template, supervisor, alloc)
+            .with_keychain(keychain.clone());
+
+        p.on_event(&record(SchedEvent::Dispatched {
+            bead: "gg-2".into(),
+            worker: "w1".into(),
+        }))
+        .await
+        .unwrap();
+
+        // The polecat was slung onto the FRESH account, not the credential-dead one.
+        let cfg = fake
+            .show_environment("hq-gg-2", "CLAUDE_CONFIG_DIR")
+            .unwrap()
+            .expect("CLAUDE_CONFIG_DIR injected from the rotated-to healthy account");
+        assert_eq!(cfg, fresh_dir.to_string_lossy());
+        let acct = fake
+            .show_environment("hq-gg-2", gt_polecat::GT_HOOK_ACCOUNT)
+            .unwrap()
+            .unwrap();
+        assert_eq!(acct, "fresh");
+        // The live pointer was persisted so the NEXT sling also lands on the healthy account.
+        assert_eq!(keychain.active().unwrap().as_deref(), Some("fresh"));
+
+        let _ = std::fs::remove_dir_all(&dead_dir);
+        let _ = std::fs::remove_dir_all(&fresh_dir);
+    }
+
+    #[tokio::test]
+    async fn dispatch_blocks_the_sling_when_no_account_has_valid_credentials() {
+        // gtcore-bf4acd / AC2: every account's creds are dead → block the sling and free the slot
+        // instead of birthing a polecat into 401.
+        use gt_quota::InMemoryKeychain;
+        let uniq = format!(
+            "{}-{}",
+            std::process::id(),
+            SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos()
+        );
+        let dead_dir = std::env::temp_dir().join(format!("gt-cred-alldead-{uniq}"));
+        let now = now_ms();
+        write_creds(&dead_dir, Some(now.saturating_sub(1)), false); // expired, no refresh
+
+        let fake = Arc::new(FakeTmux::new());
+        let tmux: Arc<dyn Tmux> = fake.clone();
+        let supervisor = Arc::new(PolecatSupervisor::new(tmux.clone(), RestartConfig::default(), 8));
+        let template = SpawnTemplate {
+            rig: "hq".into(),
+            prefix: "hq".into(),
+            workdir: "/tmp".into(),
+            command: "true".into(),
+            args: vec![],
+            base_env: vec![],
+            heartbeat_dir: std::env::temp_dir(),
+        };
+        let keychain = Arc::new(InMemoryKeychain::seeded([(
+            "dead",
+            dead_dir.to_string_lossy().to_string(),
+        )]));
+        keychain.set_active("dead").unwrap();
+        let alloc = Arc::new(Mutex::new(PoolAllocator::new(10, 5)));
+        let p = PolecatSupervisorPlugin::new("acme", tmux, template, supervisor, alloc.clone())
+            .with_keychain(keychain);
+
+        p.on_event(&record(SchedEvent::Dispatched {
+            bead: "gg-3".into(),
+            worker: "w1".into(),
+        }))
+        .await
+        .unwrap();
+
+        // No tmux session was spawned, and the admission slot was released (not leaked).
+        assert!(!fake.has_session("hq-gg-3"), "no polecat should be slung into 401");
+        assert_eq!(
+            alloc.lock().unwrap().in_flight("acme"),
+            0,
+            "the claimed slot must be released when the sling is blocked"
+        );
+
+        let _ = std::fs::remove_dir_all(&dead_dir);
     }
 
     #[tokio::test]
@@ -1489,6 +2733,140 @@ mod tests {
         assert_eq!(cfg.worktree_root.as_deref(), Some(wt_root));
         assert_eq!(paths.get("gtweb"), Some(&gtweb_root));
         assert!(!paths.contains_key("gh"), "missing-root rig not routed");
+    }
+
+    /// Run `git <args>` in `dir`, asserting success (test helper for the clone path below).
+    #[cfg(test)]
+    fn git_in(dir: &std::path::Path, args: &[&str]) {
+        let ok = std::process::Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(args)
+            .status()
+            .expect("git runs")
+            .success();
+        assert!(ok, "git {args:?} in {} failed", dir.display());
+    }
+
+    /// `git -C dir remote get-url origin`, trimmed (test helper).
+    #[cfg(test)]
+    fn origin_of(dir: &std::path::Path) -> String {
+        let out = std::process::Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(["remote", "get-url", "origin"])
+            .output()
+            .expect("git runs");
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    }
+
+    #[test]
+    fn provision_rig_checkouts_clones_missing_rig_from_its_git_url() {
+        // gtcore-d0ec4f: a cross-rig bead (gtweb-*) must land in a worktree cut off the rig's OWN
+        // catalog git_url, not the boot rig's checkout. Before routing, provision_rig_checkouts
+        // clones a missing rig from its git_url; the per-bead worktree then carries that origin.
+        use gt_rig::RigEntry;
+        let dir = tempfile::tempdir().unwrap();
+
+        // A local "remote" standing in for gt-core-labs/gt-web: a real repo with a commit on main.
+        let remote = dir.path().join("gtweb-remote");
+        std::fs::create_dir_all(&remote).unwrap();
+        git_in(&remote, &["init", "-q", "-b", "main"]);
+        git_in(&remote, &["config", "user.email", "t@t"]);
+        git_in(&remote, &["config", "user.name", "t"]);
+        std::fs::write(remote.join("package.json"), "{}").unwrap();
+        git_in(&remote, &["add", "-A"]);
+        git_in(&remote, &["commit", "-q", "-m", "init"]);
+        let remote_url = remote.display().to_string();
+
+        // The rig's resolved checkout does NOT exist yet (the regression's precondition).
+        let gtweb_root = dir.path().join("checkout").join("gtweb");
+        assert!(!gtweb_root.is_dir());
+        let mut gtweb = RigEntry::new("gtweb", "gtweb", &remote_url, "main", 0);
+        gtweb.worktree_root = Some(gtweb_root.clone());
+
+        // Provision: the missing rig is cloned from its git_url, NOT skipped.
+        let provisioned = provision_rig_checkouts(&[gtweb.clone()], "default", dir.path());
+        assert_eq!(provisioned, vec!["gtweb".to_string()]);
+        assert!(
+            gtweb_root.join("package.json").is_file(),
+            "the cloned checkout carries the remote's content"
+        );
+        assert_eq!(
+            origin_of(&gtweb_root),
+            remote_url,
+            "the provisioned checkout's origin is the rig's catalog git_url"
+        );
+
+        // Routing now finds the real checkout (no longer skipped).
+        let base = SpawnTemplate {
+            rig: "gtcore".into(),
+            prefix: "gt".into(),
+            workdir: "/rig-wt/gtcore".into(),
+            command: "claude".into(),
+            args: vec!["--flag".into()],
+            base_env: vec![("GT_ROLE".to_string(), "polecat".to_string())],
+            heartbeat_dir: std::env::temp_dir(),
+        };
+        let wt_root = dir.path().join("wt");
+        let (configs, _paths) =
+            rig_routing_from_catalog(&[gtweb], &base, Some(wt_root.as_path()), "default", dir.path());
+        let cfg = configs.get("gtweb").expect("gtweb now routes");
+        assert_eq!(cfg.template.workdir, gtweb_root);
+
+        // The per-bead worktree, cut off the routed checkout, carries gt-web's origin — NOT gt-core.
+        let worktree = wt_root.join("gt-gtweb-855bac");
+        crate::worktree::provision(&cfg.template.workdir, &worktree, "gtweb-855bac")
+            .expect("worktree provisions off the gtweb checkout");
+        assert_eq!(
+            origin_of(&worktree),
+            remote_url,
+            "a cross-rig bead's worktree clones from the rig's git_url, not GT_RIG_GIT_URL"
+        );
+    }
+
+    #[test]
+    fn provision_rig_checkouts_skips_present_or_urlless_rigs() {
+        // Idempotent: an existing checkout is left untouched; a rig with no git_url can't be cloned.
+        use gt_rig::RigEntry;
+        let dir = tempfile::tempdir().unwrap();
+        let present_root = dir.path().join("present");
+        std::fs::create_dir_all(&present_root).unwrap();
+        let mut present = RigEntry::new("present", "pr", "https://x/present.git", "main", 0);
+        present.worktree_root = Some(present_root.clone());
+
+        let mut urlless = RigEntry::new("urlless", "ul", "", "main", 0);
+        urlless.worktree_root = Some(dir.path().join("never"));
+
+        let provisioned = provision_rig_checkouts(&[present, urlless], "default", dir.path());
+        assert!(
+            provisioned.is_empty(),
+            "present checkout skipped (no clone), urlless rig not cloneable"
+        );
+        assert!(!dir.path().join("never").exists(), "urlless rig left unprovisioned");
+    }
+
+    #[test]
+    fn embed_token_in_url_credentialises_https_and_leaves_others_untouched() {
+        // gtcore-abfe8a: a plain https URL gets the token as userinfo (push-capable origin).
+        assert_eq!(
+            embed_token_in_url("https://github.com/gt-core-labs/gt-web.git", "gho_TOKEN"),
+            "https://gho_TOKEN@github.com/gt-core-labs/gt-web.git"
+        );
+        // Already credentialed — never double-embed.
+        assert_eq!(
+            embed_token_in_url("https://gho_OLD@github.com/o/r.git", "gho_NEW"),
+            "https://gho_OLD@github.com/o/r.git"
+        );
+        // Non-https remotes (ssh, local path) are left as-is.
+        assert_eq!(
+            embed_token_in_url("git@github.com:o/r.git", "gho_TOKEN"),
+            "git@github.com:o/r.git"
+        );
+        assert_eq!(
+            embed_token_in_url("/tmp/local-remote", "gho_TOKEN"),
+            "/tmp/local-remote"
+        );
     }
 
     #[tokio::test]
