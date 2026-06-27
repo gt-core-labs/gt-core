@@ -44,6 +44,7 @@ pub mod ci_gate;
 pub mod credential_guard;
 pub mod anthropic_proxy;
 pub mod continuation;
+pub mod convoy_reactor;
 pub mod auth;
 pub mod delegation;
 pub mod delegation_http;
