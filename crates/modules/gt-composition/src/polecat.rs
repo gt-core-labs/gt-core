@@ -31,7 +31,7 @@ use crate::auto_dispatch::HeldRigs;
 use gt_auth::{JwtClaims, JwtMinter};
 use gt_eventlog::EventRecord;
 use gt_events::{AppError, Envelope};
-use gt_issues::{resolve_dispatch, should_sling};
+use gt_issues::{resolve_dispatch, should_sling, Dispatch};
 use gt_mcp_server::bead_prefix;
 use gt_merge::MergeEvent;
 use gt_plugin::Plugin;
@@ -68,6 +68,7 @@ pub async fn bead_should_sling(
     issues: &DoltIssues,
     bead: &str,
     held_rigs: &HashSet<String>,
+    convoy_override: bool,
 ) -> bool {
     let detail = match issues.get_detail(bead).await {
         Ok(Some(d)) => d,
@@ -93,7 +94,16 @@ pub async fn bead_should_sling(
     let parents = issues.parent_map("", "").await.unwrap_or_default();
     let raw = issues.dispatch_index().await.unwrap_or_default();
     let dispatch = resolve_dispatch(bead, detail.dispatch.as_deref(), &parents, &raw);
-    should_sling(&detail.status, &detail.issue_type, dispatch)
+    if should_sling(&detail.status, &detail.issue_type, dispatch) {
+        return true;
+    }
+    // gtcore-7d16f0: an EXPLICIT convoy dispatch (the bead is the Active member of a Launched
+    // convoy, see `convoy_reactor::active_convoy_membership`) is slingable even though its
+    // dispatch policy is manual — a convoy member is dropped onto the dispatch channel ON PURPOSE,
+    // unlike a boot re-hydration of a stale manual bead. Re-apply the SAME predicate forcing
+    // `Dispatch::Auto` so the status∈{open,working} ∧ ¬epic checks still hold: a closed or epic
+    // bead never slings, and the rig-hold early-return above still wins.
+    convoy_override && should_sling(&detail.status, &detail.issue_type, Dispatch::Auto)
 }
 
 /// Resolves the least-privilege scope set for an agent role (`hq-agent-provisioning.3`). The
@@ -745,7 +755,21 @@ impl Plugin for PolecatSupervisorPlugin {
                 // dispatch slings), matching the rest of the sling path's degradation.
                 if let Some(issues) = &self.issues {
                     let held = self.held_rigs_set().await;
-                    if !bead_should_sling(issues, &bead, &held).await {
+                    // gtcore-7d16f0: a convoy member rides the dispatch channel as `dispatch=manual`
+                    // ON PURPOSE — recognise it as an explicit dispatch so the gate slings it (the
+                    // strict `dispatch=auto` rule still applies to every other manual bead).
+                    let convoy_override = self
+                        .event_log
+                        .as_ref()
+                        .and_then(|log| {
+                            crate::convoy_reactor::active_convoy_membership(
+                                log,
+                                Some(&self.workspace),
+                                &bead,
+                            )
+                        })
+                        .is_some();
+                    if !bead_should_sling(issues, &bead, &held, convoy_override).await {
                         eprintln!(
                             "[polecat] sling skipped for {bead}: not slingable (closed/epic/manual/rig-on-hold) — boot re-hydration / stale dispatch"
                         );

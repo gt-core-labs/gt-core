@@ -267,6 +267,10 @@ async fn main() -> anyhow::Result<()> {
     // Keep a copy for the polecat heartbeat emitter (hq-e5b288): appends AgentEvent::Heartbeat
     // for each watched session after every supervisor tick so the MCP audit trail reflects liveness.
     let event_root_for_heartbeat = event_root.clone();
+    // Keep a copy for the convoy reactor (gtcore-e719c1): the slingability re-sling guard reads the
+    // convoy board from here to recognise an explicit convoy dispatch, and the completion plugin
+    // advances a convoy when a member bead closes.
+    let event_root_for_convoy = event_root.clone();
     // A4 (gtcore-08a8be): read pool_size BEFORE daemon_root so the scheduler's capacity governor
     // matches the polecat pool — prevents over-dispatching beyond what the supervisor can sling.
     let pool_size = env_usize("GT_POOL_SIZE", 4);
@@ -661,16 +665,28 @@ async fn main() -> anyhow::Result<()> {
             let store = Arc::new(store);
             let handle = tokio::runtime::Handle::current();
             let held_for_guard = held_rigs_source.clone();
+            // gtcore-7d16f0: the crash / boot re-hydration re-sling guard must also recognise an
+            // explicit convoy dispatch, else a crashed convoy member (always dispatch=manual) is
+            // never re-slung. Read the convoy board from the shared log, same as the dispatch path.
+            let convoy_log = Arc::new(EventLog::new(Some(event_root_for_convoy.clone())));
+            let convoy_ws = ws_slug.clone();
             supervisor.set_bead_slingable(Box::new(move |bead: &str| {
                 let store = store.clone();
                 let bead = bead.to_string();
                 let held_for_guard = held_for_guard.clone();
+                let convoy_override = gt_composition::convoy_reactor::active_convoy_membership(
+                    &convoy_log,
+                    Some(&convoy_ws),
+                    &bead,
+                )
+                .is_some();
                 handle.block_on(async move {
                     let held = match &held_for_guard {
                         Some(s) => s.held().await,
                         None => std::collections::HashSet::new(),
                     };
-                    gt_composition::polecat::bead_should_sling(&store, &bead, &held).await
+                    gt_composition::polecat::bead_should_sling(&store, &bead, &held, convoy_override)
+                        .await
                 })
             }));
             eprintln!("[gt-orch-server] slingability re-sling guard armed (Dolt-backed: closed/epic/manual dropped)");
@@ -1224,6 +1240,56 @@ async fn main() -> anyhow::Result<()> {
             None
         }
     };
+
+    // Convoy completion reactor (gtcore-896a29): advance a convoy when one of its member beads
+    // closes — complete the member, feed the next one onto the dispatch channel (the orchd's own
+    // dispatch loop consumes it and slings) and close the convoy when all members are done. Sibling
+    // of PatrolBridgePlugin on the same hub (both react to issues.closed.v1). The dispatch sink is
+    // built the same way the mcp-server's convoy/agent bridge is (GT_EVENTLOG_PG ? PG queue : file
+    // channel) so the handoff rides the SAME queue the launch bridge uses.
+    let convoy_dispatch_sink: Option<Arc<gt_channel::DispatchSink>> = {
+        let dispatch_name =
+            std::env::var("GT_DISPATCH_CHANNEL").unwrap_or_else(|_| "dispatch".to_string());
+        let want_pg = std::env::var("GT_EVENTLOG_PG")
+            .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"))
+            .unwrap_or(false);
+        if want_pg {
+            match std::env::var("GT_PG_URL").ok() {
+                Some(pg_url) => gt_channel::PgQueue::connect(&pg_url, &dispatch_name)
+                    .and_then(|q| q.ensure_schema().map(|()| q))
+                    .map(|q| Arc::new(gt_channel::DispatchSink::Pg(q)))
+                    .map_err(|e| {
+                        eprintln!("[gt-orch-server] convoy completion: PG dispatch sink off — {e}")
+                    })
+                    .ok(),
+                None => None,
+            }
+        } else {
+            match std::env::var("GT_CHANNEL_ROOT").ok() {
+                Some(root) => Channel::open(&root, &dispatch_name)
+                    .map(|c| Arc::new(gt_channel::DispatchSink::File(c)))
+                    .map_err(|e| {
+                        eprintln!("[gt-orch-server] convoy completion: file dispatch sink off — {e}")
+                    })
+                    .ok(),
+                None => None,
+            }
+        }
+    };
+    let mut convoy_plugin = gt_composition::convoy_reactor::ConvoyCompletionPlugin::new(
+        Arc::new(EventLog::new(Some(event_root_for_convoy))),
+        Some(ws_slug.clone()),
+    );
+    match convoy_dispatch_sink {
+        Some(sink) => {
+            convoy_plugin = convoy_plugin.with_dispatch_channel(sink);
+            eprintln!("[gt-orch-server] convoy completion ON — issues.closed → complete-member + handoff (dispatch bridged)");
+        }
+        None => {
+            eprintln!("[gt-orch-server] convoy completion ON — issues.closed → complete-member (no dispatch sink: next member won't auto-sling)");
+        }
+    }
+    pol_registry = pol_registry.register(convoy_plugin);
 
     let pol_registry = Arc::new(pol_registry);
     let pol_relay = spawn_plugin_relay(handle.subscribe_events(), pol_registry);
