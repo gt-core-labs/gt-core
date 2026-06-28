@@ -513,7 +513,16 @@ pub(crate) fn cred_health_in(
                 now_ms,
                 REFRESH_SKEW_MS,
             );
-            if dead.contains(email.as_str()) {
+            // gtcore-62723a: force relogin for a prober-dead account ONLY while its on-disk creds
+            // are NOT Valid. `credential_dead` is LATCHED — it clears only on the prober's next
+            // successful probe — so right after a re-login the flag is still true even though the
+            // fresh access token authenticates NOW. Trusting a Valid on-disk credential over the
+            // stale latch flips the account back to healthy IMMEDIATELY (the FE updates on re-login
+            // instead of staying "needs relogin" until the next probe tick). A still-dead account is
+            // expired/Refreshable on disk, so the override still fires for it.
+            if dead.contains(email.as_str())
+                && !matches!(report.credential, gt_quota::CredentialHealth::Valid)
+            {
                 report.needs_relogin = true;
             }
             by_email.insert(email, report);
@@ -703,6 +712,15 @@ mod tests {
         )
     }
 
+    /// Expired access token WITH a refresh token ⇒ `assess_cred_health` classifies it `Refreshable`
+    /// (the on-disk shape of a dead-but-not-yet-re-logged-in account).
+    fn refreshable_creds(now_ms: u64) -> String {
+        format!(
+            r#"{{"claudeAiOauth":{{"accessToken":"at","refreshToken":"rt","expiresAt":{}}}}}"#,
+            now_ms.saturating_sub(3_600_000)
+        )
+    }
+
     #[test]
     fn email_of_reads_oauth_address() {
         let tmp = tempfile::tempdir().unwrap();
@@ -843,27 +861,52 @@ mod tests {
 
     #[test]
     fn cred_health_forces_relogin_for_prober_dead_account() {
-        // gtcore-62723a: an account whose on-disk creds LOOK healthy/refreshable but the quota prober
-        // confirmed dead (refresh rejected) must surface needs_relogin — else the FE never offers
-        // relogin and the orchd keeps slinging onto a credential that 401s.
+        // gtcore-62723a: a still-dead account is `Refreshable` on disk (access expired, refresh
+        // present) AND quota-marked credential_dead — its refresh 401s, so it must surface
+        // needs_relogin even though the static verdict alone would call it slingable.
         let tmp = tempfile::tempdir().unwrap();
         let accounts = tmp.path().join("accounts");
         std::fs::create_dir_all(&accounts).unwrap();
         let now = now_ms();
-        // Looks perfectly healthy on disk (valid creds + onboarding) ...
-        write_dir(&accounts, "01DEAD", "dead@x.com", true, Some(&valid_creds(now)));
-        // ... but quota marks it credential_dead=true.
+        write_dir(&accounts, "01DEAD", "dead@x.com", true, Some(&refreshable_creds(now)));
         let known = vec![("dead@x.com".to_string(), true)];
 
-        let reports = cred_health_in(&accounts, &known, now);
-        let by: HashMap<&str, &CredHealthReport> =
-            reports.iter().map(|r| (r.account.as_str(), r)).collect();
+        let by: HashMap<String, CredHealthReport> = cred_health_in(&accounts, &known, now)
+            .into_iter()
+            .map(|r| (r.account.clone(), r))
+            .collect();
 
         assert!(
             by["dead@x.com"].needs_relogin,
-            "prober-dead account must need relogin despite healthy-looking on-disk creds"
+            "prober-dead refreshable account must need relogin"
         );
-        // The static fields are untouched (onboarding still true) — only needs_relogin is overridden.
         assert!(by["dead@x.com"].onboarding_complete);
+    }
+
+    #[test]
+    fn cred_health_trusts_fresh_valid_creds_over_stale_dead_latch() {
+        // gtcore-62723a: `credential_dead` is LATCHED — it clears only on the prober's next
+        // successful probe. Right after a RE-LOGIN the on-disk access token is Valid yet the flag is
+        // still true. The report must trust the fresh Valid creds and report needs_relogin=FALSE so
+        // the FE flips back to healthy immediately, not stuck "needs relogin" until the next probe.
+        let tmp = tempfile::tempdir().unwrap();
+        let accounts = tmp.path().join("accounts");
+        std::fs::create_dir_all(&accounts).unwrap();
+        let now = now_ms();
+        // Freshly re-logged in: Valid (unexpired) access token on disk ...
+        write_dir(&accounts, "01RELOGGED", "relogged@x.com", true, Some(&valid_creds(now)));
+        // ... but quota still has the stale credential_dead latch (no successful probe yet).
+        let known = vec![("relogged@x.com".to_string(), true)];
+
+        let by: HashMap<String, CredHealthReport> = cred_health_in(&accounts, &known, now)
+            .into_iter()
+            .map(|r| (r.account.clone(), r))
+            .collect();
+
+        assert!(
+            !by["relogged@x.com"].needs_relogin,
+            "a re-logged-in account with Valid on-disk creds must NOT need relogin despite the stale dead latch"
+        );
+        assert_eq!(by["relogged@x.com"].credential, gt_quota::CredentialHealth::Valid);
     }
 }
