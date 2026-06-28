@@ -503,6 +503,13 @@ fn build_settings(
         return None;
     }
     let mut v = hooks.unwrap_or_else(|| serde_json::json!({}));
+    // Every role's session settings carry the SAME managed-agent permission model (gtcore-a01791):
+    // the per-role apparatus is the source of permissions, so an interactive/role/mayor session gets
+    // the memory-guard `deny` + `bypassPermissions` mode exactly like a slung polecat — instead of
+    // launching with no permissions block at all (the prior gap on this path).
+    if let Some(obj) = v.as_object_mut() {
+        obj.insert("permissions".into(), gt_polecat::managed_permissions());
+    }
     if mcp_enabled {
         if let Some(obj) = v.as_object_mut() {
             obj.insert("enabledMcpjsonServers".into(), serde_json::json!(["gt"]));
@@ -1917,6 +1924,29 @@ mod tests {
         let hooks = serde_json::json!({ "hooks": {} });
         let no_mcp = build_settings(Some(hooks), false, false).unwrap();
         assert!(no_mcp.get("enabledMcpjsonServers").is_none());
+    }
+
+    #[test]
+    fn build_settings_emits_the_shared_managed_permission_model() {
+        // gtcore-a01791: every role's session settings carry the SAME permission model the polecat
+        // sling uses — sourced from gt_polecat::managed_permissions. Previously this apparatus path
+        // emitted NO permissions block at all; now an interactive/role/mayor session gets the
+        // memory-guard deny + bypassPermissions mode uniformly.
+        for v in [
+            build_settings(None, true, false).unwrap(),                 // mcp only
+            build_settings(None, false, true).unwrap(),                 // costs only
+            build_settings(Some(serde_json::json!({ "hooks": {} })), false, false).unwrap(), // hooks
+        ] {
+            assert_eq!(v["permissions"], gt_polecat::managed_permissions());
+            assert_eq!(v["permissions"]["defaultMode"], "bypassPermissions");
+            let deny = v["permissions"]["deny"].as_array().unwrap();
+            assert!(deny.iter().any(|r| r == "Write(**/memory/**.md)"));
+            assert!(deny.iter().any(|r| r == "Edit(**/memory/**.md)"));
+            // The stale MultiEdit deny rule (no longer a known tool) is gone.
+            assert!(!deny.iter().any(|r| r == "MultiEdit(**/memory/**.md)"));
+        }
+        // Nothing to materialise ⇒ still None (no workdir, so no settings.json to carry permissions).
+        assert!(build_settings(None, false, false).is_none());
     }
 
     #[test]

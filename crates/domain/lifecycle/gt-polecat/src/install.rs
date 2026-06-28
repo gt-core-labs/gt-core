@@ -380,6 +380,28 @@ pub fn costs_report_hook_entry() -> serde_json::Value {
 /// never stalls on the interactive "New MCP server found … Use this MCP server?" prompt
 /// (`hq-polecat-provisioning-20260608.1`): the `.mcp.json` the daemon seeds into the worktree is
 /// project-scoped, and without this allowlist claude blocks on first launch waiting for a keypress.
+/// The managed-agent `permissions` block — the SINGLE source of every gt role's claude permission
+/// model (gtcore-a01791). Every launch path materialises this same value into a session's
+/// `settings.json`: the polecat sling (via [`polecat_settings_json`]), the interactive/role + mayor
+/// apparatus (via `gt_composition::build_settings`), and the account seed (`seed_user_hooks`). One
+/// definition, every role — so "the permissions load from the agents model" holds uniformly.
+///
+/// - `defaultMode: bypassPermissions` — autonomous agents never stop at an interactive permission
+///   prompt.
+/// - `deny` — a declarative backstop to the PreToolUse memory guard (hq-memory-mcp.6): the agent
+///   must save memories via `mcp__gt__memory_save`, never by writing the `*/memory/*.md` corpus.
+///   `permissions.deny` tool names are VALIDATED by claude at startup — an entry naming a tool the
+///   running claude doesn't know logs "deny rule … matches no known tool" (observed live in a mayor
+///   session, gtcore-a01791). `MultiEdit` was folded into `Edit` in recent claude, so it is omitted
+///   here to keep the rule set valid. (The PreToolUse hook matcher below still lists `MultiEdit`:
+///   hook matchers are not name-validated, so keeping it is harmless + future-proof.)
+pub fn managed_permissions() -> serde_json::Value {
+    json!({
+        "defaultMode": "bypassPermissions",
+        "deny": [ "Write(**/memory/**.md)", "Edit(**/memory/**.md)" ]
+    })
+}
+
 pub fn polecat_settings_json() -> String {
     let v = json!({
         MANAGED_MARKER: MANAGED_VALUE,
@@ -389,13 +411,8 @@ pub fn polecat_settings_json() -> String {
         // though `permissions.defaultMode` is already `bypassPermissions`.
         "dangerouslySkipPermissions": true,
         "enabledMcpjsonServers": ["gt"],
-        // bypassPermissions still skips the interactive prompt, but the `deny` rule is honoured even
-        // under it: a declarative backstop to the PreToolUse memory guard (hq-memory-mcp.6). The agent
-        // must save memories via the `mcp__gt__memory_save` MCP tool, never by writing the corpus.
-        "permissions": {
-            "defaultMode": "bypassPermissions",
-            "deny": [ "Write(**/memory/**.md)", "Edit(**/memory/**.md)", "MultiEdit(**/memory/**.md)" ]
-        },
+        // The shared managed-agent permission model (gtcore-a01791) — identical for every role.
+        "permissions": managed_permissions(),
         "hooks": {
             // SessionStart: heartbeat touch + memory autorecall (hq-memory-autorecall.1) — the
             // recall hook PUSHES the team's feedback rules + bead-relevant lore into the fresh
