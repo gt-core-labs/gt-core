@@ -1598,11 +1598,69 @@ pub fn host_cap_from_metrics() -> usize {
         .and_then(|s| s.parse::<usize>().ok())
         .filter(|&m| m > 0)
         .unwrap_or(1024);
-    let cap_by_mem = match mem_available_mb() {
-        Some(avail) => (avail / per_polecat_mb).max(1),
+    // gtcore-c233c4: I/O-pressure ceiling above which the disk gate throttles new slings. Tunable
+    // via GT_DISK_PSI_MAX (`some avg10` %); the cores+RAM-only cap that preceded this let a burst of
+    // `cargo build` polecats saturate the shared disk and starve etcd's fsync (2026-06-27 incident).
+    let psi_max = std::env::var("GT_DISK_PSI_MAX")
+        .ok()
+        .and_then(|s| s.parse::<f64>().ok())
+        .filter(|v| *v > 0.0)
+        .unwrap_or(DEFAULT_DISK_PSI_MAX);
+    compute_host_cap(cores, mem_available_mb(), per_polecat_mb, io_pressure_pct(), psi_max)
+}
+
+/// Default `some avg10` I/O-pressure-stall ceiling (%, from `/proc/pressure/io`) above which the
+/// disk gate (gtcore-c233c4) throttles new slings to 1 so in-flight builds drain instead of
+/// compounding the saturation. Tunable via `GT_DISK_PSI_MAX`; lower = more conservative.
+const DEFAULT_DISK_PSI_MAX: f64 = 50.0;
+
+/// Pure host-admission-cap arithmetic (gtcore-c233c4): the lesser of CPU cores, the RAM that fits
+/// `per_polecat_mb` polecats, and a disk-I/O-pressure gate — floored at 1. Split out of
+/// [`host_cap_from_metrics`] so the combination is unit-tested without reading /proc.
+///
+/// `avail_mb` / `io_pressure_pct` are `None` when their /proc source is absent or malformed; each
+/// degrades PERMISSIVELY (that axis does not limit), matching the rest of the sling path — a missing
+/// metric must never silently wedge dispatch. The disk gate admits at most ONE new polecat while
+/// pressure exceeds `psi_max` (let the disk drain), and does not limit below it.
+fn compute_host_cap(
+    cores: usize,
+    avail_mb: Option<usize>,
+    per_polecat_mb: usize,
+    io_pressure_pct: Option<f64>,
+    psi_max: f64,
+) -> usize {
+    let cap_by_mem = match avail_mb {
+        Some(avail) => (avail / per_polecat_mb.max(1)).max(1),
         None => cores,
     };
-    cores.min(cap_by_mem).max(1)
+    let cap_by_disk = match io_pressure_pct {
+        Some(p) if p > psi_max => 1,
+        _ => cores,
+    };
+    cores.min(cap_by_mem).min(cap_by_disk).max(1)
+}
+
+/// `some avg10` from `/proc/pressure/io` (gtcore-c233c4): the % of the last 10s during which at
+/// least one task stalled waiting on I/O — the signal that the disk, not CPU/RAM, is the bottleneck.
+/// `None` when PSI is unavailable (kernel without `CONFIG_PSI`) or the file is malformed; the caller
+/// treats that as "no disk limit".
+fn io_pressure_pct() -> Option<f64> {
+    parse_io_pressure(&std::fs::read_to_string("/proc/pressure/io").ok()?)
+}
+
+/// Parse the `some avg10=…` percent out of `/proc/pressure/io` content. Pure, so the parsing is
+/// unit-tested without the file. Format: `some avg10=0.00 avg60=… …`\n`full …`.
+fn parse_io_pressure(text: &str) -> Option<f64> {
+    for line in text.lines() {
+        if let Some(rest) = line.strip_prefix("some ") {
+            for field in rest.split_whitespace() {
+                if let Some(v) = field.strip_prefix("avg10=") {
+                    return v.parse::<f64>().ok();
+                }
+            }
+        }
+    }
+    None
 }
 
 /// `MemAvailable` from `/proc/meminfo`, in MiB. `None` when the file is absent or malformed.
@@ -2662,6 +2720,37 @@ mod tests {
     #[test]
     fn host_cap_is_at_least_one() {
         assert!(host_cap_from_metrics() >= 1);
+    }
+
+    #[test]
+    fn compute_host_cap_disk_gate_idle_vs_saturated() {
+        // 8 cores, 8 GB avail, 1 GB/polecat → cores+RAM cap = 8.
+        // Idle disk (pressure below ceiling) → disk does not limit.
+        assert_eq!(compute_host_cap(8, Some(8192), 1024, Some(5.0), 50.0), 8);
+        // Saturated disk (pressure above ceiling) → throttle new slings to 1.
+        assert_eq!(compute_host_cap(8, Some(8192), 1024, Some(80.0), 50.0), 1);
+        // Exactly at the ceiling is NOT over it → no throttle.
+        assert_eq!(compute_host_cap(8, Some(8192), 1024, Some(50.0), 50.0), 8);
+    }
+
+    #[test]
+    fn compute_host_cap_missing_metrics_are_permissive() {
+        // No PSI (kernel without CONFIG_PSI) → disk axis does not limit; RAM still governs.
+        assert_eq!(compute_host_cap(8, Some(4096), 1024, None, 50.0), 4);
+        // No RAM reading → cores govern; saturated disk still clamps to 1.
+        assert_eq!(compute_host_cap(8, None, 1024, Some(99.0), 50.0), 1);
+        // Everything unreadable → cores, floored at ≥1.
+        assert_eq!(compute_host_cap(4, None, 1024, None, 50.0), 4);
+    }
+
+    #[test]
+    fn parse_io_pressure_reads_some_avg10() {
+        let sample = "some avg10=12.34 avg60=4.50 avg300=1.00 total=123456\n\
+                      full avg10=2.00 avg60=0.50 avg300=0.10 total=789";
+        assert_eq!(parse_io_pressure(sample), Some(12.34));
+        // Malformed / empty → None (caller treats as no disk limit).
+        assert_eq!(parse_io_pressure(""), None);
+        assert_eq!(parse_io_pressure("full avg10=9.9 total=1"), None);
     }
 
     #[test]
