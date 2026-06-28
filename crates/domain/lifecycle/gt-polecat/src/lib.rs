@@ -23,7 +23,7 @@ pub mod wedge;
 
 pub use hooks::{hook_bead_for_spawn, hook_env, resolve_env_hook_bead, GT_HOOK_ACCOUNT, GT_HOOK_BEAD};
 pub use install::{
-    costs_report_hook_entry, install_polecat_hooks, memory_autorecall_enabled,
+    costs_report_hook_entry, install_polecat_hooks, managed_permissions, memory_autorecall_enabled,
     memory_autorecall_turn_enabled, memory_recall_args, memory_recall_limit, memory_recall_turn_args,
     polecat_settings_json, COSTS_REPORT_CMD, MANAGED_MARKER, MEMORY_AUTORECALL_ENV,
     MEMORY_AUTORECALL_LIMIT_ENV, MEMORY_AUTORECALL_TURN_ENV, MEMORY_RECALL_LIMIT,
