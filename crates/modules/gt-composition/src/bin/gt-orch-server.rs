@@ -760,6 +760,18 @@ async fn main() -> anyhow::Result<()> {
             "[gt-orch-server] per-polecat worktrees under {} (branch = bead, off the rig checkout)",
             root.display()
         );
+        // gtcore-acacfb: a pod restart kills every in-pod polecat, so every worktree under the root
+        // is an orphan from a prior life carrying a full cargo target/ (tens of GB). Sweep them at
+        // boot — BEFORE dispatch resumes — else they accumulate and fill the disk (107 trees /
+        // 372 GB found 2026-06-28, co-cause of the etcd I/O-saturation incident). Empty live set =
+        // nothing is alive yet at boot.
+        let swept = gt_composition::worktree::sweep_orphans(root, &std::collections::HashSet::new());
+        if swept > 0 {
+            eprintln!(
+                "[gt-orch-server] worktree boot sweep: reclaimed {swept} orphan tree(s) under {}",
+                root.display()
+            );
+        }
         pol_plugin = pol_plugin.with_worktree_root(root.clone());
     } else {
         eprintln!("[gt-orch-server] GT_POLECAT_WORKTREE_ROOT unset — polecats share the rig checkout (single-polecat safe only)");

@@ -151,6 +151,40 @@ pub fn remove(base_repo: &Path, path: &Path) -> std::io::Result<()> {
     }
 }
 
+/// Boot-time GC of orphaned worktrees (gtcore-acacfb): remove every `<root>/<child>` directory
+/// whose name is NOT in `live`. A polecat's tmux dies with the orchd pod, so on restart every
+/// worktree under the root is an orphan from a prior life (pass an empty `live` set). Left alone
+/// they accumulate a full cargo `target/` each (tens of GB) until the disk fills — 107 trees /
+/// 372 GB were found 2026-06-28, a co-cause of the etcd I/O-saturation incident. Plain `rm -rf`
+/// (not `git worktree remove`) because the owning base repo varies per tree and the space is what
+/// matters; `provision` re-creates with `--force`, so a stale `.git/worktrees` entry never blocks a
+/// later sling. Best-effort: read/remove errors log and the sweep continues. Returns trees removed.
+pub fn sweep_orphans(root: &Path, live: &std::collections::HashSet<String>) -> usize {
+    let entries = match std::fs::read_dir(root) {
+        Ok(e) => e,
+        Err(_) => return 0, // root absent (no worktrees yet) — nothing to sweep
+    };
+    let mut removed = 0;
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        if live.contains(&*name.to_string_lossy()) {
+            continue;
+        }
+        let path = entry.path();
+        if !path.is_dir() {
+            continue;
+        }
+        match std::fs::remove_dir_all(&path) {
+            Ok(()) => {
+                removed += 1;
+                eprintln!("[polecat] worktree sweep: removed orphan {}", path.display());
+            }
+            Err(e) => eprintln!("[polecat] worktree sweep: rm {} failed: {e}", path.display()),
+        }
+    }
+    removed
+}
+
 /// Seed the polecat's `.mcp.json` into a fresh worktree (`hq-orchd-deploy.10`). The file is
 /// machine-local (untracked, so it does NOT come with the worktree's checkout) yet the polecat's
 /// claude needs it to reach the `gt` MCP server. Copy it from the base rig checkout, which the
@@ -735,5 +769,43 @@ mod tests {
         seed_mcp_config(&PathBuf::from("/nonexistent-base"), &wt);
         assert!(!wt.join(".mcp.json").exists());
         let _ = std::fs::remove_dir_all(&wt);
+    }
+
+    fn uniq(tag: &str) -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "gt-{tag}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ))
+    }
+
+    #[test]
+    fn sweep_orphans_removes_orphans_keeps_live() {
+        let root = uniq("wt-sweep");
+        for s in ["dead-a", "dead-b", "alive"] {
+            std::fs::create_dir_all(root.join(s).join("target")).unwrap();
+        }
+        // A stray file (not a dir) must be ignored, not counted.
+        std::fs::write(root.join("a-file"), "x").unwrap();
+
+        let mut live = std::collections::HashSet::new();
+        live.insert("alive".to_string());
+        let removed = sweep_orphans(&root, &live);
+
+        assert_eq!(removed, 2, "both dead trees swept, alive + file left");
+        assert!(!root.join("dead-a").exists());
+        assert!(!root.join("dead-b").exists());
+        assert!(root.join("alive").exists(), "a live session's tree is kept");
+        assert!(root.join("a-file").exists());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn sweep_orphans_absent_root_is_noop() {
+        let missing = uniq("wt-sweep-absent");
+        assert_eq!(sweep_orphans(&missing, &std::collections::HashSet::new()), 0);
     }
 }
