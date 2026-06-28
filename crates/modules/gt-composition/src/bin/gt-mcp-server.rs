@@ -774,8 +774,10 @@ async fn main() -> anyhow::Result<()> {
                 .map(|st| {
                     gt_quota::AccountRegistry::from_state(&st)
                         .accounts()
-                        .map(|a| a.id.clone())
-                        .collect::<Vec<String>>()
+                        // gtcore-62723a: carry credential_dead so cred-health forces needs_relogin
+                        // for prober-confirmed-dead accounts (the FE then surfaces relogin).
+                        .map(|a| (a.id.clone(), a.credential_dead))
+                        .collect::<Vec<(String, bool)>>()
                 })
                 .unwrap_or_default()
         });

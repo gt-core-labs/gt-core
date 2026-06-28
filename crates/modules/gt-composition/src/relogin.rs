@@ -104,10 +104,14 @@ struct LiveRelogin {
     _readers: [JoinHandle<()>; 2],
 }
 
-/// Resolves the account ids the quota registry tracks (`quota.list`), so cred-health can enumerate
-/// accounts with no on-disk dir (gtcore-e09320). A thunk rather than a stored snapshot because the
-/// registry changes as accounts are registered/probed; the binary wires it over the event log.
-pub type KnownAccountsFn = Arc<dyn Fn() -> Vec<String> + Send + Sync>;
+/// Resolves the quota-tracked accounts (`quota.list`) as `(id, credential_dead)`, so cred-health can
+/// enumerate accounts with no on-disk dir (gtcore-e09320) AND override the static verdict with the
+/// prober-confirmed credential deadness (gtcore-62723a): an account whose refresh the OAuth endpoint
+/// rejected is `credential_dead=true` in the registry, yet its on-disk creds still LOOK refreshable —
+/// so the static `assess_cred_health` reports it slingable and the FE never offers relogin. Carrying
+/// the flag here lets the report force `needs_relogin`. A thunk (not a snapshot) because the registry
+/// changes as accounts are registered/probed; the binary wires it over the event log.
+pub type KnownAccountsFn = Arc<dyn Fn() -> Vec<(String, bool)> + Send + Sync>;
 
 /// Everything the relogin handlers need: auth (RS256 verifier + denial audit), the live-session
 /// map, the accounts root the per-account creds dirs live under, and (optionally) the quota account
@@ -476,9 +480,17 @@ impl ReloginState {
 /// the REST `GET /api/v1/quota/cred-health` does — one read path, two transports.
 pub(crate) fn cred_health_in(
     root: &Path,
-    known_accounts: &[String],
+    known_accounts: &[(String, bool)],
     now_ms: u64,
 ) -> Vec<CredHealthReport> {
+    // gtcore-62723a: accounts the prober confirmed DEAD (refresh rejected). The on-disk creds still
+    // look refreshable, so the static `assess_cred_health` would call them slingable — override
+    // `needs_relogin` for these so the FE surfaces relogin (and the deadness is truthful).
+    let dead: std::collections::HashSet<&str> = known_accounts
+        .iter()
+        .filter(|(_, is_dead)| *is_dead)
+        .map(|(id, _)| id.as_str())
+        .collect();
     let mut by_email: std::collections::BTreeMap<String, CredHealthReport> =
         std::collections::BTreeMap::new();
     if let Ok(read) = std::fs::read_dir(root) {
@@ -494,20 +506,23 @@ pub(crate) fn cred_health_in(
                 continue; // first dir per email wins (matches FsAccountCatalog)
             }
             let creds_raw = std::fs::read_to_string(path.join(".credentials.json")).ok();
-            let report = assess_cred_health(
+            let mut report = assess_cred_health(
                 email.clone(),
                 creds_raw.as_deref(),
                 onboarding_complete(&path),
                 now_ms,
                 REFRESH_SKEW_MS,
             );
+            if dead.contains(email.as_str()) {
+                report.needs_relogin = true;
+            }
             by_email.insert(email, report);
         }
     }
     // Enumerate every quota-tracked account: one with no on-disk dir (no entry above) is dead from
     // the FE's standpoint — a sling can't be born on it — so synthesize the `Unreadable` /
     // `needs_relogin` verdict instead of leaving it silently absent (gtcore-e09320).
-    for account in known_accounts {
+    for (account, _) in known_accounts {
         by_email.entry(account.clone()).or_insert_with(|| {
             assess_cred_health(account.clone(), None, false, now_ms, REFRESH_SKEW_MS)
         });
@@ -804,9 +819,9 @@ mod tests {
         // One account HAS a healthy dir; two are quota-tracked but dirless.
         write_dir(&accounts, "01HEALTHY", "ok@x.com", true, Some(&valid_creds(now)));
         let known = vec![
-            "ok@x.com".to_string(),
-            "brayanrayo@bi-quare.com".to_string(),
-            "fsrbwowr@gmail.com".to_string(),
+            ("ok@x.com".to_string(), false),
+            ("brayanrayo@bi-quare.com".to_string(), false),
+            ("fsrbwowr@gmail.com".to_string(), false),
         ];
 
         let reports = cred_health_in(&accounts, &known, now);
@@ -824,5 +839,31 @@ mod tests {
             assert!(!by[dead].refresh);
             assert_eq!(by[dead].expires_at_secs, None);
         }
+    }
+
+    #[test]
+    fn cred_health_forces_relogin_for_prober_dead_account() {
+        // gtcore-62723a: an account whose on-disk creds LOOK healthy/refreshable but the quota prober
+        // confirmed dead (refresh rejected) must surface needs_relogin — else the FE never offers
+        // relogin and the orchd keeps slinging onto a credential that 401s.
+        let tmp = tempfile::tempdir().unwrap();
+        let accounts = tmp.path().join("accounts");
+        std::fs::create_dir_all(&accounts).unwrap();
+        let now = now_ms();
+        // Looks perfectly healthy on disk (valid creds + onboarding) ...
+        write_dir(&accounts, "01DEAD", "dead@x.com", true, Some(&valid_creds(now)));
+        // ... but quota marks it credential_dead=true.
+        let known = vec![("dead@x.com".to_string(), true)];
+
+        let reports = cred_health_in(&accounts, &known, now);
+        let by: HashMap<&str, &CredHealthReport> =
+            reports.iter().map(|r| (r.account.as_str(), r)).collect();
+
+        assert!(
+            by["dead@x.com"].needs_relogin,
+            "prober-dead account must need relogin despite healthy-looking on-disk creds"
+        );
+        // The static fields are untouched (onboarding still true) — only needs_relogin is overridden.
+        assert!(by["dead@x.com"].onboarding_complete);
     }
 }
