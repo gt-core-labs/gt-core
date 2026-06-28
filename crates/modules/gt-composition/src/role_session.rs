@@ -13,7 +13,7 @@
 
 use std::path::Path;
 
-use gt_skills::{ModelConfig, SkillCatalog};
+use gt_skills::{default_role_permissions, ModelConfig, RolePermissions, SkillCatalog};
 
 /// Materialise `role`'s enabled skills + Knowledge prompt into `workdir`, returning its model config.
 ///
@@ -62,6 +62,45 @@ pub fn materialize_role_session(
         }
     }
     catalog.role_model(role)
+}
+
+/// The role's claude permission model, read from the catalog (the DB) — the SINGLE source the launch
+/// uses (gtcore-d175ec), like [`SkillCatalog::role_prompt`]/[`role_model`](SkillCatalog::role_model).
+/// Falls back to the apparatus default ([`gt_skills::default_role_permissions`]) ONLY when the
+/// catalog has no permissions for the role yet (a catalog seeded before the attribute existed and not
+/// migrated on this read path): defense-in-depth so an agent is never launched without the
+/// memory-guard `deny`. Once the one-shot migration backfills the DB, the value comes from there.
+pub fn role_permissions_or_default(catalog: &SkillCatalog, role: &str) -> RolePermissions {
+    catalog
+        .role_permissions(role)
+        .unwrap_or_else(default_role_permissions)
+}
+
+/// Overlay a role's `permissions` block into an existing claude `settings.json` at `path` (merge,
+/// preserving claude's other keys). The launch paths that write a static settings template
+/// (`install_polecat_hooks` for the polecat worktree, `seed_user_hooks` for the mayor account) call
+/// this AFTER the template lands so the permission model comes from the catalog, not the template.
+/// Best-effort: any IO/parse failure logs and the session still launches.
+pub fn overlay_permissions(settings_path: &Path, perms: &RolePermissions) {
+    let mut root = std::fs::read_to_string(settings_path)
+        .ok()
+        .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
+        .unwrap_or_else(|| serde_json::json!({}));
+    let Some(obj) = root.as_object_mut() else {
+        return;
+    };
+    obj.insert("permissions".into(), perms.to_settings_json());
+    match serde_json::to_string_pretty(&root) {
+        Ok(body) => {
+            if let Err(e) = std::fs::write(settings_path, body) {
+                eprintln!(
+                    "[role-session] permissions overlay write {} skipped: {e}",
+                    settings_path.display()
+                );
+            }
+        }
+        Err(e) => eprintln!("[role-session] permissions overlay serialize skipped: {e}"),
+    }
 }
 
 #[cfg(test)]
@@ -124,6 +163,42 @@ mod tests {
         assert_eq!(claude, "You are the gtcore mayor in default.");
         // No model configured ⇒ None.
         assert!(model.is_none());
+    }
+
+    #[test]
+    fn permissions_read_from_catalog_with_apparatus_default_fallback_and_overlay() {
+        // gtcore-d175ec: role_permissions_or_default reads the DB, falling back to the apparatus
+        // default; overlay_permissions merges the block into an existing settings.json.
+        let tmp = tempfile::tempdir().unwrap();
+        let settings = tmp.path().join("settings.json");
+        std::fs::write(&settings, r#"{"hasCompletedOnboarding":true}"#).unwrap();
+
+        // Empty catalog ⇒ fallback to the apparatus default (never launch without the memory guard).
+        let empty = catalog_from(vec![]);
+        let perms = role_permissions_or_default(&empty, "mayor");
+        assert_eq!(perms, gt_skills::default_role_permissions());
+
+        overlay_permissions(&settings, &perms);
+        let v: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&settings).unwrap()).unwrap();
+        // The overlay merged (preserved the existing key) and wrote the permission model.
+        assert_eq!(v["hasCompletedOnboarding"], serde_json::json!(true));
+        assert_eq!(v["permissions"]["defaultMode"], "bypassPermissions");
+        assert!(v["permissions"]["deny"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|d| d == "Write(**/memory/**.md)"));
+
+        // An operator-set value in the catalog (the DB) wins over the default.
+        let catalog = catalog_from(vec![SkillEvent::RolePermissionsSet {
+            role: "mayor".into(),
+            default_mode: "bypassPermissions".into(),
+            deny: vec!["Write(**/secret/**)".into()],
+            now_secs: 1,
+        }]);
+        let custom = role_permissions_or_default(&catalog, "mayor");
+        assert_eq!(custom.deny, vec!["Write(**/secret/**)".to_string()]);
     }
 
     #[test]
