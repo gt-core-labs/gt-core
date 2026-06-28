@@ -303,6 +303,15 @@ pub struct TmuxMayorWaker {
     /// its mayor-role config like a polecat/terminal session. `None` ⇒ no role materialisation
     /// (legacy: the mayor opens with the repo's generic `CLAUDE.md` and no role skills).
     event_log: Option<Arc<EventLog>>,
+    /// Per-agent token minter (gtcore-3f4d94). When set with [`server_url`](Self::server_url), a
+    /// mayor spawn mints a least-privilege RS256 token scoped to the `mayor` role (its `scopes` from
+    /// the catalog, NEVER `*`) and writes a `.mcp.json` + `.gt-config` into its workdir — so the
+    /// mayor's MCP/`gt` calls carry its OWN role-scoped identity, exactly like the polecat sling and
+    /// the role-agent launcher. `None` ⇒ legacy (the mayor self-mints a blanket token in-session).
+    agent_token: Option<crate::polecat::AgentTokenMinter>,
+    /// MCP server URL (`GT_SELF_URL`) the mayor's `.mcp.json`/`.gt-config` point at (gtcore-3f4d94).
+    /// Required alongside [`agent_token`](Self::agent_token) to provision role-scoped MCP auth.
+    server_url: Option<String>,
 }
 
 impl TmuxMayorWaker {
@@ -333,7 +342,24 @@ impl TmuxMayorWaker {
             quota: None,
             anthropic_proxy_url: None,
             event_log: None,
+            agent_token: None,
+            server_url: None,
         }
+    }
+
+    /// Wire the per-agent token minter so a mayor spawn provisions role-scoped MCP auth like the
+    /// polecat sling (gtcore-3f4d94). Needs [`with_server_url`](Self::with_server_url) too.
+    pub fn with_agent_token(mut self, minter: crate::polecat::AgentTokenMinter) -> Self {
+        self.agent_token = Some(minter);
+        self
+    }
+
+    /// Point the mayor's `.mcp.json`/`.gt-config` at the MCP server URL (`GT_SELF_URL`, gtcore-3f4d94).
+    /// Empty disables (treated as `None`).
+    pub fn with_server_url(mut self, url: impl Into<String>) -> Self {
+        let url = url.into();
+        self.server_url = if url.is_empty() { None } else { Some(url) };
+        self
     }
 
     /// Wire the `skills.*` catalog event log so a mayor spawn materialises its role skills +
@@ -518,7 +544,24 @@ impl MayorWaker for TmuxMayorWaker {
                 crate::worktree::seed_claude_onboarding(cd, &self.workdir);
                 crate::worktree::seed_user_hooks(cd);
             }
-            let env = self.session_env(rig, &wake_file, &session, creds.as_ref());
+            let mut env = self.session_env(rig, &wake_file, &session, creds.as_ref());
+            // Provision role-scoped MCP auth like the polecat sling + role-agent launcher
+            // (gtcore-3f4d94): mint a least-privilege token for the `mayor` role (its catalog scopes,
+            // never `*`), write a `.mcp.json` + `.gt-config` into the workdir, and stamp GT_TOKEN —
+            // so the mayor's MCP/`gt` calls carry its OWN role-scoped identity instead of a blanket
+            // self-minted token. Best-effort: a mint/write failure logs and the mayor still launches.
+            if let (Some(at), Some(url)) = (&self.agent_token, &self.server_url) {
+                match at.token_for(&session, "mayor") {
+                    Ok(tok) => {
+                        crate::worktree::write_mcp_json(&self.workdir, url, &self.workspace, rig, &tok);
+                        crate::worktree::write_gt_config(&self.workdir, url, &self.workspace, rig, &tok);
+                        env.push(("GT_TOKEN".to_string(), tok));
+                    }
+                    Err(e) => eprintln!(
+                        "[mayor-dispatch] role-scoped token mint for mayor {rig} skipped: {e}"
+                    ),
+                }
+            }
             let mut args = self.args.clone();
             args.push(mayor_prompt(&self.workspace, rig));
             // Materialise the mayor's role skills + Knowledge (CLAUDE.md) + model config into its
@@ -819,6 +862,54 @@ mod tests {
             v["projects"]["/rig"]["hasTrustDialogAccepted"],
             serde_json::json!(true),
             "the mayor's workdir is pre-trusted so the session never stalls on the trust dialog",
+        );
+    }
+
+    #[tokio::test]
+    async fn tmux_waker_provisions_a_role_scoped_mcp_token_for_the_mayor() {
+        // gtcore-3f4d94: a mayor spawn mints a least-privilege token for the `mayor` role (its catalog
+        // scopes, never `*`) and writes a .mcp.json + .gt-config + GT_TOKEN — so the mayor's MCP/`gt`
+        // calls carry its OWN role-scoped identity, like the polecat sling, instead of self-minting a
+        // blanket token. Mirrors polecat::dispatch_mints_a_role_scoped_token_into_the_polecat_env.
+        use crate::polecat::{AgentTokenMinter, ScopeResolver};
+        use gt_auth::JwtMinter;
+        const TEST_PRIV: &[u8] = include_bytes!("../tests/fixtures/rs256_priv.pem");
+
+        let tmp = tempfile::tempdir().unwrap();
+        let workdir = tmp.path().join("rig");
+        std::fs::create_dir_all(&workdir).unwrap();
+        let fake = Arc::new(FakeTmux::new());
+        let resolver: ScopeResolver = Arc::new(|role| {
+            if role == "mayor" {
+                vec!["issues.read".to_string(), "merge.write".to_string()]
+            } else {
+                vec![]
+            }
+        });
+        let minter = JwtMinter::from_rsa_pem(TEST_PRIV).unwrap();
+        let at = AgentTokenMinter::new(minter, resolver, "default", 3600);
+        let w = TmuxMayorWaker::new(
+            fake.clone(),
+            "default",
+            DEFAULT_MAYOR_PREFIX,
+            workdir.clone(),
+            "claude",
+            vec!["--dangerously-skip-permissions".to_string()],
+            vec![("GT_ROLE".to_string(), "polecat".to_string())],
+            tmp.path().join("ch"),
+        )
+        .with_agent_token(at)
+        .with_server_url("http://127.0.0.1:8080");
+
+        w.wake("gtcore", &ids(&["gtcore-a"])).await.unwrap();
+
+        assert!(fake.has_session("mayor-gtcore"));
+        // A role-scoped .mcp.json was provisioned into the mayor's workdir (not a blanket self-mint).
+        assert!(workdir.join(".mcp.json").exists(), ".mcp.json provisioned for the mayor");
+        // GT_TOKEN is stamped so the mayor's `gt`/hooks carry the same role-scoped identity.
+        assert!(
+            fake.show_environment("mayor-gtcore", "GT_TOKEN").unwrap().is_some(),
+            "GT_TOKEN stamped on the mayor session",
         );
     }
 
