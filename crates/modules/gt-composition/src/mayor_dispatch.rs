@@ -478,6 +478,29 @@ impl MayorWaker for TmuxMayorWaker {
             // An `Err` (no account can authenticate) aborts the spawn so the mayor is never born in
             // 401; the rig is retried next tick while its frontier persists.
             let creds = self.resolve_credentials().await?;
+            // Pre-accept claude's first-run onboarding/trust dialogs in the dir the mayor will read,
+            // exactly like the polecat sling (gtcore-a01791). Without this a freshly-resolved
+            // CLAUDE_CONFIG_DIR stops the interactive `claude` at the "Is this a project you trust?"
+            // folder-trust gate over the mayor's workdir, and the autonomous session hangs forever
+            // (it never reads the frontier nor delegates — observed live 2026-06-28). Seed the
+            // EFFECTIVE dir claude reads (the resolved account's CLAUDE_CONFIG_DIR, else a static one
+            // baked into base_env, else `$HOME/.claude`) and trust `self.workdir`. Best-effort.
+            let effective_config_dir: Option<PathBuf> = creds
+                .as_ref()
+                .map(|c| PathBuf::from(&c.config_dir))
+                .or_else(|| {
+                    self.base_env
+                        .iter()
+                        .find(|(k, _)| k == "CLAUDE_CONFIG_DIR")
+                        .map(|(_, v)| PathBuf::from(v))
+                })
+                .or_else(|| {
+                    std::env::var_os("HOME").map(|h| Path::new(&h).join(".claude"))
+                });
+            if let Some(cd) = &effective_config_dir {
+                crate::worktree::seed_claude_onboarding(cd, &self.workdir);
+                crate::worktree::seed_user_hooks(cd);
+            }
             let env = self.session_env(rig, &wake_file, &session, creds.as_ref());
             let mut args = self.args.clone();
             args.push(mayor_prompt(&self.workspace, rig));
@@ -717,6 +740,37 @@ mod tests {
             .expect("attribution headers stamped");
         assert!(headers.contains("x-gt-account: acct-a"));
         assert!(headers.contains("x-gt-session: mayor-gtcore"));
+    }
+
+    #[tokio::test]
+    async fn tmux_waker_seeds_onboarding_and_trusts_the_workdir_on_spawn() {
+        // gtcore-a01791: a mayor spawn must pre-accept claude's first-run onboarding + trust the
+        // workdir in the dir claude reads, or the interactive session hangs on the "Is this a project
+        // you trust?" dialog and never delegates. Mirrors the polecat sling's seed_claude_onboarding.
+        use gt_quota::InMemoryKeychain;
+        let tmp = tempfile::tempdir().unwrap();
+        let acct_dir = tmp.path().join("acct-a");
+        std::fs::create_dir_all(&acct_dir).unwrap();
+        let keychain: Arc<dyn Keychain> =
+            Arc::new(InMemoryKeychain::seeded([("acct-a", acct_dir.to_str().unwrap())]));
+        keychain.set_active("acct-a").unwrap();
+        let fake = Arc::new(FakeTmux::new());
+        // waker() uses workdir /rig.
+        let w = waker(fake.clone(), tmp.path()).with_keychain(keychain);
+
+        w.wake("gtcore", &ids(&["gtcore-a"])).await.unwrap();
+
+        // The resolved account's config dir got the onboarding + folder-trust seed for /rig.
+        let claude_json = acct_dir.join(".claude.json");
+        let v: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&claude_json).unwrap()).unwrap();
+        assert_eq!(v["hasCompletedOnboarding"], serde_json::json!(true));
+        assert_eq!(v["bypassPermissionsModeAccepted"], serde_json::json!(true));
+        assert_eq!(
+            v["projects"]["/rig"]["hasTrustDialogAccepted"],
+            serde_json::json!(true),
+            "the mayor's workdir is pre-trusted so the session never stalls on the trust dialog",
+        );
     }
 
     #[tokio::test]
