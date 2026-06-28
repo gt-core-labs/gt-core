@@ -466,6 +466,10 @@ async fn main() -> anyhow::Result<()> {
     let role_agent_token = role_agents_on
         .then(|| agent_token.clone())
         .flatten();
+    // The mayor waker mints the SAME least-privilege per-agent token as the polecat/role-agent paths
+    // (gtcore-3f4d94), so the mayor's MCP/`gt` calls carry its role-scoped identity. Clone before
+    // `agent_token` is moved into the polecat plugin below.
+    let mayor_agent_token = agent_token.clone();
 
     // Claude-account keychain for predictive rotation (hq-agent-provisioning.7). GT_CLAUDE_ACCOUNTS
     // is a comma list of `account=CLAUDE_CONFIG_DIR` pairs; the first is the boot-active account.
@@ -1189,6 +1193,14 @@ async fn main() -> anyhow::Result<()> {
                     // Materialise the mayor's role skills + Knowledge from the `skills.*` catalog at
                     // spawn, the same shared path as the polecat sling (gtcore-ec24d2).
                     waker = waker.with_event_log(knowledge_log.clone());
+                    // Role-scoped MCP token + .mcp.json/.gt-config for the mayor (gtcore-3f4d94), like
+                    // the polecat/role-agent paths — so its MCP calls honour the mayor's /agents scopes.
+                    if let Some(tm) = &mayor_agent_token {
+                        waker = waker.with_agent_token(tm.clone());
+                    }
+                    if let Some(url) = std::env::var("GT_SELF_URL").ok().filter(|v| !v.is_empty()) {
+                        waker = waker.with_server_url(url);
+                    }
                     let dispatcher =
                         Arc::new(gt_composition::mayor_dispatch::MayorDispatcher::new(source, waker));
                     mayor_dispatch_task =
