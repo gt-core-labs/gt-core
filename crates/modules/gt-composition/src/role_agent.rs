@@ -9,6 +9,13 @@
 //! recover vs. needs a human, read a closed bead's acceptance criteria and tell whether the work
 //! actually met them, or spot a contradiction in the flow. Those need a *reasoning agent*.
 //!
+//! The contrast case is the merge [`refinery`](gt_merge::refinery): for every MERGE_READY message
+//! there is exactly one correct, mechanical action (decode → `Submit`), so a reasoning agent adds
+//! nothing there — it stays an in-process I/O bridge. The criterion is therefore: *an agent earns
+//! its place only where a non-trivial judgment lives* (recover-or-escalate a failed slot, verify a
+//! closed bead met its AC); pure deterministic plumbing stays in-process. The sheriff sits one
+//! layer above the refinery and keeps it as the mechanical fallback.
+//!
 //! But a reasoning agent that idles in a loop burns tokens for nothing between events. So the
 //! design here is **event-triggered, single-shot** agents: a role is slung with a kickoff prompt
 //! ONLY when its trigger fires (sheriff ← `merge.failed.v1`/`merge.ready.v1`; witness ←

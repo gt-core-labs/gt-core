@@ -8,6 +8,26 @@
 //!
 //! At-least-once: el `ack` ocurre **después** de empujar el `Submit` al actor. Si el
 //! proceso muere entre ambos pasos, el archivo sigue ahí y la próxima refinery reanudará.
+//!
+//! ## Criterio: por qué la refinery NO es un agente (gtcore-f2ac1d)
+//!
+//! El epic `orchd→mayor→polecats` pregunta *dónde aporta un agente con criterio por encima del
+//! loop in-process*. La refinery es el caso **negativo** canónico de ese criterio: para cada
+//! mensaje MERGE_READY existe **exactamente una acción correcta** — decodificar el payload y
+//! empujar un `Submit` al actor (o ackear un payload corrupto). No hay juicio que ejercer,
+//! ningún estado que interpretar, ninguna decisión no trivial; un agente razonando aquí solo
+//! quemaría tokens para reproducir lo que un `match` de tres ramas ya hace de forma determinista
+//! y barata. Por eso la refinery se queda **in-process** (puente de I/O puro), supervisada por
+//! `gt_polecat::supervise_daemon` para la única recuperación que necesita —la *mecánica*:
+//! reinicio con backoff si la subscripción al canal cae.
+//!
+//! El juicio vive una capa **más arriba**, en el `sheriff` (ver `gt_composition::role_agent`):
+//! el sheriff es el agente con criterio que se dispara por `merge.failed.v1`/`merge.ready.v1` y
+//! decide lo que un loop no puede —si un slot fallido es recuperable con seguridad, si reordenar
+//! o desbloquear la cola, o si escalar a un humano. Reparto resultante: **refinery = bridge
+//! determinista in-process; sheriff = criterio event-triggered single-shot**. El sheriff
+//! conserva la refinery in-process como fallback mecánico, nunca la reemplaza — que es justo el
+//! "manteniendo el fallback in-process" del criterio de aceptación.
 
 use gt_channel::Channel;
 
