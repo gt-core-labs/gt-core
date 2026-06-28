@@ -1186,6 +1186,9 @@ async fn main() -> anyhow::Result<()> {
                     if let Some(url) = &anthropic_proxy_url {
                         waker = waker.with_anthropic_proxy(url.clone());
                     }
+                    // Materialise the mayor's role skills + Knowledge from the `skills.*` catalog at
+                    // spawn, the same shared path as the polecat sling (gtcore-ec24d2).
+                    waker = waker.with_event_log(knowledge_log.clone());
                     let dispatcher =
                         Arc::new(gt_composition::mayor_dispatch::MayorDispatcher::new(source, waker));
                     mayor_dispatch_task =

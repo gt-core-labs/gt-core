@@ -1082,53 +1082,22 @@ impl Plugin for PolecatSupervisorPlugin {
                         SkillState::apply,
                     ) {
                         Ok(state) => {
-                            // SKILL.md bodies → <worktree>/.claude/skills/<id>/SKILL.md
-                            // (hq-polecat-skills.1): mirrors terminal.rs::prepare_role_skills so
-                            // the polecat loads the same skill bodies as an interactive role
-                            // session. Best-effort per skill — one write failure never skips the
-                            // rest.
-                            let skills_dir = spec.workdir.join(".claude").join("skills");
-                            for id in state.catalog.skills_for_role(role) {
-                                let Some(skill) = state.catalog.get(&id) else {
-                                    continue;
-                                };
-                                if skill.body.trim().is_empty() {
-                                    continue;
-                                }
-                                let dir = skills_dir.join(&id);
-                                if let Err(e) = std::fs::create_dir_all(&dir)
-                                    .and_then(|_| std::fs::write(dir.join("SKILL.md"), &skill.body))
-                                {
-                                    eprintln!(
-                                        "[polecat] skill {id} write for {bead} skipped: {e}"
-                                    );
-                                }
-                            }
-                            // Role prompt → CLAUDE.md (hq-polecat-knowledge.1)
-                            if let Some(prompt) = state.catalog.role_prompt(role) {
-                                let rendered = crate::terminal::render_prompt(
-                                    &prompt,
-                                    &[
-                                        ("workspace", self.workspace.clone()),
-                                        ("bead", bead.clone()),
-                                        ("branch", bead.clone()),
-                                    ],
-                                );
-                                if let Err(e) =
-                                    std::fs::write(spec.workdir.join("CLAUDE.md"), &rendered)
-                                {
-                                    eprintln!(
-                                        "[polecat] CLAUDE.md write for role {role} in {} skipped: {e}",
-                                        spec.workdir.display()
-                                    );
-                                }
-                            }
-                            // Role model config (hq-b185a4): the same navbar-configured
-                            // RoleModelSet the terminal applies to interactive sessions —
-                            // stamp --model/--effort onto the polecat launch so Agents →
-                            // Model governs autonomous agents too. permission_mode is
-                            // deliberately NOT applied here (hq-e90522): see apply_role_model.
-                            if let Some(model) = state.catalog.role_model(role) {
+                            // SKILL.md bodies + Knowledge→CLAUDE.md + model config, via the SHARED
+                            // role-session materialiser (gtcore-ec24d2) — the SAME pattern every role
+                            // launch follows (polecat sling, mayor, …), so an autonomous polecat loads
+                            // the same skills/CLAUDE.md the apparatus gives an interactive role session.
+                            // permission_mode is deliberately NOT applied here (hq-e90522): see
+                            // apply_role_model.
+                            if let Some(model) = crate::role_session::materialize_role_session(
+                                &state.catalog,
+                                role,
+                                &spec.workdir,
+                                &[
+                                    ("workspace", self.workspace.clone()),
+                                    ("bead", bead.clone()),
+                                    ("branch", bead.clone()),
+                                ],
+                            ) {
                                 apply_role_model(&mut spec.args, &model);
                             }
                         }
