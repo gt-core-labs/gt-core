@@ -547,6 +547,26 @@ impl MayorWaker for TmuxMayorWaker {
                         ) {
                             crate::polecat::apply_role_model(&mut args, &model);
                         }
+                        // Permissions are catalog data (gtcore-d175ec) read from the DB. Backfill the
+                        // apparatus default once (idempotent), then overlay the mayor's permission
+                        // model onto the settings.json seed_user_hooks wrote into its config dir.
+                        let now_secs = SystemTime::now()
+                            .duration_since(UNIX_EPOCH)
+                            .map(|d| d.as_secs())
+                            .unwrap_or(0);
+                        for ev in state.catalog.role_permissions_migration(now_secs) {
+                            let _ = log.append(Some(&self.workspace), ev);
+                        }
+                        if let Some(cd) = &effective_config_dir {
+                            let perms = crate::role_session::role_permissions_or_default(
+                                &state.catalog,
+                                "mayor",
+                            );
+                            crate::role_session::overlay_permissions(
+                                &cd.join("settings.json"),
+                                &perms,
+                            );
+                        }
                     }
                     Err(e) => eprintln!(
                         "[mayor-dispatch] skills replay failed — no role skills/CLAUDE.md for mayor {rig}: {e}"

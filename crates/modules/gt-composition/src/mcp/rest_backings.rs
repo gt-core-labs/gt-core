@@ -474,6 +474,13 @@ impl WorkspaceSkills for EventLogSkills {
             self.log.append(Some(workspace), ev.clone()).map_err(lift)?;
             state.apply(&ev);
         }
+        // gtcore-d175ec: same boot/read-seam cutover for the per-role permission model — seed the
+        // apparatus default into roles with none yet, so the catalog (the DB) is the source the
+        // launch reads permissions from. Durable + idempotent (a migrated binding is skipped).
+        for ev in state.catalog.role_permissions_migration(now_secs()) {
+            self.log.append(Some(workspace), ev.clone()).map_err(lift)?;
+            state.apply(&ev);
+        }
         Ok(state.catalog)
     }
 }
