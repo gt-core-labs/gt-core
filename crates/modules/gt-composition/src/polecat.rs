@@ -548,6 +548,47 @@ impl PolecatSupervisorPlugin {
         true
     }
 
+    /// Reclaim a finished polecat's git worktree (gtcore-acacfb). Each sling provisions
+    /// `<root>/<session>` carrying a full cargo `target/` (tens of GB); without teardown they pile
+    /// up and fill the disk (107 trees / 372 GB found 2026-06-28 — a co-cause of the etcd
+    /// I/O-saturation incident). Called when a session ENDS for good (clean exit or a kill that is
+    /// NOT a context-exhaustion continuation, which reuses the same tree). Tries every `(base, root)`
+    /// the router could have used for this session. Best-effort + idempotent: a session with no
+    /// worktree is a no-op, and a `git worktree remove` failure (dirty/leftover tree) falls back to
+    /// `rm -rf` so the space is reclaimed regardless.
+    fn cleanup_worktree(&self, session: &str) {
+        let mut pairs: Vec<(&std::path::Path, &std::path::Path)> = Vec::new();
+        if let Some(root) = &self.worktree_root {
+            pairs.push((self.template.workdir.as_path(), root.as_path()));
+        }
+        for cfg in self.rig_configs.values() {
+            if let Some(root) = &cfg.worktree_root {
+                pairs.push((cfg.template.workdir.as_path(), root.as_path()));
+            }
+        }
+        for (base, root) in pairs {
+            let path = root.join(session);
+            if !path.exists() {
+                continue;
+            }
+            match crate::worktree::remove(base, &path) {
+                Ok(()) => eprintln!("[polecat] worktree GC: removed {}", path.display()),
+                Err(e) => {
+                    eprintln!(
+                        "[polecat] worktree GC: git remove failed for {} ({e}) — rm -rf fallback",
+                        path.display()
+                    );
+                    if let Err(e) = std::fs::remove_dir_all(&path) {
+                        eprintln!(
+                            "[polecat] worktree GC: rm -rf also failed for {}: {e}",
+                            path.display()
+                        );
+                    }
+                }
+            }
+        }
+    }
+
     /// Re-sling a polecat that died of context exhaustion, handing the next agent a continuation
     /// prompt instead of the original kickoff (gtcore-3b2a68).
     ///
@@ -1305,6 +1346,9 @@ impl Plugin for PolecatSupervisorPlugin {
                     self.resling_on_context_exhaustion(&session, &reason).await;
                 } else {
                     self.release_slot_for(&session);
+                    // gtcore-acacfb: the session is dead and won't continue (a re-sling gets a
+                    // fresh session id + tree) — reclaim its worktree so /rig-wt stops leaking.
+                    self.cleanup_worktree(&session);
                 }
                 Ok(())
             }
@@ -1318,6 +1362,9 @@ impl Plugin for PolecatSupervisorPlugin {
                     return Ok(());
                 };
                 self.release_slot_for(&session);
+                // gtcore-acacfb: clean exit (or post-merge) — the session is finished, reclaim its
+                // worktree's tens-of-GB cargo target so /rig-wt does not leak.
+                self.cleanup_worktree(&session);
                 Ok(())
             }
             _ => Ok(()),
