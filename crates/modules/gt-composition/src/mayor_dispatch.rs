@@ -40,9 +40,11 @@ use gt_mcp_server::bead_prefix;
 use gt_polecat::Tmux;
 use gt_quota::{AccountQuotaStatus, Keychain, QuotaHandle};
 use gt_runtime::{BeadId, ReadySource};
+use gt_skills::SkillState;
 use tokio::task::JoinHandle;
 
 use crate::credential_guard::{resolve_for_sling, CredOutcome, ResolvedCredentials};
+use crate::mcp::eventlog::EventLog;
 
 /// Why waking a mayor failed. Opaque to the policy core, which only needs to know
 /// a wake succeeded or failed (a failed rig is simply retried next tick).
@@ -295,6 +297,12 @@ pub struct TmuxMayorWaker {
     /// `x-gt-account`/`x-gt-session` attribution headers, so the mayor's spend feeds per-call quota
     /// truth like a polecat's. `None` ⇒ the mayor talks to the API directly.
     anthropic_proxy_url: Option<String>,
+    /// Event log for the `skills.*` catalog (gtcore-ec24d2). When set, a mayor spawn materialises its
+    /// role skills + Knowledge (`CLAUDE.md`) + model config into its workdir through the SAME shared
+    /// path every role uses ([`crate::role_session::materialize_role_session`]), so the mayor loads
+    /// its mayor-role config like a polecat/terminal session. `None` ⇒ no role materialisation
+    /// (legacy: the mayor opens with the repo's generic `CLAUDE.md` and no role skills).
+    event_log: Option<Arc<EventLog>>,
 }
 
 impl TmuxMayorWaker {
@@ -324,7 +332,16 @@ impl TmuxMayorWaker {
             keychain: None,
             quota: None,
             anthropic_proxy_url: None,
+            event_log: None,
         }
+    }
+
+    /// Wire the `skills.*` catalog event log so a mayor spawn materialises its role skills +
+    /// Knowledge + model config like a polecat sling (gtcore-ec24d2). Without it the mayor opens with
+    /// no role config.
+    pub fn with_event_log(mut self, log: Arc<EventLog>) -> Self {
+        self.event_log = Some(log);
+        self
     }
 
     /// Wire the claude-account keychain so a mayor spawn resolves + validates credentials like a
@@ -504,6 +521,38 @@ impl MayorWaker for TmuxMayorWaker {
             let env = self.session_env(rig, &wake_file, &session, creds.as_ref());
             let mut args = self.args.clone();
             args.push(mayor_prompt(&self.workspace, rig));
+            // Materialise the mayor's role skills + Knowledge (CLAUDE.md) + model config into its
+            // workdir via the SHARED role-session path every role uses (gtcore-ec24d2), so the mayor
+            // loads its mayor-role config like a polecat/terminal session instead of opening with the
+            // repo's generic CLAUDE.md and no skills. Best-effort: a replay/IO failure logs and the
+            // mayor still launches; a configured RoleModel is stamped onto its launch args.
+            if let Some(log) = &self.event_log {
+                match log.replay_domain(
+                    Some(&self.workspace),
+                    "skills.",
+                    SkillState::default(),
+                    SkillState::apply,
+                ) {
+                    Ok(state) => {
+                        if let Some(model) = crate::role_session::materialize_role_session(
+                            &state.catalog,
+                            "mayor",
+                            &self.workdir,
+                            &[
+                                ("workspace", self.workspace.clone()),
+                                ("rig", rig.to_string()),
+                                ("RigName", rig.to_string()),
+                                ("WorkDir", self.workdir.display().to_string()),
+                            ],
+                        ) {
+                            crate::polecat::apply_role_model(&mut args, &model);
+                        }
+                    }
+                    Err(e) => eprintln!(
+                        "[mayor-dispatch] skills replay failed — no role skills/CLAUDE.md for mayor {rig}: {e}"
+                    ),
+                }
+            }
             self.tmux
                 .new_session(&session, &self.workdir, &self.command, &args, &env)
                 .map_err(|e| MayorWakeError(format!("spawn mayor session {session}: {e}")))?;
