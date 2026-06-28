@@ -273,18 +273,8 @@ fn prepare_role_skills(
         let _ = log.append(Some(workspace), ev.clone());
         state.apply(&ev);
     }
-    // gtcore-d175ec: same cutover for the per-role permission model — backfill the apparatus default
-    // into roles with none yet so the launch reads permissions from the catalog (the DB), not a
-    // hardcoded constant. Durable + idempotent; best-effort.
-    for ev in state.catalog.role_permissions_migration(migrate_now) {
-        let _ = log.append(Some(workspace), ev.clone());
-        state.apply(&ev);
-    }
     let catalog = state.catalog;
     let model = catalog.role_model(&role); // hq-role-model.1 — applies regardless of skills/prompt
-    // The role's permission model from the catalog (the DB), apparatus default until migrated — the
-    // `settings.json` `permissions` block this session materialises (gtcore-d175ec).
-    let permissions = crate::role_session::role_permissions_or_default(&catalog, &role).to_settings_json();
     let skill_ids = catalog.skills_for_role(&role);
     let prompt = catalog.role_prompt(&role); // hq-role-skills-term.4
                                              // The GLOBAL hook registry (hq-hooks): replay the `hooks.*` stream at the `None` scope and keep
@@ -382,7 +372,7 @@ fn prepare_role_skills(
     // claude auto-loads as project settings (hq-hooks). `enabledMcpjsonServers` pre-approves the
     // `gt` server so the role's claude loads it without the interactive project-MCP trust prompt
     // (hq-role-mcp). A session whose role has no skills/prompt still gets a workdir for these files.
-    if let Some(settings) = build_settings(hooks_settings, mcp_enabled, costs_report, Some(permissions)) {
+    if let Some(settings) = build_settings(hooks_settings, mcp_enabled, costs_report) {
         let claude_dir = workdir.join(".claude");
         if std::fs::create_dir_all(&claude_dir).is_ok() {
             if let Ok(body) = serde_json::to_string_pretty(&settings) {
@@ -508,18 +498,11 @@ fn build_settings(
     hooks: Option<serde_json::Value>,
     mcp_enabled: bool,
     costs_report: bool,
-    permissions: Option<serde_json::Value>,
 ) -> Option<serde_json::Value> {
-    if hooks.is_none() && !mcp_enabled && !costs_report && permissions.is_none() {
+    if hooks.is_none() && !mcp_enabled && !costs_report {
         return None;
     }
     let mut v = hooks.unwrap_or_else(|| serde_json::json!({}));
-    // The role's permission model comes from the catalog (the DB), passed in by the caller
-    // (gtcore-d175ec) — NOT a hardcoded constant. Every role's session settings carry it, so an
-    // interactive/role session gets the memory-guard `deny` + mode just like a slung polecat.
-    if let (Some(obj), Some(perms)) = (v.as_object_mut(), permissions) {
-        obj.insert("permissions".into(), perms);
-    }
     if mcp_enabled {
         if let Some(obj) = v.as_object_mut() {
             obj.insert("enabledMcpjsonServers".into(), serde_json::json!(["gt"]));
@@ -1917,59 +1900,30 @@ mod tests {
         assert!(named.contains(r#"refresh_token = """#));
     }
 
-    fn perms() -> Option<serde_json::Value> {
-        Some(gt_skills::default_role_permissions().to_settings_json())
-    }
-
     #[test]
     fn build_settings_merges_mcp_enable_flag_with_hooks() {
         // hq-role-mcp: enable flag rides alongside any hooks; nothing to write ⇒ None.
-        assert!(build_settings(None, false, false, None).is_none());
+        assert!(build_settings(None, false, false).is_none());
 
-        let only_mcp = build_settings(None, true, false, None).unwrap();
+        let only_mcp = build_settings(None, true, false).unwrap();
         assert_eq!(only_mcp["enabledMcpjsonServers"], serde_json::json!(["gt"]));
 
         let hooks = serde_json::json!({ "hooks": { "PreToolUse": [] } });
-        let merged = build_settings(Some(hooks), true, false, None).unwrap();
+        let merged = build_settings(Some(hooks), true, false).unwrap();
         assert_eq!(merged["enabledMcpjsonServers"], serde_json::json!(["gt"]));
         assert!(merged["hooks"]["PreToolUse"].is_array());
 
         // Hooks present but MCP off ⇒ the flag is absent.
         let hooks = serde_json::json!({ "hooks": {} });
-        let no_mcp = build_settings(Some(hooks), false, false, None).unwrap();
+        let no_mcp = build_settings(Some(hooks), false, false).unwrap();
         assert!(no_mcp.get("enabledMcpjsonServers").is_none());
-    }
-
-    #[test]
-    fn build_settings_carries_the_permission_model_passed_by_the_caller() {
-        // gtcore-d175ec: the permission model is catalog data (the DB), passed in by the caller — NOT
-        // a hardcoded constant. build_settings just carries whatever `permissions` it is handed, and a
-        // session with ONLY permissions still earns a settings.json.
-        for v in [
-            build_settings(None, true, false, perms()).unwrap(),  // mcp + perms
-            build_settings(None, false, true, perms()).unwrap(),  // costs + perms
-            build_settings(None, false, false, perms()).unwrap(), // perms alone earns a settings.json
-        ] {
-            assert_eq!(v["permissions"]["defaultMode"], "bypassPermissions");
-            let deny = v["permissions"]["deny"].as_array().unwrap();
-            assert!(deny.iter().any(|r| r == "Write(**/memory/**.md)"));
-            assert!(deny.iter().any(|r| r == "Edit(**/memory/**.md)"));
-            // The stale MultiEdit deny rule (no longer a known tool) is gone.
-            assert!(!deny.iter().any(|r| r == "MultiEdit(**/memory/**.md)"));
-        }
-        // No permissions passed + nothing else ⇒ None (no settings.json).
-        assert!(build_settings(None, false, false, None).is_none());
-        // No permissions passed but hooks present ⇒ settings without a permissions key.
-        let hooks_only =
-            build_settings(Some(serde_json::json!({ "hooks": {} })), false, false, None).unwrap();
-        assert!(hooks_only.get("permissions").is_none());
     }
 
     #[test]
     fn build_settings_appends_the_quota_feed_stop_hook_when_costs_report() {
         // hq-quota-feed: costs_report alone earns a settings.json carrying the quota-feed Stop hook,
         // so an interactive session reports token usage to predictive rotation just like a polecat.
-        let only_costs = build_settings(None, false, true, None).expect("costs report ⇒ settings");
+        let only_costs = build_settings(None, false, true).expect("costs report ⇒ settings");
         let stop = only_costs["hooks"]["Stop"]
             .as_array()
             .expect("Stop hook array");
@@ -1980,11 +1934,11 @@ mod tests {
 
         // It rides ALONGSIDE existing global hooks (a Stop hook is appended, not clobbered).
         let hooks = serde_json::json!({ "hooks": { "Stop": [ { "matcher": "", "hooks": [] } ] } });
-        let merged = build_settings(Some(hooks), false, true, None).unwrap();
+        let merged = build_settings(Some(hooks), false, true).unwrap();
         assert_eq!(merged["hooks"]["Stop"].as_array().unwrap().len(), 2);
 
         // No costs report ⇒ no Stop hook injected.
-        let none = build_settings(None, true, false, None).unwrap();
+        let none = build_settings(None, true, false).unwrap();
         assert!(none.get("hooks").is_none());
     }
 }

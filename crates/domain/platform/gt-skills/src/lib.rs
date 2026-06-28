@@ -50,6 +50,6 @@ pub use module::SkillsModule;
 pub use presets::agent_least_privilege_catalog;
 pub use repo::{InMemorySkills, SkillsRepository};
 pub use state::{
-    default_role_permissions, validate_role_name, validate_skill_id, ModelConfig, RoleBinding,
-    RolePermissions, Skill, SkillCatalog, SkillState, MAX_SKILL_ID_LEN,
+    validate_role_name, validate_skill_id, ModelConfig, RoleBinding, Skill, SkillCatalog,
+    SkillState, MAX_SKILL_ID_LEN,
 };

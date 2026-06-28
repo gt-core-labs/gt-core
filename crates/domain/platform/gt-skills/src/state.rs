@@ -101,59 +101,6 @@ impl ModelConfig {
     }
 }
 
-/// A role's claude permission model (`gtcore-d175ec`): the `settings.json` `permissions` block every
-/// launch materialises for a session of that role. A first-class per-role catalog attribute — read
-/// from the DB at launch like [`ModelConfig`], never hardcoded in the launch assembler. The default
-/// lives in the seed/migration ([`default_role_permissions`] / [`SkillCatalog::role_permissions_migration`]),
-/// the apparatus layer, so the operator can edit it.
-#[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct RolePermissions {
-    /// claude `permissions.defaultMode` (e.g. `bypassPermissions`); empty ⇒ unset.
-    #[serde(default)]
-    pub default_mode: String,
-    /// claude `permissions.deny` rules (e.g. `Write(**/memory/**.md)`).
-    #[serde(default)]
-    pub deny: Vec<String>,
-}
-
-impl RolePermissions {
-    /// `true` when nothing is set — the role carries no permission block, so the launch writes none.
-    /// The `role_permissions` accessor collapses an all-empty value to `None`.
-    pub fn is_unset(&self) -> bool {
-        self.default_mode.trim().is_empty() && self.deny.is_empty()
-    }
-
-    /// Render as the claude `settings.json` `permissions` object (`{ defaultMode, deny }`), omitting
-    /// an empty `defaultMode`. The single shape every launch path writes.
-    pub fn to_settings_json(&self) -> serde_json::Value {
-        let mut obj = serde_json::Map::new();
-        if !self.default_mode.trim().is_empty() {
-            obj.insert(
-                "defaultMode".into(),
-                serde_json::Value::String(self.default_mode.clone()),
-            );
-        }
-        obj.insert("deny".into(), serde_json::json!(self.deny));
-        serde_json::Value::Object(obj)
-    }
-}
-
-/// The apparatus DEFAULT permission model (`gtcore-d175ec`) — the seed value the operator can later
-/// edit from agents. `bypassPermissions` so autonomous agents never stop at an interactive prompt,
-/// plus the memory-guard `deny` (the declarative backstop to the PreToolUse guard: memories are
-/// saved via the `memory.save` MCP tool, never by writing the `*/memory/*.md` corpus). This lives in
-/// the catalog layer — NOT in any launch assembler — and is materialised into the DB by
-/// [`SkillCatalog::role_permissions_migration`] + [`crate::presets::workspace_seed_events`].
-pub fn default_role_permissions() -> RolePermissions {
-    RolePermissions {
-        default_mode: "bypassPermissions".into(),
-        deny: vec![
-            "Write(**/memory/**.md)".into(),
-            "Edit(**/memory/**.md)".into(),
-        ],
-    }
-}
-
 /// Per-role binding. `BTreeSet` so iteration is deterministic across replay.
 #[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RoleBinding {
@@ -176,14 +123,6 @@ pub struct RoleBinding {
     /// `default_scopes`). `#[serde(default)]` keeps pre-`hq-role-scopes` bindings replayable.
     #[serde(default)]
     pub scopes: Vec<String>,
-    /// The role's claude permission model (`gtcore-d175ec`): the `settings.json` `permissions` block
-    /// every launch materialises for a session of this role — the FOURTH per-role attribute,
-    /// symmetric to [`prompt`](Self::prompt) / [`model_config`](Self::model_config) /
-    /// [`scopes`](Self::scopes). Read from the catalog (the DB) at launch, never hardcoded. Empty
-    /// until a `RolePermissionsSet` lands (or the one-shot migration seeds the apparatus default).
-    /// `#[serde(default)]` keeps pre-`gtcore-d175ec` bindings replayable.
-    #[serde(default)]
-    pub permissions: RolePermissions,
 }
 
 impl RoleBinding {
@@ -194,7 +133,6 @@ impl RoleBinding {
             prompt: String::new(),
             model_config: ModelConfig::default(),
             scopes: Vec::new(),
-            permissions: RolePermissions::default(),
         }
     }
 }
@@ -271,17 +209,6 @@ impl SkillCatalog {
             .get(role)
             .map(|b| b.scopes.clone())
             .unwrap_or_default()
-    }
-
-    /// The role's claude permission model (`gtcore-d175ec`); `None` when unset (all-empty), so the
-    /// launch writes no `permissions` block for it. The symmetric sibling of
-    /// [`role_prompt`](Self::role_prompt) / [`role_model`](Self::role_model) /
-    /// [`role_scopes`](Self::role_scopes) — the SINGLE source the launch reads from the DB.
-    pub fn role_permissions(&self, role: &str) -> Option<RolePermissions> {
-        self.bindings
-            .get(role)
-            .map(|b| b.permissions.clone())
-            .filter(|p| !p.is_unset())
     }
 
     /// All skills enabled for `role`, in stable order. Empty when the role has no
@@ -367,29 +294,6 @@ impl SkillCatalog {
         events
     }
 
-    /// One-shot idempotent backfill (`gtcore-d175ec`) seeding the apparatus DEFAULT permission model
-    /// ([`default_role_permissions`]) into every role binding that has none yet — the same cutover
-    /// shape as [`role_scopes_migration`](Self::role_scopes_migration). Run at read-time on the
-    /// replayed (DB) catalog, then appended, so a live catalog seeded before this attribute existed
-    /// gains the default without losing it on the next replay. Never clobbers an operator-set value
-    /// (a binding with permissions already set is skipped). Returns the events to append.
-    pub fn role_permissions_migration(&self, now_secs: u64) -> Vec<SkillEvent> {
-        let default = default_role_permissions();
-        let mut events = Vec::new();
-        for binding in self.bindings.values() {
-            if !binding.permissions.is_unset() {
-                continue; // already migrated or operator-set — never clobber
-            }
-            events.push(SkillEvent::RolePermissionsSet {
-                role: binding.role.clone(),
-                default_mode: default.default_mode.clone(),
-                deny: default.deny.clone(),
-                now_secs,
-            });
-        }
-        events
-    }
-
     // -- mutation helpers (the only writers, consulted by both `commands::execute`
     //    and `SkillState::apply` so the live state and the rebuilt state stay in
     //    lockstep).
@@ -439,15 +343,6 @@ impl SkillCatalog {
             .entry(role.to_string())
             .or_insert_with(|| RoleBinding::new(role))
             .scopes = scopes.to_vec();
-    }
-
-    pub(crate) fn apply_set_role_permissions(&mut self, role: &str, permissions: RolePermissions) {
-        // Materialise the binding on first permissions-set so a role can carry permissions before any
-        // skill — symmetric with the other per-role setters. A scalar overwrite (the full value).
-        self.bindings
-            .entry(role.to_string())
-            .or_insert_with(|| RoleBinding::new(role))
-            .permissions = permissions;
     }
 
     pub(crate) fn apply_disable(&mut self, role: &str, skill: &str) {
@@ -525,20 +420,6 @@ impl SkillState {
             }
             SkillEvent::RoleScopesSet { role, scopes, .. } => {
                 self.catalog.apply_set_role_scopes(role, scopes);
-            }
-            SkillEvent::RolePermissionsSet {
-                role,
-                default_mode,
-                deny,
-                ..
-            } => {
-                self.catalog.apply_set_role_permissions(
-                    role,
-                    RolePermissions {
-                        default_mode: default_mode.clone(),
-                        deny: deny.clone(),
-                    },
-                );
             }
         }
     }
@@ -829,57 +710,6 @@ mod tests {
         assert_eq!(
             s.catalog.scopes_for_roles(&["polecat".into()]),
             vec!["memory.read".to_string(), "memory.write".to_string()]
-        );
-    }
-
-    #[test]
-    fn role_permissions_migration_seeds_apparatus_default_idempotently() {
-        // gtcore-d175ec: the one-shot migration seeds the apparatus DEFAULT permission model into
-        // every role binding that has none yet, so the now-direct `role_permissions` read resolves a
-        // value from the catalog (the DB) instead of a hardcoded launch constant.
-        let mut s = SkillState::default();
-        s.apply(&registered("bead-work", &["issues.read"], 1));
-        s.apply(&enabled("polecat", "bead-work", 2));
-        s.apply(&enabled("mayor", "bead-work", 3));
-
-        // Pre-migration: no permission model on disk → the launch would write none.
-        assert!(s.catalog.role_permissions("polecat").is_none());
-
-        let events = s.catalog.role_permissions_migration(10);
-        assert_eq!(events.len(), 2, "one RolePermissionsSet per bound role");
-        for ev in &events {
-            s.apply(ev);
-        }
-
-        // Both roles now resolve the apparatus default from the catalog.
-        let want = default_role_permissions();
-        assert_eq!(s.catalog.role_permissions("polecat").as_ref(), Some(&want));
-        assert_eq!(s.catalog.role_permissions("mayor").as_ref(), Some(&want));
-        assert_eq!(want.default_mode, "bypassPermissions");
-        assert!(want.deny.iter().any(|d| d == "Write(**/memory/**.md)"));
-        // The rendered settings.json shape: { defaultMode, deny:[...] }, no stale MultiEdit rule.
-        let json = want.to_settings_json();
-        assert_eq!(json["defaultMode"], "bypassPermissions");
-        assert!(!json["deny"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|d| d == "MultiEdit(**/memory/**.md)"));
-
-        // Idempotent: a second pass emits nothing — an operator-set/seeded value is never clobbered.
-        assert!(s.catalog.role_permissions_migration(11).is_empty());
-
-        // Operator override survives: setting a custom value is not reseeded.
-        s.apply(&SkillEvent::RolePermissionsSet {
-            role: "mayor".into(),
-            default_mode: "bypassPermissions".into(),
-            deny: vec!["Write(**/secret/**)".into()],
-            now_secs: 12,
-        });
-        assert!(s.catalog.role_permissions_migration(13).is_empty());
-        assert_eq!(
-            s.catalog.role_permissions("mayor").unwrap().deny,
-            vec!["Write(**/secret/**)".to_string()]
         );
     }
 

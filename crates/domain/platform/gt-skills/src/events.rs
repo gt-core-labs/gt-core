@@ -75,21 +75,6 @@ pub enum SkillEvent {
         scopes: Vec<String>,
         now_secs: u64,
     },
-    /// A role's claude permission model was set (`gtcore-d175ec`): the `settings.json` `permissions`
-    /// block — `defaultMode` + `deny` rules — every launch materialises for a session of that role.
-    /// The FOURTH per-role attribute alongside [`RolePromptSet`](Self::RolePromptSet) /
-    /// [`RoleModelSet`](Self::RoleModelSet) / [`RoleScopesSet`](Self::RoleScopesSet): read from the
-    /// catalog (the DB) at launch, never hardcoded. The FULL intended value (a scalar overwrite, not
-    /// a delta); an all-empty value clears it. Also the carrier of the one-shot migration that seeds
-    /// the apparatus default into a live catalog at cutover.
-    RolePermissionsSet {
-        role: String,
-        /// claude `permissions.defaultMode` (e.g. `bypassPermissions`); empty ⇒ unset.
-        default_mode: String,
-        /// claude `permissions.deny` rules (e.g. `Write(**/memory/**.md)`).
-        deny: Vec<String>,
-        now_secs: u64,
-    },
 }
 
 impl EventKind for SkillEvent {
@@ -102,7 +87,6 @@ impl EventKind for SkillEvent {
             SkillEvent::RolePromptSet { .. } => "skills.role-prompt-set.v1",
             SkillEvent::RoleModelSet { .. } => "skills.role-model-set.v1",
             SkillEvent::RoleScopesSet { .. } => "skills.role-scopes-set.v1",
-            SkillEvent::RolePermissionsSet { .. } => "skills.role-permissions-set.v1",
         }
     }
 }

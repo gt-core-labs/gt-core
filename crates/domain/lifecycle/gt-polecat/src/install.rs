@@ -380,23 +380,25 @@ pub fn costs_report_hook_entry() -> serde_json::Value {
 /// never stalls on the interactive "New MCP server found … Use this MCP server?" prompt
 /// (`hq-polecat-provisioning-20260608.1`): the `.mcp.json` the daemon seeds into the worktree is
 /// project-scoped, and without this allowlist claude blocks on first launch waiting for a keypress.
-/// The static gt-managed `settings.json` template every launch path lands before `claude` starts.
-///
-/// NOTE the `permissions` block is intentionally ABSENT here (gtcore-d175ec): a role's permission
-/// model is catalog DATA read from the DB, overlaid onto this file at launch by
-/// `gt_composition::role_session::overlay_permissions` — never hardcoded in the template. The
-/// apparatus default lives in `gt_skills::default_role_permissions`. What stays here is the
-/// provisioning that is genuinely static: the managed marker, onboarding/bypass flags, the
-/// pre-trusted `gt` MCP server, and the reporting/guard hooks.
 pub fn polecat_settings_json() -> String {
     let v = json!({
         MANAGED_MARKER: MANAGED_VALUE,
         "hasCompletedOnboarding": true,
         // Suppress the interactive "1. No / 2. Yes, I accept" bypass-permissions confirmation
         // dialog on startup. Without this, autonomous polecats block waiting for a keypress even
-        // though the catalog-driven `permissions.defaultMode` is `bypassPermissions`.
+        // though `permissions.defaultMode` is already `bypassPermissions`.
         "dangerouslySkipPermissions": true,
         "enabledMcpjsonServers": ["gt"],
+        // bypassPermissions still skips the interactive prompt, but the `deny` rule is honoured even
+        // under it: a declarative backstop to the PreToolUse memory guard (hq-memory-mcp.6). The agent
+        // must save memories via the `mcp__gt__memory_save` MCP tool, never by writing the corpus.
+        // `permissions.deny` tool names are VALIDATED by claude at startup; `MultiEdit` was folded into
+        // `Edit` and now logs "deny rule … matches no known tool", so it is omitted (the PreToolUse
+        // matcher below keeps it — hook matchers are not name-validated). gtcore-a01791.
+        "permissions": {
+            "defaultMode": "bypassPermissions",
+            "deny": [ "Write(**/memory/**.md)", "Edit(**/memory/**.md)" ]
+        },
         "hooks": {
             // SessionStart: heartbeat touch + memory autorecall (hq-memory-autorecall.1) — the
             // recall hook PUSHES the team's feedback rules + bead-relevant lore into the fresh
@@ -450,9 +452,7 @@ mod tests {
     fn template_is_valid_json_with_marker_and_reporting_hooks() {
         let v: serde_json::Value = serde_json::from_str(&polecat_settings_json()).unwrap();
         assert_eq!(v[MANAGED_MARKER], json!("polecat-hooks"));
-        // gtcore-d175ec: the permission model is NOT in the static template — it is catalog data
-        // overlaid at launch (gt_composition::role_session::overlay_permissions).
-        assert!(v.get("permissions").is_none(), "permissions are catalog-driven, not templated");
+        assert_eq!(v["permissions"]["defaultMode"], json!("bypassPermissions"));
         assert_eq!(v["hasCompletedOnboarding"], json!(true));
         // Suppress the interactive bypass-permissions confirmation dialog on startup.
         assert_eq!(v["dangerouslySkipPermissions"], json!(true));
@@ -486,9 +486,12 @@ mod tests {
         assert!(guard.contains("*/memory/*.md)"), "matches the memory corpus path");
         assert!(guard.contains("exit 2"), "denies the tool call");
         assert!(guard.contains("mcp__gt__memory_save"), "redirects to the MCP tool");
-        // The declarative `permissions.deny` backstop is no longer templated here (gtcore-d175ec):
-        // it is catalog data overlaid at launch. The PreToolUse hook guard above remains the
-        // deterministic half of the memory-corpus enforcement.
+        // Declarative backstop: deny rules under the bypassPermissions mode.
+        let deny = v["permissions"]["deny"].as_array().unwrap();
+        assert!(deny.iter().any(|r| r == "Write(**/memory/**.md)"));
+        assert!(deny.iter().any(|r| r == "Edit(**/memory/**.md)"));
+        // The stale MultiEdit rule is dropped (folded into Edit; would log "no known tool").
+        assert!(!deny.iter().any(|r| r == "MultiEdit(**/memory/**.md)"));
         // SessionStart carries TWO hooks: the heartbeat touch and the memory autorecall
         // (hq-memory-autorecall.1) that injects recalled memory as additionalContext.
         let ss = v["hooks"]["SessionStart"].as_array().unwrap();

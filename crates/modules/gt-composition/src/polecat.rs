@@ -1100,27 +1100,6 @@ impl Plugin for PolecatSupervisorPlugin {
                             ) {
                                 apply_role_model(&mut spec.args, &model);
                             }
-                            // Permissions are catalog data (gtcore-d175ec), read from the DB — not a
-                            // hardcoded template. Backfill the apparatus default into the live log
-                            // once (idempotent; never clobbers an operator-set value), then overlay the
-                            // role's permission model onto the worktree settings.json that
-                            // install_polecat_hooks wrote. Pre-migration the read falls back to the
-                            // same apparatus default, so there is never a window without the guard.
-                            let now_secs = std::time::SystemTime::now()
-                                .duration_since(std::time::UNIX_EPOCH)
-                                .map(|d| d.as_secs())
-                                .unwrap_or(0);
-                            for ev in state.catalog.role_permissions_migration(now_secs) {
-                                let _ = log.append(Some(&self.workspace), ev);
-                            }
-                            let perms = crate::role_session::role_permissions_or_default(
-                                &state.catalog,
-                                role,
-                            );
-                            crate::role_session::overlay_permissions(
-                                &spec.workdir.join(".claude").join("settings.json"),
-                                &perms,
-                            );
                         }
                         Err(e) => eprintln!(
                             "[polecat] skills replay failed — no skills/CLAUDE.md written for {bead}: {e}"
