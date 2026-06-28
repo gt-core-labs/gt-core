@@ -219,9 +219,12 @@ impl DomainHandler for QuotaHandler {
                 // Unreadable / needs_relogin instead of vanishing, so the FE never shows a
                 // dead/absent credential as Healthy. The SAME report the REST
                 // `GET /api/v1/quota/cred-health` serves. Empty when no accounts root is wired.
-                let known: Vec<String> = self
+                // gtcore-62723a: carry `credential_dead` so the report forces needs_relogin for
+                // prober-confirmed-dead accounts (the FE then surfaces relogin) — the static
+                // on-disk verdict alone would call a dead-but-refreshable credential Healthy.
+                let known: Vec<(String, bool)> = self
                     .registry(ws)
-                    .map(|r| r.accounts().map(|a| a.id.clone()).collect())
+                    .map(|r| r.accounts().map(|a| (a.id.clone(), a.credential_dead)).collect())
                     .unwrap_or_default();
                 let reports = match self.accounts_root.as_ref() {
                     Some(root) => {

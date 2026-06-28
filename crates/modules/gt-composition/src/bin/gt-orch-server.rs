@@ -598,7 +598,22 @@ async fn main() -> anyhow::Result<()> {
             let q = respec_quota.clone();
             let quota_status: std::collections::HashMap<String, gt_quota::AccountQuotaStatus> =
                 respec_handle.block_on(async move {
-                    q.accounts().await.into_iter().map(|a| (a.id, a.status)).collect()
+                    q.accounts()
+                        .await
+                        .into_iter()
+                        // gtcore-62723a: a prober-confirmed-dead credential 401s every sling even
+                        // though its quota `status` reads Healthy (the budget is untouched). Report
+                        // it as Blocked so `resolve_for_sling` never picks it — the guard rotates to
+                        // a live account instead of slinging a polecat that can't authenticate.
+                        .map(|a| {
+                            let status = if a.credential_dead {
+                                gt_quota::AccountQuotaStatus::Blocked
+                            } else {
+                                a.status
+                            };
+                            (a.id, status)
+                        })
+                        .collect()
                 });
             if let gt_composition::credential_guard::CredOutcome::Resolved { resolved, .. } =
                 gt_composition::credential_guard::resolve_for_sling(&kc, now_ms, |acc| {
