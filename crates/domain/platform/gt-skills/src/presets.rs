@@ -240,15 +240,7 @@ pub fn workspace_seed_events(now: u64) -> Vec<SkillEvent> {
     for ev in &events {
         s.apply(ev);
     }
-    let scope_events = s.catalog.role_scopes_migration(now);
-    for ev in &scope_events {
-        s.apply(ev);
-    }
-    events.extend(scope_events);
-    // gtcore-d175ec: permissions are read from `RoleBinding::permissions` on the live read path, so a
-    // fresh workspace must also seed each role's permission model (the apparatus default) — else a
-    // seeded role would launch with no `permissions` block. Symmetric with the scopes seed above.
-    events.extend(s.catalog.role_permissions_migration(now));
+    events.extend(s.catalog.role_scopes_migration(now));
     events
 }
 
