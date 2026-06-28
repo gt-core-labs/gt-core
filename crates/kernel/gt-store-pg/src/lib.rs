@@ -256,6 +256,38 @@ pub fn memory_migrations() -> Vec<Migration> {
     vec![Migration::new(1, "0001_memories", MEMORY_0001_SQL)]
 }
 
+/// The complete, idempotent DDL that re-creates every per-workspace projection table this
+/// crate owns in the `ws_default` template schema: `comments`, the `documents` family
+/// (`documents` + `document_versions` + `document_shares` + `doc_chunks`, plus the pgvector
+/// `embedding` column), and `memories`. It is the concatenation, in apply order, of every
+/// [`comments_migrations`] / [`docs_migrations`] / [`memory_migrations`] migration's SQL —
+/// derived from the migration history so the self-heal can never drift from it (the same
+/// belt-and-suspenders [`gt_rig::RigsModule::template_ensure_sql`] builds for `rigs`).
+///
+/// Why this exists, given the migrations are already idempotent and applied at boot: the
+/// migration tracking table (`_gt_schema_migrations`) lives in the shared `public` schema and
+/// SURVIVES a `DROP SCHEMA ws_default CASCADE` (the tenant-reprovision / data-wipe path,
+/// gtcore-c9b292). After such a drop the loader still sees `0001_comments`, `0001_documents`,
+/// … recorded as applied and SKIPS them, so the dropped `ws_default.comments` /
+/// `ws_default.documents` / `ws_default.memories` are never recreated — the bookkeeping is
+/// desynced from reality and the comments/documents/memory features 500 with
+/// `relation "…" does not exist` forever. Replaying this DDL UNCONDITIONALLY on boot
+/// guarantees the template tables are present regardless of what the tracking table claims.
+///
+/// Every statement is `CREATE …/ALTER … IF NOT EXISTS`, so replaying it when the tables are
+/// already present is a cheap catalog-check no-op that never destroys data or clobbers a row.
+/// The caller runs it under an advisory lock — concurrent `CREATE … IF NOT EXISTS` against the
+/// same object races in Postgres across replicas (and parallel tests).
+pub fn projection_template_ensure_sql() -> String {
+    comments_migrations()
+        .iter()
+        .chain(docs_migrations().iter())
+        .chain(memory_migrations().iter())
+        .map(|m| m.sql.as_str())
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 /// Initial migration: `email_outbox` table in the public schema.
 const EMAIL_0001_SQL: &str = include_str!("../migrations/email/0001_email_outbox.sql");
 
@@ -482,5 +514,43 @@ mod tests {
         assert!(sql.contains("memories_kind_idx"), "per-kind index for list/operating_rules");
         // Locked decisions realized in the schema.
         assert!(sql.contains("version"), "optimistic-concurrency token");
+    }
+
+    #[test]
+    fn projection_ensure_is_the_complete_idempotent_superset() {
+        // gtcore-c9b292: the boot self-heal must replay EVERY per-workspace template table this
+        // crate owns, so a `DROP SCHEMA ws_default CASCADE` is fully repaired on the next boot.
+        let ddl = projection_template_ensure_sql();
+
+        // Every comments/docs/memory migration's SQL is present verbatim, so the self-heal can
+        // never drift from the migration history.
+        for m in comments_migrations()
+            .iter()
+            .chain(docs_migrations().iter())
+            .chain(memory_migrations().iter())
+        {
+            assert!(
+                ddl.contains(m.sql.as_str()),
+                "ensure DDL must contain migration `{}` verbatim",
+                m.name,
+            );
+        }
+
+        // The three projection tables the data-wipe dropped are all (re)created in the template.
+        assert!(ddl.contains("ws_default.comments"), "comments table");
+        assert!(ddl.contains("ws_default.documents"), "documents table");
+        assert!(ddl.contains("ws_default.document_versions"), "document_versions table");
+        assert!(ddl.contains("ws_default.document_shares"), "document_shares table");
+        assert!(ddl.contains("ws_default.doc_chunks"), "doc_chunks table");
+        assert!(ddl.contains("ws_default.memories"), "memories table");
+
+        // Purely additive + idempotent: only `CREATE … IF NOT EXISTS` / `ALTER … ADD COLUMN IF
+        // NOT EXISTS`, never a destructive `DROP`/`TRUNCATE`/`DELETE`, so replaying it against an
+        // intact DB is a no-op that cannot wipe data (acceptance criterion: additive DDL only).
+        let upper = ddl.to_uppercase();
+        for verb in ["DROP TABLE", "DROP SCHEMA", "TRUNCATE", "DELETE FROM"] {
+            assert!(!upper.contains(verb), "ensure DDL must not contain `{verb}`");
+        }
+        assert!(upper.contains("CREATE TABLE IF NOT EXISTS"), "idempotent table creates");
     }
 }
