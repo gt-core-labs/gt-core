@@ -421,6 +421,10 @@ impl SkillState {
             SkillEvent::RoleScopesSet { role, scopes, .. } => {
                 self.catalog.apply_set_role_scopes(role, scopes);
             }
+            // TOMBSTONE (gtcore-09c489): a reverted experiment (gtcore-d175ec) persisted these events
+            // before its variant was removed. Decode-but-ignore so the durable `skills.*` log still
+            // replays — restoring the behaviour is intentionally NOT done (/agents owns permissions).
+            SkillEvent::RolePermissionsSet { .. } => {}
         }
     }
 }
@@ -711,6 +715,31 @@ mod tests {
             s.catalog.scopes_for_roles(&["polecat".into()]),
             vec!["memory.read".to_string(), "memory.write".to_string()]
         );
+    }
+
+    #[test]
+    fn role_permissions_set_tombstone_decodes_and_is_ignored() {
+        // gtcore-09c489: a reverted experiment persisted skills.role-permissions-set.v1 events. The
+        // tombstone variant must still DECODE (round-trip) and apply as a NO-OP, so the durable log
+        // replays without "unknown variant" and no permission behaviour is restored.
+        let ev = SkillEvent::RolePermissionsSet {
+            role: "mayor".into(),
+            default_mode: "bypassPermissions".into(),
+            deny: vec!["Write(**/memory/**.md)".into()],
+            now_secs: 1,
+        };
+        // Round-trips through serde (the event-log payload codec).
+        let json = serde_json::to_string(&ev).unwrap();
+        let back: SkillEvent = serde_json::from_str(&json).unwrap();
+        assert!(matches!(back, SkillEvent::RolePermissionsSet { .. }));
+
+        // Applying it changes nothing — the binding is untouched, and replay does not break.
+        let mut s = SkillState::default();
+        s.apply(&registered("bead-work", &["issues.read"], 1));
+        s.apply(&enabled("mayor", "bead-work", 2));
+        let before = s.catalog.clone();
+        s.apply(&ev);
+        assert_eq!(s.catalog, before, "the tombstone is a no-op");
     }
 
     #[test]

@@ -75,6 +75,18 @@ pub enum SkillEvent {
         scopes: Vec<String>,
         now_secs: u64,
     },
+    /// TOMBSTONE (`gtcore-09c489`). `gtcore-d175ec` briefly modelled a role's claude `permissions`
+    /// block as a catalog attribute and its migration WROTE `skills.role-permissions-set.v1` events
+    /// into the durable log before the approach was reverted (`gtcore-e0974b`: /agents already owns
+    /// session permissions via `permission_mode` + `scopes`). Events cannot be un-written, so this
+    /// variant is KEPT solely so those persisted events still DECODE — [`SkillState::apply`] ignores
+    /// it (a no-op). It is never emitted again. Do NOT restore behaviour here.
+    RolePermissionsSet {
+        role: String,
+        default_mode: String,
+        deny: Vec<String>,
+        now_secs: u64,
+    },
 }
 
 impl EventKind for SkillEvent {
@@ -87,6 +99,8 @@ impl EventKind for SkillEvent {
             SkillEvent::RolePromptSet { .. } => "skills.role-prompt-set.v1",
             SkillEvent::RoleModelSet { .. } => "skills.role-model-set.v1",
             SkillEvent::RoleScopesSet { .. } => "skills.role-scopes-set.v1",
+            // Tombstone — still kinded so a persisted event round-trips through the log.
+            SkillEvent::RolePermissionsSet { .. } => "skills.role-permissions-set.v1",
         }
     }
 }
