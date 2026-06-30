@@ -19,7 +19,7 @@ use gt_issues::report::{build_report, to_csv, to_xlsx};
 use gt_mcp_server::{DomainCtx, DomainHandler};
 use gt_module::McpTool;
 use gt_store_blob::{sha256_hex, BlobStore};
-use gt_store_dolt::{AppError, DoltIssues, IssueFilter, WorkspacePools};
+use gt_store_dolt::{AppError, DoltIssues, IssueFilter, IssueRow, WorkspacePools};
 use gt_store_pg::{
     DocumentsRepository, EmailOutboxRepository, NewDocument, NewEmail, PgDocuments, PgEmailOutbox,
     ReportSubscriptionsRepository,
@@ -243,16 +243,36 @@ impl DomainHandler for ReportHandler {
 
                 // The same rows board.list projects (full=true for the Notas column).
                 let tracker = self.tracker(ctx.workspace).await?;
-                let rows = tracker
+                let mut rows = tracker
                     .list(&IssueFilter {
                         rig: Some(rig.clone()),
                         workspace: Some(workspace.clone()),
-                        parent_id: epic,
+                        parent_id: epic.clone(),
                         full: true,
                         limit: Some(gt_store_dolt::issues_max_limit()),
                         ..Default::default()
                     })
                     .await?;
+                // When scoped to a single epic, the parent_id filter returns only
+                // its CHILDREN — the epic row itself is absent, so build_report
+                // would label the module with the raw id and drop the epic's own
+                // metadata (gtcore-f46a56). Fetch the epic and add it to the row
+                // set; build_report skips it as a task row but reads its title +
+                // metadata from it. The whole-board path (no `epic`) is untouched.
+                if let Some(epic_id) = &epic {
+                    if let Some(detail) = tracker.get_detail(epic_id).await? {
+                        if detail.issue_type == "epic" {
+                            // IssueDetail → IssueRow: same columns. Round-trip
+                            // through serde so a future field addition needs no
+                            // manual re-mapping here.
+                            if let Ok(epic_row) = serde_json::to_value(&detail)
+                                .and_then(serde_json::from_value::<IssueRow>)
+                            {
+                                rows.push(epic_row);
+                            }
+                        }
+                    }
+                }
                 let parent_map = tracker.parent_map(&rig, &workspace).await?;
                 // Comments are wired into the planning-digest only (gtcore-01bcf2);
                 // the xlsx/csv export keeps its pure row→sheet projection.

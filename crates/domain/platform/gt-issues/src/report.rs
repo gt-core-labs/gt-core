@@ -525,6 +525,34 @@ mod tests {
         assert!(tail.epic_fin.is_empty());
     }
 
+    /// The contract gtcore-f46a56's handler fix relies on: when the epic row is
+    /// ABSENT from the set (the `report.generate --epic` parent_id filter returns
+    /// only children), the module falls back to the raw id and the epic metadata
+    /// is empty. Injecting the epic row (as the handler now does) is what restores
+    /// the title + metadata — proven by `sample()` above, where the epic IS present.
+    #[test]
+    fn epic_row_absent_falls_back_to_raw_id_and_empty_meta() {
+        // Only children — no `hq-mod-a` epic row in the set.
+        let rows = vec![
+            row("hq-1", "task", "Login form", Some(8.0), "working"),
+            row("hq-2", "task", "Sesiones", Some(4.5), "closed"),
+        ];
+        let mut parent_map = HashMap::new();
+        parent_map.insert("hq-1".to_string(), "hq-mod-a".to_string());
+        parent_map.insert("hq-2".to_string(), "hq-mod-a".to_string());
+        let report = build_report("hq", "default", &rows, &parent_map, &HashMap::new());
+
+        assert_eq!(report.sections.len(), 1);
+        let s = &report.sections[0];
+        // Raw id as the module title (the bug the handler fix avoids).
+        assert_eq!(s.module_title, "hq-mod-a");
+        // No epic row ⇒ no epic metadata, but the children rollup still holds.
+        assert!(s.epic_estado.is_empty());
+        assert_eq!(s.epic_horas, None);
+        assert!(s.epic_responsable.is_empty());
+        assert_eq!(s.horas, 12.5);
+    }
+
     #[test]
     fn csv_carries_header_rows_and_total_footer() {
         let csv = to_csv(&sample());
