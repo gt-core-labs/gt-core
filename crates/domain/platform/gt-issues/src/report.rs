@@ -244,6 +244,26 @@ pub fn to_csv(report: &OperatorReport) -> String {
         "Modulo,Tarea,Proceso,Nivel,Horas Est.,Estado,Responsable,Fecha Inicio,Fecha Fin,Notas\n",
     );
     for section in &report.sections {
+        // Module header row carrying the epic's OWN metadata (gtcore-7bf261):
+        // the flat CSV has no bands, so the epic's estado/horas/responsable/
+        // dates/notas ride on a `(epic)` row ahead of its task rows. Skipped for
+        // the "Sin módulo" tail (no backing epic).
+        if !section.module_id.is_empty() {
+            let epic_cols = [
+                csv_field(&section.module_title),
+                csv_field("(epic)"),
+                csv_field("epic"),
+                String::new(),
+                section.epic_horas.map(|h| h.to_string()).unwrap_or_default(),
+                csv_field(&section.epic_estado),
+                csv_field(&section.epic_responsable),
+                section.epic_inicio.clone(),
+                section.epic_fin.clone(),
+                csv_field(&section.epic_notas),
+            ];
+            out.push_str(&epic_cols.join(","));
+            out.push('\n');
+        }
         for row in &section.rows {
             let cols = [
                 csv_field(&section.module_title),
@@ -359,16 +379,35 @@ pub fn to_xlsx(report: &OperatorReport) -> Result<Vec<u8>, String> {
 
     let mut r: u32 = 2;
     for section in &report.sections {
-        // Section band: module title left, the section's hours subtotal in the
-        // Horas column (mockup has no separate Subtotal row).
+        // Section band: module title left + the epic's OWN estimate as a title
+        // suffix; col4 stays the CHILDREN rollup subtotal (mockup parity). The
+        // remaining band cells, blank before, now carry the epic's own metadata
+        // (gtcore-7bf261) aligned with the Estado/Responsable/Inicio/Fin/Notas
+        // columns. col4 (rollup) and the title's "est. epic" stay differentiated.
+        let band_title = match section.epic_horas {
+            Some(h) => format!("{} · est. epic {h:.1} h", section.module_title),
+            None => section.module_title.clone(),
+        };
         sheet
-            .merge_range(r, 0, r, 3, &section.module_title, &section_fmt)
+            .merge_range(r, 0, r, 3, &band_title, &section_fmt)
             .map_err(|e| e.to_string())?;
         sheet
             .write_with_format(r, 4, section.horas, &subtotal_fmt)
             .map_err(|e| e.to_string())?;
         sheet
-            .merge_range(r, 5, r, LAST_COL, "", &section_fmt)
+            .write_with_format(r, 5, section.epic_estado.as_str(), &section_fmt)
+            .map_err(|e| e.to_string())?;
+        sheet
+            .write_with_format(r, 6, section.epic_responsable.as_str(), &section_fmt)
+            .map_err(|e| e.to_string())?;
+        sheet
+            .write_with_format(r, 7, section.epic_inicio.as_str(), &section_fmt)
+            .map_err(|e| e.to_string())?;
+        sheet
+            .write_with_format(r, 8, section.epic_fin.as_str(), &section_fmt)
+            .map_err(|e| e.to_string())?;
+        sheet
+            .write_with_format(r, 9, section.epic_notas.as_str(), &section_fmt)
             .map_err(|e| e.to_string())?;
         r += 1;
         for row in &section.rows {
@@ -491,11 +530,16 @@ mod tests {
         let csv = to_csv(&sample());
         let lines: Vec<&str> = csv.lines().collect();
         assert!(lines[0].starts_with("Modulo,Tarea,Proceso,Nivel,Horas Est."));
-        // 3 task rows + header + footer.
-        assert_eq!(lines.len(), 5);
+        // header + 1 epic row (Módulo Auth) + 3 task rows + footer.
+        assert_eq!(lines.len(), 6);
         assert!(lines.last().unwrap().starts_with("TOTAL HORAS,,,,14.5"));
         // RFC 4180 quoting for the embedded quotes/comma.
         assert!(csv.contains("\"Sesiones, con \"\"comillas\"\"\""));
+        // The epic's OWN metadata rides on a `(epic)` header row (gtcore-7bf261):
+        // its own estimate (20), estado, responsable and dates — distinct from
+        // the per-task rows. The "Sin módulo" tail emits no such row.
+        assert!(csv.contains("Módulo Auth,(epic),epic,,20,En curso,ana,2026-06-01,2026-06-15,"));
+        assert!(!csv.contains("Sin módulo,(epic)"));
     }
 
     #[test]

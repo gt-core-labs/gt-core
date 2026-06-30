@@ -13,7 +13,7 @@
 use pulldown_cmark::{html::push_html, Event, Options, Parser, Tag, TagEnd};
 
 use crate::analytics::AnalyticsSummary;
-use crate::report::{OperatorReport, ReportComment};
+use crate::report::{OperatorReport, ReportComment, ReportSection};
 
 /// Minimal HTML escaping for text nodes/attributes.
 fn esc(s: &str) -> String {
@@ -80,6 +80,40 @@ fn render_comments(comments: &[ReportComment], compact: bool) -> String {
 
 fn fmt_horas(h: Option<f64>) -> String {
     h.map(|v| format!("{v:.1}")).unwrap_or_default()
+}
+
+/// The epic's own metadata as a small subline under the module band
+/// (gtcore-7bf261): estado chip · est. epic Nh · responsable · inicio→fin.
+/// Each part is dropped when the epic carries nothing for it; an epic with no
+/// metadata at all (or the "Sin módulo" tail) yields an empty string.
+fn epic_meta_line(section: &ReportSection) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    if !section.epic_estado.is_empty() {
+        parts.push(format!(
+            "<span style=\"color:{};font-weight:bold;\">{}</span>",
+            estado_color(&section.epic_estado),
+            esc(&section.epic_estado),
+        ));
+    }
+    if let Some(h) = section.epic_horas {
+        parts.push(format!("est. epic {h:.1} h"));
+    }
+    if !section.epic_responsable.is_empty() {
+        parts.push(esc(&section.epic_responsable));
+    }
+    match (section.epic_inicio.is_empty(), section.epic_fin.is_empty()) {
+        (false, false) => parts.push(format!("{}→{}", esc(&section.epic_inicio), esc(&section.epic_fin))),
+        (false, true) => parts.push(esc(&section.epic_inicio)),
+        (true, false) => parts.push(format!("→{}", esc(&section.epic_fin))),
+        (true, true) => {}
+    }
+    if parts.is_empty() {
+        return String::new();
+    }
+    format!(
+        "<div style=\"font-size:11px;font-weight:normal;color:#5b6b8c;margin-top:2px;\">{}</div>",
+        parts.join(" · ")
+    )
 }
 
 /// Estado chip colors, mirroring the xlsx vocabulary.
@@ -203,10 +237,11 @@ pub fn render_digest(report: &OperatorReport, summary: &AnalyticsSummary, fecha:
         html.push_str(&format!(
             "<tr><td colspan=\"10\" style=\"{TD}background:{band_tint};color:{NAVY};\
              font-weight:bold;\">{icon} {title}\
-             <span style=\"float:right;font-weight:normal;color:#5b6b8c;\">{horas:.1} h</span>\
-             </td></tr>",
+             <span style=\"float:right;font-weight:normal;color:#5b6b8c;\">Σ hijos {horas:.1} h</span>\
+             {meta}</td></tr>",
             title = esc(&section.module_title),
             horas = section.horas,
+            meta = epic_meta_line(section),
         ));
         // Epic-level comments (rare): a full-width row under the band.
         if !section.comentarios.is_empty() {
@@ -332,6 +367,12 @@ mod tests {
         assert!(html.contains("🏢 Modulo Uno"), "missing module separator band");
         assert!(html.contains("background:#dbe6f6"), "missing module band tint");
         assert!(html.contains("background:#f2f6fc"), "missing module row tint");
+        // The band differentiates the children rollup from the epic's own
+        // metadata subline (gtcore-7bf261): estado · est. epic Nh · resp · dates.
+        assert!(html.contains("Σ hijos"), "missing children-rollup label");
+        assert!(html.contains("est. epic 2.0 h"), "missing epic's own estimate");
+        assert!(html.contains("Pendiente"), "missing epic estado");
+        assert!(html.contains("2026-06-01→2026-06-30"), "missing epic date span");
         // Reconciles with the summary by construction.
         assert!(html.contains(&format!("{:.0}%", summary.avance.pct)));
         assert!(html.contains("3 tareas"), "missing task count in header");
