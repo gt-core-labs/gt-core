@@ -72,12 +72,30 @@ pub struct ReportSection {
     pub module_title: String,
     /// The section's task rows.
     pub rows: Vec<ReportRow>,
-    /// The section's Horas Est. subtotal.
+    /// The CHILDREN rollup: sum of the section's task-row Horas Est. Distinct
+    /// from [`Self::epic_horas`] (the epic's OWN estimate) — gtcore-6621af keeps
+    /// both so neither signal is lost.
     pub horas: f64,
     /// Comentarios on the module epic itself (gtcore-01bcf2). The epic is a
     /// section header, not a row, so its comments render in the section header.
     /// Empty for the "Sin módulo" tail (no backing epic).
     pub comentarios: Vec<ReportComment>,
+    /// Estado of the epic itself, operator vocabulary (gtcore-6621af). Empty for
+    /// the "Sin módulo" tail or an epic outside the row set.
+    pub epic_estado: String,
+    /// The epic's OWN Horas Est. (`estimated_hours`) — its planning estimate,
+    /// not the children rollup ([`Self::horas`]). `None` when unplanned or no
+    /// backing epic.
+    pub epic_horas: Option<f64>,
+    /// Responsable of the epic itself (its assignee). Empty when unassigned or
+    /// no backing epic.
+    pub epic_responsable: String,
+    /// Fecha Inicio of the epic itself (`YYYY-MM-DD`). Empty when unset.
+    pub epic_inicio: String,
+    /// Fecha Fin of the epic itself (`YYYY-MM-DD`). Empty when unset.
+    pub epic_fin: String,
+    /// Notas of the epic itself. Empty when none or no backing epic.
+    pub epic_notas: String,
 }
 
 /// The whole operator report.
@@ -127,11 +145,14 @@ pub fn build_report(
     parent_map: &HashMap<String, String>,
     comments: &HashMap<String, Vec<ReportComment>>,
 ) -> OperatorReport {
-    // Module titles: the epics present in the row set.
-    let mut titles: BTreeMap<&str, &str> = BTreeMap::new();
+    // Module epics present in the row set, keyed by id. The section header
+    // draws its title AND its own metadata (estado/horas/responsable/fechas/
+    // notas) from the epic row — the epic is a data source, not just a label
+    // (gtcore-6621af).
+    let mut epics: BTreeMap<&str, &IssueRow> = BTreeMap::new();
     for row in rows {
         if row.issue_type == "epic" {
-            titles.insert(row.id.as_str(), row.title.as_str());
+            epics.insert(row.id.as_str(), row);
         }
     }
 
@@ -163,17 +184,24 @@ pub fn build_report(
         let horas: f64 = rows.iter().filter_map(|r| r.horas).sum();
         // Epic-level comments hang on the module epic id (empty for "Sin módulo").
         let comentarios = comments.get(&module_id).cloned().unwrap_or_default();
+        // The backing epic row (absent for "Sin módulo" or an epic filtered out
+        // of the row set — gtcore-f46a56 loads it on the per-epic export path).
+        let epic = epics.get(module_id.as_str()).copied();
         let section = ReportSection {
             module_title: if module_id.is_empty() {
                 "Sin módulo".to_string()
             } else {
-                titles
-                    .get(module_id.as_str())
-                    .map(|t| t.to_string())
+                epic.map(|e| e.title.clone())
                     // The epic may live outside the filtered row set; its id
                     // still names the module.
                     .unwrap_or_else(|| module_id.clone())
             },
+            epic_estado: epic.map(|e| estado_label(&e.status).to_string()).unwrap_or_default(),
+            epic_horas: epic.and_then(|e| e.estimated_hours),
+            epic_responsable: epic.and_then(|e| e.assignee.clone()).unwrap_or_default(),
+            epic_inicio: epic.and_then(|e| e.start_date.clone()).unwrap_or_default(),
+            epic_fin: epic.and_then(|e| e.due_date.clone()).unwrap_or_default(),
+            epic_notas: epic.and_then(|e| e.notes.clone()).unwrap_or_default(),
             module_id,
             rows,
             horas,
@@ -410,7 +438,9 @@ mod tests {
 
     fn sample() -> OperatorReport {
         let rows = vec![
-            row("hq-mod-a", "epic", "Módulo Auth", None, "open"),
+            // The epic carries its OWN estimate (20.0) — distinct from the 12.5
+            // its children roll up (gtcore-6621af).
+            row("hq-mod-a", "epic", "Módulo Auth", Some(20.0), "working"),
             row("hq-1", "task", "Login form", Some(8.0), "working"),
             row("hq-2", "task", "Sesiones, con \"comillas\"", Some(4.5), "closed"),
             row("hq-3", "spike", "Suelto", Some(2.0), "open"),
@@ -435,6 +465,25 @@ mod tests {
         assert_eq!(report.total_horas, 14.5);
         // Estado uses operator vocabulary.
         assert_eq!(report.sections[0].rows[0].estado, "En curso");
+
+        // The epic's OWN metadata rides on the section (gtcore-6621af), distinct
+        // from the children rollup: epic_horas is the epic's estimate (20.0),
+        // `horas` is the children sum (12.5).
+        let auth = &report.sections[0];
+        assert_eq!(auth.epic_estado, "En curso");
+        assert_eq!(auth.epic_horas, Some(20.0));
+        assert_eq!(auth.horas, 12.5);
+        assert_eq!(auth.epic_responsable, "ana");
+        assert_eq!(auth.epic_inicio, "2026-06-01");
+        assert_eq!(auth.epic_fin, "2026-06-15");
+
+        // The "Sin módulo" tail has no backing epic → epic fields stay empty.
+        let tail = &report.sections[1];
+        assert!(tail.epic_estado.is_empty());
+        assert_eq!(tail.epic_horas, None);
+        assert!(tail.epic_responsable.is_empty());
+        assert!(tail.epic_inicio.is_empty());
+        assert!(tail.epic_fin.is_empty());
     }
 
     #[test]
