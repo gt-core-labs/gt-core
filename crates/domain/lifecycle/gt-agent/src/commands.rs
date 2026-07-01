@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 
 use gt_events::{AppError, Command};
 
-use crate::state::{Session, SessionRegistry, SessionState};
+use crate::state::{validate_session_id, Session, SessionRegistry, SessionState};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct AddSession {
@@ -25,9 +25,9 @@ impl Command for AddSession {
     type State = SessionRegistry;
 
     fn validate(&self, state: &Self::State) -> Result<(), AppError> {
-        if self.id.is_empty() {
-            return Err(AppError::Validation("session id is empty".into()));
-        }
+        // Reject empty / malformed ids (an empty role or suffix segment like `"mayor-"`),
+        // gtcore-065009.
+        validate_session_id(&self.id).map_err(AppError::Validation)?;
         if self.rig.is_empty() {
             return Err(AppError::Validation("rig is empty".into()));
         }

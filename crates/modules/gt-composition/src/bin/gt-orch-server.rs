@@ -1668,7 +1668,7 @@ async fn main() -> anyhow::Result<()> {
                 // Emit session-end when the loop exits (channel closed or daemon shutdown).
                 if let Err(e) = refinery_log.append(
                     ws_opt,
-                    gt_agent::AgentEvent::SessionEnd { session },
+                    gt_agent::AgentEvent::session_end(session),
                 ) {
                     eprintln!("[gt-orch-server] refinery: agent.session-end append failed: {e}");
                 }

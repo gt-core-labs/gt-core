@@ -135,6 +135,11 @@ impl<S: ReadySource, M: MayorWaker> MayorDispatcher<S, M> {
         let groups = plan_by_rig(&ready);
         let mut woken = Vec::new();
         for (rig, frontier) in groups {
+            // Never coordinate an empty-rig group — it would spawn a malformed `"mayor-"` session
+            // (gtcore-065009). A bead whose id-prefix is empty is itself malformed; skip it.
+            if rig.trim().is_empty() {
+                continue;
+            }
             if let Some(scope) = &self.rig {
                 if scope != &rig {
                     continue;
@@ -504,6 +509,16 @@ impl MayorWaker for TmuxMayorWaker {
         frontier: &[BeadId],
     ) -> impl std::future::Future<Output = Result<(), MayorWakeError>> + Send {
         async move {
+            // Guard against an empty rig (gtcore-065009): `mayor_session(prefix, "")` yields the
+            // malformed `"<prefix>-"` session id (the anomalous `"mayor-"` observed live). A rig
+            // group with no name has no real work to coordinate, so refuse to spawn rather than
+            // create a session with an empty suffix.
+            if rig.trim().is_empty() {
+                return Err(MayorWakeError(
+                    "refusing to wake a mayor for an empty rig (would create a 'mayor-' session)"
+                        .into(),
+                ));
+            }
             // 1. Deliver the frontier — a live mayor blocks on this file and re-reads it per signal.
             let wake_file = mayor_wake_file(&self.channel_root, rig);
             write_wake_file(&wake_file, frontier).map_err(|e| {

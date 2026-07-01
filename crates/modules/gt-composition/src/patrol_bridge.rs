@@ -132,7 +132,7 @@ impl Plugin for PatrolBridgePlugin {
             }
             "agent.session-end.v1" | "agent.killed.v1" => {
                 let session = match record.decode::<AgentEvent>()? {
-                    AgentEvent::SessionEnd { session } => session,
+                    AgentEvent::SessionEnd { session, .. } => session,
                     AgentEvent::Killed { session, .. } => session,
                     _ => return Ok(()),
                 };

@@ -44,8 +44,11 @@ use serde_json::{json, Value};
 use gt_eventlog::{replay, EventRecord, EventStore, JsonlWriter};
 use gt_events::{AppError, Envelope, EventKind};
 
-use crate::state::{Session, SessionRegistry, SessionRole, SessionState};
-use crate::AgentEvent;
+use crate::state::{
+    validate_session_id, Session, SessionRegistry, SessionRole, SessionState,
+    DEFAULT_SESSION_RETENTION_SECS,
+};
+use crate::{now_secs, AgentEvent};
 
 /// A per-workspace agent event log provider for the REST adapter.
 ///
@@ -230,16 +233,25 @@ struct PauseArgs {
     reason: String,
 }
 
-/// `?rig=` filter for `GET /` (hq-rig-isolation.2). Absent ⇒ workspace-wide (back-compat).
+/// Filters for `GET /`. `rig` narrows to one rig (hq-rig-isolation.2; absent ⇒ workspace-wide).
+/// `all` (gtcore-065009) shows the full history including terminated sessions past the retention
+/// window; the default view keeps only live + recently-ended sessions.
 #[derive(Debug, Default, Deserialize)]
 struct ListSessionsQuery {
     rig: Option<String>,
+    #[serde(default)]
+    all: bool,
 }
 
-/// `GET /` — every agent session in the workspace (`agent.list`).
+/// `GET /` — agent sessions in the workspace (`agent.list`). By default only live sessions and
+/// those that ended within the retention window are returned; `?all=true` returns the full
+/// history (gtcore-065009).
 #[cfg_attr(feature = "axum", utoipa::path(
     get, path = "/",
-    params(("rig" = Option<String>, Query, description = "Narrow to sessions with this rig")),
+    params(
+        ("rig" = Option<String>, Query, description = "Narrow to sessions with this rig"),
+        ("all" = Option<bool>, Query, description = "Include terminated sessions past the retention window"),
+    ),
     responses((status = 200, description = "Agent sessions, optionally filtered by rig")),
 ))]
 async fn list_sessions(
@@ -248,8 +260,14 @@ async fn list_sessions(
     Query(q): Query<ListSessionsQuery>,
 ) -> Result<Json<Value>, ApiError> {
     let reg = st.registry(workspace_of(&headers).as_deref())?;
-    let sessions: Vec<_> = reg
-        .snapshot()
+    // Retention view (gtcore-065009): default drops terminated sessions older than the window so
+    // agent.list stays auditable; `all=true` restores the full snapshot.
+    let rows = if q.all {
+        reg.snapshot()
+    } else {
+        reg.visible(now_secs().unwrap_or(0), DEFAULT_SESSION_RETENTION_SECS)
+    };
+    let sessions: Vec<_> = rows
         .iter()
         .filter(|s| q.rig.as_deref().map_or(true, |r| s.rig == r))
         .map(session_json)
@@ -293,6 +311,9 @@ async fn spawn_session(
 ) -> Result<Response, ApiError> {
     let ws = workspace_of(&headers);
     let ws = ws.as_deref();
+    // Reject a malformed id (empty role/suffix, e.g. `"mayor-"`) before it enters the log
+    // (gtcore-065009).
+    validate_session_id(&a.session).map_err(|m| ApiError(AppError::Validation(m)))?;
     if st.registry(ws)?.get(&a.session).is_some() {
         return Err(ApiError(AppError::Validation(format!("session {} already exists", a.session))));
     }
@@ -369,7 +390,7 @@ async fn end_session(
     let ws = workspace_of(&headers);
     let ws = ws.as_deref();
     st.require_session(ws, &id)?;
-    Ok(Json(st.record(ws, AgentEvent::SessionEnd { session: id.clone() }, &id)?))
+    Ok(Json(st.record(ws, AgentEvent::session_end(id.clone()), &id)?))
 }
 
 /// `POST /:id/kill` — record a session forcibly killed with a reason (`agent.kill`). Emits
@@ -393,7 +414,7 @@ async fn kill_session(
     let ws = workspace_of(&headers);
     let ws = ws.as_deref();
     st.require_session(ws, &id)?;
-    let body = st.record(ws, AgentEvent::Killed { session: id.clone(), reason: a.reason }, &id)?;
+    let body = st.record(ws, AgentEvent::killed(id.clone(), a.reason), &id)?;
     // Terminate the tmux session so the Claude process is cleaned up immediately.
     // Only fires when the operator explicitly calls the kill endpoint — WS disconnect does not kill.
     let server = format!("gt-{}", ws.unwrap_or("default"));
@@ -551,6 +572,7 @@ fn session_json(session: &Session) -> Value {
         "hooks": session.hooks,
         "maintains_heartbeat": session.maintains_heartbeat,
         "last_heartbeat_at": session.last_heartbeat_at,
+        "ended_at": session.ended_at,
     })
 }
 

@@ -19,9 +19,12 @@ pub mod module;
 pub mod supervisor;
 
 pub use commands::{AddSession, AgentCommand, RemoveSession, TransitionSession};
-pub use events::AgentEvent;
+pub use events::{now_secs, AgentEvent};
 #[cfg(feature = "axum")]
 pub use http::{agent_router, AgentApiState, ApiDoc, FileAgentLog, WorkspaceAgentLog};
 pub use module::AgentModule;
 pub use repo::{InMemorySessions, SessionQueries, SessionWriter};
-pub use state::{DogKind, Session, SessionRegistry, SessionRole, SessionState};
+pub use state::{
+    validate_session_id, DogKind, Session, SessionRegistry, SessionRole, SessionState,
+    DEFAULT_SESSION_RETENTION_SECS,
+};

@@ -1223,7 +1223,7 @@ impl Plugin for PolecatSupervisorPlugin {
                         );
                     }
                 }
-                self.emit(AgentEvent::SessionEnd { session });
+                self.emit(AgentEvent::session_end(session));
                 // Clear the bead's operator marker (hq-agent-observability.2): its work landed, so
                 // the FE drops the agent chip. One agent per bead → the id alone identifies it.
                 self.emit_operator(IssueOperatorEvent::Cleared { bead: bead.clone() });
@@ -1308,7 +1308,7 @@ impl Plugin for PolecatSupervisorPlugin {
             //   `release_slot_for` is idempotent, so a duplicate kill (or a kill that races the
             //   merge) is a harmless no-op.
             "agent.killed.v1" => {
-                let AgentEvent::Killed { session, reason } = record.decode::<AgentEvent>()? else {
+                let AgentEvent::Killed { session, reason, .. } = record.decode::<AgentEvent>()? else {
                     return Ok(());
                 };
                 if is_context_exhaustion(&reason) {
@@ -1327,7 +1327,7 @@ impl Plugin for PolecatSupervisorPlugin {
             // slot, so this handler's idempotent release is a no-op there (the session is no longer
             // in `claimed`). A self-exit that was NOT preceded by a merge frees the slot here.
             "agent.session-end.v1" => {
-                let AgentEvent::SessionEnd { session } = record.decode::<AgentEvent>()? else {
+                let AgentEvent::SessionEnd { session, .. } = record.decode::<AgentEvent>()? else {
                     return Ok(());
                 };
                 self.release_slot_for(&session);
@@ -1732,10 +1732,7 @@ mod tests {
         assert!(!alloc.lock().unwrap().can_claim("acme"), "pool is full while the polecat lives");
 
         // Operator kills the working session (no merge). The slot is freed immediately.
-        p.on_event(&record(AgentEvent::Killed {
-            session: "hq-gg-1".into(),
-            reason: "operator killed".into(),
-        }))
+        p.on_event(&record(AgentEvent::killed("hq-gg-1", "operator killed")))
         .await
         .unwrap();
         assert_eq!(
@@ -1770,9 +1767,7 @@ mod tests {
         .unwrap();
         assert_eq!(alloc.lock().unwrap().in_flight("acme"), 1, "slot claimed at sling");
 
-        p.on_event(&record(AgentEvent::SessionEnd {
-            session: "hq-gg-1".into(),
-        }))
+        p.on_event(&record(AgentEvent::session_end("hq-gg-1")))
         .await
         .unwrap();
         assert_eq!(
@@ -1805,10 +1800,7 @@ mod tests {
 
         // Kill gg-1, then a late merge for gg-1 arrives, then a duplicate kill: only the FIRST
         // event releases; the rest are no-ops.
-        p.on_event(&record(AgentEvent::Killed {
-            session: "hq-gg-1".into(),
-            reason: "heartbeat stale".into(),
-        }))
+        p.on_event(&record(AgentEvent::killed("hq-gg-1", "heartbeat stale")))
         .await
         .unwrap();
         p.on_event(&record(MergeEvent::Merged {
@@ -1817,10 +1809,7 @@ mod tests {
         }))
         .await
         .unwrap();
-        p.on_event(&record(AgentEvent::Killed {
-            session: "hq-gg-1".into(),
-            reason: "operator killed".into(),
-        }))
+        p.on_event(&record(AgentEvent::killed("hq-gg-1", "operator killed")))
         .await
         .unwrap();
 
@@ -1848,10 +1837,7 @@ mod tests {
         assert_eq!(alloc.lock().unwrap().in_flight("acme"), 1, "slot claimed at sling");
 
         // Context-exhaustion kill → continuation re-sling on the same session.
-        p.on_event(&record(AgentEvent::Killed {
-            session: "hq-gg-1".into(),
-            reason: "context exhausted: 92% context used".into(),
-        }))
+        p.on_event(&record(AgentEvent::killed("hq-gg-1", "context exhausted: 92% context used")))
         .await
         .unwrap();
         assert_eq!(sup.watched_count(), 1, "still supervised after re-sling");
@@ -1892,10 +1878,7 @@ mod tests {
         assert_eq!(alloc.lock().unwrap().in_flight("acme"), 1);
 
         // A kill for a session we never claimed.
-        p.on_event(&record(AgentEvent::Killed {
-            session: "hq-someone-elses-session".into(),
-            reason: "operator killed".into(),
-        }))
+        p.on_event(&record(AgentEvent::killed("hq-someone-elses-session", "operator killed")))
         .await
         .unwrap();
         assert_eq!(
@@ -1931,10 +1914,7 @@ mod tests {
         );
 
         // A heartbeat-stale kill is NOT context exhaustion → the prompt is left untouched.
-        p.on_event(&record(AgentEvent::Killed {
-            session: "hq-gg-1".into(),
-            reason: "heartbeat stale".into(),
-        }))
+        p.on_event(&record(AgentEvent::killed("hq-gg-1", "heartbeat stale")))
         .await
         .unwrap();
         assert!(
@@ -1950,10 +1930,7 @@ mod tests {
         // A context-exhaustion kill re-slings with the continuation prompt. The bead is never
         // transitioned to `open` on this path — it stays `working` (no transition call exists in
         // resling_on_context_exhaustion), and the polecat stays supervised under the same session.
-        p.on_event(&record(AgentEvent::Killed {
-            session: "hq-gg-1".into(),
-            reason: "context exhausted: 92% context used".into(),
-        }))
+        p.on_event(&record(AgentEvent::killed("hq-gg-1", "context exhausted: 92% context used")))
         .await
         .unwrap();
         assert_eq!(sup.watched_count(), 1, "still supervised after re-sling");
@@ -2650,7 +2627,7 @@ mod tests {
         assert_eq!(alloc.lock().unwrap().in_flight("acme"), 0, "slot released");
         let closed = rx.try_recv().expect("session-end emitted");
         assert_eq!(closed.kind, "agent.session-end.v1");
-        let AgentEvent::SessionEnd { session } = closed.decode::<AgentEvent>().unwrap() else {
+        let AgentEvent::SessionEnd { session, .. } = closed.decode::<AgentEvent>().unwrap() else {
             panic!("expected SessionEnd");
         };
         assert_eq!(session, "gtweb-gtweb-1", "session id derives from the ROUTED template");

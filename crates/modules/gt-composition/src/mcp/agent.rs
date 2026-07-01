@@ -27,7 +27,10 @@ use async_trait::async_trait;
 use serde::Deserialize;
 use serde_json::{json, Value};
 
-use gt_agent::{AgentEvent, Session, SessionRegistry, SessionRole, SessionState};
+use gt_agent::{
+    validate_session_id, AgentEvent, Session, SessionRegistry, SessionRole, SessionState,
+    DEFAULT_SESSION_RETENTION_SECS,
+};
 use gt_channel::DispatchSink;
 use gt_mcp_server::{DomainCtx, DomainHandler};
 use gt_module::McpTool;
@@ -167,8 +170,10 @@ impl DomainHandler for AgentHandler {
             ),
             descriptor(
                 "agent.list",
-                "List every agent session in the workspace.",
-                &[opt("crew", "string")],
+                "List agent sessions in the workspace. By default only live sessions and those that \
+                 ended within the retention window are returned; pass `all=true` to include \
+                 terminated sessions past it. `crew` narrows to one mayor's supervised polecats.",
+                &[opt("crew", "string"), opt("all", "boolean")],
             ),
             descriptor(
                 "agent.info",
@@ -183,6 +188,9 @@ impl DomainHandler for AgentHandler {
         match tool {
             "agent.spawn" => {
                 let a: SpawnArgs = parse(ctx.args)?;
+                // Reject a malformed id (empty role/suffix, e.g. `"mayor-"`) before it enters the
+                // log (gtcore-065009).
+                validate_session_id(&a.session).map_err(AppError::Validation)?;
                 if self.registry(ws)?.get(&a.session).is_some() {
                     return Err(AppError::Validation(format!(
                         "session {} already exists",
@@ -232,25 +240,12 @@ impl DomainHandler for AgentHandler {
             }
             "agent.end" => {
                 let session = self.require_session(ws, &ctx.args)?;
-                self.record(
-                    ws,
-                    AgentEvent::SessionEnd {
-                        session: session.clone(),
-                    },
-                    &session,
-                )
+                self.record(ws, AgentEvent::session_end(session.clone()), &session)
             }
             "agent.kill" => {
                 let session = self.require_session(ws, &ctx.args)?;
                 let reason = str_arg(&ctx.args, "reason")?.to_string();
-                self.record(
-                    ws,
-                    AgentEvent::Killed {
-                        session: session.clone(),
-                        reason,
-                    },
-                    &session,
-                )
+                self.record(ws, AgentEvent::killed(session.clone(), reason), &session)
             }
             "agent.pause" => {
                 // Pause-in-place (B2): record-only, mirroring agent.kill — the REST /:id/pause
@@ -280,10 +275,20 @@ impl DomainHandler for AgentHandler {
             "agent.list" => {
                 let reg = self.registry(ws)?;
                 let crew_filter = ctx.args.get("crew").and_then(|v| v.as_str());
+                let all = ctx.args.get("all").and_then(|v| v.as_bool()).unwrap_or(false);
                 let sessions: Vec<_> = if let Some(mayor_id) = crew_filter {
+                    // An explicit crew query returns that mayor's supervised polecats verbatim.
                     reg.crew_of(mayor_id).iter().map(|s| session_json(s)).collect()
-                } else {
+                } else if all {
                     reg.snapshot().iter().map(session_json).collect()
+                } else {
+                    // Retention view (gtcore-065009): drop terminated sessions older than the
+                    // window so agent.list stays auditable.
+                    let now = gt_agent::now_secs().unwrap_or(0);
+                    reg.visible(now, DEFAULT_SESSION_RETENTION_SECS)
+                        .iter()
+                        .map(session_json)
+                        .collect()
                 };
                 Ok(json!({ "sessions": sessions }))
             }
@@ -344,6 +349,7 @@ fn session_json(session: &Session) -> Value {
         "role": session.role.as_str(),
         "crew": session.crew,
         "last_heartbeat_at": session.last_heartbeat_at,
+        "ended_at": session.ended_at,
     })
 }
 
