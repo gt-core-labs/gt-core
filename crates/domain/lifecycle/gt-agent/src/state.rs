@@ -149,6 +149,35 @@ pub struct Session {
     /// that have not yet received their first supervisor-tick heartbeat).
     #[serde(default)]
     pub last_heartbeat_at: Option<u64>,
+    /// Unix seconds at which the session reached a terminal state (`Done`/`Killed`), stamped from
+    /// the terminal event's `at_secs` (gtcore-065009). `None` for a live session, and for terminal
+    /// sessions replayed from log entries written before the field existed — those are treated as
+    /// old and pruned from the default `agent.list` view (see [`SessionRegistry::visible`]).
+    #[serde(default)]
+    pub ended_at: Option<u64>,
+}
+
+/// Default retention window for terminated sessions in the `agent.list` default view: a session
+/// that ended more than this many seconds ago drops out of the default listing (the full history
+/// stays reachable via the `all` flag). 7 days — matches the bead's suggested cutoff
+/// (gtcore-065009).
+pub const DEFAULT_SESSION_RETENTION_SECS: u64 = 7 * 24 * 60 * 60;
+
+/// Reject a malformed session id before it enters the registry (gtcore-065009). An id is
+/// malformed when it is empty or carries an empty `<role>-<suffix>` segment — a leading or
+/// trailing `-`. This is the shape that produced the anomalous `"mayor-"` session (a mayor woken
+/// for an empty rig, `mayor_session("mayor", "")` → `"mayor-"`); rejecting it at the write path
+/// stops any transport from recording such a session.
+///
+/// Transport-agnostic: returns the error message on rejection so each caller can wrap it in its
+/// own `AppError` variant (the MCP and REST surfaces carry different `AppError` types).
+pub fn validate_session_id(id: &str) -> Result<(), String> {
+    if id.is_empty() || id.starts_with('-') || id.ends_with('-') {
+        return Err(format!(
+            "malformed session id {id:?}: empty role or suffix segment"
+        ));
+    }
+    Ok(())
 }
 
 impl Session {
@@ -166,6 +195,7 @@ impl Session {
             maintains_heartbeat: true,
             tmux_socket: None,
             last_heartbeat_at: None,
+            ended_at: None,
         }
     }
 
@@ -187,6 +217,7 @@ impl Session {
             maintains_heartbeat: role.maintains_heartbeat(),
             tmux_socket: None,
             last_heartbeat_at: None,
+            ended_at: None,
         }
     }
 
@@ -274,6 +305,23 @@ impl SessionRegistry {
             .collect()
     }
 
+    /// Sessions shown in the default `agent.list` view (gtcore-065009): every non-terminal
+    /// (live) session, plus terminal sessions that ended within `retention_secs` of `now_secs`
+    /// (recently finished). A terminal session with no recorded `ended_at` (historical / pre-field
+    /// log entries) is treated as old and pruned — the full history stays reachable via
+    /// [`snapshot`](Self::snapshot). Order is not guaranteed (HashMap source).
+    pub fn visible(&self, now_secs: u64, retention_secs: u64) -> Vec<Session> {
+        self.sessions
+            .values()
+            .filter(|s| {
+                !s.is_terminal()
+                    || s.ended_at
+                        .is_some_and(|t| now_secs.saturating_sub(t) <= retention_secs)
+            })
+            .cloned()
+            .collect()
+    }
+
     pub fn len(&self) -> usize {
         self.sessions.len()
     }
@@ -300,14 +348,16 @@ impl SessionRegistry {
                     s.last_heartbeat_at = Some(ts);
                 }
             }
-            AgentEvent::SessionEnd { session } => {
+            AgentEvent::SessionEnd { session, at_secs } => {
                 if let Some(s) = self.sessions.get_mut(session) {
                     s.state = SessionState::Done;
+                    s.ended_at = *at_secs;
                 }
             }
-            AgentEvent::Killed { session, .. } => {
+            AgentEvent::Killed { session, at_secs, .. } => {
                 if let Some(s) = self.sessions.get_mut(session) {
                     s.state = SessionState::Killed;
+                    s.ended_at = *at_secs;
                 }
             }
             // Pause-in-place (B2): fold the suspend/resume facts as state, unconditionally — the
@@ -440,5 +490,57 @@ mod tests {
         reg.transition("b", SessionState::Killed).unwrap();
         assert_eq!(reg.active().len(), 1);
         assert_eq!(reg.len(), 2);
+    }
+
+    #[test]
+    fn visible_keeps_live_and_recent_prunes_old_and_undated() {
+        // gtcore-065009: the default agent.list view keeps live sessions and terminal sessions
+        // that ended within the retention window, and prunes both old-terminal and
+        // undated-terminal (historical/pre-field) sessions.
+        let now = 100_000_000u64;
+        let day = 24 * 60 * 60u64;
+        let mut reg = SessionRegistry::default();
+
+        // Live session — always visible.
+        reg.add(Session::new("live", "r"));
+
+        // Ended 1 day ago — recent, visible.
+        reg.apply(&AgentEvent::Spawned {
+            session: "recent".into(), rig: "r".into(), role: SessionRole::Polecat, crew: None,
+            skills: Vec::new(), hooks: Vec::new(), maintains_heartbeat: false, tmux_socket: None,
+            spawned_by: None,
+        });
+        reg.apply(&AgentEvent::SessionEnd { session: "recent".into(), at_secs: Some(now - day) });
+
+        // Ended 30 days ago — past the 7-day window, pruned.
+        reg.apply(&AgentEvent::Spawned {
+            session: "old".into(), rig: "r".into(), role: SessionRole::Polecat, crew: None,
+            skills: Vec::new(), hooks: Vec::new(), maintains_heartbeat: false, tmux_socket: None,
+            spawned_by: None,
+        });
+        reg.apply(&AgentEvent::Killed { session: "old".into(), reason: "x".into(), at_secs: Some(now - 30 * day) });
+
+        // Terminal with no recorded end time (historical) — pruned.
+        reg.add(Session::new("undated", "r"));
+        reg.transition("undated", SessionState::Killed).unwrap();
+
+        let mut ids: Vec<String> = reg
+            .visible(now, DEFAULT_SESSION_RETENTION_SECS)
+            .into_iter()
+            .map(|s| s.id)
+            .collect();
+        ids.sort();
+        assert_eq!(ids, vec!["live".to_string(), "recent".to_string()]);
+        // The full history stays reachable via snapshot() (the `all` flag path).
+        assert_eq!(reg.snapshot().len(), 4);
+    }
+
+    #[test]
+    fn validate_session_id_rejects_empty_role_or_suffix() {
+        assert!(validate_session_id("mayor-").is_err(), "empty suffix rejected");
+        assert!(validate_session_id("-gtcore").is_err(), "empty role rejected");
+        assert!(validate_session_id("").is_err(), "empty id rejected");
+        assert!(validate_session_id("mayor-gtcore").is_ok());
+        assert!(validate_session_id("gtcore-065009").is_ok());
     }
 }

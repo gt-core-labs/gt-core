@@ -222,10 +222,7 @@ impl SessionReconciler {
                     session.tmux_socket.as_deref().unwrap_or("default")
                 )
             };
-            let event = AgentEvent::Killed {
-                session: session.id.clone(),
-                reason,
-            };
+            let event = AgentEvent::killed(session.id.clone(), reason);
             if self.emit(event) {
                 eprintln!(
                     "[session-reconcile] {} ({:?}) orphaned — emitted agent.killed",

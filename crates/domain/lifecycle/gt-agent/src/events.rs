@@ -56,8 +56,24 @@ pub enum AgentEvent {
         #[serde(default)]
         timestamp_secs: Option<u64>,
     },
-    SessionEnd { session: String },
-    Killed { session: String, reason: String },
+    SessionEnd {
+        session: String,
+        /// Unix seconds at which the session ended. Feeds [`Session::ended_at`](crate::Session)
+        /// so the list surfaces can prune terminated sessions past the retention window
+        /// (gtcore-065009). `#[serde(default)]` keeps log entries written before this field was
+        /// added replayable — an absent value is treated as "no recorded end time" (an old
+        /// session), so the default `agent.list` view prunes it.
+        #[serde(default)]
+        at_secs: Option<u64>,
+    },
+    Killed {
+        session: String,
+        reason: String,
+        /// Unix seconds at which the session was killed. Same provenance + back-compat as
+        /// [`SessionEnd::at_secs`](AgentEvent::SessionEnd).
+        #[serde(default)]
+        at_secs: Option<u64>,
+    },
     /// A session was suspended **in place** (B2, gtcore-5731e9): its coding-agent process is
     /// stopped with `SIGSTOP` so its in-memory context survives, instead of being killed and
     /// re-slung. Pause-in-place is the kill-preserving alternative for interactive sessions
@@ -68,6 +84,29 @@ pub enum AgentEvent {
     /// A suspended session was resumed with `SIGCONT` (B2, gtcore-5731e9) — folds the session
     /// back to `Working`.
     Resumed { session: String },
+}
+
+/// Unix seconds now, or `None` if the system clock is before the epoch (never, in practice).
+/// Used to stamp the terminal lifecycle events at emission — the same shape the heartbeat path
+/// stamps `timestamp_secs`.
+pub fn now_secs() -> Option<u64> {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .ok()
+}
+
+impl AgentEvent {
+    /// A normal session end, stamped with the current time so the registry records when the
+    /// session terminated (retention filtering, gtcore-065009).
+    pub fn session_end(session: impl Into<String>) -> Self {
+        AgentEvent::SessionEnd { session: session.into(), at_secs: now_secs() }
+    }
+
+    /// A forced kill with `reason`, stamped with the current time (retention filtering).
+    pub fn killed(session: impl Into<String>, reason: impl Into<String>) -> Self {
+        AgentEvent::Killed { session: session.into(), reason: reason.into(), at_secs: now_secs() }
+    }
 }
 
 impl EventKind for AgentEvent {

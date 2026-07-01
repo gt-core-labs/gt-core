@@ -88,6 +88,6 @@ pub async fn supervise(
         }
     }
     let _ = tokio::fs::remove_file(&p.heartbeat).await;
-    let end = Envelope::root(AgentEvent::SessionEnd { session: p.session });
+    let end = Envelope::root(AgentEvent::session_end(p.session));
     let _ = events.send(end).await;
 }

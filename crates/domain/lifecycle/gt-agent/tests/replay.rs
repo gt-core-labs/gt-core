@@ -24,15 +24,10 @@ fn make_events() -> Vec<AgentEvent> {
         });
     }
     for i in 0..30 {
-        evs.push(AgentEvent::SessionEnd {
-            session: format!("p{i:02}"),
-        });
+        evs.push(AgentEvent::SessionEnd { session: format!("p{i:02}"), at_secs: None });
     }
     for i in 30..40 {
-        evs.push(AgentEvent::Killed {
-            session: format!("p{i:02}"),
-            reason: "timeout".into(),
-        });
+        evs.push(AgentEvent::Killed { session: format!("p{i:02}"), reason: "timeout".into(), at_secs: None });
     }
     for i in 0..10 {
         evs.push(AgentEvent::Heartbeat {

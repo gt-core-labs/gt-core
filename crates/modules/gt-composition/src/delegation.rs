@@ -588,10 +588,7 @@ mod tests {
     }
 
     fn killed_record(session: &str) -> EventRecord {
-        EventRecord::from_envelope(&Envelope::root(AgentEvent::Killed {
-            session: session.into(),
-            reason: "stale".into(),
-        }))
+        EventRecord::from_envelope(&Envelope::root(AgentEvent::killed(session, "stale")))
         .unwrap()
     }
 

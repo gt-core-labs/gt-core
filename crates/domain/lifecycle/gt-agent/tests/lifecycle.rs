@@ -28,7 +28,7 @@ async fn fake_polecat_lifecycle_emits_session_end() {
     {
         let seen = Rc::clone(&seen);
         bus.subscribe("agent.session-end.v1", move |_ctx, env| {
-            if let AgentEvent::SessionEnd { session } = &env.payload {
+            if let AgentEvent::SessionEnd { session, .. } = &env.payload {
                 seen.borrow_mut().push(session.clone());
             }
             Ok(())
@@ -46,7 +46,7 @@ async fn fake_polecat_lifecycle_emits_session_end() {
     sup.await.unwrap();
     let ctx = Ctx::root();
     while let Some(env) = rx.recv().await {
-        if let AgentEvent::SessionEnd { session } = &env.payload {
+        if let AgentEvent::SessionEnd { session, .. } = &env.payload {
             let _ = agent.transition(session.clone(), SessionState::Killed).await;
         }
         bus.publish(&ctx, env).unwrap();

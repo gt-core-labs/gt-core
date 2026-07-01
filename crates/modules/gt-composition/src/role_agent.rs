@@ -525,9 +525,7 @@ impl RoleLauncher for SpecRoleLauncher {
                     tokio::time::sleep(poll).await;
                     if !tmux.has_session(&session) {
                         if let Ok(rec) = EventRecord::from_envelope(&Envelope::root(
-                            AgentEvent::SessionEnd {
-                                session: session.clone(),
-                            },
+                            AgentEvent::session_end(session.clone()),
                         )) {
                             let _ = tx.send(rec);
                         }
@@ -633,7 +631,7 @@ impl Plugin for RoleAgentPlugin {
             }
             "agent.session-end.v1" | "agent.killed.v1" => {
                 let session = match record.decode::<AgentEvent>()? {
-                    AgentEvent::SessionEnd { session } => session,
+                    AgentEvent::SessionEnd { session, .. } => session,
                     AgentEvent::Killed { session, .. } => session,
                     _ => return Ok(()),
                 };

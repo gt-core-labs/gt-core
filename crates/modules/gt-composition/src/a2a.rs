@@ -512,7 +512,7 @@ fn translate(rec: &FeedRecord, bead: &str, session: &str) -> Vec<StreamEvent> {
                 AgentEvent::Spawned { session: s, .. } if s == session => {
                     vec![status_update(bead, TaskState::Working, false)]
                 }
-                AgentEvent::SessionEnd { session: s } if s == session => {
+                AgentEvent::SessionEnd { session: s, .. } if s == session => {
                     vec![status_update(bead, TaskState::Completed, true)]
                 }
                 AgentEvent::Killed { session: s, .. } if s == session => {
@@ -1609,7 +1609,7 @@ mod tests {
     async fn subscribe_session_end_is_completed_final() {
         let gw = subscribe_gateway(vec![vec![record(
             "agent.session-end.v1",
-            serde_json::to_value(AgentEvent::SessionEnd { session: SUB_SESSION.into() }).unwrap(),
+            serde_json::to_value(AgentEvent::SessionEnd { session: SUB_SESSION.into(), at_secs: None }).unwrap(),
         )]]);
         let mut s = gw.send_subscribe(send_params("t")).await.unwrap();
         assert_eq!(state_of(&next(&mut s).await), (TaskState::Submitted, false));
@@ -1646,18 +1646,12 @@ mod tests {
             ),
             record(
                 "agent.killed.v1",
-                serde_json::to_value(AgentEvent::Killed {
-                    session: "gtweb-gtweb-zzz".into(),
-                    reason: "other".into(),
-                })
+                serde_json::to_value(AgentEvent::Killed { session: "gtweb-gtweb-zzz".into(), reason: "other".into(), at_secs: None })
                 .unwrap(),
             ),
             record(
                 "agent.killed.v1",
-                serde_json::to_value(AgentEvent::Killed {
-                    session: SUB_SESSION.into(),
-                    reason: "canceled via A2A tasks/cancel".into(),
-                })
+                serde_json::to_value(AgentEvent::Killed { session: SUB_SESSION.into(), reason: "canceled via A2A tasks/cancel".into(), at_secs: None })
                 .unwrap(),
             ),
         ]]);

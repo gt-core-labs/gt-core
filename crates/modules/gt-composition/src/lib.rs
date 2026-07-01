@@ -364,7 +364,7 @@ impl Plugin for SessionMinutesPlugin {
             }
             "agent.session-end.v1" | "agent.killed.v1" => {
                 let session = match record.decode::<AgentEvent>()? {
-                    AgentEvent::SessionEnd { session } => session,
+                    AgentEvent::SessionEnd { session, .. } => session,
                     AgentEvent::Killed { session, .. } => session,
                     _ => return Ok(()),
                 };
@@ -927,9 +927,7 @@ mod session_minutes_tests {
         .unwrap();
         p.on_event(&agent_record(
             "agent.session-end.v1",
-            AgentEvent::SessionEnd {
-                session: "s1".into(),
-            },
+            AgentEvent::SessionEnd { session: "s1".into(), at_secs: None },
             "2026-06-03T12:05:00Z",
         ))
         .await

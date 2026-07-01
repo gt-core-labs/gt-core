@@ -65,17 +65,11 @@ impl WatchOutcome {
     /// the context figure (gtcore-91fdde) without a new event kind.
     fn end_event(self, session: &str) -> AgentEvent {
         match self {
-            WatchOutcome::Exited => AgentEvent::SessionEnd {
-                session: session.to_string(),
-            },
-            WatchOutcome::ContextExhausted { context_pct } => AgentEvent::Killed {
-                session: session.to_string(),
-                reason: format!("context exhausted: {context_pct}% context used"),
-            },
-            WatchOutcome::StaleKilled => AgentEvent::Killed {
-                session: session.to_string(),
-                reason: "heartbeat stale".to_string(),
-            },
+            WatchOutcome::Exited => AgentEvent::session_end(session),
+            WatchOutcome::ContextExhausted { context_pct } => {
+                AgentEvent::killed(session, format!("context exhausted: {context_pct}% context used"))
+            }
+            WatchOutcome::StaleKilled => AgentEvent::killed(session, "heartbeat stale"),
         }
     }
 }
@@ -309,7 +303,7 @@ mod context_exhaustion_tests {
     fn context_exhausted_end_event_records_the_percentage() {
         let ev = WatchOutcome::ContextExhausted { context_pct: 91 }.end_event("gt-max");
         match ev {
-            AgentEvent::Killed { session, reason } => {
+            AgentEvent::Killed { session, reason, .. } => {
                 assert_eq!(session, "gt-max");
                 assert!(reason.contains("91"), "reason carries the pct: {reason}");
                 assert!(reason.contains("context"), "reason names the cause: {reason}");
