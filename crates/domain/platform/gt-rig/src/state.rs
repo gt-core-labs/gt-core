@@ -169,6 +169,11 @@ impl RigEntry {
             .as_deref()
             .map(|u| !u.trim().is_empty())
             .unwrap_or(false);
+        let has_vcs_connection = self
+            .git_connection_ref
+            .as_deref()
+            .map(|c| !c.trim().is_empty())
+            .unwrap_or(false);
         let worktree_root_pinned = self.worktree_root.is_some();
 
         // Blocking gaps: anything that stops the autonomous deliver→push cycle from closing.
@@ -176,9 +181,16 @@ impl RigEntry {
         if !has_clone_url {
             gaps.push("git_url is empty: orchd cannot clone the rig to provision worktrees".into());
         }
-        if !has_push_url {
+        // Push auth is satisfied by EITHER surface (gtcore-ae4d89): an explicit push_url, or a
+        // bound VCS connection — the operational path embeds the rig token into the checkout's
+        // origin at clone time (gtcore-abfe8a), so a connection-bound rig pushes fine and there
+        // is deliberately no push_url setter. The old check read only the push_url column and
+        // reported every connection-bound rig as unable to push (a standing false alarm).
+        if !has_push_url && !has_vcs_connection {
             gaps.push(
-                "push_url is unset: the refinery cannot auto-push main after an ff-merge".into(),
+                "no push auth: neither push_url nor a bound git_connection_ref — the refinery \
+                 cannot auto-push main after an ff-merge"
+                    .into(),
             );
         }
 
@@ -195,6 +207,7 @@ impl RigEntry {
         RigReadiness {
             has_clone_url,
             has_push_url,
+            has_vcs_connection,
             worktree_root_pinned,
             gaps,
             advisories,
@@ -217,6 +230,12 @@ pub struct RigReadiness {
     /// `push_url` is non-empty, so the refinery can fast-forward `main` automatically after a
     /// merge — closing the manual-push gap the epic's B3 criterion called out.
     pub has_push_url: bool,
+    /// A VCS connection (`git_connection_ref`) is bound — the operational push-auth surface
+    /// (gtcore-ae4d89): the rig token rides the checkout's `origin` from clone time
+    /// (gtcore-abfe8a), so a connection-bound rig auto-pushes without a `push_url`.
+    /// `#[serde(default)]` keeps pre-field payloads decodable.
+    #[serde(default)]
+    pub has_vcs_connection: bool,
     /// An explicit `worktree_root` override is pinned. `false` is NOT a blocker — orchd falls
     /// back to the convention default — but the epic asked every rig to pin one, so it surfaces
     /// as an advisory in [`Self::advisories`].
@@ -909,9 +928,9 @@ mod tests {
         assert!(r.has_clone_url);
         assert!(!r.has_push_url);
         assert!(!r.worktree_root_pinned);
-        assert!(!r.ready(), "missing push_url blocks readiness");
-        assert_eq!(r.gaps.len(), 1, "only push_url is a blocking gap here");
-        assert!(r.gaps[0].contains("push_url"));
+        assert!(!r.ready(), "missing push auth blocks readiness");
+        assert_eq!(r.gaps.len(), 1, "only push auth is a blocking gap here");
+        assert!(r.gaps[0].contains("push auth"));
         assert_eq!(r.advisories.len(), 1, "unpinned worktree_root is advisory");
         assert!(r.advisories[0].contains("worktree_root"));
     }
@@ -936,6 +955,27 @@ mod tests {
     }
 
     #[test]
+    fn readiness_accepts_a_bound_vcs_connection_as_push_auth() {
+        // gtcore-ae4d89: a connection-bound rig pushes via the token embedded into its
+        // checkout's origin at clone time (gtcore-abfe8a) — there is no push_url setter, so
+        // requiring the column reported every production rig as unable to push forever.
+        let mut entry = RigEntry::new("plane", "pl", "https://github.com/o/plane.git", "main", 1);
+        entry.git_connection_ref = Some("gh-139659957".into());
+        let r = entry.readiness();
+        assert!(!r.has_push_url, "no push_url column value");
+        assert!(r.has_vcs_connection);
+        assert!(r.gaps.is_empty(), "bound connection satisfies push auth");
+        assert!(r.ready(), "clonable + connection-bound is ready");
+
+        // A blank connection ref is NOT auth.
+        entry.git_connection_ref = Some("   ".into());
+        let r2 = entry.readiness();
+        assert!(!r2.has_vcs_connection);
+        assert!(!r2.ready());
+        assert!(r2.gaps[0].contains("push auth"));
+    }
+
+    #[test]
     fn readiness_treats_blank_urls_as_missing() {
         // A whitespace-only push_url / git_url is not a real value — both must count as gaps.
         let mut entry = RigEntry::new("plane", "pl", "   ", "main", 1);
@@ -943,7 +983,7 @@ mod tests {
         let r = entry.readiness();
         assert!(!r.has_clone_url);
         assert!(!r.has_push_url);
-        assert_eq!(r.gaps.len(), 2, "both blank git_url and push_url are gaps");
+        assert_eq!(r.gaps.len(), 2, "both blank git_url and blank push auth are gaps");
         assert!(!r.ready());
     }
 
