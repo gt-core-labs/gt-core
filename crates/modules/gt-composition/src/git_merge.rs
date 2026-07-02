@@ -418,6 +418,32 @@ fn ancestor_short_circuit(rig: &Path, branch: &str) -> Option<Result<MergeResult
     }
 }
 
+/// Boot reconciliation probe (gtcore-088db9): the sha now on `origin/main` when `branch` has
+/// already landed there **with delivery evidence**, else `None`. Reuses the exact ancestor +
+/// delivery-evidence gate as the ahead=0 short-circuit (gtcore-03be6a), so a branch merely parked
+/// AT a main commit (an idle checkout, zero own commits) is NOT mistaken for a delivered merge.
+///
+/// Fetches first so `origin/main` is current, then: `branch` must be an ancestor of `origin/main`
+/// AND some commit on `origin/main` must reference the branch/bead id. Blocking (shells `git`) —
+/// the boot reconciler runs it on a blocking thread. Used to reconcile a `Merging` slot orphaned by
+/// an orchd restart: `Some(sha)` → complete the slot, `None` → fail it for recovery.
+pub fn delivered_main_sha(rig: &Path, branch: &str) -> Option<String> {
+    let _ = run(rig, &fetch_argv());
+    match run(rig, &already_merged_argv(branch)) {
+        Ok((true, _)) => {}
+        _ => return None,
+    }
+    match run(rig, &delivery_evidence_argv(branch)) {
+        Ok((true, out)) if !out.trim().is_empty() => match run(rig, &rev_parse_origin_main_argv()) {
+            Ok((true, sha)) => Some(sha),
+            // The branch landed; we just could not read the sha back — report an empty sha rather
+            // than flip a genuine delivery to a failure.
+            _ => Some(String::new()),
+        },
+        _ => None,
+    }
+}
+
 /// Execute the real merge of `branch` into `main` from the `rig` checkout, per CLAUDE.md
 /// flat-history: fetch, fast-forward push, and on divergence rebase the branch onto `origin/main`
 /// and retry once. Returns the merged sha on success or a reason on conflict/error. Pure of the
@@ -1286,5 +1312,46 @@ dependencies = [
             ancestor_short_circuit(dir.path(), "gtcore-work01").is_none(),
             "a branch with its own commits must take the real merge path"
         );
+    }
+
+    // ---- delivered_main_sha: the boot-reconciliation probe (gtcore-088db9) ----
+
+    #[test]
+    fn delivered_main_sha_returns_none_without_evidence() {
+        // A Merging orphan whose branch is parked AT a main commit with no own commits and nothing
+        // on main referencing it — same idle-checkout shape as gtcore-4ad682. The probe must NOT
+        // report it delivered, so the reconciler fails the slot for recovery instead of completing.
+        let dir = TempDir::new().unwrap();
+        let head = repo_with_origin_main(dir.path());
+        sh(dir.path(), &["branch", "gtcore-bogus1", &head]);
+        assert_eq!(delivered_main_sha(dir.path(), "gtcore-bogus1"), None);
+    }
+
+    #[test]
+    fn delivered_main_sha_returns_sha_with_evidence() {
+        // The branch already landed on main (a commit references the bead id) → the probe returns
+        // origin/main's sha, so the reconciler completes the orphaned Merging slot.
+        let dir = TempDir::new().unwrap();
+        repo_with_origin_main(dir.path());
+        std::fs::write(dir.path().join("b.txt"), "b").unwrap();
+        sh(dir.path(), &["add", "."]);
+        sh(dir.path(), &["commit", "-q", "-m", "fix: delivered (gtcore-real01)"]);
+        let head = sh(dir.path(), &["rev-parse", "HEAD"]);
+        sh(dir.path(), &["update-ref", "refs/remotes/origin/main", &head]);
+        sh(dir.path(), &["branch", "gtcore-real01", &head]);
+
+        assert_eq!(delivered_main_sha(dir.path(), "gtcore-real01"), Some(head));
+    }
+
+    #[test]
+    fn delivered_main_sha_returns_none_when_branch_ahead() {
+        // A branch with its own un-merged commits is not an ancestor of main → not delivered.
+        let dir = TempDir::new().unwrap();
+        repo_with_origin_main(dir.path());
+        sh(dir.path(), &["checkout", "-q", "-b", "gtcore-work01"]);
+        std::fs::write(dir.path().join("c.txt"), "c").unwrap();
+        sh(dir.path(), &["add", "."]);
+        sh(dir.path(), &["commit", "-q", "-m", "feat: own work (gtcore-work01)"]);
+        assert_eq!(delivered_main_sha(dir.path(), "gtcore-work01"), None);
     }
 }
