@@ -1427,8 +1427,19 @@ async fn main() -> anyhow::Result<()> {
     // agents never race on a shared token. Registered on the SAME relay as the polecat sling so it
     // observes the same hub. GT_ROLE_AGENTS off ⇒ the legacy in-process loops + witness safety-net
     // stand unchanged. The returned dispatcher is shared with the deacon health-tick timer below.
-    let role_dispatcher: Option<Arc<RoleAgentDispatcher>> = match role_template {
-        Some(role_template) => {
+    let role_dispatcher: Option<Arc<RoleAgentDispatcher>> = match (&resident_host, role_template) {
+        // Resident mode (gtcore-865fb8): the SAME triggers deliver WAKES to the long-lived
+        // sessions instead of single-shot slings — one plugin swap, ownership unchanged
+        // (sheriff←merge.failed/ready, witness←issues.closed; deacon rides the timer below).
+        (Some(host), _) => {
+            pol_registry = pol_registry
+                .register(gt_composition::role_resident::ResidentTriggerPlugin::new(host.clone()));
+            eprintln!(
+                "[gt-orch-server] role triggers → resident wakes (GT_ROLE_SESSIONS=1) — sheriff←merge.failed/ready, witness←issues.closed, deacon←health tick"
+            );
+            None
+        }
+        (None, Some(role_template)) => {
             let mut launcher = SpecRoleLauncher::new(role_template, tmux.clone())
                 .with_workspace(ws_slug.clone())
                 .with_session_events(handle.events_sender());
@@ -1455,7 +1466,7 @@ async fn main() -> anyhow::Result<()> {
             );
             Some(dispatcher)
         }
-        None => {
+        (None, None) => {
             eprintln!(
                 "[gt-orch-server] role agents OFF — set GT_ROLE_AGENTS=1 (sheriff/witness/deacon stay in-process loops + witness safety-net)"
             );
@@ -1469,7 +1480,40 @@ async fn main() -> anyhow::Result<()> {
     // single-flight, launcher and session accounting as the trigger-driven slings. The mayor is
     // NOT spawnable here: it is the one role this orchestrator raises itself. Requires role
     // agents ON (the dispatcher is the materialization engine).
-    let role_spawn_task: Option<tokio::task::JoinHandle<()>> = match &role_dispatcher {
+    let role_spawn_task: Option<tokio::task::JoinHandle<()>> = if let Some(host) = &resident_host {
+        // Resident mode (gtcore-865fb8): the same channel + payload (mayor/polecat rejections
+        // unchanged), each accepted request wakes the resident instead of slinging single-shot.
+        let name = std::env::var("GT_ROLE_SPAWN_CHANNEL").unwrap_or_else(|_| "role-spawn".to_string());
+        let role_spawn_root =
+            std::env::var("GT_CHANNEL_ROOT").unwrap_or_else(|_| "/gt/.channels".to_string());
+        match Channel::open(&role_spawn_root, &name) {
+            Ok(channel) => {
+                eprintln!(
+                    "[gt-orch-server] on-demand role spawn on — resident wakes via file channel {role_spawn_root}/{name}"
+                );
+                let host = host.clone();
+                Some(tokio::spawn(async move {
+                    let mut tracker = RestartTracker::new(RestartConfig::default());
+                    let make = || {
+                        let channel = channel.clone();
+                        let host = host.clone();
+                        async move {
+                            if let Err(e) =
+                                gt_composition::role_resident::run_on_demand_resident(channel, host).await
+                            {
+                                eprintln!("[gt-orch-server] role-spawn resident consumer error: {e} — supervisor will restart");
+                            }
+                        }
+                    };
+                    gt_polecat::supervise_daemon("role-spawn", make, &mut tracker, u32::MAX, now_secs).await;
+                }))
+            }
+            Err(e) => {
+                eprintln!("[gt-orch-server] on-demand role spawn OFF — channel open failed: {e}");
+                None
+            }
+        }
+    } else { match &role_dispatcher {
         Some(dispatcher) => {
             let name = std::env::var("GT_ROLE_SPAWN_CHANNEL")
                 .unwrap_or_else(|_| "role-spawn".to_string());
@@ -1531,7 +1575,7 @@ async fn main() -> anyhow::Result<()> {
             eprintln!("[gt-orch-server] on-demand role spawn OFF — role agents disabled (GT_ROLE_AGENTS)");
             None
         }
-    };
+    } };
 
     // Convoy completion reactor (gtcore-896a29): advance a convoy when one of its member beads
     // closes — complete the member, feed the next one onto the dispatch channel (the orchd's own
@@ -1759,7 +1803,24 @@ async fn main() -> anyhow::Result<()> {
     // single-shot deacon (single-flight absorbs a fire while one is still live), which scans flow
     // health read-only and escalates. Only spawned when role agents are on. Default 900s (15 min) —
     // a health sweep, not a hot loop — and the first fire is skipped (nothing to scan at boot).
-    let deacon_timer = role_dispatcher.as_ref().map(|dispatcher| {
+    let deacon_timer = if let Some(host) = &resident_host {
+        let host = host.clone();
+        let deacon_tick_secs = env_usize("GT_DEACON_TICK_SECS", 900) as u64;
+        eprintln!("[gt-orch-server] deacon health tick every {deacon_tick_secs}s (resident wake)");
+        Some(tokio::spawn(async move {
+            let mut tick = tokio::time::interval(Duration::from_secs(deacon_tick_secs));
+            tick.tick().await; // skip the immediate first fire (the boot survey wake covers it)
+            loop {
+                tick.tick().await;
+                let (kind, payload) = gt_composition::role_resident::trigger_wake(
+                    &gt_composition::role_agent::RoleTrigger::HealthTick,
+                );
+                if let Err(e) = host.wake(kind, &payload).await {
+                    eprintln!("[role-resident] deacon health-tick wake failed: {e}");
+                }
+            }
+        }))
+    } else { role_dispatcher.as_ref().map(|dispatcher| {
         let dispatcher = dispatcher.clone();
         let deacon_tick_secs = env_usize("GT_DEACON_TICK_SECS", 900) as u64;
         eprintln!("[gt-orch-server] deacon health tick every {deacon_tick_secs}s");
@@ -1771,7 +1832,7 @@ async fn main() -> anyhow::Result<()> {
                 dispatcher.on_trigger(&RoleTrigger::HealthTick);
             }
         })
-    });
+    }) };
 
     eprintln!(
         "[gt-orch-server] reactor loops on — patrol tick {patrol_tick_secs}s (lease timeout {lease_timeout}s), quota tick {quota_tick_secs}s (threshold {quota_threshold}s)"
