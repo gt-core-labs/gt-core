@@ -91,7 +91,10 @@ fn enable(s: &mut SkillState, role: &str, skill: &str) {
 /// - `polecat` → `issues.read`, `issues.write`, `merge.write`, `memory.read`, `memory.write`,
 ///   `a2a.read`, `a2a.write`, `notify.write` (work + claim + transition + submit merge + durable
 ///   memory + P2P + escalate to the operator — `gtcore-44fab7`).
-/// - `mayor` → `issues.read`, `issues.write`, `agent.read`, `agent.write`, `merge.read`, `merge.write` (coordinate + dispatch).
+/// - `mayor` → `issues.read`, `issues.write`, `agent.read`, `agent.write`, `merge.read`,
+///   `merge.write`, `dispatch.read`, `dispatch.write`, `notify.write` (coordinate + the delegation
+///   edge `dispatch.request`/`dispatch.probe` its prompt drives — gtcore-c54d88 — plus escalation
+///   when a delegation fails).
 /// - `sheriff` → `merge.read`, `merge.write`, `notify.write`, `memory.read`, `memory.write`
 ///   (drive the merge board, escalate to the operator, recall/persist durable memory).
 /// - `refinery` → `merge.write` (submit MERGE_READY).
@@ -133,6 +136,13 @@ pub fn agent_least_privilege_catalog() -> SkillCatalog {
     // (NOT `notifications.write`) is what authorizes the `notify.send` MCP tool — `notify.send` lives
     // in the `notify.*` namespace, while `notifications.*` is the members' read/dismiss namespace.
     register(&mut s, "operator-notify", &["notify.write"]);
+    // gtcore-c54d88: the mayor's delegation edge. `dispatch.request` (gtcore-d24661) is what
+    // materializes a delegated bead; without this grant MAYOR mode ships inert — the first real
+    // delegation (2026-07-02) returned unauthorized on every attempt. The tool verbs
+    // (`request`/`probe`) are not in the closed SCOPE_VERBS vocabulary, so the grant rides
+    // `dispatch.read`+`dispatch.write` folding to the whole `dispatch.*` namespace, exactly like
+    // the a2a grant above.
+    register(&mut s, "dispatch-request", &["dispatch.read", "dispatch.write"]);
     register(&mut s, "comments-write", &["comments.write"]);
     // The deacon's read-only flow scan reads the board (`board.list`) and merge board (`merge.list`)
     // on top of the tracker (`issues.read`, via `observe`).
@@ -151,6 +161,11 @@ pub fn agent_least_privilege_catalog() -> SkillCatalog {
     // list/ack/administer notifications.
     enable(&mut s, "polecat", "operator-notify");
     enable(&mut s, "mayor", "bead-coordinate");
+    // gtcore-c54d88: the mayor delegates via dispatch.request and its prompt tells it to report a
+    // failed delegation via notify.send — both were unauthorized, leaving MAYOR mode unable to
+    // move the frontier (same inert-grant class as gtcore-abf278 / gtcore-44fab7).
+    enable(&mut s, "mayor", "dispatch-request");
+    enable(&mut s, "mayor", "operator-notify");
     // sheriff (gtcore-999795): drive the merge board + escalate + durable memory.
     enable(&mut s, "sheriff", "merge-ops");
     enable(&mut s, "sheriff", "operator-notify");
@@ -274,7 +289,11 @@ mod tests {
             scopes(&c, "polecat"),
             vec!["a2a.read", "a2a.write", "issues.read", "issues.write", "memory.read", "memory.write", "merge.write", "notify.write"]
         );
-        assert_eq!(scopes(&c, "mayor"), vec!["issues.read", "issues.write", "agent.read", "agent.write", "merge.read", "merge.write"]);
+        // mayor: bead-coordinate, dispatch-request (gtcore-c54d88), operator-notify.
+        assert_eq!(
+            scopes(&c, "mayor"),
+            vec!["issues.read", "issues.write", "agent.read", "agent.write", "merge.read", "merge.write", "dispatch.read", "dispatch.write", "notify.write"]
+        );
         assert_eq!(scopes(&c, "refinery"), vec!["merge.write"]);
         // gtcore-999795: sheriff/witness/deacon carry the scopes their role-agent kickoffs exercise,
         // enumerated granularly. Order is the legacy union's: enabled skills walked alphabetically by
@@ -339,6 +358,26 @@ mod tests {
         assert!(!scope.allow.iter().any(|s| s == "*"), "polecat must not carry '*'");
     }
 
+    /// gtcore-c54d88 (AC): the mayor's daemon-minted grant must AUTHORIZE the delegation edge its
+    /// prompt drives — `dispatch.request` (+ `dispatch.probe`) and the failure escalation
+    /// `notify.send` — while ungranted namespaces stay denied. The first real MAYOR-mode wake
+    /// (2026-07-02) hit unauthorized on all three and the frontier could not move.
+    #[test]
+    fn mayor_grant_reaches_the_delegation_edge() {
+        let c = agent_least_privilege_catalog();
+        let scope = gt_rbac::Scope::from_workspace_claim("mayor", &scopes(&c, "mayor"));
+
+        scope.check("dispatch.request.execute").expect("dispatch.request authorized");
+        scope.check("dispatch.probe.execute").expect("dispatch.probe authorized");
+        scope.check("notify.send.execute").expect("notify.send authorized");
+        scope.check("issues.read.execute").expect("tracker still authorized");
+
+        // Enforcement not weakened: ungranted namespaces stay denied.
+        assert!(scope.check("workspace.create").is_err(), "no workspace admin");
+        assert!(scope.check("quota.set.execute").is_err(), "no quota control");
+        assert!(!scope.allow.iter().any(|s| s == "*"), "mayor must not carry '*'");
+    }
+
     /// gtcore-999795 (AC): the trigger-driven role agents' daemon-minted grants, expanded the way the
     /// MCP boundary expands a JWT claim ([`gt_rbac::Scope::from_workspace_claim`]), must AUTHORIZE the
     /// tools each role's kickoff drives — otherwise the feature ships inert. The crucial subtlety is
@@ -391,15 +430,16 @@ mod tests {
         let c = agent_least_privilege_catalog();
         let scope = |role: &str| gt_rbac::Scope::from_workspace_claim(role, &scopes(&c, role));
 
-        // Bound to operator-notify → can escalate to the operator.
-        for role in ["polecat", "sheriff", "witness", "deacon"] {
+        // Bound to operator-notify → can escalate to the operator (mayor since gtcore-c54d88:
+        // its prompt reports a failed delegation via notify.send).
+        for role in ["polecat", "sheriff", "witness", "deacon", "mayor"] {
             scope(role)
                 .check("notify.send.execute")
                 .unwrap_or_else(|e| panic!("{role} must be able to notify.send: {e}"));
         }
 
         // Not bound to operator-notify → notify.send denied (per-role grant, not a blanket).
-        for role in ["mayor", "refinery", "overseer", "nobody"] {
+        for role in ["refinery", "overseer", "nobody"] {
             assert!(
                 scope(role).check("notify.send.execute").is_err(),
                 "{role} must NOT be able to notify.send"
