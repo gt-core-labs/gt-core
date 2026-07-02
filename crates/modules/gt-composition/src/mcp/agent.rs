@@ -66,21 +66,25 @@ impl AgentHandler {
     }
 
     /// Drop a `{bead,priority}` dispatch request on the channel — orchd picks it up and
-    /// slings a real polecat. Best-effort: a failure logs but never fails the spawn call.
-    fn bridge_to_scheduler(&self, channel: &DispatchSink, bead: &str) {
+    /// slings a real polecat. The spawn event is recorded regardless, but the outcome is
+    /// returned so the caller SEES a bridge that did not materialize (gtcore-d24661) —
+    /// the silent variant left mayors believing six delegations had slung when none did.
+    fn bridge_to_scheduler(&self, channel: &DispatchSink, bead: &str) -> Result<(), String> {
         let payload = DispatchPayload {
             bead: bead.to_string(),
             title: None,
             priority: 1,
         };
-        match serde_json::to_vec(&payload) {
-            Ok(bytes) => {
-                if let Err(e) = channel.emit(&bytes) {
-                    eprintln!("[agent] dispatch bridge: emit failed for {bead} — {e}");
-                }
-            }
-            Err(e) => eprintln!("[agent] dispatch bridge: serialize failed — {e}"),
-        }
+        let bytes = serde_json::to_vec(&payload).map_err(|e| {
+            let msg = format!("dispatch bridge: serialize failed — {e}");
+            eprintln!("[agent] {msg}");
+            msg
+        })?;
+        channel.emit(&bytes).map_err(|e| {
+            let msg = format!("dispatch bridge: emit failed for {bead} — {e}");
+            eprintln!("[agent] {msg}");
+            msg
+        })
     }
 
     /// Rebuild the session registry from the workspace's agent events.
@@ -199,7 +203,7 @@ impl DomainHandler for AgentHandler {
                 }
                 let session = a.session.clone();
                 let bead = a.bead.clone();
-                let result = self.record(
+                let mut result = self.record(
                     ws,
                     AgentEvent::Spawned {
                         session: a.session,
@@ -216,10 +220,30 @@ impl DomainHandler for AgentHandler {
                     },
                     &session,
                 )?;
-                // Bridge the bead to orchd so a real tmux polecat slings. Best-effort:
-                // the spawn event is already recorded regardless of dispatch outcome.
-                if let (Some(bead_id), Some(channel)) = (&bead, &self.dispatch) {
-                    self.bridge_to_scheduler(channel, bead_id);
+                // Bridge the bead to orchd so a real tmux polecat slings. The spawn event is
+                // already recorded regardless of dispatch outcome, but the outcome is surfaced
+                // in the result so a delegation that will NOT materialize is visible to the
+                // caller instead of dying silently in the reconciler (gtcore-d24661).
+                if let Some(bead_id) = &bead {
+                    let dispatch_outcome = match &self.dispatch {
+                        Some(channel) => self.bridge_to_scheduler(channel, bead_id).err(),
+                        None => Some(
+                            "dispatch channel not wired on this server — the bead was NOT \
+                             dispatched; no polecat will sling from this spawn"
+                                .to_string(),
+                        ),
+                    };
+                    if let Some(obj) = result.as_object_mut() {
+                        match dispatch_outcome {
+                            None => {
+                                obj.insert("dispatched".into(), Value::Bool(true));
+                            }
+                            Some(err) => {
+                                obj.insert("dispatched".into(), Value::Bool(false));
+                                obj.insert("dispatch_error".into(), Value::String(err));
+                            }
+                        }
+                    }
                 }
                 Ok(result)
             }

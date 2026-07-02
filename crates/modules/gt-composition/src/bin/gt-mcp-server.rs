@@ -2468,6 +2468,11 @@ async fn build_domain_router(
             if let Some(pg_url) = std::env::var("GT_PG_URL").ok().filter(|v| !v.is_empty()) {
                 handler = handler.with_held_rigs(Arc::new(WsPools::new(pg_url)));
             }
+            // gtcore-d24661: dispatch.request — the mayor's delegation edge. Shares the
+            // convoy/agent sink; when it is absent the tool errors loudly instead of no-op'ing.
+            if let Some(sink) = &dispatch_sink {
+                handler = handler.with_dispatch_sink(sink.clone());
+            }
             router.register(Arc::new(handler))
         }
         None => {
