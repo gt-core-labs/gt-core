@@ -31,6 +31,17 @@ pub enum WedgeDialog {
     /// claude's "Usage limit reached" rate-limit modal (Stop and wait / Upgrade). Recovery:
     /// rotate the account off the limited one, then re-sling.
     UsageLimit,
+    /// A feature-promo modal ("Yes, try it" / "Maybe later", gtcore-f396dc) — new claude releases
+    /// gate features behind first-run promos the seeded flags don't cover yet. Recovery: re-seed
+    /// (the seeder stamps the known promo flags), then re-sling.
+    FeaturePromo,
+    /// The session booted past every dialog but sits at the input box with NO turn ever started
+    /// (gtcore-f396dc): the dialog consumed the positional kickoff prompt, so the agent idles at
+    /// an empty prompt, heartbeating, indistinguishable from working via `has-session`. Only
+    /// classified for FRESHLY slung sessions (age-gated in the supervisor tick) — an old session
+    /// resting between turns always has output in its pane. Recovery: re-seed + re-sling (the
+    /// fresh spawn re-passes the kickoff prompt).
+    IdleEmptyPrompt,
 }
 
 impl WedgeDialog {
@@ -39,6 +50,8 @@ impl WedgeDialog {
         match self {
             WedgeDialog::TrustPrompt => "trust-folder dialog",
             WedgeDialog::UsageLimit => "usage-limit dialog",
+            WedgeDialog::FeaturePromo => "feature-promo dialog",
+            WedgeDialog::IdleEmptyPrompt => "idle empty prompt (kickoff prompt lost)",
         }
     }
 
@@ -51,6 +64,10 @@ impl WedgeDialog {
             // A usage-limit modal means the backing account hit its wall — the quota rotation moves
             // the live pointer, so a plain re-sling lands on the rotated (healthy) account.
             WedgeDialog::UsageLimit => WedgeRecovery::RotateAccount,
+            // A promo modal (or its aftermath, the eaten kickoff prompt) is a seeding gap — re-seed
+            // stamps the known promo flags; the re-sling re-delivers the kickoff prompt.
+            WedgeDialog::FeaturePromo => WedgeRecovery::ReseedOnboarding,
+            WedgeDialog::IdleEmptyPrompt => WedgeRecovery::ReseedOnboarding,
         }
     }
 }
@@ -84,7 +101,36 @@ pub fn classify_wedge(pane: &str) -> Option<WedgeDialog> {
     if is_trust_prompt(&lower) {
         return Some(WedgeDialog::TrustPrompt);
     }
+    if is_feature_promo(&lower) {
+        return Some(WedgeDialog::FeaturePromo);
+    }
     None
+}
+
+/// Classify a FRESHLY slung session's pane as [`WedgeDialog::IdleEmptyPrompt`] (gtcore-f396dc):
+/// the TUI booted to its interactive input box, no turn is running, and NO agent output was ever
+/// rendered — the positional kickoff prompt was consumed (by a dialog that has since closed, or
+/// it landed in the box unsubmitted) and the polecat will idle forever.
+///
+/// Deliberately separate from [`classify_wedge`]: this verdict is only sound for a session in
+/// its first minutes (a mature session resting between turns has output in its visible pane),
+/// so the supervisor tick applies it behind an age gate. All three conditions must hold:
+///
+/// 1. **Booted** — the pane shows claude's interactive bottom bar (`bypass permissions` /
+///    `? for shortcuts`), so a still-launching process is never classified.
+/// 2. **Not running** — no `esc to interrupt` marker (a turn in flight renders it).
+/// 3. **No output ever** — none of the response/thinking/tool markers (`●`, `✻`, `⎿`) appear in
+///    the visible scrollback; any of them proves the kickoff prompt WAS accepted.
+pub fn classify_fresh_idle(pane: &str) -> Option<WedgeDialog> {
+    let lower = pane.to_ascii_lowercase();
+    let booted = lower.contains("bypass permissions") || lower.contains("? for shortcuts");
+    let running = lower.contains("esc to interrupt");
+    let has_output = pane.contains('●') || pane.contains('✻') || pane.contains('⎿');
+    if booted && !running && !has_output {
+        Some(WedgeDialog::IdleEmptyPrompt)
+    } else {
+        None
+    }
 }
 
 /// True when the (already-lowercased) pane shows claude's usage-limit modal. Keys off the
@@ -107,6 +153,14 @@ fn is_trust_prompt(lower: &str) -> bool {
     lower.contains("do you trust the files in this folder")
         || lower.contains("do you trust this folder")
         || (lower.contains("trust the files") && lower.contains("folder"))
+}
+
+/// True when the (already-lowercased) pane shows a feature-promo modal (gtcore-f396dc). Keys off
+/// the accept text PAIRED with a decline choice so an agent merely quoting "yes, try it" in its
+/// own output never trips it — the modal always offers the opt-out alternative.
+fn is_feature_promo(lower: &str) -> bool {
+    lower.contains("yes, try it")
+        && (lower.contains("maybe later") || lower.contains("not now") || lower.contains("no thanks"))
 }
 
 #[cfg(test)]
@@ -185,6 +239,70 @@ Usage limit reached
         // "trust the" + "folder" could be near each other; the phrase here is not the prompt.
         // The exact-phrase guards keep it None.
         assert_eq!(classify_wedge(pane), None);
+    }
+
+    #[test]
+    fn detects_the_feature_promo_modal() {
+        // gtcore-f396dc: the promo pairs the accept text with a decline choice.
+        let pane = "\
+╭──────────────────────────────────────────────╮
+│ New: run background tasks while you work     │
+│ ❯ 1. Yes, try it                             │
+│   2. Maybe later                             │
+╰──────────────────────────────────────────────╯";
+        assert_eq!(classify_wedge(pane), Some(WedgeDialog::FeaturePromo));
+        assert_eq!(
+            classify_wedge(pane).unwrap().recovery(),
+            WedgeRecovery::ReseedOnboarding
+        );
+        assert_eq!(
+            classify_wedge("Try the new feature? 1. Yes, try it  2. Not now"),
+            Some(WedgeDialog::FeaturePromo)
+        );
+    }
+
+    #[test]
+    fn quoting_the_promo_text_in_passing_is_not_a_wedge() {
+        // The accept text without a decline choice is an agent talking, not the modal.
+        assert_eq!(classify_wedge("The dialog said 'Yes, try it' and I accepted."), None);
+    }
+
+    #[test]
+    fn fresh_idle_empty_prompt_is_classified() {
+        // gtcore-f396dc: booted TUI, no turn running, no output ever — the kickoff was eaten.
+        let pane = "\
+ Welcome to Claude Code
+────────────────────────
+❯
+────────────────────────
+  ⏵⏵ bypass permissions on (shift+tab to cycle)";
+        assert_eq!(classify_fresh_idle(pane), Some(WedgeDialog::IdleEmptyPrompt));
+        // Same verdict when the prompt landed in the box but was never submitted.
+        let stuck = "\
+❯ fix the bug in foo.rs
+──────────────────────
+  ? for shortcuts";
+        assert_eq!(classify_fresh_idle(stuck), Some(WedgeDialog::IdleEmptyPrompt));
+    }
+
+    #[test]
+    fn fresh_idle_requires_booted_and_excludes_activity() {
+        // Still launching (no bottom bar) → not classified; a later tick decides.
+        assert_eq!(classify_fresh_idle("Loading…"), None);
+        // A turn in flight → healthy.
+        assert_eq!(
+            classify_fresh_idle("✻ Thinking… esc to interrupt · bypass permissions on"),
+            None
+        );
+        // Any rendered output proves the kickoff was accepted → healthy even if idle now.
+        assert_eq!(
+            classify_fresh_idle("● Done, 3 files changed\n❯\n  bypass permissions on"),
+            None
+        );
+        assert_eq!(
+            classify_fresh_idle("  ⎿ Read 40 lines\n❯\n  ? for shortcuts"),
+            None
+        );
     }
 
     #[test]
