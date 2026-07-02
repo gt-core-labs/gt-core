@@ -21,7 +21,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
 use tokio::sync::broadcast;
@@ -277,11 +277,35 @@ pub struct PolecatSupervisorPlugin {
     /// hold paused (H2 stops new dispatch; H3 stops the re-sling behind it). In-flight polecats are
     /// untouched. `None` ⇒ no rig is ever treated as held (pre-feature behaviour).
     held_rigs: Option<Arc<dyn HeldRigs>>,
+    /// Beads parked at a pool/host-cap refusal, awaiting their delayed re-enqueue
+    /// (gtcore-f527f6). Before this, a cap-refused dispatch was dropped on the floor: a
+    /// post-OOM boot computes a depressed `host_cap`, the one-shot re-hydration skips most
+    /// `working` beads, and they stay working-without-session forever — invisible to the
+    /// frontier, needing manual operator transitions (three incidents in 24h, 2026-07-01/02).
+    /// Membership also gates the operator `SlingSkipped` alert to the FIRST refusal, so the
+    /// retry loop does not re-ring the bell every cycle.
+    cap_parked: Mutex<HashSet<String>>,
+    /// Delay before a cap-parked bead is re-emitted onto the dispatch channel
+    /// (`GT_CAP_RETRY_SECS`, default 60; tests use 0 for an immediate retry). The retry is
+    /// capacity-neutral: the governor slot is freed at park time and the retry's own channel
+    /// consumption re-acquires one, so a long outage cannot leak scheduler capacity.
+    cap_retry_secs: u64,
+    /// Producer handle onto the orchd dispatch channel for the cap-parked retry
+    /// (gtcore-f527f6). The retry MUST re-enter through the channel consumer — it re-seeds the
+    /// bead `Pending` before enqueueing — because a bare `SchedHandle::enqueue` of an
+    /// already-claimed bead loses the pump's CAS-claim and dies as `DispatchFailed`. `None` ⇒
+    /// cap refusals are terminal, exactly the pre-fix behaviour.
+    dispatch_sink: Option<Arc<gt_channel::DispatchSink>>,
 }
 
 /// Default CI-failure retry cap when `GT_CI_MAX_RETRIES` is unset (gtcore-3a1bd4): three automated
 /// fix-and-re-push attempts before escalating to a human.
 pub const DEFAULT_CI_MAX_RETRIES: u32 = 3;
+
+/// Default delay before a cap-parked bead is re-enqueued when `GT_CAP_RETRY_SECS` is unset
+/// (gtcore-f527f6): long enough for the 15s capacity timer to have refreshed `host_cap` from
+/// live metrics, short enough that a post-restart depressed cap self-heals in ~a minute.
+pub const DEFAULT_CAP_RETRY_SECS: u64 = 60;
 
 impl PolecatSupervisorPlugin {
     /// Wire the dispatch→sling observer for `workspace`. `tmux` is the edge adapter (real
@@ -317,6 +341,9 @@ impl PolecatSupervisorPlugin {
             ci_retries: Arc::new(Mutex::new(HashMap::new())),
             ci_max_retries: DEFAULT_CI_MAX_RETRIES,
             held_rigs: None,
+            cap_parked: Mutex::new(HashSet::new()),
+            cap_retry_secs: DEFAULT_CAP_RETRY_SECS,
+            dispatch_sink: None,
         }
     }
 
@@ -324,6 +351,20 @@ impl PolecatSupervisorPlugin {
     /// a bead whose rig is on `hold`. Absent ⇒ no rig is ever held (pre-feature behaviour).
     pub fn with_held_rigs(mut self, source: Arc<dyn HeldRigs>) -> Self {
         self.held_rigs = Some(source);
+        self
+    }
+
+    /// Override the cap-parked retry delay (gtcore-f527f6, `GT_CAP_RETRY_SECS`). `0` re-enqueues
+    /// immediately (tests).
+    pub fn with_cap_retry_secs(mut self, secs: u64) -> Self {
+        self.cap_retry_secs = secs;
+        self
+    }
+
+    /// Wire the dispatch-channel producer used by the cap-parked retry (gtcore-f527f6). Without
+    /// it a pool/host-cap refusal stays terminal (the pre-fix behaviour).
+    pub fn with_dispatch_sink(mut self, sink: Arc<gt_channel::DispatchSink>) -> Self {
+        self.dispatch_sink = Some(sink);
         self
     }
 
@@ -814,14 +855,22 @@ impl Plugin for PolecatSupervisorPlugin {
                         eprintln!(
                             "[polecat] sling skipped for {bead}: not slingable (closed/epic/manual/rig-on-hold) — boot re-hydration / stale dispatch"
                         );
+                        // A parked bead that became not-slingable (closed while waiting) is done:
+                        // stop its retry chain (gtcore-f527f6).
+                        self.cap_parked.lock().expect("cap-parked mutex").remove(&bead);
                         if let Some(sched) = &self.sched {
                             sched.capacity_freed().await;
                         }
                         return Ok(());
                     }
                 }
-                // Admission first: a refused claim is backpressure, not an error — the bead stays
-                // queued/dispatched in the log; capacity will free up as live polecats finish.
+                // Admission first: a refused claim is backpressure, not an error. It used to be
+                // TERMINAL backpressure though: nothing ever redelivered the bead, so a dispatch
+                // refused under a transient depressed cap (post-OOM boot) stayed
+                // working-without-session forever (gtcore-f527f6). Now the bead is parked and
+                // re-enqueued through the scheduler after `cap_retry_secs`, re-running this whole
+                // path — slingability and cap are re-checked each attempt, and the loop ends when
+                // the sling lands or the bead stops being slingable.
                 if self
                     .allocator
                     .lock()
@@ -829,18 +878,63 @@ impl Plugin for PolecatSupervisorPlugin {
                     .claim(&self.workspace)
                     .is_err()
                 {
+                    let first_refusal = self
+                        .cap_parked
+                        .lock()
+                        .expect("cap-parked mutex")
+                        .insert(bead.clone());
                     eprintln!(
-                        "[polecat] sling skipped for {bead}: pool/host cap reached (workspace {})",
-                        self.workspace
+                        "[polecat] sling skipped for {bead}: pool/host cap reached (workspace {}){}",
+                        self.workspace,
+                        match &self.dispatch_sink {
+                            Some(_) => format!(" — parked, retrying in {}s", self.cap_retry_secs),
+                            None => " — no dispatch sink wired, NOT retried".to_string(),
+                        }
                     );
-                    // Surface the backpressure to the operator (gtcore-7e19fe): the bead is in limbo
-                    // until a slot frees, which is invisible from the log alone.
-                    self.emit_polecat(PolecatEvent::SlingSkipped {
-                        bead: bead.clone(),
-                        workspace: self.workspace.clone(),
-                    });
+                    // Surface the backpressure to the operator (gtcore-7e19fe) — once per park,
+                    // not once per retry cycle, so the bell is signal rather than noise.
+                    if first_refusal {
+                        self.emit_polecat(PolecatEvent::SlingSkipped {
+                            bead: bead.clone(),
+                            workspace: self.workspace.clone(),
+                        });
+                    }
+                    if let Some(sink) = self.dispatch_sink.clone() {
+                        // Capacity-neutral retry: free the governor slot this dispatch held; the
+                        // retry re-enters through the CHANNEL consumer (which re-seeds the bead
+                        // `Pending` before enqueueing) and re-acquires a slot there.
+                        if let Some(sched) = &self.sched {
+                            sched.capacity_freed().await;
+                        }
+                        let retry_bead = bead.clone();
+                        let delay = self.cap_retry_secs;
+                        tokio::spawn(async move {
+                            if delay > 0 {
+                                tokio::time::sleep(Duration::from_secs(delay)).await;
+                            }
+                            let payload = gt_scheduling::dispatch::DispatchPayload {
+                                bead: retry_bead.clone(),
+                                title: None,
+                                priority: 1,
+                            };
+                            match serde_json::to_vec(&payload) {
+                                Ok(bytes) => {
+                                    if let Err(e) = sink.emit(&bytes) {
+                                        eprintln!(
+                                            "[polecat] cap-parked retry emit failed for {retry_bead}: {e}"
+                                        );
+                                    }
+                                }
+                                Err(e) => eprintln!(
+                                    "[polecat] cap-parked retry serialize failed for {retry_bead}: {e}"
+                                ),
+                            }
+                        });
+                    }
                     return Ok(());
                 }
+                // The claim landed: this bead is no longer parked (a retry admitted it).
+                self.cap_parked.lock().expect("cap-parked mutex").remove(&bead);
                 // Route to the bead's rig by prefix (hq-0ecfec): matched ⇒ that rig's template +
                 // worktree root; unknown prefix ⇒ the legacy boot template, unchanged behaviour.
                 let (template, worktree_root) = self.route(&bead);
@@ -2972,6 +3066,85 @@ mod tests {
         assert_eq!(
             embed_token_in_url("/tmp/local-remote", "gho_TOKEN"),
             "/tmp/local-remote"
+        );
+    }
+
+    /// gtcore-f527f6: a dispatch refused at pool/host cap is PARKED and re-enqueued through the
+    /// scheduler, alerting the operator once, and slings as soon as capacity frees — instead of
+    /// silently stranding the bead working-without-session (the post-OOM boot pattern that took
+    /// three manual recoveries in 24h on 2026-07-01/02).
+    #[tokio::test]
+    async fn cap_refused_dispatch_parks_alerts_once_and_reslings_when_capacity_frees() {
+        // Zero pool for the plugin's workspace: every claim is refused until raised.
+        let alloc = Arc::new(Mutex::new(
+            PoolAllocator::new(10, 5).with_pool_size("acme", 0),
+        ));
+        let chan_dir = tempfile::tempdir().unwrap();
+        let chan_root = chan_dir.path().to_str().unwrap().to_string();
+        let channel = gt_channel::Channel::open(&chan_root, "dispatch").unwrap();
+        let sink = Arc::new(gt_channel::DispatchSink::File(channel));
+        let (p, _sup) = plugin(alloc.clone());
+        let (tx, mut rx) = broadcast::channel::<EventRecord>(16);
+        let p = p
+            .with_session_events(tx)
+            .with_dispatch_sink(sink)
+            .with_cap_retry_secs(0);
+
+        let dispatched = || {
+            record(SchedEvent::Dispatched {
+                bead: "hq-parked1".into(),
+                worker: "w1".into(),
+            })
+        };
+
+        // First refusal: parked + the ONE operator alert.
+        p.on_event(&dispatched()).await.unwrap();
+        assert_eq!(rx.try_recv().unwrap().kind, "polecat.sling-skipped.v1");
+
+        // The retry re-entered the dispatch channel: a `{bead,priority}` .event file lands for
+        // the consumer (whose re-seed-Pending + enqueue path gt-scheduling's own dispatch test
+        // covers).
+        let event_dir = chan_dir.path().join("dispatch");
+        let retry = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                let queued = std::fs::read_dir(&event_dir)
+                    .map(|d| {
+                        d.filter_map(Result::ok)
+                            .filter(|e| e.path().extension().is_some_and(|x| x == "event"))
+                            .any(|e| {
+                                std::fs::read(e.path()).is_ok_and(|b| {
+                                    serde_json::from_slice::<
+                                        gt_scheduling::dispatch::DispatchPayload,
+                                    >(&b)
+                                    .is_ok_and(|p| p.bead == "hq-parked1")
+                                })
+                            })
+                    })
+                    .unwrap_or(false);
+                if queued {
+                    return;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        })
+        .await;
+        retry.expect("the parked bead was re-emitted onto the dispatch channel");
+
+        // Still at cap: the redelivery parks again WITHOUT re-ringing the bell.
+        p.on_event(&dispatched()).await.unwrap();
+        assert!(
+            rx.try_recv().is_err(),
+            "a retry refusal must not repeat the operator alert"
+        );
+
+        // Capacity frees (the 15s timer raising host_cap, or a polecat finishing): the next
+        // redelivery slings for real.
+        alloc.lock().unwrap().set_pool_size("acme", 1);
+        p.on_event(&dispatched()).await.unwrap();
+        assert_eq!(
+            rx.try_recv().unwrap().kind,
+            "agent.spawned.v1",
+            "the parked bead slings once capacity exists"
         );
     }
 

@@ -69,7 +69,7 @@ use gt_composition::patrol_bridge::PatrolBridgePlugin;
 use gt_composition::mcp::eventlog::EventLog;
 use gt_composition::polecat::{
     host_cap_from_metrics, rig_routing_from_catalog, AgentTokenMinter, PolecatSupervisorPlugin,
-    RigConfig, ScopeResolver, DEFAULT_CI_MAX_RETRIES,
+    RigConfig, ScopeResolver, DEFAULT_CAP_RETRY_SECS, DEFAULT_CI_MAX_RETRIES,
 };
 use gt_composition::quota_rotation::{self, QuotaRotationPlugin};
 use gt_composition::role_agent::{
@@ -847,6 +847,41 @@ async fn main() -> anyhow::Result<()> {
         eprintln!("[gt-orch-server] sling→working transition on — beads flip to working at spawn");
     } else {
         eprintln!("[gt-orch-server] sling→working transition OFF — GT_DOLT_URL unset (beads stay open until agent self-transitions)");
+    }
+    // Cap-parked retry (gtcore-f527f6): a dispatch refused at pool/host cap is re-emitted onto the
+    // dispatch channel after this many seconds instead of being dropped — the post-OOM
+    // depressed-cap boot self-heals. The sink mirrors the consumer's backend selection below
+    // (PG queue under GT_EVENTLOG_PG, else the file channel), so the retry always re-enters
+    // through the consumer that re-seeds the bead `Pending`.
+    let cap_retry_secs = env_usize("GT_CAP_RETRY_SECS", DEFAULT_CAP_RETRY_SECS as usize) as u64;
+    pol_plugin = pol_plugin.with_cap_retry_secs(cap_retry_secs);
+    let cap_retry_sink: Option<gt_channel::DispatchSink> = {
+        let name = std::env::var("GT_DISPATCH_CHANNEL").unwrap_or_else(|_| "dispatch".to_string());
+        let want_pg = std::env::var("GT_EVENTLOG_PG")
+            .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"))
+            .unwrap_or(false);
+        match (want_pg, std::env::var("GT_PG_URL").ok()) {
+            (true, Some(pg_url)) => gt_channel::PgQueue::connect(&pg_url, &name)
+                .and_then(|q| q.ensure_schema().map(|()| q))
+                .map(gt_channel::DispatchSink::Pg)
+                .map_err(|e| eprintln!("[gt-orch-server] cap-parked retry sink (PG) init failed: {e}"))
+                .ok(),
+            _ => std::env::var("GT_CHANNEL_ROOT")
+                .ok()
+                .and_then(|root| gt_channel::Channel::open(&root, &name).ok())
+                .map(gt_channel::DispatchSink::File),
+        }
+    };
+    match cap_retry_sink {
+        Some(sink) => {
+            pol_plugin = pol_plugin.with_dispatch_sink(Arc::new(sink));
+            eprintln!(
+                "[gt-orch-server] cap-parked sling retry on — a pool/host-cap refusal re-enqueues after {cap_retry_secs}s"
+            );
+        }
+        None => eprintln!(
+            "[gt-orch-server] cap-parked sling retry OFF — no dispatch sink (GT_CHANNEL_ROOT/GT_EVENTLOG_PG unset); cap refusals stay terminal"
+        ),
     }
     // Register the polecat supervisor and — when a keychain exists — the predictive rotation
     // observer on the same relay: a `quota.block_predicted.v1` / `quota.account_limited.v1` flips
