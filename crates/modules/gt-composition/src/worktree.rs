@@ -356,6 +356,15 @@ pub fn seed_claude_onboarding(config_dir: &Path, worktree: &Path) {
         "autoUpdaterStatus".into(),
         serde_json::Value::String("disabled".into()),
     );
+    // Feature-promo gates (gtcore-f396dc): new claude releases show first-run promo modals
+    // ("Yes, try it") that eat the positional kickoff prompt exactly like the trust dialog.
+    // Stamp the KNOWN promo flags; unknown future promos are caught at runtime by the wedge
+    // detector (FeaturePromo + fresh-idle classification), not by growing this list reactively.
+    obj.insert("hasSeenTasksHint".into(), serde_json::Value::Bool(true));
+    obj.insert(
+        "hasAcknowledgedCostThreshold".into(),
+        serde_json::Value::Bool(true),
+    );
     obj.entry("theme")
         .or_insert_with(|| serde_json::Value::String("dark".into()));
     // Folder trust is per-project: mark THIS worktree path trusted + onboarded, and pre-enable the

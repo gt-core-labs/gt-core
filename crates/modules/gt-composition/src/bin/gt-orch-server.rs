@@ -715,6 +715,59 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
+    // Wedge recovery hook (gtcore-2836bb, completed by gtcore-f396dc): the supervisor DETECTS an
+    // alive-but-wedged polecat (trust/promo dialog, usage-limit modal, or a fresh session whose
+    // positional kickoff prompt was eaten and now idles at an empty input box), but the recovery
+    // belongs to composition — re-seed the onboarding/promo flags into the session's ACTUAL config
+    // dir so the re-sling that follows boots past the dialog. Without this hook the detection is
+    // off entirely ("no hook ⇒ no wedge detection"): the gtcore-2836bb machinery shipped dark,
+    // which is how 4/4 re-slung polecats sat wedged unnoticed on 2026-07-02.
+    supervisor.set_on_wedge(Box::new(|spec, dialog| {
+        match dialog.recovery() {
+            gt_polecat::WedgeRecovery::ReseedOnboarding => {
+                // Same effective-config-dir resolution as the sling path: the stamped
+                // CLAUDE_CONFIG_DIR when an account was resolved, else claude's default.
+                let config_dir = spec
+                    .env
+                    .iter()
+                    .find(|(k, _)| k == "CLAUDE_CONFIG_DIR")
+                    .map(|(_, v)| std::path::PathBuf::from(v))
+                    .or_else(|| {
+                        std::env::var_os("HOME")
+                            .map(|h| std::path::Path::new(&h).join(".claude"))
+                    });
+                match config_dir {
+                    Some(cd) => {
+                        gt_composition::worktree::seed_claude_onboarding(&cd, &spec.workdir);
+                        eprintln!(
+                            "[gt-orch-server] wedge recovery session={} ({}): re-seeded onboarding/promo flags at {}",
+                            spec.session,
+                            dialog.reason(),
+                            cd.display()
+                        );
+                    }
+                    None => eprintln!(
+                        "[gt-orch-server] wedge recovery session={} ({}): no config dir resolvable — re-sling only",
+                        spec.session,
+                        dialog.reason()
+                    ),
+                }
+            }
+            gt_polecat::WedgeRecovery::RotateAccount => {
+                // Nothing to mutate here: the re-sling path re-resolves the account through the
+                // respec closure (keychain + quota snapshot), which rotates off the limited one.
+                eprintln!(
+                    "[gt-orch-server] wedge recovery session={} ({}): account re-resolves at re-sling",
+                    spec.session,
+                    dialog.reason()
+                );
+            }
+        }
+    }));
+    eprintln!(
+        "[gt-orch-server] wedge detection armed — trust/promo/usage-limit dialogs + fresh idle-empty-prompt sessions recover via kill + re-sling"
+    );
+
     // Web onboarding (hq-quota-onboard-web) moved to the backend mcp-server in .4: claude now lives
     // IN the image, so onboarding rides the existing /api/v1/* auth chain instead of a host process
     // behind a docker→host firewall hole. The daemon no longer serves it — it only hydrates its
