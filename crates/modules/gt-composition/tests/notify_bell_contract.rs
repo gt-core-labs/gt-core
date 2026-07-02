@@ -8,9 +8,13 @@
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use serde_json::{json, Value};
+
 use gt_composition::mcp::eventlog::EventLog;
+use gt_composition::mcp::notify::NotifyHandler;
 use gt_composition::notify_bell::{ring_bell, BellWrite, DEFAULT_DEDUP_WINDOW_SECS};
 use gt_composition::notify_kind::NotificationKind;
+use gt_mcp_server::{DomainCtx, DomainHandler};
 use gt_store_pg::{assert_ephemeral_pg_url, notifications_migrations};
 
 fn nonce() -> u128 {
@@ -107,6 +111,74 @@ async fn acked_and_resolved_rows_are_not_repaged() {
         assert!(again.deduped, "{state} row still absorbs the re-emission");
         assert_eq!(again.id, first.id);
     }
+}
+
+/// Drive one MCP tool through the real handler (gtcore-73d4ab surface).
+async fn call(handler: &NotifyHandler, tool: &str, args: Value) -> Result<Value, gt_store_dolt::AppError> {
+    handler
+        .dispatch(tool, DomainCtx { workspace: None, actor: "contract-test", args })
+        .await
+}
+
+#[tokio::test]
+async fn mcp_lifecycle_send_list_ack_resolve() {
+    let Some((pool, log)) = pool_or_skip("mcp_lifecycle").await else { return };
+    let handler = NotifyHandler::new(pool.clone(), log);
+    let title = format!("lifecycle finding {}", nonce());
+
+    // send twice → deduped into one row with count=2 (the derived fingerprint kicks in).
+    let first = call(&handler, "notify.send", json!({ "title": title, "kind": "alert" }))
+        .await
+        .expect("send");
+    let id = first["id"].as_str().expect("id").to_string();
+    let second = call(&handler, "notify.send", json!({ "title": title, "kind": "alert" }))
+        .await
+        .expect("re-send");
+    assert_eq!(second["deduped"], json!(true));
+    assert_eq!(second["id"].as_str(), Some(id.as_str()));
+    assert_eq!(second["count"], json!(2));
+
+    // Out-of-set kind is an explicit, listing validation error (AC c).
+    let bad = call(&handler, "notify.send", json!({ "title": "x", "kind": "warning" })).await;
+    let err = format!("{bad:?}");
+    assert!(err.contains("decision, info, alert"), "explicit listing error: {err}");
+
+    // list state=new surfaces the row with its counter.
+    let listed = call(&handler, "notify.list", json!({ "state": "new" })).await.expect("list");
+    let row = listed["rows"]
+        .as_array()
+        .expect("rows")
+        .iter()
+        .find(|r| r["id"].as_str() == Some(id.as_str()))
+        .expect("sent row is listed as new")
+        .clone();
+    assert_eq!(row["count"], json!(2));
+    assert_eq!(row["state"], json!("new"));
+
+    // ack → acked (idempotent); resolve → resolved; ack-after-resolve is a usable error.
+    let acked = call(&handler, "notify.ack", json!({ "id": id })).await.expect("ack");
+    assert_eq!(acked["state"], json!("acked"));
+    let re_acked = call(&handler, "notify.ack", json!({ "id": id })).await.expect("re-ack");
+    assert_eq!(re_acked["state"], json!("acked"), "ack is idempotent");
+    let resolved = call(&handler, "notify.resolve", json!({ "id": id })).await.expect("resolve");
+    assert_eq!(resolved["state"], json!("resolved"));
+    let regress = call(&handler, "notify.ack", json!({ "id": id })).await;
+    assert!(regress.is_err(), "ack must not regress a resolved row");
+
+    // AC (b) end-to-end: the resolved row still absorbs the same finding — no new page.
+    let after = call(&handler, "notify.send", json!({ "title": title, "kind": "alert" }))
+        .await
+        .expect("send over resolved");
+    assert_eq!(after["deduped"], json!(true), "resolved row absorbs the re-emission");
+
+    // Unknown id → NotFound.
+    let missing = call(
+        &handler,
+        "notify.resolve",
+        json!({ "id": "00000000-0000-0000-0000-000000000000" }),
+    )
+    .await;
+    assert!(missing.is_err(), "unknown id errors");
 }
 
 #[tokio::test]
