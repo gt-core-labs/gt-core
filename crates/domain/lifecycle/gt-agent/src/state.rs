@@ -346,6 +346,14 @@ impl SessionRegistry {
             AgentEvent::Heartbeat { session, timestamp_secs } => {
                 if let (Some(s), Some(ts)) = (self.sessions.get_mut(session), *timestamp_secs) {
                     s.last_heartbeat_at = Some(ts);
+                    // A heartbeat proves the agent process is alive and executing — a session
+                    // still `spawned` at its first stamped heartbeat is de-facto working
+                    // (gtcore-efb7e6: the sessions view showed live daemons stuck in `spawned`
+                    // because nothing ever transitioned them). Fold it as a fact; terminal and
+                    // paused states are untouched (a late heartbeat must not resurrect/resume).
+                    if s.state == SessionState::Spawned {
+                        s.state = SessionState::Working;
+                    }
                 }
             }
             AgentEvent::SessionEnd { session, at_secs } => {
@@ -401,6 +409,37 @@ impl SessionRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn first_heartbeat_folds_spawned_into_working() {
+        // gtcore-efb7e6: live daemons sat in `spawned` forever because nothing transitioned them;
+        // a stamped heartbeat is proof of execution, so the reducer folds it as Working.
+        let mut reg = SessionRegistry::default();
+        reg.apply(&AgentEvent::Spawned {
+            session: "sheriff-1".into(),
+            rig: "granite".into(),
+            role: SessionRole::Dog(DogKind::Sheriff),
+            crew: None,
+            spawned_by: Some("role-agent".into()),
+            skills: vec![],
+            hooks: vec![],
+            maintains_heartbeat: true,
+            tmux_socket: None,
+        });
+        assert_eq!(reg.get("sheriff-1").unwrap().state, SessionState::Spawned);
+        // A timestamp-less heartbeat (pre-field log entry) changes nothing.
+        reg.apply(&AgentEvent::Heartbeat { session: "sheriff-1".into(), timestamp_secs: None });
+        assert_eq!(reg.get("sheriff-1").unwrap().state, SessionState::Spawned);
+        // The first stamped heartbeat flips Spawned → Working and records the timestamp.
+        reg.apply(&AgentEvent::Heartbeat { session: "sheriff-1".into(), timestamp_secs: Some(42) });
+        let s = reg.get("sheriff-1").unwrap();
+        assert_eq!(s.state, SessionState::Working);
+        assert_eq!(s.last_heartbeat_at, Some(42));
+        // A late heartbeat never resurrects a terminal session.
+        reg.apply(&AgentEvent::killed("sheriff-1", "done"));
+        reg.apply(&AgentEvent::Heartbeat { session: "sheriff-1".into(), timestamp_secs: Some(99) });
+        assert_eq!(reg.get("sheriff-1").unwrap().state, SessionState::Killed);
+    }
 
     #[test]
     fn legal_lifecycle() {

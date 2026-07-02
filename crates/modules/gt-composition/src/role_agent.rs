@@ -559,8 +559,14 @@ impl RoleLauncher for SpecRoleLauncher {
 
         spawn_tmux(self.tmux.as_ref(), &spec).map_err(|e| e.to_string())?;
 
-        // Observability: the role agent is a session too. maintains_heartbeat=false so the
-        // patrol-bridge never leases it (it owns no bead) and crew=None (not a bead worker).
+        // Observability: the role agent is a session too. maintains_heartbeat=true because the
+        // exit watch below TOUCHES the session's heartbeat file + emits agent.heartbeat.v1 every
+        // poll while the tmux session lives (gtcore-efb7e6) — before this, role agents were
+        // registered with neither heartbeat nor tmux_socket, which the session reconciler's safe
+        // fallback could never judge: every registration whose exit watch died with the daemon
+        // (orchd restart) sat in `spawned` forever (~9 zombie sheriffs observed). crew=None (not
+        // a bead worker); the claude process itself installs no heartbeat hook, the WATCH is the
+        // heartbeat source, matching how the polecat supervisor heartbeats its watched sessions.
         self.emit(AgentEvent::Spawned {
             session: session.to_string(),
             rig: self.template.rig.clone(),
@@ -568,28 +574,42 @@ impl RoleLauncher for SpecRoleLauncher {
             crew: None,
             skills: Vec::new(),
             hooks: Vec::new(),
-            maintains_heartbeat: false,
+            maintains_heartbeat: true,
             tmux_socket: None,
             spawned_by: Some("role-agent".into()),
         });
 
-        // Exit watch: when the tmux session is gone, emit session-end so the dispatcher frees the
-        // single-flight slot. Only when a hub is wired (so tests without one don't spawn a task).
+        // Exit watch: while the tmux session lives, maintain its liveness signals (heartbeat file
+        // for the reconciler's staleness probe + agent.heartbeat.v1 for the sessions view); when
+        // it is gone, emit session-end so the dispatcher frees the single-flight slot and remove
+        // the heartbeat file so a reused session id starts clean. Only when a hub is wired (so
+        // tests without one don't spawn a task).
         if let Some(tx) = &self.events {
             let tmux = self.tmux.clone();
             let tx = tx.clone();
             let session = session.to_string();
             let poll = self.poll;
+            let heartbeat = spec.heartbeat.clone();
             tokio::spawn(async move {
                 loop {
                     tokio::time::sleep(poll).await;
                     if !tmux.has_session(&session) {
+                        let _ = std::fs::remove_file(&heartbeat);
                         if let Ok(rec) = EventRecord::from_envelope(&Envelope::root(
                             AgentEvent::session_end(session.clone()),
                         )) {
                             let _ = tx.send(rec);
                         }
                         break;
+                    }
+                    let _ = std::fs::write(&heartbeat, b"");
+                    if let Ok(rec) = EventRecord::from_envelope(&Envelope::root(
+                        AgentEvent::Heartbeat {
+                            session: session.clone(),
+                            timestamp_secs: Some(now_ms() / 1000),
+                        },
+                    )) {
+                        let _ = tx.send(rec);
                     }
                 }
             });
