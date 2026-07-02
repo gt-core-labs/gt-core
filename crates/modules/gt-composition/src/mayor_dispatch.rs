@@ -36,8 +36,12 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use gt_agent::{AgentEvent, SessionRole};
+use gt_eventlog::EventRecord;
+use gt_events::Envelope;
 use gt_mcp_server::bead_prefix;
 use gt_polecat::Tmux;
+use tokio::sync::broadcast;
 use gt_quota::{AccountQuotaStatus, Keychain, QuotaHandle};
 use gt_runtime::{BeadId, ReadySource};
 use gt_skills::SkillState;
@@ -323,6 +327,18 @@ pub struct TmuxMayorWaker {
     /// MCP server URL (`GT_SELF_URL`) the mayor's `.mcp.json`/`.gt-config` point at (gtcore-3f4d94).
     /// Required alongside [`agent_token`](Self::agent_token) to provision role-scoped MCP auth.
     server_url: Option<String>,
+    /// Hub sender for the mayor's session lifecycle (gtcore-a44568). Without it the mayor is a
+    /// tmux-only ghost: `agent.list` shows polecats/sheriffs/deacons but never the mayor, so an
+    /// operator concludes no mayor exists while one idles on its wake file. The waker OWNS the
+    /// lifecycle (spawn/heartbeat/supersede-kill) because the record is stamped
+    /// `tmux_socket: None` — the Interactive session reconciler cannot verify a session on the
+    /// orchd's default tmux server and must never false-kill it.
+    session_events: Option<broadcast::Sender<EventRecord>>,
+    /// Sessions THIS waker has spawned (gtcore-a44568): lets a re-spawn after a death emit the
+    /// previous incarnation's `agent.killed.v1` first, so the registry never shows two live
+    /// mayors for one rig. In-memory — an orchd restart loses it, and the fresh `Spawned` for the
+    /// same session id simply refreshes the old row (no ghost).
+    spawned: std::sync::Mutex<std::collections::HashSet<String>>,
 }
 
 impl TmuxMayorWaker {
@@ -355,6 +371,23 @@ impl TmuxMayorWaker {
             event_log: None,
             agent_token: None,
             server_url: None,
+            session_events: None,
+            spawned: std::sync::Mutex::new(std::collections::HashSet::new()),
+        }
+    }
+
+    /// Emit the mayor session lifecycle onto the hub (gtcore-a44568) so `agent.list` and the
+    /// console SEE the mayor like every other role. Absent ⇒ tmux-only (legacy, invisible).
+    pub fn with_session_events(mut self, events: broadcast::Sender<EventRecord>) -> Self {
+        self.session_events = Some(events);
+        self
+    }
+
+    fn emit_session(&self, ev: AgentEvent) {
+        if let Some(tx) = &self.session_events {
+            if let Ok(rec) = EventRecord::from_envelope(&Envelope::root(ev)) {
+                let _ = tx.send(rec);
+            }
         }
     }
 
@@ -536,7 +569,33 @@ impl MayorWaker for TmuxMayorWaker {
             // mayor's env cannot be changed, and re-resolving every tick would waste a quota probe.
             let session = mayor_session(&self.prefix, rig);
             if self.tmux.has_session(&session) {
+                // Refresh the live mayor's visibility (gtcore-a44568): the registry row carries
+                // no heartbeat promise, so this is observability, not liveness enforcement.
+                self.emit_session(AgentEvent::Heartbeat {
+                    session: session.clone(),
+                    timestamp_secs: Some(
+                        std::time::SystemTime::now()
+                            .duration_since(UNIX_EPOCH)
+                            .map(|d| d.as_secs())
+                            .unwrap_or(0),
+                    ),
+                });
                 return Ok(());
+            }
+            // The previous incarnation died (we spawned this session before and its tmux is gone):
+            // close its registry row before the fresh spawn so `agent.list` never shows a live
+            // mayor that is not there (gtcore-a44568).
+            if self.spawned.lock().expect("spawned mutex").contains(&session) {
+                self.emit_session(AgentEvent::Killed {
+                    session: session.clone(),
+                    reason: "mayor tmux session gone — superseded by a fresh wake spawn".to_string(),
+                    at_secs: Some(
+                        std::time::SystemTime::now()
+                            .duration_since(UNIX_EPOCH)
+                            .map(|d| d.as_secs())
+                            .unwrap_or(0),
+                    ),
+                });
             }
             // Resolve + validate the account to launch under, like the polecat sling (gtcore-559c50).
             // An `Err` (no account can authenticate) aborts the spawn so the mayor is never born in
@@ -620,6 +679,26 @@ impl MayorWaker for TmuxMayorWaker {
             self.tmux
                 .new_session(&session, &self.workdir, &self.command, &args, &env)
                 .map_err(|e| MayorWakeError(format!("spawn mayor session {session}: {e}")))?;
+            // Announce the mayor like every other role (gtcore-a44568): agent.list/console show
+            // it live. `tmux_socket: None` on purpose — the mayor lives on the orchd's DEFAULT
+            // tmux server, which the Interactive reconciler cannot reach; a socket value would
+            // make it check the wrong server and false-kill a live mayor. The waker owns the
+            // record's lifecycle instead (heartbeat on re-wake, supersede-kill on re-spawn).
+            self.spawned
+                .lock()
+                .expect("spawned mutex")
+                .insert(session.clone());
+            self.emit_session(AgentEvent::Spawned {
+                session: session.clone(),
+                rig: rig.to_string(),
+                role: SessionRole::Mayor,
+                crew: None,
+                spawned_by: Some("orchd-mayor-waker".to_string()),
+                skills: Vec::new(),
+                hooks: Vec::new(),
+                maintains_heartbeat: false,
+                tmux_socket: None,
+            });
             Ok(())
         }
     }
@@ -791,6 +870,52 @@ mod tests {
             vec![("GT_ROLE".to_string(), "polecat".to_string())],
             root.to_path_buf(),
         )
+    }
+
+    /// gtcore-a44568: the mayor must be OBSERVABLE — before this, the waker created a tmux-only
+    /// session and `agent.list` never showed a mayor, so an operator concluded none existed while
+    /// one idled on its wake file. The waker owns the record's lifecycle: Spawned on create
+    /// (`tmux_socket: None` so the Interactive reconciler never false-kills what it cannot see),
+    /// Heartbeat on a re-wake of a live session, and a supersede-Killed before re-spawning a dead
+    /// one.
+    #[tokio::test]
+    async fn wake_announces_the_mayor_session_lifecycle() {
+        let tmp = tempfile::tempdir().unwrap();
+        let tmux = Arc::new(FakeTmux::new());
+        let (tx, mut rx) = tokio::sync::broadcast::channel::<EventRecord>(16);
+        let w = waker(tmux.clone(), tmp.path()).with_session_events(tx);
+
+        // First wake: spawn + announce.
+        w.wake("gtcore", &ids(&["gtcore-a"])).await.unwrap();
+        let rec = rx.try_recv().expect("spawn announced");
+        assert_eq!(rec.kind, "agent.spawned.v1");
+        let ev: AgentEvent = rec.decode().unwrap();
+        match ev {
+            AgentEvent::Spawned { session, role, maintains_heartbeat, tmux_socket, .. } => {
+                assert_eq!(session, "mayor-gtcore");
+                assert_eq!(role, SessionRole::Mayor);
+                assert!(!maintains_heartbeat, "no heartbeat promise — the waker owns liveness");
+                assert!(
+                    tmux_socket.is_none(),
+                    "no socket: the Interactive reconciler must never judge (and false-kill) it"
+                );
+            }
+            other => panic!("expected Spawned, got {other:?}"),
+        }
+
+        // Re-wake of the live session: visibility heartbeat, no duplicate spawn.
+        w.wake("gtcore", &ids(&["gtcore-b"])).await.unwrap();
+        let rec = rx.try_recv().expect("re-wake announced");
+        assert_eq!(rec.kind, "agent.heartbeat.v1");
+        assert!(rx.try_recv().is_err(), "no duplicate Spawned for a live mayor");
+
+        // The mayor dies; the next wake closes the old row before announcing the fresh spawn.
+        tmux.kill_session("mayor-gtcore").unwrap();
+        w.wake("gtcore", &ids(&["gtcore-c"])).await.unwrap();
+        let rec = rx.try_recv().expect("supersede announced");
+        assert_eq!(rec.kind, "agent.killed.v1");
+        let rec = rx.try_recv().expect("fresh spawn announced");
+        assert_eq!(rec.kind, "agent.spawned.v1");
     }
 
     #[tokio::test]

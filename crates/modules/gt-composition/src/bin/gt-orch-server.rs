@@ -1236,6 +1236,9 @@ async fn main() -> anyhow::Result<()> {
                     if let Some(url) = std::env::var("GT_SELF_URL").ok().filter(|v| !v.is_empty()) {
                         waker = waker.with_server_url(url);
                     }
+                    // Announce the mayor's session lifecycle on the hub (gtcore-a44568) so
+                    // agent.list/console show it — before this the mayor was a tmux-only ghost.
+                    waker = waker.with_session_events(handle.events_sender());
                     let dispatcher =
                         Arc::new(gt_composition::mayor_dispatch::MayorDispatcher::new(source, waker));
                     mayor_dispatch_task =
