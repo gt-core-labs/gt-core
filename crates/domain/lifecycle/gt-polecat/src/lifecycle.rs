@@ -270,6 +270,17 @@ impl SpawnTemplate {
         if let Some(sandbox) = env("IS_SANDBOX") {
             base_env.push(("IS_SANDBOX".to_string(), sandbox));
         }
+        // Cap each polecat's BUILD parallelism (gtcore-d6953e): cargo fans one build out across
+        // every core, so even a small pool saturates a single disk — 2026-07-02, pool=2, two
+        // `cargo test` runs ≈ 42 concurrent rustc writers pegged the NVMe at 99% I/O pressure
+        // for ~2h and took dev down. The disk-aware host cap (gtcore-c233c4) only gates NEW
+        // slings once pressure is already high; this bounds the width of every build regardless,
+        // so the worst case is pool_size × jobs writers instead of pool_size × cores.
+        if let Some(jobs) =
+            Self::build_jobs_env(env("CARGO_BUILD_JOBS"), env("GT_POLECAT_BUILD_JOBS"))
+        {
+            base_env.push(("CARGO_BUILD_JOBS".to_string(), jobs));
+        }
         SpawnTemplate {
             rig,
             prefix,
@@ -278,6 +289,29 @@ impl SpawnTemplate {
             args,
             base_env,
             heartbeat_dir,
+        }
+    }
+
+    /// Resolve the `CARGO_BUILD_JOBS` value to stamp into every polecat's env (gtcore-d6953e).
+    ///
+    /// - The operator's explicit daemon-level `CARGO_BUILD_JOBS` wins verbatim (passthrough).
+    /// - Else `GT_POLECAT_BUILD_JOBS` decides: `0` disables the stamp entirely (escape hatch), a
+    ///   positive integer is used as-is, anything unparseable falls back to the default.
+    /// - Neither set ⇒ the safe default of `4`.
+    ///
+    /// Pure (inputs injected) so the policy is unit-tested without touching the process env.
+    fn build_jobs_env(operator: Option<String>, polecat_jobs: Option<String>) -> Option<String> {
+        const DEFAULT_JOBS: &str = "4";
+        if let Some(explicit) = operator {
+            return Some(explicit);
+        }
+        match polecat_jobs {
+            Some(v) => match v.parse::<u32>() {
+                Ok(0) => None,
+                Ok(n) => Some(n.to_string()),
+                Err(_) => Some(DEFAULT_JOBS.to_string()),
+            },
+            None => Some(DEFAULT_JOBS.to_string()),
         }
     }
 
@@ -896,5 +930,28 @@ mod lifecycle_tests {
         let probe = FakeTmux::new();
         spawn_tmux(&probe, &spec).unwrap();
         assert!(probe.show_environment("gt-hq-1", GT_WORKSPACE).unwrap().is_none());
+    }
+
+    #[test]
+    fn build_jobs_policy() {
+        // gtcore-d6953e: neither set → safe default 4.
+        assert_eq!(SpawnTemplate::build_jobs_env(None, None).as_deref(), Some("4"));
+        // GT_POLECAT_BUILD_JOBS picks the width.
+        assert_eq!(
+            SpawnTemplate::build_jobs_env(None, Some("6".into())).as_deref(),
+            Some("6")
+        );
+        // 0 = escape hatch: no stamp, cargo keeps its own default.
+        assert_eq!(SpawnTemplate::build_jobs_env(None, Some("0".into())), None);
+        // Garbage falls back to the default rather than propagating.
+        assert_eq!(
+            SpawnTemplate::build_jobs_env(None, Some("many".into())).as_deref(),
+            Some("4")
+        );
+        // An operator-level explicit CARGO_BUILD_JOBS wins verbatim over everything.
+        assert_eq!(
+            SpawnTemplate::build_jobs_env(Some("2".into()), Some("8".into())).as_deref(),
+            Some("2")
+        );
     }
 }
