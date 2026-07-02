@@ -2297,6 +2297,37 @@ async fn build_domain_router(
             }
         }
     };
+    // Role-spawn sink (gtcore-b69087): `agent.spawn` with an infra role drops a RoleSpawnPayload
+    // here and the orchd consumer materializes a single-shot role agent. Same backend selection
+    // as the dispatch sink (PG queue under GT_EVENTLOG_PG, else the file channel), so both bins
+    // always meet on the same transport.
+    let role_spawn_sink: Option<Arc<gt_channel::DispatchSink>> = {
+        let name =
+            std::env::var("GT_ROLE_SPAWN_CHANNEL").unwrap_or_else(|_| "role-spawn".to_string());
+        let want_pg = std::env::var("GT_EVENTLOG_PG")
+            .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"))
+            .unwrap_or(false);
+        if want_pg {
+            gt_channel::PgQueue::connect(&dispatch_pg_url, &name)
+                .and_then(|q| q.ensure_schema().map(|()| q))
+                .map(|q| Arc::new(gt_channel::DispatchSink::Pg(q)))
+                .map_err(|e| eprintln!("[gt-mcp-server] role-spawn bridge off — PG queue init failed: {e}"))
+                .ok()
+        } else {
+            std::env::var("GT_CHANNEL_ROOT")
+                .ok()
+                .and_then(|root| gt_channel::Channel::open(&root, &name).ok())
+                .map(|c| Arc::new(gt_channel::DispatchSink::File(c)))
+        }
+    };
+    match &role_spawn_sink {
+        Some(_) => eprintln!(
+            "[gt-mcp-server] agent→role-spawn bridge on — infra roles (refinery/sheriff/witness/deacon) spawnable on demand"
+        ),
+        None => eprintln!(
+            "[gt-mcp-server] agent→role-spawn bridge off — infra-role agent.spawn will error loudly"
+        ),
+    }
     let convoy_handler = {
         let handler = ConvoyHandler::new(event_log.clone());
         match &dispatch_sink {
@@ -2338,11 +2369,14 @@ async fn build_domain_router(
         ))
         .register(Arc::new(convoy_handler))
         .register(Arc::new({
-            let handler = AgentHandler::new(event_log.clone());
-            match &dispatch_sink {
-                Some(sink) => handler.with_dispatch_channel(sink.clone()),
-                None => handler,
+            let mut handler = AgentHandler::new(event_log.clone());
+            if let Some(sink) = &dispatch_sink {
+                handler = handler.with_dispatch_channel(sink.clone());
             }
+            if let Some(sink) = &role_spawn_sink {
+                handler = handler.with_role_spawn_channel(sink.clone());
+            }
+            handler
         }))
         .register(Arc::new(QuotaHandler::new(event_log.clone()).with_accounts_root(
             gt_composition::account_dirs::accounts_root(

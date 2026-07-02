@@ -1318,6 +1318,76 @@ async fn main() -> anyhow::Result<()> {
         }
     };
 
+    // On-demand role spawn consumer (gtcore-b69087): agent.spawn with an infra role
+    // (refinery/sheriff/witness/deacon/overseer/dog) rides the role-spawn channel from the
+    // mcp-server; this loop materializes each request through the RoleAgentDispatcher — same
+    // single-flight, launcher and session accounting as the trigger-driven slings. The mayor is
+    // NOT spawnable here: it is the one role this orchestrator raises itself. Requires role
+    // agents ON (the dispatcher is the materialization engine).
+    let role_spawn_task: Option<tokio::task::JoinHandle<()>> = match &role_dispatcher {
+        Some(dispatcher) => {
+            let name = std::env::var("GT_ROLE_SPAWN_CHANNEL")
+                .unwrap_or_else(|_| "role-spawn".to_string());
+            let want_pg = std::env::var("GT_EVENTLOG_PG")
+                .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"))
+                .unwrap_or(false);
+            let pg_queue = match (want_pg, std::env::var("GT_PG_URL").ok()) {
+                (true, Some(pg_url)) => gt_channel::PgQueue::connect(&pg_url, &name)
+                    .and_then(|q| q.ensure_schema().map(|()| q))
+                    .map_err(|e| eprintln!("[gt-orch-server] role-spawn PG queue init failed: {e} — falling back to file channel"))
+                    .ok(),
+                _ => None,
+            };
+            if let Some(queue) = pg_queue {
+                eprintln!("[gt-orch-server] on-demand role spawn on — Postgres queue (channel {name})");
+                let dispatcher = dispatcher.clone();
+                Some(tokio::spawn(async move {
+                    let mut tracker = RestartTracker::new(RestartConfig::default());
+                    let make = || {
+                        let queue = queue.clone();
+                        let dispatcher = dispatcher.clone();
+                        async move {
+                            if let Err(e) = gt_composition::role_agent::run_on_demand(queue, dispatcher).await {
+                                eprintln!("[gt-orch-server] role-spawn PG consumer error: {e} — supervisor will restart");
+                            }
+                        }
+                    };
+                    gt_polecat::supervise_daemon("role-spawn", make, &mut tracker, u32::MAX, now_secs).await;
+                }))
+            } else {
+                let role_spawn_root = std::env::var("GT_CHANNEL_ROOT")
+                    .unwrap_or_else(|_| "/gt/.channels".to_string());
+                match Channel::open(&role_spawn_root, &name) {
+                    Ok(channel) => {
+                        eprintln!("[gt-orch-server] on-demand role spawn on — file channel {role_spawn_root}/{name}");
+                        let dispatcher = dispatcher.clone();
+                        Some(tokio::spawn(async move {
+                            let mut tracker = RestartTracker::new(RestartConfig::default());
+                            let make = || {
+                                let channel = channel.clone();
+                                let dispatcher = dispatcher.clone();
+                                async move {
+                                    if let Err(e) = gt_composition::role_agent::run_on_demand(channel, dispatcher).await {
+                                        eprintln!("[gt-orch-server] role-spawn consumer error: {e} — supervisor will restart");
+                                    }
+                                }
+                            };
+                            gt_polecat::supervise_daemon("role-spawn", make, &mut tracker, u32::MAX, now_secs).await;
+                        }))
+                    }
+                    Err(e) => {
+                        eprintln!("[gt-orch-server] on-demand role spawn OFF — channel open failed: {e}");
+                        None
+                    }
+                }
+            }
+        }
+        None => {
+            eprintln!("[gt-orch-server] on-demand role spawn OFF — role agents disabled (GT_ROLE_AGENTS)");
+            None
+        }
+    };
+
     // Convoy completion reactor (gtcore-896a29): advance a convoy when one of its member beads
     // closes — complete the member, feed the next one onto the dispatch channel (the orchd's own
     // dispatch loop consumes it and slings) and close the convoy when all members are done. Sibling

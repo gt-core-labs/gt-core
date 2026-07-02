@@ -51,12 +51,30 @@ pub struct AgentHandler {
     /// loop consumes, causing a real polecat to sling. `None` ⇒ spawn only records the
     /// event (in-memory tests, GT_CHANNEL_ROOT/GT_EVENTLOG_PG unset).
     dispatch: Option<Arc<DispatchSink>>,
+    /// Optional bridge to the orchd role-agent dispatcher (gtcore-b69087). When wired,
+    /// `agent.spawn` with an infra role (refinery/sheriff/witness/deacon/overseer/dog) drops a
+    /// [`RoleSpawnPayload`](crate::role_agent::RoleSpawnPayload) on the `role-spawn` channel and
+    /// the orchd materializes a real single-shot role agent (single-flight per role). `None` ⇒
+    /// the spawn errors LOUDLY: an infra-role spawn that cannot materialize must fail visibly,
+    /// never record a tracker-only ghost.
+    role_spawn: Option<Arc<DispatchSink>>,
 }
 
 impl AgentHandler {
     /// Wrap the per-workspace event log.
     pub fn new(log: Arc<EventLog>) -> Self {
-        Self { log, dispatch: None }
+        Self {
+            log,
+            dispatch: None,
+            role_spawn: None,
+        }
+    }
+
+    /// Wire the role-spawn channel so `agent.spawn` with an infra role materializes a real role
+    /// agent through the orchd (gtcore-b69087).
+    pub fn with_role_spawn_channel(mut self, channel: Arc<DispatchSink>) -> Self {
+        self.role_spawn = Some(channel);
+        self
     }
 
     /// Wire the dispatch sink so `agent.spawn` with a `bead` argument bridges to orchd.
@@ -116,13 +134,20 @@ impl AgentHandler {
 struct SpawnArgs {
     session: String,
     rig: String,
+    /// Flat role token (`polecat`/`witness`/`refinery`/`deacon`/`overseer`/`sheriff`/`dog`;
+    /// `mayor` is rejected — orchestrator-owned). Parsed via [`SessionRole::parse`] so the wire
+    /// accepts the SAME names `agent.list` reports, instead of serde's enum shape that made
+    /// `role:"refinery"` fail with `unknown variant` (gtcore-b69087). Absent ⇒ polecat.
     #[serde(default)]
-    role: SessionRole,
+    role: Option<String>,
     #[serde(default)]
     crew: Option<String>,
     /// Bead id to dispatch to orchd after recording the spawn event.
     #[serde(default)]
     bead: Option<String>,
+    /// Free-text reason carried into an infra role's on-demand kickoff (gtcore-b69087).
+    #[serde(default)]
+    reason: Option<String>,
 }
 
 #[async_trait]
@@ -135,13 +160,18 @@ impl DomainHandler for AgentHandler {
         vec![
             descriptor(
                 "agent.spawn",
-                "Record a new agent session (spawn) under a session id + rig. Pass `bead` to also dispatch to orchd so a real polecat slings.",
+                "Spawn an agent. role=polecat (default): record the session; pass `bead` to also \
+                 dispatch to orchd so a real polecat slings. role=refinery|sheriff|witness|deacon|\
+                 overseer|dog: request an ON-DEMAND materialization — the orchd slings a real \
+                 single-shot role agent (single-flight per role; pass `reason` for its kickoff). \
+                 role=mayor is rejected: the orchestrator raises it itself.",
                 &[
                     req("session", "string"),
                     req("rig", "string"),
                     opt("role", "string"),
                     opt("crew", "string"),
                     opt("bead", "string"),
+                    opt("reason", "string"),
                 ],
             ),
             descriptor(
@@ -192,6 +222,64 @@ impl DomainHandler for AgentHandler {
         match tool {
             "agent.spawn" => {
                 let a: SpawnArgs = parse(ctx.args)?;
+                // Resolve the flat role token (gtcore-b69087). Absent ⇒ polecat (legacy default).
+                let role = match &a.role {
+                    None => SessionRole::default(),
+                    Some(s) => SessionRole::parse(s).ok_or_else(|| {
+                        AppError::Validation(format!(
+                            "unknown role `{s}` — expected one of polecat, witness, refinery, \
+                             deacon, overseer, sheriff, dog (mayor is orchestrator-owned)"
+                        ))
+                    })?,
+                };
+                match role {
+                    // The mayor is the ONE role the orchestrator raises itself (its dispatch loop
+                    // wakes/re-slings it per rig). A coordinator spawning a second mayor would
+                    // fork the orchestration brain.
+                    SessionRole::Mayor => {
+                        return Err(AppError::Validation(
+                            "mayor is orchestrator-owned — the orchd dispatch loop raises and \
+                             re-slings it; agent.spawn cannot"
+                                .to_string(),
+                        ));
+                    }
+                    // Infra roles materialize ON DEMAND through the orchd (gtcore-b69087): the
+                    // request rides the role-spawn channel and the orchd slings a real single-shot
+                    // agent (single-flight per role) that records its own session. No tracker
+                    // record is written here — a spawn that cannot materialize FAILS instead of
+                    // leaving a ghost for the reconciler.
+                    SessionRole::Dog(_) => {
+                        let Some(channel) = &self.role_spawn else {
+                            return Err(AppError::Validation(
+                                "role-spawn channel not wired on this server — an infra-role \
+                                 spawn here cannot materialize (set GT_CHANNEL_ROOT or \
+                                 GT_EVENTLOG_PG=1)"
+                                    .to_string(),
+                            ));
+                        };
+                        let payload = crate::role_agent::RoleSpawnPayload {
+                            role: role.as_str().to_string(),
+                            reason: a.reason.clone(),
+                            requested_by: Some(ctx.actor.to_string()),
+                        };
+                        let bytes = serde_json::to_vec(&payload).map_err(|e| {
+                            AppError::Validation(format!("serialize role-spawn request: {e}"))
+                        })?;
+                        channel.emit(&bytes).map_err(|e| {
+                            AppError::Validation(format!(
+                                "role-spawn request for {} failed to enqueue: {e}",
+                                role.as_str()
+                            ))
+                        })?;
+                        return Ok(json!({
+                            "ok": true,
+                            "role": role.as_str(),
+                            "requested": true,
+                            "note": "the orchd materializes the agent and records its session (single-flight per role)",
+                        }));
+                    }
+                    SessionRole::Polecat => {}
+                }
                 // Reject a malformed id (empty role/suffix, e.g. `"mayor-"`) before it enters the
                 // log (gtcore-065009).
                 validate_session_id(&a.session).map_err(AppError::Validation)?;
@@ -208,13 +296,13 @@ impl DomainHandler for AgentHandler {
                     AgentEvent::Spawned {
                         session: a.session,
                         rig: a.rig,
-                        role: a.role,
+                        role,
                         crew: a.crew,
                         // A manual MCP spawn carries no worktree manifest (hq-orch-sessions.2).
                         skills: Vec::new(),
                         hooks: Vec::new(),
-                        maintains_heartbeat: a.role.maintains_heartbeat(),
-                        tmux_socket: a.role.tmux_socket(ws.unwrap_or("default")),
+                        maintains_heartbeat: role.maintains_heartbeat(),
+                        tmux_socket: role.tmux_socket(ws.unwrap_or("default")),
                         // A5 (gtcore-f3a016): the calling actor triggered this spawn.
                         spawned_by: Some(ctx.actor.to_string()),
                     },
@@ -392,6 +480,99 @@ mod tests {
             actor: "tester",
             args,
         }
+    }
+
+    // ---- infra-role on-demand spawn (gtcore-b69087) -----------------------------------------
+
+    #[tokio::test]
+    async fn spawn_mayor_is_rejected_as_orchestrator_owned() {
+        let dir = TempDir::new().unwrap();
+        let h = handler(&dir);
+        let err = h
+            .dispatch(
+                "agent.spawn",
+                ctx(json!({ "session": "mayor-x", "rig": "granite", "role": "mayor" })),
+            )
+            .await
+            .unwrap_err();
+        assert!(format!("{err:?}").contains("orchestrator-owned"));
+    }
+
+    #[tokio::test]
+    async fn spawn_infra_role_without_bridge_errors_loudly() {
+        // A refinery spawn that cannot materialize must FAIL, not record a tracker-only ghost
+        // for the reconciler to orphan-kill (the 2026-07-02 mayor-delegation failure mode).
+        let dir = TempDir::new().unwrap();
+        let h = handler(&dir);
+        let err = h
+            .dispatch(
+                "agent.spawn",
+                ctx(json!({ "session": "r-x", "rig": "granite", "role": "refinery" })),
+            )
+            .await
+            .unwrap_err();
+        assert!(format!("{err:?}").contains("not wired"));
+    }
+
+    #[tokio::test]
+    async fn spawn_infra_role_rides_the_role_spawn_channel() {
+        use crate::role_agent::RoleSpawnPayload;
+        let dir = TempDir::new().unwrap();
+        let chan = TempDir::new().unwrap();
+        let root = chan.path().to_str().unwrap().to_string();
+        let channel = gt_channel::Channel::open(&root, "role-spawn").unwrap();
+        let h = handler(&dir)
+            .with_role_spawn_channel(Arc::new(DispatchSink::File(channel)));
+
+        let out = h
+            .dispatch(
+                "agent.spawn",
+                ctx(json!({
+                    "session": "r-x",
+                    "rig": "granite",
+                    "role": "refinery",
+                    "reason": "merge queue stuck"
+                })),
+            )
+            .await
+            .unwrap();
+        assert_eq!(out["ok"], true);
+        assert_eq!(out["requested"], true);
+        assert_eq!(out["role"], "refinery");
+
+        let events: Vec<_> = std::fs::read_dir(chan.path().join("role-spawn"))
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|e| e.path().extension().is_some_and(|x| x == "event"))
+            .collect();
+        assert_eq!(events.len(), 1);
+        let p: RoleSpawnPayload =
+            serde_json::from_slice(&std::fs::read(events[0].path()).unwrap()).unwrap();
+        assert_eq!(p.role, "refinery");
+        assert_eq!(p.reason.as_deref(), Some("merge queue stuck"));
+        assert_eq!(p.requested_by.as_deref(), Some("tester"));
+
+        // No tracker record was written: the orchd records the real session at launch.
+        let gone = h
+            .dispatch("agent.info", ctx(json!({ "session": "r-x" })))
+            .await
+            .unwrap_err();
+        assert!(matches!(gone, AppError::NotFound(_)));
+    }
+
+    #[tokio::test]
+    async fn spawn_unknown_role_names_the_valid_set() {
+        let dir = TempDir::new().unwrap();
+        let h = handler(&dir);
+        let err = h
+            .dispatch(
+                "agent.spawn",
+                ctx(json!({ "session": "s", "rig": "granite", "role": "banana" })),
+            )
+            .await
+            .unwrap_err();
+        let msg = format!("{err:?}");
+        assert!(msg.contains("unknown role") && msg.contains("refinery"), "{msg}");
     }
 
     /// Session lifecycle over the event log: spawn → heartbeat → end, with the
