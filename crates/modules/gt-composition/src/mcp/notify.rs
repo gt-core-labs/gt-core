@@ -14,47 +14,17 @@ use async_trait::async_trait;
 use serde_json::{json, Value};
 use sqlx::PgPool;
 
-use gt_events::EventKind;
 use gt_mcp_server::{DomainCtx, DomainHandler};
 use gt_module::McpTool;
 use gt_store_dolt::AppError;
 
 use super::eventlog::EventLog;
 use super::util::{descriptor, opt, req, str_arg};
+use crate::notify_bell::{ring_bell, BellWrite, DEFAULT_DEDUP_WINDOW_SECS};
+use crate::notify_kind::NotificationKind;
 
-const DEFAULT_KIND: &str = "decision";
 const DEFAULT_FROM_ROLE: &str = "mayor";
 const DEFAULT_WORKSPACE: &str = "default";
-
-/// SSE event mirroring the REST surface's `notification.created.v1`.
-struct NotificationCreated {
-    id: String,
-    workspace: String,
-    from_role: String,
-    title: String,
-    body: String,
-    kind: String,
-}
-
-impl serde::Serialize for NotificationCreated {
-    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
-        use serde::ser::SerializeStruct;
-        let mut st = s.serialize_struct("NotificationCreated", 6)?;
-        st.serialize_field("id", &self.id)?;
-        st.serialize_field("workspace", &self.workspace)?;
-        st.serialize_field("from_role", &self.from_role)?;
-        st.serialize_field("title", &self.title)?;
-        st.serialize_field("body", &self.body)?;
-        st.serialize_field("kind", &self.kind)?;
-        st.end()
-    }
-}
-
-impl EventKind for NotificationCreated {
-    fn kind(&self) -> &'static str {
-        "notification.created.v1"
-    }
-}
 
 /// PG-backed handler for the `notify.*` tool namespace.
 pub struct NotifyHandler {
@@ -77,13 +47,20 @@ impl DomainHandler for NotifyHandler {
     fn descriptors(&self) -> Vec<McpTool> {
         vec![descriptor(
             "notify.send",
-            "Send a notification to the human operator dashboard. \
-             Use for decisions requiring human input, alerts on failures, or FYI updates.",
+            "Send a notification to the human operator dashboard. Use for decisions requiring \
+             human input, alerts on failures, or FYI updates. kind is a CLOSED set \
+             (decision|info|alert). Re-sends of the same finding dedup instead of re-paging: \
+             pass `fingerprint` to name the finding explicitly, or omit it and one is derived \
+             from (from_role, kind, title) — repeats inside the window (default 24h, override \
+             with `dedup_window_secs`) bump a counter on the existing row. Pass fingerprint:\"\" \
+             to force a one-shot row (never deduped).",
             &[
                 req("title", "string"),
                 opt("body", "string"),
                 opt("kind", "string"),
                 opt("from_role", "string"),
+                opt("fingerprint", "string"),
+                opt("dedup_window_secs", "integer"),
             ],
         )]
     }
@@ -96,12 +73,21 @@ impl DomainHandler for NotifyHandler {
                     return Err(AppError::Validation("title must not be empty".into()));
                 }
                 let body = ctx.args.get("body").and_then(Value::as_str).unwrap_or("").to_string();
-                let kind = ctx.args.get("kind").and_then(Value::as_str).unwrap_or(DEFAULT_KIND);
-                if !["decision", "info", "alert"].contains(&kind) {
-                    return Err(AppError::Validation(
-                        "kind must be one of: decision, info, alert".into(),
-                    ));
-                }
+                // Closed set (gtcore-7a707a): an out-of-set kind is an EXPLICIT, listing error at
+                // the frontier. The old inline check pre-dated `warning`/`escalation` senders,
+                // whose writes died at the DB CHECK as an opaque 500 — callers then retried under
+                // a different kind, producing the audit's double-sends.
+                let kind_raw = ctx
+                    .args
+                    .get("kind")
+                    .and_then(Value::as_str)
+                    .unwrap_or(NotificationKind::default().as_str());
+                let Some(kind) = NotificationKind::parse(kind_raw) else {
+                    return Err(AppError::Validation(format!(
+                        "unknown kind `{kind_raw}` (expected one of: {})",
+                        NotificationKind::allowed()
+                    )));
+                };
                 let from_role = ctx
                     .args
                     .get("from_role")
@@ -110,42 +96,90 @@ impl DomainHandler for NotifyHandler {
                     .to_string();
                 let workspace = ctx.workspace.unwrap_or(DEFAULT_WORKSPACE).to_string();
 
-                let row: Result<(String,), _> = sqlx::query_as(
-                    "INSERT INTO notifications (workspace, from_role, title, body, kind) \
-                     VALUES ($1, $2, $3, $4, $5) RETURNING id::text",
-                )
-                .bind(&workspace)
-                .bind(&from_role)
-                .bind(&title)
-                .bind(&body)
-                .bind(kind)
-                .fetch_one(&self.pool)
-                .await;
-
-                match row {
-                    Ok((id,)) => {
-                        let ev = NotificationCreated {
-                            id: id.clone(),
-                            workspace: workspace.clone(),
-                            from_role: from_role.clone(),
-                            title: title.clone(),
-                            body: body.clone(),
-                            kind: kind.to_string(),
-                        };
-                        let ws_opt = if workspace == DEFAULT_WORKSPACE {
-                            None
-                        } else {
-                            Some(workspace.as_str())
-                        };
-                        if let Err(e) = self.log.append(ws_opt, ev) {
-                            eprintln!("[notify.send] SSE emit failed: {e}");
-                        }
-                        Ok(json!({ "ok": true, "id": id }))
+                // Dedup key (gtcore-7a707a): an explicit `fingerprint` wins; an EMPTY explicit
+                // one opts out (one-shot); absent derives from (from_role, kind, title) so the
+                // daemons that re-emit the same finding verbatim on every tick — the audit's 13
+                // identical rows — collapse without any caller change.
+                let explicit = ctx.args.get("fingerprint").and_then(Value::as_str);
+                let derived;
+                let fingerprint: Option<&str> = match explicit {
+                    Some("") => None,
+                    Some(f) => Some(f),
+                    None => {
+                        derived = derive_fingerprint(&from_role, kind, &title);
+                        Some(derived.as_str())
                     }
-                    Err(e) => Err(AppError::Other(e.to_string())),
-                }
+                };
+                let window_secs = ctx
+                    .args
+                    .get("dedup_window_secs")
+                    .and_then(Value::as_i64)
+                    .unwrap_or(DEFAULT_DEDUP_WINDOW_SECS);
+
+                let outcome = ring_bell(
+                    &self.pool,
+                    &self.log,
+                    BellWrite {
+                        workspace: &workspace,
+                        from_role: &from_role,
+                        title: &title,
+                        body: &body,
+                        kind,
+                        fingerprint,
+                    },
+                    window_secs,
+                )
+                .await?;
+                Ok(json!({
+                    "ok": true,
+                    "id": outcome.id,
+                    "deduped": outcome.deduped,
+                    "count": outcome.count,
+                }))
             }
             other => Err(AppError::Validation(format!("unknown tool `{other}`"))),
         }
+    }
+}
+
+/// Stable derived dedup key for a caller that names no fingerprint: the exact re-emission shape
+/// the audit found is the SAME (from_role, kind, title) sent on every daemon tick, so that triple
+/// IS the finding's identity. Hex-encoded FNV-1a — collision-tolerant (a collision only merges
+/// two bell rows), no new dependency.
+fn derive_fingerprint(from_role: &str, kind: NotificationKind, title: &str) -> String {
+    const OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
+    const PRIME: u64 = 0x0000_0100_0000_01b3;
+    let mut hash = OFFSET;
+    for chunk in [from_role.as_bytes(), &[0u8], kind.as_str().as_bytes(), &[0u8], title.as_bytes()]
+    {
+        for b in chunk {
+            hash ^= u64::from(*b);
+            hash = hash.wrapping_mul(PRIME);
+        }
+    }
+    format!("auto-{hash:016x}")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn derived_fingerprint_is_stable_and_field_sensitive() {
+        // The audit's re-emission shape: identical (from_role, kind, title) every tick must
+        // derive the SAME key so the rows collapse…
+        let a = derive_fingerprint("deacon", NotificationKind::Alert, "stuck slot gtcore-08a8be");
+        let b = derive_fingerprint("deacon", NotificationKind::Alert, "stuck slot gtcore-08a8be");
+        assert_eq!(a, b, "same finding ⇒ same key");
+        assert!(a.starts_with("auto-"), "derived keys are namespaced: {a}");
+
+        // …while any differing field is a different finding (separator-fenced, so the
+        // concatenation ambiguity `ab|c` vs `a|bc` cannot collide either).
+        let other_role = derive_fingerprint("witness", NotificationKind::Alert, "stuck slot gtcore-08a8be");
+        let other_kind = derive_fingerprint("deacon", NotificationKind::Info, "stuck slot gtcore-08a8be");
+        let other_title = derive_fingerprint("deacon", NotificationKind::Alert, "another finding");
+        assert_ne!(a, other_role);
+        assert_ne!(a, other_kind);
+        assert_ne!(a, other_title);
     }
 }

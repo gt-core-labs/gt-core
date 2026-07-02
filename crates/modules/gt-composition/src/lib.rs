@@ -64,6 +64,8 @@ pub mod merge_boot;
 pub mod mcp;
 pub mod mcp_push;
 pub mod notifications;
+pub mod notify_bell;
+pub mod notify_kind;
 pub mod onboard;
 pub mod operator_event;
 pub mod patrol_bridge;

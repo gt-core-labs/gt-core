@@ -332,6 +332,12 @@ pub fn invites_migrations() -> Vec<Migration> {
 const NOTIFICATIONS_0001_SQL: &str =
     include_str!("../migrations/notifications/0001_notifications.sql");
 
+/// Migration #2: dedup + lifecycle columns (`fingerprint`, `state`, `count`,
+/// `last_seen_at`) so a dedup-aware writer collapses a recurring finding into one
+/// row instead of one-per-tick (gtcore-7a707a).
+const NOTIFICATIONS_0002_SQL: &str =
+    include_str!("../migrations/notifications/0002_notifications_dedup.sql");
+
 /// Migrations for the `notifications` store.
 ///
 /// The `notifications` table lives in the public schema (not per-workspace): a single
@@ -339,7 +345,10 @@ const NOTIFICATIONS_0001_SQL: &str =
 /// here via `notify.send.execute`; the web UI polls or streams these to render the
 /// bell icon panel for the human operator.
 pub fn notifications_migrations() -> Vec<Migration> {
-    vec![Migration::new(1, "0001_notifications", NOTIFICATIONS_0001_SQL)]
+    vec![
+        Migration::new(1, "0001_notifications", NOTIFICATIONS_0001_SQL),
+        Migration::new(2, "0002_notifications_dedup", NOTIFICATIONS_0002_SQL),
+    ]
 }
 
 #[cfg(test)]
