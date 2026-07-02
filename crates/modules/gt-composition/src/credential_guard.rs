@@ -153,11 +153,24 @@ pub fn resolve_for_sling_with(
             .filter(|acc| *acc != active && quota_slingable(acc, &status_of))
             .filter_map(|acc| {
                 let h = headroom_of(&acc);
-                if h > active_headroom {
-                    keychain.get(&acc).ok().flatten().map(|cred| (acc, cred.secret, h))
-                } else {
-                    None
+                if h <= active_headroom {
+                    return None;
                 }
+                let cred = keychain.get(&acc).ok().flatten()?;
+                // gtcore-945c70: validate the ALTERNATIVE's credentials before diverting the
+                // sling onto it. This branch used to filter on quota alone, so an account whose
+                // `.credentials.json` could not authenticate (observed: a refreshToken with NO
+                // accessToken ⇒ parse error ⇒ Unreadable) but had more headroom captured every
+                // sling — each polecat was born at "Not logged in" while the ACTIVE account's
+                // validation above was never consulted for it. Divert only onto a POSITIVELY
+                // valid/refreshable credential, the same discipline the rotation path below
+                // applies; a missing/dead file keeps this sling on the already-validated active.
+                let health =
+                    classify_credentials(read(&cred.secret).as_deref(), now_ms, REFRESH_SKEW_MS);
+                if !health.is_slingable() {
+                    return None;
+                }
+                Some((acc, cred.secret, h))
             })
             .max_by(|(_, _, ha), (_, _, hb)| ha.partial_cmp(hb).unwrap_or(std::cmp::Ordering::Equal));
         if let Some((best_id, best_dir, _)) = best_alt {
@@ -514,6 +527,62 @@ mod tests {
         // Active pointer NOT moved — distribution, not rotation.
         assert_eq!(kc.active().unwrap().as_deref(), Some("a"));
         let _ = valid;
+    }
+
+    #[test]
+    fn dead_credential_account_never_receives_distribution_even_with_more_headroom() {
+        // gtcore-945c70: the headroom-distribution branch used to filter on quota alone, so an
+        // account whose .credentials.json could not authenticate (observed live: a refreshToken
+        // with NO accessToken — parse error ⇒ Unreadable) but reported more headroom captured
+        // every sling and each polecat was born at "Not logged in". The sling must stay on the
+        // validated active account.
+        let kc = keychain(&[("a", "/dir/a"), ("noaccess", "/dir/noaccess")]);
+        kc.set_active("a").unwrap();
+        let valid = creds(Some(NOW + 3_600_000), true);
+        let out = resolve_for_sling_with(
+            &kc,
+            NOW,
+            move |dir| {
+                if dir == "/dir/noaccess" {
+                    // The incident file: refresh token present, accessToken missing entirely.
+                    Some(r#"{"claudeAiOauth":{"refreshToken":"rt-1"}}"#.to_string())
+                } else {
+                    Some(valid.clone())
+                }
+            },
+            all_healthy,
+            |acc| match acc { "a" => 20.0, _ => 90.0 }, // the dead account "has more headroom"
+        );
+        match out {
+            CredOutcome::Resolved { resolved, rotated_from, .. } => {
+                assert_eq!(resolved.account, "a", "sling must stay on the validated active");
+                assert!(rotated_from.is_none());
+            }
+            other => panic!("expected Resolved, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn distribution_skips_missing_file_alternatives() {
+        // gtcore-945c70: distribution only diverts onto a POSITIVELY validated credential — an
+        // alternative with a missing .credentials.json is skipped (the missing-file leniency is
+        // for the ACTIVE account only, whose dir the seeding step populates).
+        let kc = keychain(&[("a", "/dir/a"), ("empty", "/dir/empty")]);
+        kc.set_active("a").unwrap();
+        let valid = creds(Some(NOW + 3_600_000), true);
+        let out = resolve_for_sling_with(
+            &kc,
+            NOW,
+            move |dir| (dir == "/dir/a").then(|| valid.clone()),
+            all_healthy,
+            |acc| match acc { "a" => 20.0, _ => 90.0 },
+        );
+        match out {
+            CredOutcome::Resolved { resolved, .. } => {
+                assert_eq!(resolved.account, "a", "missing-file alternative is not a target");
+            }
+            other => panic!("expected Resolved, got {other:?}"),
+        }
     }
 
     #[test]
