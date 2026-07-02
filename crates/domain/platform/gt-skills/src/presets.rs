@@ -89,7 +89,8 @@ fn enable(s: &mut SkillState, role: &str, skill: &str) {
 /// scope set its work needs. No role is granted `*`; an unbound role (e.g. `overseer`) gets nothing.
 ///
 /// - `polecat` → `issues.read`, `issues.write`, `merge.write`, `memory.read`, `memory.write`,
-///   `a2a.read`, `a2a.write` (work + claim + transition + submit merge + durable memory + P2P).
+///   `a2a.read`, `a2a.write`, `notify.write` (work + claim + transition + submit merge + durable
+///   memory + P2P + escalate to the operator — `gtcore-44fab7`).
 /// - `mayor` → `issues.read`, `issues.write`, `agent.read`, `agent.write`, `merge.read`, `merge.write` (coordinate + dispatch).
 /// - `sheriff` → `merge.read`, `merge.write`, `notify.write`, `memory.read`, `memory.write`
 ///   (drive the merge board, escalate to the operator, recall/persist durable memory).
@@ -141,6 +142,14 @@ pub fn agent_least_privilege_catalog() -> SkillCatalog {
     enable(&mut s, "polecat", "merge-submit");
     enable(&mut s, "polecat", "memory-access");
     enable(&mut s, "polecat", "a2a-coordinate");
+    // gtcore-44fab7: the polecat is the role IN THE FIELD, yet it was the only one without a channel
+    // to the operator — its `notify.send` calls returned `unauthorized` and the alert was lost (only
+    // the audit trail kept it, which nobody reads in the heat of the moment). `operator-notify` grants
+    // `notify.write`, which folds to the `notify.*` MCP namespace `notify.send` lives in — same
+    // mechanism the sheriff/witness/deacon already use. The members' read/dismiss surface is the
+    // SEPARATE `notifications.*` namespace, so this is emit-only: the polecat can escalate but not
+    // list/ack/administer notifications.
+    enable(&mut s, "polecat", "operator-notify");
     enable(&mut s, "mayor", "bead-coordinate");
     // sheriff (gtcore-999795): drive the merge board + escalate + durable memory.
     enable(&mut s, "sheriff", "merge-ops");
@@ -257,12 +266,13 @@ mod tests {
         let c = agent_least_privilege_catalog();
         // gtcore-abf278: the polecat grant carries memory.* and a2a.* so the durable-memory
         // (gtcore-bad8d9) and P2P-delegation (gtcore-3a3557) features its prompt relies on are
-        // actually authorized — not just issues.*+merge.*. Order is the legacy union's: enabled
-        // skills walked alphabetically by id (a2a-coordinate, bead-work, memory-access, merge-submit),
+        // actually authorized — not just issues.*+merge.*. gtcore-44fab7 adds notify.write so the
+        // field role can escalate to the operator. Order is the legacy union's: enabled skills walked
+        // alphabetically by id (a2a-coordinate, bead-work, memory-access, merge-submit, operator-notify),
         // each contributing its `default_scopes` in registered order.
         assert_eq!(
             scopes(&c, "polecat"),
-            vec!["a2a.read", "a2a.write", "issues.read", "issues.write", "memory.read", "memory.write", "merge.write"]
+            vec!["a2a.read", "a2a.write", "issues.read", "issues.write", "memory.read", "memory.write", "merge.write", "notify.write"]
         );
         assert_eq!(scopes(&c, "mayor"), vec!["issues.read", "issues.write", "agent.read", "agent.write", "merge.read", "merge.write"]);
         assert_eq!(scopes(&c, "refinery"), vec!["merge.write"]);
@@ -317,6 +327,9 @@ mod tests {
         scope.check("issues.read.execute").expect("issues still authorized");
         scope.check("merge.submit.execute").expect("merge still authorized");
 
+        // gtcore-44fab7: the polecat can now escalate to the operator (notify.send authorized).
+        scope.check("notify.send.execute").expect("notify.send authorized");
+
         // Enforcement is NOT weakened: a namespace the polecat was never granted stays denied.
         assert!(scope.check("workspace.create").is_err(), "no workspace admin");
         assert!(scope.check("agent.add.execute").is_err(), "no agent dispatch");
@@ -365,6 +378,45 @@ mod tests {
         for role in ["sheriff", "witness", "deacon"] {
             assert!(!scope(role).allow.iter().any(|s| s == "*"), "{role} must not carry '*'");
         }
+    }
+
+    /// gtcore-44fab7 (AC): the role→scope matrix for the operator-notification channel. Every role
+    /// bound to `operator-notify` (the field polecat + the escalating role-agents) must AUTHORIZE
+    /// `notify.send`; every role without it stays DENIED — the grant is enumerated per-role, never a
+    /// blanket. And the grant is EMIT-ONLY: it must NOT reach the members' read/dismiss surface, which
+    /// is the SEPARATE `notifications.*` namespace (list/ack/dismiss), so a polecat can escalate but
+    /// cannot list or administer notifications.
+    #[test]
+    fn notify_send_scope_matrix_across_roles() {
+        let c = agent_least_privilege_catalog();
+        let scope = |role: &str| gt_rbac::Scope::from_workspace_claim(role, &scopes(&c, role));
+
+        // Bound to operator-notify → can escalate to the operator.
+        for role in ["polecat", "sheriff", "witness", "deacon"] {
+            scope(role)
+                .check("notify.send.execute")
+                .unwrap_or_else(|e| panic!("{role} must be able to notify.send: {e}"));
+        }
+
+        // Not bound to operator-notify → notify.send denied (per-role grant, not a blanket).
+        for role in ["mayor", "refinery", "overseer", "nobody"] {
+            assert!(
+                scope(role).check("notify.send.execute").is_err(),
+                "{role} must NOT be able to notify.send"
+            );
+        }
+
+        // Emit-only: the notify.write grant folds to `notify.*` (where notify.send lives), NOT to the
+        // members' `notifications.*` read/dismiss namespace — so list/ack/dismiss stay out of reach.
+        let polecat = scope("polecat");
+        assert!(
+            polecat.check("notifications.list.execute").is_err(),
+            "polecat must not reach the notifications read/dismiss namespace"
+        );
+        assert!(
+            polecat.check("notifications.dismiss.execute").is_err(),
+            "polecat must not dismiss notifications"
+        );
     }
 
     #[test]
