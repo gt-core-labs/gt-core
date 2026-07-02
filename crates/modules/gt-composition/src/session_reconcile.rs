@@ -55,7 +55,7 @@ use std::time::Duration;
 
 use tokio::sync::broadcast;
 
-use gt_agent::{AgentEvent, SessionState};
+use gt_agent::{AgentEvent, Session, SessionRole, SessionState};
 use gt_eventlog::EventRecord;
 use gt_events::Envelope;
 use gt_polecat::tmux::{Tmux, TmuxCli};
@@ -77,14 +77,36 @@ pub enum ReapScope {
 }
 
 impl ReapScope {
-    /// Does this scope own a session with the given heartbeat promise? Polecats
-    /// (`maintains_heartbeat = true`) belong to `Heartbeat`; interactive sessions to `Interactive`.
-    fn owns(&self, maintains_heartbeat: bool) -> bool {
+    /// Does this scope own `session`? Heartbeat-bearing sessions (polecats, and role agents whose
+    /// exit watch heartbeats for them) belong to `Heartbeat`; interactive sessions on a declared
+    /// per-workspace socket belong to `Interactive`.
+    ///
+    /// gtcore-efb7e6: dog-role sessions with NO declared socket are the orchd's single-shot role
+    /// agents (sheriff/witness/deacon/…) — `SpecRoleLauncher` spawns them on the orchd DEFAULT
+    /// tmux server, the same server the `Heartbeat` reconciler probes. Legacy registrations of
+    /// this shape (spawned with `maintains_heartbeat=false` before the exit watch heartbeated)
+    /// previously fell into the never-judge fallback and sat in `spawned` forever (~9 zombie
+    /// sheriffs observed); owning them here lets the orchd sweep reap them. An interactive
+    /// mayor/dog on the mcp-server ALWAYS declares its `gt-<ws>` socket
+    /// ([`SessionRole::tmux_socket`]), so it can never be misread as this shape.
+    fn owns(&self, session: &Session) -> bool {
         match self {
-            ReapScope::Heartbeat => maintains_heartbeat,
-            ReapScope::Interactive => !maintains_heartbeat,
+            ReapScope::Heartbeat => {
+                session.maintains_heartbeat || orchd_hosted_role_agent(session)
+            }
+            ReapScope::Interactive => {
+                !session.maintains_heartbeat && session.tmux_socket.is_some()
+            }
         }
     }
+}
+
+/// A single-shot role agent hosted on the orchd default tmux server: dog-role with no declared
+/// socket (see [`ReapScope::owns`]). Judged like a heartbeat-bearing session — its exit watch
+/// maintains the heartbeat file; a registration with NO file (the watch died with the daemon, or
+/// predates the watch heartbeating at all) reads as stale and is reapable once tmux is gone.
+fn orchd_hosted_role_agent(session: &Session) -> bool {
+    matches!(session.role, SessionRole::Dog(_)) && session.tmux_socket.is_none()
 }
 
 /// Where a reaped `agent.killed.v1` is published so the backend fold and the SSE feed pick it up.
@@ -197,12 +219,12 @@ impl SessionReconciler {
 
             // Only judge the class this instance can actually reach — probing the other class's
             // tmux (in another container) reports it absent and would false-kill a live session.
-            if !self.scope.owns(session.maintains_heartbeat) {
+            if !self.scope.owns(&session) {
                 continue;
             }
 
             // Use the tmux adapter that targets the server where this session lives.
-            // Polecats (tmux_socket=None) → shared default adapter.
+            // Polecats + orchd role agents (tmux_socket=None) → shared default adapter.
             // Interactive (tmux_socket=Some(s)) → per-call TmuxCli pinned to that socket.
             let alive = match &session.tmux_socket {
                 None => self.tmux.has_session(&session.id),
@@ -211,11 +233,19 @@ impl SessionReconciler {
             let hb = self.heartbeat_dir.join(format!("{}.heartbeat", session.id));
             let stale = gt_polecat::lifecycle::heartbeat_is_stale(&hb, self.stale_after);
             let socket_known = session.tmux_socket.is_some();
-            if !is_orphan(alive, stale, session.maintains_heartbeat, socket_known) {
+            // An orchd-hosted role agent is judged like a heartbeat-bearing session
+            // (gtcore-efb7e6): its exit watch maintains the file while the tmux lives, and a
+            // legacy registration with no file at all reads stale — reapable once tmux is gone.
+            let heartbeat_judged =
+                session.maintains_heartbeat || orchd_hosted_role_agent(&session);
+            if !is_orphan(alive, stale, heartbeat_judged, socket_known) {
                 continue;
             }
             let reason = if session.maintains_heartbeat {
                 "orphaned: no tmux session, heartbeat stale".to_string()
+            } else if heartbeat_judged {
+                "orphaned: role-agent registration with no tmux session and no heartbeat"
+                    .to_string()
             } else {
                 format!(
                     "orphaned: tmux session absent on {} (interactive, no heartbeat)",
@@ -297,13 +327,50 @@ mod tests {
         assert!(!is_orphan(true, true, false, false), "old event: tmux present ⇒ keep");
     }
 
+    fn session(role: SessionRole, maintains_heartbeat: bool, socket: Option<&str>) -> Session {
+        let mut s = Session::with_role("s-1", "granite", role, None);
+        s.maintains_heartbeat = maintains_heartbeat;
+        s.tmux_socket = socket.map(str::to_string);
+        s
+    }
+
     #[test]
     fn scope_owns_only_its_class() {
-        // Heartbeat scope owns polecats (maintains_heartbeat=true), not interactive sessions.
-        assert!(ReapScope::Heartbeat.owns(true), "heartbeat owns polecats");
-        assert!(!ReapScope::Heartbeat.owns(false), "heartbeat skips interactive");
-        // Interactive scope owns mayor/dog (maintains_heartbeat=false), not polecats.
-        assert!(ReapScope::Interactive.owns(false), "interactive owns mayor/dog");
-        assert!(!ReapScope::Interactive.owns(true), "interactive skips polecats");
+        use gt_agent::DogKind;
+        // Heartbeat scope owns polecats (maintains_heartbeat=true), not socketed interactive.
+        let polecat = session(SessionRole::Polecat, true, None);
+        let mayor_socketed = session(SessionRole::Mayor, false, Some("gt-ws"));
+        assert!(ReapScope::Heartbeat.owns(&polecat), "heartbeat owns polecats");
+        assert!(!ReapScope::Heartbeat.owns(&mayor_socketed), "heartbeat skips interactive");
+        // Interactive scope owns socketed mayor/dog, not polecats.
+        assert!(ReapScope::Interactive.owns(&mayor_socketed), "interactive owns mayor/dog");
+        assert!(!ReapScope::Interactive.owns(&polecat), "interactive skips polecats");
+
+        // gtcore-efb7e6: a dog-role session with NO socket is an orchd-hosted role agent — owned
+        // by the Heartbeat scope (its tmux lives on the orchd default server), never Interactive.
+        let sheriff = session(SessionRole::Dog(DogKind::Sheriff), false, None);
+        assert!(ReapScope::Heartbeat.owns(&sheriff), "heartbeat owns orchd role agents");
+        assert!(!ReapScope::Interactive.owns(&sheriff), "interactive skips orchd role agents");
+        // A socketed dog (mcp-server interactive) stays Interactive.
+        let dog_socketed = session(SessionRole::Dog(DogKind::Witness), false, Some("gt-ws"));
+        assert!(!ReapScope::Heartbeat.owns(&dog_socketed));
+        assert!(ReapScope::Interactive.owns(&dog_socketed));
+        // A legacy pre-role event (defaults: polecat role, no heartbeat, no socket) is owned by
+        // NEITHER scope — same never-judge outcome as before, just decided at ownership.
+        let legacy = session(SessionRole::Polecat, false, None);
+        assert!(!ReapScope::Heartbeat.owns(&legacy));
+        assert!(!ReapScope::Interactive.owns(&legacy));
+    }
+
+    #[test]
+    fn orchd_role_agent_is_judged_like_a_heartbeat_session() {
+        // The sweep passes `heartbeat_judged=true` for a dog-with-no-socket: no tmux + missing
+        // heartbeat file (stale=true) ⇒ orphan; a live tmux or fresh file keeps it.
+        assert!(
+            is_orphan(false, true, true, false),
+            "zombie role agent: no tmux + no/stale heartbeat ⇒ reap"
+        );
+        assert!(!is_orphan(true, true, true, false), "live tmux ⇒ keep");
+        assert!(!is_orphan(false, false, true, false), "fresh heartbeat ⇒ keep");
     }
 }
