@@ -75,6 +75,7 @@ pub mod polecat_event;
 pub mod quota_rotation;
 pub mod relogin;
 pub mod report_scheduler;
+pub mod role_resident;
 pub mod role_session;
 pub mod rig_connection_notify;
 pub mod role_agent;

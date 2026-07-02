@@ -782,6 +782,15 @@ async fn main() -> anyhow::Result<()> {
         template.base_env.clone(),
         template.workdir.clone(),
     );
+    // Same snapshot for the resident role sessions (gtcore-3246e8): the host launches
+    // sheriff/witness/deacon/refinery with the same agent command/env/checkout as everyone else.
+    let resident_launch = (
+        template.rig.clone(),
+        template.command.clone(),
+        template.args.clone(),
+        template.base_env.clone(),
+        template.workdir.clone(),
+    );
 
     // Observe the SAME hub the root drains actor output onto: a fresh broadcast receiver, so the
     // sling observer runs independently of the root's own plugin relay (durability/roles/reactor).
@@ -875,6 +884,55 @@ async fn main() -> anyhow::Result<()> {
     // the same pattern terminal.rs uses for interactive sessions.
     let knowledge_log = Arc::new(EventLog::new(Some(event_root_for_polecat)));
     pol_plugin = pol_plugin.with_event_log(knowledge_log.clone());
+    // Resident role sessions (gtcore-3246e8, epic gtcore-4c40b5): with GT_ROLE_SESSIONS=1 the
+    // infra roles (sheriff/witness/deacon/refinery) live as LONG-LIVED tmux sessions on the
+    // mayor pattern — spawned at boot, idle-blocked on their wake file (idle ≈ 0 tokens),
+    // heartbeated and re-raised by a supervision pass when they die. Credential resolution,
+    // onboarding seed, role-scoped tokens and role skills ride the same shared paths as the
+    // mayor/polecat spawns. Default OFF: the single-shot role agents below stay byte-for-byte
+    // the production behaviour until the rollout bead (gtcore-d58dff) flips the flag.
+    let resident_host: Option<Arc<gt_composition::role_resident::ResidentRoleHost>> =
+        if std::env::var("GT_ROLE_SESSIONS").ok().as_deref() == Some("1") {
+            let (res_rig, res_cmd, res_args, res_env, res_workdir) = resident_launch;
+            let channel_root = std::env::var("GT_CHANNEL_ROOT")
+                .unwrap_or_else(|_| "/gt/.channels".to_string());
+            let mut host = gt_composition::role_resident::ResidentRoleHost::new(
+                tmux.clone(),
+                ws_slug.clone(),
+                res_rig,
+                res_workdir,
+                res_cmd,
+                res_args,
+                res_env,
+                std::path::PathBuf::from(channel_root),
+            );
+            if let Some(kc) = &keychain {
+                host = host.with_keychain(kc.clone());
+            }
+            host = host.with_quota(quota.clone());
+            if let Some(url) = &anthropic_proxy_url {
+                host = host.with_anthropic_proxy(url.clone());
+            }
+            host = host.with_event_log(knowledge_log.clone());
+            if let Some(tm) = &mayor_agent_token {
+                host = host.with_agent_token(tm.clone());
+            }
+            if let Some(url) = std::env::var("GT_SELF_URL").ok().filter(|v| !v.is_empty()) {
+                host = host.with_server_url(url);
+            }
+            host = host.with_session_events(handle.events_sender());
+            let host = Arc::new(host);
+            // Boot + re-raise supervision: every resident ensured now and on each pass.
+            let _resident_supervisor = host.clone().spawn_supervisor(Duration::from_secs(60));
+            eprintln!(
+                "[gt-orch-server] resident role sessions ON — sheriff/witness/deacon/refinery live in tmux, supervised every 60s (GT_ROLE_SESSIONS=1)"
+            );
+            Some(host)
+        } else {
+            None
+        };
+    // Consumed by the trigger rewiring (gtcore-865fb8); until then the supervision pass is the host's driver.
+    let _ = &resident_host;
     // rig-hold H3 (gtcore-9a84e6): the supervisor plugin's crash re-sling (boot re-hydration /
     // stale dispatch) and CI-failure re-sling (sheriff) skip a bead whose rig is on hold — reusing
     // the same source the dead-polecat guard above uses.
