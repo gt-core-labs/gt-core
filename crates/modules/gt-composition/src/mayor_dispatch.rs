@@ -209,9 +209,15 @@ pub fn mayor_prompt(workspace: &str, rig: &str) -> String {
          orchestration loop: the orchd keeps you alive and signals you the ready frontier \
          instead of slinging polecats itself. Do NOT busy-poll. When signalled, read the \
          ready beads the orchd delivered to `$GT_CHANNEL_ROOT/mayor-wake/{rig}.event` (a JSON \
-         array of bead ids), then for each bead decide whether to delegate it — the orchd's \
-         pool / host_cap arbitration bounds how many actually sling, so request freely and let \
-         it backpressure. Use the `mcp__gt__*` tools for all tracker access. Recall durable team \
+         array of bead ids), then for each bead you decide to delegate call the MCP tool \
+         `mcp__gt__dispatch_request` with {{\"bead\":\"<bead-id>\"}} — that enqueues the bead \
+         on the orchd scheduler, which slings the real polecat and registers its session \
+         itself. Do NOT call `mcp__gt__agent_spawn` to delegate and do NOT invent session \
+         ids: a spawn without a materialized process is orphan-killed by the reconciler. If \
+         `dispatch_request` returns an error, the delegation did NOT happen — report it via \
+         `mcp__gt__notify_send` instead of assuming success. The orchd's pool / host_cap \
+         arbitration bounds how many actually sling, so request freely and let it \
+         backpressure. Use the `mcp__gt__*` tools for all tracker access. Recall durable team \
          memory with `mcp__gt__memory_recall` before acting and treat every `feedback` memory as \
          a hard rule. When there is no ready work, stay idle (block on the wake file); burn no \
          tokens until the orchd signals again."
@@ -752,6 +758,22 @@ mod tests {
         assert!(p.contains("workspace `default`"));
         assert!(p.contains("mayor-wake/gtcore.event"), "points the mayor at its wake file");
         assert!(p.contains("Do NOT busy-poll"), "wake-on-task directive present");
+    }
+
+    /// gtcore-d24661: the delegation edge must be NAMED. A prompt that says "delegate through
+    /// the MCP tools" without naming `dispatch_request` left mayors calling `agent.spawn`
+    /// without a bead — six tracker-only sessions orphan-killed, zero polecats slung.
+    #[test]
+    fn mayor_prompt_names_the_delegation_tool() {
+        let p = mayor_prompt("default", "gtcore");
+        assert!(
+            p.contains("mcp__gt__dispatch_request"),
+            "the prompt must name the tool that materializes a delegation"
+        );
+        assert!(
+            p.contains("Do NOT call `mcp__gt__agent_spawn` to delegate"),
+            "the prompt must steer the mayor away from record-only spawns"
+        );
     }
 
     // ---- TmuxMayorWaker: the production wake adapter ------------------------
