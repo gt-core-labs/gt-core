@@ -264,6 +264,7 @@ type MergeOutcome = Result<String, String>;
 
 /// What a `merge.started.v1` merge attempt resolved to, unifying the direct-push and CI-gated PR
 /// paths so [`GitMergePlugin`]'s event handler drives the slot's terminal transition from one match.
+#[derive(Debug)]
 enum MergeResult {
     /// The branch is on `main` now — either a direct fast-forward push (non-CI-gated), or a
     /// CI-gated PR that had no blocking required checks and so was merged immediately
@@ -366,6 +367,57 @@ fn already_merged_argv(branch: &str) -> Vec<String> {
     ]
 }
 
+/// `git -C <rig> log origin/main --fixed-strings --grep=<branch> -n 1 --format=%H` argv — the
+/// first commit on main whose message references the branch/bead id. Non-empty output is the
+/// delivery evidence the ahead=0 short-circuit requires (gtcore-03be6a).
+fn delivery_evidence_argv(branch: &str) -> Vec<String> {
+    vec![
+        "log".into(),
+        "origin/main".into(),
+        "--fixed-strings".into(),
+        format!("--grep={branch}"),
+        "-n".into(),
+        "1".into(),
+        "--format=%H".into(),
+    ]
+}
+
+/// The ahead=0 short-circuit (gtcore-e34546) hardened with a delivery-evidence gate
+/// (gtcore-03be6a). A branch that is an ancestor of `origin/main` completes ONLY when some
+/// commit on main references the branch/bead id — proof the work actually landed via another
+/// path (operator rebase, duplicate slot, redelivery). A branch parked AT a main commit with
+/// zero own commits has no such evidence: the checkpoint-push of an idle worktree produces
+/// exactly that shape, and completing it silently closed an undelivered bead (gtcore-4ad682).
+/// With no evidence the merge FAILS loudly — the slot lands in `failed`, recoverable, and the
+/// bead stays open.
+///
+/// Returns `None` when the branch is not an ancestor (no short-circuit applies).
+fn ancestor_short_circuit(rig: &Path, branch: &str) -> Option<Result<MergeResult, String>> {
+    match run(rig, &already_merged_argv(branch)) {
+        Ok((true, _)) => {}
+        _ => return None,
+    }
+    match run(rig, &delivery_evidence_argv(branch)) {
+        Ok((true, out)) if !out.trim().is_empty() => {
+            let evidence = out.trim().lines().next().unwrap_or("").to_string();
+            eprintln!(
+                "[git-merge] {branch}: already merged into origin/main (evidence {evidence}) — marking complete"
+            );
+            let sha = match run(rig, &rev_parse_origin_main_argv()) {
+                Ok((true, s)) => s,
+                _ => String::new(),
+            };
+            Some(Ok(MergeResult::Merged(sha)))
+        }
+        _ => Some(Err(format!(
+            "branch {branch} is an ancestor of origin/main but no commit on main references \
+             it — refusing the ahead=0 complete: the branch carries no delivered work (an idle \
+             checkout pushed at main looks exactly like this), and marking it merged would \
+             falsely close the bead (gtcore-03be6a)"
+        ))),
+    }
+}
+
 /// Execute the real merge of `branch` into `main` from the `rig` checkout, per CLAUDE.md
 /// flat-history: fetch, fast-forward push, and on divergence rebase the branch onto `origin/main`
 /// and retry once. Returns the merged sha on success or a reason on conflict/error. Pure of the
@@ -379,16 +431,10 @@ fn merge_branch_to_main(rig: &Path, branch: &str) -> Result<MergeResult, String>
         Err(e) => return Err(format!("git fetch origin error: {e}")),
     }
 
-    // 1a) Short-circuit: branch already an ancestor of origin/main (gtcore-e34546).
-    // Work arrived via another path (cherry-pick, another PR) — report merged immediately
-    // rather than failing with a non-ff conflict and looping through the sheriff.
-    if let Ok((true, _)) = run(rig, &already_merged_argv(branch)) {
-        eprintln!("[git-merge] {branch}: already merged into origin/main — marking complete");
-        let sha = match run(rig, &rev_parse_origin_main_argv()) {
-            Ok((true, s)) => s,
-            _ => String::new(),
-        };
-        return Ok(MergeResult::Merged(sha));
+    // 1a) Short-circuit: branch already an ancestor of origin/main (gtcore-e34546), gated on
+    // delivery evidence so an idle checkout at main cannot falsely complete (gtcore-03be6a).
+    if let Some(outcome) = ancestor_short_circuit(rig, branch) {
+        return outcome;
     }
 
     // 1b) Sync Cargo.lock before pushing (gtcore-bfb203): regenerate and commit if drifted.
@@ -457,14 +503,13 @@ fn merge_branch_via_pr(rig: &Path, branch: &str, bead: &str) -> Result<MergeResu
         Err(e) => return Err(format!("git fetch origin error: {e}")),
     }
 
-    // 1a) Short-circuit: branch already an ancestor of origin/main (gtcore-e34546).
-    if let Ok((true, _)) = run(rig, &already_merged_argv(branch)) {
-        eprintln!("[git-merge] {bead}: branch {branch} already merged into origin/main — marking complete");
-        let sha = match run(rig, &rev_parse_origin_main_argv()) {
-            Ok((true, s)) => s,
-            _ => String::new(),
-        };
-        return Ok(MergeResult::Merged(sha));
+    // 1a) Short-circuit: branch already an ancestor of origin/main (gtcore-e34546), gated on
+    // delivery evidence so an idle checkout at main cannot falsely complete (gtcore-03be6a).
+    if let Some(outcome) = ancestor_short_circuit(rig, branch) {
+        if outcome.is_err() {
+            eprintln!("[git-merge] {bead}: ahead=0 short-circuit refused — no delivery evidence");
+        }
+        return outcome;
     }
 
     // 2) Rebase onto origin/main so the PR is clean.
@@ -825,6 +870,19 @@ mod tests {
             "exits 0 when branch is already an ancestor of main"
         );
         assert_eq!(
+            delivery_evidence_argv("gtcore-00325f"),
+            vec![
+                "log",
+                "origin/main",
+                "--fixed-strings",
+                "--grep=gtcore-00325f",
+                "-n",
+                "1",
+                "--format=%H"
+            ],
+            "first main commit referencing the bead id — the ahead=0 delivery evidence"
+        );
+        assert_eq!(
             push_force_branch_argv("hq-x.1"),
             vec!["push", "--force-with-lease", "origin", "hq-x.1"],
             "BEHIND recovery force-pushes the rebased branch (lease-guarded), not branch:main"
@@ -1138,6 +1196,95 @@ dependencies = [
             slot.state,
             gt_merge::MergeSlotState::Ready,
             "non-Started events never advance the slot — the queue is the only path to main"
+        );
+    }
+
+    // ---- ancestor_short_circuit: the ahead=0 delivery-evidence gate (gtcore-03be6a) ----
+
+    use tempfile::TempDir;
+
+    /// Shell a git command in `dir`, panicking on failure — test scaffolding only.
+    fn sh(dir: &Path, args: &[&str]) -> String {
+        let out = std::process::Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(args)
+            .env("GIT_AUTHOR_NAME", "t")
+            .env("GIT_AUTHOR_EMAIL", "t@t")
+            .env("GIT_COMMITTER_NAME", "t")
+            .env("GIT_COMMITTER_EMAIL", "t@t")
+            .output()
+            .expect("git runs");
+        assert!(
+            out.status.success(),
+            "git {args:?} failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    }
+
+    /// A repo whose `origin/main` ref is maintained locally (no network): one base commit on
+    /// main, with `origin/main` pointing at it.
+    fn repo_with_origin_main(dir: &Path) -> String {
+        sh(dir, &["init", "-q", "-b", "main"]);
+        std::fs::write(dir.join("a.txt"), "a").unwrap();
+        sh(dir, &["add", "."]);
+        sh(dir, &["commit", "-q", "-m", "chore: base"]);
+        let head = sh(dir, &["rev-parse", "HEAD"]);
+        sh(dir, &["update-ref", "refs/remotes/origin/main", &head]);
+        head
+    }
+
+    #[test]
+    fn ahead0_with_no_evidence_is_refused() {
+        // The gtcore-4ad682 shape: an idle checkout pushed a branch pointing AT a main commit,
+        // zero own commits, nothing on main references the bead. Completing it would falsely
+        // close an undelivered bead — the short-circuit must refuse.
+        let dir = TempDir::new().unwrap();
+        let head = repo_with_origin_main(dir.path());
+        sh(dir.path(), &["branch", "gtcore-bogus1", &head]);
+
+        let outcome = ancestor_short_circuit(dir.path(), "gtcore-bogus1")
+            .expect("branch is an ancestor — the short-circuit applies");
+        let err = outcome.expect_err("no evidence ⇒ refuse to mark merged");
+        assert!(err.contains("no commit on main references"), "got: {err}");
+    }
+
+    #[test]
+    fn ahead0_with_evidence_completes() {
+        // The legitimate gtcore-e34546 case: the work landed on main via another path and a
+        // main commit references the bead id — the short-circuit completes with main's sha.
+        let dir = TempDir::new().unwrap();
+        repo_with_origin_main(dir.path());
+        std::fs::write(dir.path().join("b.txt"), "b").unwrap();
+        sh(dir.path(), &["add", "."]);
+        sh(dir.path(), &["commit", "-q", "-m", "fix(merge): delivered elsewhere (gtcore-real01)"]);
+        let head = sh(dir.path(), &["rev-parse", "HEAD"]);
+        sh(dir.path(), &["update-ref", "refs/remotes/origin/main", &head]);
+        sh(dir.path(), &["branch", "gtcore-real01", &head]);
+
+        let outcome = ancestor_short_circuit(dir.path(), "gtcore-real01")
+            .expect("ancestor — short-circuit applies");
+        match outcome.expect("evidence present ⇒ complete") {
+            MergeResult::Merged(sha) => assert_eq!(sha, head),
+            other => panic!("expected Merged, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn branch_with_own_commits_is_not_short_circuited() {
+        // A branch ahead of origin/main is NOT an ancestor: no short-circuit, the normal
+        // merge path proceeds.
+        let dir = TempDir::new().unwrap();
+        repo_with_origin_main(dir.path());
+        sh(dir.path(), &["checkout", "-q", "-b", "gtcore-work01"]);
+        std::fs::write(dir.path().join("c.txt"), "c").unwrap();
+        sh(dir.path(), &["add", "."]);
+        sh(dir.path(), &["commit", "-q", "-m", "feat: own work (gtcore-work01)"]);
+
+        assert!(
+            ancestor_short_circuit(dir.path(), "gtcore-work01").is_none(),
+            "a branch with its own commits must take the real merge path"
         );
     }
 }
