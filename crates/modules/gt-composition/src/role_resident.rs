@@ -32,12 +32,15 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use async_trait::async_trait;
 use tokio::sync::broadcast;
 use tokio::task::JoinHandle;
 
 use gt_agent::{AgentEvent, DogKind, SessionRole};
 use gt_eventlog::EventRecord;
-use gt_events::Envelope;
+use gt_events::{AppError, Envelope};
+use gt_merge::MergeEvent;
+use gt_plugin::Plugin;
 use gt_polecat::tmux::Tmux;
 use gt_quota::actor::QuotaHandle;
 use gt_quota::{AccountQuotaStatus, Keychain};
@@ -45,7 +48,7 @@ use gt_skills::SkillState;
 
 use crate::credential_guard::{resolve_for_sling, CredOutcome, ResolvedCredentials};
 use crate::mcp::EventLog;
-use crate::role_agent::dog_role_str;
+use crate::role_agent::{dog_role_str, RoleSpawnPayload, RoleTrigger};
 
 /// The infra roles a resident host keeps alive. The mayor is deliberately NOT here — it stays
 /// orchestrator-owned through its own waker; `overseer`/`dog` stay on-demand only.
@@ -102,7 +105,11 @@ pub fn resident_prompt(workspace: &str, role: &str, wake_file: &Path) -> String 
          blocking. Recall durable team memory with `mcp__gt__memory_recall` before your first \
          action and treat every `feedback` memory as a hard rule. Do NOT exit when idle. Do NOT \
          busy-poll the tracker. Do NOT spawn other agents. Between wakes you burn no tokens — \
-         blocking on the file IS your idle state. A wake payload of {{\"trigger\":\"boot\"}} \
+         blocking on the file IS your idle state. AFTER finishing a trigger, RE-READ the wake \
+         file before blocking again: a wake that landed while you worked replaced its content \
+         (rapid triggers coalesce, latest wins), so handle the changed content first — and \
+         always re-derive current state with your tools rather than trusting a payload\'s \
+         snapshot. A wake payload of {{\"trigger\":\"boot\"}} \
          means: survey your domain once (fresh daemon boot), settle anything actionable, then \
          block."
     , wake = wake_file.display())
@@ -445,6 +452,124 @@ impl ResidentRoleHost {
     }
 }
 
+/// Map a role trigger onto its resident + wake payload (gtcore-865fb8): the SAME
+/// trigger→role ownership as the single-shot [`crate::role_agent::role_for`], with the trigger
+/// context serialized as the JSON object the resident reads off its wake file.
+pub fn trigger_wake(trigger: &RoleTrigger) -> (DogKind, String) {
+    match trigger {
+        RoleTrigger::MergeFailed { bead, reason } => (
+            DogKind::Sheriff,
+            serde_json::json!({"trigger":"merge.failed","bead":bead,"reason":reason}).to_string(),
+        ),
+        RoleTrigger::MergeReady { bead, branch } => (
+            DogKind::Sheriff,
+            serde_json::json!({"trigger":"merge.ready","bead":bead,"branch":branch}).to_string(),
+        ),
+        RoleTrigger::BeadClosed { bead } => (
+            DogKind::Witness,
+            serde_json::json!({"trigger":"issues.closed","bead":bead}).to_string(),
+        ),
+        RoleTrigger::HealthTick => {
+            (DogKind::Deacon, serde_json::json!({"trigger":"health-tick"}).to_string())
+        }
+        RoleTrigger::OnDemand { role, reason } => (
+            *role,
+            serde_json::json!({"trigger":"on-demand","reason":reason}).to_string(),
+        ),
+    }
+}
+
+/// Hub observer that delivers role triggers as resident WAKES (gtcore-865fb8) — the resident
+/// sibling of [`crate::role_agent::RoleAgentPlugin`]. Same events, same role ownership; instead
+/// of a single-shot sling each trigger becomes a wake-file write + ensure. No session-end
+/// handling: residents have no single-flight slot to free — one stable session per role is
+/// structural.
+pub struct ResidentTriggerPlugin {
+    host: Arc<ResidentRoleHost>,
+}
+
+impl ResidentTriggerPlugin {
+    pub fn new(host: Arc<ResidentRoleHost>) -> Self {
+        Self { host }
+    }
+
+    async fn deliver(&self, trigger: &RoleTrigger) {
+        let (kind, payload) = trigger_wake(trigger);
+        match self.host.wake(kind, &payload).await {
+            Ok(()) => eprintln!("[role-resident] {} woken — {payload}", dog_role_str(kind)),
+            Err(e) => eprintln!("[role-resident] wake {} failed: {e}", dog_role_str(kind)),
+        }
+    }
+}
+
+#[async_trait]
+impl Plugin for ResidentTriggerPlugin {
+    fn name(&self) -> &'static str {
+        "role-resident"
+    }
+
+    async fn on_event(&self, record: &EventRecord) -> Result<(), AppError> {
+        match record.kind.as_str() {
+            "merge.failed.v1" => {
+                if let MergeEvent::Failed { bead, reason } = record.decode::<MergeEvent>()? {
+                    self.deliver(&RoleTrigger::MergeFailed { bead, reason }).await;
+                }
+                Ok(())
+            }
+            "merge.ready.v1" => {
+                if let MergeEvent::Ready { bead, branch, .. } = record.decode::<MergeEvent>()? {
+                    self.deliver(&RoleTrigger::MergeReady { bead, branch }).await;
+                }
+                Ok(())
+            }
+            "issues.closed.v1" => {
+                if let Some(id) = record.payload.get("id").and_then(|v| v.as_str()) {
+                    self.deliver(&RoleTrigger::BeadClosed { bead: id.to_string() }).await;
+                }
+                Ok(())
+            }
+            _ => Ok(()),
+        }
+    }
+}
+
+/// On-demand role-spawn consumer in resident mode (gtcore-865fb8): the same channel + payload
+/// as [`crate::role_agent::run_on_demand`] (agent.spawn with an infra role, gtcore-b69087), but
+/// each accepted request becomes a WAKE of the resident instead of a single-shot sling. The
+/// mayor/polecat rejections live in [`RoleSpawnPayload::into_trigger`], unchanged — and failure
+/// stays noisy: an undeliverable wake logs the reason, never a phantom registration.
+pub async fn run_on_demand_resident<C: gt_channel::DispatchConsumer>(
+    consumer: C,
+    host: Arc<ResidentRoleHost>,
+) -> Result<(), gt_channel::ChannelError> {
+    let mut rx = consumer.subscribe(16)?;
+    while let Some(msg) = rx.recv().await {
+        match serde_json::from_slice::<RoleSpawnPayload>(&msg.payload) {
+            Ok(payload) => match payload.into_trigger() {
+                Ok(trigger) => {
+                    let (kind, wake) = trigger_wake(&trigger);
+                    match host.wake(kind, &wake).await {
+                        Ok(()) => eprintln!(
+                            "[role-spawn] on-demand {} woken (resident mode)",
+                            dog_role_str(kind)
+                        ),
+                        Err(e) => eprintln!(
+                            "[role-spawn] on-demand {} wake FAILED: {e}",
+                            dog_role_str(kind)
+                        ),
+                    }
+                }
+                Err(e) => eprintln!("[role-spawn] rejected request: {e}"),
+            },
+            Err(e) => eprintln!("[role-spawn] undecodable payload ignored: {e}"),
+        }
+        if let Err(e) = consumer.ack(&msg) {
+            eprintln!("[role-spawn] ack failed: {e}");
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -527,6 +652,34 @@ mod tests {
         tmux.kill_session("refinery-resident").unwrap();
         assert!(h.ensure(DogKind::Refinery).await.unwrap(), "re-raised after death");
         assert!(tmux.has_session("refinery-resident"));
+    }
+
+    #[test]
+    fn trigger_wake_keeps_the_single_shot_role_ownership() {
+        // gtcore-865fb8: same trigger→role mapping as role_agent::role_for, context serialized.
+        let (k, p) = trigger_wake(&RoleTrigger::MergeFailed {
+            bead: "gtcore-1".into(),
+            reason: "ci red".into(),
+        });
+        assert_eq!(k, DogKind::Sheriff);
+        assert!(p.contains("merge.failed") && p.contains("gtcore-1") && p.contains("ci red"));
+        let (k, _) = trigger_wake(&RoleTrigger::MergeReady {
+            bead: "gtcore-2".into(),
+            branch: "gtcore-2".into(),
+        });
+        assert_eq!(k, DogKind::Sheriff);
+        let (k, p) = trigger_wake(&RoleTrigger::BeadClosed { bead: "gtcore-3".into() });
+        assert_eq!(k, DogKind::Witness);
+        assert!(p.contains("issues.closed"));
+        let (k, p) = trigger_wake(&RoleTrigger::HealthTick);
+        assert_eq!(k, DogKind::Deacon);
+        assert!(p.contains("health-tick"));
+        let (k, p) = trigger_wake(&RoleTrigger::OnDemand {
+            role: DogKind::Refinery,
+            reason: "unstick the queue".into(),
+        });
+        assert_eq!(k, DogKind::Refinery);
+        assert!(p.contains("on-demand") && p.contains("unstick the queue"));
     }
 
     #[tokio::test]
