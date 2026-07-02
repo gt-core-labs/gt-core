@@ -71,6 +71,12 @@ pub enum RoleTrigger {
     BeadClosed { bead: String },
     /// A periodic flow-health tick → the **deacon** scans for stuck/contradictory work.
     HealthTick,
+    /// An operator/coordinator explicitly requested this role via `agent.spawn`
+    /// (gtcore-b69087). The one trigger a human controls directly: the orchd auto-raises only
+    /// the MAYOR; every infra role must also be launchable on demand, or a dead one (a stuck
+    /// merge queue with no refinery) leaves the operator with no lever but a full daemon
+    /// restart.
+    OnDemand { role: DogKind, reason: String },
 }
 
 impl RoleTrigger {
@@ -81,7 +87,21 @@ impl RoleTrigger {
             RoleTrigger::MergeFailed { bead, .. } | RoleTrigger::MergeReady { bead, .. } => bead,
             RoleTrigger::BeadClosed { bead } => bead,
             RoleTrigger::HealthTick => "tick",
+            RoleTrigger::OnDemand { .. } => "demand",
         }
+    }
+}
+
+/// The flat role token for a [`DogKind`] — the single-flight key and session-name prefix for an
+/// on-demand sling. Static so it can key the dispatcher's `live` map like [`role_for`]'s returns.
+pub fn dog_role_str(kind: DogKind) -> &'static str {
+    match kind {
+        DogKind::Witness => "witness",
+        DogKind::Refinery => "refinery",
+        DogKind::Deacon => "deacon",
+        DogKind::Overseer => "overseer",
+        DogKind::Sheriff => "sheriff",
+        DogKind::Dog => "dog",
     }
 }
 
@@ -92,6 +112,7 @@ pub fn role_for(trigger: &RoleTrigger) -> &'static str {
         RoleTrigger::MergeFailed { .. } | RoleTrigger::MergeReady { .. } => "sheriff",
         RoleTrigger::BeadClosed { .. } => "witness",
         RoleTrigger::HealthTick => "deacon",
+        RoleTrigger::OnDemand { role, .. } => dog_role_str(*role),
     }
 }
 
@@ -149,6 +170,45 @@ pub fn kickoff_for(workspace: &str, trigger: &RoleTrigger) -> String {
              contradictory item, escalate it via `mcp__gt__notify_send`. If the flow is healthy, say \
              so and stop."
         ),
+        RoleTrigger::OnDemand { role, reason } => {
+            let mission = match role {
+                DogKind::Refinery => format!(
+                    "You are the gt **refinery** for workspace `{workspace}`, slung ON DEMAND — the \
+                     in-process merge edge may be dead or the queue stuck. Inspect the merge board \
+                     with `mcp__gt__merge_list`: drive every slot stuck in `ready`/`merging` — \
+                     `mcp__gt__merge_info` for detail, `mcp__gt__merge_complete` (with the landed sha) \
+                     for a slot whose bead already delivered to main, `mcp__gt__merge_submit` to \
+                     re-enter a branch that never landed — and escalate via `mcp__gt__notify_send` \
+                     anything that needs a human (conflicts, missing branches)."
+                ),
+                DogKind::Sheriff => format!(
+                    "You are the gt **sheriff** for workspace `{workspace}`, slung ON DEMAND. Review \
+                     the merge board with `mcp__gt__merge_list`/`mcp__gt__merge_info` and drive it back \
+                     to health: recover what is safe, escalate what needs a human via \
+                     `mcp__gt__notify_send`."
+                ),
+                DogKind::Witness => format!(
+                    "You are the gt **witness** for workspace `{workspace}`, slung ON DEMAND. Audit the \
+                     recently closed beads (`mcp__gt__issues_list` status=closed, newest first) against \
+                     their acceptance criteria; flag any false completion with `mcp__gt__comments_create` \
+                     + `mcp__gt__notify_send`."
+                ),
+                DogKind::Deacon => format!(
+                    "You are the gt **deacon** for workspace `{workspace}`, slung ON DEMAND for a flow \
+                     health scan. Read-only: `mcp__gt__issues_list`, `mcp__gt__board_list`, \
+                     `mcp__gt__merge_list`; escalate genuinely stuck or contradictory items via \
+                     `mcp__gt__notify_send`."
+                ),
+                DogKind::Overseer | DogKind::Dog => format!(
+                    "You are a gt **{}** supervisory agent for workspace `{workspace}`, slung ON \
+                     DEMAND. Assess the situation named in the request, act within your role's \
+                     standing mission (your CLAUDE.md), and escalate via `mcp__gt__notify_send` what \
+                     needs a human.",
+                    dog_role_str(*role)
+                ),
+            };
+            format!("{mission} The request's stated reason: {reason}.")
+        }
     };
     format!("{body}{}", discipline(workspace))
 }
@@ -645,6 +705,83 @@ impl Plugin for RoleAgentPlugin {
     }
 }
 
+/// Wire payload of an on-demand role-spawn request (gtcore-b69087): what `agent.spawn` with an
+/// infra role emits onto the `role-spawn` channel and the orchd consumer decodes. `role` is the
+/// flat token (`refinery`/`sheriff`/`witness`/`deacon`/`overseer`/`dog`); `mayor` and `polecat`
+/// are rejected at decode — the mayor is orchestrator-owned and polecats ride the dispatch
+/// channel.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct RoleSpawnPayload {
+    pub role: String,
+    #[serde(default)]
+    pub reason: Option<String>,
+    #[serde(default)]
+    pub requested_by: Option<String>,
+}
+
+impl RoleSpawnPayload {
+    /// Map the wire payload onto the dispatcher trigger, rejecting non-infra roles.
+    pub fn into_trigger(self) -> Result<RoleTrigger, String> {
+        let role = match SessionRole::parse(&self.role) {
+            Some(SessionRole::Dog(kind)) => kind,
+            Some(SessionRole::Mayor) => {
+                return Err("mayor is orchestrator-owned — the orchd dispatch loop raises it".into())
+            }
+            Some(SessionRole::Polecat) => {
+                return Err("polecats ride the dispatch channel (agent.spawn with a `bead`), not role-spawn".into())
+            }
+            None => return Err(format!("unknown role `{}`", self.role)),
+        };
+        let mut reason = self
+            .reason
+            .filter(|r| !r.trim().is_empty())
+            .unwrap_or_else(|| "operator on-demand request".to_string());
+        if let Some(who) = self.requested_by.filter(|w| !w.trim().is_empty()) {
+            reason = format!("{reason} (requested by {who})");
+        }
+        Ok(RoleTrigger::OnDemand { role, reason })
+    }
+}
+
+/// Consume the `role-spawn` channel and materialize each request through the dispatcher
+/// (gtcore-b69087). The single-flight invariant still holds — a request for an already-live role
+/// is absorbed and logged. The launch shells tmux (blocking), so it runs on a blocking thread.
+pub async fn run_on_demand<C: gt_channel::DispatchConsumer>(
+    consumer: C,
+    dispatcher: Arc<RoleAgentDispatcher>,
+) -> Result<(), gt_channel::ChannelError> {
+    let mut rx = consumer.subscribe(16)?;
+    while let Some(msg) = rx.recv().await {
+        match serde_json::from_slice::<RoleSpawnPayload>(&msg.payload) {
+            Ok(payload) => match payload.into_trigger() {
+                Ok(trigger) => {
+                    let d = dispatcher.clone();
+                    let outcome =
+                        tokio::task::spawn_blocking(move || d.on_trigger(&trigger)).await;
+                    match outcome {
+                        Ok(RoleDispatch::Slung { role, session }) => eprintln!(
+                            "[role-spawn] on-demand {role} slung as {session}"
+                        ),
+                        Ok(RoleDispatch::SkippedAlreadyLive { role, session }) => eprintln!(
+                            "[role-spawn] on-demand {role} absorbed — {session} already live (single-flight)"
+                        ),
+                        Ok(RoleDispatch::LaunchFailed { role, reason }) => eprintln!(
+                            "[role-spawn] on-demand {role} launch FAILED: {reason}"
+                        ),
+                        Err(e) => eprintln!("[role-spawn] launch task panicked: {e}"),
+                    }
+                }
+                Err(e) => eprintln!("[role-spawn] rejected request: {e}"),
+            },
+            Err(e) => eprintln!("[role-spawn] undecodable payload ignored: {e}"),
+        }
+        if let Err(e) = consumer.ack(&msg) {
+            eprintln!("[role-spawn] ack failed: {e}");
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -748,6 +885,83 @@ mod tests {
                 .unwrap()
                 .push((role.to_string(), session.to_string()));
             Ok(())
+        }
+    }
+
+    // ---- on-demand role spawn (gtcore-b69087) ----------------------------------------------
+
+    #[test]
+    fn on_demand_kickoff_names_role_and_reason() {
+        let k = kickoff_for(
+            ws(),
+            &RoleTrigger::OnDemand {
+                role: DogKind::Refinery,
+                reason: "merge queue stuck, 2 ready slots (requested by operator)".into(),
+            },
+        );
+        assert!(k.contains("**refinery**"), "kickoff frames the role: {k}");
+        assert!(k.contains("mcp__gt__merge_list"), "names the board tool");
+        assert!(
+            k.contains("merge queue stuck, 2 ready slots"),
+            "carries the request's reason"
+        );
+        assert!(k.contains("single-shot"), "keeps the stop discipline");
+    }
+
+    #[test]
+    fn on_demand_trigger_slings_with_single_flight() {
+        let launcher = FakeLauncher::new();
+        let d = RoleAgentDispatcher::new("default", launcher.clone());
+        let demand = || RoleTrigger::OnDemand {
+            role: DogKind::Refinery,
+            reason: "stuck queue".into(),
+        };
+        match d.on_trigger(&demand()) {
+            RoleDispatch::Slung { role, session } => {
+                assert_eq!(role, "refinery");
+                assert!(session.starts_with("refinery-demand-"), "session {session}");
+            }
+            other => panic!("expected Slung, got {other:?}"),
+        }
+        // A second request while the first agent lives is absorbed — no racing herd.
+        assert!(matches!(
+            d.on_trigger(&demand()),
+            RoleDispatch::SkippedAlreadyLive { role: "refinery", .. }
+        ));
+        assert_eq!(launcher.count(), 1);
+    }
+
+    #[test]
+    fn role_spawn_payload_maps_infra_roles_and_rejects_owned_ones() {
+        let t = RoleSpawnPayload {
+            role: "refinery".into(),
+            reason: Some("queue stuck".into()),
+            requested_by: Some("operator@gt".into()),
+        }
+        .into_trigger()
+        .expect("refinery is on-demand spawnable");
+        match t {
+            RoleTrigger::OnDemand { role, reason } => {
+                assert_eq!(role, DogKind::Refinery);
+                assert!(reason.contains("queue stuck") && reason.contains("operator@gt"));
+            }
+            other => panic!("expected OnDemand, got {other:?}"),
+        }
+
+        // The mayor is orchestrator-owned; polecats ride the dispatch channel; garbage is named.
+        for (role, want) in [
+            ("mayor", "orchestrator-owned"),
+            ("polecat", "dispatch channel"),
+            ("banana", "unknown role"),
+        ] {
+            let err = RoleSpawnPayload {
+                role: role.into(),
+                reason: None,
+                requested_by: None,
+            }
+            .into_trigger()
+            .unwrap_err();
+            assert!(err.contains(want), "{role}: {err}");
         }
     }
 
