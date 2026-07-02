@@ -23,7 +23,7 @@ use gt_events::Envelope;
 use crate::lifecycle::{heartbeat_is_stale, spawn_process, spawn_tmux, SpawnSpec, SpawnedPolecat};
 use crate::restart::{RestartConfig, RestartTracker};
 use crate::tmux::Tmux;
-use crate::wedge::{classify_wedge, WedgeDialog};
+use crate::wedge::{classify_fresh_idle, classify_wedge, WedgeDialog};
 
 /// Context-usage percentage at or above which a polecat's self-exit is read as a death by
 /// context exhaustion rather than a clean completion (gtcore-91fdde). Claude Code surfaces an
@@ -31,6 +31,13 @@ use crate::wedge::{classify_wedge, WedgeDialog};
 /// longer make progress and bails, which looks identical to a normal exit unless we inspect
 /// the pane.
 const CONTEXT_EXHAUSTION_THRESHOLD: u8 = 85;
+
+/// Age window (seconds since the supervisor first saw the session in a tick) inside which an
+/// idle-empty-prompt pane is classified as a wedge (gtcore-f396dc). Below the floor claude may
+/// still be booting/thinking its first turn; past the ceiling an idle pane is a session resting
+/// between turns (its output may have scrolled away), so the verdict is no longer sound.
+const FRESH_IDLE_MIN_AGE_SECS: u64 = 120;
+const FRESH_IDLE_MAX_AGE_SECS: u64 = 900;
 
 /// Why a watched polecat stopped.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -522,6 +529,11 @@ struct SupervisorState {
     /// A paused polecat keeps its tmux session, so `tick`'s `has_session` check still sees it alive
     /// (no spurious re-sling); the set is what [`PolecatSupervisor::resume_account`] thaws.
     paused: HashSet<String>,
+    /// Unix-seconds when a session was FIRST observed by a tick (gtcore-f396dc) — the anchor for
+    /// the fresh-idle age gate. Stamped lazily on the first tick (not at `watch`, whose callers
+    /// carry no clock) and re-stamped after each re-sling so the fresh window re-opens for the
+    /// replacement session.
+    first_seen: HashMap<String, u64>,
 }
 
 impl PolecatSupervisor {
@@ -534,6 +546,7 @@ impl PolecatSupervisor {
                 restarts: HashMap::new(),
                 max_restarts,
                 paused: HashSet::new(),
+                first_seen: HashMap::new(),
             }),
             respec: Mutex::new(None),
             slingable: Mutex::new(None),
@@ -577,6 +590,7 @@ impl PolecatSupervisor {
         st.watched.remove(session);
         st.restarts.remove(session);
         st.paused.remove(session);
+        st.first_seen.remove(session);
     }
 
     /// Stop supervising whatever polecat was slung for `member` (its `hook_bead`). Called when
@@ -593,6 +607,7 @@ impl PolecatSupervisor {
             st.watched.remove(&session);
             st.restarts.remove(&session);
             st.paused.remove(&session);
+            st.first_seen.remove(&session);
         }
     }
 
@@ -742,20 +757,37 @@ impl PolecatSupervisor {
         let mut reslung = 0usize;
         let mut to_drop: Vec<String> = Vec::new();
         for session in sessions {
+            // First tick that sees this session anchors its age (gtcore-f396dc) — the fresh-idle
+            // gate below counts from here. `watch` callers carry no clock, so the stamp is lazy.
+            let first_seen = *st.first_seen.entry(session.clone()).or_insert(now);
             if self.tmux.has_session(&session) {
                 // Alive by `has_session` — but a polecat can be alive yet WEDGED on an interactive
-                // dialog claude never gets past (trust-folder / usage-limit). Such a session
-                // produces nothing while holding its pool slot and would otherwise be counted
-                // healthy here (gtcore-2836bb). When a wedge hook is wired, inspect the pane: a
-                // known dialog ⇒ run the recovery (re-seed/rotate + alert via the hook), then KILL
-                // the session so the dead-path below re-slings it THIS tick onto the recovered
-                // state. A paused (SIGSTOP'd) polecat is deliberately skipped — its frozen pane is
-                // not a wedge, and resuming it is the quota subsystem's job.
+                // dialog claude never gets past (trust-folder / usage-limit / feature-promo). Such
+                // a session produces nothing while holding its pool slot and would otherwise be
+                // counted healthy here (gtcore-2836bb). When a wedge hook is wired, inspect the
+                // pane: a known dialog ⇒ run the recovery (re-seed/rotate + alert via the hook),
+                // then KILL the session so the dead-path below re-slings it THIS tick onto the
+                // recovered state. A paused (SIGSTOP'd) polecat is deliberately skipped — its
+                // frozen pane is not a wedge, and resuming it is the quota subsystem's job.
+                //
+                // gtcore-f396dc: a dialog can also CONSUME the positional kickoff prompt and then
+                // close — the session then idles at an empty input box forever, with no dialog on
+                // screen to classify. For a FRESH session (age within the fresh-idle window) an
+                // idle pane with no output ever rendered is that exact failure, so it is treated
+                // as a wedge too; a mature session resting between turns is past the window and
+                // never classified.
                 let wedge_armed = self.on_wedge.lock().unwrap().is_some();
                 let wedged = if wedge_armed && !st.paused.contains(&session) {
-                    self.tmux
-                        .capture_pane(&session)
-                        .and_then(|pane| classify_wedge(&pane))
+                    self.tmux.capture_pane(&session).and_then(|pane| {
+                        classify_wedge(&pane).or_else(|| {
+                            let age = now.saturating_sub(first_seen);
+                            if (FRESH_IDLE_MIN_AGE_SECS..=FRESH_IDLE_MAX_AGE_SECS).contains(&age) {
+                                classify_fresh_idle(&pane)
+                            } else {
+                                None
+                            }
+                        })
+                    })
                 } else {
                     None
                 };
@@ -833,6 +865,9 @@ impl PolecatSupervisor {
                 };
                 match spawn_tmux(self.tmux.as_ref(), &spec) {
                     Ok(()) => {
+                        // Re-open the fresh-idle window for the replacement session
+                        // (gtcore-f396dc): its kickoff prompt delivery starts from now.
+                        st.first_seen.insert(session.clone(), now);
                         *st.restarts.entry(session).or_insert(0) += 1;
                         reslung += 1;
                     }
@@ -845,6 +880,7 @@ impl PolecatSupervisor {
         for session in to_drop {
             st.watched.remove(&session);
             st.restarts.remove(&session);
+            st.first_seen.remove(&session);
             eprintln!(
                 "[polecat-supervisor] giving up on session={session} (restart budget exhausted)"
             );
@@ -1192,6 +1228,58 @@ mod polecat_supervisor_tests {
         tmux.set_pane("gt-legacy", "Usage limit reached\n1. Stop and wait for limit to reset");
         assert_eq!(sup.tick(1000), 0, "no hook ⇒ no wedge detection");
         assert!(tmux.has_session("gt-legacy"), "session left running");
+    }
+
+    #[test]
+    fn fresh_idle_session_is_reslung_only_inside_the_age_window() {
+        // gtcore-f396dc: a freshly slung session whose pane shows the booted TUI with no output
+        // ever (the kickoff prompt was eaten) must be recovered — but only once it is old enough
+        // that claude is definitely not still booting, and not after the window closes.
+        let tmux: Arc<FakeTmux> = Arc::new(FakeTmux::new());
+        let sup = PolecatSupervisor::new(
+            tmux.clone(),
+            RestartConfig {
+                initial_backoff_secs: 1,
+                crash_loop_count: 100,
+                ..RestartConfig::default()
+            },
+            u32::MAX,
+        );
+        let s = spec("gt-eaten", "hq-e");
+        spawn_tmux(tmux.as_ref(), &s).unwrap();
+        sup.watch(s);
+        sup.set_on_wedge(Box::new(|_spec, _dialog| {}));
+        let idle = "❯\n──────\n  ⏵⏵ bypass permissions on (shift+tab to cycle)";
+        tmux.set_pane("gt-eaten", idle);
+
+        // t=0 anchors first_seen; the session is younger than the floor → left alone.
+        assert_eq!(sup.tick(0), 0, "too young to classify");
+        assert_eq!(sup.tick(60), 0, "still below the 120s floor");
+        // Inside the window → recovered + re-slung this tick.
+        assert_eq!(sup.tick(200), 1, "idle-empty fresh session re-slung");
+        assert!(tmux.has_session("gt-eaten"));
+
+        // The re-sling re-anchored first_seen at t=200. FakeTmux re-created the session with an
+        // empty pane; make it look eaten again but only tick PAST the ceiling — no re-sling.
+        tmux.set_pane("gt-eaten", idle);
+        assert_eq!(sup.tick(200 + 901), 0, "past the ceiling the verdict is unsound");
+    }
+
+    #[test]
+    fn fresh_session_with_output_is_not_reslung() {
+        // No-regression: a young session whose pane proves the kickoff WAS accepted (any output
+        // marker) is healthy, even though it is idle inside the window.
+        let tmux: Arc<FakeTmux> = Arc::new(FakeTmux::new());
+        let sup = PolecatSupervisor::new(tmux.clone(), RestartConfig::default(), u32::MAX);
+        let s = spec("gt-fine", "hq-f");
+        spawn_tmux(tmux.as_ref(), &s).unwrap();
+        sup.watch(s);
+        sup.set_on_wedge(Box::new(|_spec, _dialog| {
+            panic!("a session with rendered output must not trip the fresh-idle wedge");
+        }));
+        tmux.set_pane("gt-fine", "● Working on it\n❯\n  bypass permissions on");
+        assert_eq!(sup.tick(0), 0);
+        assert_eq!(sup.tick(300), 0, "output marker ⇒ healthy inside the window");
     }
 
     #[test]
