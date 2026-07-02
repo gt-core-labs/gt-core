@@ -415,7 +415,7 @@ async fn main() -> anyhow::Result<()> {
     // GT_PG_URL is set; unset ⇒ an empty router, so the server serves issues +
     // meta exactly as before.
     let (domains, rig_prefixes, ws_status, documents, report_service) =
-        build_domain_router(event_log.clone())
+        build_domain_router(event_log.clone(), store.clone())
             .await?;
     // Report-digest scheduler (hq-84f93b): fixed-time daily send to the ENABLED
     // subscribers. Like the outbox drain/mailbox, NOT behind the singleton gate —
@@ -2175,6 +2175,8 @@ ORDER BY c.relname, a.attnum";
 /// SSE feed streams from.
 async fn build_domain_router(
     event_log: Arc<EventLog>,
+    // Shared Dolt issues store: backs the `merge.reset` "already delivered" guard (gtcore-4ad682).
+    issues_store: Arc<DoltIssues>,
 ) -> anyhow::Result<(
     DomainRouter,
     Option<Arc<dyn WorkspaceRigPrefixes>>,
@@ -2363,9 +2365,13 @@ async fn build_domain_router(
             RigHandler::new(ws_pools.clone())
                 .with_event_sink(Arc::new(EventLogRigSink::new(event_log.clone()))),
         ))
-        // A completed merge marks the owning rig's graph stale (hq-graphrig.7).
+        // A completed merge marks the owning rig's graph stale (hq-graphrig.7). The delivery
+        // reader (the shared Dolt issues store) backs the `merge.reset` "already delivered"
+        // guard (gtcore-4ad682): a reset is rejected when the bead is closed with a delivered_sha.
         .register(Arc::new(
-            MergeHandler::new(event_log.clone()).with_rig_pools(ws_pools.clone()),
+            MergeHandler::new(event_log.clone())
+                .with_rig_pools(ws_pools.clone())
+                .with_delivery_reader(issues_store.clone()),
         ))
         .register(Arc::new(convoy_handler))
         .register(Arc::new({

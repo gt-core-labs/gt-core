@@ -16,7 +16,7 @@ use serde::{Deserialize, Serialize};
 use gt_events::{AppError, Command};
 
 use crate::events::MergeEvent;
-use crate::state::{MergeBoard, MergeSlotState};
+use crate::state::{MergeBoard, MergeSlotState, MAX_MERGE_RETRIES};
 
 /// Refinery (or an MCP client) requests a merge: register a new slot in `Ready`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -140,6 +140,64 @@ impl Command for FailMerge {
     }
 }
 
+/// Operator/sheriff re-queues a `Failed` slot: `Failed → Ready` (gtcore-4ad682).
+///
+/// This is the missing exit from `failed`: `SubmitMerge` answers "already submitted" for a slot
+/// that is not `Failed`, and `StartMerge` rejects `failed → merging`, so before this command a
+/// slot that failed the physical merge had no MCP path back into the queue — sheriffs/polecats
+/// with READY, pushed work had to ask for a manual DB edit. `ResetMerge` gives them that path,
+/// bounded by [`MAX_MERGE_RETRIES`] so a branch that keeps failing cannot loop forever.
+///
+/// The "already delivered" guard (bead `closed` with a `delivered_sha`, or the branch is
+/// `ahead=0` of `main`) is NOT here: it needs the issues store / git, which the pure command
+/// cannot see. It lives in the MCP handler (`merge.reset` dispatch) which reads the bead before
+/// running this command. What the command DOES enforce is the state-machine half — only a
+/// `Failed` slot resets; a `Merged` slot (the board's record that the work reached `main`) is
+/// rejected, pointing the caller at `merge.complete` instead of a pointless retry.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct ResetMerge {
+    /// Bead of an existing slot in `Failed`.
+    pub bead: String,
+}
+
+impl Command for ResetMerge {
+    type Output = MergeEvent;
+    type State = MergeBoard;
+
+    fn validate(&self, state: &Self::State) -> Result<(), AppError> {
+        let slot = state
+            .get(&self.bead)
+            .ok_or_else(|| AppError::NotFound(format!("merge slot {}", self.bead)))?;
+        // A Merged slot means the work already landed on main — retrying is meaningless; the
+        // caller wanted `merge.complete`, not `reset`. Give that hint instead of a bare
+        // "invalid transition".
+        if slot.state == MergeSlotState::Merged {
+            return Err(AppError::Validation(format!(
+                "merge slot {} is already merged — nothing to reset (use merge.complete)",
+                self.bead
+            )));
+        }
+        // Cap the retry loop (acceptance #4). A re-`submit` (fresh branch) zeroes the counter;
+        // blind resets of the same failed branch are bounded.
+        if slot.retries >= MAX_MERGE_RETRIES {
+            return Err(AppError::Validation(format!(
+                "merge slot {} hit the reset cap ({MAX_MERGE_RETRIES}); re-submit a fixed branch or merge.complete it",
+                self.bead
+            )));
+        }
+        // State-machine legality: only `Failed → Ready` is legal here.
+        probe_transition(state, &self.bead, MergeSlotState::Ready)
+    }
+
+    fn execute(&self, state: &mut Self::State) -> Result<Self::Output, AppError> {
+        self.validate(state)?;
+        state.reset(&self.bead)?;
+        Ok(MergeEvent::Reset {
+            bead: self.bead.clone(),
+        })
+    }
+}
+
 /// Check a transition without mutating the board: clone the slot and probe it.
 fn probe_transition(
     state: &MergeBoard,
@@ -160,6 +218,7 @@ pub enum MergeCommand {
     Start(StartMerge),
     Complete(CompleteMerge),
     Fail(FailMerge),
+    Reset(ResetMerge),
 }
 
 impl MergeCommand {
@@ -170,6 +229,7 @@ impl MergeCommand {
             Self::Start(_) => "merge.start",
             Self::Complete(_) => "merge.complete",
             Self::Fail(_) => "merge.fail",
+            Self::Reset(_) => "merge.reset",
         }
     }
 }
@@ -184,6 +244,7 @@ impl Command for MergeCommand {
             Self::Start(c) => c.validate(state),
             Self::Complete(c) => c.validate(state),
             Self::Fail(c) => c.validate(state),
+            Self::Reset(c) => c.validate(state),
         }
     }
 
@@ -193,6 +254,7 @@ impl Command for MergeCommand {
             Self::Start(c) => c.execute(state),
             Self::Complete(c) => c.execute(state),
             Self::Fail(c) => c.execute(state),
+            Self::Reset(c) => c.execute(state),
         }
     }
 }
@@ -302,5 +364,64 @@ mod tests {
         let board = MergeBoard::default();
         let cmd = StartMerge { bead: "ghost".into() };
         assert!(matches!(cmd.validate(&board), Err(AppError::NotFound(_))));
+    }
+
+    /// Drive a slot to Failed via the commands so ResetMerge sees a real board.
+    fn board_with_failed_slot() -> MergeBoard {
+        let mut board = MergeBoard::default();
+        SubmitMerge { bead: "b1".into(), branch: "feat/x".into(), channel_msg_id: "01".into() }
+            .execute(&mut board)
+            .unwrap();
+        StartMerge { bead: "b1".into() }.execute(&mut board).unwrap();
+        FailMerge { bead: "b1".into(), reason: "conflict".into() }
+            .execute(&mut board)
+            .unwrap();
+        board
+    }
+
+    #[test]
+    fn reset_emits_reset_event_and_requeues() {
+        let mut board = board_with_failed_slot();
+        let ev = ResetMerge { bead: "b1".into() }.execute(&mut board).unwrap();
+        assert_eq!(ev, MergeEvent::Reset { bead: "b1".into() });
+        assert_eq!(board.get("b1").unwrap().state, MergeSlotState::Ready);
+    }
+
+    #[test]
+    fn reset_rejects_unknown_merged_and_capped() {
+        // Unknown slot → NotFound.
+        let empty = MergeBoard::default();
+        assert!(matches!(
+            ResetMerge { bead: "ghost".into() }.validate(&empty),
+            Err(AppError::NotFound(_))
+        ));
+
+        // Merged slot → Validation pointing at merge.complete (not a bare invalid-transition).
+        let mut merged = MergeBoard::default();
+        SubmitMerge { bead: "b1".into(), branch: "x".into(), channel_msg_id: "01".into() }
+            .execute(&mut merged)
+            .unwrap();
+        StartMerge { bead: "b1".into() }.execute(&mut merged).unwrap();
+        CompleteMerge { bead: "b1".into(), sha: "abc".into() }
+            .execute(&mut merged)
+            .unwrap();
+        assert!(matches!(
+            ResetMerge { bead: "b1".into() }.validate(&merged),
+            Err(AppError::Validation(_))
+        ));
+
+        // Retry cap (acceptance #4): after MAX_MERGE_RETRIES resets, the next is rejected. Each
+        // cycle is reset → start → fail so the slot is Failed again before the next reset.
+        let mut board = board_with_failed_slot();
+        for _ in 0..MAX_MERGE_RETRIES {
+            ResetMerge { bead: "b1".into() }.execute(&mut board).unwrap();
+            StartMerge { bead: "b1".into() }.execute(&mut board).unwrap();
+            FailMerge { bead: "b1".into(), reason: "again".into() }
+                .execute(&mut board)
+                .unwrap();
+        }
+        assert_eq!(board.get("b1").unwrap().retries, MAX_MERGE_RETRIES);
+        let capped = ResetMerge { bead: "b1".into() }.execute(&mut board).unwrap_err();
+        assert!(matches!(capped, AppError::Validation(_)), "reset is capped");
     }
 }

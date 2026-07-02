@@ -754,6 +754,7 @@ mod tests {
             bead: bead.into(),
             branch: branch.into(),
             state,
+            retries: 0,
         }
     }
 

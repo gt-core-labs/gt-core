@@ -23,11 +23,13 @@ mod repo;
 mod state;
 
 pub use branch::{BranchReaper, InMemoryBranchReaper};
-pub use commands::{CompleteMerge, FailMerge, MergeCommand, StartMerge, SubmitMerge};
+pub use commands::{CompleteMerge, FailMerge, MergeCommand, ResetMerge, StartMerge, SubmitMerge};
 pub use events::{MergeEvent, MergeReadyPayload};
 pub use module::MergeModule;
 pub use repo::{InMemoryMergeRepo, MergeRepository};
-pub use state::{BoardSnapshot, MergeBoard, MergeSlot, MergeSlotState, MergeState};
+pub use state::{
+    BoardSnapshot, MergeBoard, MergeSlot, MergeSlotState, MergeState, MAX_MERGE_RETRIES,
+};
 
 // The off-by-default `axum` REST adapter (`hq-fe-api-orch.2`): re-export the surface the
 // composition root wires (the per-workspace provider, its object-safe repo mirror, and the REST

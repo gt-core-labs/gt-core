@@ -307,6 +307,11 @@ fn is_routable(tool: &str) -> bool {
         // Traefik, reads the accounts dirs), not the quota module ApiDoc.
         && tool != "quota.cred_health"
         && tool != "rig.readiness"
+        // Operator/sheriff merge-slot reset (gtcore-4ad682): MCP-only. Its "already delivered"
+        // guard reads the Dolt issues store, which is wired on the gt-composition MCP dispatch
+        // path but NOT into the thin gt-merge REST router — an unguarded REST reset would let an
+        // operator re-queue work that already landed on main, the exact case the tool must reject.
+        && tool != "merge.reset"
 }
 
 /// The `(METHOD, path)` set a module's OpenAPI actually declares.

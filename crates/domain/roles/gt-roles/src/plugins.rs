@@ -96,8 +96,10 @@ impl Plugin for DeaconPlugin {
                     }))
                     .await
             }
-            // started / failed are not drain-tracked.
-            MergeEvent::Started { .. } | MergeEvent::Failed { .. } => Ok(()),
+            // started / failed / reset are not drain-tracked.
+            MergeEvent::Started { .. } | MergeEvent::Failed { .. } | MergeEvent::Reset { .. } => {
+                Ok(())
+            }
         }
     }
 }

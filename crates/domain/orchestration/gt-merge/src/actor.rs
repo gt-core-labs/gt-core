@@ -239,6 +239,7 @@ fn event_bead(event: &MergeEvent) -> Option<&str> {
         MergeEvent::Ready { bead, .. }
         | MergeEvent::Started { bead }
         | MergeEvent::Merged { bead, .. }
-        | MergeEvent::Failed { bead, .. } => Some(bead.as_str()),
+        | MergeEvent::Failed { bead, .. }
+        | MergeEvent::Reset { bead } => Some(bead.as_str()),
     }
 }

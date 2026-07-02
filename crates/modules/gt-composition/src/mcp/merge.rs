@@ -21,12 +21,12 @@ use gt_graphwarden::{MarkStale, WardenCommand, WardenState};
 use gt_mcp_server::prefixes::bead_prefix;
 use gt_mcp_server::{DomainCtx, DomainHandler};
 use gt_merge::{
-    CompleteMerge, FailMerge, MergeBoard, MergeEvent, MergeSlot, MergeState, StartMerge,
-    SubmitMerge,
+    CompleteMerge, FailMerge, MergeBoard, MergeEvent, MergeSlot, MergeState, ResetMerge,
+    StartMerge, SubmitMerge,
 };
 use gt_module::McpTool;
 use gt_rig::{PgRigs, RigRepository};
-use gt_store_dolt::AppError;
+use gt_store_dolt::{AppError, DoltIssues};
 
 use super::eventlog::EventLog;
 use super::pools::WsPools;
@@ -37,6 +37,32 @@ const NS: &str = "merge.";
 /// The warden event-log kind prefix, replayed to check graph custody (`hq-graphrig.7`).
 const WARDEN_NS: &str = "graphwarden.";
 
+/// Reads a bead's delivery evidence for the `merge.reset` guard (gtcore-4ad682). A slot must NOT
+/// be reset when its bead already landed on `main` — the caller wanted `merge.complete`, not a
+/// pointless retry. Kept as a trait (not a bare `Arc<DoltIssues>`) so the handler stays testable
+/// without a live Dolt: a unit test injects a stub, production wires the real store.
+#[async_trait]
+pub trait BeadDeliveryReader: Send + Sync {
+    /// The bead's `delivered_sha` when it is closed with delivery evidence (`Some(sha)` ⇒
+    /// already on main ⇒ block the reset). Any other state, or a read failure, yields `None`
+    /// so the reset is never blocked by a transient store error (fail-open on this axis; the
+    /// state-machine + retry-cap guards still apply).
+    async fn delivered_sha(&self, bead: &str) -> Option<String>;
+}
+
+#[async_trait]
+impl BeadDeliveryReader for DoltIssues {
+    async fn delivered_sha(&self, bead: &str) -> Option<String> {
+        // `delivered_sha` is only stamped at close when the delivering commit is verified, so its
+        // mere presence is the trustworthy "already delivered" signal (issues_repo.rs) — no need
+        // to also assert `status == closed`.
+        match self.get_detail(bead).await {
+            Ok(Some(detail)) => detail.delivered_sha,
+            _ => None,
+        }
+    }
+}
+
 /// Event-sourced handler for the `merge.*` tool namespace.
 pub struct MergeHandler {
     log: Arc<EventLog>,
@@ -44,6 +70,10 @@ pub struct MergeHandler {
     /// graph stale so the custodian knows to refresh it (`hq-graphrig.7`). `None` keeps the
     /// handler a pure merge handler (tests, issues-only builds).
     rig_pools: Option<Arc<WsPools>>,
+    /// Optional bead reader backing the `merge.reset` "already delivered" guard (gtcore-4ad682).
+    /// `None` (tests, issues-only builds) skips that guard — the state-machine + retry-cap guards
+    /// on `ResetMerge` still hold.
+    delivery: Option<Arc<dyn BeadDeliveryReader>>,
 }
 
 impl MergeHandler {
@@ -52,6 +82,7 @@ impl MergeHandler {
         Self {
             log,
             rig_pools: None,
+            delivery: None,
         }
     }
 
@@ -59,6 +90,14 @@ impl MergeHandler {
     /// the merged bead's prefix via `pools`' per-workspace rig catalog.
     pub fn with_rig_pools(mut self, pools: Arc<WsPools>) -> Self {
         self.rig_pools = Some(pools);
+        self
+    }
+
+    /// Wire the bead reader that backs the `merge.reset` "already delivered" guard: a reset is
+    /// rejected (pointing at `merge.complete`) when the bead is closed with a `delivered_sha`
+    /// (gtcore-4ad682).
+    pub fn with_delivery_reader(mut self, reader: Arc<dyn BeadDeliveryReader>) -> Self {
+        self.delivery = Some(reader);
         self
     }
 
@@ -207,6 +246,13 @@ impl DomainHandler for MergeHandler {
                 "Mark a bead's merge failed with a reason.",
                 &[req("bead", "string"), req("reason", "string")],
             ),
+            descriptor(
+                "merge.reset",
+                "Reset a failed merge slot back to ready so it can be re-queued (operator/sheriff). \
+                 Rejected if the bead is already delivered (closed with a delivered_sha — use \
+                 merge.complete) or the slot hit its retry cap.",
+                &[req("bead", "string")],
+            ),
             descriptor("merge.list", "List every slot on the merge board.", &[]),
             descriptor(
                 "merge.info",
@@ -232,6 +278,21 @@ impl DomainHandler for MergeHandler {
                 Ok(out)
             }
             "merge.fail" => self.run::<FailMerge>(ws, ctx.args),
+            "merge.reset" => {
+                let bead = str_arg(&ctx.args, "bead")?.to_string();
+                // "Already delivered" guard (gtcore-4ad682, acceptance #2): if the bead is
+                // closed with a delivered_sha the work is already on main — retrying the merge is
+                // wrong; the caller wanted merge.complete. Best-effort: no reader wired / read
+                // miss ⇒ fall through to the state-machine + retry-cap guards on ResetMerge.
+                if let Some(reader) = &self.delivery {
+                    if let Some(sha) = reader.delivered_sha(&bead).await {
+                        return Err(AppError::Validation(format!(
+                            "bead {bead} is already delivered (sha {sha}); use merge.complete, not merge.reset"
+                        )));
+                    }
+                }
+                self.run::<ResetMerge>(ws, ctx.args)
+            }
             "merge.list" => {
                 let board = self.board(ws)?;
                 Ok(json!({ "slots": board.snapshot().iter().map(slot_json).collect::<Vec<_>>() }))
@@ -254,6 +315,7 @@ fn slot_json(slot: &MergeSlot) -> Value {
         "bead": slot.bead,
         "branch": slot.branch,
         "state": slot.state.as_str(),
+        "retries": slot.retries,
     })
 }
 
@@ -357,5 +419,77 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(bad, AppError::InvalidTransition(_)));
+    }
+
+    /// A stub delivery reader for the `merge.reset` guard tests.
+    struct StubDelivery(Option<String>);
+    #[async_trait]
+    impl BeadDeliveryReader for StubDelivery {
+        async fn delivered_sha(&self, _bead: &str) -> Option<String> {
+            self.0.clone()
+        }
+    }
+
+    /// gtcore-4ad682: a `failed` slot re-queues via `merge.reset` and drives the full
+    /// failed → ready → merging → merged cycle through the event log.
+    #[tokio::test]
+    async fn merge_reset_requeues_failed_slot_through_event_log() {
+        let dir = TempDir::new().unwrap();
+        let h = handler(&dir);
+
+        h.dispatch("merge.submit", ctx(json!({ "bead": "b1", "branch": "feat/b1", "channel_msg_id": "m1" })))
+            .await
+            .unwrap();
+        h.dispatch("merge.start", ctx(json!({ "bead": "b1" }))).await.unwrap();
+        h.dispatch("merge.fail", ctx(json!({ "bead": "b1", "reason": "conflict" })))
+            .await
+            .unwrap();
+        let info = h.dispatch("merge.info", ctx(json!({ "bead": "b1" }))).await.unwrap();
+        assert_eq!(info["state"], "failed");
+
+        // Reset re-queues it back to ready and records a retry.
+        let out = h.dispatch("merge.reset", ctx(json!({ "bead": "b1" }))).await.unwrap();
+        assert_eq!(out["event"], "merge.reset.v1");
+        let info = h.dispatch("merge.info", ctx(json!({ "bead": "b1" }))).await.unwrap();
+        assert_eq!(info["state"], "ready");
+        assert_eq!(info["retries"], 1);
+
+        // …and drives cleanly to merged.
+        h.dispatch("merge.start", ctx(json!({ "bead": "b1" }))).await.unwrap();
+        h.dispatch("merge.complete", ctx(json!({ "bead": "b1", "sha": "abc1234" })))
+            .await
+            .unwrap();
+        let info = h.dispatch("merge.info", ctx(json!({ "bead": "b1" }))).await.unwrap();
+        assert_eq!(info["state"], "merged");
+    }
+
+    /// The "already delivered" guard: a reset is rejected (pointing at merge.complete) when the
+    /// bead is closed with a delivered_sha, without ever touching the board.
+    #[tokio::test]
+    async fn merge_reset_blocked_when_bead_already_delivered() {
+        let dir = TempDir::new().unwrap();
+        let h = handler(&dir)
+            .with_delivery_reader(Arc::new(StubDelivery(Some("cafef00d".into()))));
+
+        // A failed slot exists…
+        h.dispatch("merge.submit", ctx(json!({ "bead": "b1", "branch": "feat/b1", "channel_msg_id": "m1" })))
+            .await
+            .unwrap();
+        h.dispatch("merge.start", ctx(json!({ "bead": "b1" }))).await.unwrap();
+        h.dispatch("merge.fail", ctx(json!({ "bead": "b1", "reason": "conflict" })))
+            .await
+            .unwrap();
+
+        // …but the bead is already delivered, so reset is rejected and the slot stays failed.
+        let err = h.dispatch("merge.reset", ctx(json!({ "bead": "b1" }))).await.unwrap_err();
+        match err {
+            AppError::Validation(m) => assert!(
+                m.contains("already delivered") && m.contains("merge.complete"),
+                "message should point at merge.complete: {m}"
+            ),
+            other => panic!("expected Validation, got {other:?}"),
+        }
+        let info = h.dispatch("merge.info", ctx(json!({ "bead": "b1" }))).await.unwrap();
+        assert_eq!(info["state"], "failed", "board untouched by a blocked reset");
     }
 }

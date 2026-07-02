@@ -23,6 +23,10 @@ pub enum MergeEvent {
     Merged { bead: String, sha: String },
     /// Merge falló (conflictos, hook, etc): `Merging → Failed`.
     Failed { bead: String, reason: String },
+    /// Operador/sheriff re-encoló un slot `Failed`: `Failed → Ready` (gtcore-4ad682). Antes
+    /// `failed` era terminal y el trabajo LISTO+pusheado no se podía reintentar sin tocar la DB.
+    /// El replay lo pliega vía [`crate::MergeState`] (state → Ready + retry counter += 1).
+    Reset { bead: String },
 }
 
 impl EventKind for MergeEvent {
@@ -32,6 +36,7 @@ impl EventKind for MergeEvent {
             MergeEvent::Started { .. } => "merge.started.v1",
             MergeEvent::Merged { .. } => "merge.merged.v1",
             MergeEvent::Failed { .. } => "merge.failed.v1",
+            MergeEvent::Reset { .. } => "merge.reset.v1",
         }
     }
 }

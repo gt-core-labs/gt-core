@@ -25,11 +25,23 @@ impl MergeSlotState {
     }
 }
 
+/// Cap on operator/sheriff `reset`s of a slot (gtcore-4ad682, acceptance #4): the `failed →
+/// ready` re-queue is bounded so a branch that keeps failing the merge cannot be reset in an
+/// infinite loop. The counter accumulates across retry cycles (`reset → merging → failed →
+/// reset …`) and is only zeroed by a genuine re-`submit` (a fresh branch push = a new attempt
+/// lineage). Once a slot reaches this many resets, `merge.reset` is rejected and a human must
+/// re-`submit` a fixed branch (or `merge.complete` it) instead of blindly retrying.
+pub const MAX_MERGE_RETRIES: u32 = 3;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MergeSlot {
     pub bead: String,
     pub branch: String,
     pub state: MergeSlotState,
+    /// Number of `failed → ready` resets applied to this slot since the last `submit`
+    /// (gtcore-4ad682). Bounds the retry loop against [`MAX_MERGE_RETRIES`]. Derived from the
+    /// event log (`merge.reset.v1` events), so it survives replay.
+    pub retries: u32,
 }
 
 impl MergeSlot {
@@ -38,16 +50,20 @@ impl MergeSlot {
             bead: bead.into(),
             branch: branch.into(),
             state: MergeSlotState::Ready,
+            retries: 0,
         }
     }
 
-    /// `Ready → Merging`, `Merging → Merged | Failed`. Cualquier otra es ilegal.
+    /// `Ready → Merging`, `Merging → Merged | Failed`, `Failed → Ready`. Cualquier otra es
+    /// ilegal. `Failed → Ready` (gtcore-4ad682) es la salida operador/sheriff de un slot en
+    /// `failed` — antes `failed` era terminal y el trabajo LISTO no se podía re-encolar.
     pub fn transition(&mut self, to: MergeSlotState) -> Result<(), AppError> {
         let ok = matches!(
             (self.state, to),
             (MergeSlotState::Ready, MergeSlotState::Merging)
                 | (MergeSlotState::Merging, MergeSlotState::Merged)
                 | (MergeSlotState::Merging, MergeSlotState::Failed)
+                | (MergeSlotState::Failed, MergeSlotState::Ready)
         );
         if ok {
             self.state = to;
@@ -104,6 +120,21 @@ impl MergeBoard {
 
     pub fn fail(&mut self, bead: &str) -> Result<(), AppError> {
         self.transition(bead, MergeSlotState::Failed)
+    }
+
+    /// Operator/sheriff re-queue of a `Failed` slot: `Failed → Ready` + bump the retry counter
+    /// (gtcore-4ad682). The state-machine legality (`slot` exists and is `Failed`) is enforced by
+    /// [`MergeSlot::transition`]; the retry CAP is enforced one layer up in
+    /// [`crate::commands::ResetMerge`] so replay (which folds already-emitted events
+    /// unconditionally) never re-checks a bound the write path already passed.
+    pub fn reset(&mut self, bead: &str) -> Result<(), AppError> {
+        let slot = self
+            .slots
+            .get_mut(bead)
+            .ok_or_else(|| AppError::NotFound(format!("merge slot {bead}")))?;
+        slot.transition(MergeSlotState::Ready)?;
+        slot.retries = slot.retries.saturating_add(1);
+        Ok(())
     }
 
     fn transition(&mut self, bead: &str, to: MergeSlotState) -> Result<(), AppError> {
@@ -182,6 +213,9 @@ impl MergeState {
                 self.board.set_state(bead, MergeSlotState::Failed);
                 self.failed.push((bead.clone(), reason.clone()));
             }
+            MergeEvent::Reset { bead } => {
+                self.board.reset(bead);
+            }
         }
     }
 }
@@ -199,7 +233,9 @@ impl BoardSnapshot {
     }
 
     fn upsert(&mut self, bead: String, branch: String, state: MergeSlotState) {
-        let slot = MergeSlot { bead: bead.clone(), branch, state };
+        // A (re-)submit is a fresh attempt lineage: the retry counter is born/reset to 0. The
+        // reset counter only accumulates via `reset` (below), never across a re-`submit`.
+        let slot = MergeSlot { bead: bead.clone(), branch, state, retries: 0 };
         match self.pos(&bead) {
             Ok(i) => self.slots[i] = slot,
             Err(i) => self.slots.insert(i, slot),
@@ -209,6 +245,15 @@ impl BoardSnapshot {
     fn set_state(&mut self, bead: &str, state: MergeSlotState) {
         if let Ok(i) = self.pos(bead) {
             self.slots[i].state = state;
+        }
+    }
+
+    /// Fold a `merge.reset.v1` event: `Failed → Ready` + bump the retry counter. Total (no
+    /// cap re-check) so replay stays deterministic — the cap was enforced at write time.
+    fn reset(&mut self, bead: &str) {
+        if let Ok(i) = self.pos(bead) {
+            self.slots[i].state = MergeSlotState::Ready;
+            self.slots[i].retries = self.slots[i].retries.saturating_add(1);
         }
     }
 
@@ -296,12 +341,88 @@ mod tests {
     }
 
     #[test]
+    fn reset_cycles_failed_to_ready_to_merged_and_counts_retries() {
+        // gtcore-4ad682 acceptance #3: a failed slot re-queues via `reset` and drives the full
+        // failed → ready → merging → merged cycle. The retry counter accrues per reset.
+        let mut b = MergeBoard::default();
+        b.submit("b1".into(), "feat/x".into()).unwrap();
+        b.start("b1").unwrap();
+        b.fail("b1").unwrap();
+        assert_eq!(b.get("b1").unwrap().state, MergeSlotState::Failed);
+        assert_eq!(b.get("b1").unwrap().retries, 0);
+
+        // Reset (operator/sheriff): Failed → Ready, retries bumped.
+        b.reset("b1").unwrap();
+        assert_eq!(b.get("b1").unwrap().state, MergeSlotState::Ready);
+        assert_eq!(b.get("b1").unwrap().retries, 1);
+
+        // The re-queued branch drives cleanly to Merged.
+        b.start("b1").unwrap();
+        b.complete("b1").unwrap();
+        assert_eq!(b.get("b1").unwrap().state, MergeSlotState::Merged);
+    }
+
+    #[test]
+    fn reset_rejects_non_failed_slots() {
+        // `reset` is Failed → Ready only. A Ready / Merging / Merged slot rejects it (the
+        // state-machine legality that keeps the queue the only path to main intact).
+        let mut b = MergeBoard::default();
+        b.submit("b1".into(), "feat/x".into()).unwrap();
+        assert!(b.reset("b1").is_err(), "Ready slot cannot be reset");
+        b.start("b1").unwrap();
+        assert!(b.reset("b1").is_err(), "Merging slot cannot be reset");
+        b.complete("b1").unwrap();
+        assert!(b.reset("b1").is_err(), "Merged slot cannot be reset");
+        assert!(b.reset("ghost").is_err(), "unknown slot cannot be reset");
+    }
+
+    #[test]
+    fn resubmit_zeroes_the_retry_counter() {
+        // A genuine re-submit is a fresh branch attempt: it resets the retry lineage to 0, so
+        // the reset cap bounds only blind resets of the *same* failed branch.
+        let mut b = MergeBoard::default();
+        b.submit("b1".into(), "feat/x".into()).unwrap();
+        b.start("b1").unwrap();
+        b.fail("b1").unwrap();
+        b.reset("b1").unwrap();
+        assert_eq!(b.get("b1").unwrap().retries, 1);
+        b.start("b1").unwrap();
+        b.fail("b1").unwrap();
+        // Re-submit the fixed branch — counter is born again at 0.
+        b.submit("b1".into(), "feat/x2".into()).unwrap();
+        assert_eq!(b.get("b1").unwrap().state, MergeSlotState::Ready);
+        assert_eq!(b.get("b1").unwrap().retries, 0);
+    }
+
+    #[test]
+    fn reset_event_replays_deterministically() {
+        // The reset counter is derived from the log: a `Reset` event folds to Ready + retries+1,
+        // so a replay reconstructs the same slot the live board held.
+        let log = vec![
+            MergeEvent::Ready { bead: "b1".into(), branch: "feat/x".into(), channel_msg_id: "01".into() },
+            MergeEvent::Started { bead: "b1".into() },
+            MergeEvent::Failed { bead: "b1".into(), reason: "conflict".into() },
+            MergeEvent::Reset { bead: "b1".into() },
+            MergeEvent::Started { bead: "b1".into() },
+            MergeEvent::Failed { bead: "b1".into(), reason: "conflict again".into() },
+            MergeEvent::Reset { bead: "b1".into() },
+        ];
+        let mut s = MergeState::default();
+        for e in &log {
+            s.apply(e);
+        }
+        let slot = &s.board.slots()[0];
+        assert_eq!(slot.state, MergeSlotState::Ready);
+        assert_eq!(slot.retries, 2, "two resets fold to retries=2");
+    }
+
+    #[test]
     fn from_slots_rehydrates_states_for_command_validation() {
         // A repo projection carries each slot's *current* state, not just `Ready`. The board
         // must come back with those states so a follow-up command validates correctly.
         let board = MergeBoard::from_slots([
-            MergeSlot { bead: "b1".into(), branch: "feat/x".into(), state: MergeSlotState::Merging },
-            MergeSlot { bead: "b2".into(), branch: "feat/y".into(), state: MergeSlotState::Ready },
+            MergeSlot { bead: "b1".into(), branch: "feat/x".into(), state: MergeSlotState::Merging, retries: 0 },
+            MergeSlot { bead: "b2".into(), branch: "feat/y".into(), state: MergeSlotState::Ready, retries: 0 },
         ]);
         assert_eq!(board.get("b1").unwrap().state, MergeSlotState::Merging);
         assert_eq!(board.get("b2").unwrap().state, MergeSlotState::Ready);
@@ -350,7 +471,7 @@ mod tests {
 
         // The ONLY legal transition into `Merged` (≙ on main) is `Merging → Merged`.
         for from in [Ready, Merging, Merged, Failed] {
-            let mut s = MergeSlot { bead: "b".into(), branch: "x".into(), state: from };
+            let mut s = MergeSlot { bead: "b".into(), branch: "x".into(), state: from, retries: 0 };
             assert_eq!(
                 s.transition(Merged).is_ok(),
                 from == Merging,
@@ -359,7 +480,7 @@ mod tests {
         }
         // The ONLY legal transition into `Merging` (the queue admit) is `Ready → Merging`.
         for from in [Ready, Merging, Merged, Failed] {
-            let mut s = MergeSlot { bead: "b".into(), branch: "x".into(), state: from };
+            let mut s = MergeSlot { bead: "b".into(), branch: "x".into(), state: from, retries: 0 };
             assert_eq!(
                 s.transition(Merging).is_ok(),
                 from == Ready,
