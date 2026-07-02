@@ -45,24 +45,48 @@ impl DomainHandler for NotifyHandler {
     }
 
     fn descriptors(&self) -> Vec<McpTool> {
-        vec![descriptor(
-            "notify.send",
-            "Send a notification to the human operator dashboard. Use for decisions requiring \
-             human input, alerts on failures, or FYI updates. kind is a CLOSED set \
-             (decision|info|alert). Re-sends of the same finding dedup instead of re-paging: \
-             pass `fingerprint` to name the finding explicitly, or omit it and one is derived \
-             from (from_role, kind, title) — repeats inside the window (default 24h, override \
-             with `dedup_window_secs`) bump a counter on the existing row. Pass fingerprint:\"\" \
-             to force a one-shot row (never deduped).",
-            &[
-                req("title", "string"),
-                opt("body", "string"),
-                opt("kind", "string"),
-                opt("from_role", "string"),
-                opt("fingerprint", "string"),
-                opt("dedup_window_secs", "integer"),
-            ],
-        )]
+        vec![
+            descriptor(
+                "notify.send",
+                "Send a notification to the human operator dashboard. Use for decisions requiring \
+                 human input, alerts on failures, or FYI updates. kind is a CLOSED set \
+                 (decision|info|alert). Re-sends of the same finding dedup instead of re-paging: \
+                 pass `fingerprint` to name the finding explicitly, or omit it and one is derived \
+                 from (from_role, kind, title) — repeats inside the window (default 24h, override \
+                 with `dedup_window_secs`) bump a counter on the existing row. Pass fingerprint:\"\" \
+                 to force a one-shot row (never deduped).",
+                &[
+                    req("title", "string"),
+                    opt("body", "string"),
+                    opt("kind", "string"),
+                    opt("from_role", "string"),
+                    opt("fingerprint", "string"),
+                    opt("dedup_window_secs", "integer"),
+                ],
+            ),
+            descriptor(
+                "notify.list",
+                "List operator notifications for the workspace, newest activity first. \
+                 `state` narrows to new|acked|resolved (omit for every state); `limit` caps \
+                 rows (default 50). A daemon should consult this before re-alerting: a finding \
+                 already acked/resolved needs no new page. Read-only.",
+                &[opt("state", "string"), opt("limit", "integer")],
+            ),
+            descriptor(
+                "notify.ack",
+                "Acknowledge a notification (state new → acked): the operator has seen it; \
+                 dedup keeps absorbing re-emissions of its fingerprint. Idempotent on an \
+                 already-acked row; a resolved row stays resolved (error).",
+                &[req("id", "string")],
+            ),
+            descriptor(
+                "notify.resolve",
+                "Resolve a notification (→ resolved): the underlying finding is fixed/cleared. \
+                 Terminal and idempotent. The emitter+fingerprint stops being absorbed only \
+                 after the dedup window expires, so a genuinely recurring finding re-pages.",
+                &[req("id", "string")],
+            ),
+        ]
     }
 
     async fn dispatch(&self, tool: &str, ctx: DomainCtx<'_>) -> Result<Value, AppError> {
@@ -137,9 +161,107 @@ impl DomainHandler for NotifyHandler {
                     "count": outcome.count,
                 }))
             }
+            // gtcore-73d4ab: the read/lifecycle half that closes the emitter↔operator loop —
+            // without it agents could only ever ADD to the bell, never see or settle it.
+            "notify.list" => {
+                let workspace = ctx.workspace.unwrap_or(DEFAULT_WORKSPACE).to_string();
+                let state = match ctx.args.get("state").and_then(Value::as_str) {
+                    None | Some("") => None,
+                    Some(s @ ("new" | "acked" | "resolved")) => Some(s.to_string()),
+                    Some(other) => {
+                        return Err(AppError::Validation(format!(
+                            "unknown state `{other}` (expected one of: new, acked, resolved)"
+                        )))
+                    }
+                };
+                let limit = ctx
+                    .args
+                    .get("limit")
+                    .and_then(Value::as_i64)
+                    .unwrap_or(50)
+                    .clamp(1, 500);
+                let rows: Vec<NotificationRow> = sqlx::query_as(
+                    "SELECT id::text, from_role, title, body, kind, state, count, fingerprint, \
+                            to_char(created_at at time zone 'utc', 'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"') AS created_at, \
+                            to_char(last_seen_at at time zone 'utc', 'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"') AS last_seen_at \
+                     FROM notifications \
+                     WHERE workspace = $1 AND ($2::text IS NULL OR state = $2) \
+                     ORDER BY last_seen_at DESC LIMIT $3",
+                )
+                .bind(&workspace)
+                .bind(&state)
+                .bind(limit)
+                .fetch_all(&self.pool)
+                .await
+                .map_err(|e| AppError::Other(e.to_string()))?;
+                Ok(json!({ "rows": rows, "total": rows.len() }))
+            }
+            "notify.ack" | "notify.resolve" => {
+                let id = str_arg(&ctx.args, "id")?.trim().to_string();
+                if id.is_empty() {
+                    return Err(AppError::Validation("id must not be empty".into()));
+                }
+                let workspace = ctx.workspace.unwrap_or(DEFAULT_WORKSPACE).to_string();
+                // Legal moves only: ack settles a NEW row (idempotent on acked; never
+                // un-resolves), resolve is terminal from either live state (idempotent).
+                // `read_at` keeps mirroring ack for the legacy dashboard badge.
+                let query = if tool == "notify.ack" {
+                    "UPDATE notifications \
+                     SET state = 'acked', read_at = coalesce(read_at, now()) \
+                     WHERE id = $1::uuid AND workspace = $2 AND state <> 'resolved' \
+                     RETURNING state"
+                } else {
+                    "UPDATE notifications SET state = 'resolved' \
+                     WHERE id = $1::uuid AND workspace = $2 \
+                     RETURNING state"
+                };
+                let updated: Option<(String,)> = sqlx::query_as(query)
+                    .bind(&id)
+                    .bind(&workspace)
+                    .fetch_optional(&self.pool)
+                    .await
+                    .map_err(|e| AppError::Other(e.to_string()))?;
+                match updated {
+                    Some((state,)) => Ok(json!({ "ok": true, "id": id, "state": state })),
+                    None if tool == "notify.ack" => {
+                        // Distinguish "gone" from "already resolved" for a usable error.
+                        let exists: Option<(String,)> = sqlx::query_as(
+                            "SELECT state FROM notifications WHERE id = $1::uuid AND workspace = $2",
+                        )
+                        .bind(&id)
+                        .bind(&workspace)
+                        .fetch_optional(&self.pool)
+                        .await
+                        .map_err(|e| AppError::Other(e.to_string()))?;
+                        match exists {
+                            Some(_) => Err(AppError::Validation(format!(
+                                "notification {id} is resolved — ack would regress it"
+                            ))),
+                            None => Err(AppError::NotFound(format!("notification {id}"))),
+                        }
+                    }
+                    None => Err(AppError::NotFound(format!("notification {id}"))),
+                }
+            }
             other => Err(AppError::Validation(format!("unknown tool `{other}`"))),
         }
     }
+}
+
+/// One `notify.list` row, straight off the store. String timestamps (UTC, RFC3339-ish) so the
+/// JSON needs no chrono round-trip; `fingerprint` is `None` for one-shot rows.
+#[derive(Debug, serde::Serialize, sqlx::FromRow)]
+struct NotificationRow {
+    id: String,
+    from_role: String,
+    title: String,
+    body: String,
+    kind: String,
+    state: String,
+    count: i32,
+    fingerprint: Option<String>,
+    created_at: String,
+    last_seen_at: String,
 }
 
 /// Stable derived dedup key for a caller that names no fingerprint: the exact re-emission shape
