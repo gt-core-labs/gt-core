@@ -901,6 +901,32 @@ async fn main() -> anyhow::Result<()> {
     } else {
         eprintln!("[gt-orch-server] sling→working transition OFF — GT_DOLT_URL unset (beads stay open until agent self-transitions)");
     }
+    // Merge-board boot reconciliation phase 1 (gtcore-088db9): settle any hydrated slot whose bead
+    // already closed with a `delivered_sha` — walk it to `Merged` with NO git attempt (boot-time
+    // `try_complete_slot`). Run HERE, before the git-merge edge subscribes onto the hub (pol_relay,
+    // below), so the `start`/`complete` it emits cannot trigger a real merge for work already on
+    // main (the gtcore-4ad682 hazard). Phase 2 (`reconcile_inflight_slots`) runs after the edge is
+    // live. Gated on GT_DOLT_URL: without the issues store there is no close-state to read.
+    if let Some(issues) = &dolt_issues {
+        let issues = issues.clone();
+        let healed = gt_composition::merge_boot::settle_delivered_slots(&merge, |bead| {
+            let issues = issues.clone();
+            async move {
+                match issues.get_detail(&bead).await {
+                    Ok(Some(detail)) if detail.status == "closed" => detail
+                        .delivered_sha
+                        .filter(|s| !s.trim().is_empty()),
+                    _ => None,
+                }
+            }
+        })
+        .await;
+        if healed > 0 {
+            eprintln!(
+                "[gt-orch-server] merge boot reconcile (phase 1) — {healed} delivered slot(s) auto-completed"
+            );
+        }
+    }
     // Cap-parked retry (gtcore-f527f6): a dispatch refused at pool/host cap is re-emitted onto the
     // dispatch channel after this many seconds instead of being dropped — the post-OOM
     // depressed-cap boot self-heals. The sink mirrors the consumer's backend selection below
@@ -971,6 +997,11 @@ async fn main() -> anyhow::Result<()> {
     // checkpoint timer below MOVES `checkpoint_rigs` into its closure, so the shutdown path needs its
     // own copy to commit + push every worktree's pending work before the pod dies.
     let drain_rigs = checkpoint_rigs.clone();
+    // Per-prefix rig routing for the phase-2 merge-board reconciler (gtcore-088db9), captured before
+    // `rig_paths` is moved into the plugin: it resolves each orphaned `Merging` slot's checkout the
+    // same way the edge does (bead prefix → rig, else the boot fallback) to probe origin/main.
+    let reconcile_rig_paths = rig_paths.clone();
+    let reconcile_rig_fallback = rig_path.clone();
     pol_registry = pol_registry.register(
         GitMergePlugin::with_rig_paths(merge.clone(), rig_paths, rig_path.clone())
             .with_ci_gated(ci_gated),
@@ -1503,27 +1534,38 @@ async fn main() -> anyhow::Result<()> {
         allocator.lock().expect("pool mutex").host_cap()
     );
 
-    // Restart recovery (gtcore-c15018): slots still in `Merging` after rehydration are orphans —
-    // the refinery died mid-merge and will never call `fail`, so `merge.failed.v1` would never
-    // reach the hub and the sheriff would never fire. Emit the failure now while pol_relay is
-    // already subscribed so the sheriff fires and drives the board back to health autonomously.
+    // Merge-board boot reconciliation phase 2 (gtcore-088db9, extending the gtcore-c15018 restart
+    // recovery): now that the git-merge edge + sheriff + polecat supervisor are subscribed on
+    // pol_relay, reconcile the in-flight slots boot hydration seeded silently. A `Ready` slot is
+    // re-enqueued (→ Merging, so the edge lands it — the restart-lost `merge.ready.v1` never
+    // re-fired). A `Merging` orphan is completed if its branch already reached origin/main with
+    // delivery evidence, else failed so the sheriff / supervisor recover it (the old behaviour, now
+    // gated on the not-on-main check instead of failing every orphan). Delivered slots were already
+    // settled in phase 1, so they read as `Merged` here and are skipped. The origin/main probe
+    // shells git, so it runs on a blocking thread, routed to each bead's rig checkout by prefix.
     {
-        let orphaned: Vec<_> = merge
-            .snapshot()
-            .await
-            .into_iter()
-            .filter(|s| s.state == gt_merge::MergeSlotState::Merging)
-            .map(|s| s.bead.clone())
-            .collect();
-        if !orphaned.is_empty() {
+        let reconcile_rig_paths = reconcile_rig_paths.clone();
+        let reconcile_rig_fallback = reconcile_rig_fallback.clone();
+        let (requeued, orphans) =
+            gt_composition::merge_boot::reconcile_inflight_slots(&merge, |bead, branch| {
+                let rig = reconcile_rig_paths
+                    .get(gt_mcp_server::bead_prefix(&bead))
+                    .cloned()
+                    .unwrap_or_else(|| reconcile_rig_fallback.clone());
+                async move {
+                    tokio::task::spawn_blocking(move || {
+                        gt_composition::git_merge::delivered_main_sha(&rig, &branch)
+                    })
+                    .await
+                    .ok()
+                    .flatten()
+                }
+            })
+            .await;
+        if requeued > 0 || orphans > 0 {
             eprintln!(
-                "[gt-orch-server] restart recovery — {} orphaned merging slot(s) → emitting merge.failed.v1: {}",
-                orphaned.len(),
-                orphaned.join(", ")
+                "[gt-orch-server] merge boot reconcile (phase 2) — {requeued} ready slot(s) re-enqueued, {orphans} merging orphan(s) reconciled"
             );
-            for bead in orphaned {
-                merge.fail(bead, "orchd restart — orphaned merging slot").await;
-            }
         }
     }
 
