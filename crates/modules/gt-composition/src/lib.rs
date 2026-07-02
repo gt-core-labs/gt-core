@@ -60,6 +60,7 @@ pub mod inbound_email;
 pub mod kanban_rest;
 pub mod mailbox;
 pub mod mayor_dispatch;
+pub mod merge_boot;
 pub mod mcp;
 pub mod mcp_push;
 pub mod notifications;
