@@ -630,6 +630,28 @@ impl PolecatSupervisorPlugin {
         true
     }
 
+    /// Abandon a re-sling whose spawn failed PERMANENTLY (gtcore-408279): retrying the identical
+    /// spawn (command too long, missing binary, bad workdir) can never succeed, so the retry
+    /// chain stops here instead of hot-looping every supervisor tick. Stops supervising the
+    /// session, frees the session's pool slot + a scheduler-governor slot, and alerts the
+    /// operator; the bead itself stays `working` for the task custodian to re-open (gtcore-912043).
+    async fn abandon_respawn(&self, bead: &str, session: &str, path: &str, e: &std::io::Error) {
+        eprintln!(
+            "[polecat] {path} spawn failed PERMANENTLY for {bead}: {e} — retry abandoned, slot freed (the task custodian re-opens the bead)"
+        );
+        self.supervisor.unwatch(session);
+        self.release_slot_for(session);
+        if let Some(sched) = &self.sched {
+            sched.capacity_freed().await;
+        }
+        self.emit_polecat(PolecatEvent::SlingFailed {
+            bead: bead.to_string(),
+            reason: format!(
+                "fallo PERMANENTE de spawn en {path}: {e}. Reintentos abandonados para no ciclar; el custodio de tareas re-abrirá el bead."
+            ),
+        });
+    }
+
     /// Reclaim a finished polecat's git worktree (gtcore-acacfb). Each sling provisions
     /// `<root>/<session>` carrying a full cargo `target/` (tens of GB); without teardown they pile
     /// up and fill the disk (107 trees / 372 GB found 2026-06-28 — a co-cause of the etcd
@@ -737,6 +759,15 @@ impl PolecatSupervisorPlugin {
         // Re-sling directly: spawn a fresh polecat for the SAME session/bead. No bead transition —
         // it stays `working`. The deterministic session id + per-bead worktree are reused.
         if let Err(e) = spawn_tmux(self.tmux.as_ref(), &spec) {
+            if gt_polecat::tmux::spawn_error_is_permanent(&e) {
+                // gtcore-408279: retrying an identical permanent failure (command too long,
+                // missing binary, bad workdir) hot-loops forever. Abandon: stop supervising the
+                // session, free both capacity systems, alert the operator; the task custodian
+                // re-opens the stranded bead.
+                self.abandon_respawn(&bead, &spec.session, "context-exhaustion re-sling", &e)
+                    .await;
+                return;
+            }
             eprintln!(
                 "[polecat] context-exhaustion re-sling spawn failed for {bead}: {e} — supervisor tick will retry"
             );
@@ -829,6 +860,13 @@ impl PolecatSupervisorPlugin {
         }
 
         if let Err(e) = spawn_tmux(self.tmux.as_ref(), &spec) {
+            if gt_polecat::tmux::spawn_error_is_permanent(&e) {
+                // gtcore-408279: the observed live hot loop — `command too long` retried every
+                // tick for days with the bead stranded `working`. Abandon instead.
+                self.ci_retries.lock().expect("ci_retries mutex").remove(bead);
+                self.abandon_respawn(bead, &session, "CI-failure re-sling", &e).await;
+                return;
+            }
             eprintln!(
                 "[polecat] CI-failure re-sling spawn failed for {bead}: {e} — supervisor tick will retry"
             );
@@ -2973,6 +3011,71 @@ mod tests {
             ],
             "model+effort land, the bypass flag survives, permission_mode never applies"
         );
+    }
+
+    #[tokio::test]
+    async fn permanent_spawn_failure_abandons_the_ci_retry_loop() {
+        // gtcore-408279: the live incident — `tmux respawn-pane failed: command too long`
+        // retried every tick forever. A PERMANENT spawn error must abandon: unwatch, free the
+        // slot, and never re-enter the loop.
+        let fake = Arc::new(FakeTmux::new());
+        let tmux: Arc<dyn Tmux> = fake.clone();
+        let supervisor = Arc::new(PolecatSupervisor::new(
+            tmux.clone(),
+            RestartConfig::default(),
+            8,
+        ));
+        let template = SpawnTemplate {
+            rig: "hq".into(),
+            prefix: "hq".into(),
+            workdir: "/tmp".into(),
+            command: "true".into(),
+            args: vec![],
+            base_env: vec![],
+            heartbeat_dir: std::env::temp_dir(),
+        };
+        let alloc = Arc::new(Mutex::new(PoolAllocator::new(10, 5)));
+        let p = PolecatSupervisorPlugin::new("acme", tmux, template, supervisor.clone(), alloc.clone())
+            .with_ci_max_retries(3);
+
+        // Normal sling claims the slot and supervises the session.
+        p.on_event(&record(SchedEvent::Dispatched {
+            bead: "gg-1".into(),
+            worker: "w1".into(),
+        }))
+        .await
+        .unwrap();
+        assert_eq!(supervisor.watched_count(), 1);
+        assert_eq!(alloc.lock().unwrap().in_flight("acme"), 1);
+
+        // From here every spawn fails permanently (the command-too-long class).
+        fake.fail_new_session_with("tmux respawn-pane failed: command too long");
+        p.on_event(&record(MergeEvent::Failed {
+            bead: "gg-1".into(),
+            reason: "CI failed: failure".into(),
+        }))
+        .await
+        .unwrap();
+
+        assert_eq!(
+            supervisor.watched_count(),
+            0,
+            "permanent failure unwatches the session — nothing left for the tick to retry"
+        );
+        assert_eq!(
+            alloc.lock().unwrap().in_flight("acme"),
+            0,
+            "the session's pool slot was freed on abandon"
+        );
+
+        // A second CI failure does NOT re-enter the loop: the session is no longer supervised.
+        p.on_event(&record(MergeEvent::Failed {
+            bead: "gg-1".into(),
+            reason: "CI failed: failure".into(),
+        }))
+        .await
+        .unwrap();
+        assert_eq!(supervisor.watched_count(), 0, "no retry chain re-armed");
     }
 
     #[test]

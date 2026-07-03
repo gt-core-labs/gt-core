@@ -78,6 +78,95 @@ pub trait Tmux: Send + Sync {
     fn resume(&self, session: &str) -> io::Result<()>;
 }
 
+/// Conservative bound on the assembled inline `respawn-pane … env … command args…` command, in
+/// bytes (gtcore-408279). tmux rejects an over-long command with `command too long` (its imsg
+/// frame is 16 KiB, shared with framing overhead); a CI-fix kickoff prompt embedding a diff + CI
+/// log routinely blows past it. Above this bound the real command is written to a launch script
+/// and the pane runs `sh <script>` instead — bounded, regardless of prompt size.
+const MAX_INLINE_COMMAND_BYTES: usize = 8192;
+
+/// How the pane's real command is handed to `respawn-pane` (gtcore-408279): inline argv when it
+/// fits tmux's command-size budget, else the content of a launch script the adapter writes and
+/// runs via `sh`. Decided by [`spawn_invocation`] — pure, so the size policy and the script
+/// quoting are unit-tested without tmux.
+#[derive(Debug, PartialEq, Eq)]
+enum SpawnInvocation {
+    /// `env K=V … command args…`, appended verbatim to the `respawn-pane` argv.
+    Inline(Vec<String>),
+    /// The `#!/bin/sh` launch script replacing the inline command: `exec env 'K=V' … 'command'
+    /// 'args'…` with every word single-quoted, so env-in-process semantics (`GT_HOOK_BEAD` in
+    /// the agent's environ) are identical to the inline form.
+    Script { content: String },
+}
+
+/// POSIX-shell single-quote `s` (embedded `'` becomes `'\''`), so arbitrary prompt bytes —
+/// newlines, quotes, `$`, backticks — pass through the launch script verbatim.
+fn shell_quote(s: &str) -> String {
+    format!("'{}'", s.replace('\'', "'\\''"))
+}
+
+/// Build the pane invocation for `respawn-pane`: inline when the assembled words fit
+/// `max_inline` bytes, else a launch script carrying the same env prefix + command + args.
+fn spawn_invocation(
+    pairs: &[(String, String)],
+    command: &str,
+    args: &[String],
+    max_inline: usize,
+) -> SpawnInvocation {
+    let mut inline: Vec<String> = vec!["env".into()];
+    for (k, v) in pairs {
+        inline.push(format!("{k}={v}"));
+    }
+    inline.push(command.to_string());
+    inline.extend(args.iter().cloned());
+    // +1 per word approximates the argv separators in tmux's assembled command.
+    let total: usize = inline.iter().map(|w| w.len() + 1).sum();
+    if total <= max_inline {
+        return SpawnInvocation::Inline(inline);
+    }
+    let mut content = String::from(
+        "#!/bin/sh\n# generated launch script (gtcore-408279): the inline respawn command exceeded tmux's size limit\nexec env",
+    );
+    for (k, v) in pairs {
+        content.push(' ');
+        content.push_str(&shell_quote(&format!("{k}={v}")));
+    }
+    content.push(' ');
+    content.push_str(&shell_quote(command));
+    for a in args {
+        content.push(' ');
+        content.push_str(&shell_quote(a));
+    }
+    content.push('\n');
+    SpawnInvocation::Script { content }
+}
+
+/// Where a session's launch script lives: an adapter-owned scratch dir, NEVER the workdir — the
+/// workdir is the polecat's git worktree, and a stray script there would dirty the tree the
+/// agent commits from.
+fn launch_script_path(session: &str) -> std::path::PathBuf {
+    std::env::temp_dir().join("gt-spawn").join(format!("{session}.sh"))
+}
+
+/// Whether a spawn error is PERMANENT — retrying the identical spawn cannot succeed, so a retry
+/// loop must abandon instead of hot-looping forever (gtcore-408279; observed live: a supervisor
+/// retrying `command too long` every tick for days). Matched on the rendered message because the
+/// error crosses the [`Tmux`] trait as a plain [`io::Error`]:
+///
+/// - `command too long` — the assembled command exceeds tmux's size limit (same input ⇒ same
+///   result; also defense-in-depth should the launch-script path be bypassed).
+/// - `No such file or directory` — the agent binary or the workdir does not exist.
+/// - `not a directory` — the workdir path resolves to a file.
+///
+/// Everything else (timeouts, a busy server, a duplicate session) stays transient — today's
+/// retry behaviour.
+pub fn spawn_error_is_permanent(e: &io::Error) -> bool {
+    let msg = e.to_string();
+    msg.contains("command too long")
+        || msg.contains("No such file or directory")
+        || msg.contains("not a directory")
+}
+
 /// Real adapter: shells out to the `tmux` binary. Mirrors the flag shape of
 /// `internal/tmux/tmux.go` (`new-session -d -s … -c … -e KEY=VAL …` then `respawn-pane`).
 pub struct TmuxCli {
@@ -277,13 +366,31 @@ impl Tmux for TmuxCli {
             session.into(),
             "-c".into(),
             workdir,
-            "env".into(),
         ];
-        for (k, v) in &pairs {
-            respawn.push(format!("{k}={v}"));
+        // gtcore-408279: an over-long inline command (huge kickoff prompt) makes tmux fail with
+        // `command too long` — permanently, every retry. Above the size budget the same env +
+        // command + args go into a launch script and the pane runs `sh <script>`: identical
+        // process semantics (exec env … command), bounded tmux command.
+        match spawn_invocation(&pairs, command, args, MAX_INLINE_COMMAND_BYTES) {
+            SpawnInvocation::Inline(words) => respawn.extend(words),
+            SpawnInvocation::Script { content } => {
+                let path = launch_script_path(session);
+                let write = path
+                    .parent()
+                    .map(std::fs::create_dir_all)
+                    .unwrap_or(Ok(()))
+                    .and_then(|()| std::fs::write(&path, content));
+                if let Err(e) = write {
+                    let _ = self.kill_session(session);
+                    return Err(io::Error::new(
+                        e.kind(),
+                        format!("write launch script {}: {e}", path.display()),
+                    ));
+                }
+                respawn.push("sh".into());
+                respawn.push(path.to_string_lossy().into_owned());
+            }
         }
-        respawn.push(command.into());
-        respawn.extend(args.iter().cloned());
         let respawn_ref: Vec<&str> = respawn.iter().map(String::as_str).collect();
         if let Err(e) = self.run_checked(&respawn_ref) {
             let _ = self.kill_session(session);
@@ -420,6 +527,9 @@ pub struct FakeTmux {
     /// Names passed to [`Tmux::kill_session`], in call order. Lets gates assert a teardown happened
     /// (e.g. the CI-failure re-sling killing a still-live session before respawning, gtcore-8701c4).
     kills: Mutex<Vec<String>>,
+    /// When set, every [`Tmux::new_session`] fails with this message (gtcore-408279) — lets a
+    /// gate exercise the permanent-spawn-failure abandon path without a real tmux server.
+    new_session_error: Mutex<Option<String>>,
 }
 
 impl FakeTmux {
@@ -442,6 +552,12 @@ impl FakeTmux {
         self.paused.lock().unwrap().contains(session)
     }
 
+    /// Make every subsequent [`Tmux::new_session`] fail with `msg` (gtcore-408279) — stands in
+    /// for a real adapter failure like `tmux respawn-pane failed: command too long`.
+    pub fn fail_new_session_with(&self, msg: &str) {
+        *self.new_session_error.lock().unwrap() = Some(msg.to_string());
+    }
+
     /// Session names handed to [`Tmux::kill_session`], in call order — test observability for
     /// teardown paths (gtcore-8701c4).
     pub fn kills(&self) -> Vec<String> {
@@ -458,6 +574,9 @@ impl Tmux for FakeTmux {
         _args: &[String],
         env: &[(String, String)],
     ) -> io::Result<()> {
+        if let Some(msg) = self.new_session_error.lock().unwrap().as_ref() {
+            return Err(io::Error::other(msg.clone()));
+        }
         let mut map = self.sessions.lock().unwrap();
         let entry = map.entry(session.to_string()).or_default();
         for (k, v) in env {
@@ -600,6 +719,63 @@ mod tests {
         assert!(t.capture_pane("s1").is_none());
         t.set_pane("s1", "⏵ 88% context used");
         assert_eq!(t.capture_pane("s1").as_deref(), Some("⏵ 88% context used"));
+    }
+
+    #[test]
+    fn small_command_stays_inline_oversized_goes_to_script() {
+        // gtcore-408279: the size policy. A normal kickoff stays the inline `env … command args`
+        // form; a prompt past the tmux budget moves the WHOLE invocation into a launch script.
+        let pairs = vec![("GT_HOOK_BEAD".to_string(), "hq-1".to_string())];
+        let small = spawn_invocation(&pairs, "claude", &["hola".to_string()], 8192);
+        assert_eq!(
+            small,
+            SpawnInvocation::Inline(vec![
+                "env".into(),
+                "GT_HOOK_BEAD=hq-1".into(),
+                "claude".into(),
+                "hola".into(),
+            ])
+        );
+
+        let huge_prompt = "x".repeat(20_000);
+        let big = spawn_invocation(&pairs, "claude", &[huge_prompt.clone()], 8192);
+        let SpawnInvocation::Script { content } = big else {
+            panic!("oversized prompt must produce a launch script");
+        };
+        // Same env-in-process semantics: exec env K=V … command 'prompt'.
+        assert!(content.starts_with("#!/bin/sh\n"));
+        assert!(content.contains("exec env 'GT_HOOK_BEAD=hq-1' 'claude'"));
+        assert!(content.contains(&huge_prompt), "the full prompt travels in the script");
+    }
+
+    #[test]
+    fn script_quoting_survives_hostile_prompt_bytes() {
+        // Quotes, `$`, backticks and newlines in a prompt must reach the agent verbatim: every
+        // word is single-quoted, embedded single quotes escaped as '\'' .
+        let pairs: Vec<(String, String)> = vec![];
+        let hostile = format!("it's a $HOME `test`\nline2 {}", "y".repeat(9000));
+        let SpawnInvocation::Script { content } =
+            spawn_invocation(&pairs, "claude", &[hostile], 100)
+        else {
+            panic!("past the bound the invocation is a script");
+        };
+        assert!(content.contains("'it'\\''s a $HOME `test`\nline2"));
+    }
+
+    #[test]
+    fn permanent_spawn_errors_are_classified() {
+        // gtcore-408279: `command too long` / missing binary / bad workdir are permanent — the
+        // retry loop must abandon; timeouts and duplicate sessions stay transient.
+        let perm = |m: &str| io::Error::other(m.to_string());
+        assert!(spawn_error_is_permanent(&perm(
+            "tmux respawn-pane failed: command too long"
+        )));
+        assert!(spawn_error_is_permanent(&perm(
+            "spawn tmux: No such file or directory (os error 2)"
+        )));
+        assert!(spawn_error_is_permanent(&perm("chdir: not a directory")));
+        assert!(!spawn_error_is_permanent(&perm("tmux new-session timed out")));
+        assert!(!spawn_error_is_permanent(&perm("duplicate session: hq-1")));
     }
 
     #[test]
