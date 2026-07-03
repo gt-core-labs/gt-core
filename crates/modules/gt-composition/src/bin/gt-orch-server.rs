@@ -262,6 +262,9 @@ async fn main() -> anyhow::Result<()> {
     let event_root_for_seed = event_root.clone();
     // Keep a copy for the session reconciler (hq-orchd-deploy.23): it replays the same agent.* log.
     let event_root_for_reconcile = event_root.clone();
+    // Keep a copy for the task custodian (gtcore-912043): it replays the same agent.* log to find
+    // beads stuck `working` with no live session.
+    let event_root_for_custodian = event_root.clone();
     // Keep a copy for the polecat Knowledge prompt reader (hq-polecat-knowledge.1).
     let event_root_for_polecat = event_root.clone();
     // Keep a copy for the polecat heartbeat emitter (hq-e5b288): appends AgentEvent::Heartbeat
@@ -1940,6 +1943,50 @@ async fn main() -> anyhow::Result<()> {
             }
         }
     });
+
+    // --- Task custodian (gtcore-912043) ---
+    // The task-side twin of the session reconciler: the sling flips beads open→working, but a
+    // failed spawn / dead agent left them `working` forever (nothing reconciled the TASK after
+    // the session died — "el dispatch se preocupa solo por los agentes, no por las tareas").
+    // Each tick, a bead `working` with no active session in the agent.* registry and no merge
+    // slot in flight, session-less past the grace window, is CAS re-opened: auto beads re-enter
+    // the frontier, manual/epic beads become claimable instead of stranded. Requires the Dolt
+    // issues store (same gate as the sling→working transition itself).
+    let _custodian_timer: Option<tokio::task::JoinHandle<()>> = match &dolt_issues {
+        Some(issues) => {
+            let custodian_tick_secs = env_usize("GT_TASK_CUSTODIAN_TICK_SECS", 120) as u64;
+            let custodian_grace_secs = env_usize("GT_TASK_CUSTODIAN_GRACE_SECS", 600) as u64;
+            let custodian = gt_composition::task_custodian::TaskCustodian::new(
+                event_root_for_custodian,
+                ws_slug.clone(),
+                issues.clone(),
+                Some(merge.clone()),
+                Duration::from_secs(custodian_grace_secs),
+                Some(handle.events_sender()),
+            );
+            eprintln!(
+                "[gt-orch-server] task custodian on — sweep {custodian_tick_secs}s (grace {custodian_grace_secs}s); re-opens working beads with no live session"
+            );
+            Some(tokio::spawn(async move {
+                let mut tick = tokio::time::interval(Duration::from_secs(custodian_tick_secs));
+                loop {
+                    tick.tick().await;
+                    let recovered = custodian.sweep().await;
+                    if !recovered.is_empty() {
+                        eprintln!(
+                            "[gt-orch-server] task custodian re-opened {} stranded bead(s): {}",
+                            recovered.len(),
+                            recovered.join(", ")
+                        );
+                    }
+                }
+            }))
+        }
+        None => {
+            eprintln!("[gt-orch-server] task custodian OFF — GT_DOLT_URL unset (no issues store to reconcile)");
+            None
+        }
+    };
 
     // Refinery MERGE_READY live loop: await MERGE_READY messages on a gt-channel and submit each to
     // the merge actor, under a restart+backoff supervisor (gt-core agents may instead submit via
