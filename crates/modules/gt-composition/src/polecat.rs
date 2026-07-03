@@ -153,13 +153,25 @@ impl AgentTokenMinter {
     /// `pub(crate)` so the role-agent launcher ([`crate::role_agent`]) can mint the same kind of
     /// least-privilege token for a triggered sheriff/witness/deacon session.
     pub(crate) fn token_for(&self, session: &str, role: &str) -> Result<String, gt_auth::AuthError> {
+        self.token_for_in(session, role, &self.workspace)
+    }
+
+    /// Like [`Self::token_for`] but scoped to an EXPLICIT tenant (gtcore-717e13): the mayor of a
+    /// rig adopted from another workspace must operate in THAT workspace — a boot-workspace claim
+    /// made its board/probe reads resolve the wrong tenant.
+    pub(crate) fn token_for_in(
+        &self,
+        session: &str,
+        role: &str,
+        workspace: &str,
+    ) -> Result<String, gt_auth::AuthError> {
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_secs())
             .unwrap_or(0);
         let claims = JwtClaims {
             sub: session.to_string(),
-            workspace: self.workspace.clone(),
+            workspace: workspace.to_string(),
             scopes: (self.scopes_for_role)(role),
             exp: now + self.ttl_secs,
             nbf: None,

@@ -376,6 +376,10 @@ async fn main() -> anyhow::Result<()> {
     // workdir is its resolved_worktree_root; per-rig templates inherit the boot template's shared
     // fields via SpawnTemplate::for_rig. Without GT_PG_URL (or on any load failure) both maps stay
     // empty and the daemon behaves exactly as the legacy single-rig deployment.
+    // Rig name → owning workspace for rigs adopted from OTHER tenants (gtcore-717e13): the mayor
+    // waker scopes those rigs' session lifecycle + token/.gt-config to their OWN workspace, so
+    // each tenant's Sessions view shows its mayor and the mayor reads the right board.
+    let mut rig_workspace_map: HashMap<String, String> = HashMap::new();
     let (rig_configs, rig_paths): (HashMap<String, RigConfig>, HashMap<String, PathBuf>) =
         match std::env::var("GT_PG_URL").ok().filter(|v| !v.is_empty()) {
             Some(pg_url) => match gt_store_pg::WorkspacePool::connect(&pg_url, &ws_slug).await {
@@ -425,6 +429,8 @@ async fn main() -> anyhow::Result<()> {
                                                         eprintln!("[gt-orch-server] rig '{}' (ws '{slug}') skipped — prefix/name collides with an earlier workspace's rig", rig.name);
                                                     } else {
                                                         eprintln!("[gt-orch-server] rig '{}' (prefix '{}') adopted from workspace '{slug}'", rig.name, rig.prefix);
+                                                        rig_workspace_map
+                                                            .insert(rig.name.clone(), slug.clone());
                                                         rigs.push(rig);
                                                     }
                                                 }
@@ -1408,7 +1414,11 @@ async fn main() -> anyhow::Result<()> {
                         args,
                         base_env,
                         std::path::PathBuf::from(channel_root),
-                    );
+                    )
+                    // gtcore-717e13: an adopted rig's mayor lives (sessions + token + .gt-config)
+                    // in its OWN workspace, so the tenant's console sees it and it reads the
+                    // tenant's board.
+                    .with_rig_workspaces(rig_workspace_map.clone());
                     // Resolve + validate the mayor's claude account at spawn, exactly like the
                     // polecat sling (gtcore-559c50): without this the mayor inherits the static
                     // boot-template CLAUDE_CONFIG_DIR and is born in 401 once that account's creds

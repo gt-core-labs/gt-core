@@ -307,6 +307,10 @@ pub struct TmuxMayorWaker {
     /// sling-time gate skips a Limited/Blocked active account, exactly like the polecat path. `None`
     /// ⇒ every account's status is unknown (permissive), i.e. credential-validity only.
     quota: Option<QuotaHandle>,
+    /// Rig name → owning workspace for rigs adopted from OTHER tenants (gtcore-717e13): drives
+    /// the session's `agent.*` scope and its `.gt-config`/token workspace. A rig absent here is
+    /// the boot workspace's (legacy behaviour).
+    rig_workspaces: HashMap<String, String>,
     /// Anthropic passthrough proxy URL (gtcore-559c50 / hq-284842): when set AND an account is
     /// resolved, the mayor's `claude` is pointed at it via `ANTHROPIC_BASE_URL` with the
     /// `x-gt-account`/`x-gt-session` attribution headers, so the mayor's spend feeds per-call quota
@@ -367,6 +371,7 @@ impl TmuxMayorWaker {
             channel_root,
             keychain: None,
             quota: None,
+            rig_workspaces: HashMap::new(),
             anthropic_proxy_url: None,
             event_log: None,
             agent_token: None,
@@ -389,6 +394,43 @@ impl TmuxMayorWaker {
                 let _ = tx.send(rec);
             }
         }
+    }
+
+    /// The workspace `rig`'s mayor session belongs to (gtcore-717e13): the workspace the rig was
+    /// adopted from, else the daemon's boot workspace. This is what the session's `agent.*`
+    /// lifecycle is scoped to (so the TENANT's Sessions view shows its own mayor) and what its
+    /// `.gt-config`/token operate in (so its MCP calls read the tenant's board, not the boot
+    /// workspace's).
+    fn session_workspace<'a>(&'a self, rig: &str) -> &'a str {
+        self.rig_workspaces
+            .get(rig)
+            .map(String::as_str)
+            .unwrap_or(&self.workspace)
+    }
+
+    /// Emit a session lifecycle event scoped to `rig`'s OWN workspace (gtcore-717e13). A boot-rig
+    /// mayor keeps the legacy hub path (the daemon's persistence sink lands it in the boot
+    /// workspace log); an adopted rig's mayor appends STRAIGHT to that workspace's log — the hub
+    /// sink only knows the boot workspace, which is exactly how `mayor-authapp` ended up
+    /// invisible under `templates` ("Sin sesiones activas" while the mayor worked).
+    fn emit_session_for(&self, rig: &str, ev: AgentEvent) {
+        let ws = self.session_workspace(rig);
+        if ws != self.workspace {
+            if let Some(log) = &self.event_log {
+                if let Err(e) = log.append(Some(ws), ev) {
+                    eprintln!("[mayor-dispatch] session event append for ws {ws} failed: {e}");
+                }
+                return;
+            }
+        }
+        self.emit_session(ev);
+    }
+
+    /// Map rig name → owning workspace for the rigs this daemon adopted from OTHER tenants
+    /// (gtcore-717e13). Built at boot next to the routing tables.
+    pub fn with_rig_workspaces(mut self, map: HashMap<String, String>) -> Self {
+        self.rig_workspaces = map;
+        self
     }
 
     /// Wire the per-agent token minter so a mayor spawn provisions role-scoped MCP auth like the
@@ -571,7 +613,7 @@ impl MayorWaker for TmuxMayorWaker {
             if self.tmux.has_session(&session) {
                 // Refresh the live mayor's visibility (gtcore-a44568): the registry row carries
                 // no heartbeat promise, so this is observability, not liveness enforcement.
-                self.emit_session(AgentEvent::Heartbeat {
+                self.emit_session_for(rig, AgentEvent::Heartbeat {
                     session: session.clone(),
                     timestamp_secs: Some(
                         std::time::SystemTime::now()
@@ -586,7 +628,7 @@ impl MayorWaker for TmuxMayorWaker {
             // close its registry row before the fresh spawn so `agent.list` never shows a live
             // mayor that is not there (gtcore-a44568).
             if self.spawned.lock().expect("spawned mutex").contains(&session) {
-                self.emit_session(AgentEvent::Killed {
+                self.emit_session_for(rig, AgentEvent::Killed {
                     session: session.clone(),
                     reason: "mayor tmux session gone — superseded by a fresh wake spawn".to_string(),
                     at_secs: Some(
@@ -640,11 +682,15 @@ impl MayorWaker for TmuxMayorWaker {
             // never `*`), write a `.mcp.json` + `.gt-config` into the workdir, and stamp GT_TOKEN —
             // so the mayor's MCP/`gt` calls carry its OWN role-scoped identity instead of a blanket
             // self-minted token. Best-effort: a mint/write failure logs and the mayor still launches.
+            // gtcore-717e13: the mayor operates IN the rig's owning workspace — its token claim,
+            // .mcp.json/.gt-config X-Workspace and GT_WORKSPACE all name that tenant, so its MCP
+            // board/probe reads resolve the tenant's beads instead of the boot workspace's.
+            let session_ws = self.session_workspace(rig).to_string();
             if let (Some(at), Some(url)) = (&self.agent_token, &self.server_url) {
-                match at.token_for(&session, "mayor") {
+                match at.token_for_in(&session, "mayor", &session_ws) {
                     Ok(tok) => {
-                        crate::worktree::write_mcp_json(&session_wd, url, &self.workspace, rig, &tok);
-                        crate::worktree::write_gt_config(&session_wd, url, &self.workspace, rig, &tok);
+                        crate::worktree::write_mcp_json(&session_wd, url, &session_ws, rig, &tok);
+                        crate::worktree::write_gt_config(&session_wd, url, &session_ws, rig, &tok);
                         env.push(("GT_TOKEN".to_string(), tok));
                     }
                     Err(e) => eprintln!(
@@ -652,6 +698,7 @@ impl MayorWaker for TmuxMayorWaker {
                     ),
                 }
             }
+            env.push(("GT_WORKSPACE".to_string(), session_ws.clone()));
             let mut args = self.args.clone();
             args.push(mayor_prompt(&self.workspace, rig));
             // Materialise the mayor's role skills + Knowledge (CLAUDE.md) + model config into its
@@ -698,7 +745,7 @@ impl MayorWaker for TmuxMayorWaker {
                 .lock()
                 .expect("spawned mutex")
                 .insert(session.clone());
-            self.emit_session(AgentEvent::Spawned {
+            self.emit_session_for(rig, AgentEvent::Spawned {
                 session: session.clone(),
                 rig: rig.to_string(),
                 role: SessionRole::Mayor,
@@ -888,6 +935,47 @@ mod tests {
     /// (`tmux_socket: None` so the Interactive reconciler never false-kills what it cannot see),
     /// Heartbeat on a re-wake of a live session, and a supersede-Killed before re-spawning a dead
     /// one.
+    #[tokio::test]
+    async fn adopted_rig_mayor_is_announced_in_its_own_workspace() {
+        // gtcore-717e13: the mayor of a rig adopted from workspace `acme` must be visible in
+        // ACME's Sessions view — its agent.* lifecycle lands in acme's log, NOT the boot
+        // workspace's hub ("Sin sesiones activas" while mayor-authapp worked). Boot-rig mayors
+        // keep the legacy hub path.
+        let tmp = tempfile::tempdir().unwrap();
+        let tmux = Arc::new(FakeTmux::new());
+        let (tx, mut rx) = tokio::sync::broadcast::channel::<EventRecord>(16);
+        let log = Arc::new(crate::mcp::eventlog::EventLog::new(Some(
+            tmp.path().join("evlog"),
+        )));
+        let w = waker(tmux.clone(), tmp.path())
+            .with_session_events(tx)
+            .with_event_log(log.clone())
+            .with_rig_workspaces(HashMap::from([("authapp".to_string(), "acme".to_string())]));
+
+        w.wake("authapp", &ids(&["authapp-1"])).await.unwrap();
+
+        // Nothing on the boot hub — the tenant's log carries the lifecycle instead.
+        assert!(rx.try_recv().is_err(), "adopted-rig spawn must not ride the boot hub");
+        let reg = log
+            .replay_domain::<gt_agent::SessionRegistry, AgentEvent, _>(
+                Some("acme"),
+                "agent.",
+                gt_agent::SessionRegistry::default(),
+                gt_agent::SessionRegistry::apply,
+            )
+            .unwrap();
+        assert!(
+            reg.active().iter().any(|s| s.id == "mayor-authapp"),
+            "mayor-authapp announced in workspace acme"
+        );
+
+        // Its identity operates in the tenant too: .gt-config names acme, GT_WORKSPACE stamped.
+        assert_eq!(
+            tmux.show_environment("mayor-authapp", "GT_WORKSPACE").unwrap().as_deref(),
+            Some("acme"),
+        );
+    }
+
     #[tokio::test]
     async fn wake_announces_the_mayor_session_lifecycle() {
         let tmp = tempfile::tempdir().unwrap();
