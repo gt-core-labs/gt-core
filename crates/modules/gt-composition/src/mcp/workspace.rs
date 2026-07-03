@@ -576,8 +576,10 @@ pub(crate) async fn provision_tenant(
 /// already has a seeded catalog — the idempotent no-op the acceptance criteria require, so a
 /// `default`/`gtcore` already carrying its technical set is left untouched).
 ///
-/// Requires multi-tenant Dolt routing (a per-workspace `hq_<slug>` pool); without it there is no
-/// per-tenant catalog to backfill, which is a configuration error rather than a caller fault.
+/// The domain-catalog half requires multi-tenant Dolt routing (a per-workspace `hq_<slug>` pool);
+/// without it the workspaces share the one `hq` catalog and there is nothing per-tenant to write —
+/// that half is a logged no-op (gtcore-db6324), NOT an error, so the role-catalog half still runs
+/// on single-tenant deployments.
 pub(crate) async fn backfill_catalog(
     dolt: Option<&Arc<WorkspacePools>>,
     skills: Option<&super::rest_backings::EventLogSkills>,
@@ -594,22 +596,11 @@ pub(crate) async fn backfill_catalog(
              eligible for the generic-template backfill"
         )));
     }
-    let Some(dolt) = dolt else {
-        return Err(AppError::Other(
-            "domain-catalog backfill needs multi-tenant Dolt routing (GT_DOLT_BASE_URL); \
-             single-tenant deployments share the one `hq` catalog"
-                .to_string(),
-        ));
-    };
-    // Resolve the clone source (if any) before touching the target, so a bad `clone_from`
-    // surfaces before we ensure the target's schema.
-    let clone_rows = clone_catalog_rows(Some(dolt), init).await?;
-    let pool = dolt.ensured_pool(slug).await?;
-    let catalog = DoltDomainCatalog::new(pool);
-    let written = catalog.seed_initial(init, &clone_rows).await?;
     // Role/skills backfill (gtcore-03baf7): a tenant created before provisioning seeded the role
     // catalog has an empty `skills.*` stream — its roles launch with no config. Same emptiness
-    // guard as create: a populated (curated) catalog is never touched.
+    // guard as create: a populated (curated) catalog is never touched. Runs BEFORE the Dolt-gated
+    // domain half (gtcore-db6324): the skills stream is per-workspace on EVERY deployment, so
+    // single-tenant Dolt must not make it unreachable.
     if let Some(skills) = skills {
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -624,7 +615,19 @@ pub(crate) async fn backfill_catalog(
             );
         }
     }
-    Ok(written)
+    let Some(dolt) = dolt else {
+        eprintln!(
+            "[workspace] domain-catalog backfill for `{slug}` skipped — single-tenant Dolt \
+             (GT_DOLT_BASE_URL unset) shares the one `hq` catalog"
+        );
+        return Ok(0);
+    };
+    // Resolve the clone source (if any) before touching the target, so a bad `clone_from`
+    // surfaces before we ensure the target's schema.
+    let clone_rows = clone_catalog_rows(Some(dolt), init).await?;
+    let pool = dolt.ensured_pool(slug).await?;
+    let catalog = DoltDomainCatalog::new(pool);
+    catalog.seed_initial(init, &clone_rows).await
 }
 
 /// Whether `slug` is a TECHNICAL workspace that owns the enum-derived domain set seeded at boot
@@ -977,6 +980,33 @@ impl WorkspaceStatusGate for PgWorkspaceStatus {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// gtcore-db6324: on a single-tenant Dolt deployment (no `GT_DOLT_BASE_URL` → `dolt: None`)
+    /// the backfill still seeds the tenant's role/skills catalog — the missing per-tenant domain
+    /// catalog is a logged no-op (`Ok(0)`), never an error that makes the skills half unreachable.
+    #[tokio::test]
+    async fn backfill_seeds_role_catalog_without_multi_tenant_dolt() {
+        use gt_skills::WorkspaceSkills;
+        let root = tempfile::tempdir().unwrap();
+        let log = std::sync::Arc::new(crate::mcp::eventlog::EventLog::new(Some(
+            root.path().to_path_buf(),
+        )));
+        let skills = crate::mcp::rest_backings::EventLogSkills::new(log);
+        let init = CatalogInit::parse(None).unwrap();
+
+        let written = backfill_catalog(None, Some(&skills), "acme", &init)
+            .await
+            .expect("single-tenant backfill must not error");
+        assert_eq!(written, 0, "no per-tenant domain catalog to write");
+        assert!(
+            !skills.catalog("acme").await.unwrap().is_empty(),
+            "role catalog seeded into the tenant's skills.* stream"
+        );
+
+        // Idempotent: a second backfill leaves the (now populated) catalog untouched.
+        let again = backfill_catalog(None, Some(&skills), "acme", &init).await.unwrap();
+        assert_eq!(again, 0);
+    }
 
     /// `workspace.create` rejects a payload without an `id`.
     #[tokio::test]
