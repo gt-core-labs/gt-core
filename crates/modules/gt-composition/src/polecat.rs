@@ -182,6 +182,36 @@ pub struct RigConfig {
     pub worktree_root: Option<std::path::PathBuf>,
 }
 
+/// Sling-time STRICT routing (gtcore-c82d0f): the (template, worktree root) a NEW sling may use,
+/// or `None` when the bead is unroutable and the sling must be REFUSED.
+///
+/// Unlike the derivation fallback (`route`), an unknown prefix never falls back to the boot
+/// template here: under multi-rig routing that fallback slung a new workspace's bead into the
+/// boot rig's checkout — the WRONG repo (authapp-9238e5 got a gt-core worktree; a merge-submit
+/// there would have clobbered gt-core main). The rules:
+///
+/// - prefix in the rig catalog → that rig's config (as before);
+/// - empty catalog → the boot template for everything (the legacy single-rig deployment, where
+///   the boot template IS the rig);
+/// - prefix == the boot template's rig name → the boot template (the boot rig's own beads,
+///   which a single-workspace catalog may not re-list);
+/// - anything else → `None`: refuse, free the capacity, surface to the operator.
+pub fn route_for_sling<'a>(
+    rig_configs: &'a HashMap<String, RigConfig>,
+    boot_template: &'a SpawnTemplate,
+    boot_worktree_root: Option<&'a std::path::PathBuf>,
+    bead: &str,
+) -> Option<(&'a SpawnTemplate, Option<&'a std::path::PathBuf>)> {
+    let prefix = bead_prefix(bead);
+    if let Some(cfg) = rig_configs.get(prefix) {
+        return Some((&cfg.template, cfg.worktree_root.as_ref()));
+    }
+    if rig_configs.is_empty() || prefix == boot_template.rig {
+        return Some((boot_template, boot_worktree_root));
+    }
+    None
+}
+
 /// Observer that turns the scheduler's dispatch decisions into live, supervised tmux polecats for
 /// one workspace, bounded by a shared [`PoolAllocator`]. Registered on the daemon's event hub
 /// alongside the reactor arms (`hq-orchd.3`).
@@ -296,6 +326,11 @@ pub struct PolecatSupervisorPlugin {
     /// already-claimed bead loses the pump's CAS-claim and dies as `DispatchFailed`. `None` ⇒
     /// cap refusals are terminal, exactly the pre-fix behaviour.
     dispatch_sink: Option<Arc<gt_channel::DispatchSink>>,
+    /// Beads whose sling was refused as UNROUTABLE (gtcore-c82d0f): their prefix has no
+    /// [`RigConfig`] and the boot-template fallback would sling them into the WRONG repo. The
+    /// frontier re-offers such a bead every tick, so membership gates the operator alert to the
+    /// FIRST refusal — the log line still fires every time.
+    refused_unroutable: Mutex<HashSet<String>>,
 }
 
 /// Default CI-failure retry cap when `GT_CI_MAX_RETRIES` is unset (gtcore-3a1bd4): three automated
@@ -344,6 +379,7 @@ impl PolecatSupervisorPlugin {
             cap_parked: Mutex::new(HashSet::new()),
             cap_retry_secs: DEFAULT_CAP_RETRY_SECS,
             dispatch_sink: None,
+            refused_unroutable: Mutex::new(HashSet::new()),
         }
     }
 
@@ -441,6 +477,11 @@ impl PolecatSupervisorPlugin {
     /// The (template, worktree_root) pair for `bead`, by its rig prefix. Falls back to the
     /// legacy single `template` + `worktree_root` for an unknown prefix, so single-rig
     /// deployments are untouched.
+    ///
+    /// Only for DERIVATION on beads that already slung (session naming for teardown/re-sling
+    /// consistency). A NEW sling must route through [`route_for_sling`] instead — the unknown-
+    /// prefix fallback is exactly what slung a new workspace's bead into the wrong repo
+    /// (gtcore-c82d0f, the authapp-9238e5 mis-dispatch).
     fn route(&self, bead: &str) -> (&SpawnTemplate, Option<&std::path::PathBuf>) {
         match self.rig_configs.get(bead_prefix(bead)) {
             Some(cfg) => (&cfg.template, cfg.worktree_root.as_ref()),
@@ -935,9 +976,43 @@ impl Plugin for PolecatSupervisorPlugin {
                 }
                 // The claim landed: this bead is no longer parked (a retry admitted it).
                 self.cap_parked.lock().expect("cap-parked mutex").remove(&bead);
-                // Route to the bead's rig by prefix (hq-0ecfec): matched ⇒ that rig's template +
-                // worktree root; unknown prefix ⇒ the legacy boot template, unchanged behaviour.
-                let (template, worktree_root) = self.route(&bead);
+                // Route to the bead's rig by prefix (hq-0ecfec) — STRICT at sling time
+                // (gtcore-c82d0f): an unroutable prefix is refused rather than falling back to
+                // the boot template, which would sling the bead into the wrong repo. The refusal
+                // frees both capacity systems and leaves the bead for the frontier/custodian; the
+                // operator alert fires once per bead per daemon run (the log line every time).
+                let Some((template, worktree_root)) = route_for_sling(
+                    &self.rig_configs,
+                    &self.template,
+                    self.worktree_root.as_ref(),
+                    &bead,
+                ) else {
+                    let prefix = bead_prefix(&bead).to_string();
+                    eprintln!(
+                        "[polecat] sling REFUSED for {bead}: prefix '{prefix}' has no registered rig checkout — the boot-template fallback would sling into the wrong repo; register the rig (with a provisionable checkout) and re-dispatch"
+                    );
+                    self.allocator
+                        .lock()
+                        .expect("pool mutex")
+                        .release(&self.workspace);
+                    if let Some(sched) = &self.sched {
+                        sched.capacity_freed().await;
+                    }
+                    let first_refusal = self
+                        .refused_unroutable
+                        .lock()
+                        .expect("refused-unroutable mutex")
+                        .insert(bead.clone());
+                    if first_refusal {
+                        self.emit_polecat(PolecatEvent::SlingFailed {
+                            bead: bead.clone(),
+                            reason: format!(
+                                "prefijo '{prefix}' sin rig registrado en el catálogo de routing — sling rehusado para no caer al checkout del boot template (repo equivocado). Registra el rig con su checkout y re-despacha."
+                            ),
+                        });
+                    }
+                    return Ok(());
+                };
                 let mut spec = template.spec_for(&self.workspace, &bead);
                 // Stamp a least-privilege per-agent token (hq-agent-provisioning.3) so the polecat
                 // acts as itself, scoped to its role — not as the operator. Best-effort: a mint
@@ -2613,20 +2688,28 @@ mod tests {
             Some("/rig-wt/gtweb")
         );
 
-        // Unknown prefix → the legacy fallback template (boot rig), unchanged.
+        // Unknown prefix → REFUSED under multi-rig routing (gtcore-c82d0f): the legacy fallback
+        // slung the bead into the boot rig's checkout — the wrong repo.
         p.on_event(&record(SchedEvent::Dispatched {
             bead: "zz-1".into(),
             worker: "w2".into(),
         }))
         .await
         .unwrap();
-        assert_eq!(
-            fake.show_environment("gtcore-zz-1", "GT_RIG").unwrap().as_deref(),
-            Some("gtcore")
+        assert!(
+            !fake.has_session("gtcore-zz-1"),
+            "unroutable bead must not sling into the boot template"
         );
+        // The boot rig's OWN beads still route to the boot template.
+        p.on_event(&record(SchedEvent::Dispatched {
+            bead: "gtcore-7".into(),
+            worker: "w3".into(),
+        }))
+        .await
+        .unwrap();
         assert_eq!(
-            fake.show_environment("gtcore-zz-1", "GT_RIG_PATH").unwrap().as_deref(),
-            Some("/rig-wt/gtcore")
+            fake.show_environment("gtcore-gtcore-7", "GT_RIG").unwrap().as_deref(),
+            Some("gtcore")
         );
     }
 
@@ -2890,6 +2973,115 @@ mod tests {
             ],
             "model+effort land, the bypass flag survives, permission_mode never applies"
         );
+    }
+
+    #[test]
+    fn route_for_sling_is_strict_under_multi_rig_routing() {
+        // gtcore-c82d0f: at sling time an unknown prefix must be REFUSED, never boot-template'd —
+        // the fallback is what slung authapp-9238e5 (ws templates) into the gt-core checkout.
+        let boot = SpawnTemplate {
+            rig: "hq".into(),
+            prefix: "hq".into(),
+            workdir: "/tmp".into(),
+            command: "true".into(),
+            args: vec![],
+            base_env: vec![],
+            heartbeat_dir: std::env::temp_dir(),
+        };
+        let gtweb = SpawnTemplate {
+            rig: "gtweb".into(),
+            prefix: "gtweb".into(),
+            ..boot.clone()
+        };
+        let mut configs = HashMap::new();
+        configs.insert(
+            "gtweb".to_string(),
+            RigConfig {
+                template: gtweb,
+                worktree_root: None,
+            },
+        );
+
+        // Catalog rig → its own template.
+        let (t, _) = route_for_sling(&configs, &boot, None, "gtweb-12").expect("routable");
+        assert_eq!(t.rig, "gtweb");
+        // The boot rig's own beads keep the boot template.
+        let (t, _) = route_for_sling(&configs, &boot, None, "hq-7").expect("boot rig routes");
+        assert_eq!(t.rig, "hq");
+        // Unknown prefix under multi-rig routing → refused.
+        assert!(
+            route_for_sling(&configs, &boot, None, "authapp-9238e5").is_none(),
+            "unroutable prefix must be refused, not boot-template'd"
+        );
+        // Empty catalog = legacy single-rig deployment: everything slings on the boot template.
+        let empty = HashMap::new();
+        let (t, _) = route_for_sling(&empty, &boot, None, "authapp-9238e5").expect("legacy");
+        assert_eq!(t.rig, "hq");
+    }
+
+    #[tokio::test]
+    async fn unroutable_dispatch_is_refused_and_frees_the_slot() {
+        // gtcore-c82d0f: a dispatched bead whose prefix has no RigConfig is not slung anywhere —
+        // no tmux session, nothing supervised — and the pool slot it claimed is released.
+        let fake = Arc::new(FakeTmux::new());
+        let tmux: Arc<dyn Tmux> = fake.clone();
+        let supervisor = Arc::new(PolecatSupervisor::new(
+            tmux.clone(),
+            RestartConfig::default(),
+            8,
+        ));
+        let boot = SpawnTemplate {
+            rig: "hq".into(),
+            prefix: "hq".into(),
+            workdir: "/tmp".into(),
+            command: "true".into(),
+            args: vec![],
+            base_env: vec![],
+            heartbeat_dir: std::env::temp_dir(),
+        };
+        let gtweb = SpawnTemplate {
+            rig: "gtweb".into(),
+            prefix: "gtweb".into(),
+            ..boot.clone()
+        };
+        let mut configs = HashMap::new();
+        configs.insert(
+            "gtweb".to_string(),
+            RigConfig {
+                template: gtweb,
+                worktree_root: None,
+            },
+        );
+        let alloc = Arc::new(Mutex::new(PoolAllocator::new(10, 5)));
+        let p = PolecatSupervisorPlugin::new("acme", tmux, boot, supervisor.clone(), alloc.clone())
+            .with_rig_configs(configs);
+
+        p.on_event(&record(SchedEvent::Dispatched {
+            bead: "authapp-1".into(),
+            worker: "w1".into(),
+        }))
+        .await
+        .unwrap();
+
+        assert!(
+            !fake.has_session("hq-authapp-1"),
+            "never slung into the boot template"
+        );
+        assert_eq!(supervisor.watched_count(), 0, "nothing supervised");
+        assert_eq!(
+            alloc.lock().unwrap().in_flight("acme"),
+            0,
+            "the claimed pool slot was released on refusal"
+        );
+
+        // A routable bead on the same plugin still slings — the refusal leaked no capacity.
+        p.on_event(&record(SchedEvent::Dispatched {
+            bead: "gtweb-3".into(),
+            worker: "w1".into(),
+        }))
+        .await
+        .unwrap();
+        assert!(fake.has_session("gtweb-gtweb-3"), "catalog rig slings normally");
     }
 
     #[test]

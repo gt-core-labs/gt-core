@@ -383,7 +383,58 @@ async fn main() -> anyhow::Result<()> {
                     use gt_rig::RigRepository;
                     let repo = gt_rig::PgRigs::new(pool.pool().clone());
                     match repo.list().await {
-                        Ok(rigs) => {
+                        Ok(mut rigs) => {
+                            // Cross-workspace rig hydration (gtcore-c82d0f): rigs are a per-
+                            // workspace catalog, but this daemon's frontier dispatches EVERY
+                            // workspace's beads. Union the other tenants' rigs so a properly
+                            // registered new-workspace rig routes to its OWN checkout instead of
+                            // being refused (or, before the strict router, mis-slung into the
+                            // boot template's repo). The boot workspace wins prefix/name
+                            // collisions. Best-effort per tenant: one bad schema never blocks
+                            // boot. Workspaces created AFTER boot hydrate on the next restart —
+                            // until then their beads are refused loudly by the strict router.
+                            match sqlx::query_scalar::<_, String>(
+                                "SELECT id FROM workspaces ORDER BY id",
+                            )
+                            .fetch_all(pool.pool())
+                            .await
+                            {
+                                Ok(slugs) => {
+                                    for slug in slugs.into_iter().filter(|s| s != &ws_slug) {
+                                        let ws_pool = match gt_store_pg::WorkspacePool::connect(
+                                            &pg_url, &slug,
+                                        )
+                                        .await
+                                        {
+                                            Ok(p) => p,
+                                            Err(e) => {
+                                                eprintln!("[gt-orch-server] workspace '{slug}' pool connect failed: {e} — its rigs stay unroutable");
+                                                continue;
+                                            }
+                                        };
+                                        match gt_rig::PgRigs::new(ws_pool.pool().clone())
+                                            .list()
+                                            .await
+                                        {
+                                            Ok(extra) => {
+                                                for rig in extra {
+                                                    if rigs.iter().any(|r| {
+                                                        r.prefix == rig.prefix
+                                                            || r.name == rig.name
+                                                    }) {
+                                                        eprintln!("[gt-orch-server] rig '{}' (ws '{slug}') skipped — prefix/name collides with an earlier workspace's rig", rig.name);
+                                                    } else {
+                                                        eprintln!("[gt-orch-server] rig '{}' (prefix '{}') adopted from workspace '{slug}'", rig.name, rig.prefix);
+                                                        rigs.push(rig);
+                                                    }
+                                                }
+                                            }
+                                            Err(e) => eprintln!("[gt-orch-server] rig list for workspace '{slug}' failed: {e} — its beads stay unroutable"),
+                                        }
+                                    }
+                                }
+                                Err(e) => eprintln!("[gt-orch-server] workspace catalog list failed: {e} — cross-workspace rigs not hydrated"),
+                            }
                             eprintln!(
                                 "[gt-orch-server] rig catalog loaded — {} rig(s) registered",
                                 rigs.len()
