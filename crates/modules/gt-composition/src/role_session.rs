@@ -11,9 +11,38 @@
 //! stamp via [`crate::polecat::apply_role_model`]. Best-effort throughout — a per-file IO failure
 //! logs and never aborts the launch (the session still opens, just without that artefact).
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use gt_skills::{ModelConfig, SkillCatalog};
+
+/// Per-session launch workdir (gtcore-aa639a): the directory a role session's launch artefacts
+/// (`.mcp.json`, `.gt-config`, `CLAUDE.md`, `.claude/skills`, settings) are materialised into —
+/// `<root>/role-wd/<session>`, created on demand. `root` is the daemon's channel root (the same
+/// durable dir the `role-wake/`/`mayor-wake/` channels live under).
+///
+/// Every role launch used to share the rig checkout as its workdir, so each launch REWROTE the
+/// same `.mcp.json`/`CLAUDE.md` and the last writer won: observed live 2026-07-03, the mayor's
+/// MCP calls authenticated as `refinery-resident` (its `.mcp.json` had been overwritten one
+/// second after spawn) and every `dispatch.request` was rejected — the whole mayor pipeline dead
+/// while the session looked healthy. A per-session dir makes the identity files unclobberable;
+/// the rig checkout stays reachable via `GT_RIG_PATH` in the session env.
+///
+/// Falls back to `shared_workdir` (the legacy behaviour) only when the dir cannot be created —
+/// a launch is never blocked on scratch-dir IO.
+pub fn session_workdir(root: &Path, session: &str, shared_workdir: &Path) -> PathBuf {
+    let wd = root.join("role-wd").join(session);
+    match std::fs::create_dir_all(&wd) {
+        Ok(()) => wd,
+        Err(e) => {
+            eprintln!(
+                "[role-session] per-session workdir {} unavailable ({e}) — falling back to the shared workdir {}",
+                wd.display(),
+                shared_workdir.display()
+            );
+            shared_workdir.to_path_buf()
+        }
+    }
+}
 
 /// Materialise `role`'s enabled skills + Knowledge prompt into `workdir`, returning its model config.
 ///

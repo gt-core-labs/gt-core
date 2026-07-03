@@ -328,6 +328,16 @@ impl ResidentRoleHost {
             format!("resident {role}: {e}")
         })?;
 
+        // Per-session workdir (gtcore-aa639a): every resident materialises its identity files
+        // (.mcp.json/.gt-config/CLAUDE.md/skills) into its OWN dir — sharing the rig checkout let
+        // each launch clobber the previous role's .mcp.json (the mayor authenticated as
+        // refinery-resident). Rooted next to the channel dir (the daemon's durable scratch).
+        let session_wd = crate::role_session::session_workdir(
+            &self.channel_root,
+            &session,
+            &self.workdir,
+        );
+
         // Seed first-run onboarding/trust in the dir claude will actually read, exactly like the
         // mayor/polecat paths — a resident wedged on the trust dialog would be deaf forever.
         let effective_config_dir: Option<PathBuf> = creds
@@ -341,7 +351,7 @@ impl ResidentRoleHost {
             })
             .or_else(|| std::env::var_os("HOME").map(|h| Path::new(&h).join(".claude")));
         if let Some(cd) = &effective_config_dir {
-            crate::worktree::seed_claude_onboarding(cd, &self.workdir);
+            crate::worktree::seed_claude_onboarding(cd, &session_wd);
             crate::worktree::seed_user_hooks(cd);
         }
 
@@ -355,8 +365,8 @@ impl ResidentRoleHost {
         if let (Some(at), Some(url)) = (&self.agent_token, &self.server_url) {
             match at.token_for(&session, role) {
                 Ok(tok) => {
-                    crate::worktree::write_mcp_json(&self.workdir, url, &self.workspace, &self.rig, &tok);
-                    crate::worktree::write_gt_config(&self.workdir, url, &self.workspace, &self.rig, &tok);
+                    crate::worktree::write_mcp_json(&session_wd, url, &self.workspace, &self.rig, &tok);
+                    crate::worktree::write_gt_config(&session_wd, url, &self.workspace, &self.rig, &tok);
                     env.push(("GT_TOKEN".to_string(), tok));
                 }
                 Err(e) => {
@@ -378,7 +388,7 @@ impl ResidentRoleHost {
                     if let Some(model) = crate::role_session::materialize_role_session(
                         &state.catalog,
                         role,
-                        &self.workdir,
+                        &session_wd,
                         &[
                             ("workspace", self.workspace.clone()),
                             ("rig", self.rig.clone()),
@@ -394,7 +404,7 @@ impl ResidentRoleHost {
         }
 
         self.tmux
-            .new_session(&session, &self.workdir, &self.command, &args, &env)
+            .new_session(&session, &session_wd, &self.command, &args, &env)
             .map_err(|e| format!("spawn resident session {session}: {e}"))?;
         self.spawned.lock().expect("spawned mutex").insert(session.clone());
         self.emit_session(AgentEvent::Spawned {

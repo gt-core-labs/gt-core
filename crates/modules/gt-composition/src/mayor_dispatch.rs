@@ -620,8 +620,18 @@ impl MayorWaker for TmuxMayorWaker {
                 .or_else(|| {
                     std::env::var_os("HOME").map(|h| Path::new(&h).join(".claude"))
                 });
+            // Per-session workdir (gtcore-aa639a): the mayor materialises its identity files
+            // (.mcp.json/.gt-config/CLAUDE.md/skills) into its OWN dir. Sharing the rig checkout
+            // let the resident roles clobber the mayor's .mcp.json (last writer wins): observed
+            // live, mayor-authapp authenticated as refinery-resident and every dispatch.request
+            // was rejected. The checkout stays reachable via the session env.
+            let session_wd = crate::role_session::session_workdir(
+                &self.channel_root,
+                &session,
+                &self.workdir,
+            );
             if let Some(cd) = &effective_config_dir {
-                crate::worktree::seed_claude_onboarding(cd, &self.workdir);
+                crate::worktree::seed_claude_onboarding(cd, &session_wd);
                 crate::worktree::seed_user_hooks(cd);
             }
             let mut env = self.session_env(rig, &wake_file, &session, creds.as_ref());
@@ -633,8 +643,8 @@ impl MayorWaker for TmuxMayorWaker {
             if let (Some(at), Some(url)) = (&self.agent_token, &self.server_url) {
                 match at.token_for(&session, "mayor") {
                     Ok(tok) => {
-                        crate::worktree::write_mcp_json(&self.workdir, url, &self.workspace, rig, &tok);
-                        crate::worktree::write_gt_config(&self.workdir, url, &self.workspace, rig, &tok);
+                        crate::worktree::write_mcp_json(&session_wd, url, &self.workspace, rig, &tok);
+                        crate::worktree::write_gt_config(&session_wd, url, &self.workspace, rig, &tok);
                         env.push(("GT_TOKEN".to_string(), tok));
                     }
                     Err(e) => eprintln!(
@@ -660,12 +670,12 @@ impl MayorWaker for TmuxMayorWaker {
                         if let Some(model) = crate::role_session::materialize_role_session(
                             &state.catalog,
                             "mayor",
-                            &self.workdir,
+                            &session_wd,
                             &[
                                 ("workspace", self.workspace.clone()),
                                 ("rig", rig.to_string()),
                                 ("RigName", rig.to_string()),
-                                ("WorkDir", self.workdir.display().to_string()),
+                                ("WorkDir", session_wd.display().to_string()),
                             ],
                         ) {
                             crate::polecat::apply_role_model(&mut args, &model);
@@ -677,7 +687,7 @@ impl MayorWaker for TmuxMayorWaker {
                 }
             }
             self.tmux
-                .new_session(&session, &self.workdir, &self.command, &args, &env)
+                .new_session(&session, &session_wd, &self.command, &args, &env)
                 .map_err(|e| MayorWakeError(format!("spawn mayor session {session}: {e}")))?;
             // Announce the mayor like every other role (gtcore-a44568): agent.list/console show
             // it live. `tmux_socket: None` on purpose — the mayor lives on the orchd's DEFAULT
@@ -1020,10 +1030,13 @@ mod tests {
             serde_json::from_str(&std::fs::read_to_string(&claude_json).unwrap()).unwrap();
         assert_eq!(v["hasCompletedOnboarding"], serde_json::json!(true));
         assert_eq!(v["bypassPermissionsModeAccepted"], serde_json::json!(true));
+        // gtcore-aa639a: the trusted dir is the mayor's PER-SESSION workdir (where claude now
+        // starts), not the shared rig checkout.
+        let session_wd = tmp.path().join("role-wd").join("mayor-gtcore");
         assert_eq!(
-            v["projects"]["/rig"]["hasTrustDialogAccepted"],
+            v["projects"][session_wd.to_str().unwrap()]["hasTrustDialogAccepted"],
             serde_json::json!(true),
-            "the mayor's workdir is pre-trusted so the session never stalls on the trust dialog",
+            "the mayor's session workdir is pre-trusted so the session never stalls on the trust dialog",
         );
     }
 
@@ -1066,13 +1079,40 @@ mod tests {
         w.wake("gtcore", &ids(&["gtcore-a"])).await.unwrap();
 
         assert!(fake.has_session("mayor-gtcore"));
-        // A role-scoped .mcp.json was provisioned into the mayor's workdir (not a blanket self-mint).
-        assert!(workdir.join(".mcp.json").exists(), ".mcp.json provisioned for the mayor");
+        // gtcore-aa639a: the role-scoped .mcp.json lands in the mayor's PER-SESSION workdir
+        // (`<channel-root-parent>/role-wd/<session>`), never the shared rig checkout — so another
+        // role's launch can never clobber the mayor's MCP identity (the mayor-as-refinery bug).
+        let session_wd = tmp.path().join("ch").join("role-wd").join("mayor-gtcore");
+        assert!(
+            session_wd.join(".mcp.json").exists(),
+            ".mcp.json provisioned in the mayor's own session workdir"
+        );
+        assert!(
+            !workdir.join(".mcp.json").exists(),
+            "the shared rig checkout must stay clean of identity files"
+        );
         // GT_TOKEN is stamped so the mayor's `gt`/hooks carry the same role-scoped identity.
         assert!(
             fake.show_environment("mayor-gtcore", "GT_TOKEN").unwrap().is_some(),
             "GT_TOKEN stamped on the mayor session",
         );
+    }
+
+    #[test]
+    fn session_workdirs_are_distinct_per_session() {
+        // gtcore-aa639a AC4: two role launches materialise into DISTINCT dirs; one launch can
+        // never rewrite the other's .mcp.json.
+        let tmp = tempfile::tempdir().unwrap();
+        let shared = tmp.path().join("rig");
+        std::fs::create_dir_all(&shared).unwrap();
+        let a = crate::role_session::session_workdir(tmp.path(), "mayor-authapp", &shared);
+        let b = crate::role_session::session_workdir(tmp.path(), "refinery-resident", &shared);
+        assert_ne!(a, b, "each session owns its workdir");
+        assert!(a.is_dir() && b.is_dir(), "created on demand");
+        assert_ne!(a, shared);
+        std::fs::write(a.join(".mcp.json"), "mayor").unwrap();
+        std::fs::write(b.join(".mcp.json"), "refinery").unwrap();
+        assert_eq!(std::fs::read_to_string(a.join(".mcp.json")).unwrap(), "mayor");
     }
 
     #[tokio::test]
