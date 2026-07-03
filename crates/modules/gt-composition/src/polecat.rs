@@ -343,6 +343,10 @@ pub struct PolecatSupervisorPlugin {
     /// frontier re-offers such a bead every tick, so membership gates the operator alert to the
     /// FIRST refusal — the log line still fires every time.
     refused_unroutable: Mutex<HashSet<String>>,
+    /// Rig name → owning workspace for rigs adopted from OTHER tenants (gtcore-717e13): drives
+    /// which workspace's `agent.*` log a session's lifecycle lands in. Absent rig ⇒ boot
+    /// workspace (legacy behaviour).
+    rig_workspaces: HashMap<String, String>,
 }
 
 /// Default CI-failure retry cap when `GT_CI_MAX_RETRIES` is unset (gtcore-3a1bd4): three automated
@@ -392,6 +396,7 @@ impl PolecatSupervisorPlugin {
             cap_retry_secs: DEFAULT_CAP_RETRY_SECS,
             dispatch_sink: None,
             refused_unroutable: Mutex::new(HashSet::new()),
+            rig_workspaces: HashMap::new(),
         }
     }
 
@@ -586,6 +591,38 @@ impl PolecatSupervisorPlugin {
                 let _ = tx.send(record);
             }
         }
+    }
+
+    /// The workspace `rig_name`'s sessions belong to (gtcore-717e13): the workspace the rig was
+    /// adopted from, else the daemon's boot workspace.
+    pub(crate) fn workspace_for_rig<'a>(&'a self, rig_name: &str) -> &'a str {
+        self.rig_workspaces
+            .get(rig_name)
+            .map(String::as_str)
+            .unwrap_or(&self.workspace)
+    }
+
+    /// Publish an [`AgentEvent`] scoped to `rig_name`'s OWN workspace (gtcore-717e13). Boot-rig
+    /// sessions keep the legacy hub path (the daemon's persistence sink lands them in the boot
+    /// workspace log); an adopted rig's session lifecycle is appended STRAIGHT to its tenant's
+    /// log so that workspace's Sessions view shows its own polecats.
+    fn emit_for_rig(&self, rig_name: &str, event: AgentEvent) {
+        let ws = self.workspace_for_rig(rig_name);
+        if ws != self.workspace {
+            if let Some(log) = &self.event_log {
+                if let Err(e) = log.append(Some(ws), event) {
+                    eprintln!("[polecat] agent event append for ws {ws} failed: {e}");
+                }
+                return;
+            }
+        }
+        self.emit(event);
+    }
+
+    /// Map rig name → owning workspace for rigs adopted from OTHER tenants (gtcore-717e13).
+    pub fn with_rig_workspaces(mut self, map: HashMap<String, String>) -> Self {
+        self.rig_workspaces = map;
+        self
     }
 
     /// Publish an [`IssueOperatorEvent`] onto the hub so the FE sees which agent operates a bead
@@ -1392,7 +1429,7 @@ impl Plugin for PolecatSupervisorPlugin {
                 // Open the agent session (hq-orchd.6): the slung polecat IS the session; its start
                 // timestamp anchors the session-minutes projection. Built before `watch` consumes
                 // the spec.
-                self.emit(AgentEvent::Spawned {
+                self.emit_for_rig(&spec.rig.clone(), AgentEvent::Spawned {
                     session: spec.session.clone(),
                     rig: spec.rig.clone(),
                     role: SessionRole::default(),
@@ -1442,7 +1479,7 @@ impl Plugin for PolecatSupervisorPlugin {
                         );
                     }
                 }
-                self.emit(AgentEvent::session_end(session));
+                self.emit_for_rig(&template.rig.clone(), AgentEvent::session_end(session));
                 // Clear the bead's operator marker (hq-agent-observability.2): its work landed, so
                 // the FE drops the agent chip. One agent per bead → the id alone identifies it.
                 self.emit_operator(IssueOperatorEvent::Cleared { bead: bead.clone() });
@@ -3485,6 +3522,81 @@ mod tests {
         let closed = rx.try_recv().expect("a session-close record was emitted");
         assert_eq!(closed.kind, "agent.session-end.v1");
         assert_eq!(rx.try_recv().unwrap().kind, "issues.operator-cleared.v1");
+    }
+
+    #[tokio::test]
+    async fn adopted_rig_polecat_lifecycle_lands_in_its_own_workspace() {
+        // gtcore-717e13: a polecat slung for a rig adopted from workspace `acme` announces its
+        // agent.* lifecycle in ACME's log — not the boot hub — so acme's Sessions view shows its
+        // own polecats. Boot-rig sessions keep the hub path (previous test).
+        let tmp = tempfile::tempdir().unwrap();
+        let fake = Arc::new(FakeTmux::new());
+        let tmux: Arc<dyn Tmux> = fake.clone();
+        let supervisor = Arc::new(PolecatSupervisor::new(
+            tmux.clone(),
+            RestartConfig::default(),
+            8,
+        ));
+        let boot = SpawnTemplate {
+            rig: "hq".into(),
+            prefix: "hq".into(),
+            workdir: "/tmp".into(),
+            command: "true".into(),
+            args: vec![],
+            base_env: vec![],
+            heartbeat_dir: std::env::temp_dir(),
+        };
+        let gtweb = SpawnTemplate {
+            rig: "gtweb".into(),
+            prefix: "gtweb".into(),
+            ..boot.clone()
+        };
+        let (tx, mut rx) = broadcast::channel::<EventRecord>(16);
+        let log = Arc::new(crate::mcp::eventlog::EventLog::new(Some(
+            tmp.path().to_path_buf(),
+        )));
+        let alloc = Arc::new(Mutex::new(PoolAllocator::new(10, 5)));
+        let p = PolecatSupervisorPlugin::new("default", tmux, boot, supervisor, alloc)
+            .with_rig_configs(HashMap::from([(
+                "gtweb".to_string(),
+                RigConfig {
+                    template: gtweb,
+                    worktree_root: None,
+                },
+            )]))
+            .with_session_events(tx)
+            .with_event_log(log.clone())
+            .with_rig_workspaces(HashMap::from([("gtweb".to_string(), "acme".to_string())]));
+
+        p.on_event(&record(SchedEvent::Dispatched {
+            bead: "gtweb-9".into(),
+            worker: "w1".into(),
+        }))
+        .await
+        .unwrap();
+
+        // The lifecycle landed in acme's log…
+        let reg = log
+            .replay_domain::<gt_agent::SessionRegistry, AgentEvent, _>(
+                Some("acme"),
+                "agent.",
+                gt_agent::SessionRegistry::default(),
+                gt_agent::SessionRegistry::apply,
+            )
+            .unwrap();
+        assert!(
+            reg.active().iter().any(|s| s.id == "gtweb-gtweb-9"),
+            "spawned announced in workspace acme"
+        );
+        // …and NOT on the boot hub (the operator marker still rides the hub's issues channel).
+        let mut hub_kinds = Vec::new();
+        while let Ok(rec) = rx.try_recv() {
+            hub_kinds.push(rec.kind);
+        }
+        assert!(
+            !hub_kinds.iter().any(|k| k.starts_with("agent.")),
+            "no agent.* lifecycle on the boot hub for an adopted rig: {hub_kinds:?}"
+        );
     }
 
     #[tokio::test]

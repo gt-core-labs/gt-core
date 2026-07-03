@@ -944,6 +944,9 @@ async fn main() -> anyhow::Result<()> {
     // the same pattern terminal.rs uses for interactive sessions.
     let knowledge_log = Arc::new(EventLog::new(Some(event_root_for_polecat)));
     pol_plugin = pol_plugin.with_event_log(knowledge_log.clone());
+    // gtcore-717e13: an adopted rig's polecat sessions (spawned/session-end) land in its OWN
+    // workspace's log so the tenant's Sessions view shows its polecats.
+    pol_plugin = pol_plugin.with_rig_workspaces(rig_workspace_map.clone());
     // Resident role sessions (gtcore-3246e8, epic gtcore-4c40b5): with GT_ROLE_SESSIONS=1 the
     // infra roles (sheriff/witness/deacon/refinery) live as LONG-LIVED tmux sessions on the
     // mayor pattern — spawned at boot, idle-blocked on their wake file (idle ≈ 0 tokens),
@@ -1744,6 +1747,10 @@ async fn main() -> anyhow::Result<()> {
     // Shared with the refinery lifecycle emitter below (same log root, cheap Arc clone).
     let refinery_log = Arc::clone(&heartbeat_log);
     let heartbeat_ws = ws_slug.clone();
+    // gtcore-717e13: heartbeats for an adopted rig's polecats land in ITS workspace's log — the
+    // same scope their Spawned/session-end ride — so the tenant's Sessions view stays fresh and
+    // the multi-workspace reconciler/custodian judge them where they live.
+    let heartbeat_rig_ws = rig_workspace_map.clone();
     let pol_timer = tokio::spawn(async move {
         let mut tick = tokio::time::interval(Duration::from_secs(tick_secs));
         tick.tick().await; // skip the immediate first fire
@@ -1765,11 +1772,16 @@ async fn main() -> anyhow::Result<()> {
             // Emit MCP agent heartbeats for all still-watched polecats (hq-e5b288): after the
             // tick, the watched set only contains sessions that are alive or being re-slung.
             // Best-effort: a log failure never aborts the supervision loop.
-            let ws_opt = Some(heartbeat_ws.as_str());
             let hb_ts = now_secs();
             for session in sup_timer.watched_sessions() {
+                // Route each heartbeat to the workspace the session was announced in
+                // (gtcore-717e13): the spec's rig resolves the owning tenant, boot ws otherwise.
+                let ws = sup_timer
+                    .spec_for_session(&session)
+                    .and_then(|spec| heartbeat_rig_ws.get(&spec.rig).cloned())
+                    .unwrap_or_else(|| heartbeat_ws.clone());
                 let ev = gt_agent::AgentEvent::Heartbeat { session, timestamp_secs: Some(hb_ts) };
-                if let Err(e) = heartbeat_log.append(ws_opt, ev) {
+                if let Err(e) = heartbeat_log.append(Some(ws.as_str()), ev) {
                     eprintln!("[gt-orch-server] heartbeat append failed: {e}");
                 }
             }
@@ -1979,6 +1991,14 @@ async fn main() -> anyhow::Result<()> {
     // server. Interactive mayor/dog sessions live on the mcp-server's `gt-<ws>` socket (another
     // container) and are reaped there; probing them from here always reports absent and would
     // false-kill a live mayor (hq-flow-validation-20260609.5).
+    // gtcore-717e13: also sweep the tenants whose adopted rigs' sessions this daemon announces —
+    // their reaps land in their own logs.
+    let extra_session_workspaces: Vec<String> = {
+        let mut v: Vec<String> = rig_workspace_map.values().cloned().collect();
+        v.sort();
+        v.dedup();
+        v
+    };
     let reconciler = SessionReconciler::new(
         event_root_for_reconcile,
         ws_slug.clone(),
@@ -1987,7 +2007,8 @@ async fn main() -> anyhow::Result<()> {
         tmux.clone(),
         ReapScope::Heartbeat,
         ReapSink::Hub(handle.events_sender()),
-    );
+    )
+    .with_extra_workspaces(extra_session_workspaces.clone());
     eprintln!(
         "[gt-orch-server] session reconciler on — sweep {reconcile_tick_secs}s (stale {reconcile_stale_secs}s); closes orphaned polecat sessions"
     );
@@ -2024,7 +2045,10 @@ async fn main() -> anyhow::Result<()> {
                 Some(merge.clone()),
                 Duration::from_secs(custodian_grace_secs),
                 Some(handle.events_sender()),
-            );
+            )
+            // gtcore-717e13: session truth spans every workspace this daemon announces into —
+            // without this, an adopted rig's actively-worked bead would read as abandoned.
+            .with_extra_workspaces(extra_session_workspaces.clone());
             eprintln!(
                 "[gt-orch-server] task custodian on — sweep {custodian_tick_secs}s (grace {custodian_grace_secs}s); re-opens working beads with no live session"
             );
