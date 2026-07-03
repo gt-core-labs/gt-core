@@ -40,19 +40,35 @@ pub struct WorkspaceHandler {
     /// end to end. `None` ⇒ single-tenant Dolt; create provisions only the PG
     /// side (the Dolt DB is the shared `hq`).
     dolt: Option<Arc<WorkspacePools>>,
+    /// The per-workspace `skills.*` store (gtcore-03baf7): `workspace.create` /
+    /// `workspace.backfill-catalog` seed the canonical role catalog into the new tenant's stream
+    /// when it is empty, so its roles come up functional (skills + Knowledge + model + permissions)
+    /// instead of blank. `None` ⇒ legacy behaviour: only the boot workspace is seeded (at boot).
+    skills: Option<Arc<super::rest_backings::EventLogSkills>>,
 }
 
 impl WorkspaceHandler {
     /// Wrap a connection pool. The `workspaces` table is expected to already
     /// exist (applied via the `gt-store-pg` migration at boot).
     pub fn new(pool: PgPool) -> Self {
-        Self { pool, dolt: None }
+        Self {
+            pool,
+            dolt: None,
+            skills: None,
+        }
     }
 
     /// Attach the per-workspace Dolt pools so `workspace.create` also provisions
     /// the tenant's `hq_<slug>` database + issues schema (hq-gap-workspace-provision-full).
     pub fn with_dolt(mut self, dolt: Arc<WorkspacePools>) -> Self {
         self.dolt = Some(dolt);
+        self
+    }
+
+    /// Attach the skills event-log store so tenant provisioning also seeds the new workspace's
+    /// role catalog (gtcore-03baf7).
+    pub fn with_skills(mut self, skills: Arc<super::rest_backings::EventLogSkills>) -> Self {
+        self.skills = Some(skills);
         self
     }
 
@@ -212,8 +228,15 @@ impl DomainHandler for WorkspaceHandler {
                 // issues schema, so the workspace is usable the moment it is created. Shared with
                 // the REST `POST /api/v1/workspace` path via `provision_tenant`
                 // (hq-gap-workspace-rest-create-provision).
-                provision_tenant(&self.pool, self.dolt.as_ref(), id.as_str(), ctx.actor, &init)
-                    .await?;
+                provision_tenant(
+                    &self.pool,
+                    self.dolt.as_ref(),
+                    self.skills.as_deref(),
+                    id.as_str(),
+                    ctx.actor,
+                    &init,
+                )
+                .await?;
                 Ok(json!({
                     "ok": true,
                     "id": id.as_str(),
@@ -229,7 +252,9 @@ impl DomainHandler for WorkspaceHandler {
                 let id = workspace_id(str_arg(&ctx.args, "id")?)?;
                 let init = CatalogInit::parse(opt_arg(&ctx.args, "catalog"))
                     .map_err(AppError::Validation)?;
-                let written = backfill_catalog(self.dolt.as_ref(), id.as_str(), &init).await?;
+                let written =
+                    backfill_catalog(self.dolt.as_ref(), self.skills.as_deref(), id.as_str(), &init)
+                        .await?;
                 Ok(json!({
                     "ok": true,
                     "id": id.as_str(),
@@ -495,6 +520,7 @@ fn provider_err(e: gt_auth::AuthError) -> AppError {
 pub(crate) async fn provision_tenant(
     pool: &PgPool,
     dolt: Option<&Arc<WorkspacePools>>,
+    skills: Option<&super::rest_backings::EventLogSkills>,
     slug: &str,
     actor: &str,
     catalog_init: &CatalogInit,
@@ -524,6 +550,24 @@ pub(crate) async fn provision_tenant(
         let catalog = DoltDomainCatalog::new(pool);
         catalog.seed_initial(catalog_init, &clone_rows).await?;
     }
+    // Role/skills catalog (gtcore-03baf7): every role launch replays `skills.*` scoped to the
+    // session's workspace, so a tenant whose stream is empty has roles with no skills, Knowledge,
+    // model or permissions. Seed the canonical catalog exactly as boot does for the boot workspace
+    // — guarded on emptiness, so a re-provision (or a curated catalog) is never stomped. A seed
+    // failure fails the provision: the call is idempotent, and a silently-unseeded tenant is the
+    // bug this closes.
+    if let Some(skills) = skills {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let seeded = gt_skills::seed_workspace_if_empty(skills, slug, now)
+            .await
+            .map_err(|e| AppError::Other(format!("seed role catalog for {slug}: {e}")))?;
+        if seeded > 0 {
+            eprintln!("[workspace] seeded {seeded} role-catalog event(s) into new workspace `{slug}`");
+        }
+    }
     Ok(())
 }
 
@@ -536,6 +580,7 @@ pub(crate) async fn provision_tenant(
 /// per-tenant catalog to backfill, which is a configuration error rather than a caller fault.
 pub(crate) async fn backfill_catalog(
     dolt: Option<&Arc<WorkspacePools>>,
+    skills: Option<&super::rest_backings::EventLogSkills>,
     slug: &str,
     init: &CatalogInit,
 ) -> Result<u64, AppError> {
@@ -561,7 +606,25 @@ pub(crate) async fn backfill_catalog(
     let clone_rows = clone_catalog_rows(Some(dolt), init).await?;
     let pool = dolt.ensured_pool(slug).await?;
     let catalog = DoltDomainCatalog::new(pool);
-    catalog.seed_initial(init, &clone_rows).await
+    let written = catalog.seed_initial(init, &clone_rows).await?;
+    // Role/skills backfill (gtcore-03baf7): a tenant created before provisioning seeded the role
+    // catalog has an empty `skills.*` stream — its roles launch with no config. Same emptiness
+    // guard as create: a populated (curated) catalog is never touched.
+    if let Some(skills) = skills {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let seeded = gt_skills::seed_workspace_if_empty(skills, slug, now)
+            .await
+            .map_err(|e| AppError::Other(format!("backfill role catalog for {slug}: {e}")))?;
+        if seeded > 0 {
+            eprintln!(
+                "[workspace] backfilled {seeded} role-catalog event(s) into workspace `{slug}`"
+            );
+        }
+    }
+    Ok(written)
 }
 
 /// Whether `slug` is a TECHNICAL workspace that owns the enum-derived domain set seeded at boot
@@ -604,12 +667,26 @@ async fn clone_catalog_rows(
 pub struct CompositionTenantProvisioner {
     pool: PgPool,
     dolt: Option<Arc<WorkspacePools>>,
+    /// The per-workspace `skills.*` store (gtcore-03baf7): REST-created tenants get the same
+    /// seeded role catalog the MCP path provisions. `None` ⇒ legacy (no seeding).
+    skills: Option<Arc<super::rest_backings::EventLogSkills>>,
 }
 
 impl CompositionTenantProvisioner {
     /// Wrap the shared PG pool + (optional) per-workspace Dolt pools.
     pub fn new(pool: PgPool, dolt: Option<Arc<WorkspacePools>>) -> Self {
-        Self { pool, dolt }
+        Self {
+            pool,
+            dolt,
+            skills: None,
+        }
+    }
+
+    /// Attach the skills event-log store so REST tenant provisioning also seeds the new
+    /// workspace's role catalog (gtcore-03baf7).
+    pub fn with_skills(mut self, skills: Arc<super::rest_backings::EventLogSkills>) -> Self {
+        self.skills = Some(skills);
+        self
     }
 }
 
@@ -625,9 +702,16 @@ impl gt_workspace::TenantProvisioner for CompositionTenantProvisioner {
         // text the MCP path produces (the REST handler maps it onto a 422).
         let init = CatalogInit::parse(catalog)
             .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { e.into() })?;
-        provision_tenant(&self.pool, self.dolt.as_ref(), slug, actor, &init)
-            .await
-            .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { e.to_string().into() })
+        provision_tenant(
+            &self.pool,
+            self.dolt.as_ref(),
+            self.skills.as_deref(),
+            slug,
+            actor,
+            &init,
+        )
+        .await
+        .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { e.to_string().into() })
     }
 
     async fn backfill_catalog(
@@ -637,7 +721,7 @@ impl gt_workspace::TenantProvisioner for CompositionTenantProvisioner {
     ) -> Result<u64, Box<dyn std::error::Error + Send + Sync>> {
         let init = CatalogInit::parse(catalog)
             .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { e.into() })?;
-        backfill_catalog(self.dolt.as_ref(), slug, &init)
+        backfill_catalog(self.dolt.as_ref(), self.skills.as_deref(), slug, &init)
             .await
             .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { e.to_string().into() })
     }

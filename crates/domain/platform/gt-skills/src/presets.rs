@@ -14,6 +14,11 @@
 
 use serde::Deserialize;
 
+#[cfg(feature = "axum")]
+use gt_events::AppError;
+
+#[cfg(feature = "axum")]
+use crate::http::{SkillWriter, WorkspaceSkills};
 use crate::{SkillCatalog, SkillEvent, SkillState};
 
 /// The curated interactive-role Knowledge, extracted from a live workspace's `skills.*` log and
@@ -268,6 +273,33 @@ pub fn workspace_seed_events(now: u64) -> Vec<SkillEvent> {
     events
 }
 
+/// Seed `workspace`'s `skills.*` stream with the canonical role catalog when — and only when — its
+/// catalog is empty (gtcore-03baf7). Returns the number of events appended (`0` = the catalog was
+/// already populated and was left untouched).
+///
+/// This is the one guard the boot path (`rest_modules.rs`) applies before seeding the boot
+/// workspace, factored out so tenant provisioning (`workspace.create` / `POST /api/v1/workspace`)
+/// can give a NEW workspace the same functional roles at creation. Every role launch replays
+/// `skills.*` scoped to the session's workspace, so without this a fresh tenant's roles come up
+/// with no skills, no Knowledge, no model and no permissions. Idempotent by the emptiness guard:
+/// re-provisioning an existing tenant (or racing a curated catalog) never appends a second seed.
+#[cfg(feature = "axum")]
+pub async fn seed_workspace_if_empty<S>(skills: &S, workspace: &str, now: u64) -> Result<usize, AppError>
+where
+    S: WorkspaceSkills + SkillWriter + ?Sized,
+{
+    let catalog = skills.catalog(workspace).await?;
+    if !catalog.is_empty() {
+        return Ok(0);
+    }
+    let events = workspace_seed_events(now);
+    let total = events.len();
+    for ev in events {
+        skills.append(workspace, ev).await?;
+    }
+    Ok(total)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -464,6 +496,71 @@ mod tests {
         let c = agent_least_privilege_catalog();
         assert!(scopes(&c, "overseer").is_empty());
         assert!(scopes(&c, "nobody").is_empty());
+    }
+
+    /// In-memory two-trait store for [`seed_workspace_if_empty`]: a per-workspace event vec whose
+    /// catalog is the same replay the composition root's `EventLogSkills` performs.
+    #[cfg(feature = "axum")]
+    struct MemStore(std::sync::Mutex<std::collections::HashMap<String, Vec<SkillEvent>>>);
+
+    #[cfg(feature = "axum")]
+    #[async_trait::async_trait]
+    impl WorkspaceSkills for MemStore {
+        async fn catalog(&self, workspace: &str) -> Result<SkillCatalog, AppError> {
+            let mut s = SkillState::default();
+            if let Some(evs) = self.0.lock().unwrap().get(workspace) {
+                for ev in evs {
+                    s.apply(ev);
+                }
+            }
+            Ok(s.catalog)
+        }
+    }
+
+    #[cfg(feature = "axum")]
+    #[async_trait::async_trait]
+    impl SkillWriter for MemStore {
+        async fn append(&self, workspace: &str, event: SkillEvent) -> Result<(), AppError> {
+            self.0
+                .lock()
+                .unwrap()
+                .entry(workspace.to_string())
+                .or_default()
+                .push(event);
+            Ok(())
+        }
+    }
+
+    #[cfg(feature = "axum")]
+    #[tokio::test]
+    async fn seed_workspace_if_empty_seeds_once_and_never_twice() {
+        // gtcore-03baf7: a fresh tenant's empty catalog receives the full seed (equal to the
+        // embedded seed catalog), and a re-provision is a no-op — the emptiness guard is what makes
+        // tenant provisioning idempotent and curated-catalog-safe.
+        let store = MemStore(std::sync::Mutex::new(std::collections::HashMap::new()));
+
+        let seeded = seed_workspace_if_empty(&store, "acme", 0).await.unwrap();
+        assert_eq!(seeded, workspace_seed_events(0).len());
+        let catalog = store.catalog("acme").await.unwrap();
+        assert!(!catalog.is_empty());
+        let drift = crate::compute_drift(&crate::seed_catalog(), &catalog);
+        assert!(
+            drift.is_empty(),
+            "seeded tenant catalog must match the embedded seed: {}",
+            drift.summary()
+        );
+
+        // Second provision: guard sees the populated catalog, appends nothing.
+        let again = seed_workspace_if_empty(&store, "acme", 1).await.unwrap();
+        assert_eq!(again, 0);
+        assert_eq!(
+            store.0.lock().unwrap().get("acme").unwrap().len(),
+            seeded,
+            "re-provision must not duplicate seed events"
+        );
+
+        // Other tenants are independent streams: seeding `acme` leaves `beta` empty.
+        assert!(store.catalog("beta").await.unwrap().is_empty());
     }
 
     #[test]

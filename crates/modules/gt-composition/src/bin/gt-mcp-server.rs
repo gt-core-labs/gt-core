@@ -2231,10 +2231,14 @@ async fn build_domain_router(
         .transpose()
         .context("GT_DOLT_BASE_URL is malformed")?
         .map(Arc::new);
+    // The MCP `workspace.create`/`backfill-catalog` path seeds the new tenant's role catalog into
+    // its `skills.*` stream (gtcore-03baf7) — same event log the skills REST surface replays.
+    let workspace_skills = Arc::new(gt_composition::mcp::EventLogSkills::new(event_log.clone()));
     let workspace_handler = match &dolt_pools {
         Some(dolt) => WorkspaceHandler::new(pool.clone()).with_dolt(dolt.clone()),
         None => WorkspaceHandler::new(pool.clone()),
-    };
+    }
+    .with_skills(workspace_skills);
     // Convoy → scheduler bridge (hq-daemons-health-20260607.2): a convoy.launch runs in THIS
     // process, but the polecat sling lives in the orchd daemon and there is no cross-process
     // event bus — the dispatch channel is the IPC. Wire the ConvoyHandler to drop a
