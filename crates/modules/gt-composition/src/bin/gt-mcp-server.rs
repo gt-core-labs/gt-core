@@ -783,7 +783,11 @@ async fn main() -> anyhow::Result<()> {
         });
         gt_composition::relogin::relogin_router(
             gt_composition::relogin::ReloginState::new(v.clone(), audit.clone(), accounts_root)
-                .with_known_accounts(known_accounts),
+                .with_known_accounts(known_accounts)
+                // gtcore-6d4c5f: a successful relogin re-points the keychain at the dir it wrote
+                // when the registration diverged (split-brain: probe reading a dead dir while
+                // relogin refreshed another → eternal needs_relogin loop).
+                .with_event_log(event_log.clone()),
         )
     });
 
