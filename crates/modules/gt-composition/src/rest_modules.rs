@@ -226,6 +226,9 @@ pub async fn build_rest_modules(
     // workspace's `skills.*` log when empty (idempotent), so a clean deploy gives
     // each role a working least-privilege MCP grant out of the box.
     let skills = Arc::new(EventLogSkills::new(event_log.clone()));
+    // Kept for the REST tenant provisioner below (gtcore-03baf7): `skills` itself moves into the
+    // SkillsModule; this clone seeds new workspaces' role catalogs at REST create/backfill.
+    let skills_for_provision = skills.clone();
     // gtcore-63bb20: the operator bell for embedded-seed drift rides the `notifications` table, so it
     // needs the public PG pool. Borrow it before `pg` is consumed by the module-slice block below;
     // `None` (GT_PG_URL unset) ⇒ the drift scan still warns to the log, just with no bell.
@@ -309,10 +312,10 @@ pub async fn build_rest_modules(
             // provisioner (PG schema/RBAC + per-tenant Dolt).
             .module(WorkspaceModule::with_http(
                 WorkspaceApiState::new(Arc::new(PgWorkspaces::new(pool.clone()))).with_provisioner(
-                    Arc::new(CompositionTenantProvisioner::new(
-                        pool.clone(),
-                        issues_workspaces,
-                    )),
+                    Arc::new(
+                        CompositionTenantProvisioner::new(pool.clone(), issues_workspaces)
+                            .with_skills(skills_for_provision),
+                    ),
                 ),
             ))
             // rig-hold H1: the REST hold/resume routes emit `rig.held.v1` / `rig.resumed.v1` to the

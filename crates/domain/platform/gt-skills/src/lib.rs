@@ -48,6 +48,8 @@ pub use http::{skills_router, SkillWriter, SkillsApiState, WorkspaceSkills};
 pub use module::SkillsHttpModule;
 pub use module::SkillsModule;
 pub use presets::agent_least_privilege_catalog;
+#[cfg(feature = "axum")]
+pub use presets::seed_workspace_if_empty;
 pub use repo::{InMemorySkills, SkillsRepository};
 pub use state::{
     validate_role_name, validate_skill_id, ModelConfig, RoleBinding, Skill, SkillCatalog,
