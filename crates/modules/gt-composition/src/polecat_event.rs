@@ -50,6 +50,10 @@ pub enum PolecatEvent {
         reason: String,
         attempts: u32,
     },
+    /// The task custodian (gtcore-912043) re-opened a bead stuck `working` with no live agent
+    /// session past the grace window — a failed spawn or a dead agent had stranded it. `reason`
+    /// carries the evidence for the operator bell.
+    WorkingRecovered { bead: String, reason: String },
 }
 
 impl EventKind for PolecatEvent {
@@ -62,6 +66,7 @@ impl EventKind for PolecatEvent {
             PolecatEvent::CredentialDead { .. } => "polecat.credential-dead.v1",
             PolecatEvent::SlingAuthBlocked { .. } => "polecat.sling-auth-blocked.v1",
             PolecatEvent::CiRetriesExhausted { .. } => "polecat.ci-retries-exhausted.v1",
+            PolecatEvent::WorkingRecovered { .. } => "polecat.working-recovered.v1",
         }
     }
 }

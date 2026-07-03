@@ -273,6 +273,22 @@ pub fn draft_for(record: &EventRecord) -> Option<NotificationDraft> {
                 kind: "alert",
             })
         }
+        // The task custodian re-opened a bead stuck `working` with no live session (gtcore-912043):
+        // a failed spawn or dead agent had stranded it. A bell (`info`) — the recovery itself is the
+        // fix (auto beads re-enter the frontier); the operator just needs the trace of WHY the bead
+        // bounced back to open.
+        "polecat.working-recovered.v1" => {
+            let PolecatEvent::WorkingRecovered { bead, reason } =
+                record.decode::<PolecatEvent>().ok()?
+            else {
+                return None;
+            };
+            Some(NotificationDraft {
+                title: format!("{bead}: recuperado de working sin agente"),
+                body: reason,
+                kind: "info",
+            })
+        }
         _ => None,
     }
 }

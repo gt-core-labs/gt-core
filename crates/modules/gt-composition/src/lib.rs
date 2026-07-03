@@ -84,6 +84,7 @@ pub mod scope_bridge;
 pub mod session_reconcile;
 pub mod stream;
 pub mod system;
+pub mod task_custodian;
 pub mod terminal;
 pub mod usage_probe;
 pub mod webhook;
