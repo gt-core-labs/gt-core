@@ -54,7 +54,13 @@ use tokio::task::JoinHandle;
 use ulid::Ulid;
 
 use gt_auth::JwtClaims;
-use gt_quota::{assess_cred_health, CredHealthReport, REFRESH_SKEW_MS};
+use gt_events::Command;
+use gt_quota::{
+    assess_cred_health, AccountRegistry, CredHealthReport, QuotaState, RegisterAccount,
+    REFRESH_SKEW_MS,
+};
+
+use crate::mcp::eventlog::EventLog;
 
 use crate::auth::SharedAuthenticator;
 use crate::denial_audit::{record_denial, SharedAudit, ANONYMOUS};
@@ -125,6 +131,13 @@ pub struct ReloginState {
     /// The quota-tracked account ids (`quota.list`). `None` ⇒ cred-health reports only the on-disk
     /// dirs (the prior behavior, kept for tests / degraded boots without an event log).
     known_accounts: Option<KnownAccountsFn>,
+    /// The per-workspace quota event log (gtcore-6d4c5f): a successful relogin RE-REGISTERS the
+    /// keychain onto the dir it just wrote when the registered dir differs. Without this the
+    /// keychain can point at a dead dir while relogin refreshes another (split-brain): the probe
+    /// reads the dead dir forever ("missing accessToken"), never reaches its own token refresh,
+    /// and the operator is asked to relogin every ~8h although a valid refresh token exists.
+    /// `None` ⇒ legacy behaviour (no re-registration).
+    event_log: Option<Arc<EventLog>>,
 }
 
 impl ReloginState {
@@ -139,7 +152,15 @@ impl ReloginState {
             sessions: Arc::new(Mutex::new(HashMap::new())),
             accounts_root: accounts_root.into(),
             known_accounts: None,
+            event_log: None,
         }
+    }
+
+    /// Wire the quota event log so a successful relogin re-points the keychain at the dir it
+    /// wrote (gtcore-6d4c5f). The workspace is the caller's JWT claim, like the onboard flow.
+    pub fn with_event_log(mut self, log: Arc<EventLog>) -> Self {
+        self.event_log = Some(log);
+        self
     }
 
     /// Wire the quota-account roster so `GET /api/v1/quota/cred-health` enumerates every account
@@ -177,6 +198,11 @@ pub struct CompleteRequest {
 pub struct CompleteResponse {
     pub account: String,
     pub config_dir: String,
+    /// Whether the keychain registration was RE-POINTED at `config_dir` (gtcore-6d4c5f): `true`
+    /// means the quota registry mapped this account to a different (or no) dir — the split-brain
+    /// this relogin just healed.
+    #[serde(default)]
+    pub repointed: bool,
     pub deduped: Vec<String>,
 }
 
@@ -313,6 +339,42 @@ fn retire_dir(dir: &Path, disabled_root: &Path) -> Option<String> {
     std::fs::rename(dir, &target).ok().map(|_| base)
 }
 
+/// Re-point the quota keychain at `dir` when its registration for `account` differs
+/// (gtcore-6d4c5f). Reads the workspace quota registry; a matching registration is a no-op
+/// (`Ok(false)`), a missing/different one appends the same `quota.account_registered.v1` the
+/// onboard flow and the `quota.register` tool emit (`Ok(true)`). Pure event-log I/O, so the
+/// split-brain healing is unit-tested without driving `claude auth login`.
+pub(crate) fn reregister_if_split(
+    log: &EventLog,
+    ws: &str,
+    account: &str,
+    dir: &Path,
+) -> Result<bool, String> {
+    let state = log
+        .replay_domain(Some(ws), "quota.", QuotaState::default(), QuotaState::apply)
+        .map_err(|e| format!("quota replay: {e}"))?;
+    let dir_str = dir.display().to_string();
+    let prior = state.registered.get(account).cloned();
+    if prior.as_deref() == Some(dir_str.as_str()) {
+        return Ok(false);
+    }
+    let mut registry = AccountRegistry::from_state(&state);
+    let event = RegisterAccount {
+        account: account.to_string(),
+        config_dir: dir_str.clone(),
+        now_secs: now_ms() / 1000,
+    }
+    .execute(&mut registry)
+    .map_err(|e| format!("register: {e}"))?;
+    log.append(Some(ws), event)
+        .map_err(|e| format!("append: {e}"))?;
+    eprintln!(
+        "[relogin] keychain re-pointed for {account}: {} → {dir_str} (the registered dir was not the one relogin wrote)",
+        prior.as_deref().unwrap_or("(unregistered)")
+    );
+    Ok(true)
+}
+
 impl ReloginState {
     /// Begin a relogin: resolve the account's existing creds dir, spawn `claude auth login` into it,
     /// capture the URL, keep the process alive in the session map.
@@ -386,7 +448,7 @@ impl ReloginState {
 
     /// Finish a relogin: feed the OOB code to the live process, wait for exit, seed the dir
     /// onboarding-complete (so it is consumable as-is), and dedup the email's other dirs.
-    async fn complete(&self, req: CompleteRequest) -> Result<CompleteResponse, ReloginError> {
+    async fn complete(&self, ws: &str, req: CompleteRequest) -> Result<CompleteResponse, ReloginError> {
         let live = self
             .sessions
             .lock()
@@ -443,10 +505,27 @@ impl ReloginState {
             }
         }
 
+        // Keychain re-registration (gtcore-6d4c5f): when the quota registry maps this account to a
+        // DIFFERENT dir than the one relogin just wrote (split-brain — observed live: the keychain
+        // held a credential-less dir while every relogin refreshed another, so the probe errored
+        // "missing accessToken" forever and the FE re-asked for login every ~8h), emit the same
+        // quota.account_registered the onboard flow does, pointing at the relogged dir. Best-effort:
+        // a failed re-registration logs loudly but the relogin itself already succeeded.
+        let mut repointed = false;
+        if let Some(log) = &self.event_log {
+            match reregister_if_split(log, ws, &account, &dir) {
+                Ok(r) => repointed = r,
+                Err(e) => eprintln!(
+                    "[relogin] keychain re-registration for {account} failed: {e} — the probe may keep reading a stale dir"
+                ),
+            }
+        }
+
         Ok(CompleteResponse {
             account,
             config_dir: dir.display().to_string(),
             deduped,
+            repointed,
         })
     }
 
@@ -646,10 +725,13 @@ async fn complete_handler(
     headers: HeaderMap,
     Json(req): Json<CompleteRequest>,
 ) -> Response {
-    if let Err((status, msg)) = authorize(&st, &headers, WRITE_SCOPE) {
-        return (status, msg).into_response();
-    }
-    match st.complete(req).await {
+    // The claims' workspace scopes the quota.account_registered the re-registration emits —
+    // the same tenant derivation the onboard flow uses (gtcore-6d4c5f).
+    let ws = match authorize(&st, &headers, WRITE_SCOPE) {
+        Ok(claims) => claims.workspace,
+        Err((status, msg)) => return (status, msg).into_response(),
+    };
+    match st.complete(&ws, req).await {
         Ok(r) => (StatusCode::OK, Json(r)).into_response(),
         Err(e) => e.into_response(),
     }
@@ -908,5 +990,44 @@ mod tests {
             "a re-logged-in account with Valid on-disk creds must NOT need relogin despite the stale dead latch"
         );
         assert_eq!(by["relogged@x.com"].credential, gt_quota::CredentialHealth::Valid);
+    }
+
+    #[test]
+    fn reregister_heals_the_split_and_noops_when_aligned() {
+        // gtcore-6d4c5f: the keychain registered acct → dirA (dead), while relogin wrote dirB —
+        // the split that looped the operator through relogin every 8h. A relogin into dirB must
+        // re-point the registration; a relogin into the already-registered dir must not append.
+        let tmp = tempfile::tempdir().unwrap();
+        let log = EventLog::new(Some(tmp.path().to_path_buf()));
+        let dir_a = tmp.path().join("accounts").join("A");
+        let dir_b = tmp.path().join("accounts").join("B");
+
+        // Seed the original registration → dirA (the same event quota.register emits).
+        log.append(
+            Some("default"),
+            gt_quota::QuotaEvent::AccountRegistered {
+                account: "acct@x.com".into(),
+                config_dir: dir_a.display().to_string(),
+                now_secs: 1,
+            },
+        )
+        .unwrap();
+
+        // Relogin landed in dirB → split detected, registration re-pointed.
+        assert!(reregister_if_split(&log, "default", "acct@x.com", &dir_b).unwrap());
+        let state = log
+            .replay_domain(Some("default"), "quota.", QuotaState::default(), QuotaState::apply)
+            .unwrap();
+        assert_eq!(
+            state.registered.get("acct@x.com").map(String::as_str),
+            Some(dir_b.display().to_string().as_str()),
+            "keychain now points at the dir relogin wrote"
+        );
+
+        // Aligned relogin → no-op, no duplicate event.
+        assert!(!reregister_if_split(&log, "default", "acct@x.com", &dir_b).unwrap());
+
+        // A never-registered account gets registered outright (relogin doubles as repair).
+        assert!(reregister_if_split(&log, "default", "new@x.com", &dir_b).unwrap());
     }
 }
