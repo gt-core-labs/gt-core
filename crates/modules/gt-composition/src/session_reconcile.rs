@@ -168,6 +168,9 @@ pub struct SessionReconciler {
     scope: ReapScope,
     /// Where the reaped `agent.killed.v1` is published (see [`ReapSink`]).
     sink: ReapSink,
+    /// Extra workspaces also swept (gtcore-717e13): tenants whose adopted rigs' sessions this
+    /// daemon announces into their own logs. Reaps for them append directly to their logs.
+    extra_workspaces: Vec<String>,
 }
 
 impl SessionReconciler {
@@ -189,23 +192,42 @@ impl SessionReconciler {
             tmux,
             scope,
             sink,
+            extra_workspaces: Vec::new(),
         }
     }
 
-    /// Reconcile once: close every orphaned session of the owned class. Returns the number of
-    /// sessions reaped this sweep. Best-effort: a log-replay failure logs and yields 0 rather than
-    /// aborting the daemon.
+    /// Extra workspaces whose `agent.*` registries this reconciler also sweeps (gtcore-717e13):
+    /// the tenants whose adopted rigs' sessions this daemon announces. Their reaps land in their
+    /// own logs.
+    pub fn with_extra_workspaces(mut self, workspaces: Vec<String>) -> Self {
+        self.extra_workspaces = workspaces;
+        self
+    }
+
+    /// Reconcile once: close every orphaned session of the owned class, across the primary
+    /// workspace AND every extra workspace whose sessions this daemon announces (gtcore-717e13 —
+    /// adopted rigs' sessions live in their tenant's log). Returns the number of sessions reaped.
+    /// Best-effort: a log-replay failure logs and yields 0 for that workspace.
     pub async fn sweep(&self) -> usize {
+        let mut reaped = self.sweep_workspace(&self.workspace).await;
+        for ws in &self.extra_workspaces {
+            reaped += self.sweep_workspace(ws).await;
+        }
+        reaped
+    }
+
+    /// Sweep ONE workspace's `agent.*` registry; reaps go back to that same workspace's log.
+    async fn sweep_workspace(&self, workspace: &str) -> usize {
         let log = EventLog::new(Some(self.event_root.clone()));
         let registry = match log.replay_domain::<gt_agent::SessionRegistry, AgentEvent, _>(
-            Some(&self.workspace),
+            Some(workspace),
             "agent.",
             gt_agent::SessionRegistry::default(),
             gt_agent::SessionRegistry::apply,
         ) {
             Ok(reg) => reg,
             Err(e) => {
-                eprintln!("[session-reconcile] replay agent log failed: {e}");
+                eprintln!("[session-reconcile] replay agent log failed ({workspace}): {e}");
                 return 0;
             }
         };
@@ -253,9 +275,9 @@ impl SessionReconciler {
                 )
             };
             let event = AgentEvent::killed(session.id.clone(), reason);
-            if self.emit(event) {
+            if self.emit(workspace, event) {
                 eprintln!(
-                    "[session-reconcile] {} ({:?}) orphaned — emitted agent.killed",
+                    "[session-reconcile] {} ({:?}) orphaned in {workspace} — emitted agent.killed",
                     session.id, session.state
                 );
                 reaped += 1;
@@ -264,8 +286,20 @@ impl SessionReconciler {
         reaped
     }
 
-    /// Publish one `agent.killed.v1` via the configured sink. Returns whether it was accepted.
-    fn emit(&self, event: AgentEvent) -> bool {
+    /// Publish one `agent.killed.v1` via the configured sink. A kill for an EXTRA workspace's
+    /// session must land in THAT workspace's log (the hub sink only persists to the primary), so
+    /// it always appends directly (gtcore-717e13). Returns whether it was accepted.
+    fn emit(&self, workspace: &str, event: AgentEvent) -> bool {
+        if workspace != self.workspace {
+            let log = EventLog::new(Some(self.event_root.clone()));
+            return match log.append(Some(workspace), event) {
+                Ok(()) => true,
+                Err(e) => {
+                    eprintln!("[session-reconcile] append killed failed ({workspace}): {e}");
+                    false
+                }
+            };
+        }
         match &self.sink {
             ReapSink::Hub(hub) => match EventRecord::from_envelope(&Envelope::root(event)) {
                 Ok(record) => hub.send(record).is_ok(),

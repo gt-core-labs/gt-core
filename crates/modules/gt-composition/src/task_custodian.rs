@@ -106,6 +106,9 @@ pub struct TaskCustodian {
     events: Option<broadcast::Sender<EventRecord>>,
     /// First sweep instant each candidate bead was seen session-less — the grace clock.
     first_seen: Mutex<HashMap<String, Instant>>,
+    /// Extra workspaces whose `agent.*` registries also count as session truth (gtcore-717e13):
+    /// tenants whose adopted rigs' sessions this daemon announces into their own logs.
+    extra_workspaces: Vec<String>,
 }
 
 impl TaskCustodian {
@@ -125,7 +128,14 @@ impl TaskCustodian {
             grace,
             events,
             first_seen: Mutex::new(HashMap::new()),
+            extra_workspaces: Vec::new(),
         }
+    }
+
+    /// Extra workspaces whose registries also count as session truth (gtcore-717e13).
+    pub fn with_extra_workspaces(mut self, workspaces: Vec<String>) -> Self {
+        self.extra_workspaces = workspaces;
+        self
     }
 
     /// Advance `bead`'s grace clock to `now` and answer whether the window elapsed. First
@@ -166,21 +176,27 @@ impl TaskCustodian {
             }
         };
 
+        // Union the ACTIVE sessions across the boot workspace and every tenant whose adopted
+        // rigs' sessions this daemon announces (gtcore-717e13): a bead of an adopted rig has its
+        // polecat session in the TENANT's log — replaying only the boot workspace would misread
+        // it as abandoned and re-open actively-worked beads.
         let log = EventLog::new(Some(self.event_root.clone()));
-        let live_sessions: HashSet<String> = match log
-            .replay_domain::<gt_agent::SessionRegistry, AgentEvent, _>(
-                Some(&self.workspace),
+        let mut live_sessions: HashSet<String> = HashSet::new();
+        for ws in std::iter::once(&self.workspace).chain(self.extra_workspaces.iter()) {
+            match log.replay_domain::<gt_agent::SessionRegistry, AgentEvent, _>(
+                Some(ws),
                 "agent.",
                 gt_agent::SessionRegistry::default(),
                 gt_agent::SessionRegistry::apply,
             ) {
-            Ok(reg) => reg.active().into_iter().map(|s| s.id).collect(),
-            Err(e) => {
-                // Without session truth every bead would look abandoned — recover nothing.
-                eprintln!("[task-custodian] agent log replay failed: {e}");
-                return Vec::new();
+                Ok(reg) => live_sessions.extend(reg.active().into_iter().map(|s| s.id)),
+                Err(e) => {
+                    // Without session truth every bead would look abandoned — recover nothing.
+                    eprintln!("[task-custodian] agent log replay failed ({ws}): {e}");
+                    return Vec::new();
+                }
             }
-        };
+        }
 
         let merge_inflight: HashSet<String> = match &self.merge {
             Some(merge) => merge
