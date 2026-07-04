@@ -280,6 +280,19 @@ impl RigCatalog {
         self.prefix_index.get(prefix).map(String::as_str)
     }
 
+    /// Name of the rig already registered against `git_url`, if any. Linear scan — the
+    /// catalog is small (a handful of rigs per workspace) and this only runs on the
+    /// add/adopt validate path, not per-dispatch. Used to catch a rig mis-registered
+    /// against a repo another rig already owns (the authapp incident: a new rig
+    /// silently pointed at gt-core.git, the boot rig's own repo, instead of its
+    /// dedicated one — a polecat only surfaced it after landing in the wrong worktree).
+    pub fn git_url_owner(&self, git_url: &str) -> Option<&str> {
+        self.rigs
+            .values()
+            .find(|entry| entry.git_url == git_url)
+            .map(|entry| entry.name.as_str())
+    }
+
     pub fn rigs(&self) -> impl Iterator<Item = &RigEntry> {
         self.rigs.values()
     }
