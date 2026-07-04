@@ -202,7 +202,13 @@ pub async fn build_rest_modules(
         // (gtcore-8c3823), so both transports always agree on session state regardless of
         // whether the backend is file or Postgres.
         .module(AgentModule::with_http({
-            let agent_state = AgentApiState::new(Arc::new(EventLogAgentEvents::new(event_log.clone())));
+            let agent_state = AgentApiState::new(Arc::new(EventLogAgentEvents::new(event_log.clone())))
+                // gtcore-c848dd: `GET /:id/transcript` serves an ended session's stored
+                // conversation from the accounts volume — the history-only view the FE renders
+                // instead of spawning a fresh agent.
+                .with_transcripts(Arc::new(crate::transcripts::FsTranscripts::new(
+                    accounts_root.clone(),
+                )));
             match dispatch_channel {
                 Some(channel_dir) => agent_state.with_dispatch_channel(channel_dir),
                 None => agent_state,

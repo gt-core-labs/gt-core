@@ -86,6 +86,7 @@ pub mod stream;
 pub mod system;
 pub mod task_custodian;
 pub mod terminal;
+pub mod transcripts;
 pub mod usage_probe;
 pub mod webhook;
 pub mod witness_sweep;
