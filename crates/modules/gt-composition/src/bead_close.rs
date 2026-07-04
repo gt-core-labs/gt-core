@@ -29,14 +29,24 @@ use gt_plugin::Plugin;
 /// [`DoltIssues::close`](gt_store_dolt::DoltIssues); tests use a fake.
 #[async_trait]
 pub trait BeadCloser: Send + Sync {
-    /// Transition `bead` from `working`/`open` → `closed`. Returns `Ok(())` on
-    /// success or if the bead is already closed (idempotent on replay).
-    async fn close_bead(&self, bead: &str, attribution: &str) -> Result<(), String>;
+    /// Stamp `sha` as the bead's `delivered_sha` and transition it from `working`/`open` →
+    /// `closed`. Returns `Ok(())` on success or if the bead is already closed (idempotent on
+    /// replay). The sha stamp is NOT optional (gtcore-ac9782): `dep_satisfied` requires a
+    /// non-epic dependency to be DELIVERED (sha on main), so a merged-but-unstamped bead stalls
+    /// every dependent — observed live: the authapp wave froze after its first two merges left
+    /// `delivered_sha` NULL.
+    async fn close_bead(&self, bead: &str, sha: &str, attribution: &str) -> Result<(), String>;
 }
 
 #[async_trait]
 impl BeadCloser for gt_store_dolt::DoltIssues {
-    async fn close_bead(&self, bead: &str, attribution: &str) -> Result<(), String> {
+    async fn close_bead(&self, bead: &str, sha: &str, attribution: &str) -> Result<(), String> {
+        // Stamp FIRST: the merge event is the delivery proof, and the stamp must land even when
+        // the close below is a no-op because the agent (or an operator) already closed the bead.
+        if let Err(e) = self.set_delivered_sha(bead, sha).await {
+            // Best-effort: a missing bead falls through to close()'s own handling.
+            eprintln!("[bead-close] {bead}: delivered_sha stamp failed ({e}) — closing anyway");
+        }
         match self.close(bead, attribution).await {
             Ok(()) => Ok(()),
             // Already closed (invalid transition) or not found — both are fine
@@ -74,7 +84,7 @@ impl Plugin for BeadClosePlugin {
             return Ok(());
         };
         let attribution = format!("merge:{sha}");
-        match self.closer.close_bead(&bead, &attribution).await {
+        match self.closer.close_bead(&bead, &sha, &attribution).await {
             Ok(()) => {
                 eprintln!("[bead-close] {bead}: closed after merge (sha {sha})");
             }
@@ -98,23 +108,31 @@ mod tests {
 
     struct FakeCloser {
         called: AtomicBool,
+        /// The sha handed to `close_bead` (gtcore-ac9782): the plugin must forward the merge
+        /// sha so the store stamps `delivered_sha`, not just the attribution note.
+        sha: std::sync::Mutex<Option<String>>,
     }
 
     impl FakeCloser {
         fn new() -> Arc<Self> {
             Arc::new(Self {
                 called: AtomicBool::new(false),
+                sha: std::sync::Mutex::new(None),
             })
         }
         fn was_called(&self) -> bool {
             self.called.load(Ordering::SeqCst)
         }
+        fn stamped_sha(&self) -> Option<String> {
+            self.sha.lock().unwrap().clone()
+        }
     }
 
     #[async_trait]
     impl BeadCloser for FakeCloser {
-        async fn close_bead(&self, _bead: &str, _attribution: &str) -> Result<(), String> {
+        async fn close_bead(&self, _bead: &str, sha: &str, _attribution: &str) -> Result<(), String> {
             self.called.store(true, Ordering::SeqCst);
+            *self.sha.lock().unwrap() = Some(sha.to_string());
             Ok(())
         }
     }
@@ -133,6 +151,11 @@ mod tests {
         let plugin = BeadClosePlugin::new(closer.clone() as Arc<dyn BeadCloser>);
         plugin.on_event(&merged_record("gtcore-abc", "deadbeef")).await.unwrap();
         assert!(closer.was_called(), "close_bead should have been called");
+        assert_eq!(
+            closer.stamped_sha().as_deref(),
+            Some("deadbeef"),
+            "the merge sha rides into the store so delivered_sha is stamped (gtcore-ac9782)"
+        );
     }
 
     #[tokio::test]
