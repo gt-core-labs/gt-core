@@ -21,7 +21,10 @@ pub mod supervisor;
 pub use commands::{AddSession, AgentCommand, RemoveSession, TransitionSession};
 pub use events::{now_secs, AgentEvent};
 #[cfg(feature = "axum")]
-pub use http::{agent_router, AgentApiState, ApiDoc, FileAgentLog, WorkspaceAgentLog};
+pub use http::{
+    agent_router, AgentApiState, ApiDoc, FileAgentLog, Transcript, TranscriptSource,
+    TranscriptTurn, WorkspaceAgentLog,
+};
 pub use module::AgentModule;
 pub use repo::{InMemorySessions, SessionQueries, SessionWriter};
 pub use state::{

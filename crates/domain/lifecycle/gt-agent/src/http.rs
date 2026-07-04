@@ -126,6 +126,42 @@ pub struct AgentApiState {
     /// the event is still recorded but orchd is not notified (GT_CHANNEL_ROOT unset, tests, or
     /// the MCP server surface where the channel dir is not wired).
     dispatch_channel: Option<Arc<PathBuf>>,
+    /// Optional stored-conversation reader (gtcore-c848dd): serves `GET /:id/transcript` — the
+    /// history view for ENDED sessions, where there is no live process to attach. `None` ⇒ the
+    /// route answers 404 (deployment without an accounts volume, tests).
+    transcripts: Option<Arc<dyn TranscriptSource>>,
+}
+
+/// Where a session's stored conversation is read from (gtcore-c848dd). The composition root
+/// resolves the transcript on the accounts volume (the `claude` CLI writes one JSONL per
+/// conversation under `<account>/projects/<workdir-slug>/`); tests supply a stub.
+pub trait TranscriptSource: Send + Sync {
+    /// The parsed conversation for `session`, or `None` when no transcript exists for it.
+    fn transcript(&self, session: &str) -> Option<Transcript>;
+}
+
+/// A session's stored conversation, parsed for read-only rendering (gtcore-c848dd).
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct Transcript {
+    /// The session the turns belong to (echo of the path parameter).
+    pub session: String,
+    /// Conversation turns in stored order.
+    pub turns: Vec<TranscriptTurn>,
+}
+
+/// One conversation turn: who spoke, what text survived, and which tools were invoked.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct TranscriptTurn {
+    /// `user` | `assistant`.
+    pub role: String,
+    /// Concatenated text content of the turn (empty when the turn was tool-only).
+    pub text: String,
+    /// Tool names the assistant invoked in this turn (empty for user turns).
+    #[serde(default)]
+    pub tools: Vec<String>,
+    /// The record's timestamp when the transcript carried one (RFC3339), else empty.
+    #[serde(default)]
+    pub at: String,
 }
 
 impl std::fmt::Debug for AgentApiState {
@@ -138,7 +174,18 @@ impl AgentApiState {
     /// Build the REST state over a per-workspace agent log provider. The binary supplies an
     /// `EventLog`-backed implementation; the contract test supplies a [`FileAgentLog`].
     pub fn new(log: Arc<dyn WorkspaceAgentLog>) -> Self {
-        Self { log, dispatch_channel: None }
+        Self {
+            log,
+            dispatch_channel: None,
+            transcripts: None,
+        }
+    }
+
+    /// Wire the stored-conversation reader so `GET /:id/transcript` serves an ended session's
+    /// history (gtcore-c848dd).
+    pub fn with_transcripts(mut self, transcripts: Arc<dyn TranscriptSource>) -> Self {
+        self.transcripts = Some(transcripts);
+        self
     }
 
     /// Wire the orchd dispatch channel dir so a polecat spawn auto-drops a dispatch request
@@ -193,12 +240,36 @@ pub fn agent_router(state: AgentApiState) -> Router {
     Router::new()
         .route("/", get(list_sessions).post(spawn_session))
         .route("/:id", get(get_session))
+        .route("/:id/transcript", get(get_transcript))
         .route("/:id/heartbeat", post(heartbeat_session))
         .route("/:id/end", post(end_session))
         .route("/:id/kill", post(kill_session))
         .route("/:id/pause", post(pause_session))
         .route("/:id/resume", post(resume_session))
         .with_state(state)
+}
+
+/// `GET /:id/transcript` — an ended session's stored conversation (gtcore-c848dd): the read-only
+/// history view the FE renders instead of spawning a fresh agent. Tenant-scoped: the session must
+/// exist in the caller's workspace registry (the same check every per-session route applies), so
+/// one tenant can never read another's transcripts by guessing ids. `404` when the session is
+/// unknown here or no transcript was stored for it.
+async fn get_transcript(
+    State(st): State<AgentApiState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> Result<Json<Transcript>, ApiError> {
+    st.require_session(workspace_of(&headers).as_deref(), &id)?;
+    let source = st
+        .transcripts
+        .as_ref()
+        .ok_or_else(|| ApiError(AppError::NotFound("no transcript store wired".into())))?;
+    match source.transcript(&id) {
+        Some(t) => Ok(Json(t)),
+        None => Err(ApiError(AppError::NotFound(format!(
+            "no stored transcript for session {id}"
+        )))),
+    }
 }
 
 /// `agent.spawn` body: a session id + rig, with an optional role/crew (the `Spawned` event's own
