@@ -89,6 +89,13 @@ impl AddRig {
                 self.effective_prefix(), owner
             )));
         }
+        if let Some(owner) = state.git_url_owner(&self.git_url) {
+            return Err(AppError::Validation(format!(
+                "git_url {:?} already registered to rig {:?} — a new rig pointing at the \
+                 same repo is very likely a mis-provisioned duplicate (verify before adding)",
+                self.git_url, owner
+            )));
+        }
         Ok(())
     }
 
@@ -772,6 +779,27 @@ mod tests {
             bad_prefix.validate(&catalog),
             Err(AppError::Validation(_))
         ));
+    }
+
+    /// Regression for the authapp incident (gtcore-b4bd2b): a rig accidentally registered
+    /// with another rig's git_url landed a polecat in the wrong worktree, and it took
+    /// several sling cycles before a human noticed. `git_url` reuse across distinct rig
+    /// names is now rejected at `rig.add`/`rig.adopt`, not discovered later at runtime.
+    #[test]
+    fn add_rejects_git_url_reused_by_another_rig() {
+        let mut catalog = RigCatalog::default();
+        add_cmd("gtcore", "gtcore", 1).execute(&mut catalog).unwrap();
+
+        let mut dup_git_url = add_cmd("authapp", "authapp", 2);
+        dup_git_url.git_url = "git@github.com:o/gtcore.git".into();
+        assert!(matches!(
+            dup_git_url.validate(&catalog),
+            Err(AppError::Validation(_))
+        ));
+
+        // A distinct git_url for a distinct rig is unaffected.
+        let ok = add_cmd("authapp", "authapp", 3);
+        assert!(ok.validate(&catalog).is_ok());
     }
 
     #[test]
