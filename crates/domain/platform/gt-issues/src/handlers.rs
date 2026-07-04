@@ -274,14 +274,14 @@ pub async fn run_close_issue(
     }
 
     // When no inspector is wired (no repo configured) S2 is skipped entirely.
-    // Still stamp delivered_sha with the caller-supplied sha so code-surface
-    // beads never leave it NULL regardless of whether git verification ran.
-    // Metadata-only beads (non_planned empty) correctly keep delivered_sha NULL.
+    // Still stamp delivered_sha with EVERY caller-supplied sha (gtcore-ac9782): the old
+    // surface-gated stamp left a surfaceless-but-code-bearing bead (the common shape agents
+    // create ad hoc) closed with `delivered_sha` NULL, and `dep_satisfied` requires a non-epic
+    // dependency to be DELIVERED — its dependents never became ready. A caller volunteering a
+    // sha is asserting delivery; only a truly sha-less metadata close keeps NULL.
     if delivered.is_none() {
         if let Some(s) = sha {
-            if !non_planned.is_empty() {
-                delivered = Some(s.to_string());
-            }
+            delivered = Some(s.to_string());
         }
     }
 
