@@ -51,6 +51,10 @@ impl PgAuditSink {
 
 impl AuditSink for PgAuditSink {
     fn record(&self, record: AuditRecord) -> Result<(), AppError> {
+        eprintln!(
+            "[gt-mcp-server] audit ws={} actor={} tool={} outcome={:?}",
+            record.workspace_id, record.actor, record.tool, record.outcome
+        );
         self.tx
             .send(record)
             .map_err(|_| AppError::Sink("audit drain task is gone".into()))
