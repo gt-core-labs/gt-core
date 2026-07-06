@@ -334,6 +334,53 @@ impl GraphHandler {
         )?;
         Ok((commit, stats))
     }
+
+    /// The custodian's batch tick: refresh every rig `ws` has under custody with `stale == true`.
+    /// Shared by the `graph.refresh-stale` tool AND [`crate::graph_refresh_daemon`], the scheduled
+    /// loop that drives this automatically (hq-graphrig-autotick) — without it, a rig only ever
+    /// gets its FIRST index when someone remembers to call `graph.refresh`/`graph.refresh-stale`
+    /// by hand (a rig sat registered-but-never-indexed for days before this was noticed on
+    /// `authapp`).
+    ///
+    /// Best-effort per rig: one rig's provision/build failure is captured in its own result entry
+    /// instead of aborting the batch (the previous single-`?`-chain meant one broken checkout in
+    /// the middle of a workspace's stale set silently starved every rig after it).
+    pub async fn refresh_stale(&self, ws: Option<&str>) -> Result<Vec<Value>, AppError> {
+        let state = self.warden(ws)?;
+        let stale: Vec<String> = state
+            .rigs
+            .values()
+            .filter(|g| g.stale)
+            .map(|g| g.rig.clone())
+            .collect();
+        let mut refreshed = Vec::with_capacity(stale.len());
+        for rig in stale {
+            let repo = Self::derived_path(ws, &rig);
+            let outcome = self.refresh_stale_one(ws, &rig, &repo).await;
+            refreshed.push(match outcome {
+                Ok((commit, stats)) => json!({
+                    "rig": rig, "ok": true, "commit": commit, "nodes": stats.nodes,
+                }),
+                Err(e) => json!({ "rig": rig, "ok": false, "error": e.to_string() }),
+            });
+        }
+        Ok(refreshed)
+    }
+
+    /// One rig's provision-then-build step of [`Self::refresh_stale`], split out so its `?`-chain
+    /// stays scoped to a single rig's outcome rather than the whole batch.
+    async fn refresh_stale_one(
+        &self,
+        ws: Option<&str>,
+        rig: &str,
+        repo: &Path,
+    ) -> Result<(String, IndexStats), AppError> {
+        if let Some(provisioner) = &self.provisioner {
+            provisioner.provision(ws, rig, repo).await?;
+        }
+        self.ensure_custody(ws, rig, repo)?;
+        self.refresh_one(ws, rig, repo).await
+    }
 }
 
 /// Map the warden custody's `(stale, ever_indexed)` onto the freshness state the FE chip renders.
@@ -603,31 +650,10 @@ impl DomainHandler for GraphHandler {
                     "communities": stats.communities,
                 }))
             }
-            "graph.refresh-stale" => {
-                // The custodian's batch tick: refresh every rig currently marked stale. A
-                // loop/cron invokes this; `graph.agent.backend` is who runs the loop. Each stale
-                // rig is re-provisioned from its connection at the server-derived path (the stored
-                // repo_dir is authoritative — it already equals the derived path after a prior
-                // refresh).
-                let state = self.warden(ws)?;
-                let stale: Vec<String> = state
-                    .rigs
-                    .values()
-                    .filter(|g| g.stale)
-                    .map(|g| g.rig.clone())
-                    .collect();
-                let mut refreshed = Vec::new();
-                for rig in stale {
-                    let repo = Self::derived_path(ws, &rig);
-                    if let Some(provisioner) = &self.provisioner {
-                        provisioner.provision(ws, &rig, &repo).await?;
-                    }
-                    self.ensure_custody(ws, &rig, &repo)?;
-                    let (commit, stats) = self.refresh_one(ws, &rig, &repo).await?;
-                    refreshed.push(json!({ "rig": rig, "commit": commit, "nodes": stats.nodes }));
-                }
-                Ok(json!({ "ok": true, "refreshed": refreshed }))
-            }
+            "graph.refresh-stale" => Ok(json!({
+                "ok": true,
+                "refreshed": self.refresh_stale(ws).await?,
+            })),
             "graph.list" => {
                 let state = self.warden(ws)?;
                 let rigs: Vec<Value> = state

@@ -55,6 +55,7 @@ pub mod email_outbox_drain;
 pub mod escalation_notify;
 pub mod gh_auth;
 pub mod git_merge;
+pub mod graph_refresh_daemon;
 pub mod hooks;
 pub mod inbound_email;
 pub mod kanban_rest;

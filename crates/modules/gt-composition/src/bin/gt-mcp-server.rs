@@ -414,7 +414,7 @@ async fn main() -> anyhow::Result<()> {
     // (workspace.*, rig.*, …) route to PG-backed handlers. Wired only when
     // GT_PG_URL is set; unset ⇒ an empty router, so the server serves issues +
     // meta exactly as before.
-    let (domains, rig_prefixes, ws_status, documents, report_service) =
+    let (domains, rig_prefixes, ws_status, documents, report_service, graph_handler) =
         build_domain_router(event_log.clone())
             .await?;
     // Report-digest scheduler (hq-84f93b): fixed-time daily send to the ENABLED
@@ -1185,6 +1185,46 @@ async fn main() -> anyhow::Result<()> {
                 eprintln!("[gt-mcp-server] graph drift-reconcile off (GT_GRAPH_DRIFT_TICK_SECS=0)");
             } else {
                 eprintln!("[gt-mcp-server] graph drift-reconcile off (GT_PG_URL unset)");
+            }
+        }
+    }
+
+    // Graph refresh daemon (hq-graphrig-autotick): actually REBUILDS a rig once it is marked
+    // stale — the step drift-reconcile deliberately leaves undone ("NEVER clones or indexes, only
+    // flips the freshness flag"). Without this, a newly-registered rig (or one whose main moved)
+    // sits un-indexed indefinitely with no error and no visible symptom until someone happens to
+    // call `graph.refresh` / `graph.refresh-stale` by hand — exactly what happened to `authapp`
+    // in the `templates` workspace (registered 2026-07-03, still un-indexed 2026-07-06, found only
+    // because an operator asked why the graph wasn't building). Drives the SAME
+    // `GraphHandler::refresh_stale` the MCP tool calls, so there is one refresh code path whether
+    // it fires on a timer or on demand. Opt-in: only when GT_GRAPH_REFRESH_TICK_SECS > 0 (default
+    // 900 = 15min — tighter than the hourly drift backstop, since this is the step that removes
+    // the user-visible staleness, not just detects it) AND a `GraphHandler` was built (implies
+    // GT_PG_URL was set — same precondition `build_domain_router` already gates graph.* on).
+    let refresh_tick = env_u64("GT_GRAPH_REFRESH_TICK_SECS", 900);
+    match (run_daemons && refresh_tick > 0)
+        .then_some(())
+        .and(graph_handler.clone())
+    {
+        Some(handler) => {
+            eprintln!(
+                "[gt-mcp-server] graph refresh daemon on (every {refresh_tick}s; rebuilds every rig the warden marked stale)"
+            );
+            tokio::spawn(gt_composition::graph_refresh_daemon::run(
+                std::time::Duration::from_secs(refresh_tick),
+                event_log.clone(),
+                handler,
+            ));
+        }
+        None => {
+            if !run_daemons {
+                eprintln!("[gt-mcp-server] graph refresh daemon off (API tier, GT_RUN_DAEMONS=0)");
+            } else if refresh_tick == 0 {
+                eprintln!("[gt-mcp-server] graph refresh daemon off (GT_GRAPH_REFRESH_TICK_SECS=0)");
+            } else {
+                eprintln!(
+                    "[gt-mcp-server] graph refresh daemon off (no GraphHandler — GT_PG_URL unset)"
+                );
             }
         }
     }
@@ -2185,10 +2225,11 @@ async fn build_domain_router(
     Option<Arc<dyn WorkspaceStatusGate>>,
     Option<Arc<dyn DocumentsResource>>,
     Option<Arc<gt_composition::report_scheduler::ReportService>>,
+    Option<Arc<GraphHandler>>,
 )> {
     let Ok(pg_url) = std::env::var("GT_PG_URL") else {
         eprintln!("[gt-mcp-server] GT_PG_URL unset; domain dispatch disabled (issues + meta only)");
-        return Ok((DomainRouter::new(), None, None, None, None));
+        return Ok((DomainRouter::new(), None, None, None, None, None));
     };
     // The workspace catalog lives in the shared `public` schema, so it uses a
     // plain pool; the per-workspace domains (rig, …) resolve their `ws_<slug>`
@@ -2363,6 +2404,10 @@ async fn build_domain_router(
             .map(gt_vcs::GithubAppClient::new);
         gt_composition::mcp::RigProvisioner::new(ws_pools.clone(), connections, github)
     };
+    let graph_handler = Arc::new(
+        GraphHandler::new(event_log.clone(), Arc::new(GraphifyIndexer::new()))
+            .with_provisioner(graph_provisioner),
+    );
     let router = DomainRouter::new()
         .register(Arc::new(workspace_handler))
         // rig-hold H1: the rig handler emits `rig.held.v1` / `rig.resumed.v1` to the shared event
@@ -2420,10 +2465,9 @@ async fn build_domain_router(
         // graph.* read-only queries (hq-graphrig.10) + server-side refresh (hq-vcs-connections.4):
         // graphify-backed indexer; the warden state (replayed from event_log) resolves rig ->
         // repo_dir, and the provisioner clones/fetches from the rig's VCS connection on refresh.
-        .register(Arc::new(
-            GraphHandler::new(event_log.clone(), Arc::new(GraphifyIndexer::new()))
-                .with_provisioner(graph_provisioner),
-        ));
+        // Kept as its own `Arc` (not just registered) so `main` can also hand it to the
+        // `graph_refresh_daemon` tick (hq-graphrig-autotick) — the same handler, one extra reader.
+        .register(graph_handler.clone());
 
     // documents.* dispatch (hq-docs-api.2, docs/11): .md content + binary attachments a model
     // reads as context. The blob store is wired from GT_BLOB_* when set; unset ⇒ md-only
@@ -2737,7 +2781,14 @@ async fn build_domain_router(
     // The same per-workspace pool cache backs the document resource reads (hq-docs-api.3):
     // gt://doc/{id} + the documents inline on gt://issue/{id}.
     let documents: Arc<dyn DocumentsResource> = Arc::new(PgDocumentsResource::new(ws_pools));
-    Ok((router, Some(rig_prefixes), Some(ws_status), Some(documents), report_service))
+    Ok((
+        router,
+        Some(rig_prefixes),
+        Some(ws_status),
+        Some(documents),
+        report_service,
+        Some(graph_handler),
+    ))
 }
 
 /// Resolve the RBAC config from the environment (scope-profiles feature). Precedence:
