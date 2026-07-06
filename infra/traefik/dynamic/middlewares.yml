@@ -1,0 +1,52 @@
+# Middlewares dinámicos — cargados por el file provider.
+#
+# Se agrupan en dos chains reutilizables:
+#   web-chain → SPA: headers de seguridad + compresión
+#   api-chain → API: strip /api + headers + compresión + rate limit
+http:
+  middlewares:
+    # ── Headers de seguridad (aplican a web y api) ──────────────────────
+    security-headers:
+      headers:
+        stsSeconds: 31536000
+        stsIncludeSubdomains: true
+        stsPreload: true
+        forceSTSHeader: true
+        contentTypeNosniff: true
+        browserXssFilter: true
+        frameDeny: true
+        referrerPolicy: "strict-origin-when-cross-origin"
+        customResponseHeaders:
+          X-Powered-By: ""
+          Server: ""
+
+    # ── Compresión de respuestas ────────────────────────────────────────
+    compression:
+      compress: {}
+
+    # ── Rate limit de la API: 50 req/s sostenido, ráfaga de 100 ─────────
+    api-ratelimit:
+      rateLimit:
+        average: 50
+        burst: 100
+
+    # ── Quita el prefijo /api antes de pasar al backend ─────────────────
+    api-strip:
+      stripPrefix:
+        prefixes:
+          - "/api"
+
+    # ── Chains ──────────────────────────────────────────────────────────
+    web-chain:
+      chain:
+        middlewares:
+          - security-headers
+          - compression
+
+    api-chain:
+      chain:
+        middlewares:
+          - api-strip
+          - security-headers
+          - compression
+          - api-ratelimit
