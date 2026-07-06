@@ -1,0 +1,71 @@
+# Traefik static configuration — único punto de entrada del stack.
+#
+# Entrypoints:
+#   web        :80  → redirección permanente a HTTPS (y sirve el challenge ACME HTTP-01)
+#   websecure  :443 → tráfico TLS, certificados vía resolver `letsencrypt`
+#   traefik    :8080 interno → healthcheck (ping), NO expuesto al exterior
+#
+# Providers: docker (routers por labels de los servicios) + file (middlewares y TLS).
+
+global:
+  checkNewVersion: false
+  sendAnonymousUsage: false
+
+log:
+  level: INFO
+
+accessLog: {}
+
+# Healthcheck interno — el compose lo consulta con `traefik healthcheck --ping`.
+ping:
+  entryPoint: traefik
+
+entryPoints:
+  web:
+    address: ":80"
+    # Todo lo que entra por :80 se redirige a :443 de forma permanente.
+    http:
+      redirections:
+        entryPoint:
+          to: websecure
+          scheme: https
+          permanent: true
+
+  websecure:
+    address: ":443"
+    http:
+      tls:
+        certResolver: letsencrypt
+
+  traefik:
+    address: ":8080"
+
+providers:
+  # Routers declarados como labels en docker-compose.yml.
+  docker:
+    endpoint: "unix:///var/run/docker.sock"
+    exposedByDefault: false
+    network: web
+
+  # Configuración dinámica (middlewares, TLS options) desde ./dynamic/.
+  file:
+    directory: /etc/traefik/dynamic
+    watch: true
+
+# Certificados Let's Encrypt con renovación automática.
+# Estrategia por defecto: HTTP-01 sobre el entrypoint `web`.
+# El almacén acme.json vive en un volumen para persistir/renovar sin re-emitir.
+certificatesResolvers:
+  letsencrypt:
+    acme:
+      email: "${ACME_EMAIL:?ACME_EMAIL requerido para Let's Encrypt}"
+      storage: /letsencrypt/acme.json
+      httpChallenge:
+        entryPoint: web
+      # ── Alternativa DNS-01 (wildcards / sin exponer :80) ──────────────
+      # Descomentar y proveer las credenciales del proveedor DNS por env.
+      # dnsChallenge:
+      #   provider: cloudflare
+      #   resolvers:
+      #     - "1.1.1.1:53"
+      #     - "8.8.8.8:53"
