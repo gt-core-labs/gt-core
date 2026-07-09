@@ -124,6 +124,9 @@ mod cli_code;
 #[cfg(feature = "oauth")]
 mod oauth_client;
 
+#[cfg(feature = "oauth")]
+mod oauth_as;
+
 pub use error::AuthError;
 pub use provider::{Credentials, IdentityProvider, ProviderKind, VerifiedIdentity};
 pub use refresh::{
@@ -214,6 +217,11 @@ pub mod migrations {
     /// THROUGH gt.  Inverse of `oauth_providers` (upstream IdPs).
     pub const CREATE_OAUTH_CLIENTS: &str =
         include_str!("../migrations/auth/0013__create_oauth_clients.sql");
+    /// `0014` — the OAuth Authorization Server authorization codes (hq-oauth-as.2):
+    /// short-lived, one-shot codes issued by `/oauth/authorize` and consumed by
+    /// `/oauth/token` to mint access + refresh tokens for downstream OAuth clients.
+    pub const CREATE_OAUTH_AS_CODES: &str =
+        include_str!("../migrations/auth/0014__create_oauth_as_codes.sql");
 }
 
 #[cfg(feature = "jsonwebtoken")]
@@ -317,6 +325,14 @@ pub use oauth_client::{
 
 #[cfg(all(feature = "oauth", feature = "pg"))]
 pub use oauth_client::PgOAuthClientRepo;
+
+/// The OAuth Authorization Server code store (hq-oauth-as.2): the ephemeral, one-shot
+/// authorization codes issued by `/oauth/authorize` and consumed by `/oauth/token`.
+#[cfg(feature = "oauth")]
+pub use oauth_as::{AsCodeStore, NewAsCode, PendingAsCode, CODE_TTL_SECS, generate_code};
+
+#[cfg(all(feature = "oauth", feature = "pg"))]
+pub use oauth_as::PgAsCodeStore;
 
 #[cfg(all(feature = "oauth", feature = "pg"))]
 pub use cli_code::PgCliCodeRepo;
