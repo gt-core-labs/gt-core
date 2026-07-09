@@ -2589,6 +2589,9 @@ impl IntoResponse for AuthError {
             | AuthError::UnknownKey(_)
             | AuthError::MissingWorkspace => StatusCode::UNAUTHORIZED,
             AuthError::UnsupportedProvider(_) => StatusCode::BAD_REQUEST,
+            // A malformed OAuth client registration (blank id/secret, no/wildcard/relative
+            // redirect_uri) is a caller error — a clear `400`, never a server fault.
+            AuthError::InvalidClient(_) => StatusCode::BAD_REQUEST,
             // An unknown/disabled `provider_id` is a client error (wrong/retired login button),
             // not a server fault: a clear `404`, distinct from the `501` "oauth not wired at all".
             AuthError::UnknownProvider(_) => StatusCode::NOT_FOUND,

@@ -68,6 +68,14 @@ pub enum AuthError {
     /// Only raised by the `jsonwebtoken` minter adapter.
     #[error("token signing failure: {0}")]
     SigningFailure(String),
+    /// An OAuth client registration was rejected on its own merits — a blank `client_id`, a
+    /// missing secret, no redirect URI, or a redirect URI that is relative, carries a fragment, or
+    /// contains a `*` wildcard (redirect URIs are matched EXACTLY, so a wildcard could never match
+    /// and would only invite an open-redirect mistake). A caller error, distinct from a
+    /// [`Backend`](Self::Backend) store fault. Carries a human-readable reason. Raised by the OAuth
+    /// client registry (`oauth_client.rs`, gtcore-95f950).
+    #[error("invalid oauth client registration: {0}")]
+    InvalidClient(String),
     /// A backing store / infrastructure fault while authenticating — e.g. the Postgres
     /// connection dropped or a query failed. Deliberately distinct from
     /// [`InvalidCredentials`](Self::InvalidCredentials): a DB outage is **not** a rejected

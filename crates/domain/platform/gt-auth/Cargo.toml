@@ -82,6 +82,11 @@ hex = { workspace = true, optional = true }
 # `oauth` provider store (the same gating as `aes-gcm`/`reqwest` above); the seed is a non-secret
 # extract the composition root replays into an empty `oauth_providers` table.
 serde_json = { workspace = true, optional = true }
+# Async runtime for the `gt-oauth-client` admin CLI (`bin/gt-oauth-client.rs`, gtcore-95f950): the
+# registry CRUD is async (sqlx), so the bin needs a runtime + the `#[tokio::main]` macro. Off-by-
+# default and pulled ONLY by the `cli` feature (`required-features` on the bin), so the library and
+# every other binary in the workspace stay runtime-free — `cargo build -p gt-auth` links no tokio.
+tokio = { workspace = true, optional = true, features = ["rt-multi-thread", "macros"] }
 
 [features]
 # Production email+password provider — argon2 hash + verify.
@@ -112,6 +117,20 @@ secret-crypto = ["dep:aes-gcm", "dep:base64", "dep:hex"]
 # secret at rest, with `base64`/`hex` decoding the `GT_SECRET_KEY` master key. The Postgres adapter
 # (`PgProviderRepo`) additionally needs `pg`, which a deploy opts into separately.
 oauth = ["dep:reqwest", "dep:serde_json", "secret-crypto", "dep:sha2", "axum"]
+# The `gt-oauth-client` admin CLI (`bin/gt-oauth-client.rs`, gtcore-95f950): register / list /
+# revoke the OAuth clients (e.g. Claude.ai) that authenticate against gt-core's own authorization
+# endpoints. Needs the Postgres client registry (`pg` for `PgOauthClientRepo`), the registry types
+# + secret crypto (`oauth`), and an async runtime (`tokio`). The bin declares it as a
+# `required-features`, so a default `cargo build` never pulls the runtime.
+cli = ["pg", "oauth", "dep:tokio"]
+
+# The OAuth client-registration admin CLI (gtcore-95f950). Built only when `--features cli` is on
+# (it needs Postgres + a runtime), so the default library build and `--all-targets` without the
+# feature skip it and stay runtime-free.
+[[bin]]
+name = "gt-oauth-client"
+path = "src/bin/gt-oauth-client.rs"
+required-features = ["cli"]
 
 [dev-dependencies]
 serde_json = { workspace = true }
