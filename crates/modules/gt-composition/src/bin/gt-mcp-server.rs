@@ -1539,6 +1539,9 @@ async fn main() -> anyhow::Result<()> {
                 // downstream apps (e.g. Claude.ai remote MCP connector) that authenticate users
                 // THROUGH gt.  CREATE TABLE IF NOT EXISTS, idempotent.
                 gt_auth::migrations::CREATE_OAUTH_CLIENTS,
+                // hq-oauth-as.2: the ephemeral authorization-code store — one-shot codes
+                // issued by /oauth/authorize and consumed by /oauth/token.
+                gt_auth::migrations::CREATE_OAUTH_AS_CODES,
             ] {
                 sqlx::raw_sql(sql)
                     .execute(&pool)
@@ -1670,6 +1673,10 @@ async fn main() -> anyhow::Result<()> {
                 #[cfg(feature = "oauth")]
                 oauth_clients: Some(Arc::new(gt_auth::PgOAuthClientRepo::new(pool.clone()))
                     as Arc<dyn gt_auth::OAuthClientRepo>),
+                // hq-oauth-as.2: the authorization-code store — ephemeral one-shot codes.
+                #[cfg(feature = "oauth")]
+                as_code_store: Some(Arc::new(gt_auth::PgAsCodeStore::new(pool.clone()))
+                    as Arc<dyn gt_auth::AsCodeStore>),
             };
             let auth_app = auth_router(login_state).layer(axum::middleware::from_fn_with_state(
                 AuthState::new(verifier, audit.clone())

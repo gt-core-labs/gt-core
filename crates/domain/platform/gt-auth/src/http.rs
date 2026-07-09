@@ -683,6 +683,11 @@ pub struct AuthState {
     /// `/auth/clients` CRUD surface. `None` ⇒ those endpoints respond `501`.
     #[cfg(feature = "oauth")]
     pub oauth_clients: Option<Arc<dyn crate::oauth_client::OAuthClientRepo>>,
+    /// The OAuth Authorization Server code store (hq-oauth-as.2): short-lived, one-shot
+    /// authorization codes issued by `/oauth/authorize` and consumed by `/oauth/token`.
+    /// `None` ⇒ those endpoints respond `501`.
+    #[cfg(feature = "oauth")]
+    pub as_code_store: Option<Arc<dyn crate::oauth_as::AsCodeStore>>,
 }
 
 /// Build the auth router. Mount it under the API base at the composition root.
@@ -758,7 +763,11 @@ pub fn auth_router(state: AuthState) -> Router {
             get(get_oauth_client)
                 .patch(patch_oauth_client)
                 .delete(delete_oauth_client),
-        );
+        )
+        // OAuth Authorization Server endpoints (hq-oauth-as.2/3): gt acts as the AS for
+        // downstream OAuth clients (e.g. Claude.ai remote MCP connector).
+        .route("/oauth/authorize", get(oauth_as_authorize))
+        .route("/oauth/token", post(oauth_as_token));
     router.with_state(state)
 }
 
@@ -2185,6 +2194,357 @@ async fn delete_oauth_client(
     }
 }
 
+// ---------------------------------------------------------------------------
+// OAuth Authorization Server endpoints (hq-oauth-as.2/3)
+// ---------------------------------------------------------------------------
+
+/// Query params for `GET /oauth/authorize` (RFC 6749 §4.1.1).
+#[cfg(feature = "oauth")]
+#[derive(Debug, Deserialize)]
+struct OAuthAuthorizeParams {
+    response_type: String,
+    client_id: String,
+    redirect_uri: String,
+    #[serde(default)]
+    state: Option<String>,
+    code_challenge: String,
+    #[serde(default)]
+    code_challenge_method: Option<String>,
+    /// Requested scopes (space-separated). Currently unused — scope negotiation uses the
+    /// client's `allowed_scopes` ceiling intersected with the user's claims.
+    #[serde(default)]
+    #[allow(dead_code)]
+    scope: Option<String>,
+}
+
+/// `GET /oauth/authorize` — OAuth 2.0 Authorization Endpoint (hq-oauth-as.2).
+///
+/// The authenticated user (bearer/cookie) authorises a downstream OAuth client (e.g. Claude.ai
+/// remote MCP connector). On success, 302-redirects to `redirect_uri?code=X&state=Y`.
+///
+/// Auto-consent: the first iteration skips a consent screen — the user's presence + valid
+/// credentials imply consent. A consent UI can gate this later.
+#[cfg(feature = "oauth")]
+async fn oauth_as_authorize(
+    State(state): State<AuthState>,
+    claims: Option<Extension<JwtClaims>>,
+    axum::extract::Query(params): axum::extract::Query<OAuthAuthorizeParams>,
+) -> Result<Response, ApiError> {
+    // 1. Require authenticated user.
+    let Extension(claims) = claims.ok_or(ApiError::Unauthenticated)?;
+
+    // 2. Validate response_type.
+    if params.response_type != "code" {
+        return Err(ApiError::BadOAuthRequest(
+            "unsupported response_type, expected \"code\"".into(),
+        ));
+    }
+
+    // 3. Validate code_challenge_method (only S256).
+    if let Some(ref m) = params.code_challenge_method {
+        if m != "S256" {
+            return Err(ApiError::BadOAuthRequest(
+                "unsupported code_challenge_method, expected \"S256\"".into(),
+            ));
+        }
+    }
+
+    // 4. Look up the client and verify it is enabled + redirect_uri is registered.
+    let client_store = state.oauth_clients.as_ref().ok_or(ApiError::NotConfigured)?;
+    let client = client_store
+        .get(&params.client_id)
+        .await?
+        .ok_or_else(|| ApiError::BadOAuthRequest("unknown client_id".into()))?;
+    if !client.enabled {
+        return Err(ApiError::BadOAuthRequest("client is disabled".into()));
+    }
+    if !client.redirect_uri_allowed(&params.redirect_uri) {
+        return Err(ApiError::BadOAuthRequest(
+            "redirect_uri is not registered for this client".into(),
+        ));
+    }
+
+    // 5. Compute granted scopes: intersection of user's scopes and client's allowed ceiling.
+    let client_scopes = client.scope_list();
+    let granted: Vec<String> = if client_scopes.is_empty() {
+        // No ceiling — grant all the user's scopes.
+        claims.scopes.clone()
+    } else {
+        claims
+            .scopes
+            .iter()
+            .filter(|s| client_scopes.contains(&s.as_str()))
+            .cloned()
+            .collect()
+    };
+
+    // 6. Generate and persist the authorization code.
+    let code_store = state.as_code_store.as_ref().ok_or(ApiError::NotConfigured)?;
+    let code = crate::oauth_as::generate_code()?;
+    let now = (state.now)();
+    code_store
+        .insert(crate::oauth_as::NewAsCode {
+            code: code.clone(),
+            client_id: params.client_id,
+            user_sub: claims.sub,
+            user_workspace: claims.workspace,
+            user_scopes: granted.join(","),
+            redirect_uri: params.redirect_uri.clone(),
+            code_challenge: params.code_challenge,
+            created_at: now,
+            expires_at: now + crate::oauth_as::CODE_TTL_SECS,
+        })
+        .await?;
+
+    // 7. 302 redirect to the client's redirect_uri with code + state.
+    let mut location = format!("{}?code={}", params.redirect_uri, code);
+    if let Some(ref st) = params.state {
+        location.push_str("&state=");
+        // Percent-encode the state value for safe URL embedding (RFC 3986 query component).
+        for b in st.bytes() {
+            match b {
+                b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
+                    location.push(b as char);
+                }
+                _ => {
+                    location.push_str(&format!("%{b:02X}"));
+                }
+            }
+        }
+    }
+    Ok((
+        StatusCode::FOUND,
+        [(header::LOCATION, HeaderValue::from_str(&location).map_err(
+            |e| ApiError::BadOAuthRequest(format!("invalid redirect_uri: {e}")),
+        )?)],
+    )
+        .into_response())
+}
+
+/// Form body for `POST /oauth/token` (RFC 6749 §4.1.3 / §6).
+#[cfg(feature = "oauth")]
+#[derive(Debug, Deserialize)]
+struct OAuthTokenRequest {
+    grant_type: String,
+    /// authorization_code grant
+    #[serde(default)]
+    code: Option<String>,
+    #[serde(default)]
+    redirect_uri: Option<String>,
+    #[serde(default)]
+    code_verifier: Option<String>,
+    /// Both grants require client authentication.
+    #[serde(default)]
+    client_id: Option<String>,
+    #[serde(default)]
+    client_secret: Option<String>,
+    /// refresh_token grant
+    #[serde(default)]
+    refresh_token: Option<String>,
+}
+
+/// RFC 6749 §5.1 token response (like [`TokenResponse`] but with an optional `scope` field).
+#[cfg(feature = "oauth")]
+#[derive(Debug, Serialize)]
+struct OAuthTokenResponse {
+    access_token: String,
+    refresh_token: String,
+    token_type: &'static str,
+    expires_in: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    scope: Option<String>,
+}
+
+/// `POST /oauth/token` — OAuth 2.0 Token Endpoint (hq-oauth-as.3).
+///
+/// Supports `grant_type=authorization_code` (redeem a code from `/oauth/authorize`) and
+/// `grant_type=refresh_token` (rotate a refresh token for a new access+refresh pair).
+/// Client authentication is via `client_id` + `client_secret` in the form body.
+#[cfg(feature = "oauth")]
+async fn oauth_as_token(
+    State(state): State<AuthState>,
+    axum::extract::Form(body): axum::extract::Form<OAuthTokenRequest>,
+) -> Result<Json<OAuthTokenResponse>, ApiError> {
+    match body.grant_type.as_str() {
+        "authorization_code" => oauth_token_authz_code(&state, body).await,
+        "refresh_token" => oauth_token_refresh(&state, body).await,
+        _ => Err(ApiError::BadOAuthRequest(
+            "unsupported grant_type".into(),
+        )),
+    }
+}
+
+/// Handle `grant_type=authorization_code`: consume the one-shot code, verify PKCE + client
+/// credentials, and mint an access + refresh token pair.
+#[cfg(feature = "oauth")]
+async fn oauth_token_authz_code(
+    state: &AuthState,
+    body: OAuthTokenRequest,
+) -> Result<Json<OAuthTokenResponse>, ApiError> {
+    let code_val = body
+        .code
+        .as_deref()
+        .filter(|c| !c.is_empty())
+        .ok_or_else(|| ApiError::BadOAuthRequest("missing code".into()))?;
+    let redirect_uri = body
+        .redirect_uri
+        .as_deref()
+        .filter(|r| !r.is_empty())
+        .ok_or_else(|| ApiError::BadOAuthRequest("missing redirect_uri".into()))?;
+    let code_verifier = body
+        .code_verifier
+        .as_deref()
+        .filter(|v| !v.is_empty())
+        .ok_or_else(|| ApiError::BadOAuthRequest("missing code_verifier".into()))?;
+    let client_id = body
+        .client_id
+        .as_deref()
+        .filter(|c| !c.is_empty())
+        .ok_or_else(|| ApiError::BadOAuthRequest("missing client_id".into()))?;
+    let client_secret = body
+        .client_secret
+        .as_deref()
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| ApiError::BadOAuthRequest("missing client_secret".into()))?;
+
+    // 1. Consume the authorization code (one-shot).
+    let code_store = state.as_code_store.as_ref().ok_or(ApiError::NotConfigured)?;
+    let pending = code_store
+        .consume(code_val)
+        .await?
+        .ok_or_else(|| ApiError::BadOAuthRequest("invalid or already-consumed code".into()))?;
+
+    // 2. Verify code not expired.
+    let now = (state.now)();
+    if now > pending.expires_at {
+        return Err(ApiError::BadOAuthRequest("authorization code expired".into()));
+    }
+
+    // 3. Verify client_id matches the code's client.
+    if pending.client_id != client_id {
+        return Err(ApiError::BadOAuthRequest("client_id mismatch".into()));
+    }
+
+    // 4. Verify redirect_uri matches.
+    if pending.redirect_uri != redirect_uri {
+        return Err(ApiError::BadOAuthRequest("redirect_uri mismatch".into()));
+    }
+
+    // 5. Verify client credentials (unseal the stored secret and compare).
+    let client_store = state.oauth_clients.as_ref().ok_or(ApiError::NotConfigured)?;
+    let client = client_store
+        .get(client_id)
+        .await?
+        .ok_or_else(|| ApiError::BadOAuthRequest("unknown client_id".into()))?;
+    let stored_secret = client.unseal_secret()?;
+    if stored_secret != client_secret {
+        return Err(ApiError::BadOAuthRequest("invalid client_secret".into()));
+    }
+
+    // 6. Verify PKCE: BASE64URL-NOPAD(SHA256(code_verifier)) must equal code_challenge.
+    let digest = {
+        use sha2::Digest;
+        let hash = sha2::Sha256::digest(code_verifier.as_bytes());
+        base64_url_nopad_encode(&hash)
+    };
+    if digest != pending.code_challenge {
+        return Err(ApiError::BadOAuthRequest("PKCE code_verifier mismatch".into()));
+    }
+
+    // 7. Mint tokens.
+    let scopes: Vec<String> = pending
+        .user_scopes
+        .split(',')
+        .filter(|s| !s.is_empty())
+        .map(String::from)
+        .collect();
+    let scope_str = if scopes.is_empty() {
+        None
+    } else {
+        Some(scopes.join(" "))
+    };
+    let tokens = issue_tokens(state, pending.user_sub, pending.user_workspace, scopes).await?;
+    Ok(Json(OAuthTokenResponse {
+        access_token: tokens.access_token,
+        refresh_token: tokens.refresh_token,
+        token_type: "Bearer",
+        expires_in: tokens.expires_in,
+        scope: scope_str,
+    }))
+}
+
+/// Handle `grant_type=refresh_token`: verify client credentials, rotate the refresh token,
+/// and mint a new access + refresh pair.
+#[cfg(feature = "oauth")]
+async fn oauth_token_refresh(
+    state: &AuthState,
+    body: OAuthTokenRequest,
+) -> Result<Json<OAuthTokenResponse>, ApiError> {
+    let refresh_val = body
+        .refresh_token
+        .as_deref()
+        .filter(|r| !r.is_empty())
+        .ok_or_else(|| ApiError::BadOAuthRequest("missing refresh_token".into()))?;
+    let client_id = body
+        .client_id
+        .as_deref()
+        .filter(|c| !c.is_empty())
+        .ok_or_else(|| ApiError::BadOAuthRequest("missing client_id".into()))?;
+    let client_secret = body
+        .client_secret
+        .as_deref()
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| ApiError::BadOAuthRequest("missing client_secret".into()))?;
+
+    // 1. Verify client credentials.
+    let client_store = state.oauth_clients.as_ref().ok_or(ApiError::NotConfigured)?;
+    let client = client_store
+        .get(client_id)
+        .await?
+        .ok_or_else(|| ApiError::BadOAuthRequest("unknown client_id".into()))?;
+    if !client.enabled {
+        return Err(ApiError::BadOAuthRequest("client is disabled".into()));
+    }
+    let stored_secret = client.unseal_secret()?;
+    if stored_secret != client_secret {
+        return Err(ApiError::BadOAuthRequest("invalid client_secret".into()));
+    }
+
+    // 2. Rotate the refresh token (same logic as /auth/refresh).
+    let token = RefreshToken::new(refresh_val);
+    let now = (state.now)();
+    let (new_token, record) = state.refresh.rotate(&token, now).await?;
+
+    // 3. Mint a fresh access JWT from the rotated record's claims.
+    let identity = VerifiedIdentity {
+        sub: record.sub.clone(),
+        workspace: record.workspace.clone(),
+        scopes: record.scopes.clone(),
+        email: None,
+    };
+    let claims = identity.into_claims(now + state.access_ttl, now);
+    let access_token = state.minter.mint(&claims)?;
+    let scope_str = if record.scopes.is_empty() {
+        None
+    } else {
+        Some(record.scopes.join(" "))
+    };
+    Ok(Json(OAuthTokenResponse {
+        access_token,
+        refresh_token: new_token.as_str().to_owned(),
+        token_type: "Bearer",
+        expires_in: state.access_ttl,
+        scope: scope_str,
+    }))
+}
+
+/// BASE64URL encoding without padding (RFC 7636 Appendix B).
+#[cfg(feature = "oauth")]
+fn base64_url_nopad_encode(input: &[u8]) -> String {
+    use base64::Engine;
+    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(input)
+}
+
 /// Query params for `GET /auth/providers/{id}/authorize`. `cli_redirect` is present only for the
 /// `gt login` browser flow (hq-gt-login-oauth.1): the local loopback URL the callback hands the
 /// minted session back to (via a one-shot code). Absent ⇒ the ordinary web login, redirected to the
@@ -2777,6 +3137,10 @@ enum ApiError {
     /// from becoming an open redirect.
     #[cfg(feature = "oauth")]
     BadCliRedirect,
+    /// An OAuth Authorization Server request was malformed or failed validation — `400`
+    /// (hq-oauth-as.2/3).
+    #[cfg(feature = "oauth")]
+    BadOAuthRequest(String),
 }
 
 impl From<RefreshError> for ApiError {
@@ -2840,6 +3204,8 @@ impl IntoResponse for ApiError {
                 "cli_redirect must be a http://127.0.0.1 or http://localhost loopback URL",
             )
                 .into_response(),
+            #[cfg(feature = "oauth")]
+            ApiError::BadOAuthRequest(msg) => (StatusCode::BAD_REQUEST, msg).into_response(),
         }
     }
 }
@@ -3428,6 +3794,8 @@ mod tests {
             sso_provisioner: None,
             #[cfg(feature = "oauth")]
             oauth_clients: None,
+            #[cfg(feature = "oauth")]
+            as_code_store: None,
             // Publish the public half of the same "k1" key the minter signs with.
             jwks: Arc::new(
                 JwtAuthenticator::from_kid_pems([("k1", PUB_PEM)])
