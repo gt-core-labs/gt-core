@@ -677,6 +677,12 @@ pub struct AuthState {
     /// ([`JwtAuthenticator::jwk_set`](crate::JwtAuthenticator::jwk_set)) — never the signing
     /// secret. `Arc` so cloning the state per request stays cheap.
     pub jwks: Arc<JwkSet>,
+    /// The OAuth client registry (Authorization Server surface, hq-oauth-as.1): downstream
+    /// applications (e.g. Claude.ai remote MCP connector) that authenticate users THROUGH gt.
+    /// A SYSTEM admin manages the GLOBAL `public.oauth_clients` table via the
+    /// `/auth/clients` CRUD surface. `None` ⇒ those endpoints respond `501`.
+    #[cfg(feature = "oauth")]
+    pub oauth_clients: Option<Arc<dyn crate::oauth_client::OAuthClientRepo>>,
 }
 
 /// Build the auth router. Mount it under the API base at the composition root.
@@ -740,7 +746,19 @@ pub fn auth_router(state: AuthState) -> Router {
         // PUBLIC callback (hq-idp-db.3): validate+consume state, redeem the code, issue tokens.
         .route("/auth/callback", get(callback))
         // PUBLIC CLI hand-off exchange (hq-gt-login-oauth.2): redeem the one-shot `gt login` code.
-        .route("/auth/cli/exchange", post(cli_exchange));
+        .route("/auth/cli/exchange", post(cli_exchange))
+        // OAuth client administration (hq-oauth-as.1): a SYSTEM admin manages downstream OAuth
+        // clients (apps that authenticate users THROUGH gt, e.g. Claude.ai remote MCP connector).
+        .route(
+            "/auth/clients",
+            get(list_oauth_clients).post(create_oauth_client),
+        )
+        .route(
+            "/auth/clients/:id",
+            get(get_oauth_client)
+                .patch(patch_oauth_client)
+                .delete(delete_oauth_client),
+        );
     router.with_state(state)
 }
 
@@ -2045,6 +2063,128 @@ async fn get_provider(
         .ok_or(ApiError::NotFound)
 }
 
+// ---------------------------------------------------------------------------
+// OAuth client administration (Authorization Server surface, hq-oauth-as.1)
+// ---------------------------------------------------------------------------
+
+/// Request body for `POST /auth/clients`.
+#[cfg(feature = "oauth")]
+#[derive(Debug, Deserialize)]
+pub struct CreateOAuthClientRequest {
+    pub client_id: String,
+    pub client_secret: String,
+    pub display_name: String,
+    #[serde(default)]
+    pub redirect_uris: Vec<String>,
+    #[serde(default)]
+    pub allowed_scopes: String,
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+}
+
+/// Request body for `PATCH /auth/clients/{id}`.
+#[cfg(feature = "oauth")]
+#[derive(Debug, Deserialize)]
+pub struct PatchOAuthClientRequest {
+    pub display_name: Option<String>,
+    pub client_secret: Option<String>,
+    pub redirect_uris: Option<Vec<String>>,
+    pub allowed_scopes: Option<String>,
+    pub enabled: Option<bool>,
+}
+
+/// `POST /auth/clients` — register a downstream OAuth client (system admin only).
+/// The `client_secret` is accepted in the body, sealed at rest, and NEVER returned.
+#[cfg(feature = "oauth")]
+async fn create_oauth_client(
+    State(state): State<AuthState>,
+    claims: Option<Extension<JwtClaims>>,
+    Json(body): Json<CreateOAuthClientRequest>,
+) -> Result<(StatusCode, Json<crate::oauth_client::OAuthClientView>), ApiError> {
+    require_system_admin(claims.as_deref())?;
+    let store = state.oauth_clients.as_ref().ok_or(ApiError::NotConfigured)?;
+    let new = crate::oauth_client::NewOAuthClient {
+        client_id: body.client_id,
+        client_secret: body.client_secret,
+        display_name: body.display_name,
+        redirect_uris: body.redirect_uris,
+        allowed_scopes: body.allowed_scopes,
+        enabled: body.enabled,
+    };
+    let stored = store.create(new).await?;
+    Ok((StatusCode::CREATED, Json(stored.into())))
+}
+
+/// `GET /auth/clients` — list all registered OAuth clients (system admin only, secret-free).
+#[cfg(feature = "oauth")]
+async fn list_oauth_clients(
+    State(state): State<AuthState>,
+    claims: Option<Extension<JwtClaims>>,
+) -> Result<Json<Vec<crate::oauth_client::OAuthClientView>>, ApiError> {
+    require_system_admin(claims.as_deref())?;
+    let store = state.oauth_clients.as_ref().ok_or(ApiError::NotConfigured)?;
+    let clients = store
+        .list()
+        .await?
+        .into_iter()
+        .map(crate::oauth_client::OAuthClientView::from)
+        .collect();
+    Ok(Json(clients))
+}
+
+/// `GET /auth/clients/{id}` — get a single OAuth client (system admin only, secret-free).
+#[cfg(feature = "oauth")]
+async fn get_oauth_client(
+    State(state): State<AuthState>,
+    claims: Option<Extension<JwtClaims>>,
+    Path(id): Path<String>,
+) -> Result<Json<crate::oauth_client::OAuthClientView>, ApiError> {
+    require_system_admin(claims.as_deref())?;
+    let store = state.oauth_clients.as_ref().ok_or(ApiError::NotConfigured)?;
+    match store.get(&id).await? {
+        Some(rec) => Ok(Json(rec.into())),
+        None => Err(ApiError::NotFound),
+    }
+}
+
+/// `PATCH /auth/clients/{id}` — partially update an OAuth client (system admin only).
+#[cfg(feature = "oauth")]
+async fn patch_oauth_client(
+    State(state): State<AuthState>,
+    claims: Option<Extension<JwtClaims>>,
+    Path(id): Path<String>,
+    Json(body): Json<PatchOAuthClientRequest>,
+) -> Result<Json<crate::oauth_client::OAuthClientView>, ApiError> {
+    require_system_admin(claims.as_deref())?;
+    let store = state.oauth_clients.as_ref().ok_or(ApiError::NotConfigured)?;
+    let patch = crate::oauth_client::PatchOAuthClient {
+        display_name: body.display_name,
+        client_secret: body.client_secret,
+        redirect_uris: body.redirect_uris,
+        allowed_scopes: body.allowed_scopes,
+        enabled: body.enabled,
+    };
+    match store.patch(&id, patch).await? {
+        Some(updated) => Ok(Json(updated.into())),
+        None => Err(ApiError::NotFound),
+    }
+}
+
+/// `DELETE /auth/clients/{id}` — remove an OAuth client (system admin only).
+#[cfg(feature = "oauth")]
+async fn delete_oauth_client(
+    State(state): State<AuthState>,
+    claims: Option<Extension<JwtClaims>>,
+    Path(id): Path<String>,
+) -> Result<StatusCode, ApiError> {
+    require_system_admin(claims.as_deref())?;
+    let store = state.oauth_clients.as_ref().ok_or(ApiError::NotConfigured)?;
+    match store.delete(&id).await? {
+        true => Ok(StatusCode::NO_CONTENT),
+        false => Err(ApiError::NotFound),
+    }
+}
+
 /// Query params for `GET /auth/providers/{id}/authorize`. `cli_redirect` is present only for the
 /// `gt login` browser flow (hq-gt-login-oauth.1): the local loopback URL the callback hands the
 /// minted session back to (via a one-shot code). Absent ⇒ the ordinary web login, redirected to the
@@ -3286,6 +3426,8 @@ mod tests {
             fe_redirect_url: None,
             #[cfg(feature = "oauth")]
             sso_provisioner: None,
+            #[cfg(feature = "oauth")]
+            oauth_clients: None,
             // Publish the public half of the same "k1" key the minter signs with.
             jwks: Arc::new(
                 JwtAuthenticator::from_kid_pems([("k1", PUB_PEM)])

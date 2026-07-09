@@ -1535,6 +1535,10 @@ async fn main() -> anyhow::Result<()> {
                 // hq-epic.auth-refactor.4: make `public.users.password_hash` nullable so JIT-provisioned
                 // SSO users (no password) can be inserted. ALTER ... DROP NOT NULL, idempotent.
                 gt_auth::migrations::SSO_USER_PASSWORD_NULLABLE,
+                // hq-oauth-as.1: the OAuth client registry (Authorization Server surface) —
+                // downstream apps (e.g. Claude.ai remote MCP connector) that authenticate users
+                // THROUGH gt.  CREATE TABLE IF NOT EXISTS, idempotent.
+                gt_auth::migrations::CREATE_OAUTH_CLIENTS,
             ] {
                 sqlx::raw_sql(sql)
                     .execute(&pool)
@@ -1661,6 +1665,11 @@ async fn main() -> anyhow::Result<()> {
                 cookie_secure: cookie_secure(),
                 cookie_same_site: cookie_same_site(),
                 jwks,
+                // hq-oauth-as.1: the OAuth client registry — downstream apps (e.g. Claude.ai
+                // remote MCP connector). Backed by PgOAuthClientRepo over the shared pool.
+                #[cfg(feature = "oauth")]
+                oauth_clients: Some(Arc::new(gt_auth::PgOAuthClientRepo::new(pool.clone()))
+                    as Arc<dyn gt_auth::OAuthClientRepo>),
             };
             let auth_app = auth_router(login_state).layer(axum::middleware::from_fn_with_state(
                 AuthState::new(verifier, audit.clone())

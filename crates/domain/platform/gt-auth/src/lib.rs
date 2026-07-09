@@ -121,6 +121,9 @@ mod authz_state;
 #[cfg(feature = "oauth")]
 mod cli_code;
 
+#[cfg(feature = "oauth")]
+mod oauth_client;
+
 pub use error::AuthError;
 pub use provider::{Credentials, IdentityProvider, ProviderKind, VerifiedIdentity};
 pub use refresh::{
@@ -206,6 +209,11 @@ pub mod migrations {
     /// email+password rows keep their non-NULL hash unchanged.
     pub const SSO_USER_PASSWORD_NULLABLE: &str =
         include_str!("../migrations/auth/0012__sso_user_password_nullable.sql");
+    /// `0013` — the OAuth client registry (Authorization Server surface, hq-oauth-as.1):
+    /// downstream applications (e.g. Claude.ai remote MCP connector) that authenticate users
+    /// THROUGH gt.  Inverse of `oauth_providers` (upstream IdPs).
+    pub const CREATE_OAUTH_CLIENTS: &str =
+        include_str!("../migrations/auth/0013__create_oauth_clients.sql");
 }
 
 #[cfg(feature = "jsonwebtoken")]
@@ -298,6 +306,17 @@ pub use cli_code::{CliCodeRepo, NewCliCode, PendingCliCode};
 
 #[cfg(all(feature = "oauth", feature = "pg"))]
 pub use authz_state::PgAuthzStateRepo;
+
+/// The OAuth client registry (Authorization Server surface, hq-oauth-as.1): downstream
+/// applications that authenticate users THROUGH gt (e.g. Claude.ai remote MCP connector).
+/// The `OAuthClientRepo` CRUD port, domain types, and the secret-omitting `OAuthClientView`.
+#[cfg(feature = "oauth")]
+pub use oauth_client::{
+    NewOAuthClient, OAuthClientRecord, OAuthClientRepo, OAuthClientView, PatchOAuthClient,
+};
+
+#[cfg(all(feature = "oauth", feature = "pg"))]
+pub use oauth_client::PgOAuthClientRepo;
 
 #[cfg(all(feature = "oauth", feature = "pg"))]
 pub use cli_code::PgCliCodeRepo;
