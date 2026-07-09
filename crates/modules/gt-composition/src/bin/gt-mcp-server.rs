@@ -1696,6 +1696,29 @@ async fn main() -> anyhow::Result<()> {
         }
     };
 
+    // OAuth 2.0 Authorization Server Metadata (RFC 8414, hq-oauth-as.4): the public
+    // discovery endpoint Claude.ai (and any RFC-compliant OAuth client) hits before
+    // starting the authorization-code flow. Returns the absolute URLs of the authorize
+    // and token endpoints so the client doesn't need out-of-band configuration.
+    let app = {
+        let public_url =
+            std::env::var("GT_PUBLIC_URL").unwrap_or_else(|_| format!("http://{bind}"));
+        let metadata = serde_json::json!({
+            "issuer": public_url,
+            "authorization_endpoint": format!("{public_url}/oauth/authorize"),
+            "token_endpoint": format!("{public_url}/oauth/token"),
+            "response_types_supported": ["code"],
+            "grant_types_supported": ["authorization_code", "refresh_token"],
+            "code_challenge_methods_supported": ["S256"],
+            "token_endpoint_auth_methods_supported": ["client_secret_post"],
+        });
+        let handler = move || async move { axum::Json(metadata) };
+        app.route(
+            "/.well-known/oauth-authorization-server",
+            axum::routing::get(handler),
+        )
+    };
+
     // A2A ingress (B5, gtcore-9039b5 / epic gtcore-155917): `POST /a2a` (JSON-RPC
     // tasks/send|get|cancel|sendSubscribe over the A2aGateway) + the public
     // `GET /.well-known/agent.json` discovery card. Opt-in wiring — mounted ONLY
