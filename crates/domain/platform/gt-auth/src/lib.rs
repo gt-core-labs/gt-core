@@ -113,6 +113,9 @@ mod crypto;
 mod provider_repo;
 
 #[cfg(feature = "oauth")]
+mod oauth_client;
+
+#[cfg(feature = "oauth")]
 mod provider_seed;
 
 #[cfg(feature = "oauth")]
@@ -206,6 +209,12 @@ pub mod migrations {
     /// email+password rows keep their non-NULL hash unchanged.
     pub const SSO_USER_PASSWORD_NULLABLE: &str =
         include_str!("../migrations/auth/0012__sso_user_password_nullable.sql");
+    /// `0013` — the GLOBAL OAuth client registry (`public.oauth_clients`, gtcore-95f950): the
+    /// relying parties (e.g. Claude.ai) that authenticate AGAINST gt-core's own `/oauth/authorize`
+    /// + `/oauth/token` endpoints, the outbound counterpart of the inbound-SSO `oauth_providers`.
+    /// The client secret column holds the AES-GCM-sealed blob, never cleartext.
+    pub const CREATE_OAUTH_CLIENTS: &str =
+        include_str!("../migrations/auth/0013__create_oauth_clients.sql");
 }
 
 #[cfg(feature = "jsonwebtoken")]
@@ -281,6 +290,19 @@ pub use http::{AuthzStateStore, CliCodeStore, OauthAuthzFlow, PublicProvider, Ss
 
 #[cfg(all(feature = "oauth", feature = "pg"))]
 pub use provider_repo::PgProviderRepo;
+
+/// The GLOBAL OAuth client registry (gtcore-95f950): gt-core as an authorization SERVER. Where
+/// [`ProviderRepo`] configures the external IdPs users log INTO, [`OauthClientRepo`] registers the
+/// relying parties (e.g. Claude.ai) that authenticate AGAINST gt-core's `/oauth/authorize` +
+/// `/oauth/token` endpoints. [`NewOauthClient`] carries the cleartext secret the repo SEALS
+/// (`crypto::seal`); reads return the sealed [`OauthClient`], and [`OauthClientView`] is the
+/// secret-redacted projection admin listings render. Redirect URIs are matched EXACTLY (no
+/// wildcards). The Postgres adapter [`PgOauthClientRepo`] is additionally gated by `pg`.
+#[cfg(feature = "oauth")]
+pub use oauth_client::{NewOauthClient, OauthClient, OauthClientRepo, OauthClientView};
+
+#[cfg(all(feature = "oauth", feature = "pg"))]
+pub use oauth_client::PgOauthClientRepo;
 
 /// The ephemeral OAuth authorize-state + PKCE store (hq-idp-db.3): the `AuthzStateRepo` CRUD port
 /// the public `/authorize`→`/callback` flow depends on, the `PendingAuthz`/`NewAuthz` row shapes,
