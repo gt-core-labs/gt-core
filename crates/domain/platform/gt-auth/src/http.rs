@@ -766,7 +766,7 @@ pub fn auth_router(state: AuthState) -> Router {
         )
         // OAuth Authorization Server endpoints (hq-oauth-as.2/3): gt acts as the AS for
         // downstream OAuth clients (e.g. Claude.ai remote MCP connector).
-        .route("/oauth/authorize", get(oauth_as_authorize))
+        .route("/oauth/authorize", get(oauth_as_authorize).post(oauth_as_consent))
         .route("/oauth/token", post(oauth_as_token));
     router.with_state(state)
 }
@@ -2219,11 +2219,13 @@ struct OAuthAuthorizeParams {
 
 /// `GET /oauth/authorize` — OAuth 2.0 Authorization Endpoint (hq-oauth-as.2).
 ///
-/// The authenticated user (bearer/cookie) authorises a downstream OAuth client (e.g. Claude.ai
-/// remote MCP connector). On success, 302-redirects to `redirect_uri?code=X&state=Y`.
+/// Validates the request, looks up the client, computes the granted scopes, then
+/// 302-redirects to the frontend consent page (`fe_redirect_url` + `/oauth/consent`)
+/// so the user can review and approve/deny. The consent page POSTs back to
+/// `POST /oauth/authorize` with the decision.
 ///
-/// Auto-consent: the first iteration skips a consent screen — the user's presence + valid
-/// credentials imply consent. A consent UI can gate this later.
+/// If no `fe_redirect_url` is configured, falls through to auto-consent (headless
+/// deploy without a frontend).
 #[cfg(feature = "oauth")]
 async fn oauth_as_authorize(
     State(state): State<AuthState>,
@@ -2233,14 +2235,123 @@ async fn oauth_as_authorize(
     // 1. Require authenticated user.
     let Extension(claims) = claims.ok_or(ApiError::Unauthenticated)?;
 
-    // 2. Validate response_type.
+    // 2. Validate the authorize params (shared with the POST consent handler).
+    let validated = validate_authorize_params(&state, &params).await?;
+
+    // 3. Compute granted scopes.
+    let granted = compute_granted_scopes(&claims, &validated.client);
+
+    // 4. If a frontend is configured, redirect to the consent page.
+    if let Some(ref fe_url) = state.fe_redirect_url {
+        let mut consent_url = format!(
+            "{}/oauth/consent?client_id={}&client_name={}&scopes={}&redirect_uri={}&code_challenge={}&state={}",
+            fe_url.trim_end_matches('/'),
+            pct_encode(&params.client_id),
+            pct_encode(&validated.client.display_name),
+            pct_encode(&granted.join(",")),
+            pct_encode(&params.redirect_uri),
+            pct_encode(&params.code_challenge),
+            pct_encode(params.state.as_deref().unwrap_or("")),
+        );
+        if let Some(ref m) = params.code_challenge_method {
+            consent_url.push_str("&code_challenge_method=");
+            consent_url.push_str(&pct_encode(m));
+        }
+        return Ok((
+            StatusCode::FOUND,
+            [(header::LOCATION, HeaderValue::from_str(&consent_url).map_err(
+                |e| ApiError::BadOAuthRequest(format!("invalid consent redirect: {e}")),
+            )?)],
+        )
+            .into_response());
+    }
+
+    // 5. No frontend — auto-consent (headless deploy).
+    issue_authorize_code_and_redirect(&state, &claims, &params, &granted).await
+}
+
+/// `POST /oauth/authorize` — consent decision from the frontend (hq-oauth-as.2).
+///
+/// The consent page posts the user's decision (approve/deny). On approve, generates
+/// the authorization code and 302-redirects to the client's `redirect_uri`. On deny,
+/// redirects with `error=access_denied` (RFC 6749 §4.1.2.1).
+#[cfg(feature = "oauth")]
+async fn oauth_as_consent(
+    State(state): State<AuthState>,
+    claims: Option<Extension<JwtClaims>>,
+    axum::extract::Form(body): axum::extract::Form<OAuthConsentForm>,
+) -> Result<Response, ApiError> {
+    let Extension(claims) = claims.ok_or(ApiError::Unauthenticated)?;
+
+    // Denied — redirect with error.
+    if !body.approved {
+        let mut location = format!("{}?error=access_denied", body.redirect_uri);
+        if !body.state.is_empty() {
+            location.push_str("&state=");
+            location.push_str(&pct_encode(&body.state));
+        }
+        return Ok((
+            StatusCode::FOUND,
+            [(header::LOCATION, HeaderValue::from_str(&location).map_err(
+                |e| ApiError::BadOAuthRequest(format!("invalid redirect_uri: {e}")),
+            )?)],
+        )
+            .into_response());
+    }
+
+    // Approved — reconstruct the authorize params from the consent form and issue the code.
+    let params = OAuthAuthorizeParams {
+        response_type: "code".into(),
+        client_id: body.client_id.clone(),
+        redirect_uri: body.redirect_uri.clone(),
+        state: if body.state.is_empty() { None } else { Some(body.state.clone()) },
+        code_challenge: body.code_challenge.clone(),
+        code_challenge_method: if body.code_challenge_method.is_empty() {
+            None
+        } else {
+            Some(body.code_challenge_method.clone())
+        },
+        scope: None,
+    };
+    let validated = validate_authorize_params(&state, &params).await?;
+    let granted = compute_granted_scopes(&claims, &validated.client);
+
+    issue_authorize_code_and_redirect(&state, &claims, &params, &granted).await
+}
+
+/// Form body for `POST /oauth/authorize` (consent decision).
+#[cfg(feature = "oauth")]
+#[derive(Debug, Deserialize)]
+struct OAuthConsentForm {
+    client_id: String,
+    redirect_uri: String,
+    code_challenge: String,
+    #[serde(default)]
+    code_challenge_method: String,
+    #[serde(default)]
+    state: String,
+    /// `true` = user approved, `false` = user denied.
+    #[serde(default)]
+    approved: bool,
+}
+
+/// Validated authorize request (client looked up + checks passed).
+#[cfg(feature = "oauth")]
+struct ValidatedAuthorize {
+    client: crate::oauth_client::OAuthClientRecord,
+}
+
+/// Validate common authorize params: response_type, code_challenge_method, client lookup.
+#[cfg(feature = "oauth")]
+async fn validate_authorize_params(
+    state: &AuthState,
+    params: &OAuthAuthorizeParams,
+) -> Result<ValidatedAuthorize, ApiError> {
     if params.response_type != "code" {
         return Err(ApiError::BadOAuthRequest(
             "unsupported response_type, expected \"code\"".into(),
         ));
     }
-
-    // 3. Validate code_challenge_method (only S256).
     if let Some(ref m) = params.code_challenge_method {
         if m != "S256" {
             return Err(ApiError::BadOAuthRequest(
@@ -2248,8 +2359,6 @@ async fn oauth_as_authorize(
             ));
         }
     }
-
-    // 4. Look up the client and verify it is enabled + redirect_uri is registered.
     let client_store = state.oauth_clients.as_ref().ok_or(ApiError::NotConfigured)?;
     let client = client_store
         .get(&params.client_id)
@@ -2263,54 +2372,57 @@ async fn oauth_as_authorize(
             "redirect_uri is not registered for this client".into(),
         ));
     }
+    Ok(ValidatedAuthorize { client })
+}
 
-    // 5. Compute granted scopes: intersection of user's scopes and client's allowed ceiling.
-    let client_scopes = client.scope_list();
-    let granted: Vec<String> = if client_scopes.is_empty() {
-        // No ceiling — grant all the user's scopes.
+/// Compute granted scopes: intersection of user's scopes and client's allowed ceiling.
+#[cfg(feature = "oauth")]
+fn compute_granted_scopes(
+    claims: &JwtClaims,
+    client: &crate::oauth_client::OAuthClientRecord,
+) -> Vec<String> {
+    let ceiling = client.scope_list();
+    if ceiling.is_empty() {
         claims.scopes.clone()
     } else {
         claims
             .scopes
             .iter()
-            .filter(|s| client_scopes.contains(&s.as_str()))
+            .filter(|s| ceiling.contains(&s.as_str()))
             .cloned()
             .collect()
-    };
+    }
+}
 
-    // 6. Generate and persist the authorization code.
+/// Generate an authorization code, persist it, and 302-redirect to the client.
+#[cfg(feature = "oauth")]
+async fn issue_authorize_code_and_redirect(
+    state: &AuthState,
+    claims: &JwtClaims,
+    params: &OAuthAuthorizeParams,
+    granted: &[String],
+) -> Result<Response, ApiError> {
     let code_store = state.as_code_store.as_ref().ok_or(ApiError::NotConfigured)?;
     let code = crate::oauth_as::generate_code()?;
     let now = (state.now)();
     code_store
         .insert(crate::oauth_as::NewAsCode {
             code: code.clone(),
-            client_id: params.client_id,
-            user_sub: claims.sub,
-            user_workspace: claims.workspace,
+            client_id: params.client_id.clone(),
+            user_sub: claims.sub.clone(),
+            user_workspace: claims.workspace.clone(),
             user_scopes: granted.join(","),
             redirect_uri: params.redirect_uri.clone(),
-            code_challenge: params.code_challenge,
+            code_challenge: params.code_challenge.clone(),
             created_at: now,
             expires_at: now + crate::oauth_as::CODE_TTL_SECS,
         })
         .await?;
 
-    // 7. 302 redirect to the client's redirect_uri with code + state.
     let mut location = format!("{}?code={}", params.redirect_uri, code);
     if let Some(ref st) = params.state {
         location.push_str("&state=");
-        // Percent-encode the state value for safe URL embedding (RFC 3986 query component).
-        for b in st.bytes() {
-            match b {
-                b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
-                    location.push(b as char);
-                }
-                _ => {
-                    location.push_str(&format!("%{b:02X}"));
-                }
-            }
-        }
+        location.push_str(&pct_encode(st));
     }
     Ok((
         StatusCode::FOUND,
@@ -2319,6 +2431,23 @@ async fn oauth_as_authorize(
         )?)],
     )
         .into_response())
+}
+
+/// Percent-encode a string for safe URL embedding (RFC 3986 unreserved chars only).
+#[cfg(feature = "oauth")]
+fn pct_encode(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    for b in input.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
+                out.push(b as char);
+            }
+            _ => {
+                out.push_str(&format!("%{b:02X}"));
+            }
+        }
+    }
+    out
 }
 
 /// Form body for `POST /oauth/token` (RFC 6749 §4.1.3 / §6).
