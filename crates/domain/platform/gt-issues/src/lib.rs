@@ -140,7 +140,9 @@ pub use readiness::is_ready;
 pub use report::{
     build_report, to_csv, to_xlsx, OperatorReport, ReportComment, ReportRow, ReportSection,
 };
-pub use report_html::render_digest;
+pub use report_html::{
+    collect_report_mermaid_sources, render_digest, render_digest_with_diagrams,
+};
 pub use stats::{MeStatsResponse, WorkspaceStats};
 pub use surface::{AllowAllProvider, AllowAllTree, SurfaceEntry, SurfaceProvider, SurfaceTree};
 pub use taxonomy::{Dispatch, Domain, IssueType, RoleScope};
