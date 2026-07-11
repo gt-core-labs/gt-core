@@ -25,7 +25,7 @@ use sqlx::PgPool;
 
 use gt_issues::analytics::{summarize, AnalyticsSummary};
 use gt_issues::report::{build_report, OperatorReport, ReportComment};
-use gt_issues::report_html::render_digest;
+use gt_issues::report_html::{collect_report_mermaid_sources, render_digest, render_digest_with_diagrams};
 use gt_store_dolt::{DoltIssues, IssueFilter, WorkspacePools};
 use gt_store_pg::{
     EmailOutboxRepository, NewEmail, PgComments, PgEmailOutbox, PgReportSchedules,
@@ -288,17 +288,30 @@ impl LegacyReportConfig {
 // and nowhere else.
 // ---------------------------------------------------------------------------
 
-/// A registered report renderer.
-pub type RenderFn = fn(&OperatorReport, &AnalyticsSummary, &str) -> (String, String);
+/// A registered report renderer. Receives an optional map of pre-rendered
+/// mermaid diagrams (source → SVG) so fenced mermaid blocks in notes/comments
+/// appear as inline SVGs in the email.
+pub type RenderFn = fn(
+    &OperatorReport,
+    &AnalyticsSummary,
+    &str,
+    &std::collections::HashMap<String, String>,
+) -> (String, String);
 
 fn render_planning_digest(
     report: &OperatorReport,
     summary: &AnalyticsSummary,
     fecha: &str,
+    diagrams: &std::collections::HashMap<String, String>,
 ) -> (String, String) {
+    let html = if diagrams.is_empty() {
+        render_digest(report, summary, fecha)
+    } else {
+        render_digest_with_diagrams(report, summary, fecha, diagrams)
+    };
     (
         format!("Reporte de planning {}/{} — {fecha}", report.rig, report.workspace),
-        render_digest(report, summary, fecha),
+        html,
     )
 }
 
@@ -937,7 +950,10 @@ impl ReportService {
         // reopens=0: the audit-derived count lives with the analytics handler;
         // the digest tolerates the conservative zero (defects still counted).
         let summary = summarize(&schedule.rig, &schedule.workspace, &rows, 0, &today, 7, 30, &parent_map);
-        let (subject, html) = render(&report, &summary, &today);
+        // Pre-render mermaid diagrams to SVG via mmdc (if available).
+        let mermaid_sources = collect_report_mermaid_sources(&report);
+        let diagrams = render_mermaid_batch(&mermaid_sources).await;
+        let (subject, html) = render(&report, &summary, &today, &diagrams);
 
         // One email To: the configured sender (`GT_SMTP_FROM`) with every
         // registered recipient in CC (gtcore-ecf70d) — instead of one outbox row
@@ -971,6 +987,77 @@ impl ReportService {
         // One email queued (carrying the whole CC list), not one per recipient.
         Ok(1)
     }
+}
+
+// ---------------------------------------------------------------------------
+// Mermaid → SVG batch renderer (shell out to `mmdc`, the mermaid-cli).
+// ---------------------------------------------------------------------------
+
+/// Render a single mermaid source string to SVG via `mmdc`. Returns `None` if
+/// `mmdc` is not installed or the source fails to parse.
+async fn render_mermaid_one(src: &str) -> Option<String> {
+    use tokio::process::Command;
+
+    // mmdc reads from stdin (-i -) and writes SVG to stdout (-o -).
+    // --quiet suppresses the progress bar. -e svg selects SVG output.
+    let result = Command::new("mmdc")
+        .args(["-i", "-", "-o", "-", "-e", "svg", "--quiet"])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .kill_on_drop(true)
+        .spawn();
+
+    let mut child = match result {
+        Ok(c) => c,
+        Err(_) => {
+            return None;
+        }
+    };
+
+    // Write source to stdin.
+    if let Some(mut stdin) = child.stdin.take() {
+        use tokio::io::AsyncWriteExt;
+        if stdin.write_all(src.as_bytes()).await.is_err() {
+            return None;
+        }
+        // Drop stdin to signal EOF.
+    }
+
+    let output = tokio::time::timeout(
+        Duration::from_secs(30),
+        child.wait_with_output(),
+    )
+    .await
+    .ok()?
+    .ok()?;
+
+    if !output.status.success() {
+        return None;
+    }
+
+    let svg = String::from_utf8(output.stdout).ok()?;
+    // mmdc may wrap the SVG with extra output; extract just the <svg>…</svg>.
+    if let Some(start) = svg.find("<svg") {
+        if let Some(end) = svg.rfind("</svg>") {
+            return Some(svg[start..end + 6].to_string());
+        }
+    }
+    // If no <svg> tag found, the output is unexpected.
+    None
+}
+
+/// Batch-render mermaid sources to SVGs. Returns a map source→SVG for every
+/// source that rendered successfully. Failures are silently skipped (the HTML
+/// renderer falls back to a styled `<pre>` block).
+async fn render_mermaid_batch(sources: &[String]) -> std::collections::HashMap<String, String> {
+    let mut map = std::collections::HashMap::new();
+    for src in sources {
+        if let Some(svg) = render_mermaid_one(src).await {
+            map.insert(src.clone(), svg);
+        }
+    }
+    map
 }
 
 /// The fixed-time daemon: ticks every minute, fires every due schedule.
