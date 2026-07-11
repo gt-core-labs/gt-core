@@ -10,7 +10,9 @@
 //! `<link>`/`<script>`/external CSS — Gmail strips them), table layout, same
 //! navy aesthetic as the xlsx report.
 
-use pulldown_cmark::{html::push_html, Event, Options, Parser, Tag, TagEnd};
+use std::collections::HashMap;
+
+use pulldown_cmark::{html::push_html, CodeBlockKind, CowStr, Event, Options, Parser, Tag, TagEnd};
 
 use crate::analytics::AnalyticsSummary;
 use crate::report::{OperatorReport, ReportComment, ReportSection};
@@ -23,26 +25,139 @@ fn esc(s: &str) -> String {
 /// Render a markdown string to inline-safe HTML for email clients.
 /// GFM enabled (tables, strikethrough, task lists). Returns an empty string for
 /// empty input so callers can use it in format strings without conditional guards.
+///
+/// When `diagrams` is provided, fenced ` ```mermaid ` blocks whose source text
+/// matches a key in the map are replaced by the pre-rendered SVG value (inline,
+/// no `<script>` — email-safe). Unmatched mermaid blocks fall back to a styled
+/// `<pre>` with a "Mermaid diagram" label.
 fn md_to_html(s: &str) -> String {
+    md_to_html_inner(s, None)
+}
+
+fn md_to_html_with_diagrams(s: &str, diagrams: &HashMap<String, String>) -> String {
+    md_to_html_inner(s, Some(diagrams))
+}
+
+fn md_to_html_inner(s: &str, diagrams: Option<&HashMap<String, String>>) -> String {
     if s.is_empty() {
         return String::new();
     }
     let opts = Options::ENABLE_TABLES
         | Options::ENABLE_STRIKETHROUGH
         | Options::ENABLE_TASKLISTS;
-    // Strip raw HTML events so operator notes cannot inject arbitrary tags.
-    let safe = Parser::new_ext(s, opts).filter(|e| {
-        !matches!(
-            e,
+
+    let parser = Parser::new_ext(s, opts);
+    let mut out = String::with_capacity(s.len() + 64);
+    let mut in_mermaid = false;
+    let mut mermaid_src = String::new();
+
+    // We collect events that we want to transform (mermaid code blocks) and
+    // pass everything else through the normal pulldown_cmark HTML renderer.
+    // To do this efficiently we process events one by one.
+    let mut batch: Vec<Event<'_>> = Vec::new();
+
+    for event in parser {
+        // Strip raw HTML events so operator notes cannot inject arbitrary tags.
+        if matches!(
+            &event,
             Event::Html(_)
                 | Event::InlineHtml(_)
                 | Event::Start(Tag::HtmlBlock)
                 | Event::End(TagEnd::HtmlBlock)
-        )
-    });
-    let mut out = String::with_capacity(s.len() + 64);
-    push_html(&mut out, safe);
+        ) {
+            continue;
+        }
+
+        match &event {
+            Event::Start(Tag::CodeBlock(CodeBlockKind::Fenced(lang)))
+                if lang_is_mermaid(lang) =>
+            {
+                // Flush any pending events before the mermaid block.
+                if !batch.is_empty() {
+                    push_html(&mut out, batch.drain(..));
+                }
+                in_mermaid = true;
+                mermaid_src.clear();
+            }
+            Event::Text(text) if in_mermaid => {
+                mermaid_src.push_str(text);
+            }
+            Event::End(TagEnd::CodeBlock) if in_mermaid => {
+                in_mermaid = false;
+                let src = mermaid_src.trim().to_string();
+                if let Some(svg) = diagrams.and_then(|d| d.get(&src)) {
+                    // Inline the pre-rendered SVG wrapped in a centered div.
+                    out.push_str(&format!(
+                        "<div style=\"text-align:center;margin:8px 0;\">{svg}</div>"
+                    ));
+                } else {
+                    // Fallback: styled code block with a label.
+                    out.push_str(&format!(
+                        "<div style=\"margin:8px 0;\">\
+                         <div style=\"font-size:10px;color:#888;text-transform:uppercase;\
+                         letter-spacing:.5px;margin-bottom:2px;\">Mermaid</div>\
+                         <pre style=\"background:#f2f6fc;border:1px solid #d9e2f3;\
+                         border-radius:6px;padding:8px 12px;font-size:12px;\
+                         font-family:monospace;overflow-x:auto;white-space:pre-wrap;\">\
+                         {code}</pre></div>",
+                        code = esc(&src)
+                    ));
+                }
+                mermaid_src.clear();
+            }
+            _ => {
+                batch.push(event);
+            }
+        }
+    }
+    // Flush remaining events.
+    if !batch.is_empty() {
+        push_html(&mut out, batch.drain(..));
+    }
     out
+}
+
+/// Check if a fenced code block language tag is `mermaid` (ignoring extra info
+/// after a space, e.g. `mermaid {theme: dark}`).
+fn lang_is_mermaid(lang: &CowStr<'_>) -> bool {
+    let l = lang.split_whitespace().next().unwrap_or("");
+    l.eq_ignore_ascii_case("mermaid")
+}
+
+/// Extract all mermaid code-block sources from a markdown string. Returns the
+/// trimmed source texts, deduplicated. Callers use this to batch-render them
+/// via `mmdc` before passing the SVG map to [`render_digest_with_diagrams`].
+pub fn extract_mermaid_sources(s: &str) -> Vec<String> {
+    if s.is_empty() {
+        return Vec::new();
+    }
+    let opts = Options::ENABLE_TABLES
+        | Options::ENABLE_STRIKETHROUGH
+        | Options::ENABLE_TASKLISTS;
+    let parser = Parser::new_ext(s, opts);
+    let mut sources = Vec::new();
+    let mut in_mermaid = false;
+    let mut buf = String::new();
+    for event in parser {
+        match &event {
+            Event::Start(Tag::CodeBlock(CodeBlockKind::Fenced(lang)))
+                if lang_is_mermaid(lang) =>
+            {
+                in_mermaid = true;
+                buf.clear();
+            }
+            Event::Text(text) if in_mermaid => buf.push_str(text),
+            Event::End(TagEnd::CodeBlock) if in_mermaid => {
+                in_mermaid = false;
+                let src = buf.trim().to_string();
+                if !src.is_empty() && !sources.contains(&src) {
+                    sources.push(src);
+                }
+            }
+            _ => {}
+        }
+    }
+    sources
 }
 
 /// Render a bead/epic's comments as an inline block (gtcore-01bcf2): one entry
@@ -50,12 +165,32 @@ fn md_to_html(s: &str) -> String {
 /// markdown HTML. Empty input → empty string. `compact=true` drops the top
 /// divider for the section-header variant.
 fn render_comments(comments: &[ReportComment], compact: bool) -> String {
+    render_comments_inner(comments, compact, None)
+}
+
+fn render_comments_with_diagrams(
+    comments: &[ReportComment],
+    compact: bool,
+    diagrams: &HashMap<String, String>,
+) -> String {
+    render_comments_inner(comments, compact, Some(diagrams))
+}
+
+fn render_comments_inner(
+    comments: &[ReportComment],
+    compact: bool,
+    diagrams: Option<&HashMap<String, String>>,
+) -> String {
     if comments.is_empty() {
         return String::new();
     }
     let items: String = comments
         .iter()
         .map(|c| {
+            let body = match diagrams {
+                Some(d) => md_to_html_with_diagrams(&c.body, d),
+                None => md_to_html(&c.body),
+            };
             format!(
                 "<div style=\"font-size:11px;color:#555;margin-top:4px;\">\
                  <span style=\"color:{NAVY};font-weight:bold;\">[{autor}]</span>\
@@ -63,7 +198,6 @@ fn render_comments(comments: &[ReportComment], compact: bool) -> String {
                  <div style=\"margin-top:2px;\">{body}</div></div>",
                 autor = esc(&c.author),
                 fecha = esc(&c.fecha),
-                body = md_to_html(&c.body),
             )
         })
         .collect();
@@ -159,10 +293,50 @@ fn kpi(label: &str, value: String, detail: String) -> String {
     )
 }
 
+/// Collect every mermaid code-block source from the report's notes and
+/// comments. Returns deduplicated trimmed sources ready for batch rendering.
+pub fn collect_report_mermaid_sources(report: &OperatorReport) -> Vec<String> {
+    let mut all = Vec::new();
+    for section in &report.sections {
+        for c in &section.comentarios {
+            all.extend(extract_mermaid_sources(&c.body));
+        }
+        for row in &section.rows {
+            all.extend(extract_mermaid_sources(&row.notas));
+            for c in &row.comentarios {
+                all.extend(extract_mermaid_sources(&c.body));
+            }
+        }
+    }
+    all.sort();
+    all.dedup();
+    all
+}
+
+/// Render the digest with pre-rendered mermaid diagrams inlined as SVG.
+/// `diagrams` maps trimmed mermaid source → SVG string (from `mmdc`).
+pub fn render_digest_with_diagrams(
+    report: &OperatorReport,
+    summary: &AnalyticsSummary,
+    fecha: &str,
+    diagrams: &HashMap<String, String>,
+) -> String {
+    render_digest_inner(report, summary, fecha, Some(diagrams))
+}
+
 /// Render the digest: `(bitácora, kpis, fecha)` → standalone HTML document.
 /// Pure — no IO, no clock (the caller passes `fecha`, normally
 /// `summary.today`).
 pub fn render_digest(report: &OperatorReport, summary: &AnalyticsSummary, fecha: &str) -> String {
+    render_digest_inner(report, summary, fecha, None)
+}
+
+fn render_digest_inner(
+    report: &OperatorReport,
+    summary: &AnalyticsSummary,
+    fecha: &str,
+    diagrams: Option<&HashMap<String, String>>,
+) -> String {
     let mut html = String::with_capacity(16 * 1024);
     html.push_str(
         "<!DOCTYPE html><html><head><meta charset=\"utf-8\"></head>\
@@ -245,14 +419,25 @@ pub fn render_digest(report: &OperatorReport, summary: &AnalyticsSummary, fecha:
         ));
         // Epic-level comments (rare): a full-width row under the band.
         if !section.comentarios.is_empty() {
+            let comments_html = match diagrams {
+                Some(d) => render_comments_with_diagrams(&section.comentarios, true, d),
+                None => render_comments(&section.comentarios, true),
+            };
             html.push_str(&format!(
-                "<tr><td colspan=\"10\" style=\"{TD}background:{row_tint};\">{}</td></tr>",
-                render_comments(&section.comentarios, true),
+                "<tr><td colspan=\"10\" style=\"{TD}background:{row_tint};\">{comments_html}</td></tr>",
             ));
         }
         for row in &section.rows {
             // Subtle per-module tint on every row of the group.
             let bg = format!("background:{row_tint};");
+            let notas_html = match diagrams {
+                Some(d) => md_to_html_with_diagrams(&row.notas, d),
+                None => md_to_html(&row.notas),
+            };
+            let comments_html = match diagrams {
+                Some(d) => render_comments_with_diagrams(&row.comentarios, false, d),
+                None => render_comments(&row.comentarios, false),
+            };
             html.push_str(&format!(
                 "<tr><td style=\"{TD}{bg}{NOWRAP}\">{modulo}</td>\
                  <td style=\"{TD}{bg}\">{tarea}<div style=\"font-size:11px;color:#6c757d;\">\
@@ -263,7 +448,7 @@ pub fn render_digest(report: &OperatorReport, summary: &AnalyticsSummary, fecha:
                  <td style=\"{TD}{bg}{NOWRAP}\">{resp}</td>\
                  <td style=\"{TD}{bg}{NOWRAP}\">{ini}</td>\
                  <td style=\"{TD}{bg}{NOWRAP}\">{fin}</td>\
-                 <td style=\"{TD}{bg}\">{notas}{comentarios}</td></tr>",
+                 <td style=\"{TD}{bg}\">{notas_html}{comments_html}</td></tr>",
                 modulo = esc(&section.module_title),
                 tarea = esc(&row.tarea),
                 id = esc(&row.id),
@@ -275,8 +460,6 @@ pub fn render_digest(report: &OperatorReport, summary: &AnalyticsSummary, fecha:
                 resp = esc(&row.responsable),
                 ini = esc(&row.fecha_inicio),
                 fin = esc(&row.fecha_fin),
-                notas = md_to_html(&row.notas),
-                comentarios = render_comments(&row.comentarios, false),
             ));
         }
     }
