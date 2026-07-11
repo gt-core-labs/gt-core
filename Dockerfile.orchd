@@ -42,7 +42,7 @@ RUN apt-get update \
     && apt-get install -y --no-install-recommends gh \
     && curl -fsSL https://deb.nodesource.com/setup_20.x | bash - \
     && apt-get install -y --no-install-recommends nodejs \
-    && npm install -g @anthropic-ai/claude-code \
+    && npm install -g @anthropic-ai/claude-code @mermaid-js/mermaid-cli \
     && npm cache clean --force \
     && apt-get purge -y gnupg \
     && apt-get autoremove -y \
