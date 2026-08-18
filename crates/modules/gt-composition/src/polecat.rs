@@ -1628,11 +1628,18 @@ pub fn apply_role_model(args: &mut Vec<String>, model: &ModelConfig) {
 /// and bead prefix → rig checkout path for the git-merge edge.
 ///
 /// Each rig's workdir is its [`RigEntry::resolved_worktree_root`] (an explicit catalog override,
-/// else the `<home>/gastown-wt/<ws>/<name>` convention). The per-rig template inherits the boot
-/// template's shared fields (command/args/base_env/heartbeat_dir) via [`SpawnTemplate::for_rig`];
-/// `polecat_worktree_root` (the global `GT_POLECAT_WORKTREE_ROOT`) carries over so every rig's
-/// polecats get per-bead worktrees — session names embed the rig prefix, so one shared root never
-/// collides.
+/// else the `<home>/gt-wt/<ws>/<name>` convention) resolved under **its own** workspace —
+/// `rig_workspaces` (rig name → owning workspace, gtcore-717e13) for a rig adopted from another
+/// tenant, else the daemon's boot `ws` (mirrors [`PolecatSupervisorPlugin::workspace_for_rig`]).
+/// Before this, every rig's convention path derived under the BOOT `ws` regardless of which
+/// tenant it actually belonged to, so an adopted rig with no pinned `worktree_root` (e.g.
+/// `authapp`, ws `templates`) resolved to `<home>/gt-wt/<boot-ws>/authapp` — the wrong
+/// directory, which then either stayed permanently un-provisioned or silently pinned whatever
+/// unrelated checkout happened to already sit there (gtcore-03c97f's sibling routing bug). The
+/// per-rig template inherits the boot template's shared fields (command/args/base_env/
+/// heartbeat_dir) via [`SpawnTemplate::for_rig`]; `polecat_worktree_root` (the global
+/// `GT_POLECAT_WORKTREE_ROOT`) carries over so every rig's polecats get per-bead worktrees —
+/// session names embed the rig prefix, so one shared root never collides.
 ///
 /// A rig whose resolved workdir does not exist on this host is skipped (logged): provisioning
 /// missing rig checkouts is explicitly out of scope for hq-554308, and skipping keeps its beads
@@ -1643,6 +1650,7 @@ pub fn rig_routing_from_catalog(
     polecat_worktree_root: Option<&std::path::Path>,
     ws: &str,
     home: &std::path::Path,
+    rig_workspaces: &HashMap<String, String>,
 ) -> (
     HashMap<String, RigConfig>,
     HashMap<String, std::path::PathBuf>,
@@ -1650,7 +1658,11 @@ pub fn rig_routing_from_catalog(
     let mut configs = HashMap::new();
     let mut paths = HashMap::new();
     for rig in rigs {
-        let workdir = rig.resolved_worktree_root(ws, home);
+        let rig_ws = rig_workspaces
+            .get(&rig.name)
+            .map(String::as_str)
+            .unwrap_or(ws);
+        let workdir = rig.resolved_worktree_root(rig_ws, home);
         if !workdir.is_dir() {
             eprintln!(
                 "[gt-orch-server] rig '{}' (prefix '{}') skipped — worktree root {} does not exist; its beads fall back to the boot template",
@@ -1698,6 +1710,11 @@ pub fn rig_routing_from_catalog(
 /// OWN catalog `git_url` here, BEFORE routing, makes routing find a real checkout so the per-bead
 /// worktree carries the correct origin (`git_url`), exactly as the multi-rig path intends.
 ///
+/// `rig_workspaces` resolves each rig's OWN workspace the same way [`rig_routing_from_catalog`]
+/// does (gtcore-717e13 map, falling back to the boot `ws`) — an adopted rig's convention path
+/// must derive under ITS tenant, not the boot workspace, or this clones into (and permanently
+/// pins) the wrong directory (gtcore-03c97f).
+///
 /// Best-effort and idempotent: a rig whose checkout already exists, or whose `git_url` is empty, is
 /// left untouched; a clone failure (auth/network) is logged and the rig stays unrouted (the legacy
 /// skip). Returns the prefixes successfully provisioned (for logging / tests).
@@ -1705,10 +1722,15 @@ pub fn provision_rig_checkouts(
     rigs: &[gt_rig::RigEntry],
     ws: &str,
     home: &std::path::Path,
+    rig_workspaces: &HashMap<String, String>,
 ) -> Vec<String> {
     let mut provisioned = Vec::new();
     for rig in rigs {
-        let workdir = rig.resolved_worktree_root(ws, home);
+        let rig_ws = rig_workspaces
+            .get(&rig.name)
+            .map(String::as_str)
+            .unwrap_or(ws);
+        let workdir = rig.resolved_worktree_root(rig_ws, home);
         if workdir.is_dir() {
             continue;
         }
@@ -1753,7 +1775,7 @@ fn embed_token_in_url(url: &str, token: &str) -> String {
 }
 
 /// `git clone [--branch <default_branch>] <git_url> <workdir>` for [`provision_rig_checkouts`].
-/// Creates `workdir`'s parent first so a convention root (`<home>/gastown-wt/<ws>/<name>`) under a
+/// Creates `workdir`'s parent first so a convention root (`<home>/gt-wt/<ws>/<name>`) under a
 /// not-yet-existing tree still lands. An empty `git_url` is rejected (nothing to clone from).
 ///
 /// The catalog `git_url` is the PLAIN `https://github.com/...` (no token), but the orchd pod has
@@ -3267,6 +3289,7 @@ mod tests {
             Some(wt_root),
             "default",
             dir.path(),
+            &HashMap::new(),
         );
 
         assert_eq!(configs.len(), 1, "only the rig with an existing root routes");
@@ -3277,6 +3300,50 @@ mod tests {
         assert_eq!(cfg.worktree_root.as_deref(), Some(wt_root));
         assert_eq!(paths.get("gtweb"), Some(&gtweb_root));
         assert!(!paths.contains_key("gh"), "missing-root rig not routed");
+    }
+
+    /// gtcore-03c97f regression: an adopted rig (present in `rig_workspaces`, no pinned
+    /// `worktree_root`) must derive its convention path under ITS OWN workspace, not the
+    /// daemon's boot `ws` — the exact bug that made `authapp` (ws `templates`) provision/route
+    /// under `<home>/gt-wt/default/authapp` while the daemon booted as ws `default`.
+    #[test]
+    fn adopted_rig_convention_path_uses_its_own_workspace_not_the_boot_ws() {
+        use gt_rig::RigEntry;
+        let dir = tempfile::tempdir().unwrap();
+        // The rig's convention checkout, pre-created under its OWN workspace ("templates") —
+        // proof the fix looks there, not under the boot ws ("default").
+        let own_ws_root = dir.path().join("gt-wt").join("templates").join("authapp");
+        std::fs::create_dir_all(&own_ws_root).unwrap();
+        // The wrong (pre-fix) location: same rig name, under the boot ws. Left ABSENT so the
+        // test would fail loudly (not silently route to it) if the fix regresses.
+        let wrong_ws_root = dir.path().join("gt-wt").join("default").join("authapp");
+        assert!(!wrong_ws_root.exists());
+
+        // No `worktree_root` override — the convention default is what's under test.
+        let authapp = RigEntry::new("authapp", "authapp", "https://x/authapp.git", "main", 0);
+        let rig_workspaces = HashMap::from([("authapp".to_string(), "templates".to_string())]);
+
+        let base = SpawnTemplate {
+            rig: "gtcore".into(),
+            prefix: "gtcore".into(),
+            workdir: "/rig".into(),
+            command: "claude".into(),
+            args: vec![],
+            base_env: vec![],
+            heartbeat_dir: std::env::temp_dir(),
+        };
+        let (configs, paths) = rig_routing_from_catalog(
+            &[authapp],
+            &base,
+            None,
+            "default", // the daemon's OWN boot workspace — must NOT win for an adopted rig.
+            dir.path(),
+            &rig_workspaces,
+        );
+
+        let cfg = configs.get("authapp").expect("adopted rig routes off its own workspace");
+        assert_eq!(cfg.template.workdir, own_ws_root);
+        assert_eq!(paths.get("authapp"), Some(&own_ws_root));
     }
 
     /// Run `git <args>` in `dir`, asserting success (test helper for the clone path below).
@@ -3330,7 +3397,8 @@ mod tests {
         gtweb.worktree_root = Some(gtweb_root.clone());
 
         // Provision: the missing rig is cloned from its git_url, NOT skipped.
-        let provisioned = provision_rig_checkouts(&[gtweb.clone()], "default", dir.path());
+        let provisioned =
+            provision_rig_checkouts(&[gtweb.clone()], "default", dir.path(), &HashMap::new());
         assert_eq!(provisioned, vec!["gtweb".to_string()]);
         assert!(
             gtweb_root.join("package.json").is_file(),
@@ -3353,8 +3421,14 @@ mod tests {
             heartbeat_dir: std::env::temp_dir(),
         };
         let wt_root = dir.path().join("wt");
-        let (configs, _paths) =
-            rig_routing_from_catalog(&[gtweb], &base, Some(wt_root.as_path()), "default", dir.path());
+        let (configs, _paths) = rig_routing_from_catalog(
+            &[gtweb],
+            &base,
+            Some(wt_root.as_path()),
+            "default",
+            dir.path(),
+            &HashMap::new(),
+        );
         let cfg = configs.get("gtweb").expect("gtweb now routes");
         assert_eq!(cfg.template.workdir, gtweb_root);
 
@@ -3382,7 +3456,8 @@ mod tests {
         let mut urlless = RigEntry::new("urlless", "ul", "", "main", 0);
         urlless.worktree_root = Some(dir.path().join("never"));
 
-        let provisioned = provision_rig_checkouts(&[present, urlless], "default", dir.path());
+        let provisioned =
+            provision_rig_checkouts(&[present, urlless], "default", dir.path(), &HashMap::new());
         assert!(
             provisioned.is_empty(),
             "present checkout skipped (no clone), urlless rig not cloneable"

@@ -147,7 +147,7 @@ impl RigEntry {
 
     /// Resolve the absolute worktree root the orchestrator carves this rig's polecat
     /// checkouts under, within a workspace. An explicit [`Self::worktree_root`] override wins;
-    /// otherwise the convention default `<home>/gastown-wt/<ws>/<name>` is derived.
+    /// otherwise the convention default `<home>/gt-wt/<ws>/<name>` is derived.
     ///
     /// `ws` is the workspace slug as `&str`, NOT a `gt-workspace::WorkspaceId`: gt-rig is a
     /// `domain/platform` crate and must not take a `gt-workspace` dep (docs/03 Rule 4 forbids
@@ -156,7 +156,7 @@ impl RigEntry {
     pub fn resolved_worktree_root(&self, ws: &str, home: &Path) -> PathBuf {
         self.worktree_root
             .clone()
-            .unwrap_or_else(|| home.join("gastown-wt").join(ws).join(&self.name))
+            .unwrap_or_else(|| home.join("gt-wt").join(ws).join(&self.name))
     }
 
     /// Assess whether this rig is provisioned for autonomous, parallel polecat operation
@@ -199,7 +199,7 @@ impl RigEntry {
         if !worktree_root_pinned {
             advisories.push(
                 "worktree_root not pinned: orchd falls back to the convention default \
-                 <home>/gastown-wt/<ws>/<name>"
+                 <home>/gt-wt/<ws>/<name>"
                     .into(),
             );
         }
@@ -773,7 +773,7 @@ mod tests {
 
     #[test]
     fn validate_worktree_root_enforces_absolute_no_dotdot_and_length() {
-        assert!(validate_worktree_root(Path::new("/home/nixos/gastown-wt/acme/plane")).is_ok());
+        assert!(validate_worktree_root(Path::new("/home/nixos/gt-wt/acme/plane")).is_ok());
         assert!(
             validate_worktree_root(Path::new("relative/path")).is_err(),
             "must be absolute"
@@ -794,11 +794,11 @@ mod tests {
     fn resolved_worktree_root_prefers_override_then_convention() {
         let home = Path::new("/home/nixos");
 
-        // No override → convention default `<home>/gastown-wt/<ws>/<name>`.
+        // No override → convention default `<home>/gt-wt/<ws>/<name>`.
         let plain = RigEntry::new("plane", "pl", "git@github.com:o/plane.git", "main", 1);
         assert_eq!(
             plain.resolved_worktree_root("acme", home),
-            PathBuf::from("/home/nixos/gastown-wt/acme/plane")
+            PathBuf::from("/home/nixos/gt-wt/acme/plane")
         );
 
         // Explicit override wins, ignoring ws/home.
@@ -820,7 +820,7 @@ mod tests {
             "main",
             1,
         ));
-        let root = PathBuf::from("/home/nixos/gastown-wt/acme/plane");
+        let root = PathBuf::from("/home/nixos/gt-wt/acme/plane");
         assert!(catalog.apply_worktree_root_change("plane", Some(root.clone())));
         assert_eq!(
             catalog.get("plane").unwrap().worktree_root.as_ref(),

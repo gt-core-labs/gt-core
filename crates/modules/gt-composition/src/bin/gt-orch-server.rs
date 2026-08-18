@@ -456,8 +456,20 @@ async fn main() -> anyhow::Result<()> {
                             // route find a real checkout so the per-bead worktree carries the
                             // correct origin. Best-effort: a clone failure leaves the rig on the
                             // legacy skip.
+                            //
+                            // `rig_workspace_map` (gtcore-717e13) resolves EACH rig's own tenant
+                            // (an adopted rig, else this daemon's boot workspace) — until
+                            // gtcore-03c97f both calls below derived every rig's convention
+                            // `<home>/gt-wt/<ws>/<name>` path under the SINGLE boot `ws_slug`,
+                            // so an adopted rig with no pinned `worktree_root` (e.g. `authapp`, ws
+                            // `templates`) provisioned/routed under the wrong tenant's directory —
+                            // permanently, since the existence check never re-validates against
+                            // the catalog `git_url` once something is sitting there.
                             let _ = gt_composition::polecat::provision_rig_checkouts(
-                                &rigs, &ws_slug, &home,
+                                &rigs,
+                                &ws_slug,
+                                &home,
+                                &rig_workspace_map,
                             );
                             rig_routing_from_catalog(
                                 &rigs,
@@ -465,6 +477,7 @@ async fn main() -> anyhow::Result<()> {
                                 polecat_worktree_root.as_deref(),
                                 &ws_slug,
                                 &home,
+                                &rig_workspace_map,
                             )
                         }
                         Err(e) => {
